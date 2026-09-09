@@ -43,14 +43,14 @@ const DEFAULT_ROUTES = {
   '/api/workspace/ws-1/workers': jsonOk([]),
   '/api/workspace/ws-1/containers': jsonOk({ containers: [] }),
   '/api/workspace/ws-1/effective_permissions': jsonOk({
-    effective_permissions: { filesystem: 'read', network: 'banned', git: 'read', system: 'read', execution: 'banned', container: true },
+    effective_permissions: { git: 'read', filesystem: 'read', container: true, network: 'banned', mcp: 'banned', host_bash: 'banned' },
   }),
   '/api/workspace/list': jsonOk([{ id: 'ws-1', label: 'Code Development', root: '/root' }]),
 }
 
 // Raw grant map the backend stores for session s1. Canonical safe-default grant
-// map — useStore's legacy PERMISSION_DEFAULTS still carries system/execution and
-// lacks mcp/host_bash, so it cannot describe the session profile.
+// map matching useStore's PERMISSION_DEFAULTS (git/filesystem read, container
+// false, network/mcp/host_bash banned).
 const RAW_PROFILE = {
   filesystem: 'read',
   network: 'banned',
@@ -65,7 +65,7 @@ const RAW_PROFILE = {
 // handleApply before it surfaces as 'Failed to save permissions: <msg>').
 const PUT_422_ERRORS = [
   'container permission rejected by workspace policy',
-  'execution grant locked to read-only',
+  'mcp grant locked to read-only',
 ]
 
 const PERMISSIONS_RESPONSE = (raw = RAW_PROFILE) => ({

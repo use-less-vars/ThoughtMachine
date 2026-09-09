@@ -34,12 +34,12 @@
 import { create } from 'zustand'
 
 export const PERMISSION_DEFAULTS = {
-  filesystem: 'read',
-  network: 'banned',
-  container: false,
-  system: 'read',
   git: 'read',
-  execution: 'banned',
+  filesystem: 'read',
+  container: false,
+  network: 'banned',
+  mcp: 'banned',
+  host_bash: 'banned',
 }
 
 // Default per-session entries created by registerSession / receive* actions.

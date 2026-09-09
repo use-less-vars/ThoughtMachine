@@ -133,13 +133,18 @@ class TestGetWorkspaceCapabilities:
 
 class TestEffectivePermissionsMerge:
     def test_all_max(self):
-        """All-session-max with all-workspace-true yields maximum effective permissions."""
+        """All-session-max with all-workspace-true yields maximum effective permissions.
+
+        The effective dict carries exactly the six canonical category keys
+        (filesystem | network | container | git | mcp | host_bash); the
+        legacy ``system`` grain was removed in the permission-schema
+        unification and is never emitted.
+        """
         session = SessionPermissions(
             filesystem="write",
             network="write",
             container=True,
             git="write",
-            system="full",
         )
         workspace = WorkspaceCapabilities(
             allow_network=True,
@@ -152,7 +157,9 @@ class TestEffectivePermissionsMerge:
         assert eff["network"] == "write"  # "write" + workspace=True → "write" (pass-through)
         assert eff["container"] is True
         assert eff["git"] == "write"
-        assert eff["system"] == "full"
+        assert eff["mcp"] == "banned"  # session default
+        assert eff["host_bash"] == "banned"  # session default
+        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash"}
 
     def test_network_workspace_denied(self):
         """Workspace allow_network=False → effective network=False."""
@@ -217,12 +224,20 @@ class TestEffectivePermissionsMerge:
         eff = get_effective_permissions(session, workspace)
         assert eff["container"] is True
 
-    def test_system_passthrough(self):
-        """System permission passes through unchanged (no workspace cap)."""
-        session = SessionPermissions(system="read")
+    def test_system_grain_not_emitted(self):
+        """Legacy system/execution grains never reach the effective dict.
+
+        SessionPermissions no longer declares ``system``/``execution``
+        fields (permission-schema unification); the effective dict exposes
+        only the six canonical category keys, so no ``system``-keyed gate
+        look-up can ever succeed.
+        """
+        session = SessionPermissions()
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(session, workspace)
-        assert eff["system"] == "read"
+        assert "system" not in eff
+        assert "execution" not in eff
+        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash"}
 
 
 # ══════════════════════════════════════════════════════════════════════════

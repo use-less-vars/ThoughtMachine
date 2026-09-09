@@ -11,7 +11,7 @@ The ``to_agent_config()`` method injects it back when constructing the full
 """
 
 from __future__ import annotations
-from typing import Optional, Dict, Any, List, Literal
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, model_validator, ConfigDict
 
 
@@ -69,17 +69,36 @@ class SessionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode='before')
-    def migrate_git_allow_worktree_commits(cls, values):
-        """Migrate the removed ``git_allow_worktree_commits`` session flag.
+    def migrate_legacy_git_fields(cls, values):
+        """Migrate removed legacy git fields to the canonical session permissions.
 
-        ``extra='forbid'`` would otherwise reject the legacy key. ``True``
-        folds into ``git_write='write'``; ``False`` / absent is dropped
-        (fail-closed default).
+        The resource model is the canonical six
+        (``git | filesystem | container | network | mcp | host_bash``) — the
+        split ``git_read``/``git_write`` grains no longer exist.  ``extra='forbid'``
+        would otherwise reject the legacy keys, so old persisted ``SessionConfig``
+        JSON stays loadable (fail-closed):
+
+        * top-level ``git_read`` (legacy read-grain override) is dropped;
+        * top-level ``git_write == 'write'`` (legacy write-grain override) is
+          folded into ``session_permissions['git'] = 'write'`` (a full
+          git-write grant is the session git permission level ``'write'``);
+          other ``git_write`` values are dropped;
+        * the removed ``git_allow_worktree_commits`` flag: ``True`` folds the
+          same way; ``False`` / absent is dropped.
         """
         if isinstance(values, dict):
-            legacy = values.pop('git_allow_worktree_commits', None)
-            if legacy is True:
-                values['git_write'] = 'write'
+            values.pop('git_read', None)
+            grant_write = False
+            if values.pop('git_write', None) == 'write':
+                grant_write = True
+            if values.pop('git_allow_worktree_commits', None) is True:
+                grant_write = True
+            if grant_write:
+                perms = values.get('session_permissions')
+                if not isinstance(perms, dict):
+                    perms = {}
+                    values['session_permissions'] = perms
+                perms['git'] = 'write'
         return values
 
     @model_validator(mode='before')
@@ -171,15 +190,6 @@ class SessionConfig(BaseModel):
     use_container_registry: bool = Field(
         default=False,
         description='Enable the ContainerRegistry delegation for container lifecycle in this session (feature flag).',
-    )
-    git_read: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
-        default=None,
-        description='Session-level git read grain override (None = derived from the git permission).',
-    )
-    git_write: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
-        default=None,
-        description='Session-level git write grain override (None = derived from the git permission). '
-                    'git_write="write" replaces the removed git_allow_worktree_commits flag.',
     )
     worker_timeout_seconds: Optional[int] = Field(
         default=None,
@@ -306,10 +316,6 @@ class SessionConfig(BaseModel):
             sp_copy = dict(self.session_permissions)
         else:
             sp_copy = {}
-        if self.git_read is not None:
-            sp_copy['git_read'] = self.git_read
-        if self.git_write is not None:
-            sp_copy['git_write'] = self.git_write
         if sp_copy:
             kwargs['session_permissions'] = sp_copy
 

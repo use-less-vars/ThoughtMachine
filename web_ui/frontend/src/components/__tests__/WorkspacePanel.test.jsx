@@ -351,15 +351,16 @@ describe('Workers section', () => {
 // Effective permissions
 // ===========================================================================
 describe('Effective Permissions section', () => {
-  it('renders the five default permission pills when the session has none', async () => {
+  it('renders the six canonical default permission pills when the session has none', async () => {
     stubBackend()
     renderPanel()
     await act(async () => {})
-    expect(screen.getByText('Filesystem: Read')).toBeInTheDocument()
-    expect(screen.getByText('Network: Banned')).toBeInTheDocument()
     expect(screen.getByText('Git: Read')).toBeInTheDocument()
-    expect(screen.getByText('System: Read')).toBeInTheDocument()
+    expect(screen.getByText('Filesystem: Read')).toBeInTheDocument()
     expect(screen.getByText('Container: Disabled')).toBeInTheDocument()
+    expect(screen.getByText('Network: Banned')).toBeInTheDocument()
+    expect(screen.getByText('MCP: Banned')).toBeInTheDocument()
+    expect(screen.getByText('Host Bash: Banned')).toBeInTheDocument()
   })
 
   it('renders pills from the seeded session config and maps boolean container values', async () => {
@@ -368,22 +369,24 @@ describe('Effective Permissions section', () => {
       sessionConfigs: {
         'sess-1': {
           permissions: {
-            filesystem: 'full',
-            network: 'ask',
             git: 'write',
-            system: 'read',
+            filesystem: 'full',
             container: true,
+            network: 'ask',
+            mcp: 'banned',
+            host_bash: 'banned',
           },
         },
       },
     })
     renderPanel()
     await act(async () => {})
-    expect(screen.getByText('Filesystem: Full')).toBeInTheDocument()
-    expect(screen.getByText('Network: Ask')).toBeInTheDocument()
     expect(screen.getByText('Git: Write')).toBeInTheDocument()
-    expect(screen.getByText('System: Read')).toBeInTheDocument()
+    expect(screen.getByText('Filesystem: Full')).toBeInTheDocument()
     expect(screen.getByText('Container: Enabled')).toBeInTheDocument()
+    expect(screen.getByText('Network: Ask')).toBeInTheDocument()
+    expect(screen.getByText('MCP: Banned')).toBeInTheDocument()
+    expect(screen.getByText('Host Bash: Banned')).toBeInTheDocument()
     expect(screen.getByTitle('Container: true')).toBeInTheDocument()
     expect(screen.getByTitle('Filesystem: full')).toBeInTheDocument()
   })
@@ -449,12 +452,12 @@ function stubTabsBackend(extra = {}) {
     '/api/workspace/list': jsonOk([TABS_ENTRY]),
     '/api/workspace/ws-tabs/effective_permissions': jsonOk({
       effective_permissions: {
-        filesystem: 'write',
-        network: 'read',
         git: 'write',
-        system: 'read',
-        execution: 'banned',
+        filesystem: 'write',
         container: true,
+        network: 'read',
+        mcp: 'banned',
+        host_bash: 'banned',
       },
     }),
     '/api/health/containers': jsonOk({ docker: 'reachable' }),
@@ -709,12 +712,12 @@ describe('Phase 4 tabbed panel — safety advisory', () => {
     stubTabsBackend({
       '/api/workspace/ws-tabs/effective_permissions': jsonOk({
         effective_permissions: {
-          filesystem: 'write',
-          network: 'write',
           git: 'write',
-          system: 'read',
-          execution: 'banned',
+          filesystem: 'write',
           container: true,
+          network: 'write',
+          mcp: 'banned',
+          host_bash: 'banned',
         },
       }),
     })

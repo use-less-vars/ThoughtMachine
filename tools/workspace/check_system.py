@@ -131,54 +131,41 @@ _CANONICAL_GIT_LEVELS = ('banned', 'ask', 'read', 'write', 'write_on_feature_bra
 
 
 def _canonical_git_level(effective):
-    """Fold the gate's git grains (git / git_read / git_write) into one canonical level.
+    """Fold the effective ``git`` level into one canonical display value.
 
     DISPLAY-ONLY: this fold is for human-readable output (CheckSystem
-    'effective_permissions'). Gating always consumes the individual grains from
-    the security gate — nothing here feeds authorization.
+    'effective_permissions'). Gating consumes the canonical ``git`` grain from
+    the security gate directly — nothing here feeds authorization. Legacy
+    stored values (``full``, ``write_feature_branches``) are normalized to the
+    canonical ladder for display.
     """
     if not isinstance(effective, dict):
         return None
-    # git_write is the strongest signal of what git operations are allowed.
-    gw = effective.get('git_write')
-    if gw not in (None, False):
-        gw = str(gw).lower()
-        if gw == 'full':
-            gw = 'write'
-        if gw in ('write', 'write_on_feature_branch'):
-            return gw
-    # The stored session git level (if present) is the next best signal.
     git = effective.get('git')
-    if git not in (None, False):
-        git = str(git).lower()
-        if git == 'full':
-            git = 'write'
-        if git == 'write_feature_branches':
-            git = 'write_on_feature_branch'
-        if git in _CANONICAL_GIT_LEVELS:
-            return git
-    # git_read only ever implies read-level access (never write).
-    gr = effective.get('git_read')
-    if gr not in (None, False):
-        gr = str(gr).lower()
-        if gr == 'banned':
-            return 'banned'
-        if gr in ('ask', 'read', 'write', 'full'):
-            return 'read'
+    if git in (None, False):
+        return None
+    git = str(git).lower()
+    if git == 'full':
+        git = 'write'
+    if git == 'write_feature_branches':
+        git = 'write_on_feature_branch'
+    if git in _CANONICAL_GIT_LEVELS:
+        return git
     return None
 
 
 def _canonical_permission_display(effective):
     """Return the canonical session-resource view of an effective-permissions dict.
 
-    DISPLAY-ONLY (see _canonical_git_level): legacy/gate-only keys such as
-    system, execution, git_read and git_write are hidden or folded, so what the
-    operator sees matches the session-resource vocabulary the ConfigPanel edits.
+    DISPLAY-ONLY (see _canonical_git_level): the effective dict is filtered to
+    the canonical session-resource keys and the git level is folded to the
+    canonical ladder, so what the operator sees matches the session-resource
+    vocabulary the ConfigPanel edits. Stray or legacy keys never appear.
     """
     if not isinstance(effective, dict):
         return {}
     reported = {k: v for k, v in effective.items() if k in canonical_resource_keys}
-    if 'git' in effective or 'git_read' in effective or 'git_write' in effective:
+    if 'git' in effective:
         level = _canonical_git_level(effective)
         if level is not None:
             reported['git'] = level
@@ -195,8 +182,14 @@ class CheckSystem(ToolBase):
     """Inspect the runtime environment — permissions, container, workspace, config, and network."""
 
     tool: str = "CheckSystem"
-    # CheckSystem inspects host state and can run subprocesses - always gate it.
-    required_categories: ClassVar[List[str]] = ["system:read"]
+    # System checks are always available: no gate category here. The security
+    # gate's effective dict has no 'system' key (canonical session resources:
+    # filesystem/network/container/git/mcp/host_bash), so declaring a
+    # "system:read" category would make check_required_categories deny EVERY
+    # query (unknown category -> fail closed). The vault query allowlist
+    # (_load_allowlist_from_vault / get_checksystem_allowlist) is the access
+    # control for CheckSystem.
+    required_categories: ClassVar[List[str]] = []
 
     query: str = Field(
         description="What to check. Valid values: 'my_config' (full agent config), "
@@ -403,9 +396,9 @@ class CheckSystem(ToolBase):
             permission_origin = "session-mirror"
 
         return {
-            # DISPLAY-ONLY fold: gate grain keys (git_read/git_write/system/
-            # execution) are hidden/folded so the report matches the canonical
-            # session-resource vocabulary the ConfigPanel edits.
+            # DISPLAY-ONLY fold: the effective dict is reduced to the canonical
+            # session-resource keys (git level folded to the canonical ladder)
+            # so the report matches the ConfigPanel vocabulary.
             "effective_permissions": _canonical_permission_display(effective),
             "workspace_capabilities": workspace_capabilities,
             "workspace_id": ws_id,

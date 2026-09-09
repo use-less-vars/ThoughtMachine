@@ -22,36 +22,32 @@ from thoughtmachine.security import (
 from session.lock import FileLock, FileLockTimeoutError
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Tests: coerce_session_permissions
-# ══════════════════════════════════════════════════════════════════════════════
-
 class TestCoerceSessionPermissions:
     """Tests for coerce_session_permissions()."""
 
     def test_valid_permissions_pass_through(self):
         """All valid values should pass through unchanged."""
-        # NOTE: "mcp" and the split git sub-grains ("git_read"/"git_write")
-        # are part of PERMISSION_SCHEMA; keys absent from raw are filled
-        # with SAFE_DEFAULTS (the security gate derives git_read/git_write
-        # from "git"), so the pass-through contract applies to raw's keys,
-        # and the normalized result additionally carries the sub-grain
-        # defaults.
+        # The canonical permission schema has exactly six keys
+        # (container/network/filesystem/git/mcp/host_bash). The legacy
+        # ``system``/``execution`` categories and the split
+        # ``git_read``/``git_write`` grains no longer exist as permission
+        # resources, so keys absent from raw are filled with SAFE_DEFAULTS
+        # and unknown legacy keys are dropped, never carried through.
         raw = {
             "network": "write",
             "filesystem": "read",
             "container": True,
-            "execution": "banned",
             "git": "read",
-            "system": "ask",
             "mcp": "connect",
+            "host_bash": "ask",
         }
         result = coerce_session_permissions(raw)
         for key, value in raw.items():
             assert result[key] == value, f"Expected {key}={value!r}, got {result[key]!r}"
-        # Sub-grains absent from raw are default-filled (not dropped):
-        assert result["git_read"] == SAFE_DEFAULTS["git_read"]
-        assert result["git_write"] == SAFE_DEFAULTS["git_write"]
+        # The normalized result carries exactly the six canonical schema keys
+        # (never legacy sub-grains such as git_read/git_write):
+        assert set(result.keys()) == set(PERMISSION_SCHEMA.keys())
+        assert set(result.keys()) == set(SAFE_DEFAULTS.keys())
 
     def test_invalid_value_replaced_with_default(self):
         """An invalid value for a known key should be replaced by the safe default."""

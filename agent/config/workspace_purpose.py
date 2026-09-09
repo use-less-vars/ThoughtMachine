@@ -25,14 +25,16 @@ WORKSPACE_PURPOSES = ["coding", "research", "general"]
 PURPOSE_PRESETS: Dict[str, Dict[str, Any]] = {
     "coding": {
         "default_permissions": {
-            "git_read": "read",
-            "git_write": "ask",
+            # git: single canonical ceiling chosen to preserve the legacy
+            # two-grain intent (git_read: read -- reads always allowed;
+            # git_write: ask -- writes only via interactive ask).  An
+            # ``ask`` ceiling admits session read grants and prompted
+            # (ask) write grants while capping unconditional write grants.
+            "git": "ask",
             "host_bash": "banned",
             "container": False,
             "network": "ask",
             "filesystem": "write",
-            "system": "read",
-            "execution": "banned",
             "mcp": "banned",
         },
         "risk_settings": {
@@ -41,14 +43,17 @@ PURPOSE_PRESETS: Dict[str, Dict[str, Any]] = {
     },
     "research": {
         "default_permissions": {
-            "git_read": "read",
-            "git_write": "banned",
+            # git: single canonical ceiling chosen to preserve the legacy
+            # two-grain intent (git_read: read, git_write: banned --
+            # read-only repository access).  A ``read`` ceiling admits
+            # session read grants and caps every write-mode grant
+            # (ask/write_on_feature_branch/write) to the read tier, so no
+            # write ever happens.
+            "git": "read",
             "host_bash": "banned",
             "container": False,
             "network": "ask",
             "filesystem": "read",
-            "system": "read",
-            "execution": "banned",
             "mcp": "banned",
         },
         "risk_settings": {

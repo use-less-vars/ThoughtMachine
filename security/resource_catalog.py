@@ -19,11 +19,15 @@ applies.  The workspace ceiling's canonical key for sandboxed execution is
 ``container`` (boolean); the legacy alias ``docker`` is accepted by the
 security gate and normalised onto ``container`` at enforcement time (a
 write-level docker ceiling allows the container grant, banned/read/ask
-denies it).  The ceiling keeps the wider workspace vocabulary
-(``container``, ``host_bash``, ``git_read``, ``git_write``, ...) and is
-enforced separately by the security gate;
-``thoughtmachine/permission_store.workspace_ceiling`` is therefore NOT
-coerced.
+denies it).  The ceiling surface is the six canonical resources only
+(``container`` boolean; ``git``, ``filesystem``, ``network``, ``mcp``,
+``host_bash``); the legacy ceiling grains
+``git_read``/``git_write``/``system``/``execution`` were removed from it
+-- legacy stored values are folded onto ``git`` or dropped by the
+workspace-permission loader, and workspace-permission PUT validation
+rejects the names.  The ceiling is enforced separately by the security
+gate; ``thoughtmachine/permission_store.workspace_ceiling`` is therefore
+NOT coerced by :func:`coerce_resource_permissions`.
 
 One canonical per-resource vocabulary backs both the session-grant
 catalog (:data:`RESOURCE_CATALOG` below) and the workspace-ceiling
@@ -42,10 +46,6 @@ Workspace-ceiling values, validated by the workspace-permission loader
 
     git          banned | ask | read | write_on_feature_branch | write
     filesystem   banned | ask | read | write
-    system       banned | ask | read | write   (legacy ceiling grain)
-    execution    banned | ask | read | write   (legacy ceiling grain)
-    git_read     banned | ask | read | write   (legacy ceiling grain)
-    git_write    banned | ask | read | write   (legacy ceiling grain)
     network      banned | ask | write | outbound
     mcp          banned | connect | full
     host_bash    banned | ask | allow
@@ -80,7 +80,7 @@ because each answers a different question:
   ceiling (2.0) does NOT cap it -- read-only sessions are never forced
   into an interactive ask loop.  A session ``write`` grant ranks 3.0, so
   an ``ask`` ceiling caps it to the read tier (``read`` for the
-  read-capable filesystem/git/git_read/git_write/system/execution keys,
+  read-capable filesystem/git keys,
   ``banned`` for the others), and a ``write_on_feature_branch`` *ceiling*
   (2.5, strictly between ask and write) caps ``write`` down to
   branch-restricted write -- never unlimited.  Ceilings at rank 4.0
@@ -92,9 +92,11 @@ because each answers a different question:
 
 Legacy-load-normalisation policy: the workspace-permission loader
 normalises legacy stored ceilings onto the canonical vocabularies --
-legacy ``full`` ceilings for ``git``/``filesystem``/``system``/
-``execution`` are stored as ``write``, and legacy container string
-ceilings are stored as booleans.  Any stray ``full`` ceiling or
+legacy ``full`` ceilings for ``git``/``filesystem`` are stored as
+``write``, legacy container string ceilings are stored as booleans, and
+the removed legacy grains are folded or dropped (``git_read`` +
+``git_write`` fold onto the single ``git`` ceiling; ``system`` and
+``execution`` are dropped).  Any stray ``full`` ceiling or
 container string that still reaches the gate at runtime is handled
 fail-open: ``full`` ranks 4.0 (unlimited; the session value stands) and
 an out-of-vocab container string is warned about and ignored (no
@@ -166,24 +168,22 @@ WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
 
 #: Per-session-key whitelist of workspace-ceiling levels that may ever be
 #: applied to that key (validation vocab used by ``apply_workspace_ceiling``;
-#: a ceiling level outside the key's vocabulary is ignored fail-open).
-#: ``git_read``/``git_write``/``system``/``execution`` are legacy ceiling
-#: grains the gate caps onto session keys.  ``container`` is NOT a string
-#: vocabulary key: its ceiling is boolean-only (dedicated gate branch), and
-#: legacy string ceilings are normalised to booleans by the
+#: a ceiling level outside the key's vocabulary is ignored fail-open).  The
+#: ceiling surface is exactly the six canonical session-grant resources; the
+#: legacy ceiling grains ``git_read``/``git_write``/``system``/``execution``
+#: were removed (legacy stored values are folded/dropped by the loader and
+#: PUT validation rejects the names with a legacy hint).  ``container`` is
+#: NOT a string vocabulary key: its ceiling is boolean-only (dedicated gate
+#: branch), and legacy string ceilings are normalised to booleans by the
 #: workspace-permission loader; a stray string that still reaches the gate is
 #: ranked or warned about fail-open.  ``full`` is likewise not a ceiling
-#: level for ``git``/``filesystem``/``system``/``execution`` -- legacy stored
-#: ``full`` ceilings are loader-normalised to ``write``; a stray runtime
-#: ``full`` ceiling ranks 4.0 (unlimited) so it is behaviourally identical to
-#: fail-open (session value stands).
+#: level for ``git``/``filesystem`` -- legacy stored ``full`` ceilings are
+#: loader-normalised to ``write``; a stray runtime ``full`` ceiling ranks
+#: 4.0 (unlimited) so it is behaviourally identical to fail-open (session
+#: value stands).
 WORKSPACE_CEILING_VOCAB: Dict[str, tuple] = {
-    "filesystem": ("banned", "ask", "read", "write"),
-    "system": ("banned", "ask", "read", "write"),
-    "execution": ("banned", "ask", "read", "write"),
     "git": ("banned", "ask", "read", "write_on_feature_branch", "write"),
-    "git_read": ("banned", "ask", "read", "write"),
-    "git_write": ("banned", "ask", "read", "write"),
+    "filesystem": ("banned", "ask", "read", "write"),
     "network": ("banned", "ask", "write", "outbound"),
     "mcp": ("banned", "connect", "full"),
     "host_bash": ("banned", "ask", "allow"),

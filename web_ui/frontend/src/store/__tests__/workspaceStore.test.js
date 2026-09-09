@@ -51,8 +51,8 @@ const CONFIG_ROUTES = {
       filesystem: 'read',
       network: 'banned',
       git: 'write',
-      system: 'read',
-      execution: 'banned',
+      mcp: 'banned',
+      host_bash: 'banned',
       container: true,
     },
   }),
@@ -151,7 +151,7 @@ describe('fetchWorkspaceConfig', () => {
     expect(st.currentWorkspace.id).toBe('ws-1')
     expect(st.currentWorkspace.name).toBe('Code Development')
     expect(st.currentWorkspace.permissions.map((p) => p.name)).toEqual([
-      'filesystem', 'network', 'git', 'system', 'execution', 'container',
+      'git', 'filesystem', 'container', 'network', 'mcp', 'host_bash',
     ])
     const containerPerm = st.currentWorkspace.permissions.find((p) => p.name === 'container')
     expect(containerPerm.ceiling).toBe('enabled') // backend bool -> 'enabled'

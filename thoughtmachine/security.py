@@ -109,14 +109,20 @@ class SessionPermissions(BaseModel):
     Maps to the permission system used by
     ``tool_executor._check_permissions()``:
 
+    The canonical session permission categories are exactly six:
+    ``container | network | filesystem | git | mcp | host_bash``.
+
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
     - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **system**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask' | 'write_on_feature_branch'``
-    - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **mcp**:        ``'banned' | 'connect' | 'full'``
     - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
+
+    The legacy ``system``/``execution`` permission categories and the split
+    ``git_read``/``git_write`` grains were removed in the permission-schema
+    unification: the git tools (named ``git_read``/``git_write``) gate on the
+    single ``git`` category instead.
     """
 
     container: bool = Field(
@@ -131,33 +137,11 @@ class SessionPermissions(BaseModel):
         default='read',
         description='Filesystem access level for the session.',
     )
-    system: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
-        default='read',
-        description='System operations access level.',
-    )
     git: Literal[
         'banned', 'read', 'write', 'full', 'ask', 'write_on_feature_branch',
     ] = Field(
         default='read',
         description='Git operations access level for the session.',
-    )
-    git_read: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
-        default=None,
-        description=(
-            'Explicit git READ grain. None means \"derive from git\" via '
-            'split_git_permission at the security gate.'
-        ),
-    )
-    git_write: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
-        default=None,
-        description=(
-            'Explicit git WRITE grain. None means \"derive from git\" via '
-            'split_git_permission at the security gate.'
-        ),
-    )
-    execution: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
-        default='banned',
-        description='Code execution access level for the session.',
     )
     mcp: Literal['banned', 'connect', 'full'] = Field(
         default='banned',
@@ -196,37 +180,29 @@ VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
 # "full" is intentionally excluded — it is not a valid mode for
 # the Docker security gate and should not be settable from the UI.
 # ``write_on_feature_branch`` is a git-only level ("commit only on feature
-# branches"; the security gate splits it into git_read=read +
-# git_write=write_on_feature_branch). It must NOT leak into the other
-# VALID_PERMISSION_LEVELS consumers (filesystem/system/git_read/git_write),
-# so ``git`` gets its own dedicated tuple below.
+# branches"; the security gate maps it to a write-restricted git grant). It
+# must NOT leak into the other VALID_PERMISSION_LEVELS consumers
+# (filesystem/network), so ``git`` gets its own dedicated tuple below.
 GIT_PERMISSION_LEVELS = VALID_PERMISSION_LEVELS + ("write_on_feature_branch",)
+# Canonical permission categories: exactly the six session resources
+# (container, network, filesystem, git, mcp, host_bash). The legacy
+# ``system``/``execution`` categories and the split ``git_read``/``git_write``
+# grains no longer exist as permission resources.
 PERMISSION_SCHEMA: Dict[str, tuple] = {
     "network":   ("banned", "ask", "write", "outbound"),
     "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
     "container":  (True, False),
-    "execution":  ("banned", "ask", "read", "write"),
     "git":        GIT_PERMISSION_LEVELS,   # + write_on_feature_branch (git-only)
-    # Split git sub-categories (derived from ``git`` by the security gate;
-    # declared here so worker permission footprints and config validation
-    # accept them).
-    "git_read":   VALID_PERMISSION_LEVELS,
-    "git_write":  VALID_PERMISSION_LEVELS,
     "mcp":        ("banned", "connect", "full"),
     "host_bash":  ("banned", "ask", "allow"),
-    "system":     VALID_PERMISSION_LEVELS,
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
     "container": False,
-    "execution": "banned",
     "filesystem": "read",
     "git": "read",
-    "git_read": "read",
-    "git_write": "banned",
     "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
-    "system": "read",
 }
 
 

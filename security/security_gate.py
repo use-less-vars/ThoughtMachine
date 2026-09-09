@@ -73,24 +73,21 @@ _FAIL_CLOSED_CAPABILITIES = WorkspaceCapabilities(
 # ``workspace_permissions``) and the vault permission store cannot be read
 # (missing/corrupt sidecar or config, I/O error, unexpected exception).  The
 # deny-all session plus deny-all ceiling flow through the SAME merge below
-# and yield the all-banned 10-key result shape — a disk-mode caller never
+# and yield the all-banned 6-key result shape — a disk-mode caller never
 # receives default grants because the store was unreadable.
 _DISK_FAIL_CLOSED_SESSION = SessionPermissions(
     container=False,
     network="banned",
     filesystem="banned",
-    system="banned",
     git="banned",
-    execution="banned",
     mcp="banned",
+    host_bash="banned",
 )
 _DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
     "filesystem": "banned",
     "container": False,
     "host_bash": "banned",
     "git": "banned",
-    "git_read": "banned",
-    "git_write": "banned",
     "network": "banned",
 }
 
@@ -183,11 +180,9 @@ _WORKSPACE_CEILING_LEVELS = WORKSPACE_CEILING_LEVELS_RANKS
 # The canonical workspace resource for sandboxed execution is ``container``
 # (boolean ceiling); the legacy alias ``docker`` maps onto it here, so a
 # docker ceiling of write-rank allows the container session grant while
-# anything stricter (banned/read/ask) denies it.  Also accepts the OLD
-# purpose-preset names (container, git_read, git_write, host_bash, network,
-# filesystem), the session-catalog resource ``mcp`` (capped on its own
-# banned < connect < full scale) and the session keys ``system`` /
-# ``execution`` (read-tier resources capped like filesystem/git).
+# anything stricter (banned/read/ask) denies it.  Also accepts the
+# session-catalog resources (filesystem, git, network, mcp -- capped on
+# their own scales) plus the canonical ``host_bash`` key.
 _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "filesystem": "filesystem",
     "docker": "container",
@@ -195,33 +190,19 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "host_bash": "host_bash",
     "git": "git",
     "network": "network",
-    "git_read": "git_read",
-    "git_write": "git_write",
     "mcp": "mcp",
-    "system": "system",
-    "execution": "execution",
 }
 
 #: Recognised workspace-ceiling resource names: the canonical catalog
 #: resources (session-grant keys git/filesystem/container/network/mcp/
 #: host_bash -- see security/resource_catalog.py) plus the legacy alias
 #: ``docker`` (kept recognised -- normalised onto ``container`` by
-#: _WORKSPACE_RESOURCE_MAP so legacy disk ceilings never fail open) and the
-#: legacy git grains (git_read, git_write).
-#: ``system``/``execution`` are recognised as deliberate extensions beyond
-#: the session catalog (which deliberately stays 6-key git/filesystem/
-#: container/network/mcp/host_bash to keep the legacy disk-mode drop tests
-#: stable): both carry read-tier session scales and their workspace ceilings
-#: cap the corresponding session keys.
+#: _WORKSPACE_RESOURCE_MAP so legacy disk ceilings never fail open).
 #: A ceiling key outside this set is an unknown resource: it is logged and
 #: ignored (fail-open), so forward-compatible workspace maps never break
 #: session resolution.
 _WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
     "docker",
-    "git_read",
-    "git_write",
-    "system",
-    "execution",
 }
 
 #: Session-permission keys whose level scale has a ``read`` tier BELOW
@@ -233,10 +214,6 @@ _WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
 _ASK_CEILING_READ_TIER_KEYS = frozenset({
     "filesystem",
     "git",
-    "git_read",
-    "git_write",
-    "system",
-    "execution",
 })
 
 
@@ -265,10 +242,9 @@ def apply_workspace_ceiling(
           session value stands.
         * An unknown ceiling level is treated as no ceiling (fail-open), so
           forward-compatible workspace maps never break session resolution.
-        * An unknown ceiling resource (outside ``RESOURCE_CATALOG``, the
-          session keys ``system``/``execution``, and the legacy workspace
-          grains ``docker``/``git_read``/``git_write``) is logged and
-          ignored (fail-open) -- the session value stands.
+        * An unknown ceiling resource (outside ``RESOURCE_CATALOG`` and the
+          legacy workspace alias ``docker``) is logged and ignored
+          (fail-open) -- the session value stands.
         * ``docker`` is a legacy alias for ``container``: it is normalised
           onto ``container`` by ``_WORKSPACE_RESOURCE_MAP`` before ranking,
           so a docker ceiling of ``write`` (or ``full``/``True``) allows the
@@ -279,9 +255,8 @@ def apply_workspace_ceiling(
           ``False``.  The ``container`` key is always emitted as a boolean.
         * A workspace ceiling of ``ask`` caps a more-permissive session
           value to the most permissive tier BELOW ask: ``read`` for
-          resources whose session scale has a read tier (filesystem, git,
-          git_read, git_write, system, execution), else ``banned``
-          (network).  An ask ceiling
+          resources whose session scale has a read tier (filesystem, git),
+          else ``banned`` (network).  An ask ceiling
           therefore NEVER yields an effective ``ask`` grant -- interactive
           prompting stays reserved for genuine session-level ``ask``
           grants, which rank at the ceiling and pass through unchanged.
@@ -439,15 +414,16 @@ def apply_workspace_ceiling(
 
 
 def split_git_permission(level: Any) -> tuple:
-    """Split a merged git permission level into ``(read, write)`` sub-levels.
+    """Derive legacy ``(read, write)`` git sub-levels from a merged ``git`` level.
 
-    Tools declare their needs as ``git:read`` / ``git:write``; the merged
-    ``git`` level is a single value.  This helper derives the two sub-levels
-    so read-only git tools can run on a ``read`` session while write tools
-    stay denied:
+    Internal helper (kept for direct callers/tests).  The canonical
+    effective-permission dict exposes a single ``git`` value --
+    ``git_read``/``git_write`` are no longer emitted as effective keys -- but
+    the legacy two-grain view is still useful where a read-only git path must
+    run on a ``read`` session while the write path stays denied:
 
     ===================  ===================  ====================
-    merged ``git``       git_read             git_write
+    merged ``git``       read sub-level       write sub-level
     ===================  ===================  ====================
     ``False``/``None``   ``False``            ``False``
     ``banned``           ``banned``           ``banned``
@@ -457,15 +433,14 @@ def split_git_permission(level: Any) -> tuple:
     ``full``             ``full``             ``full``
     ===================  ===================  ====================
 
-    ``write_on_feature_branch`` (session git level, branch-restricted
-    writes) splits into git_read ``read`` + git_write
-    ``write_on_feature_branch``: reads are allowed on any branch, while the
-    write grain carries the verbatim branch-aware level so the Phase-3 git
-    write tool gate can admit feature-branch commits and deny plain
-    ``git:write`` requests.
+    ``write_on_feature_branch`` (a session ``git`` level, branch-restricted
+    writes) splits into read ``read`` + write ``write_on_feature_branch``:
+    reads are allowed on any branch, while the write side keeps the verbatim
+    branch-aware level so a branch-aware consumer can admit feature-branch
+    commits and deny plain ``git:write`` requests.
 
     ``ask`` maps to ``ask`` on both sub-levels so the interactive prompt
-    flow for ``git:write`` is preserved (an ``ask`` write is prompted
+    flow for a write request is preserved (an ``ask`` write is prompted
     exactly as before).
     """
     if level is False or level is None:
@@ -542,33 +517,15 @@ def _merge_with_capabilities(
     container: Any = session.container and workspace.allow_docker
 
     # ── Git ─────────────────────────────────────────────────────────────
-    # Explicit session grains (git_read/git_write) take precedence over the
-    # single ``git`` level; each grain is still capped by the workspace
-    # capability.  When a grain is None it falls back to split_git_permission
-    # so legacy ``git``-only configs keep their exact historical behaviour.
+    # The single ``git`` level is capped by the workspace capability.
     git: Any = _min_permission(session.git, workspace.git_available)
-    if session.git_read is not None:
-        git_read: Any = _min_permission(session.git_read, workspace.git_available)
-    else:
-        git_read = split_git_permission(git)[0]
-    if session.git_write is not None:
-        git_write: Any = _min_permission(session.git_write, workspace.git_available)
-    else:
-        git_write = split_git_permission(git)[1]
-
-    # ── System ──────────────────────────────────────────────────────────
-    system: Any = session.system  # no workspace cap yet
 
     return {
         "filesystem": fs,
         "network": net,
         "container": container,
         "git": git,
-        "git_read": git_read,
-        "git_write": git_write,
-        "system": system,
         "mcp": session.mcp,
-        "execution": session.execution,
         "host_bash": session.host_bash,
     }
 
@@ -606,10 +563,6 @@ def _annotate_ceiling_changes(
     annotated = _CeilingAnnotatedDict(capped_eff)
     for key in changed:
         label = level_by_session_key.get(key)
-        if label is None and key in ("git_read", "git_write"):
-            # A session-level ``git`` ceiling also caps the split write grain
-            # when no explicit grain exists — attribute it to the ceiling.
-            label = level_by_session_key.get("git")
         if label is None:
             continue  # no attributable ceiling: leave unannotated
         annotated._ceiling_annotations[key] = {
@@ -669,11 +622,10 @@ def get_effective_permissions(
     """
     Merge the session's permission profile with the workspace's capabilities.
 
-    Returns a flat dict with keys matching the eight permission categories
-    (including ``host_bash``), plus the split git sub-categories::
+    Returns a flat dict with the six canonical permission category keys::
 
-        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "mcp": ..., "execution": ..., "host_bash": ...}
-        {"git_read": ..., "git_write": ...}
+        {"filesystem": ..., "network": ..., "container": ...,
+         "git": ..., "mcp": ..., "host_bash": ...}
 
     ``host_bash`` is capped by the workspace ceiling inside
     :func:`apply_workspace_ceiling` (its own ``banned < ask < allow``
@@ -681,18 +633,15 @@ def get_effective_permissions(
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``, ``"outbound"``),
-    or ``False`` if the workspace forbids the operation.  ``git_read`` /
-    ``git_write`` are taken from the session's explicit grains when set
-    (merged with ``workspace.git_available`` via ``_min_permission``), and
-    otherwise derived from the merged ``git`` value via
-    :func:`split_git_permission` (backward compatibility).
+    or ``False`` if the workspace forbids the operation.  ``git`` is merged
+    with ``workspace.git_available`` via ``_min_permission``.
 
     Args:
         workspace_permissions:
             Optional workspace-level permission ceilings — a dict mapping
             workspace resource names (``filesystem``, ``container``,
-            ``host_bash``, ``git``, ``network``, ``git_read``,
-            ``git_write``) to their maximum allowed level (e.g.
+            ``host_bash``, ``git``, ``network``, ``mcp``) to their maximum
+            allowed level (e.g.
             ``{"filesystem": "read", "container": False}``).  ``container``
             is the canonical boolean ceiling; the legacy alias ``docker`` is
             also accepted and normalised onto ``container`` (write-level
@@ -728,8 +677,8 @@ def get_effective_permissions(
 
     Absent-grant rule:
         ``SessionPermissions`` carries safe pydantic defaults (filesystem
-        ``read``, git ``read``, system ``read``; network / mcp / execution
-        ``banned``; container ``False``).  A grant set that is missing a
+        ``read``, git ``read``; network / mcp / host_bash ``banned``;
+        container ``False``).  A grant set that is missing a
         key resolves to that key's default -- never an accidental denial of
         a default.  Ceilings and workspace capabilities only ever lower
         those values further; a ceiling-only passthrough that would lift a

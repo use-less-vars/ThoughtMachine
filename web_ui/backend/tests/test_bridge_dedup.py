@@ -42,6 +42,17 @@ _agent_patches = {
     'agent.config.service': _agent_mock.config.service,
     'agent.config.session_config': _agent_mock.config.session_config,  # imported by bridge.py / session_manager.py
     'agent.config.presets': _agent_mock.config.presets,  # imported by config_manager.py (bridge import chain)
+    # Compensating sys.modules keys for the config_manager import chain
+    # (web_ui/backend/config_manager.py:39 ``from agent.config.config_manager
+    # import ...``).  Because 'agent' / 'agent.config' above are replaced by
+    # NON-package MagicMocks, importing a real submodule through them fails with
+    # ``'agent.config' is not a package``.  Registering the fully-qualified
+    # child names in sys.modules short-circuits the parent traversal, so this
+    # file collects standalone (and no longer aborts whole-directory runs when
+    # it is collected first alphabetically).
+    'agent.config.audit': _agent_mock.config.audit,
+    'agent.config.config_manager': _agent_mock.config.config_manager,
+    'agent.config.deep_merge': _agent_mock.config.deep_merge,
     'agent.controller': _agent_mock.controller,
     'agent.core': _agent_mock.core,  # session_manager.py imports agent.core.message
     'agent.core.message': _agent_mock.core.message,
@@ -49,6 +60,10 @@ _agent_patches = {
     'session': _session_mock,
     'session.store': _session_mock.store,
     'session.context_builder': _session_mock.context_builder,
+    # Same compensating pattern for the session submodules pulled in by the
+    # bridge/session_manager import chain (see comment above).
+    'session.models': _session_mock.models,
+    'session.session_registry': _session_mock.session_registry,
     'tools': _tools_mock,
     'tools.workspace': _tools_mock.workspace,
     'tools.workspace.worker': _tools_mock.workspace.worker,

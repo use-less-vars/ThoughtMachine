@@ -180,16 +180,14 @@ PROMPT_TIMEOUT = 120.0
 DEFAULT_RESPONSE_TOKENS = 4096
 
 # ── agent/core/tool_executor.py ──────────────────────────────────────────────
-# Fallback session-permissions profile (seven categories) used when no live
-# SessionPermissions model is available on config.
+# Fallback session-permissions profile (canonical six categories) used when no
+# live SessionPermissions model is available on config.
 DEFAULT_SESSION_PERMISSIONS = {
     "container": False,
     "network": "banned",
     "filesystem": "read",
-    "system": "read",
     "git": "read",
     "mcp": "banned",
-    "execution": "banned",
+    "host_bash": "banned",
 }
-
 

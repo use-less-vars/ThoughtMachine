@@ -38,31 +38,24 @@ client = TestClient(app)
 
 SESSION_SCHEMA_KEYS = sorted(PERMISSION_SCHEMA.keys())
 
-# Canonical 10-grain workspace catalog defaults (agent/config/resource_catalog).
+# Canonical six-key workspace purpose presets (agent/config/workspace_purpose).
+# "general" preset == catalog defaults.
 CATALOG_DEFAULTS = {
-    "git_read": "read",
-    "git_write": "ask",
-    "host_bash": "banned",
-    "container": "ask",
-    "network": "ask",
+    "container": False,
     "filesystem": "read",
-    "system": "read",
     "git": "read",
-    "execution": "banned",
+    "host_bash": "banned",
     "mcp": "banned",
+    "network": "ask",
 }
 
 CODING_PRESET = {
-    "git_read": "read",
-    "git_write": "ask",
-    "host_bash": "banned",
-    "container": "ask",
-    "network": "ask",
+    "container": False,
     "filesystem": "write",
-    "system": "read",
-    "git": "read",
-    "execution": "banned",
+    "git": "ask",
+    "host_bash": "banned",
     "mcp": "banned",
+    "network": "ask",
 }
 
 
@@ -445,8 +438,8 @@ class TestWorkspacePermissionsRoutes:
     def test_put_then_get_roundtrip_persists_config(self, vault):
         perms = {
             "filesystem": "write",
-            "network": "read",
-            "git_write": "read",
+            "network": "outbound",
+            "git": "write",
         }
         put = client.put(
             f"/api/workspace/{self.WS}/permissions",

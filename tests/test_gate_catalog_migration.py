@@ -5,17 +5,23 @@ Phase-2 migration contract (security/security_gate.py now consumes
 ``security/resource_catalog.py``):
 
 * **Ceiling-vocabulary validation (fail-open):** ``apply_workspace_ceiling``
-  recognises the catalog resource keys (+ the legacy workspace grains
-  ``docker``/``git_read``/``git_write``).  A ceiling on an unknown resource
-  or with an unknown level is logged at WARNING and ignored — the session
-  value stands (forward-compatible workspace maps never break resolution).
-* **write_on_feature_branch is a first-class git level:** it splits into
-  git_read ``read`` + git_write ``write_on_feature_branch``, ranks at write
-  level in ``_min_permission``, ceiling comparisons AND ``_value_satisfies``
-  (Phase-3 helper edit: the outer ``git:write`` category gate passes and the
-  feature-branch-only restriction is enforced inside the git write tool at
-  commit time), survives disk-mode coercion (catalog-valid), and satisfies
-  ``git:read``.
+  recognises the canonical catalog resource keys (filesystem, git,
+  container, network, mcp, host_bash) plus the legacy workspace alias
+  ``docker`` (normalised onto ``container``).  A ceiling on an unknown
+  resource or with an unknown level is logged at WARNING and ignored — the
+  session value stands (forward-compatible workspace maps never break
+  resolution).  The legacy ``git_read``/``git_write`` ceiling grains were
+  removed in the permission-schema unification and are unknown resources
+  now.
+* **write_on_feature_branch is a first-class git level:** it ranks at
+  write level in ``_min_permission``, ceiling comparisons AND
+  ``_value_satisfies`` (Phase-3 helper edit: the outer ``git:write``
+  category gate passes and the feature-branch-only restriction is enforced
+  inside the git write tool at commit time), survives disk-mode coercion
+  (catalog-valid), and satisfies ``git:read``.  The effective dict exposes
+  the single ``git`` value — the ``git_read``/``git_write`` split exists
+  only inside ``split_git_permission`` (used by the git tools), never as
+  effective keys.
 * **Worker footprints** capping git to ``read`` also cap a
   branch-write session git level down to ``read``.
 * **Disk mode** (``hermetic_vault`` fixture) coerces stored grants through
@@ -88,8 +94,10 @@ def test_ceiling_unknown_level_warns_fail_open(caplog):
 
 
 def test_catalog_ceiling_keys_recognised_no_warning(caplog):
-    """Every catalog key + legacy workspace grain is a recognised ceiling
-    resource: applying them emits no unknown-resource warning."""
+    """Every canonical catalog key + the legacy ``docker`` alias is a
+    recognised ceiling resource: applying them emits no unknown-resource
+    warning.  (``git_read``/``git_write`` were removed in the
+    permission-schema unification and are no longer recognised.)"""
     ceiling = {
         "git": "read",
         "filesystem": "read",
@@ -97,9 +105,7 @@ def test_catalog_ceiling_keys_recognised_no_warning(caplog):
         "network": "banned",
         "mcp": "banned",
         "host_bash": "banned",
-        "docker": "banned",
-        "git_read": "read",
-        "git_write": "read",
+        "docker": "banned",  # legacy alias normalised onto container
     }
     session = {
         "git": "write",
@@ -108,8 +114,6 @@ def test_catalog_ceiling_keys_recognised_no_warning(caplog):
         "network": "write",
         "mcp": "connect",
         "host_bash": "allow",
-        "execution": "read",
-        "system": "read",
     }
     with caplog.at_level(logging.WARNING):
         result = apply_workspace_ceiling(ceiling, session)
@@ -117,10 +121,12 @@ def test_catalog_ceiling_keys_recognised_no_warning(caplog):
         "ignoring workspace ceiling" in r.message for r in caplog.records
     )
     assert result["git"] == "read"
+    assert result["filesystem"] == "read"
     assert result["container"] is False
+    assert result["network"] == "banned"
+    assert result["mcp"] == "banned"
     assert result["host_bash"] == "banned"
-    # session keys with no ceiling pass through untouched
-    assert result["execution"] == "read"
+    assert set(result) == {"git", "filesystem", "container", "network", "mcp", "host_bash"}
 
 
 # ── host_bash ceiling semantics (banned < ask < allow) ─────────────────────
@@ -247,12 +253,18 @@ def _branch_write_eff():
 
 
 def test_effective_branch_write_session_grains():
-    """A branch-write session yields git='write_on_feature_branch' with
-    derived grains git_read='read' / git_write='write_on_feature_branch'."""
+    """A branch-write session yields git='write_on_feature_branch' as the
+    single canonical git category value.  The effective dict exposes only
+    the six canonical keys — the derived git_read/git_write split lives in
+    ``split_git_permission`` (consumed by the git tools), never as
+    effective keys."""
     eff = _branch_write_eff()
     assert eff["git"] == "write_on_feature_branch"
-    assert eff["git_read"] == "read"
-    assert eff["git_write"] == "write_on_feature_branch"
+    assert split_git_permission(eff["git"]) == (
+        "read",
+        "write_on_feature_branch",
+    )
+    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash"}
 
 
 def test_outer_gate_branch_write_allows_write_and_read():
@@ -298,9 +310,9 @@ def test_worker_footprint_read_caps_branch_write():
 
 def test_disk_mode_branch_write_grant_capped_by_ceiling(hermetic_vault):
     """A stored write_on_feature_branch grant is catalog-valid (survives
-    coercion); a read ceiling caps the merged git level to read -> derived
-    git_write 'banned'.  A write ceiling leaves the branch-write grant
-    standing."""
+    coercion); a read ceiling caps the merged git level to read.  A write
+    ceiling leaves the branch-write grant standing.  The effective dict
+    always exposes the single canonical ``git`` value."""
     ws_id, sid = "ws-a", "sess-1"
     write_session_permissions(
         hermetic_vault, ws_id, sid, {"git": "write_on_feature_branch"}
@@ -314,8 +326,7 @@ def test_disk_mode_branch_write_grant_capped_by_ceiling(hermetic_vault):
         workspace_id=ws_id,
     )
     assert eff["git"] == "read"
-    assert eff["git_read"] == "read"
-    assert eff["git_write"] == "banned"
+    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash"}
 
     # Control: a write-level ceiling leaves the branch-write grant standing.
     _write_config(hermetic_vault, ws_id, {"git": "write"})
@@ -326,8 +337,10 @@ def test_disk_mode_branch_write_grant_capped_by_ceiling(hermetic_vault):
         workspace_id=ws_id,
     )
     assert eff2["git"] == "write_on_feature_branch"
-    assert eff2["git_read"] == "read"
-    assert eff2["git_write"] == "write_on_feature_branch"
+    assert split_git_permission(eff2["git"]) == (
+        "read",
+        "write_on_feature_branch",
+    )
 
 
 def test_disk_mode_non_catalog_grant_keys_dropped(
@@ -354,9 +367,18 @@ def test_disk_mode_non_catalog_grant_keys_dropped(
             session_id=sid,
             workspace_id=ws_id,
         )
-    assert eff["git"] == "read"
-    assert eff["system"] == "read"  # default stands; 'write' grant dropped
-    assert eff["execution"] == "banned"  # default stands
+    # The effective dict carries only the six canonical keys; the dropped
+    # system/stray grants leave the pydantic defaults standing.
+    assert eff == {
+        "filesystem": "read",  # session default
+        "network": "banned",  # session default
+        "container": False,  # session default
+        "git": "read",
+        "mcp": "banned",  # session default
+        "host_bash": "banned",  # session default
+    }
+    assert "system" not in eff
+    assert "execution" not in eff
     assert any(
         "dropping unknown session permission key" in r.message
         for r in caplog.records

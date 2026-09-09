@@ -59,23 +59,22 @@ function TabPlaceholder({ tab }) {
 
 // Per-resource ceiling vocabulary. The PUT /{ws_id}/permissions validator
 // (agent/config/resource_catalog.validate_workspace_permissions) accepts exactly
-// the 10 ceiling keys in CEILING_KEY_ORDER with a per-resource canonical
+// the 6 ceiling keys in CEILING_KEY_ORDER with a per-resource canonical
 // vocabulary -- the SAME full level set that resource accepts as a session
 // grant (git write_on_feature_branch, network outbound, mcp connect/full are
 // all valid ceiling levels too, so every dropdown below offers the full set):
 //   - git accepts banned|ask|read|write_on_feature_branch|write
-//   - git_read, git_write, filesystem, system, execution accept
-//     banned|ask|read|write
+//   - filesystem accepts banned|ask|read|write
 //   - network accepts banned|ask|write|outbound
 //   - mcp accepts banned|connect|full
 //   - host_bash accepts banned|ask|allow
 //   - container is a real boolean (true == write-level enabled)
 // summary.resource_catalog only supplies card metadata (labels, descriptions,
 // tools, execution context); when a ceiling key has no catalog entry the card
-// falls back to CEILING_METADATA_FALLBACK so all 10 keys stay editable even
+// falls back to CEILING_METADATA_FALLBACK so all 6 keys stay editable even
 // with an empty catalog. tty/jtag appear in the catalog but are NOT
 // permission-gated (the validator rejects them outright) and render as
-// informational cards after the 10 editors. So the editors are driven from
+// informational cards after the 6 editors. So the editors are driven from
 // this table, never from entry.permission_grain_set.
 const GENERIC_CEILING_LEVELS = ['banned', 'ask', 'read', 'write']
 const GIT_CEILING_LEVELS = ['banned', 'ask', 'read', 'write_on_feature_branch', 'write']
@@ -85,17 +84,13 @@ const HOST_BASH_CEILING_LEVELS = ['banned', 'ask', 'allow']
 
 export const CONTAINER_CEILING = 'boolean'
 
-// Fixed render order for the 10 ceiling-gated keys (validator order).
+// Fixed render order for the 6 ceiling-gated keys (validator order).
 const CEILING_KEY_ORDER = [
   'git',
-  'git_read',
-  'git_write',
   'filesystem',
-  'network',
-  'system',
-  'execution',
-  'mcp',
   'container',
+  'network',
+  'mcp',
   'host_bash',
 ]
 
@@ -103,25 +98,9 @@ const CEILING_KEY_ORDER = [
 // row (the catalog usually covers git/filesystem/container/host_bash; these
 // fallbacks keep every card readable even when a row is missing).
 const CEILING_METADATA_FALLBACK = {
-  git_read: {
-    display_name: 'Git (read)',
-    description: 'Read access to git repositories (fetch/log/diff/status).',
-  },
-  git_write: {
-    display_name: 'Git (write)',
-    description: 'Write access to git repositories (commit/push/branch).',
-  },
   network: {
     display_name: 'Network',
     description: 'Outbound network access from the execution context.',
-  },
-  system: {
-    display_name: 'System',
-    description: 'System-level operations (processes, environment, users).',
-  },
-  execution: {
-    display_name: 'Execution',
-    description: 'Command and code execution in the workspace context.',
   },
   mcp: {
     display_name: 'MCP',
@@ -139,14 +118,10 @@ const CEILING_METADATA_FALLBACK = {
 
 export const WORKSPACE_CEILING_OPTIONS = {
   git: GIT_CEILING_LEVELS,
-  git_read: GENERIC_CEILING_LEVELS,
-  git_write: GENERIC_CEILING_LEVELS,
   filesystem: GENERIC_CEILING_LEVELS,
-  network: NETWORK_CEILING_LEVELS,
-  system: GENERIC_CEILING_LEVELS,
-  execution: GENERIC_CEILING_LEVELS,
-  mcp: MCP_CEILING_LEVELS,
   container: CONTAINER_CEILING,
+  network: NETWORK_CEILING_LEVELS,
+  mcp: MCP_CEILING_LEVELS,
   host_bash: HOST_BASH_CEILING_LEVELS,
 }
 
@@ -261,7 +236,7 @@ function PermissionsResourcesTab({
     )
   }
 
-  // Fixed-order 10 ceiling-gated cards: every key the PUT validator accepts is
+  // Fixed-order 6 ceiling-gated cards: every key the PUT validator accepts is
   // always editable here, catalog row or not (metadata falls back gracefully).
   const ceilingCards = CEILING_KEY_ORDER.map((name) => {
     const entry = catalogByName.get(name)
@@ -280,7 +255,7 @@ function PermissionsResourcesTab({
     })
   })
 
-  // Catalog rows outside the 10-key ceiling map (tty/jtag...) are not
+  // Catalog rows outside the 6-key ceiling map (tty/jtag...) are not
   // permission-gated; keep them as informational cards after the editors.
   const informationalCards = catalog
     .filter((entry) => WORKSPACE_CEILING_OPTIONS[entry.name] === undefined)

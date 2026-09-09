@@ -124,6 +124,15 @@ function WorkerDot({ status }) {
 
 
 // ── Section: Effective Permissions ───────────────────────────────────────
+const CATEGORY_LABELS = {
+  git: 'Git',
+  filesystem: 'Filesystem',
+  container: 'Container',
+  network: 'Network',
+  mcp: 'MCP',
+  host_bash: 'Host Bash',
+};
+
 function EffectivePermissionsSection({ sessionId, effectivePermissions }) {
   // Preferred source: the session GET/PUT effective dict passed down by
   // ConfigPanel (sessionPerms.effective from /api/session/{id}/permissions),
@@ -135,13 +144,13 @@ function EffectivePermissionsSection({ sessionId, effectivePermissions }) {
   // pills live after apply_config when no REST session profile is loaded.
   const permissions = useStore((s) => (sessionId ? (s.sessionConfigs[sessionId]?.permissions ?? null) : null));
   const ep = effectivePermissions || permissions || PERMISSION_DEFAULTS;
-  const categories = ['filesystem', 'network', 'git', 'system', 'container'];
+  const categories = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash'];
 
   return (
     <div>
       {categories.map((cat) => {
         if (cat in ep) {
-          return <PermissionPill key={cat} name={cat.charAt(0).toUpperCase() + cat.slice(1)} value={ep[cat]} />;
+          return <PermissionPill key={cat} name={CATEGORY_LABELS[cat] || cat.charAt(0).toUpperCase() + cat.slice(1)} value={ep[cat]} />;
         }
         return null;
       })}

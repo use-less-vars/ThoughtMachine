@@ -1,9 +1,10 @@
-"""Git read/write permission grains and branch protection.
+"""Git permission grains and branch protection.
 
-Phase 1+2 contract:
+Canonical 6-key contract:
 
-- Explicit ``git_read`` / ``git_write`` session grains override the split
-  derived from the merged ``git`` level; the workspace capability caps them.
+- The session ``git`` level passes straight through to the effective
+  ``git`` grain (SessionPermissions holds a single git key, not split
+  read/write grains); the workspace capability (``git_available``) caps it.
 - ``GitWriteTool`` refuses agent commits in operator-managed worktrees
   unless container execution is active AND the branch is unprotected.
 """
@@ -18,47 +19,31 @@ from tools.git_write_tool import GitWriteTool
 
 
 class TestGitReadWritePermissionGrains:
-    """Explicit session grains win over the derived split; workspace caps."""
+    """Session 'git' level passes through to the effective 'git' grain;
+    the workspace capability caps it (canonical 6-key contract)."""
 
-    def test_explicit_git_write_grain_overrides_derived_split(self):
-        # git='read' alone would derive git_write='banned'; the explicit
-        # session grain must override the derived value.
-        session = SessionPermissions(git='read', git_write='write')
-        eff = get_effective_permissions(session, WorkspaceCapabilities())
-        assert eff['git'] == 'read'
-        assert eff['git_write'] == 'write'
-
-    def test_explicit_git_read_grain_overrides_derived_split(self):
-        session = SessionPermissions(git='read', git_read='write')
-        eff = get_effective_permissions(session, WorkspaceCapabilities())
-        assert eff['git_read'] == 'write'
-
-    def test_none_grains_fall_back_to_split(self):
+    def test_git_read_passthrough(self):
         session = SessionPermissions(git='read')
         eff = get_effective_permissions(session, WorkspaceCapabilities())
-        assert eff['git_read'] == 'read'
-        assert eff['git_write'] == 'banned'
+        assert eff['git'] == 'read'
 
+    def test_git_write_passthrough(self):
         session = SessionPermissions(git='write')
         eff = get_effective_permissions(session, WorkspaceCapabilities())
-        assert eff['git_read'] == 'write'
-        assert eff['git_write'] == 'write'
+        assert eff['git'] == 'write'
 
-    def test_workspace_git_unavailable_caps_grains_to_false(self):
+    def test_workspace_git_unavailable_caps_git_to_false(self):
         caps = WorkspaceCapabilities(git_available=False)
-        session = SessionPermissions(git='write', git_write='write')
+        session = SessionPermissions(git='write')
         eff = get_effective_permissions(session, caps)
         assert eff['git'] is False
-        assert eff['git_read'] is False
-        assert eff['git_write'] is False
 
-    def test_safe_defaults_keep_write_denied(self):
-        # SAFE_DEFAULTS contract: git_read='read', git_write='banned'.
+    def test_safe_defaults_deny_write(self):
+        # Canonical defaults: git='read' -- write is denied unless granted.
         eff = get_effective_permissions(
             SessionPermissions(), WorkspaceCapabilities()
         )
-        assert eff['git_read'] == 'read'
-        assert eff['git_write'] == 'banned'
+        assert eff['git'] == 'read'
 
 
 class TestGitWriteBranchProtection:
@@ -79,7 +64,7 @@ class TestGitWriteBranchProtection:
         defaults = {
             'operation': 'commit',
             'message': 'agent commit',
-            'agent_config': {'session_permissions': {'git_write': 'write'}},
+            'agent_config': {'session_permissions': {'git': 'write'}},
         }
         defaults.update(params)
         return GitWriteTool(**defaults)
@@ -131,13 +116,12 @@ class TestGitWriteBranchProtection:
 
 
 def test_git_read_write_permission_grains():
-    """Contract wrapper: explicit grains, workspace caps, safe defaults."""
+    """Contract wrapper: git passthrough, workspace caps, safe defaults."""
     tc = TestGitReadWritePermissionGrains()
-    tc.test_explicit_git_write_grain_overrides_derived_split()
-    tc.test_explicit_git_read_grain_overrides_derived_split()
-    tc.test_none_grains_fall_back_to_split()
-    tc.test_workspace_git_unavailable_caps_grains_to_false()
-    tc.test_safe_defaults_keep_write_denied()
+    tc.test_git_read_passthrough()
+    tc.test_git_write_passthrough()
+    tc.test_workspace_git_unavailable_caps_git_to_false()
+    tc.test_safe_defaults_deny_write()
 
 
 def test_git_write_respects_branch_protection(tmp_path):

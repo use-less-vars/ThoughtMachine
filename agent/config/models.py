@@ -204,9 +204,10 @@ class AgentConfig(BaseModel):
     def migrate_git_allow_worktree_commits(cls, values):
         """Migrate the removed ``git_allow_worktree_commits`` flag.
 
-        The legacy operator flag is folded into the session permission
-        ``git_write``: ``True`` -> ``session_permissions['git_write'] =
-        'write'`` (the flag only ever enabled the ``write`` level).
+        The legacy operator flag is folded into the canonical session git
+        permission: ``True`` -> ``session_permissions['git'] = 'write'`` (the
+        flag only ever enabled the ``write`` level; the split
+        ``git_read``/``git_write`` grains no longer exist).
         ``False`` / absent -> no change (default remains fail-closed).
         Handles ``session_permissions`` already being a
         :class:`~thoughtmachine.security.SessionPermissions` instance by
@@ -220,7 +221,7 @@ class AgentConfig(BaseModel):
                     sp = sp.to_dict()
                 if not isinstance(sp, dict):
                     sp = {}
-                sp['git_write'] = 'write'
+                sp['git'] = 'write'
                 values['session_permissions'] = sp
         return values
 

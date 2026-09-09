@@ -89,7 +89,10 @@ class ScriptedProvider(LLMProvider):
 def register_scripted_provider():
     """Register ScriptedProvider in ProviderFactory once for all tests."""
     if ProviderFactory._providers is None:
-        ProviderFactory._providers = {}
+        # Seed the real provider registry first so this module-scoped
+        # fixture never hides the default providers (e.g. openai_compatible)
+        # from later test files in the same process (combined-suite runs).
+        ProviderFactory._get_providers()
     if "scripted" not in ProviderFactory._providers:
         ProviderFactory._providers["scripted"] = ScriptedProvider
 
@@ -1185,7 +1188,6 @@ class TestWorkerConfigForwarding:
                 "container": False,
                 "filesystem": "read",
                 "network": "banned",
-                "execution": "banned",
             },
             project_root=None,
             timeout_seconds=30,
@@ -1300,7 +1302,8 @@ class TestWorkerConfigForwarding:
         assert perms.container is False
         assert perms.filesystem == 'read'
         assert perms.network == 'banned'
-        assert perms.execution == 'banned'
+        assert perms.mcp == 'banned'
+        assert perms.host_bash == 'banned'
 
     def test_worker_session_permissions_accepts_wofb_effective_dict(
         self, tmp_path: Path
@@ -1308,13 +1311,11 @@ class TestWorkerConfigForwarding:
         """A worker must build a valid AgentConfig when the session's effective
         git grain is write_on_feature_branch.
 
-        The gate mirrors canonical git='write_on_feature_branch' into the
-        derived git_write split grain of the effective dict, and the spawn
-        path forwards that dict as the worker's session_permissions.  The
-        config-bound SessionPermissions schema accepts wofb ONLY on 'git'
-        (git_write stays a 4-value literal — bca9663 invariant), so
-        _build_agent_config must fold the derived grain back onto the
-        canonical channel instead of raising a ValidationError.
+        The canonical SessionPermissions schema accepts wofb on 'git'; the
+        spawn path forwards the session's effective-permissions dict as the
+        worker's session_permissions, so _build_agent_config must accept the
+        canonical dict (git='write_on_feature_branch' included) without
+        raising a ValidationError.
         """
         from tools.workspace.worker import WorkerThread
 
@@ -1328,16 +1329,14 @@ class TestWorkerConfigForwarding:
             },
             workspace_dir=tmp_path,
             tool_classes={},
-            # Effective-permissions shape: git canonical wofb plus the derived
-            # git_write split grain carrying the wofb echo (see
-            # tests/test_git_write_wofb.py get_effective_permissions contract).
+            # Canonical effective-permissions shape: git carries the wofb
+            # grant; the remaining grains are canonical defaults/grants.
             session_permissions={
                 "git": "write_on_feature_branch",
-                "git_read": "read",
-                "git_write": "write_on_feature_branch",
                 "filesystem": "read",
                 "network": "banned",
-                "execution": "banned",
+                "mcp": "banned",
+                "host_bash": "banned",
                 "container": False,
             },
             project_root=None,
@@ -1347,11 +1346,11 @@ class TestWorkerConfigForwarding:
         assert agent_cfg is not None
         perms = agent_cfg.session_permissions
         assert perms is not None
-        # Canonical wofb survives on 'git'; the derived split grain is folded
-        # away so SessionPermissions validation succeeds.
+        # Canonical wofb survives on 'git'; the whole canonical dict passes
+        # SessionPermissions validation.
         assert perms.git == "write_on_feature_branch"
-        assert perms.git_write != "write_on_feature_branch"
-        assert perms.git_read == "read"
+        assert perms.filesystem == 'read'
+        assert perms.mcp == 'banned'
 
     def test_worker_overrides_warning_threshold(
         self, tmp_path: Path

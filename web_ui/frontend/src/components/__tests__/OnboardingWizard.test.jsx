@@ -95,12 +95,12 @@ function stubBackend(entry = ENTRY, extra = {}) {
     '/api/workspace/list': jsonOk([entry]),
     [`/api/workspace/${id}/effective_permissions`]: jsonOk({
       effective_permissions: {
-        filesystem: 'write',
-        network: 'read',
         git: 'write',
-        system: 'read',
-        execution: 'banned',
+        filesystem: 'write',
         container: true,
+        network: 'read',
+        mcp: 'banned',
+        host_bash: 'banned',
       },
     }),
     '/api/health/containers': jsonOk({ docker: 'reachable' }),

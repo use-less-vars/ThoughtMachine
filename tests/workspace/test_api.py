@@ -138,8 +138,8 @@ class TestEffectivePermissions:
         assert "network" in eff
         assert "container" in eff
         assert "git" in eff
-        assert "system" in eff
-        assert "execution" in eff
+        assert "mcp" in eff
+        assert "host_bash" in eff
 
     def test_with_session_id(self, client, temp_user_dir):
         """When session_id is provided, permissions are loaded from the session."""
@@ -155,9 +155,9 @@ class TestEffectivePermissions:
                         "container": True,
                         "network": "write",
                         "filesystem": "write",
-                        "system": "write",
                         "git": "write",
-                        "execution": "read",
+                        "mcp": "connect",
+                        "host_bash": "allow",
                     }
                 }
             },

@@ -8,6 +8,13 @@ ceiling rankings applied by the security gate
 ``container`` ceiling everywhere (catalog defaults, purpose presets,
 validator), and a full PUT /permissions roundtrip proving a legacy
 ``docker`` string grant persists as the canonical ``container`` boolean.
+
+The ceiling surface is the six canonical workspace resources
+``container | network | filesystem | git | mcp | host_bash``: the legacy
+grains ``git_read`` / ``git_write`` / ``system`` / ``execution`` were
+removed and are rejected fail-closed by the validator (``git_read`` /
+``git_write`` with a hint pointing at ``git``); the security gate no
+longer recognises them as ceiling keys.
 """
 
 from __future__ import annotations
@@ -91,10 +98,24 @@ def test_validator_rejects_mcp_level_outside_own_scale():
     assert "expected one of ['banned', 'connect', 'full']" in errors[0]
 
 
-def test_validator_rejects_git_write_level_outside_own_scale():
-    normalized, errors = validate_workspace_permissions({"git_write": "banana"})
+def test_validator_rejects_git_level_outside_own_scale():
+    """git's canonical ceiling scale includes the branch-restricted write
+    tier but no split grains: a level outside it is rejected."""
+    normalized, errors = validate_workspace_permissions({"git": "banana"})
     assert normalized == {}
-    assert "expected one of ['ask', 'banned', 'read', 'write']" in errors[0]
+    assert len(errors) == 1
+    assert "expected one of ['ask', 'banned', 'read', 'write', 'write_on_feature_branch']" in errors[0]
+
+
+def test_validator_rejects_legacy_split_git_grains_fail_closed():
+    """The removed git_read/git_write ceiling grains are rejected with a
+    precise legacy hint naming the canonical replacement -- never accepted
+    as workspace ceilings."""
+    for grain in ("git_write", "git_read"):
+        normalized, errors = validate_workspace_permissions({grain: "write"})
+        assert normalized == {}
+        assert len(errors) == 1
+        assert f"legacy permission resource '{grain}' is no longer supported; use 'git'" in errors[0]
 
 
 def test_validator_rejects_container_string_booleans_only():
@@ -116,12 +137,11 @@ def test_validator_rejects_unknown_resource():
 
 
 # --------------------------------------------------------------------------
-# Gate: workspace ceilings for mcp (banned < connect < full) and the
-# read-tier system/execution resources
+# Gate: workspace ceilings for mcp (banned < connect < full)
 # --------------------------------------------------------------------------
 
-class TestWorkspaceCeilingMcpSystemExecution:
-    """apply_workspace_ceiling over the newly recognised ceiling keys."""
+class TestWorkspaceCeilingMcp:
+    """apply_workspace_ceiling over the mcp ceiling key."""
 
     def test_mcp_banned_ceiling_caps_full(self):
         result = apply_workspace_ceiling({"mcp": "banned"}, {"mcp": "full"})
@@ -145,39 +165,12 @@ class TestWorkspaceCeilingMcpSystemExecution:
         result = apply_workspace_ceiling({"mcp": "read"}, {"mcp": "full"})
         assert result == {"mcp": "full"}
 
-    def test_system_read_ceiling_caps_write(self):
-        result = apply_workspace_ceiling({"system": "read"}, {"system": "write"})
-        assert result == {"system": "read"}
 
-    def test_system_ask_ceiling_caps_write_to_read(self):
-        result = apply_workspace_ceiling({"system": "ask"}, {"system": "write"})
-        assert result == {"system": "read"}
-
-    def test_system_banned_ceiling_caps_write(self):
-        result = apply_workspace_ceiling({"system": "banned"}, {"system": "write"})
-        assert result == {"system": "banned"}
-
-    def test_execution_read_ceiling_caps_write(self):
-        result = apply_workspace_ceiling({"execution": "read"}, {"execution": "write"})
-        assert result == {"execution": "read"}
-
-    def test_execution_ask_ceiling_caps_write_to_read(self):
-        result = apply_workspace_ceiling({"execution": "ask"}, {"execution": "write"})
-        assert result == {"execution": "read"}
-
-    def test_execution_banned_ceiling_caps_write(self):
-        result = apply_workspace_ceiling({"execution": "banned"}, {"execution": "write"})
-        assert result == {"execution": "banned"}
-
-
-def test_ceiling_keys_mcp_system_execution_emit_no_warnings(caplog):
-    """mcp/system/execution are recognised ceiling keys: no 'ignoring
-    workspace ceiling' warning is emitted for them."""
+def test_ceiling_key_mcp_emits_no_warning(caplog):
+    """mcp is a recognised ceiling key: no 'ignoring workspace ceiling'
+    warning is emitted for it."""
     with caplog.at_level(logging.WARNING, logger="security.security_gate"):
-        apply_workspace_ceiling(
-            {"mcp": "banned", "system": "read", "execution": "read"},
-            {"mcp": "full", "system": "write", "execution": "write"},
-        )
+        apply_workspace_ceiling({"mcp": "banned"}, {"mcp": "full"})
     warnings = [
         r.getMessage()
         for r in caplog.records
@@ -191,26 +184,28 @@ def test_ceiling_keys_mcp_system_execution_emit_no_warnings(caplog):
 # --------------------------------------------------------------------------
 
 class TestEffectivePermissionsUnifiedVocabWiring:
-    """get_effective_permissions caps mcp/system/execution session grants."""
+    """get_effective_permissions caps canonical-resource session grants."""
 
     @staticmethod
     def _session():
         return SessionPermissions(
             mcp="connect",
-            system="write",
-            execution="write",
+            filesystem="write",
         )
 
-    def test_mcp_system_execution_ceilings_applied(self):
+    def test_mcp_and_filesystem_ceilings_applied(self):
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(
             self._session(),
             workspace,
-            {"mcp": "banned", "system": "read", "execution": "read"},
+            {"mcp": "banned", "filesystem": "read"},
         )
         assert eff["mcp"] == "banned"
-        assert eff["system"] == "read"
-        assert eff["execution"] == "read"
+        assert eff["filesystem"] == "read"
+        # Effective permissions always carry the full six-key canonical set.
+        assert set(eff.keys()) == {
+            "container", "network", "filesystem", "git", "mcp", "host_bash",
+        }
 
     def test_mcp_connect_ceiling_passthrough(self):
         # A genuine session-level connect grant ranks AT the connect ceiling

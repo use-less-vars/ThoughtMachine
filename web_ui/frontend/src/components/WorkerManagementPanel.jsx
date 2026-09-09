@@ -419,7 +419,7 @@ function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemp
             style={{ ...inputStyle, minHeight: '48px', resize: 'vertical', fontFamily: 'monospace' }}
             value={permFootprint}
             onChange={(e) => setPermFootprint(e.target.value)}
-            placeholder='{"filesystem": "write", "execution": "docker"}'
+            placeholder='{"filesystem": "write", "container": true}'
           />
         </div>
 

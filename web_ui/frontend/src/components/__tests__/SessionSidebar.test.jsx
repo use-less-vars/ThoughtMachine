@@ -128,12 +128,12 @@ const DEFAULT_ROUTES = {
   '/api/workspace/list': jsonOk([{ id: 'ws-1', label: 'Code Development', root: '/root' }]),
   '/api/workspace/ws-1/effective_permissions': jsonOk({
     effective_permissions: {
-      filesystem: 'read',
-      network: 'banned',
       git: 'write',
-      system: 'read',
-      execution: 'banned',
+      filesystem: 'read',
       container: true,
+      network: 'banned',
+      mcp: 'banned',
+      host_bash: 'banned',
     },
   }),
   '/api/health/containers': jsonOk({ docker: 'reachable' }),
@@ -296,8 +296,8 @@ describe('SessionSidebar — permissions (read-only)', () => {
     // container is a backend bool → frontend 'enabled'; it appears once as
     // ceiling and once as effective.
     expect(screen.getAllByText('enabled')).toHaveLength(2)
-    // network + execution are banned in both columns.
-    expect(screen.getAllByText('banned')).toHaveLength(4)
+    // network, mcp and host_bash are banned in both columns.
+    expect(screen.getAllByText('banned')).toHaveLength(6)
   })
 
   it('is read-only — no buttons, checkboxes or text inputs inside the section', async () => {

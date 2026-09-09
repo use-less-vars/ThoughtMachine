@@ -2,17 +2,20 @@
 Resource catalog loader.
 
 Loads ``agent/config/resource_catalog.json`` — the canonical list of
-controllable resource grains (``git_read``, ``git_write``, ``host_bash``,
-``container``, ...), their permission levels (``banned|ask|read|write``),
-defaults, required workspace feature switches, and risk ratings.
+controllable resource grains (``git``, ``filesystem``, ``container``,
+``network``, ``mcp``, ``host_bash``), their permission levels
+(``banned|ask|read|write``), defaults, required workspace feature
+switches, and risk ratings.
 
 NOTE: the catalog FILE now carries the new resource-level array shape
 (``git`` / ``filesystem`` / ``container`` / ``host_bash`` / ``tty`` /
 ``jtag``) and is the source of truth for the ``/api/resource-catalog``
-endpoint.  This loader exposes a LEGACY tool-level view (the permission
-grains in ``_LEGACY_RESOURCES``) for the permission machinery (workspace
-permission validation, purpose presets, risk model) so their behavior stays
-unchanged.
+endpoint.  This loader exposes the workspace-permission view (the
+permission resources in ``_LEGACY_RESOURCES`` — the six canonical
+workspace resources; the removed legacy grains ``git_read``/
+``git_write``/``system``/``execution`` no longer appear) for the
+permission machinery (workspace permission validation, purpose presets,
+risk model) so their behavior stays unchanged.
 
 Consumers: workspace permission endpoints (``web_ui/backend/workspace_routes.py``),
 the workspace purpose presets (``agent/config/workspace_purpose.py``) and the
@@ -28,33 +31,29 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _CATALOG_PATH = Path(__file__).resolve().parent / "resource_catalog.json"
 
-#: Legacy tool-level resource grains exposed to the permission machinery.
-#: The on-disk catalog file is the NEW resource-level array; this constant is
-#: the authoritative legacy view so validation / presets / risk keep working.
+#: Workspace-permission resource grains exposed to the permission
+#: machinery.  The on-disk catalog file is the NEW resource-level array;
+#: this constant is the authoritative view for validation / presets / risk.
+#: It carries exactly the six canonical workspace resources -- the legacy
+#: grains ``git_read`` / ``git_write`` / ``system`` / ``execution`` were
+#: removed from the ceiling surface (``validate_workspace_permissions``
+#: rejects them with a legacy hint).
 _LEGACY_RESOURCES = {
-    "git_read": {
-        "name": "Git Read",
-        "description": "Read-only git repository inspection (status, diff, log, branch).",
+    "git": {
+        "name": "Git",
+        "description": "Git repository operations (read, write and branch-aware write).",
         "default_permission": "read",
         "required_workspace_switch": None,
         "risk_level": "low",
         "ui_category": "git",
     },
-    "git_write": {
-        "name": "Git Write",
-        "description": "Git write operations (commit, init, clone, checkout, stage).",
-        "default_permission": "ask",
+    "filesystem": {
+        "name": "Filesystem",
+        "description": "File read/write access to the workspace tree.",
+        "default_permission": "read",
         "required_workspace_switch": None,
-        "risk_level": "medium",
-        "ui_category": "git",
-    },
-    "host_bash": {
-        "name": "Host Bash",
-        "description": "Supervised shell command execution on the host machine.",
-        "default_permission": "banned",
-        "required_workspace_switch": "allow_host_resources",
-        "risk_level": "high",
-        "ui_category": "host",
+        "risk_level": "low",
+        "ui_category": "filesystem",
     },
     "container": {
         "name": "Container",
@@ -72,38 +71,6 @@ _LEGACY_RESOURCES = {
         "risk_level": "medium",
         "ui_category": "network",
     },
-    "filesystem": {
-        "name": "Filesystem",
-        "description": "File read/write access to the workspace tree.",
-        "default_permission": "read",
-        "required_workspace_switch": None,
-        "risk_level": "low",
-        "ui_category": "filesystem",
-    },
-    "system": {
-        "name": "System",
-        "description": "Read-only system inspection (environment, processes, vault state).",
-        "default_permission": "read",
-        "required_workspace_switch": None,
-        "risk_level": "low",
-        "ui_category": "system",
-    },
-    "git": {
-        "name": "Git",
-        "description": "Legacy git permission grain (superseded by git_read / git_write).",
-        "default_permission": "read",
-        "required_workspace_switch": None,
-        "risk_level": "low",
-        "ui_category": "git",
-    },
-    "execution": {
-        "name": "Execution",
-        "description": "Arbitrary code execution outside sandboxes (high blast radius).",
-        "default_permission": "banned",
-        "required_workspace_switch": None,
-        "risk_level": "high",
-        "ui_category": "execution",
-    },
     "mcp": {
         "name": "MCP Integrations",
         "description": "External MCP server tool integrations.",
@@ -112,23 +79,29 @@ _LEGACY_RESOURCES = {
         "risk_level": "high",
         "ui_category": "integrations",
     },
+    "host_bash": {
+        "name": "Host Bash",
+        "description": "Supervised shell command execution on the host machine.",
+        "default_permission": "banned",
+        "required_workspace_switch": "allow_host_resources",
+        "risk_level": "high",
+        "ui_category": "host",
+    },
 }
 
 #: Canonical per-resource permission vocabularies (workspace ceilings;
 #: mirrors ``security.resource_catalog.WORKSPACE_CEILING_VOCAB``).
 #: ``validate_workspace_permissions`` accepts exactly these levels per
 #: resource: ``git`` retains ``write_on_feature_branch`` (branch-restricted
-#: write ceiling); ``git``/``filesystem``/``system``/``execution`` do NOT
-#: accept ``full`` (a legacy stored ``full`` ceiling is normalised to
-#: ``write``); ``docker`` is handled as a legacy string alias of the
-#: boolean ``container`` ceiling and is NOT a table key.
+#: write ceiling); ``git``/``filesystem`` do NOT accept ``full`` (a legacy
+#: stored ``full`` ceiling is normalised to ``write``); ``docker`` is
+#: handled as a legacy string alias of the boolean ``container`` ceiling
+#: and is NOT a table key.  The removed legacy grains ``git_read``/
+#: ``git_write``/``system``/``execution`` have no entry here -- they are
+#: rejected by validation with a legacy-removed hint.
 _PERMISSION_LEVELS_BY_RESOURCE: Dict[str, Tuple[str, ...]] = {
     "git": ("banned", "ask", "read", "write_on_feature_branch", "write"),
-    "git_read": ("banned", "ask", "read", "write"),
-    "git_write": ("banned", "ask", "read", "write"),
     "filesystem": ("banned", "ask", "read", "write"),
-    "system": ("banned", "ask", "read", "write"),
-    "execution": ("banned", "ask", "read", "write"),
     "network": ("banned", "ask", "write", "outbound"),
     "mcp": ("banned", "connect", "full"),
     "host_bash": ("banned", "ask", "allow"),
@@ -143,6 +116,18 @@ _CONTAINER_LEGACY_STRINGS: Tuple[str, ...] = ("banned", "read", "ask", "write", 
 
 #: Legacy docker-alias strings that map to a granted (True) ceiling.
 _CONTAINER_GRANT_STRINGS: Tuple[str, ...] = ("write", "full")
+
+
+#: Legacy permission resources removed from the workspace-ceiling surface.
+#: ``git_read`` / ``git_write`` folded onto the canonical ``git`` ceiling;
+#: ``system`` / ``execution`` ceilings no longer exist (system inspection
+#: is unconditionally available; execution is not user-configurable).
+_REMOVED_LEGACY_RESOURCES: Tuple[str, ...] = (
+    "git_read",
+    "git_write",
+    "system",
+    "execution",
+)
 
 
 def load_resource_catalog() -> Dict[str, Any]:
@@ -207,11 +192,14 @@ def validate_workspace_permissions(
     resource has its own canonical vocabulary (see
     ``_PERMISSION_LEVELS_BY_RESOURCE``):
 
-    - ``git`` / ``git_read`` / ``git_write`` / ``filesystem`` / ``system`` /
-      ``execution`` accept the ceiling levels ``banned|ask|read|write``
-      (``git`` additionally retains ``write_on_feature_branch`` as its
-      branch-restricted-write ceiling; no ``full`` ceiling exists -- legacy
-      stored ``full`` ceilings are normalised to ``write``);
+    - ``git`` / ``filesystem`` accept the ceiling levels ``banned|ask|read|
+      write`` (``git`` additionally retains ``write_on_feature_branch`` as
+      its branch-restricted-write ceiling; no ``full`` ceiling exists --
+      legacy stored ``full`` ceilings are normalised to ``write``); the
+      removed legacy grains ``git_read`` / ``git_write`` / ``system`` /
+      ``execution`` are rejected with a legacy-removed hint (``git_read``/
+      ``git_write`` point at ``git``; ``system``/``execution`` have no
+      ceiling anymore);
     - ``network`` accepts ``banned|ask|write|outbound``;
     - ``mcp`` accepts ``banned|connect|full`` (its own session scale);
     - ``host_bash`` accepts ``banned|ask|allow``;
@@ -240,6 +228,16 @@ def validate_workspace_permissions(
             errors.append(
                 f"invalid level '{level}' for resource 'docker' (legacy alias of "
                 f"'container'; expected one of {sorted(_CONTAINER_LEGACY_STRINGS)})"
+            )
+            continue
+        if name in _REMOVED_LEGACY_RESOURCES:
+            # Removed ceiling grains: always rejected with a hint naming the
+            # canonical replacement so stale configs/UI payloads get a
+            # precise 422 instead of a generic 'unknown resource'.
+            hint = "; use 'git'" if name in ("git_read", "git_write") else ""
+            errors.append(
+                f"legacy permission resource '{name}' is no longer supported"
+                f"{hint}"
             )
             continue
         if name not in known:

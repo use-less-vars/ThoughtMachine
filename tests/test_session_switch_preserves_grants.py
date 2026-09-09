@@ -78,9 +78,10 @@ def _assert_perms(perms, expected, label):
 FULL_PERMS = {
     "filesystem": "write",
     "container": True,
-    "git_write": "write",
+    "git": "write",
     "network": "ask",
-    "system": "read",
+    "mcp": "banned",
+    "host_bash": "banned",
 }
 
 TIGHTENED_CEILING = {

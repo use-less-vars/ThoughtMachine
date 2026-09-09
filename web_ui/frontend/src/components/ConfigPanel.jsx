@@ -15,9 +15,9 @@ const SESSION_PERMISSION_OPTION_ORDER = {
   mcp: ['full', 'connect', 'banned'],
   host_bash: ['allow', 'ask', 'banned'],
 }
-// Mirrors backend SAFE_DEFAULTS for the canonical session resources. The legacy
-// useStore PERMISSION_DEFAULTS still carries system/execution and lacks
-// mcp/host_bash, so it cannot seed the session-permissions tab.
+// Mirrors backend SAFE_DEFAULTS for the canonical session resources. useStore's
+// PERMISSION_DEFAULTS carries the same six canonical keys, so either may seed
+// the session-permissions tab.
 const CANONICAL_PERMISSION_DEFAULTS = {
   git: 'read',
   filesystem: 'read',
@@ -307,8 +307,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
     if (sessionId && sessionPerms) {
       try {
-        // PUT only canonical session-permission keys — legacy frontend keys
-        // (system/execution/git_read/git_write) are rejected by the backend schema.
+        // PUT only canonical session-permission keys — the backend schema rejects
+        // any other key (legacy system/execution or gate grains).
         const rawPerms = sessionPerms.raw ?? {};
         const payload = Object.fromEntries(
           CANONICAL_SESSION_PERMISSION_KEYS.filter((k) => k in rawPerms).map((k) => [k, rawPerms[k]])

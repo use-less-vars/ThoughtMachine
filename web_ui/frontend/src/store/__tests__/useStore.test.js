@@ -22,11 +22,11 @@ describe('PERMISSION_DEFAULTS', () => {
   it('exposes exactly the 6 documented permission keys', () => {
     expect(Object.keys(PERMISSION_DEFAULTS).sort()).toEqual([
       'container',
-      'execution',
       'filesystem',
       'git',
+      'host_bash',
+      'mcp',
       'network',
-      'system',
     ]);
   });
 
@@ -42,16 +42,16 @@ describe('PERMISSION_DEFAULTS', () => {
     expect(PERMISSION_DEFAULTS.container).toBe(false);
   });
 
-  it('system defaults to read', () => {
-    expect(PERMISSION_DEFAULTS.system).toBe('read');
+  it('mcp defaults to banned', () => {
+    expect(PERMISSION_DEFAULTS.mcp).toBe('banned');
   });
 
   it('git defaults to read', () => {
     expect(PERMISSION_DEFAULTS.git).toBe('read');
   });
 
-  it('execution defaults to banned', () => {
-    expect(PERMISSION_DEFAULTS.execution).toBe('banned');
+  it('host_bash defaults to banned', () => {
+    expect(PERMISSION_DEFAULTS.host_bash).toBe('banned');
   });
 });
 

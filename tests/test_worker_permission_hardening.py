@@ -136,12 +136,12 @@ class TestRestrictiveMerge:
     """Session permissions are the ceiling; the stricter value wins."""
 
     def test_session_ceiling_wins_when_session_stricter(self):
-        result = _restrictive_merge({"execution": "deny"}, {"execution": "allow"})
-        assert result["execution"] == "deny"
+        result = _restrictive_merge({"network": "banned"}, {"network": "write"})
+        assert result["network"] == "banned"
 
     def test_session_ceiling_wins_when_worker_stricter(self):
-        result = _restrictive_merge({"execution": "allow"}, {"execution": "deny"})
-        assert result["execution"] == "deny"
+        result = _restrictive_merge({"filesystem": "write"}, {"filesystem": "read"})
+        assert result["filesystem"] == "read"
 
     def test_filesystem_levels_stricter_wins(self):
         """Ordering: none < read < write -- lower strictness never survives."""
@@ -560,21 +560,21 @@ class TestPermissionDefaultsAndRoundTrip:
         cfg = AgentConfig()
         cfg.session_permissions = SessionPermissions(
             container=True, network=True, filesystem="full",
-            system="write", git="read", execution="banned",
+            mcp="connect", git="read", host_bash="ask",
         )
         sp2 = AgentConfig(**cfg.model_dump()).session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coerces to 'write'
         assert sp2.filesystem == "full"
-        assert sp2.system == "write"
+        assert sp2.mcp == "connect"
         assert sp2.git == "read"
-        assert sp2.execution == "banned"
+        assert sp2.host_bash == "ask"
 
     def test_restrictive_permissions_round_trip(self):
         cfg = AgentConfig()
         cfg.session_permissions = SessionPermissions(
             container=False, network=False, filesystem="read",
-            system="banned", git="banned", execution="banned",
+            mcp="banned", git="banned", host_bash="banned",
         )
         sp2 = AgentConfig(**cfg.model_dump()).session_permissions
         assert sp2.container is False
@@ -601,7 +601,7 @@ class TestPermissionDefaultsAndRoundTrip:
         cfg = AgentConfig()
         cfg.session_permissions = SessionPermissions(
             container=True, network=True, filesystem="full",
-            system="write", git="read", execution="banned",
+            mcp="connect", git="read", host_bash="ask",
         )
         path = str(tmp_path / "config.json")
         save_config(cfg.model_dump(exclude={"api_key"}, exclude_none=True), path)
@@ -610,9 +610,9 @@ class TestPermissionDefaultsAndRoundTrip:
         assert sp.container is True
         assert sp.network == "write"
         assert sp.filesystem == "full"
-        assert sp.system == "write"
+        assert sp.mcp == "connect"
         assert sp.git == "read"
-        assert sp.execution == "banned"
+        assert sp.host_bash == "ask"
 
     def test_missing_permissions_backfilled_from_factory_defaults(self, tmp_path):
         cfg = AgentConfig()
@@ -625,9 +625,11 @@ class TestPermissionDefaultsAndRoundTrip:
         assert sp.container is True
         assert sp.network == "write"
         assert sp.filesystem == "write"
-        assert sp.system == "read"
         assert sp.git == "read"
-        assert sp.execution == "banned"
+        # The removed system/execution channels no longer exist; the canonical
+        # mcp/host_bash channels are backfilled fail-closed from model defaults.
+        assert sp.mcp == "banned"
+        assert sp.host_bash == "banned"
 
 
 # =========================================================================

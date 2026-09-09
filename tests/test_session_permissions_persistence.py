@@ -31,12 +31,9 @@ GRANTS = {
     "container": False,
     "network": "banned",
     "filesystem": "write",
-    "system": "read",
     "git": "write",
-    "execution": "read",
-    "git_read": "read",
-    "git_write": "write",
     "mcp": "banned",
+    "host_bash": "banned",
 }
 
 
@@ -131,9 +128,9 @@ def test_session_permissions_roundtrip_with_ceiling_reapplication(tmp_path, monk
         "container": False,
         "network": "banned",
         "filesystem": "write",  # above ceiling
-        "system": "read",
         "git": "write",         # above ceiling
-        "execution": "banned",
+        "mcp": "banned",
+        "host_bash": "banned",
     }
     store, manager = _make_manager(tmp_path)
     session_id, _ = manager.create_session(mode="agent")
@@ -189,7 +186,8 @@ def test_load_session_permissions_legacy_agent_config_fallback(tmp_path, monkeyp
     # ``Session.from_persistable_dict`` coerces partial maps by merging with
     # the safe defaults, so the legacy grant must be preserved as a key/value.
     assert loaded["git"] == "read"
-    assert loaded["execution"] == "banned"  # safe default untouched
+    assert loaded["mcp"] == "banned"      # safe default untouched
+    assert loaded["host_bash"] == "banned"  # safe default untouched
 
 
 def test_load_session_permissions_missing_session_returns_none(tmp_path, monkeypatch):
@@ -223,5 +221,6 @@ def test_effective_permissions_restores_grants_after_restart(tmp_path, monkeypat
     # Pre-fix these would be the safe defaults (read / read / banned).
     assert eff["filesystem"] == "write"
     assert eff["git"] == "write"
-    assert eff["execution"] == "read"
     assert eff["network"] == "banned"
+    assert eff["mcp"] == "banned"
+    assert eff["host_bash"] == "banned"

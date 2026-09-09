@@ -34,12 +34,12 @@ const DEFAULT_ROUTES = {
   '/api/workspace/ws-1/containers': jsonOk({ containers: [] }),
   '/api/workspace/ws-1/effective_permissions': jsonOk({
     effective_permissions: {
-      filesystem: 'read',
-      network: 'banned',
       git: 'read',
-      system: 'read',
-      execution: 'banned',
+      filesystem: 'read',
       container: true,
+      network: 'banned',
+      mcp: 'banned',
+      host_bash: 'banned',
     },
   }),
   '/api/workspace/list': jsonOk([{ id: 'ws-1', label: 'Code Development', root: '/root' }]),

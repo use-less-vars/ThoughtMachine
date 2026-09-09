@@ -150,14 +150,16 @@ class TestOperatorFlagPropagation:
             use_workspace_lifecycle_manager=True,
             use_container_registry=True,
         ).to_agent_config()
-        assert acfg.session_permissions.git_write == 'write'
+        assert acfg.session_permissions.git == 'write'
+        assert 'git_write' not in acfg.session_permissions.model_dump()
         assert 'allow_host_resources' not in acfg.model_dump()
         assert acfg.use_workspace_lifecycle_manager is True
         assert acfg.use_container_registry is True
 
     def test_flags_default_to_false(self):
         acfg = SessionConfig().to_agent_config()
-        assert acfg.session_permissions.git_write is None
+        assert acfg.session_permissions.git == 'read'
+        assert 'git_write' not in acfg.session_permissions.model_dump()
         assert 'allow_host_resources' not in acfg.model_dump()
 
 
@@ -228,7 +230,8 @@ class TestWorkerFlagForwarding:
         )
         acfg = wt._build_agent_config()
         assert acfg is not None
-        assert acfg.session_permissions.git_write == 'write'
+        assert acfg.session_permissions.git == 'write'
+        assert 'git_write' not in acfg.session_permissions.model_dump()
         assert 'allow_host_resources' not in acfg.model_dump()
 
 
@@ -245,17 +248,17 @@ class TestGitWriteToolFlagGate:
             Path("/tmp")) is False
 
     def test_blocked_when_flag_not_exactly_true(self):
-        # Any session git_write value other than 'write'/'full' must fail
-        # closed (effective_permissions is None on the direct-call path, so
-        # even 'ask' resolves to False here).
+        # Any session git level other than 'write'/'write_on_feature_branch'
+        # must fail closed (effective_permissions is None on the direct-call
+        # path, so even 'ask' resolves to False here).
         for bad_value in ("read", "ask", "banned", None):
             tool = self._tool(agent_config={
-                "session_permissions": {"git_write": bad_value}})
+                "session_permissions": {"git": bad_value}})
             assert tool._unprotected_branch_agent_commit_allowed(
                 Path("/tmp")) is False, bad_value
 
     def test_true_flag_proceeds_past_gate(self, monkeypatch):
-        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
+        tool = self._tool(agent_config={"session_permissions": {"git": "write"}})
         # Exactly True passes the operator gate; the container-mode gate then
         # decides. Patch it to False so the method returns False without
         # needing a real git repo — proving the exact-True check passed.
@@ -265,7 +268,7 @@ class TestGitWriteToolFlagGate:
     def test_protected_branch_names_denied(self, monkeypatch):
         """dev/master/main are protected: commits stay host-side."""
         for branch in ("dev", "master", "main"):
-            tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
+            tool = self._tool(agent_config={"session_permissions": {"git": "write"}})
             monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
             monkeypatch.setattr(
                 tool, "_run_git",
@@ -276,7 +279,7 @@ class TestGitWriteToolFlagGate:
 
     def test_unprotected_branch_allowed(self, monkeypatch):
         """feat/fix/refactor branches may be committed agent-side."""
-        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
+        tool = self._tool(agent_config={"session_permissions": {"git": "write"}})
         monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
         monkeypatch.setattr(
             tool, "_run_git",
@@ -286,7 +289,7 @@ class TestGitWriteToolFlagGate:
 
     def test_empty_branch_output_fails_closed(self, monkeypatch):
         """Blank branch resolution must deny, never allow."""
-        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
+        tool = self._tool(agent_config={"session_permissions": {"git": "write"}})
         monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
         monkeypatch.setattr(
             tool, "_run_git",
@@ -296,7 +299,7 @@ class TestGitWriteToolFlagGate:
 
     def test_branch_check_runtime_error_fails_closed(self, monkeypatch):
         """Container-mandatory branch resolution failure must deny."""
-        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
+        tool = self._tool(agent_config={"session_permissions": {"git": "write"}})
         monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
 
         def _boom(*args, **kwargs):

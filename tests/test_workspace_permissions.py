@@ -28,11 +28,17 @@ from agent.config.resource_catalog import validate_workspace_permissions
 def test_workspace_permissions_validation_rejects_unknown():
     """Unknown resources and invalid levels are dropped and reported as errors."""
     normalized, errors = validate_workspace_permissions(
-        {"git_read": "read", "not_a_resource": "write", "git_write": "banana"}
+        {"git": "read", "not_a_resource": "write", "filesystem": "banana"}
     )
-    assert normalized == {"git_read": "read"}
+    assert normalized == {"git": "read"}
     assert any("unknown resource 'not_a_resource'" in e for e in errors)
-    assert any("invalid level 'banana' for resource 'git_write'" in e for e in errors)
+    assert any("invalid level 'banana' for resource 'filesystem'" in e for e in errors)
+
+    normalized, errors = validate_workspace_permissions({"git_write": "banana"})
+    assert normalized == {}
+    assert errors == [
+        "legacy permission resource 'git_write' is no longer supported; use 'git'"
+    ]
 
 
 def test_workspace_permissions_validation_docker_alias_write():
@@ -80,7 +86,7 @@ def test_workspace_permissions_persist_and_load(tmp_path, monkeypatch):
     ws_dir = vault / "workspaces" / "ws-test"
     ws_dir.mkdir(parents=True)
     (ws_dir / "config.json").write_text(
-        json.dumps({"purpose": "general", "permissions": {"git_read": "read"}}),
+        json.dumps({"purpose": "general", "permissions": {"git": "read"}}),
         encoding="utf-8",
     )
 
@@ -91,24 +97,16 @@ def test_workspace_permissions_persist_and_load(tmp_path, monkeypatch):
     with TestClient(app) as client:
         put = client.put(
             "/api/workspace/ws-test/permissions",
-            json={"permissions": {"git_read": "read", "git_write": "ask", "host_bash": "banned"}},
+            json={"permissions": {"git": "read", "host_bash": "banned"}},
         )
         assert put.status_code == 200
         data = put.json()
-        assert data["permissions"] == {
-            "git_read": "read",
-            "git_write": "ask",
-            "host_bash": "banned",
-        }
+        assert data["permissions"] == {"git": "read", "host_bash": "banned"}
         assert data["risk"]["level"] in ("low", "medium", "high")
 
         get = client.get("/api/workspace/ws-test/permissions")
         assert get.status_code == 200
-        assert get.json()["permissions"] == {
-            "git_read": "read",
-            "git_write": "ask",
-            "host_bash": "banned",
-        }
+        assert get.json()["permissions"] == {"git": "read", "host_bash": "banned"}
 
         bad = client.put(
             "/api/workspace/ws-test/permissions", json={"permissions": {"nope": "write"}}
@@ -117,11 +115,7 @@ def test_workspace_permissions_persist_and_load(tmp_path, monkeypatch):
         assert bad.json()["detail"]["errors"] == ["unknown resource 'nope'"]
 
     saved = json.loads((ws_dir / "config.json").read_text(encoding="utf-8"))
-    assert saved["permissions"] == {
-        "git_read": "read",
-        "git_write": "ask",
-        "host_bash": "banned",
-    }
+    assert saved["permissions"] == {"git": "read", "host_bash": "banned"}
 
 
 def test_workspace_permissions_validation_accepts_canonical_catalog_levels():
@@ -145,10 +139,6 @@ def test_workspace_permissions_validation_accepts_canonical_catalog_levels():
         {"container": True},
         {"container": False},
         {"filesystem": "write"},
-        {"system": "read"},
-        {"execution": "banned"},
-        {"git_read": "read"},
-        {"git_write": "write"},
     ]
     for entry in accepted:
         key, value = next(iter(entry.items()))
@@ -166,9 +156,6 @@ def test_workspace_permissions_validation_rejects_off_catalog_levels():
         ({"mcp": "write"}, "invalid level 'write' for resource 'mcp'"),
         ({"git": "full"}, "invalid level 'full' for resource 'git'"),
         ({"filesystem": "full"}, "invalid level 'full' for resource 'filesystem'"),
-        ({"system": "full"}, "invalid level 'full' for resource 'system'"),
-        ({"execution": "full"}, "invalid level 'full' for resource 'execution'"),
-        ({"git_read": "full"}, "invalid level 'full' for resource 'git_read'"),
         ({"host_bash": "read"}, "invalid level 'read' for resource 'host_bash'"),
         (
             {"git": "write_feature_branches"},
@@ -252,11 +239,14 @@ class TestNormalizeLegacyWorkspaceCeiling:
 
     def test_full_maps_to_write_on_write_scale_resources(self):
         n = config_manager.normalize_legacy_workspace_ceiling
-        for key in ("filesystem", "system", "git"):
+        for key in ("filesystem", "git"):
             assert n({key: "full"}) == {key: "write"}, key
-        # execution / git grains are outside the rewrite set: left untouched
-        assert n({"execution": "full"}) == {"execution": "full"}
-        assert n({"git_read": "full"}) == {"git_read": "full"}
+        # removed-legacy resources never survive normalization
+        assert n({"system": "full"}) == {}
+        assert n({"execution": "full"}) == {}
+        assert n({"git_read": "full"}) == {}
+        assert n({"git_read": "read", "git_write": "ask"}) == {"git": "ask"}
+        assert n({"git_write": "banned", "git": "read"}) == {"git": "read"}
 
     def test_git_write_feature_branches_maps_to_write_on_feature_branch(self):
         n = config_manager.normalize_legacy_workspace_ceiling
@@ -269,7 +259,7 @@ class TestNormalizeLegacyWorkspaceCeiling:
 
     def test_unknown_keys_and_values_left_untouched(self):
         n = config_manager.normalize_legacy_workspace_ceiling
-        raw = {"unknown_key": "whatever", "host_bash": "read", "git_write": "mega"}
+        raw = {"unknown_key": "whatever", "host_bash": "read"}
         assert n(dict(raw)) == raw
         assert n({"host_bash": "allow"}) == {"host_bash": "allow"}
 
@@ -314,8 +304,6 @@ class TestNormalizeLegacyWorkspaceCeiling:
             "network": "ask",
             "mcp": "full",
             "filesystem": "write",
-            "system": "write",
-            "execution": "full",
         }
 
 
@@ -396,9 +384,9 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"host_bash": "banned"}, {"host_bash": "allow"})
         assert result == {"host_bash": "banned"}
 
-    def test_git_read_read_caps_write(self):
-        result = apply_workspace_ceiling({"git_read": "read"}, {"git_read": "write"})
-        assert result == {"git_read": "read"}
+    def test_git_read_ceiling_caps_write(self):
+        result = apply_workspace_ceiling({"git": "read"}, {"git": "write"})
+        assert result == {"git": "read"}
 
     def test_filesystem_read_caps_full(self):
         result = apply_workspace_ceiling({"filesystem": "read"}, {"filesystem": "full"})
@@ -415,10 +403,6 @@ class TestApplyWorkspaceCeiling:
     def test_git_ask_ceiling_caps_write_to_read(self):
         result = apply_workspace_ceiling({"git": "ask"}, {"git": "write"})
         assert result == {"git": "read"}
-
-    def test_git_write_ask_ceiling_caps_write_to_read(self):
-        result = apply_workspace_ceiling({"git_write": "ask"}, {"git_write": "write"})
-        assert result == {"git_write": "read"}
 
     def test_ask_ceiling_over_session_ask_stands(self):
         # A genuine session-level ask grant ranks AT the ask ceiling and
@@ -492,18 +476,6 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"network": "outbound"}, {"network": "write"})
         assert result == {"network": "write"}
 
-    def test_git_read_ask_ceiling_caps_write_to_read(self):
-        result = apply_workspace_ceiling({"git_read": "ask"}, {"git_read": "write"})
-        assert result == {"git_read": "read"}
-
-    def test_system_ask_ceiling_caps_write_to_read(self):
-        result = apply_workspace_ceiling({"system": "ask"}, {"system": "write"})
-        assert result == {"system": "read"}
-
-    def test_execution_ask_ceiling_caps_write_to_read(self):
-        result = apply_workspace_ceiling({"execution": "ask"}, {"execution": "write"})
-        assert result == {"execution": "read"}
-
     def test_mcp_connect_ceiling_caps_full_grant(self):
         result = apply_workspace_ceiling({"mcp": "connect"}, {"mcp": "full"})
         assert result == {"mcp": "connect"}
@@ -548,9 +520,6 @@ class TestEffectivePermissionsCeilingWiring:
             network="write",
             container=True,
             git="write",
-            system="read",
-            mcp="banned",
-            execution="banned",
         )
 
     def test_filesystem_ceiling_read(self):
@@ -572,17 +541,14 @@ class TestEffectivePermissionsCeilingWiring:
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(self._session(), workspace, {"git": "read"})
         assert eff["git"] == "read"
-        assert eff["git_read"] == "read"
-        assert eff["git_write"] == "banned"
+        assert "git_read" not in eff and "git_write" not in eff
 
     def test_git_ceiling_ask_read_splits_never_ask(self):
-        # An ask ceiling over a session write grant caps git to read; the
-        # derived git_write grain is banned -- no effective value is ask.
+        # An ask ceiling over a session write grant caps git to read -- no
+        # effective value is ever ask.
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(self._session(), workspace, {"git": "ask"})
         assert eff["git"] == "read"
-        assert eff["git_read"] == "read"
-        assert eff["git_write"] == "banned"
         assert "ask" not in [str(v) for v in eff.values()]
 
     def test_filesystem_ceiling_ask_caps_write_to_read(self):
@@ -606,26 +572,18 @@ class TestEffectivePermissionsCeilingWiring:
             network="write",
             container=True,
             git="ask",
-            system="read",
-            mcp="banned",
-            execution="banned",
         )
         eff = get_effective_permissions(session, workspace, {"git": "ask"})
         assert eff["git"] == "ask"
-        assert eff["git_read"] == "ask"
-        assert eff["git_write"] == "ask"
 
     def test_git_write_on_feature_branch_ceiling_wiring(self):
         # Normative DISPATCH-6 example end-to-end: ceiling wofb over a
-        # session write grant -> effective git is write_on_feature_branch;
-        # the split git_write grain carries the feature-branch restriction.
+        # session write grant -> effective git is write_on_feature_branch.
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(
             self._session(), workspace, {"git": "write_on_feature_branch"}
         )
         assert eff["git"] == "write_on_feature_branch"
-        assert eff["git_read"] == "read"
-        assert eff["git_write"] == "write_on_feature_branch"
 
     def test_git_write_ceiling_does_not_cap_wofb_grant_wiring(self):
         workspace = WorkspaceCapabilities()
@@ -634,14 +592,9 @@ class TestEffectivePermissionsCeilingWiring:
             network="write",
             container=True,
             git="write_on_feature_branch",
-            system="read",
-            mcp="banned",
-            execution="banned",
         )
         eff = get_effective_permissions(session, workspace, {"git": "write"})
         assert eff["git"] == "write_on_feature_branch"
-        assert eff["git_read"] == "read"
-        assert eff["git_write"] == "write_on_feature_branch"
 
     def test_git_read_ceiling_caps_wofb_grant_wiring(self):
         workspace = WorkspaceCapabilities()
@@ -650,13 +603,9 @@ class TestEffectivePermissionsCeilingWiring:
             network="write",
             container=True,
             git="write_on_feature_branch",
-            system="read",
-            mcp="banned",
-            execution="banned",
         )
         eff = get_effective_permissions(session, workspace, {"git": "read"})
         assert eff["git"] == "read"
-        assert eff["git_write"] == "banned"
 
     def test_git_ask_ceiling_caps_wofb_grant_wiring(self):
         workspace = WorkspaceCapabilities()
@@ -665,13 +614,9 @@ class TestEffectivePermissionsCeilingWiring:
             network="write",
             container=True,
             git="write_on_feature_branch",
-            system="read",
-            mcp="banned",
-            execution="banned",
         )
         eff = get_effective_permissions(session, workspace, {"git": "ask"})
         assert eff["git"] == "read"
-        assert eff["git_write"] == "banned"
 
     def test_network_write_ceiling_caps_outbound_grant_wiring(self):
         workspace = WorkspaceCapabilities()

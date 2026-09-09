@@ -349,7 +349,7 @@ const useWorkspaceStore = create((set, get) => ({
       const ep = permsData && permsData.effective_permissions
       let permissions = []
       if (ep) {
-        permissions = ['filesystem', 'network', 'git', 'system', 'execution', 'container'].map((name) => {
+        permissions = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash'].map((name) => {
           let effective = ep[name]
           if (name === 'container') effective = effective ? 'enabled' : 'banned'
           return { name, ceiling: effective, effective }

@@ -2,26 +2,25 @@
 Workspace risk model.
 
 Computes a numeric risk score and a human-readable level for a workspace
-permission map (see ``agent/config/resource_catalog.json`` for the resource
-grains) combined with the workspace feature switches
-(``allow_host_resources``).
+permission map (see ``agent/config/resource_catalog.py`` for the resource
+grains — the six canonical workspace resources) combined with the workspace
+feature switches (``allow_host_resources``).
 
 Scoring rules (deterministic, additive):
 
 - a granted (non-``banned``) catalog resource with ``risk_level == "high"``
   adds +25;
 - a granted catalog resource with ``risk_level == "medium"`` adds +8;
-- ``git_write`` granted at ``read`` or ``write`` adds +10 (repo mutation);
+- the ``git`` resource granted at ``write`` or ``write_on_feature_branch``
+  adds +10 (repo mutation);
 - ``allow_host_resources=True`` adds +20;
 - every non-``banned`` permission adds +1.
 
 Levels: score < 20 → ``low``; < 45 → ``medium``; otherwise ``high``.
 
-Sanity: all-banned → 0 → low; the ``general`` purpose preset → ~31 →
-medium; full grants + host resources → high.
+Sanity: all-banned → 0 → low; catalog defaults → 20 → medium; full grants +
+host resources → high.
 """
-
-from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
@@ -87,17 +86,16 @@ def compute_workspace_risk(
                     "reason": f"medium-risk resource '{name}' granted ({level})",
                 }
             )
-        if name == "git_write" and level in ("read", "write"):
+        if name == "git" and level in ("write", "write_on_feature_branch"):
             score += 10
             factors.append(
                 {
                     "resource": name,
                     "level": level,
                     "weight": 10,
-                    "reason": "git_write grants repository mutation",
+                    "reason": "git write grants repository mutation",
                 }
             )
-
     if allow_host_resources:
         score += 20
         factors.append(

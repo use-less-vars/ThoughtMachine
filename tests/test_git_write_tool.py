@@ -3,8 +3,8 @@
 Policy: commits in an operator-managed worktree are blocked by default; they
 are allowed only when all of the following hold:
 
-1. the session ``git_write`` permission is ``"write"`` (via
-   ``agent_config["session_permissions"]["git_write"]`` or effective
+1. the session ``git`` permission is ``"write"`` (via
+   ``agent_config["session_permissions"]["git"]`` or effective
    permissions);
 2. the current branch is NOT a protected branch (``dev``, ``master``,
    ``main``).  Feature-style branches (``feat/*``, ``fix/*``, ``refactor/*``,
@@ -103,7 +103,7 @@ def test_worktree_commit_blocked_on_dev_by_default():
 
 def test_worktree_commit_blocked_on_main_with_flag():
     """Flag present but branch is protected (main) -> operator error."""
-    tool = _tool(agent_config={"session_permissions": {"git_write": "write"}})
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
@@ -126,7 +126,7 @@ def test_feature_branch_commit_allowed_with_flag_container_mode(tmp_path):
     (tmp_path / "agent_change.py").write_text("print('x')\n")
     tool = _tool(
         file_path="agent_change.py",
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "write"}},
     )
     manager = _RecordingManager()
     exec_container = _RecordingExec()
@@ -179,7 +179,7 @@ def test_feature_branch_commit_allowed_on_non_protected_branch(tmp_path):
     (tmp_path / "agent_change.py").write_text("print('x')\n")
     tool = _tool(
         file_path="agent_change.py",
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "write"}},
     )
     calls = []
     exec_container = _RecordingExec()
@@ -205,7 +205,7 @@ def test_feature_branch_commit_allowed_on_non_protected_branch(tmp_path):
 
 def test_feature_branch_commit_denied_when_host_mode():
     """Host execution mode -> worktree commit denied before branch check."""
-    tool = _tool(agent_config={"session_permissions": {"git_write": "write"}})
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
@@ -224,7 +224,7 @@ def test_feature_branch_commit_denied_when_host_mode():
 
 def test_feature_branch_commit_denied_when_container_unavailable():
     """No containerized resource -> branch check fails closed."""
-    tool = _tool(agent_config={"session_permissions": {"git_write": "write"}})
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
     tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
@@ -244,7 +244,7 @@ def test_feature_branch_commit_denied_when_container_unavailable():
 
 def test_feature_branch_commit_does_not_use_host_fallback():
     """Execution degraded to host -> denied, no host or container subprocess."""
-    tool = _tool(agent_config={"session_permissions": {"git_write": "write"}})
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
     tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
@@ -269,7 +269,7 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
     tool = _tool(
         file_path="agent_change.py",
         message="Merge branch 'main' into feat/x",
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "write"}},
     )
     calls = []
     exec_container = _RecordingExec()
@@ -292,7 +292,7 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
     # Same intent but on a protected branch -> denied.
     tool2 = _tool(
         message="Merge branch 'main' into main",
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "write"}},
     )
     calls2 = []
     exec_container2 = _RecordingExec()
@@ -313,7 +313,7 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
 
 def test_unprotected_branch_allows_bare_feature_prefix():
     """Bare 'feat/' prefix is an unprotected branch."""
-    tool = _tool(agent_config={"session_permissions": {"git_write": "write"}})
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
     calls = []
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/")  # noqa: SLF001
@@ -325,7 +325,7 @@ def test_unprotected_branch_allows_bare_feature_prefix():
 
 def test_unprotected_branch_allows_whitespace_only_suffix():
     """Bare 'feat/' with a whitespace-only suffix is still unprotected."""
-    tool = _tool(agent_config={"session_permissions": {"git_write": "write"}})
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
     calls = []
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/   ")  # noqa: SLF001
@@ -337,7 +337,7 @@ def test_unprotected_branch_allows_whitespace_only_suffix():
 
 def test_commit_requires_file_path():
     """Missing file_path -> explicit error after the branch check passes."""
-    tool = _tool(agent_config={"session_permissions": {"git_write": "write"}})
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
@@ -360,7 +360,7 @@ def test_feature_branch_commit_stages_only_named_path(tmp_path):
     (tmp_path / "unrelated.txt").write_text("untracked\n")
     tool = _tool(
         file_path="agent_change.py",
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "write"}},
     )
     calls = []
     exec_container = _RecordingExec()

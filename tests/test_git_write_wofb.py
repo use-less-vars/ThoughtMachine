@@ -44,7 +44,7 @@ def _commit_tool(**params):
         "message": "agent commit",
         "file_path": ["note.txt"],
         "agent_config": {
-            "session_permissions": {"git_write": "write_on_feature_branch"}
+            "session_permissions": {"git": "write_on_feature_branch"}
         },
     }
     defaults.update(params)
@@ -72,7 +72,6 @@ def test_wofb_session_passes_git_write_category_gate():
         SessionPermissions(git="write_on_feature_branch"), _FULL_CAPS
     )
     assert eff["git"] == "write_on_feature_branch"
-    assert eff["git_write"] == "write_on_feature_branch"
     ok, msg = check_required_categories(
         ["git:write"], dict(eff), "GitWriteTool", {}, "write git", event_bus=None
     )
@@ -137,7 +136,7 @@ def test_full_write_grant_commit_allowed_on_protected_branch(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     tool_sp = _commit_tool(
-        agent_config={"session_permissions": {"git_write": "write"}}
+        agent_config={"session_permissions": {"git": "write"}}
     )
     with mock.patch.object(
         tool_sp, "_run_git", return_value="committed"
@@ -151,9 +150,7 @@ def test_full_write_grant_commit_allowed_on_protected_branch(tmp_path):
 
     tool_eff = _commit_tool(
         agent_config={},
-        effective_permissions={
-            "git": "write", "git_read": "write", "git_write": "write",
-        },
+        effective_permissions={"git": "write"},
     )
     with mock.patch.object(
         tool_eff, "_run_git", return_value="committed"

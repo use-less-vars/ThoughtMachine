@@ -111,7 +111,7 @@ def test_update_workspace_permissions_persists_and_reflects_in_summary(
         "domain_allowlist": ["example.com"],
     })
 
-    saved = {"git_read": "write", "filesystem": "ask"}
+    saved = {"git": "write", "filesystem": "ask"}
     result = _put("ws-1", saved)
     assert result["permissions"] == saved
     assert result["purpose"] == "general"

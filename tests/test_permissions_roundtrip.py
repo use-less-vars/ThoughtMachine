@@ -92,9 +92,9 @@ class TestSessionPermissionsRoundTrip:
         assert sp2.container == sp1.container
         assert sp2.network == sp1.network
         assert sp2.filesystem == sp1.filesystem
-        assert sp2.system == sp1.system
         assert sp2.git == sp1.git
-        assert sp2.execution == sp1.execution
+        assert sp2.mcp == sp1.mcp
+        assert sp2.host_bash == sp1.host_bash
 
     def test_custom_permissions_round_trip(self):
         """Custom SessionPermissions survives model_dump → re-init."""
@@ -103,9 +103,9 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=True,
             filesystem="full",
-            system="write",
             git="read",
-            execution="banned",
+            mcp="connect",
+            host_bash="allow",
         )
         d = cfg1.model_dump()
         cfg2 = AgentConfig(**d)
@@ -114,9 +114,9 @@ class TestSessionPermissionsRoundTrip:
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
         assert sp2.filesystem == "full"
-        assert sp2.system == "write"
         assert sp2.git == "read"
-        assert sp2.execution == "banned"
+        assert sp2.mcp == "connect"
+        assert sp2.host_bash == "allow"
 
     def test_permissive_permissions_round_trip(self):
         """Maximally permissive SessionPermissions round-trips correctly."""
@@ -125,9 +125,9 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=True,
             filesystem="full",
-            system="full",
             git="full",
-            execution="full",
+            mcp="full",
+            host_bash="allow",
         )
         d = cfg1.model_dump()
         cfg2 = AgentConfig(**d)
@@ -136,9 +136,9 @@ class TestSessionPermissionsRoundTrip:
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
         assert sp2.filesystem == "full"
-        assert sp2.system == "full"
         assert sp2.git == "full"
-        assert sp2.execution == "full"
+        assert sp2.mcp == "full"
+        assert sp2.host_bash == "allow"
 
     def test_restrictive_permissions_round_trip(self):
         """Restrictive permissions round-trip correctly."""
@@ -147,9 +147,9 @@ class TestSessionPermissionsRoundTrip:
             container=False,
             network=False,
             filesystem="read",
-            system="banned",
             git="banned",
-            execution="banned",
+            mcp="banned",
+            host_bash="banned",
         )
         d = cfg1.model_dump()
         cfg2 = AgentConfig(**d)
@@ -158,9 +158,9 @@ class TestSessionPermissionsRoundTrip:
         assert sp2.container is False
         assert sp2.network == "banned"  # False coercees to 'banned'
         assert sp2.filesystem == "read"
-        assert sp2.system == "banned"
         assert sp2.git == "banned"
-        assert sp2.execution == "banned"
+        assert sp2.mcp == "banned"
+        assert sp2.host_bash == "banned"
 
     def test_model_dump_is_serializable(self):
         """model_dump() output must be JSON-serializable (no Pydantic models leaked)."""
@@ -169,9 +169,9 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=False,
             filesystem="write",
-            system="read",
             git="full",
-            execution="banned",
+            mcp="banned",
+            host_bash="banned",
         )
         d = cfg.model_dump()
         # Should not raise TypeError
@@ -179,7 +179,7 @@ class TestSessionPermissionsRoundTrip:
         parsed = json.loads(json_str)
         assert parsed["session_permissions"]["container"] is True
         assert parsed["session_permissions"]["filesystem"] == "write"
-        assert parsed["session_permissions"]["execution"] == "banned"
+        assert parsed["session_permissions"]["host_bash"] == "banned"
 
     def test_exclude_api_key_keeps_permissions(self):
         """Excluding api_key from serialization must NOT drop session_permissions."""
@@ -224,9 +224,9 @@ class TestConfigFileRoundTrip:
         assert sp2.container == sp1.container
         assert sp2.network == sp1.network
         assert sp2.filesystem == sp1.filesystem
-        assert sp2.system == sp1.system
         assert sp2.git == sp1.git
-        assert sp2.execution == sp1.execution
+        assert sp2.mcp == sp1.mcp
+        assert sp2.host_bash == sp1.host_bash
 
     def test_custom_permissions_survive_file_io(self, temp_config_path):
         """Custom permissions survive save_config → load_config cycle."""
@@ -235,9 +235,9 @@ class TestConfigFileRoundTrip:
             container=True,
             network=True,
             filesystem="full",
-            system="write",
             git="read",
-            execution="banned",
+            mcp="connect",
+            host_bash="allow",
         )
         config_dict = cfg.model_dump(exclude={"api_key"}, exclude_none=True)
 
@@ -249,9 +249,9 @@ class TestConfigFileRoundTrip:
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
         assert sp2.filesystem == "full"
-        assert sp2.system == "write"
         assert sp2.git == "read"
-        assert sp2.execution == "banned"
+        assert sp2.mcp == "connect"
+        assert sp2.host_bash == "allow"
 
     def test_json_file_contents_are_human_readable(self, temp_config_path):
         """The saved JSON should have readable permission values."""
@@ -271,8 +271,9 @@ class TestConfigFileRoundTrip:
         assert sp["container"] is True
         assert sp["network"] == "banned"  # False coercees to 'banned'
         assert sp["filesystem"] == "write"
-        assert sp["system"] == "read"  # default
-        assert sp["execution"] == "banned"  # default
+        assert sp["git"] == "read"  # default
+        assert sp["mcp"] == "banned"  # default
+        assert sp["host_bash"] == "banned"  # default
 
     def test_missing_session_permissions_backfilled_from_defaults(self, temp_config_path):
         """If loaded JSON has no session_permissions key, defaults are used."""
@@ -287,14 +288,14 @@ class TestConfigFileRoundTrip:
         # Should have factory defaults (layered config: resources/default_config.json
         # deep-merges the PERMISSIVE profile — verified at runtime in the container:
         # SessionPermissions(container=True, network='write', filesystem='write',
-        #                    system='read', git='read', execution='banned'))
+        #                    git='read', mcp='banned', host_bash='banned'))
         sp = cfg2.session_permissions
         assert sp.container is True
         assert sp.network == "write"  # factory default (True coerces to 'write')
         assert sp.filesystem == "write"  # factory default
-        assert sp.system == "read"  # factory default
         assert sp.git == "read"  # factory default
-        assert sp.execution == "banned"
+        assert sp.mcp == "banned"  # factory default
+        assert sp.host_bash == "banned"  # factory default
 
     def test_partial_permissions_backfilled_from_defaults(self, temp_config_path):
         """Partial session_permissions should have missing fields backfilled."""
@@ -314,7 +315,9 @@ class TestConfigFileRoundTrip:
         assert sp.container is True       # from file
         assert sp.network == "write"      # factory default (network: true -> 'write')
         assert sp.filesystem == "write"   # factory default
-        assert sp.execution == "banned"
+        assert sp.git == "read"           # factory default
+        assert sp.mcp == "banned"         # factory default
+        assert sp.host_bash == "banned"   # factory default
 
 
 # =========================================================================

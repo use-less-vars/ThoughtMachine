@@ -5,8 +5,8 @@ Covers the operations added to GitInfoTool: ``diff_cached``, ``branch_list``,
 and the operator-managed worktree commit guard. Read operations (diff_cached,
 branch_list, ...) live in ``GitInfoTool``; write operations (branch_create,
 checkout, stage, unstage, commit) live in ``GitWriteTool`` (which subclasses
-GitInfoTool) and require the session ``git_write`` permission to be at least
-``'write'`` (``agent_config['session_permissions']['git_write']``). Mock-based (fake
+GitInfoTool) and require the session ``git`` permission to be at least
+``'write'`` (``agent_config['session_permissions']['git']``). Mock-based (fake
 SandboxedExecution / fake resource manager, mirroring
 ``tests/security/test_git_execution_mode.py``): no real git binary and no
 docker daemon are required.
@@ -98,10 +98,10 @@ def fake_manager():
 def _tool(tmp_path, **params):
     """Construct a GitWriteTool wired to the workspace for path validation.
 
-    Write operations require the session git_write permission, so it is set
+    Write operations require the session git permission, so it is set
     by default unless the caller overrides agent_config explicitly.
     """
-    params.setdefault("agent_config", {"session_permissions": {"git_write": "write"}})
+    params.setdefault("agent_config", {"session_permissions": {"git": "write"}})
     tool = GitWriteTool(**params)
     object.__setattr__(tool, "workspace_path", str(tmp_path))
     return tool
@@ -605,7 +605,7 @@ class TestWorktreeCommitGuard:
         assert tool._is_operator_managed_worktree(tmp_path) is False
 
     def test_other_write_ops_denied_without_flag_in_worktree(self, tmp_path):
-        # Without the session git_write permission the gate fires for every
+        # Without the session git permission the gate fires for every
         # write op, worktree or not: branch_create / stage / checkout all return
         # FLAG_ERROR before any git subprocess could run.
         self._make_worktree(tmp_path)

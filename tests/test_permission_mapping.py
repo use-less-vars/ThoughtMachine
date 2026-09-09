@@ -1,10 +1,11 @@
 """
 Permission mapping tests for the tool registration & naming cleanup.
 
-Verifies the security-gate git permission split (merged ``git`` level into
-``git_read`` / ``git_write`` sub-levels) and the frontend tool-list mapping
-(backend ``enabled_tools`` -> frontend ``tools`` list keyed by stable tool
-names) after the ``GitInfoTool`` -> ``GitReadTool`` / ``git_read`` cleanup.
+Verifies the canonical security-gate git permission handling (a single
+``git`` level passes through to the effective-permissions dict) and the
+frontend tool-list mapping (backend ``enabled_tools`` -> frontend ``tools``
+list keyed by stable tool names) after the ``GitInfoTool`` -> ``GitReadTool``
+/ ``git_read`` cleanup.
 """
 
 import pytest
@@ -46,36 +47,28 @@ class TestSplitGitPermission:
 
 
 class TestEffectivePermissionsGitSplit:
-    """get_effective_permissions exposes git_read/git_write for the gate."""
+    """get_effective_permissions carries a single canonical ``git`` level."""
 
     def _eff(self, git_level):
         return get_effective_permissions(
             SessionPermissions(git=git_level), WorkspaceCapabilities()
         )
 
-    def test_read_splits_to_read_banned(self):
+    def test_read_passthrough(self):
         eff = self._eff("read")
         assert eff["git"] == "read"
-        assert eff["git_read"] == "read"
-        assert eff["git_write"] == "banned"
 
-    def test_write_splits_to_write_write(self):
+    def test_write_passthrough(self):
         eff = self._eff("write")
         assert eff["git"] == "write"
-        assert eff["git_read"] == "write"
-        assert eff["git_write"] == "write"
 
-    def test_banned_splits_to_banned_banned(self):
+    def test_banned_passthrough(self):
         eff = self._eff("banned")
         assert eff["git"] == "banned"
-        assert eff["git_read"] == "banned"
-        assert eff["git_write"] == "banned"
 
-    def test_full_splits_to_full_full(self):
+    def test_full_passthrough(self):
         eff = self._eff("full")
         assert eff["git"] == "full"
-        assert eff["git_read"] == "full"
-        assert eff["git_write"] == "full"
 
     def test_workspace_git_unavailable_fail_closed(self):
         eff = get_effective_permissions(
@@ -83,8 +76,6 @@ class TestEffectivePermissionsGitSplit:
             WorkspaceCapabilities(git_available=False),
         )
         assert eff["git"] is False
-        assert eff["git_read"] is False
-        assert eff["git_write"] is False
 
     def test_workspace_defaults_are_permissive(self):
         caps = WorkspaceCapabilities()

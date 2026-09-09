@@ -702,16 +702,17 @@ def _resolve_worker_thread(
 _STRICTNESS_ORDER: dict[str, int] = {
     "container": 0,
     "filesystem": 1,
-    "execution": 2,
-    "network": 3,
+    "network": 2,
 }
 
 # Value ordering within each category: stricter = lower index
-# "deny" is stricter than "allow", "none" is stricter than "read"
+# "deny" is stricter than "allow", "none" is stricter than "read".  The maps
+# cover the legacy string vocabularies only; canonical category values outside
+# this vocab fall out of the map and merge session-wins (the session is the
+# ceiling, so a worker may never raise a level above it).
 _PERMISSION_ORDER: dict[str, dict[str, int]] = {
     "container": {"deny": 0, "allow": 1},
     "filesystem": {"none": 0, "read": 1, "write": 2},
-    "execution": {"deny": 0, "allow": 1},
     "network": {"deny": 0, "allow": 1},
 }
 
@@ -730,14 +731,16 @@ def _restrictive_merge(
 
     Examples
     --------
-    >>> _restrictive_merge({"execution": "allow"}, {"execution": "deny"})
-    {'execution': 'deny'}
-    >>> _restrictive_merge({"execution": "deny"}, {"execution": "allow"})
-    {'execution': 'deny'}        # session ceiling wins
-    >>> _restrictive_merge({"filesystem": "none"}, {"filesystem": "write"})
-    {'filesystem': 'none'}
+    # The session is the ceiling: the merged result may never exceed the
+    # session level, and unmapped (canonical) values merge session-wins.
+    >>> _restrictive_merge({"filesystem": "read"}, {"filesystem": "write"})
+    {'filesystem': 'read'}
+    >>> _restrictive_merge({"git": "read"}, {"git": "write"})
+    {'git': 'read'}
+    >>> _restrictive_merge({"network": "banned"}, {"network": "ask"})
+    {'network': 'banned'}
     >>> _restrictive_merge({"container": False}, {"container": True})
-    {'container': False}         # session ceiling wins
+    {'container': False}
     """
     result = {}
     all_keys = set(session_perms) | set(worker_perms)
@@ -765,36 +768,26 @@ def _restrictive_merge(
     return result
 
 
-_WOFB_GRAIN = "write_on_feature_branch"
-
-
 def _canonicalize_session_permissions(
     permissions: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Fold derived ``write_on_feature_branch`` split grains onto the canonical
-    ``git`` channel (worker AgentConfig boundary).
+    """Strip legacy permission grains at the worker AgentConfig boundary.
 
-    The permission gate mirrors canonical ``git='write_on_feature_branch'``
-    into the derived ``git_read`` / ``git_write`` split grains of the
-    effective-permissions dict (a plain-dict convenience for the tools layer
-    — see bca9663).  The config-bound ``SessionPermissions`` schema accepts
-    ``write_on_feature_branch`` ONLY on ``git``: the ``git_read`` /
-    ``git_write`` fields deliberately stay 4-value literals so the wofb value
-    must never reach them.  When a split grain carries the wofb echo we drop
-    it (absent means the gate re-derives it from ``git``); when the dict is
-    internally inconsistent (wofb grain without a canonical ``git`` wofb) we
-    fall back fail-closed to the category's safe default.
+    The canonical session-permission schema is exactly six categories
+    (``container | network | filesystem | git | mcp | host_bash``), with
+    ``write_on_feature_branch`` carried on the ``git`` channel.  The legacy
+    ``system``/``execution`` categories and the split ``git_read`` /
+    ``git_write`` grains were removed in the permission-schema unification
+    (the gate no longer mirrors ``git`` into derived grains).  Any legacy keys
+    surviving in the merged dict (stale worker definitions, hand-built test
+    configs) are dropped here — ``SessionPermissions`` ignores them anyway,
+    but the AgentConfig-bound dict stays canonical and unambiguous.
     """
     if not isinstance(permissions, dict):
         return permissions
-    canonical_wofb = permissions.get("git") == _WOFB_GRAIN
     result = dict(permissions)
-    for grain in ("git_read", "git_write"):
-        if result.get(grain) == _WOFB_GRAIN:
-            if canonical_wofb:
-                result.pop(grain, None)
-            else:
-                result[grain] = _load_safe_defaults().get(grain) or "banned"
+    for legacy in ("git_read", "git_write", "system", "execution"):
+        result.pop(legacy, None)
     return result
 
 
@@ -1658,10 +1651,10 @@ class WorkerThread(threading.Thread):
 
         # ── Inject session permissions (restrictive merge — session is ceiling) ──
         merged = _restrictive_merge(self._session_permissions, self._permission_footprint)
-        # Fold derived ``write_on_feature_branch`` split grains back onto the
-        # canonical ``git`` channel: SessionPermissions validates git_read /
-        # git_write against 4-value literals only (bca9663 invariant), so the
-        # AgentConfig-bound dict must never carry the wofb echo on a grain.
+        # Canonicalize: drop any legacy permission grains that survived the
+        # merge (stale worker definitions).  The AgentConfig-bound dict uses
+        # the canonical six-category schema, with write_on_feature_branch
+        # carried on the ``git`` channel.
         worker_cfg["session_permissions"] = _canonicalize_session_permissions(merged)
 
         # ── Safety net: inject workspace_path if missing ────────────────

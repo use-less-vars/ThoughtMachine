@@ -471,3 +471,15 @@ Every new event type must be added to every layer of the pipeline. Missing any s
 - If `status="ready"` and `alive=True`, the worker is ready for a follow-up `query`
 - If `status="stopped"` or `alive=False`, need to `spawn` fresh
 
+## cmd.exe .bat block-paren scanner (caret/quote/echo(-aware)
+
+## 2026-09-08 — Reusable scanner methodology for finding cmd.exe crash hazar...
+
+Reusable scanner methodology for finding cmd.exe crash hazards in .bat files (perfected during the install_thoughtmachine.bat Windows saga). Write a python script that walks lines tracking paren depth with these rules:
+- '(' and ')' ONLY count when OUTSIDE double quotes.
+- '^(' and '^)' are caret-escaped = LITERAL parens, never block tokens.
+- A line matching ^\s*echo\s*\( is the echo( idiom — does NOT open a block.
+- Parens inside REM comments / quoted strings are ONLY risky when current depth > 0 (inside a real open multi-line block). On top-level lines they are safe (they can only OPEN a block at the next ( that ends a line, and REM/quoted ones don't).
+- A line ending with an unclosed '(' at depth>0 opens a multi-line block that continues until matching ')'.
+Desired end state: unclosed depth == 0 at EOF and zero lines where (content with parens) sits inside an open block. Then grep-flag candidates for manual eyeball (REM w/ parens + python -c "...(...)" one-liners + call :label "text (parens)"): verify whether each flagged line is inside an open block; if yes, apply the flat single-line if/goto fix pattern (see bugs_and_fixes 'Windows .bat cmd.exe parsing saga'). All 5 repo .bat files pass depth=0 at EOF; install_thoughtmachine.bat is the only confirmed hazard instance fixed (a9ee26e).
+

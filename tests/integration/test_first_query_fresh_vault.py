@@ -328,7 +328,8 @@ class TestConfigChangedMessageStructure:
         assert result["permissions"]["network"] == "banned"
         # Default fields should be present
         assert result["permissions"].get("container") is not None
-        assert result["permissions"].get("execution") is not None
+        assert result["permissions"].get("mcp") is not None
+        assert result["permissions"].get("host_bash") is not None
 
         # --- merged_config equals config (full frontend format) ---
         assert result["merged_config"] == result["config"]
@@ -361,9 +362,9 @@ class TestConfigChangedMessageStructure:
         assert perms.get("filesystem") is not None
         assert perms.get("network") is not None
         assert perms.get("container") is not None
-        assert perms.get("system") is not None
+        assert perms.get("mcp") is not None
         assert perms.get("git") is not None
-        assert perms.get("execution") is not None
+        assert perms.get("host_bash") is not None
 
     def test_apply_config_changed_event_has_settings_permissions(self, hermetic_vault):
         """Config changed event sent to frontend has all new fields."""

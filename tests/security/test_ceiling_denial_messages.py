@@ -77,18 +77,15 @@ class TestCeilingCausedFilesystemDenial:
             _PERMISSIVE_CAPS,
             {"filesystem": "read"},
         )
-        # Content identical to a plain dict merge result …
+        # Content identical to a plain dict merge result — the effective
+        # dict carries exactly the six canonical category keys.
         assert eff["filesystem"] == "read"
         assert eff == {
             "filesystem": "read",
             "network": "banned",  # session default
             "container": False,
-            "git": "read",
-            "git_read": "read",
-            "git_write": "banned",
-            "system": "read",
+            "git": "read",  # session default
             "mcp": "banned",
-            "execution": "banned",
             "host_bash": "banned",
         }
         assert json.loads(json.dumps(eff)) == dict(eff)  # JSON-safe subclass
@@ -249,10 +246,10 @@ class TestWorkerFootprintAttribution:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Git split grains
+# 5. Git ceiling denials
 # ─────────────────────────────────────────────────────────────────────────────
 class TestGitCeilingDenials:
-    def test_git_ceiling_read_annotates_git_write_denial(self):
+    def test_git_write_denial_by_read_ceiling_annotates_category(self):
         eff = get_effective_permissions(
             SessionPermissions(git="write"),
             _PERMISSIVE_CAPS,
@@ -260,23 +257,34 @@ class TestGitCeilingDenials:
         )
         assert eff["git"] == "read"
         ann = getattr(eff, "_ceiling_annotations", {})
-        # Legacy 'git'-only session: the write grain derived from the capped
-        # git level is banned and attributed to the git ceiling.
-        assert ann.get("git_write") == {"pre": "write", "level": "read"}
-        msg = _deny(["git_write:write"], eff)
+        # The single canonical ``git`` category is annotated when the
+        # ceiling caps it; the legacy git_read/git_write split grains are
+        # no longer emitted, so the git:write requirement is what the
+        # ceiling binds.
+        assert ann.get("git") == {"pre": "write", "level": "read"}
+        msg = _deny(["git:write"], eff)
         assert msg.endswith(
-            "but session allows git_write:banned (workspace ceiling: read)"
+            "but session allows git:read (workspace ceiling: read)"
         )
 
-    def test_explicit_git_write_grain_capped_by_git_write_ceiling(self):
+    def test_git_write_denial_by_banned_ceiling(self):
+        """A ``banned`` git ceiling caps the write grant and is named in the
+        denial message (git_write ceiling grains were removed in the
+        permission-schema unification)."""
         eff = get_effective_permissions(
-            SessionPermissions(git="read", git_write="write"),
+            SessionPermissions(git="write"),
             _PERMISSIVE_CAPS,
-            {"git_write": "banned"},
+            {"git": "banned"},
         )
-        assert eff["git_write"] == "banned"
-        msg = _deny(["git_write:write"], eff)
-        assert "workspace ceiling: banned" in msg
+        assert eff["git"] == "banned"
+        assert getattr(eff, "_ceiling_annotations", {}).get("git") == {
+            "pre": "write",
+            "level": "banned",
+        }
+        msg = _deny(["git:write"], eff)
+        assert msg.endswith(
+            "but session allows git:banned (workspace ceiling: banned)"
+        )
 
     def test_plain_git_write_denial_by_read_ceiling(self):
         eff = get_effective_permissions(

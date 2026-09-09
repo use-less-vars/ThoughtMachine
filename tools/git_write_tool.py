@@ -20,9 +20,10 @@ class GitWriteTool(GitReadTool):
     """
     Git write operations tool (commit, init, clone, branch_create, checkout,
     stage, unstage).
-    Every write is gated (fail closed) on the session git_write permission
-    (``session_permissions['git_write']`` / effective ``git_write`` grain)
-    being ``write`` (or the outer ask gate having run), and on the agent's
+    Every write is gated (fail closed) on the session git permission
+    (``session_permissions['git']`` / the effective ``git`` grain) being
+    write-capable (``write``, ``full`` or ``write_on_feature_branch``) or
+    ``ask`` (the outer ask gate having run), and on the agent's
     ask policy enforced by the ToolExecutor / security gate. The
     read surface (status, diff, diff_cached, log, branch, branch_list, show,
     remote, blame, config) lives in ``GitReadTool`` (tools/git_info_tool.py);
@@ -84,19 +85,19 @@ class GitWriteTool(GitReadTool):
     )
 
     def _flag_gate_error(self) -> str:
-        """Return the git_write permission denial message (fail-closed gate)."""
+        """Return the git permission denial message (fail-closed gate)."""
         return 'Error: git:write denied: session git_write permission is not "write"'
 
     def _git_write_allowed(self) -> bool:
         """Fail-closed check that this write call may proceed.
 
         True when any of the following hold:
-        - effective permissions carry ``git_write`` of ``write``, ``full``
-          or ``write_on_feature_branch``;
-        - effective permissions carry ``git_write`` of ``ask`` (the outer
-          ToolExecutor gate already prompted and approved this call);
-        - the session_permissions dict explicitly sets ``git_write`` to
-          ``write``, ``full`` or ``write_on_feature_branch`` (direct-call
+        - the effective permissions carry a ``git`` level of ``write``,
+          ``full`` or ``write_on_feature_branch``;
+        - the effective ``git`` level is ``ask`` (the outer ToolExecutor
+          gate already prompted and approved this call);
+        - the session_permissions dict explicitly sets ``git`` to ``write``,
+          ``full`` or ``write_on_feature_branch`` (direct-call
           defense-in-depth).
 
         A ``write_on_feature_branch`` grant passes this gate (the outer
@@ -106,13 +107,13 @@ class GitWriteTool(GitReadTool):
         """
         effective = self.effective_permissions or {}
         if effective:
-            gw = effective.get("git_write")
+            gw = effective.get("git")
             if gw in ("write", "full", "write_on_feature_branch"):
                 return True
             if gw == "ask":
                 return True
         sp = (getattr(self, "agent_config", None) or {}).get("session_permissions") or {}
-        if isinstance(sp, dict) and sp.get("git_write") in (
+        if isinstance(sp, dict) and sp.get("git") in (
             "write", "full", "write_on_feature_branch",
         ):
             return True
@@ -120,23 +121,23 @@ class GitWriteTool(GitReadTool):
 
     def _git_write_restricted_to_feature_branch(self) -> bool:
         """True when this write call is governed by the
-        ``write_on_feature_branch`` grain (effective ``git_write`` when
+        ``write_on_feature_branch`` grant (the effective ``git`` level when
         present, else the session_permissions dict for direct callers).
 
         ``write`` / ``full`` / ``ask`` grants are never branch-restricted by
-        this tool: an effective ``git_write`` that is present but not
+        this tool: an effective ``git`` level that is present but not
         ``write_on_feature_branch`` is authoritative and returns False.
         """
         effective = self.effective_permissions or {}
         if effective:
-            gw = effective.get("git_write")
+            gw = effective.get("git")
             if gw == "write_on_feature_branch":
                 return True
             if gw is not None:
                 return False
         sp = (getattr(self, "agent_config", None) or {}).get("session_permissions") or {}
         if isinstance(sp, dict):
-            return sp.get("git_write") == "write_on_feature_branch"
+            return sp.get("git") == "write_on_feature_branch"
         return False
 
     def execute(self) -> str:
@@ -148,8 +149,8 @@ class GitWriteTool(GitReadTool):
         self._last_failure_reason = None
         self._last_fallback_used = False
 
-        # git_write permission gate (fail closed): every write requires the
-        # session git_write permission (effective or session_permissions).
+        # git permission gate (fail closed): every write requires a
+        # write-capable session git permission (effective or session_permissions).
         # Also enforced at the top of each _git_* write method as
         # defense-in-depth for direct callers.
         if not self._git_write_allowed():
@@ -293,7 +294,7 @@ class GitWriteTool(GitReadTool):
         """Narrow allow for agent commits in operator-managed worktrees.
         An agent commit is permitted in an operator-managed worktree only
         when ALL of the following hold:
-        1. The session git_write permission is ``write`` (``_git_write_allowed()``).
+        1. The session git permission is write-capable (``_git_write_allowed()``).
         2. Container git execution is active (``_use_container_mode()``).
         3. Container execution is mandatory for the branch check too: no
            host fallback may resolve the branch, because the host backend
@@ -416,8 +417,8 @@ class GitWriteTool(GitReadTool):
 
     def _git_branch_create(self, repo_root: Path) -> str:
         """Create a new branch (git branch <name>)."""
-        # git_write permission gate (fail closed): direct callers must also
-        # pass the session git_write permission check.
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.branch:
@@ -431,8 +432,8 @@ class GitWriteTool(GitReadTool):
 
     def _git_checkout(self, repo_root: Path) -> str:
         """Check out an existing branch (git checkout <name>)."""
-        # git_write permission gate (fail closed): direct callers must also
-        # pass the session git_write permission check.
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.branch:
@@ -449,8 +450,8 @@ class GitWriteTool(GitReadTool):
 
     def _git_stage(self, repo_root: Path) -> str:
         """Stage file path(s) (git add -- <paths>)."""
-        # git_write permission gate (fail closed): direct callers must also
-        # pass the session git_write permission check.
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.file_path:
@@ -466,8 +467,8 @@ class GitWriteTool(GitReadTool):
 
     def _git_unstage(self, repo_root: Path) -> str:
         """Unstage file path(s) (git reset HEAD -- <paths>)."""
-        # git_write permission gate (fail closed): direct callers must also
-        # pass the session git_write permission check.
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.file_path:
@@ -546,8 +547,8 @@ class GitWriteTool(GitReadTool):
         --no-verify). No vault-backed hooks are consulted. No agent-visible
         flags are added here.
         """
-        # git_write permission gate (fail closed): direct callers must also
-        # pass the session git_write permission check.
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
         # write_on_feature_branch grants: the outer git:write category gate
@@ -641,8 +642,8 @@ class GitWriteTool(GitReadTool):
 
     def _git_init(self, repo_root: Path) -> str:
         """Initialize a new git repository in the target directory."""
-        # git_write permission gate (fail closed): direct callers must also
-        # pass the session git_write permission check.
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
         # Ensure the directory exists
@@ -653,8 +654,8 @@ class GitWriteTool(GitReadTool):
 
     def _git_clone(self, repo_root: Path) -> str:
         """Clone a remote git repository into the workspace."""
-        # git_write permission gate (fail closed): direct callers must also
-        # pass the session git_write permission check.
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.clone_url:

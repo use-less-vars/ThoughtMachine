@@ -361,9 +361,13 @@ class TestCheckSystem:
         assert "nonexistent_query" in result["error"]
         assert result["status"] == "denied"
 
-    def test_required_categories_requires_system_read(self):
-        """CheckSystem requires system:read because it inspects host state and can run subprocesses."""
-        assert CheckSystem.required_categories == ["system:read"]
+    def test_no_gate_category_system_checks_always_available(self):
+        """CheckSystem declares NO gate category: the canonical effective dict
+        has no 'system' key (session resources: filesystem/network/container/
+        git/mcp/host_bash), so a legacy 'system:read' category would make
+        check_required_categories deny EVERY query (unknown category -> fail
+        closed). Access control is the vault query allowlist."""
+        assert CheckSystem.required_categories == []
 
     # ── New query tests ────────────────────────────────────────────────
 

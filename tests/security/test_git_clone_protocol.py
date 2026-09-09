@@ -10,7 +10,8 @@ Verifies:
 3.  ``execute(operation='clone', ...)`` surfaces the protocol ``ValueError``
     (returned as the error string) *before* any git subprocess would run
     (the atomic ``network:outbound`` gate is pre-approved via
-    ``effective_permissions``).
+    ``effective_permissions``; the write path is gated on the session's
+    canonical ``git`` permission, per the 6-key contract).
 
 **Docker note:** ``tests/security/conftest.py`` fixes ``sys.path`` so the
 real ``tools/`` and ``security/`` packages are imported instead of the
@@ -73,6 +74,21 @@ class TestValidateCloneUrlAccepts:
 
 
 class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
+    @staticmethod
+    def _clone_tool(clone_url: str, network_level: str) -> GitWriteTool:
+        """Build a clone tool whose write gate passes (canonical ``git``
+        session grain = ``write``) and whose network grain is ``network_level``
+        (drives the atomic ``network:outbound`` re-check inside execute())."""
+        return GitWriteTool(
+            operation="clone",
+            clone_url=clone_url,
+            effective_permissions={
+                "git": "write",
+                "network": network_level,
+            },
+            agent_config={"session_permissions": {"git": "write"}},
+        )
+
     @pytest.mark.parametrize(
         "clone_url",
         [
@@ -84,30 +100,24 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
     def test_execute_raises_value_error(self, clone_url):
         """execute() returns the protocol error before any git clone.
 
-        The atomic network:outbound check is pre-approved (effective
-        permissions "outbound"), so execution reaches the clone-URL validation,
+        The write gate is pre-approved (canonical ``git`` grain ``write``)
+        and the atomic network:outbound check is pre-approved (effective
+        network ``outbound``), so execution reaches the clone-URL validation,
         which must reject instead of handing the URL to a git subprocess.
         GitWriteTool.execute() catches the ValueError and returns it as the
         error string ("Error: Unsupported git protocol: <url>").
         """
-        tool = GitWriteTool(
-            operation="clone",
-            clone_url=clone_url,
-            effective_permissions={"network": "outbound"},
-            agent_config={"session_permissions": {"git_write": "write"}},
-        )
+        tool = self._clone_tool(clone_url, network_level="outbound")
         result = tool.execute()
         assert isinstance(result, str)
         assert "Unsupported git protocol" in result
 
     def test_execute_without_network_permission_denied_by_gate(self):
         """Without network:outbound the atomic gate denies before validation."""
-        tool = GitWriteTool(
-            operation="clone",
-            clone_url='ext::sh -c "echo pwned"',
-            effective_permissions={"network": "banned"},
-            agent_config={"session_permissions": {"git_write": "write"}},
+        tool = self._clone_tool(
+            'ext::sh -c "echo pwned"', network_level="banned"
         )
         result = tool.execute()
         assert isinstance(result, str)
         assert "Atomic permission check failed" in result
+

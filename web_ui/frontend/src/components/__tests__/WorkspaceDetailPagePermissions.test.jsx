@@ -104,16 +104,12 @@ function makeSummary(overrides = {}) {
     root_path: '~/workspaces/ws-test-1',
     allow_host_resources: false,
     permissions: {
-      git_read: 'read',
-      git_write: 'ask',
-      host_bash: 'banned',
-      container: 'ask',
-      network: 'ask',
-      filesystem: 'read',
-      system: 'read',
       git: 'read',
-      execution: 'banned',
+      filesystem: 'read',
+      container: false,
+      network: 'ask',
       mcp: 'banned',
+      host_bash: 'banned',
     },
     resource_catalog: CATALOG,
     active_sessions: [],
@@ -169,16 +165,12 @@ afterEach(() => {
 describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
   it('renders every resource card with the correct per-resource ceiling control', async () => {
     await renderPermissionsTab()
-    // The 10 validator-gated ceiling keys render as editors in validator
-    // order (git, git_read, git_write, filesystem, network, system, execution,
-    // mcp, container, host_bash) plus the informational tty/jtag cards.
-    expect(document.querySelectorAll('.wdp-resource-card').length).toBe(12)
+    // The 6 validator-gated ceiling keys render as editors in validator order
+    // (git, filesystem, container, network, mcp, host_bash) plus the
+    // informational tty/jtag cards.
+    expect(document.querySelectorAll('.wdp-resource-card').length).toBe(8)
     // Fallback metadata labels the ceiling keys the catalog does not describe.
-    expect(screen.getByText('Git (read)')).toBeInTheDocument()
-    expect(screen.getByText('Git (write)')).toBeInTheDocument()
     expect(screen.getByText('Network')).toBeInTheDocument()
-    expect(screen.getByText('System')).toBeInTheDocument()
-    expect(screen.getByText('Execution')).toBeInTheDocument()
     expect(screen.getByText('MCP')).toBeInTheDocument()
     // Ceiling dropdowns offer the resource's FULL canonical vocabulary (the
     // same level set that resource accepts as a session grant), with the
@@ -187,15 +179,8 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     expect(
       Array.from(cardFor('Git').getByRole('combobox').options).map((o) => o.value)
     ).toEqual(['banned', 'ask', 'read', 'write_on_feature_branch', 'write'])
-    expect(
-      Array.from(cardFor('Git (read)').getByRole('combobox').options).map((o) => o.value)
-    ).toEqual(['banned', 'ask', 'read', 'write'])
     expect(cardFor('Filesystem').getByRole('combobox')).toHaveValue('read')
-    expect(cardFor('Git (read)').getByRole('combobox')).toHaveValue('read')
-    expect(cardFor('Git (write)').getByRole('combobox')).toHaveValue('ask')
     expect(cardFor('Network').getByRole('combobox')).toHaveValue('ask')
-    expect(cardFor('System').getByRole('combobox')).toHaveValue('read')
-    expect(cardFor('Execution').getByRole('combobox')).toHaveValue('banned')
     expect(cardFor('MCP').getByRole('combobox')).toHaveValue('banned')
     // network offers banned|ask|write|outbound (no read); mcp offers its own
     // scale banned|connect|full; host_bash stays banned|ask|allow.
@@ -205,13 +190,13 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     expect(
       Array.from(cardFor('MCP').getByRole('combobox').options).map((o) => o.value)
     ).toEqual(['banned', 'connect', 'full'])
-    expect(screen.getAllByRole('combobox')).toHaveLength(9)
+    expect(screen.getAllByRole('combobox')).toHaveLength(5)
     // host_bash: dropdown over banned|ask|allow (never read/write).
     expect(cardFor('Host bash').getByRole('combobox')).toHaveValue('banned')
     expect(
       Array.from(cardFor('Host bash').getByRole('combobox').options).map((o) => o.value)
     ).toEqual(['banned', 'ask', 'allow'])
-    // Container: a real boolean toggle, not a string dropdown ('ask' maps OFF).
+    // Container: a real boolean toggle, not a string dropdown (false = OFF).
     expect(cardFor('Container').queryByRole('combobox')).toBeNull()
     expect(cardFor('Container').getByRole('switch', { name: 'Toggle Container' })).toHaveAttribute(
       'aria-checked',
@@ -224,12 +209,12 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     expect(cardFor('JTAG').getByText('Not permission-gated')).toBeInTheDocument()
     // Banned/off resources render as Disabled with an Off switch; catalog rows
     // carry the execution-context badge. Enabled = read/ask/write (or ON for
-    // container) so 6 of the 9 string-level cards are Enabled here.
+    // container) so 3 of the 5 string-level cards are Enabled here.
     expect(cardFor('Container').getByText('Disabled')).toBeInTheDocument()
     expect(cardFor('Container').getByText('Off')).toBeInTheDocument()
     expect(cardFor('Git').getByText('Enabled')).toBeInTheDocument()
-    expect(screen.getAllByText('Enabled')).toHaveLength(6)
-    expect(screen.getAllByText('Disabled')).toHaveLength(4)
+    expect(screen.getAllByText('Enabled')).toHaveLength(3)
+    expect(screen.getAllByText('Disabled')).toHaveLength(3)
     // git/filesystem/container/host_bash catalog rows + tty/jtag all carry the
     // 'containerized' execution-context badge.
     expect(screen.getAllByText('containerized')).toHaveLength(6)
@@ -259,7 +244,7 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     await screen.findAllByText('Permissions updated')
     expect(putCalls.length).toBe(1)
     // The container ceiling leaves the editor as a real boolean, never a
-    // 'banned'/'ask' string (the preset value this fixture starts from).
+    // 'banned'/'ask' string (the fixture's canonical default is false).
     expect(putCalls[0].permissions).toEqual({
       ...makeSummary().permissions,
       container: true,

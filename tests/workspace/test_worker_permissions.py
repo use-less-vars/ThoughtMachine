@@ -5,6 +5,14 @@ Verifies that worker-level permissions are merged *restrictively* with
 session permissions — the session acts as a ceiling that the worker
 cannot exceed, though the worker may impose stricter limits.
 
+Canonical permission schema (permission-schema unification):
+  Exactly six categories: container | network | filesystem | git | mcp |
+  host_bash.  The legacy ``system``/``execution`` categories and the split
+  ``git_read``/``git_write`` grains no longer exist; worker definitions
+  that still request them are merged fail-closed (a canonical category
+  absent from the session resolves to its SAFE_DEFAULTS level) and any
+  legacy grain is stripped at the AgentConfig boundary.
+
 Key behavioural change (2025-04):
   Old: union merge (worker could elevate, e.g. container: true over false)
   New: restrictive merge (session is ceiling — the strictest value wins)
@@ -23,6 +31,7 @@ from tools.workspace.worker import (
     DEFAULT_WORKER_SYSTEM_PROMPT,
     WorkerThread,
 )
+from tools.workspace.worker_thread import _canonicalize_session_permissions
 from tools import SIMPLIFIED_TOOL_CLASSES
 
 
@@ -31,19 +40,21 @@ class TestRestrictiveMerge:
 
     def test_session_ceiling_wins_string(self):
         """When session is stricter than worker, session value prevails."""
+        # Canonical values outside the legacy strictness maps merge
+        # session-wins: the session is the ceiling.
         result = _restrictive_merge(
-            {"execution": "deny"},
-            {"execution": "allow"},
+            {"git": "read"},
+            {"git": "write"},
         )
-        assert result == {"execution": "deny"}
+        assert result == {"git": "read"}
 
     def test_worker_can_be_stricter_string(self):
         """Worker can reduce a permission (make it stricter)."""
         result = _restrictive_merge(
-            {"execution": "allow"},
-            {"execution": "deny"},
+            {"filesystem": "write"},
+            {"filesystem": "read"},
         )
-        assert result == {"execution": "deny"}
+        assert result == {"filesystem": "read"}
 
     def test_equal_values_string(self):
         """Equal values are preserved."""
@@ -125,15 +136,29 @@ class TestRestrictiveMerge:
 
     def test_session_missing_key(self):
         """Key only in worker falls back to the category's safe default."""
-        # NOTE: a category absent from the session never takes the worker
-        # value directly — it falls back to the fail-closed safe default
-        # ("execution" -> "banned"), so a worker cannot grant itself a
+        # NOTE: a canonical category absent from the session never takes the
+        # worker value directly — it falls back to the fail-closed safe
+        # default (host_bash -> "banned"), so a worker cannot grant itself a
         # category the session does not expose.
+        result = _restrictive_merge(
+            {"filesystem": "read"},
+            {"host_bash": "ask"},
+        )
+        assert result == {"filesystem": "read", "host_bash": "banned"}
+
+    def test_legacy_worker_only_key_resolves_none(self):
+        """Legacy category only in worker has no safe default -> None.
+
+        The SAFE_DEFAULTS map only covers the six canonical categories, so a
+        stale legacy grain (``execution``) requested by a worker resolves to
+        ``None`` in the raw merge; _canonicalize_session_permissions then
+        strips it at the AgentConfig boundary.
+        """
         result = _restrictive_merge(
             {"filesystem": "read"},
             {"execution": "deny"},
         )
-        assert result == {"filesystem": "read", "execution": "banned"}
+        assert result == {"filesystem": "read", "execution": None}
 
     def test_worker_missing_key(self):
         """Key only in session is used as-is."""
@@ -148,17 +173,49 @@ class TestRestrictiveMerge:
         assert _restrictive_merge({}, {}) == {}
 
     def test_unknown_key_passthrough(self):
-        """Unknown key (e.g. 'git', 'system') passes through with session wins."""
+        """Unmapped canonical key (e.g. 'git', 'mcp') passes through session-wins."""
         result = _restrictive_merge(
-            {"git": "read"},
-            {"git": "write"},
+            {"git": "read", "mcp": "banned"},
+            {"git": "write", "mcp": "connect"},
         )
-        assert result == {"git": "read"}
+        assert result == {"git": "read", "mcp": "banned"}
+
+
+class TestCanonicalizeSessionPermissions:
+    """Direct tests of the AgentConfig-boundary canonicalization."""
+
+    def test_strips_legacy_grains(self):
+        merged = {
+            "container": False,
+            "filesystem": "read",
+            "git_read": "read",
+            "git_write": "write",
+            "system": "banned",
+            "execution": None,
+        }
+        assert _canonicalize_session_permissions(merged) == {
+            "container": False,
+            "filesystem": "read",
+        }
+
+    def test_keeps_canonical_categories(self):
+        merged = {
+            "container": False,
+            "network": "banned",
+            "filesystem": "read",
+            "git": "write_on_feature_branch",
+            "mcp": "banned",
+            "host_bash": "ask",
+        }
+        assert _canonicalize_session_permissions(merged) == merged
+
+    def test_non_dict_passthrough(self):
+        assert _canonicalize_session_permissions(None) is None
 
 
 @pytest.fixture
 def _mock_agent_config():
-    """Patch AgentConfig inside worker.py so _build_agent_config returns a mock.
+    """Patch AgentConfig inside worker_thread.py so _build_agent_config returns a mock.
 
     Injects a stub module into sys.modules so the lazy import inside
     _build_agent_config (``from agent.config.models import AgentConfig``)
@@ -204,11 +261,20 @@ class TestWorkerPermissionsMergeIntegration:
     """Integration tests via _build_agent_config."""
 
     def test_session_ceiling_enforced(self, _mock_agent_config):
-        """Session False denies even if worker requests True."""
+        """Session False denies even if worker requests True.
+
+        Canonical category the session does not expose (network) is filled
+        with its fail-closed safe default; a legacy worker grain (execution)
+        is stripped at the AgentConfig boundary.
+        """
         session_perms = {"container": False, "filesystem": "read"}
         definition = {
             "name": "test-worker",
-            "permission_footprint": {"container": True, "execution": "full"},
+            "permission_footprint": {
+                "container": True,
+                "network": "write",
+                "execution": "full",
+            },
         }
         wt = make_worker_thread(definition, session_perms)
 
@@ -220,14 +286,14 @@ class TestWorkerPermissionsMergeIntegration:
         assert merged == {
             "container": False,
             "filesystem": "read",
-            # NOTE: "execution" is absent from the session, so the worker's
-            # "full" is replaced by the fail-closed safe default ("banned").
-            "execution": "banned",
+            # network absent from the session -> fail-closed safe default
+            "network": "banned",
         }, f"Expected container=False (ceiling), got {merged}"
+        assert "execution" not in merged
 
     def test_worker_can_strengthen(self, _mock_agent_config):
         """Worker can make a permission stricter than the session."""
-        session_perms = {"container": True, "filesystem": "write"}
+        session_perms = {"container": True, "filesystem": "write", "git": "write"}
         definition = {
             "name": "test-worker",
             "permission_footprint": {"filesystem": "read", "execution": "deny"},
@@ -242,10 +308,9 @@ class TestWorkerPermissionsMergeIntegration:
         assert merged == {
             "container": True,
             "filesystem": "read",
-            # NOTE: "execution" is absent from the session, so the worker's
-            # "deny" is replaced by the fail-closed safe default ("banned").
-            "execution": "banned",
+            "git": "write",
         }, f"Expected filesystem=read (worker stricter), got {merged}"
+        assert "execution" not in merged
 
     def test_backward_compat_worker_permissions_key(self, _mock_agent_config):
         """'worker_permissions' key (backward compat) is used when 'permission_footprint' not present."""
@@ -264,10 +329,8 @@ class TestWorkerPermissionsMergeIntegration:
         assert merged == {
             "container": False,
             "filesystem": "none",
-            # NOTE: "execution" is absent from the session, so the worker's
-            # "deny" is replaced by the fail-closed safe default ("banned").
-            "execution": "banned",
         }, f"Expected filesystem=none (worker stricter), got {merged}"
+        assert "execution" not in merged
 
     def test_no_permission_footprint(self, _mock_agent_config):
         """When worker has neither permission_footprint nor worker_permissions, session permissions pass through unchanged."""
@@ -285,12 +348,17 @@ class TestWorkerPermissionsMergeIntegration:
             "filesystem": "read",
         }, f"Expected unchanged session permissions, got {merged}"
 
-    def test_worker_fills_gap(self, _mock_agent_config):
-        """Worker adds a category not in session permissions."""
+    def test_worker_cannot_fill_gap(self, _mock_agent_config):
+        """Worker requesting a category not in session permissions is fail-closed.
+
+        A canonical category (network) absent from the session resolves to its
+        safe default rather than the worker's own permissive value; a legacy
+        grain (execution) is stripped entirely.
+        """
         session_perms = {"filesystem": "read"}
         definition = {
             "name": "test-worker",
-            "permission_footprint": {"execution": "allow"},
+            "permission_footprint": {"network": "write", "execution": "allow"},
         }
         wt = make_worker_thread(definition, session_perms)
 
@@ -301,10 +369,9 @@ class TestWorkerPermissionsMergeIntegration:
         merged = call_kwargs.get("session_permissions", {})
         assert merged == {
             "filesystem": "read",
-            # NOTE: "execution" is absent from the session, so the worker's
-            # "allow" is replaced by the fail-closed safe default ("banned").
-            "execution": "banned",
-        }, f"Expected worker to fill gap, got {merged}"
+            "network": "banned",
+        }, f"Expected network to fall back to safe default, got {merged}"
+        assert "execution" not in merged
 
     def test_default_tool_set(self, _mock_agent_config):
         """When definition has no 'tools', enabled_tools = SIMPLIFIED_TOOL_CLASSES minus blocklist."""
@@ -338,4 +405,3 @@ class TestWorkerPermissionsMergeIntegration:
         assert prompt == DEFAULT_WORKER_SYSTEM_PROMPT, (
             f"Expected DEFAULT_WORKER_SYSTEM_PROMPT, got {prompt[:80]!r}..."
         )
-

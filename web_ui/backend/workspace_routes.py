@@ -824,14 +824,15 @@ async def get_effective_permissions(
                 session_perms = None
 
     if session_perms is None:
-        # Default safety: read-only filesystem, no network, no container
+        # Default safety: read-only filesystem; no network, container,
+        # mcp or host-shell access
         session_perms = SessionPermissions(
             container=False,
             network="banned",
             filesystem="read",
-            system="read",
             git="read",
-            execution="banned",
+            mcp="banned",
+            host_bash="banned",
         )
 
     # ── Load the workspace permission ceiling. Only explicitly saved
@@ -866,8 +867,8 @@ async def get_effective_permissions(
             "network": session_perms.network,
             "container": session_perms.container,
             "git": session_perms.git,
-            "system": session_perms.system,
-            "execution": session_perms.execution,
+            "mcp": session_perms.mcp,
+            "host_bash": session_perms.host_bash,
             "workspace_restrictions": {
                 "allow_docker": caps.allow_docker,
                 "allow_network": caps.allow_network,

@@ -40,12 +40,12 @@ function stubBackend(entry = ENTRY, extra = {}) {
     '/api/workspace/list': jsonOk([entry]),
     [`/api/workspace/${id}/effective_permissions`]: jsonOk({
       effective_permissions: {
-        filesystem: 'write',
-        network: 'read',
         git: 'write',
-        system: 'read',
-        execution: 'banned',
+        filesystem: 'write',
         container: true,
+        network: 'read',
+        mcp: 'banned',
+        host_bash: 'banned',
       },
     }),
     '/api/health/containers': jsonOk({ docker: 'reachable' }),
@@ -135,7 +135,7 @@ describe('WorkspacePanel — tab navigation', () => {
     expect(screen.getByRole('button', { name: 'Add Resource' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('tab', { name: 'Permissions' }))
     expect(screen.getByRole('heading', { name: 'Permissions' })).toBeInTheDocument()
-    expect(screen.getByText('execution')).toBeInTheDocument()
+    expect(screen.getByText('mcp')).toBeInTheDocument()
     expect(screen.getAllByText('banned').length).toBeGreaterThanOrEqual(1)
     fireEvent.click(screen.getByRole('tab', { name: 'Tools' }))
     expect(screen.getByRole('heading', { name: 'Tools' })).toBeInTheDocument()
@@ -284,12 +284,12 @@ describe('WorkspacePanel — safety advisory', () => {
     stubBackend(ENTRY, {
       '/api/workspace/ws-test-1/effective_permissions': jsonOk({
         effective_permissions: {
-          filesystem: 'write',
-          network: 'write',
           git: 'write',
-          system: 'read',
-          execution: 'banned',
+          filesystem: 'write',
           container: true,
+          network: 'write',
+          mcp: 'banned',
+          host_bash: 'banned',
         },
       }),
     })

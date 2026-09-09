@@ -1,6 +1,17 @@
 # Roadmap
 Milestones and future plans. **Restructured 2026-08-16**: completed phases (Phase 2, Phase 2.5, Tasks 1-4) moved to `archive_arch_b.md`; future-ideas retained.
 > **LOST (2026-08-16, S2 incident):** the `V3 ORDER` section (operator priority list) was uncommitted in the working tree at restore time and is not recoverable from git/workspace. The authoritative 1–14 status list survives in `personal/task_tracker.md` → OPERATOR HANDOFF. Please re-supply the section from host-side if available.
+## 2026-09-09 — EPOCH PLAN / Mid-Term Design snapshot (archived)
+
+> The main engineer's mid-term design document + 10-phase epoch plan to a stable V3
+> foundation ("the goal we had back then", current as of 2026-09-09) is archived VERBATIM at
+> **`project/epoch_plan.md`** — do not confuse it with this roadmap's older pre-epoch phase
+> tables below. The epoch plan is the authoritative 2026-09-09 sequence (Phases 1-10:
+> permission consistency → resource catalog → UI navigation → safe internet → container
+> resources → stable release → security P0 → resource workflow → credentials → comm gate/MCP);
+> this file's Phase 3-7 tables + Future Ideas below are earlier-era history/ideas. Its
+> deferred items are also digestable from `personal/parking_lot.md` (Sections B & C.8).
+
 ## Current Status (2026-08-16)
 - V3 ORDER section: LOST (see note above); 1–14 status list preserved in task_tracker.md OPERATOR HANDOFF.
 

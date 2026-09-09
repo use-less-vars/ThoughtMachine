@@ -22,22 +22,24 @@ def test_purpose_presets_apply_default_permissions():
     assert WORKSPACE_PURPOSES == ["coding", "research", "general"]
 
     coding = preset_default_permissions("coding")
-    assert coding["git_read"] == "read"
-    assert coding["git_write"] == "ask"
+    # The canonical git ceiling (ask) admits read grants plus prompted
+    # (ask) write grants, preserving the legacy two-grain intent.
+    assert coding["git"] == "ask"
     assert coding["host_bash"] == "banned"
     assert coding["filesystem"] == "write"
 
     research = preset_default_permissions("research")
-    assert research["git_write"] == "banned"
+    # The canonical read ceiling keeps research workspaces read-only
+    # (legacy two-grain intent: git_write banned).
+    assert research["git"] == "read"
     assert research["container"] is False
     assert research["network"] == "ask"
 
     assert preset_default_permissions("general") == catalog_default_permissions()
 
     # Custom overrides win over preset defaults.
-    merged = apply_purpose_preset("coding", custom_permissions={"git_write": "write"})
-    assert merged["git_write"] == "write"
-    assert merged["git_read"] == "read"
+    merged = apply_purpose_preset("coding", custom_permissions={"git": "write"})
+    assert merged["git"] == "write"
 
 
 def test_workspace_registration_with_purpose(tmp_path, monkeypatch):
@@ -61,7 +63,7 @@ def test_workspace_registration_with_purpose(tmp_path, monkeypatch):
         assert resp.status_code == 201
         data = resp.json()
         assert data["purpose"] == "coding"
-        assert data["permissions"]["git_write"] == "ask"
+        assert data["permissions"]["git"] == "ask"
         assert data["permissions"]["host_bash"] == "banned"
         assert data["risk"]["level"] in ("low", "medium", "high")
 
@@ -75,4 +77,4 @@ def test_workspace_registration_with_purpose(tmp_path, monkeypatch):
     )
     assert saved["purpose"] == "coding"
     assert saved["permissions"]["filesystem"] == "write"
-    assert saved["permissions"]["git_write"] == "ask"
+    assert saved["permissions"]["git"] == "ask"

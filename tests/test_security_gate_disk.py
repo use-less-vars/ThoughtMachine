@@ -11,8 +11,8 @@ Dual-mode contract (security/security_gate.py):
   (``<vault>/workspaces/<ws>/sessions/<sid>/permissions.json``) and the
   workspace ceiling from ``<vault>/workspaces/<ws>/config.json``.  Disk
   mode fails CLOSED: missing/corrupt store state yields the all-banned
-  10-key result shape (including ``host_bash: "banned"``), never default
-  grants.
+  six-key result shape (``container: False``, every string category
+  ``banned``), never default grants.
 
 The ``hermetic_vault`` fixture (tests/conftest.py) monkeypatches
 ``thoughtmachine.vault.vault_root()`` to a temp vault, which the gate's
@@ -30,18 +30,14 @@ from security.security_gate import get_effective_permissions
 # merge below never downgrades beyond what the disk ceiling/grants dictate.
 _FULL_CAPS = WorkspaceCapabilities()
 
-# The fail-closed 10-key shape produced by a deny-all session + deny-all
+# The fail-closed six-key shape produced by a deny-all session + deny-all
 # ceiling merged with the fully-permissive workspace caps.
 ALL_BANNED = {
-    "filesystem": "banned",
-    "network": "banned",
     "container": False,
+    "network": "banned",
+    "filesystem": "banned",
     "git": "banned",
-    "git_read": "banned",
-    "git_write": "banned",
-    "system": "banned",
     "mcp": "banned",
-    "execution": "banned",
     "host_bash": "banned",
 }
 
@@ -85,12 +81,10 @@ def test_disk_mode_grant_wider_than_ceiling_is_capped(hermetic_vault):
     )
     assert eff["filesystem"] == "read"  # capped by ceiling
     assert eff["git"] == "read"
-    assert eff["git_read"] == "read"  # derived from capped git
-    assert eff["git_write"] == "banned"
-    assert eff["system"] == "read"  # grant-side default passes through
+    assert eff["container"] is False  # session default (no grant)
+    assert eff["network"] == "banned"  # session default (no grant)
     assert eff["mcp"] == "banned"
-    assert eff["execution"] == "banned"
-    assert eff["container"] is False
+    assert eff["host_bash"] == "banned"
 
 
 def test_disk_mode_compatible_grants_pass_ceiling(hermetic_vault):
@@ -119,15 +113,15 @@ def test_disk_mode_compatible_grants_pass_ceiling(hermetic_vault):
     )
     assert eff["filesystem"] == "write"
     assert eff["git"] == "write"
-    assert eff["git_read"] == "write"
-    assert eff["git_write"] == "write"
     assert eff["network"] == "write"
     assert eff["container"] is True
+    assert eff["mcp"] == "banned"
+    assert eff["host_bash"] == "banned"
 
 
 def test_disk_mode_missing_session_record_fails_closed(hermetic_vault):
     """(c) Missing session record (no sidecar, no legacy fallback) -> the
-    all-banned 10-key shape, no exception — even with a permissive ceiling."""
+    all-banned six-key shape, no exception — even with a permissive ceiling."""
     ws_id = "ws-c"
     _write_config(
         hermetic_vault, ws_id,
@@ -143,7 +137,7 @@ def test_disk_mode_missing_session_record_fails_closed(hermetic_vault):
 
 
 def test_disk_mode_corrupt_sidecar_fails_closed(hermetic_vault):
-    """(d) Corrupt permission sidecar -> all-banned shape, no exception."""
+    """(d) Corrupt permission sidecar -> all-banned six-key shape, no exception."""
     ws_id, sid = "ws-d", "sess-1"
     _write_corrupt_sidecar(hermetic_vault, ws_id, sid)
     _write_config(
@@ -161,7 +155,7 @@ def test_disk_mode_corrupt_sidecar_fails_closed(hermetic_vault):
 
 def test_disk_mode_missing_or_corrupt_config_fails_closed(hermetic_vault):
     """(e) Missing or corrupt workspace config.json (no ceiling readable) ->
-    all-banned shape, no exception."""
+    all-banned six-key shape, no exception."""
     ws_id, sid = "ws-e", "sess-1"
     # Grant is perfectly readable — the unreadable ceiling still fails closed.
     write_session_permissions(
@@ -220,10 +214,11 @@ def test_disk_mode_equals_legacy_explicit_args(hermetic_vault):
         workspace_id=ws_id,
     )
     assert disk == legacy
-    # Sanity on the shared shape: git capped to read, write grain denied.
+    # Sanity on the shared shape: git capped to read by the ceiling.
     assert legacy["git"] == "read"
-    assert legacy["git_write"] == "banned"
     assert legacy["filesystem"] == "write"
+    assert legacy["network"] == "write"
+    assert legacy["container"] is True
 
 
 def test_explicit_workspace_permissions_win_over_disk_ids(hermetic_vault):
@@ -250,7 +245,7 @@ def test_explicit_workspace_permissions_win_over_disk_ids(hermetic_vault):
     )
     assert eff["filesystem"] == "read"  # explicit ceiling applied
     assert eff["git"] == "read"
-    assert eff["git_write"] == "banned"
+    assert eff["container"] is False
 
     # Control: same ids, workspace_permissions=None -> disk mode says write.
     disk = get_effective_permissions(

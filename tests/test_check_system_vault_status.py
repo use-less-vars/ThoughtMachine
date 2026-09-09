@@ -95,9 +95,13 @@ def test_check_system_vault_status_returns_report_without_secrets(tmp_path):
     assert out["vault_root"] == str(tmp_vault)
 
 
-def test_check_system_vault_status_respects_permissions():
-    """vault_status is gated by system:read and blocked by the allowlist."""
-    assert CheckSystem.required_categories == ["system:read"]
+def test_check_system_vault_status_not_gated_by_session_permissions():
+    """vault_status is NOT gated by a permission category: CheckSystem declares
+    no required categories (the canonical effective dict has no 'system' key;
+    resources are filesystem/network/container/git/mcp/host_bash), so a legacy
+    'system:read' category would fail-closed deny every query. Access control
+    is the vault query allowlist."""
+    assert CheckSystem.required_categories == []
 
     with patch.object(
         CheckSystem, "_load_allowlist_from_vault", return_value=["my_config"]

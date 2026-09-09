@@ -1,9 +1,14 @@
-"""SessionConfig is the session-level owner of git grains and worker fields.
+"""SessionConfig is the session-level owner of git permissions and worker fields.
 
-The session owns the ``git_read`` / ``git_write`` permission grains and the
-``worker_timeout_seconds`` / ``worker_max_retries`` worker fields. They fold
-into the AgentConfig produced by ``to_agent_config()`` only when set (None is
-the fail-closed default), and they are hot-swappable at runtime.
+The session's canonical git permission lives in ``session_permissions['git']``
+(one of the six canonical keys). The removed legacy top-level ``git_read`` /
+``git_write`` keys are migrated on load by ``SessionConfig``'s before-validator:
+``git_read`` is dropped, and ``git_write == 'write'`` (or the removed
+``git_allow_worktree_commits == True`` flag) folds into
+``session_permissions['git'] = 'write'``; other ``git_write`` values are
+dropped. The ``worker_timeout_seconds`` / ``worker_max_retries`` worker fields
+fold into the AgentConfig produced by ``to_agent_config()`` only when set
+(None is the fail-closed default), and they are hot-swappable at runtime.
 """
 
 from agent.config.models import AgentConfig, HOT_SWAPPABLE
@@ -13,27 +18,34 @@ from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 
 class TestSessionGitGrainFolding:
-    def test_grains_fold_into_session_permissions(self):
+    def test_git_write_grain_folds_into_session_permissions(self):
+        # Legacy git_read is dropped; git_write == 'write' folds into git.
         ac = SessionConfig(git_read='read', git_write='write').to_agent_config()
-        assert ac.session_permissions.git_read == 'read'
-        assert ac.session_permissions.git_write == 'write'
+        assert ac.session_permissions.git == 'write'
 
-    def test_grains_merge_with_existing_permissions_dict(self):
+    def test_fold_merges_with_existing_session_permissions_dict(self):
         ac = SessionConfig(
             session_permissions={'filesystem': 'write'}, git_write='write'
         ).to_agent_config()
         assert ac.session_permissions.filesystem == 'write'
-        assert ac.session_permissions.git_write == 'write'
+        assert ac.session_permissions.git == 'write'
 
-    def test_none_grains_not_present(self):
+    def test_no_legacy_grains_keeps_canonical_git_default(self):
         ac = SessionConfig().to_agent_config()
-        assert ac.session_permissions.git_read is None
-        assert ac.session_permissions.git_write is None
+        assert ac.session_permissions.git == 'read'  # canonical default
 
-    def test_effective_permissions_use_session_grain(self):
+    def test_non_write_legacy_git_write_is_dropped(self):
+        ac = SessionConfig(git_write='write_on_feature_branch').to_agent_config()
+        assert ac.session_permissions.git == 'read'  # default retained
+
+    def test_git_allow_worktree_commits_true_folds_equally(self):
+        ac = SessionConfig(git_allow_worktree_commits=True).to_agent_config()
+        assert ac.session_permissions.git == 'write'
+
+    def test_effective_permissions_use_canonical_git_permission(self):
         ac = SessionConfig(git_read='read', git_write='write').to_agent_config()
         eff = get_effective_permissions(ac.session_permissions, WorkspaceCapabilities())
-        assert eff['git_write'] == 'write'
+        assert eff['git'] == 'write'
 
 
 class TestWorkerFieldsSessionOwned:
@@ -73,7 +85,8 @@ class TestLegacyAllowHostResourcesDropped:
         )
         dumped = cfg.model_dump()
         assert "allow_host_resources" not in dumped
-        assert dumped["git_write"] == "write"
+        assert "git_write" not in dumped
+        assert dumped["session_permissions"]["git"] == "write"
 
     def test_attribute_absent(self):
         cfg = SessionConfig.model_validate({"allow_host_resources": True})

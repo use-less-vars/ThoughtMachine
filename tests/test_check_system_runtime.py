@@ -53,11 +53,22 @@ def test_my_config_uses_runtime_not_disk():
 
 def test_effective_permissions_uses_runtime():
     """effective_permissions comes from get_effective_permissions(session, caps)."""
+    # Bind the module object CURRENT at call time: security-gate suites in this
+    # repo purge/replace sys.modules entries for tools.workspace.check_system
+    # while running, so a collection-time import can point at a stale module
+    # whose globals a string-based patch no longer reaches. Same idiom as
+    # tests/test_session_load_ceiling.py (patch the live module, then build
+    # the tool from that same module object).
+    import tools.workspace.check_system as cs_module
+
     mock_perms = MagicMock(return_value={"filesystem": "read", "network": "deny"})
     with patch.object(
-        CheckSystem, "_load_allowlist_from_vault", return_value=["effective_permissions"]
-    ), patch("tools.workspace.check_system.get_effective_permissions", mock_perms):
-        tool = CheckSystem(query="effective_permissions", **BASE_KWARGS)
+        cs_module.CheckSystem, "_load_allowlist_from_vault",
+        return_value=["effective_permissions"],
+    ), patch.object(cs_module, "get_effective_permissions", mock_perms), patch.object(
+        cs_module, "GATE_AVAILABLE", True
+    ):
+        tool = cs_module.CheckSystem(query="effective_permissions", **BASE_KWARGS)
         result = _parse_result(tool.execute())
     assert result["effective_permissions"] == {"filesystem": "read", "network": "deny"}
     assert result["source"] == "gate"
@@ -157,7 +168,7 @@ def test_effective_permissions_reports_canonical_git_only():
     assert result["permission_origin"] == "executor-disk"
 
 
-def test_effective_permissions_folds_session_mirror_git_grains_without_gate():
+def test_effective_permissions_session_mirror_reports_canonical_git_without_gate():
     """session-mirror fallback still reports a canonical git level (display-only)."""
     with patch.object(
         CheckSystem, "_load_allowlist_from_vault", return_value=["effective_permissions"]
@@ -166,8 +177,7 @@ def test_effective_permissions_folds_session_mirror_git_grains_without_gate():
             query="effective_permissions",
             session_permissions={
                 "filesystem": "read",
-                "git_read": "write",
-                "git_write": "write_on_feature_branch",
+                "git": "write_on_feature_branch",
             },
         )
         result = _parse_result(tool.execute())

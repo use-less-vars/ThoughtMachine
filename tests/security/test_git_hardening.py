@@ -33,6 +33,14 @@ import pytest
 from tools.git_info_tool import GitInfoTool
 from tools.git_write_tool import GitWriteTool
 
+# Canonical fail-closed gate denial returned by GitWriteTool for direct calls
+# when the session git permission is not write-capable (byte-identical to
+# test_git_info_tool_operations.FLAG_ERROR and to the tool's
+# _flag_gate_error(); the in-tool gate reads ``agent_config['session_permissions']
+# ['git']`` / the effective ``git`` grain -- the legacy ``git_write`` agent key
+# is no longer consulted).
+FLAG_ERROR = 'Error: git:write denied: session git_write permission is not "write"'
+
 
 def _run_git_clean(cwd: Path, *args) -> subprocess.CompletedProcess:
     """Run git with a sanitized environment (mirrors the tool's hardening)."""
@@ -87,7 +95,7 @@ def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
         file_path=file_path,
         working_dir=str(repo),
         workspace_path=str(workspace),
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "write"}},
     )
 
 
@@ -239,7 +247,7 @@ def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file
         workspace_path=str(workspace),
         workspace_id=ws_id,
         session_permissions=dict(FULL_PERMISSIONS),
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "write"}},
     )
 
 
@@ -371,7 +379,12 @@ def test_failing_vault_pre_commit_hook_does_not_abort(tmp_path, monkeypatch):
 
 
 def test_commit_denied_without_git_write_permission(hardened_repo):
-    """Committing without git:write fails closed with PermissionError."""
+    """Committing without a write-capable session git permission fails closed.
+
+    The in-tool gate returns the canonical denial string (FLAG_ERROR) before
+    any git subprocess can run -- direct-call semantics mirroring
+    test_git_info_tool_operations -- so nothing is committed.
+    """
     workspace, repo, _ = hardened_repo
     (repo / "hello.txt").write_text("hi\n")
     _run_git_clean(repo, "add", "hello.txt")
@@ -381,18 +394,10 @@ def test_commit_denied_without_git_write_permission(hardened_repo):
         file_path="hello.txt",
         working_dir=str(repo),
         workspace_path=str(workspace),
-        session_permissions={
-            "git": "read",
-            "container": False,
-            "network": "banned",
-            "filesystem": "read",
-            "system": "read",
-            "execution": "banned",
-        },
-        agent_config={"session_permissions": {"git_write": "write"}},
+        agent_config={"session_permissions": {"git": "read"}},
     )
-    with pytest.raises(PermissionError):
-        tool.execute()
+    result = tool.execute()
+    assert result == FLAG_ERROR
     log = _run_git_clean(repo, "log", "--oneline")
     assert log.returncode != 0  # nothing was committed
 
