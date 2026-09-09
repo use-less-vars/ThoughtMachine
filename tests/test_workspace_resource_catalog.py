@@ -33,10 +33,15 @@ def test_resource_catalog_default_permissions():
     levels = catalog_permission_levels()
     assert list(defaults.keys()) == catalog_resource_names()
     for name, level in defaults.items():
+        # Boolean ceilings (container) are normalised separately; string
+        # levels must be part of the canonical vocabulary.
+        if isinstance(level, bool):
+            continue
         assert level in levels, f"resource '{name}' has invalid default level '{level}'"
     assert defaults["git_read"] == "read"
     assert defaults["git_write"] == "ask"
     assert defaults["host_bash"] == "banned"
+    assert defaults["container"] is False
     assert levels == ["banned", "ask", "read", "write"]
 
 
@@ -76,7 +81,7 @@ def test_resource_catalog_json_matches_loader():
     ]
     legacy_defaults = {
         "git_read": "read", "git_write": "ask", "host_bash": "banned",
-        "container": "ask", "network": "ask", "filesystem": "read",
+        "container": False, "network": "ask", "filesystem": "read",
         "system": "read", "git": "read", "execution": "banned",
         "mcp": "banned",
     }

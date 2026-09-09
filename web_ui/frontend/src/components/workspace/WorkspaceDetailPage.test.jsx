@@ -71,7 +71,7 @@ function makeSummary(overrides = {}) {
       git_read: 'read',
       git_write: 'ask',
       host_bash: 'banned',
-      container: 'ask',
+      container: false,
       network: 'ask',
       filesystem: 'read',
       system: 'read',
@@ -330,13 +330,25 @@ describe('WorkspaceDetailPage', () => {
     await screen.findByText('Research Sandbox')
     fireEvent.click(screen.getByRole('tab', { name: 'Permissions & Resources' }))
 
-    // One card per resource_catalog entry: display name, description,
-    // execution-context badge and the tool list.
+    // All 10 validator-gated ceiling keys render as editor cards (validator
+    // order), not just the 3 catalog rows: catalog entries supply the display
+    // name/description/tools/context badge, missing keys fall back to fixed
+    // metadata (Git (read), Git (write), Network, System, Execution, MCP,
+    // Container).
     expect(screen.getByText('Git')).toBeInTheDocument()
     expect(screen.getByText('Version control access to repositories.')).toBeInTheDocument()
     expect(screen.getByText('Filesystem')).toBeInTheDocument()
     expect(screen.getByText('Read and write access to workspace files.')).toBeInTheDocument()
     expect(screen.getByText('Host shell')).toBeInTheDocument()
+    expect(screen.getByText('Git (read)')).toBeInTheDocument()
+    expect(screen.getByText('Git (write)')).toBeInTheDocument()
+    expect(screen.getByText('Network')).toBeInTheDocument()
+    expect(screen.getByText('System')).toBeInTheDocument()
+    expect(screen.getByText('Execution')).toBeInTheDocument()
+    expect(screen.getByText('MCP')).toBeInTheDocument()
+    expect(screen.getByText('Container')).toBeInTheDocument()
+    expect(document.querySelectorAll('.wdp-resource-card').length).toBe(10)
+    // Execution-context badges exist only on catalog rows (here: 3).
     expect(screen.getAllByText('containerized')).toHaveLength(3)
     // Tools render as individual chips (not a comma-joined string).
     expect(screen.getByText('git_read')).toBeInTheDocument()
@@ -344,31 +356,44 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getByText('read_file')).toBeInTheDocument()
     expect(screen.getByText('file_editor')).toBeInTheDocument()
     expect(screen.getByText('apply_edits')).toBeInTheDocument()
-    expect(screen.getAllByText('Enabled')).toHaveLength(2)
-    expect(screen.getByText('Disabled')).toBeInTheDocument()
+    // Enabled = level !== banned (container false maps OFF), so git,
+    // git_read, git_write, filesystem, network and system are Enabled.
+    expect(screen.getAllByText('Enabled')).toHaveLength(6)
+    expect(screen.getAllByText('Disabled')).toHaveLength(4)
+
+    // Nine ceiling selects in validator order; container has NO dropdown —
+    // it is a real boolean switch (Off for false). Each select offers that
+    // key's full canonical ceiling vocabulary:
+    //   git            banned|ask|read|write_on_feature_branch|write
+    //   git_read, git_write, filesystem, system, execution
+    //                  banned|ask|read|write
+    //   network        banned|ask|write|outbound
+    //   mcp            banned|connect|full
+    //   host_bash      banned|ask|allow
+    const selects = screen.getAllByRole('combobox')
+    expect(selects).toHaveLength(9)
+    const optionValues = (index) =>
+      Array.from(selects[index].options).map((o) => o.value)
+    expect(optionValues(0)).toEqual([
+      'banned',
+      'ask',
+      'read',
+      'write_on_feature_branch',
+      'write',
+    ])
+    const generic = ['banned', 'ask', 'read', 'write']
+    expect(optionValues(1)).toEqual(generic)
+    expect(optionValues(2)).toEqual(generic)
+    expect(optionValues(3)).toEqual(generic)
+    expect(optionValues(4)).toEqual(['banned', 'ask', 'write', 'outbound'])
+    expect(optionValues(5)).toEqual(generic)
+    expect(optionValues(6)).toEqual(generic)
+    expect(optionValues(7)).toEqual(['banned', 'connect', 'full'])
+    expect(optionValues(8)).toEqual(['banned', 'ask', 'allow'])
+    const containerToggle = screen.getByRole('switch', { name: 'Toggle Container' })
+    expect(containerToggle).toHaveAttribute('aria-checked', 'false')
 
     // Changing a dropdown marks pending state.
-    const selects = screen.getAllByRole('combobox')
-    expect(selects).toHaveLength(3)
-    // Each select offers exactly the vocabulary the backend validator accepts:
-    // generic banned|ask|read|write, and banned|ask|allow for host_bash.
-    expect(Array.from(selects[0].options).map((o) => o.value)).toEqual([
-      'banned',
-      'ask',
-      'read',
-      'write',
-    ])
-    expect(Array.from(selects[1].options).map((o) => o.value)).toEqual([
-      'banned',
-      'ask',
-      'read',
-      'write',
-    ])
-    expect(Array.from(selects[2].options).map((o) => o.value)).toEqual([
-      'banned',
-      'ask',
-      'allow',
-    ])
     fireEvent.change(selects[0], { target: { value: 'write' } })
     expect(screen.getByText('Unsaved changes')).toBeInTheDocument()
 
@@ -385,7 +410,7 @@ describe('WorkspaceDetailPage', () => {
         git_read: 'read',
         git_write: 'ask',
         host_bash: 'banned',
-        container: 'ask',
+        container: false,
         network: 'ask',
         filesystem: 'read',
         system: 'read',

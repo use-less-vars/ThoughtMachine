@@ -57,29 +57,95 @@ function TabPlaceholder({ tab }) {
 
 // ---- Permissions & Resources tab --------------------------------------------
 
-// Per-resource ceiling vocabulary. The backend serves the workspace ceiling as
-// the 10-key legacy permission map while summary.resource_catalog is the 6-entry
-// "new level" array whose generic permission_grain_set does NOT match what the
-// PUT /{ws_id}/permissions validator actually accepts:
-//   - generic resources accept banned|ask|read|write
-//   - host_bash accepts banned|ask|allow only
+// Per-resource ceiling vocabulary. The PUT /{ws_id}/permissions validator
+// (agent/config/resource_catalog.validate_workspace_permissions) accepts exactly
+// the 10 ceiling keys in CEILING_KEY_ORDER with a per-resource canonical
+// vocabulary -- the SAME full level set that resource accepts as a session
+// grant (git write_on_feature_branch, network outbound, mcp connect/full are
+// all valid ceiling levels too, so every dropdown below offers the full set):
+//   - git accepts banned|ask|read|write_on_feature_branch|write
+//   - git_read, git_write, filesystem, system, execution accept
+//     banned|ask|read|write
+//   - network accepts banned|ask|write|outbound
+//   - mcp accepts banned|connect|full
+//   - host_bash accepts banned|ask|allow
 //   - container is a real boolean (true == write-level enabled)
-//   - tty/jtag are not permission-gated (the validator rejects them outright)
-// So the editors are driven from this table, never from entry.permission_grain_set.
+// summary.resource_catalog only supplies card metadata (labels, descriptions,
+// tools, execution context); when a ceiling key has no catalog entry the card
+// falls back to CEILING_METADATA_FALLBACK so all 10 keys stay editable even
+// with an empty catalog. tty/jtag appear in the catalog but are NOT
+// permission-gated (the validator rejects them outright) and render as
+// informational cards after the 10 editors. So the editors are driven from
+// this table, never from entry.permission_grain_set.
 const GENERIC_CEILING_LEVELS = ['banned', 'ask', 'read', 'write']
+const GIT_CEILING_LEVELS = ['banned', 'ask', 'read', 'write_on_feature_branch', 'write']
+const NETWORK_CEILING_LEVELS = ['banned', 'ask', 'write', 'outbound']
+const MCP_CEILING_LEVELS = ['banned', 'connect', 'full']
 const HOST_BASH_CEILING_LEVELS = ['banned', 'ask', 'allow']
 
 export const CONTAINER_CEILING = 'boolean'
 
+// Fixed render order for the 10 ceiling-gated keys (validator order).
+const CEILING_KEY_ORDER = [
+  'git',
+  'git_read',
+  'git_write',
+  'filesystem',
+  'network',
+  'system',
+  'execution',
+  'mcp',
+  'container',
+  'host_bash',
+]
+
+// Display metadata for ceiling keys that may have no summary.resource_catalog
+// row (the catalog usually covers git/filesystem/container/host_bash; these
+// fallbacks keep every card readable even when a row is missing).
+const CEILING_METADATA_FALLBACK = {
+  git_read: {
+    display_name: 'Git (read)',
+    description: 'Read access to git repositories (fetch/log/diff/status).',
+  },
+  git_write: {
+    display_name: 'Git (write)',
+    description: 'Write access to git repositories (commit/push/branch).',
+  },
+  network: {
+    display_name: 'Network',
+    description: 'Outbound network access from the execution context.',
+  },
+  system: {
+    display_name: 'System',
+    description: 'System-level operations (processes, environment, users).',
+  },
+  execution: {
+    display_name: 'Execution',
+    description: 'Command and code execution in the workspace context.',
+  },
+  mcp: {
+    display_name: 'MCP',
+    description: 'MCP server connections and tool access.',
+  },
+  container: {
+    display_name: 'Container',
+    description: 'Container-sandboxed code execution (Docker runtime).',
+  },
+  host_bash: {
+    display_name: 'Host bash',
+    description: 'Direct shell command execution on the host machine.',
+  },
+}
+
 export const WORKSPACE_CEILING_OPTIONS = {
-  git: GENERIC_CEILING_LEVELS,
+  git: GIT_CEILING_LEVELS,
   git_read: GENERIC_CEILING_LEVELS,
   git_write: GENERIC_CEILING_LEVELS,
   filesystem: GENERIC_CEILING_LEVELS,
-  network: GENERIC_CEILING_LEVELS,
+  network: NETWORK_CEILING_LEVELS,
   system: GENERIC_CEILING_LEVELS,
   execution: GENERIC_CEILING_LEVELS,
-  mcp: GENERIC_CEILING_LEVELS,
+  mcp: MCP_CEILING_LEVELS,
   container: CONTAINER_CEILING,
   host_bash: HOST_BASH_CEILING_LEVELS,
 }
@@ -103,114 +169,138 @@ function PermissionsResourcesTab({
   dirty,
 }) {
   const catalog = Array.isArray(summary.resource_catalog) ? summary.resource_catalog : []
+  const catalogByName = new Map(catalog.map((entry) => [entry.name, entry]))
 
-  if (catalog.length === 0) {
+  function renderResourceCard({ name, label, context, description, options, tools, current }) {
+    const booleanCeiling = options === CONTAINER_CEILING
+    const noCeilingControl = options === undefined
+    const enabled = booleanCeiling ? containerCeilingEnabled(current) : current !== 'banned'
     return (
-      <div className="wdp-tab-content">
-        <div className="wdp-empty">No resource catalog available.</div>
+      <div className="wdp-resource-card" key={name}>
+        <div className="wdp-resource-header">
+          <span className="wdp-resource-name">{label}</span>
+          {context !== null && (
+            <span className="wdp-badge wdp-context-badge">{context}</span>
+          )}
+          {noCeilingControl ? (
+            <span className="wdp-badge wdp-context-badge">Not permission-gated</span>
+          ) : (
+            <span
+              className={
+                enabled ? 'wdp-badge wdp-badge-enabled' : 'wdp-badge wdp-badge-disabled'
+              }
+            >
+              {enabled ? 'Enabled' : 'Disabled'}
+            </span>
+          )}
+        </div>
+        <div className="wdp-resource-desc">{description}</div>
+        <div className="wdp-resource-controls">
+          {booleanCeiling ? (
+            <React.Fragment>
+              <label className="wdp-perm-label">Permission</label>
+              <button
+                type="button"
+                className={'wdp-toggle' + (enabled ? ' wdp-toggle-on' : '')}
+                onClick={() => onPermissionChange(name, !enabled)}
+                role="switch"
+                aria-checked={enabled}
+                aria-label={'Toggle ' + label}
+              >
+                <span className="wdp-toggle-knob" />
+              </button>
+              <span className="wdp-toggle-state">{enabled ? 'On' : 'Off'}</span>
+            </React.Fragment>
+          ) : noCeilingControl ? (
+            <span className="wdp-tools-none">No ceiling control.</span>
+          ) : (
+            <React.Fragment>
+              <label className="wdp-perm-label">
+                Permission
+                <select
+                  className="wdp-perm-select"
+                  value={current}
+                  onChange={(event) => onPermissionChange(name, event.target.value)}
+                >
+                  {options.map((level) => (
+                    <option key={level} value={level}>
+                      {level}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className={'wdp-toggle' + (enabled ? ' wdp-toggle-on' : '')}
+                onClick={() =>
+                  onPermissionChange(name, enabled ? 'banned' : firstEnabledLevel(options))
+                }
+                role="switch"
+                aria-checked={enabled}
+                aria-label={'Toggle ' + label}
+              >
+                <span className="wdp-toggle-knob" />
+              </button>
+              <span className="wdp-toggle-state">{enabled ? 'On' : 'Off'}</span>
+            </React.Fragment>
+          )}
+        </div>
+        <div className="wdp-tools-list">
+          <span className="wdp-tools-label">Tools:</span>
+          {Array.isArray(tools) && tools.length > 0 ? (
+            tools.map((tool) => (
+              <span className="wdp-tools-chip" style={TOOL_CHIP_STYLE} key={tool}>
+                {tool}
+              </span>
+            ))
+          ) : (
+            <span className="wdp-tools-none">none</span>
+          )}
+        </div>
       </div>
     )
   }
 
+  // Fixed-order 10 ceiling-gated cards: every key the PUT validator accepts is
+  // always editable here, catalog row or not (metadata falls back gracefully).
+  const ceilingCards = CEILING_KEY_ORDER.map((name) => {
+    const entry = catalogByName.get(name)
+    const fallback = CEILING_METADATA_FALLBACK[name]
+    return renderResourceCard({
+      name,
+      label: (entry && entry.display_name) || (fallback && fallback.display_name) || name,
+      context: entry ? entry.default_execution_context || 'unknown context' : null,
+      description:
+        (entry && entry.description) ||
+        (fallback && fallback.description) ||
+        'No description provided.',
+      options: WORKSPACE_CEILING_OPTIONS[name],
+      tools: entry ? entry.tools : null,
+      current: localPermissions?.[name] ?? 'banned',
+    })
+  })
+
+  // Catalog rows outside the 10-key ceiling map (tty/jtag...) are not
+  // permission-gated; keep them as informational cards after the editors.
+  const informationalCards = catalog
+    .filter((entry) => WORKSPACE_CEILING_OPTIONS[entry.name] === undefined)
+    .map((entry) =>
+      renderResourceCard({
+        name: entry.name,
+        label: entry.display_name || entry.name,
+        context: entry.default_execution_context || 'unknown context',
+        description: entry.description || 'No description provided.',
+        options: undefined,
+        tools: entry.tools,
+        current: localPermissions?.[entry.name] ?? 'banned',
+      })
+    )
+
   return (
     <div className="wdp-tab-content">
       <div className="wdp-section-title">Resource permissions</div>
-      {catalog.map((entry) => {
-        const name = entry.name
-        const options = WORKSPACE_CEILING_OPTIONS[name]
-        const booleanCeiling = options === CONTAINER_CEILING
-        const noCeilingControl = options === undefined
-        const current = localPermissions?.[name] ?? 'banned'
-        const enabled = booleanCeiling
-          ? containerCeilingEnabled(current)
-          : current !== 'banned'
-        return (
-          <div className="wdp-resource-card" key={name}>
-            <div className="wdp-resource-header">
-              <span className="wdp-resource-name">{entry.display_name || name}</span>
-              <span className="wdp-badge wdp-context-badge">
-                {entry.default_execution_context || 'unknown context'}
-              </span>
-              {noCeilingControl ? (
-                <span className="wdp-badge wdp-context-badge">Not permission-gated</span>
-              ) : (
-                <span
-                  className={
-                    enabled ? 'wdp-badge wdp-badge-enabled' : 'wdp-badge wdp-badge-disabled'
-                  }
-                >
-                  {enabled ? 'Enabled' : 'Disabled'}
-                </span>
-              )}
-            </div>
-            <div className="wdp-resource-desc">
-              {entry.description || 'No description provided.'}
-            </div>
-            <div className="wdp-resource-controls">
-              {booleanCeiling ? (
-                <React.Fragment>
-                  <label className="wdp-perm-label">Permission</label>
-                  <button
-                    type="button"
-                    className={'wdp-toggle' + (enabled ? ' wdp-toggle-on' : '')}
-                    onClick={() => onPermissionChange(name, !enabled)}
-                    role="switch"
-                    aria-checked={enabled}
-                    aria-label={'Toggle ' + (entry.display_name || name)}
-                  >
-                    <span className="wdp-toggle-knob" />
-                  </button>
-                  <span className="wdp-toggle-state">{enabled ? 'On' : 'Off'}</span>
-                </React.Fragment>
-              ) : noCeilingControl ? (
-                <span className="wdp-tools-none">No ceiling control.</span>
-              ) : (
-                <React.Fragment>
-                  <label className="wdp-perm-label">
-                    Permission
-                    <select
-                      className="wdp-perm-select"
-                      value={current}
-                      onChange={(event) => onPermissionChange(name, event.target.value)}
-                    >
-                      {options.map((level) => (
-                        <option key={level} value={level}>
-                          {level}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <button
-                    type="button"
-                    className={'wdp-toggle' + (enabled ? ' wdp-toggle-on' : '')}
-                    onClick={() =>
-                      onPermissionChange(name, enabled ? 'banned' : firstEnabledLevel(options))
-                    }
-                    role="switch"
-                    aria-checked={enabled}
-                    aria-label={'Toggle ' + (entry.display_name || name)}
-                  >
-                    <span className="wdp-toggle-knob" />
-                  </button>
-                  <span className="wdp-toggle-state">{enabled ? 'On' : 'Off'}</span>
-                </React.Fragment>
-              )}
-            </div>
-            <div className="wdp-tools-list">
-              <span className="wdp-tools-label">Tools:</span>
-              {Array.isArray(entry.tools) && entry.tools.length > 0 ? (
-                entry.tools.map((tool) => (
-                  <span className="wdp-tools-chip" style={TOOL_CHIP_STYLE} key={tool}>
-                    {tool}
-                  </span>
-                ))
-              ) : (
-                <span className="wdp-tools-none">none</span>
-              )}
-            </div>
-          </div>
-        )
-      })}
+      {ceilingCards}
+      {informationalCards}
 
       <div className="wdp-perm-apply-row">
         {applyError && <div className="wdp-apply-error">{applyError}</div>}

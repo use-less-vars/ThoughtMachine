@@ -2,14 +2,14 @@
 """Tests for the supervised host_bash tool.
 
 All execution is mocked — ``subprocess`` is patched so no real host shell
-command ever runs.  Execution gating is decided solely by the effective
-``host_bash`` permission grain (``ask`` / ``allow``); after the
-permission-simplification refactor the legacy vault ``allow_host_resources``
-flags are no longer consulted.  Vault fixtures (``workspaces/<id>/config.json``
-and ``sessions/<id>/config.json``) are still written under pytest's
-``tmp_path`` with ``THOUGHTMACHINE_VAULT_ROOT`` pointing at them - purely
-to prove host_bash ignores them; the real vault is never touched.  The audit
-log (JSONL) is written under ``tmp_path`` too.
+command ever runs.  Gating is two-layered: the workspace operator policy
+``allow_host_resources`` (``workspaces/<id>/config.json``, read in-tool via
+``tools.host_resource_policy`` from the ``THOUGHTMACHINE_VAULT_ROOT`` env,
+fail-closed when the config is missing) is checked BEFORE the effective
+``host_bash`` permission grain (``ask`` / ``allow``) flow.  The session vault
+config and the legacy injected ``agent_config`` flag remain unconsulted
+fixtures, written purely to prove host_bash ignores them; the real vault is
+never touched.  The audit log (JSONL) is written under ``tmp_path`` too.
 """
 
 import json
@@ -42,9 +42,11 @@ def make_tool(
 ):
     """Build a HostBashTool wired to tmp_path vault fixtures + audit log.
 
-    The vault cfg writes are legacy fixtures: host_bash no longer reads
-    workspace/session ``allow_host_resources`` configs, but keeping them
-    lets tests prove the flags are ignored.
+    The workspace cfg write is read by the tool as an operator gate
+    (``tools.host_resource_policy`` resolves it from the
+    ``THOUGHTMACHINE_VAULT_ROOT`` env; missing configs fail closed); the
+    session cfg and the legacy injected ``agent_config`` flag are
+    unconsulted fixtures kept to prove host_bash ignores them.
     """
     vault = tmp_path / "vault"
     if create_workspace_cfg:
@@ -85,7 +87,9 @@ def read_audit(tmp_path, audit_log_path=None):
 
 
 # ---------------------------------------------------------------------------
-# Permission-grain gating (grain is the only gate; vault flags are legacy)
+# Workspace-policy + permission-grain gating (workspace allow_host_resources
+# is the operator gate, read in-tool and checked before the host_bash
+# grain/approval flow; session cfg and agent_config flag are never consulted)
 # ---------------------------------------------------------------------------
 
 def test_host_bash_grain_allow_executes(tmp_path, monkeypatch):
@@ -106,87 +110,90 @@ def test_host_bash_grain_allow_executes(tmp_path, monkeypatch):
     assert records[0]["command"] == "echo hello"
 
 
-def test_host_bash_vault_flags_and_configs_do_not_block_grain_allow(tmp_path, monkeypatch):
-    """Workspace/session vault allow_host_resources flags no longer gate host_bash.
-
-    After the permission-simplification refactor execution is decided solely by
-    the effective 'host_bash' grain (ask/allow). Legacy vault flags (workspace
-    or session, present or missing, true or false) and the legacy injected
-    agent_config flag must not block a grain-allowed run, and the result must
-    never mention allow_host_resources.
-    """
-    scenarios = [
-        {"ws_allow": False},
-        {"create_workspace_cfg": False},
-        {"session_allow": False, "agent_allow": False},
-        {"create_session_cfg": False, "agent_allow": False},
-        {"ws_allow": False, "session_allow": False, "agent_allow": False},
-        {
-            "ws_allow": False,
-            "session_allow": False,
-            "agent_allow": False,
-            "create_workspace_cfg": False,
-            "create_session_cfg": False,
-        },
-    ]
-    for kwargs in scenarios:
-        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
-            mock_subprocess.run.return_value = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-            tool = make_tool(tmp_path, monkeypatch, **kwargs)
-            result = json.loads(tool.execute())
-        assert result["success"] is True, kwargs
-        assert result["outcome"] == "executed", kwargs
-        assert "allow_host_resources" not in result.get("error", ""), kwargs
-        mock_subprocess.run.assert_called_once()
+def test_host_bash_disabled_when_workspace_denies_host_resources(tmp_path, monkeypatch):
+    """Workspace allow_host_resources=false is an operator gate: denies even an 'allow' grain."""
+    msg = "Host execution is disabled for this workspace (allow_host_resources=false)"
+    with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+        mock_subprocess.run.return_value = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        tool = make_tool(tmp_path, monkeypatch, ws_allow=False, grain="allow")
+        result = json.loads(tool.execute())
+    assert result["success"] is False
+    assert result["outcome"] == "denied"
+    assert result["permission_level"] == "allow"
+    assert msg in result["error"]
+    mock_subprocess.run.assert_not_called()
+    records = read_audit(tmp_path)
+    assert len(records) == 1
+    assert records[0]["outcome"] == "deny"
+    assert msg in records[0]["reason"]
 
 
-def test_host_bash_ask_approval_independent_of_vault_flag(tmp_path, monkeypatch):
-    """(scenario a) 'ask' approval flow runs even with the legacy vault flag false."""
-    with mock.patch.object(HostBashTool, "_request_approval", return_value="approved"):
+def test_host_bash_fails_closed_when_workspace_config_missing(tmp_path, monkeypatch):
+    """A missing workspace config fails closed: no config means no host resources."""
+    msg = "Host execution is disabled for this workspace (allow_host_resources=false)"
+    with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+        mock_subprocess.run.return_value = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        tool = make_tool(tmp_path, monkeypatch, create_workspace_cfg=False, grain="allow")
+        result = json.loads(tool.execute())
+    assert result["success"] is False
+    assert result["outcome"] == "denied"
+    assert msg in result["error"]
+    mock_subprocess.run.assert_not_called()
+    records = read_audit(tmp_path)
+    assert records[0]["outcome"] == "deny"
+    assert msg in records[0]["reason"]
+
+
+def test_host_bash_workspace_flag_wins_over_ask_never_prompts(tmp_path, monkeypatch):
+    """Workspace deny short-circuits before the ask grain: no approval request is made."""
+    msg = "Host execution is disabled for this workspace (allow_host_resources=false)"
+    with mock.patch.object(
+        HostBashTool, "_request_approval", side_effect=AssertionError("must not prompt")
+    ):
         with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
             tool = make_tool(tmp_path, monkeypatch, ws_allow=False, grain="ask")
             result = json.loads(tool.execute())
-    assert result["success"] is True
-    assert result["outcome"] == "executed"
+    assert result["success"] is False
+    assert result["outcome"] == "denied"
     assert result["permission_level"] == "ask"
-    assert "allow_host_resources" not in result.get("error", "")
+    assert msg in result["error"]
+    mock_subprocess.run.assert_not_called()
     records = read_audit(tmp_path)
-    assert records[0]["outcome"] == "allow"
+    assert records[0]["outcome"] == "deny"
+    assert msg in records[0]["reason"]
 
 
-def test_host_bash_grain_denied_wins_over_vault_flags(tmp_path, monkeypatch):
-    """(scenario b) A banned/missing grain denies regardless of vault flags."""
+def test_host_bash_workspace_flag_wins_over_banned_grain(tmp_path, monkeypatch):
+    """Workspace deny dominates banned/missing grains; the grain still labels the denial."""
+    msg = "Host execution is disabled for this workspace (allow_host_resources=false)"
     for grain in ("banned", None):
-        tool = make_tool(
-            tmp_path,
-            monkeypatch,
-            ws_allow=False,
-            session_allow=False,
-            agent_allow=False,
-            grain=grain,
-        )
-        result = json.loads(tool.execute())
+        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+            tool = make_tool(tmp_path, monkeypatch, ws_allow=False, grain=grain)
+            result = json.loads(tool.execute())
         assert result["success"] is False
         assert result["outcome"] == "denied"
-        assert "not allowed (requires ask or allow)" in result["error"]
-        assert "allow_host_resources" not in result["error"]
         assert result["permission_level"] == grain
+        assert msg in result["error"]
+        mock_subprocess.run.assert_not_called()
     records = read_audit(tmp_path)
     assert len(records) == 2
     assert all(r["outcome"] == "deny" for r in records)
-    assert all("not allowed (requires ask or allow)" in r["reason"] for r in records)
+    assert all(msg in r["reason"] for r in records)
 
 
-def test_host_bash_grain_allow_ignores_agent_flag(tmp_path, monkeypatch):
-    """The legacy agent_config allow_host_resources flag is ignored; grain allow runs."""
+def test_host_bash_agent_config_flag_irrelevant(tmp_path, monkeypatch):
+    """The legacy injected agent_config allow_host_resources flag is never consulted."""
     with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
-        mock_subprocess.run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+        mock_subprocess.run.return_value = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
         tool = make_tool(tmp_path, monkeypatch, agent_allow=False)
         result = json.loads(tool.execute())
     assert result["success"] is True
     assert result["outcome"] == "executed"
+    assert "allow_host_resources" not in result.get("error", "")
     mock_subprocess.run.assert_called_once()
+    records = read_audit(tmp_path)
+    assert records[0]["outcome"] == "allow"
 
 
 def test_host_bash_denied_when_permission_banned(tmp_path, monkeypatch):

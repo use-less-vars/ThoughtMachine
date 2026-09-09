@@ -85,7 +85,7 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
         """execute() returns the protocol error before any git clone.
 
         The atomic network:outbound check is pre-approved (effective
-        permissions "write"), so execution reaches the clone-URL validation,
+        permissions "outbound"), so execution reaches the clone-URL validation,
         which must reject instead of handing the URL to a git subprocess.
         GitWriteTool.execute() catches the ValueError and returns it as the
         error string ("Error: Unsupported git protocol: <url>").
@@ -93,7 +93,7 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
         tool = GitWriteTool(
             operation="clone",
             clone_url=clone_url,
-            effective_permissions={"network": "write"},
+            effective_permissions={"network": "outbound"},
             agent_config={"session_permissions": {"git_write": "write"}},
         )
         result = tool.execute()

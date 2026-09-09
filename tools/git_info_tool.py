@@ -671,7 +671,10 @@ class GitReadTool(ToolBase):
             level = self._get_operation_level(args)
             effective = self.effective_permissions or {}
             if effective.get("git") != "ask":
-                from security.security_gate import check_atomic_operation
+                from security.security_gate import (
+                    _ceiling_denial_note,
+                    check_atomic_operation,
+                )
 
                 if not check_atomic_operation(
                     f"git:{level}",
@@ -679,8 +682,10 @@ class GitReadTool(ToolBase):
                     "GitReadTool",
                     f"git {' '.join(args)}",
                 ):
+                    note = _ceiling_denial_note("git", level, effective)
                     raise PermissionError(
                         f"Permission denied: git:{level} required for this operation"
+                        + (f" (workspace ceiling: {note})" if note else "")
                     )
 
         # NOTE: no --no-verify here. The resource container IS the security

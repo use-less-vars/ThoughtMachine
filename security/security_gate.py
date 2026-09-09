@@ -32,7 +32,13 @@ from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pend
 from agent.config.defaults import PROMPT_TIMEOUT, RESOURCE_REGISTRY
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
 from security.gate_helpers import _value_satisfies
-from security.resource_catalog import RESOURCE_CATALOG, coerce_resource_permissions
+from security.resource_catalog import (
+    RESOURCE_CATALOG,
+    coerce_resource_permissions,
+    GRANT_LEVEL_RANKS,
+    WORKSPACE_CEILING_LEVELS_RANKS,
+    WORKSPACE_CEILING_VOCAB,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,16 +140,16 @@ def _min_permission(
             return False  # hard deny
         return effective_val  # True → passthrough
 
-    # override_val is a string — compare permission levels
+    # override_val is a string — compare permission levels on the shared
+    # session-grant rank space (security/resource_catalog.py
+    # GRANT_LEVEL_RANKS): write == write_on_feature_branch at the write tier
+    # (3), outbound above them (3.5), full at 4.  A worker footprint
+    # restricting git to read therefore caps a branch-write session level to
+    # read; 'none' is a legacy preset alias ranking with read.
     _LEVEL_MAP: dict[str, float] = {
-        "banned": 0.0, "ask": 1.0, "none": 1.0,
-        "read": 2.0, "outbound": 2.5, "write": 3.0, "full": 4.0,
-        # Session git level (branch-restricted writes) ranks at write level,
-        # so a worker footprint restricting git to read caps it to read
-        # instead of keeping branch-write silently (the 2.0 unknown default
-        # below would let it slip through the comparison otherwise).
-        "write_on_feature_branch": 3.0,
+        level: float(rank) for level, rank in GRANT_LEVEL_RANKS.items()
     }
+    _LEVEL_MAP["none"] = 1.0
 
     def _level(v: Any) -> float:
         if isinstance(v, bool):
@@ -159,28 +165,19 @@ def _min_permission(
 # The workspace's saved permission map (vault ``workspaces/<id>/config.json``
 # ``permissions`` key, with the purpose preset as fallback) declares the
 # maximum each resource may be used at inside that workspace.  The ceiling
-# ordering below is the workspace contract:
-#     banned(0) < read(1) < ask(2) < write(3) < write_feature_branches(4)
-# ``write_feature_branches`` is a workspace-only level meaning "unlimited"
-# (it does not exist as a session level).  Note this ordering is NOT the same
-# as ``_min_permission``'s internal level map (where ask < read); ceiling
-# comparisons follow the workspace contract above.
-
-_WORKSPACE_CEILING_LEVELS: Dict[str, float] = {
-    "banned": 0.0,
-    "read": 1.0,
-    "ask": 2.0,
-    "write": 3.0,
-    # Session git level (branch-restricted writes) ranks at write level so
-    # a stricter ceiling (read/ask/banned) caps it like plain write while a
-    # write ceiling leaves it standing.  As a ceiling value it means
-    # write-rank (3.0) -- never unlimited.
-    "write_on_feature_branch": 3.0,
-    "full": 3.0,  # session-side alias for write-level
-    "none": 1.0,  # alias used by some purpose presets
-    "outbound": 2.5,  # session-side network level
-    "write_feature_branches": 4.0,  # unlimited ceiling
-}
+# ordering is the shared rank table in security/resource_catalog.py
+# (WORKSPACE_CEILING_LEVELS_RANKS):
+#     banned(0) < read(1) == connect(1) == none(1) < ask(2)
+#         < write_on_feature_branch(2.5) < write(3)
+#         < outbound(4) == full(4)
+# Ceilings at rank 4.0 (``outbound``/``full``) are unlimited.  As a *ceiling*
+# value ``write_on_feature_branch`` ranks between ask and write (2.5): it
+# caps a session ``write`` grant down to branch-restricted write -- never
+# unlimited.  Note this ordering is NOT the same as ``_min_permission``'s
+# grant-level map (where ask < read); ceiling comparisons follow the
+# workspace contract above.  Which ceiling levels may apply to which session
+# key is additionally whitelisted by WORKSPACE_CEILING_VOCAB.
+_WORKSPACE_CEILING_LEVELS = WORKSPACE_CEILING_LEVELS_RANKS
 
 # Workspace permission-map resource names -> session-permissions keys they cap.
 # The canonical workspace resource for sandboxed execution is ``container``
@@ -188,7 +185,9 @@ _WORKSPACE_CEILING_LEVELS: Dict[str, float] = {
 # docker ceiling of write-rank allows the container session grant while
 # anything stricter (banned/read/ask) denies it.  Also accepts the OLD
 # purpose-preset names (container, git_read, git_write, host_bash, network,
-# filesystem).
+# filesystem), the session-catalog resource ``mcp`` (capped on its own
+# banned < connect < full scale) and the session keys ``system`` /
+# ``execution`` (read-tier resources capped like filesystem/git).
 _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "filesystem": "filesystem",
     "docker": "container",
@@ -198,6 +197,9 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "network": "network",
     "git_read": "git_read",
     "git_write": "git_write",
+    "mcp": "mcp",
+    "system": "system",
+    "execution": "execution",
 }
 
 #: Recognised workspace-ceiling resource names: the canonical catalog
@@ -206,6 +208,11 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
 #: ``docker`` (kept recognised -- normalised onto ``container`` by
 #: _WORKSPACE_RESOURCE_MAP so legacy disk ceilings never fail open) and the
 #: legacy git grains (git_read, git_write).
+#: ``system``/``execution`` are recognised as deliberate extensions beyond
+#: the session catalog (which deliberately stays 6-key git/filesystem/
+#: container/network/mcp/host_bash to keep the legacy disk-mode drop tests
+#: stable): both carry read-tier session scales and their workspace ceilings
+#: cap the corresponding session keys.
 #: A ceiling key outside this set is an unknown resource: it is logged and
 #: ignored (fail-open), so forward-compatible workspace maps never break
 #: session resolution.
@@ -213,6 +220,8 @@ _WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
     "docker",
     "git_read",
     "git_write",
+    "system",
+    "execution",
 }
 
 #: Session-permission keys whose level scale has a ``read`` tier BELOW
@@ -226,6 +235,8 @@ _ASK_CEILING_READ_TIER_KEYS = frozenset({
     "git",
     "git_read",
     "git_write",
+    "system",
+    "execution",
 })
 
 
@@ -239,20 +250,25 @@ def apply_workspace_ceiling(
     Returns a NEW dict; ``session_permissions`` is not mutated.  For every
     resource present in ``workspace_permissions`` the result is the more
     restrictive of the workspace ceiling and the session value, following the
-    workspace ordering::
+    workspace ceiling ordering::
 
-        banned(0) < read(1) < ask(2) < write(3) < write_feature_branches(4)
+        banned(0) < read(1) == connect(1) == none(1) < ask(2)
+            < write_on_feature_branch(2.5) < write(3)
+            < outbound(4) == full(4)
 
     Rules:
         * A resource missing from ``workspace_permissions`` has no ceiling —
           the session value stands.
-        * A ``write_feature_branches`` ceiling means "unlimited" — the
+        * A ``write_on_feature_branch`` ceiling (rank 2.5) caps a session
+          ``write`` grant down to branch-restricted write — never unlimited.
+          Ceilings at rank 4.0 (``outbound``/``full``) are unlimited — the
           session value stands.
         * An unknown ceiling level is treated as no ceiling (fail-open), so
           forward-compatible workspace maps never break session resolution.
-        * An unknown ceiling resource (outside ``RESOURCE_CATALOG`` and the
-          legacy workspace grains ``docker``/``git_read``/``git_write``) is
-          logged and ignored (fail-open) -- the session value stands.
+        * An unknown ceiling resource (outside ``RESOURCE_CATALOG``, the
+          session keys ``system``/``execution``, and the legacy workspace
+          grains ``docker``/``git_read``/``git_write``) is logged and
+          ignored (fail-open) -- the session value stands.
         * ``docker`` is a legacy alias for ``container``: it is normalised
           onto ``container`` by ``_WORKSPACE_RESOURCE_MAP`` before ranking,
           so a docker ceiling of ``write`` (or ``full``/``True``) allows the
@@ -264,7 +280,8 @@ def apply_workspace_ceiling(
         * A workspace ceiling of ``ask`` caps a more-permissive session
           value to the most permissive tier BELOW ask: ``read`` for
           resources whose session scale has a read tier (filesystem, git,
-          git_read, git_write), else ``banned`` (network).  An ask ceiling
+          git_read, git_write, system, execution), else ``banned``
+          (network).  An ask ceiling
           therefore NEVER yields an effective ``ask`` grant -- interactive
           prompting stays reserved for genuine session-level ``ask``
           grants, which rank at the ceiling and pass through unchanged.
@@ -273,6 +290,10 @@ def apply_workspace_ceiling(
           (or a boolean, ``True`` ~ ``allow``, ``False`` ~ ``banned``) caps
           the session value accordingly.  The ``host_bash`` key is always
           emitted as one of ``banned``/``ask``/``allow``.
+        * ``mcp`` is capped on its own session scale -- ``banned < connect
+          < full`` (``connect`` ranks 1.0, between ``read`` and ``ask``) --
+          so a workspace ceiling of ``banned``/``connect``/``full`` caps a
+          more permissive session mcp grant to the ceiling level.
         * Unknown session keys are passed through untouched.
     """
     if not workspace_permissions:
@@ -344,7 +365,26 @@ def apply_workspace_ceiling(
         if isinstance(ceiling, bool):
             ceiling_rank = 3.0 if ceiling else 0.0
         elif isinstance(ceiling, str):
-            ceiling_rank = _WORKSPACE_CEILING_LEVELS.get(ceiling.lower())
+            ceiling_lower = ceiling.lower()
+            # Per-key vocab unification: only levels on this session key's
+            # own scale may cap it (e.g. an mcp 'read' ceiling, a docker
+            # 'write_on_feature_branch' ceiling or the legacy
+            # 'write_feature_branches' marker are NOT valid for these keys)
+            # -- anything else is ignored fail-open so the session value
+            # stands.
+            ceiling_vocab = WORKSPACE_CEILING_VOCAB.get(key)
+            if ceiling_vocab is not None and ceiling_lower not in ceiling_vocab:
+                logger.warning(
+                    "ignoring workspace ceiling level %r for resource %r "
+                    "(not a valid ceiling level for %s; allowed: %s); "
+                    "fail-open: no ceiling applied",
+                    ceiling,
+                    resource,
+                    key,
+                    sorted(ceiling_vocab),
+                )
+                continue
+            ceiling_rank = _WORKSPACE_CEILING_LEVELS.get(ceiling_lower)
         else:
             ceiling_rank = None
         if ceiling_rank is None:
@@ -356,7 +396,7 @@ def apply_workspace_ceiling(
             )
             continue
         if ceiling_rank >= 4.0:
-            continue  # write_feature_branches -> unlimited
+            continue  # outbound/full ceilings -> unlimited
 
         # Container is a boolean in SessionPermissions; always emit a bool.
         if key == "container":
@@ -930,11 +970,17 @@ def check_requires_resource(
         description=description,
     )
     if not allowed:
-        return (
-            False,
+        message = (
             f"Permission denied: Tool requires resource '{requires_resource}' "
-            f"(permission {permission}:read), but session does not allow it.",
+            f"(permission {permission}:read), but session does not allow it."
         )
+        ceiling_level = _ceiling_denial_note(permission, "read", effective_permissions)
+        if ceiling_level:
+            # The workspace permission ceiling is what blocks this call (the
+            # session grant alone would allow it) — name it so the denial
+            # explains why a permissive-looking session profile still refuses.
+            message += f" (workspace ceiling: {ceiling_level})"
+        return (False, message)
     return (True, "")
 
 

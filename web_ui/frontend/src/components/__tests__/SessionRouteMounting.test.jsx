@@ -178,14 +178,25 @@ describe('SessionTab body mounts only on session routes', () => {
     expect(document.querySelector('.tab-wrapper')).toBeNull()
     expect(screen.queryByText(/Loading session/)).not.toBeInTheDocument()
 
-    // The workspace route view renders instead. WorkspaceDetailPage mounts
-    // and the Permissions & Resources tab (default is Overview) shows the
-    // empty-catalog message because the stubbed summary has resource_catalog: [].
+    // The workspace route view renders instead. WorkspaceDetailPage mounts;
+    // the Permissions & Resources tab always renders the 10 ceiling-gated
+    // editor cards (fixed CEILING_KEY_ORDER) even though this stubbed summary
+    // has resource_catalog: [] — keys without a catalog row fall back to
+    // fixed metadata, so no empty-catalog message is shown.
     await screen.findByRole('tab', { name: 'Permissions & Resources' })
     fireEvent.click(screen.getByRole('tab', { name: 'Permissions & Resources' }))
-    await waitFor(() => {
-      expect(screen.getByText('No resource catalog available.')).toBeInTheDocument()
-    })
+    await screen.findByText('Resource permissions')
+    expect(document.querySelectorAll('.wdp-resource-card').length).toBe(10)
+    expect(screen.getAllByRole('combobox').length).toBe(9)
+    expect(screen.getByText('Git (read)')).toBeInTheDocument()
+    expect(screen.getByText('Git (write)')).toBeInTheDocument()
+    expect(screen.getByText('Network')).toBeInTheDocument()
+    expect(screen.getByText('System')).toBeInTheDocument()
+    expect(screen.getByText('Execution')).toBeInTheDocument()
+    expect(screen.getByText('MCP')).toBeInTheDocument()
+    expect(screen.getByText('Container')).toBeInTheDocument()
+    expect(screen.getByText('Host bash')).toBeInTheDocument()
+    expect(screen.queryByText('No resource catalog available.')).toBeNull()
   })
 
   it('nested session route: active session mounts its own WS and loads it', async () => {

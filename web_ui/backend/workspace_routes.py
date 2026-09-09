@@ -15,7 +15,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -846,6 +846,12 @@ async def get_effective_permissions(
         ceiling = None
     if not isinstance(ceiling, dict):
         ceiling = {}
+    elif ceiling:
+        from web_ui.backend.config_manager import (
+            normalize_legacy_workspace_ceiling,
+        )
+
+        ceiling = normalize_legacy_workspace_ceiling(ceiling)
 
     # ── Merge via security gate (lazy import, with fallback) ──────────────
     try:
@@ -1351,9 +1357,15 @@ async def resume_worker(
 
 
 class WorkspacePermissionsBody(BaseModel):
-    """Body for PUT /api/workspace/{ws_id}/permissions."""
+    """Body for PUT /api/workspace/{ws_id}/permissions.
 
-    permissions: Dict[str, str]
+    ``permissions`` values are level strings (banned|ask|read|write, or
+    banned|ask|allow for host_bash) except ``container`` which the validator
+    accepts as a real boolean (True == write-level enabled) - so the map
+    carries ``Union[str, bool]`` values.
+    """
+
+    permissions: Dict[str, Union[str, bool]]
     allow_host_resources: Optional[bool] = None
 
 
@@ -1384,14 +1396,21 @@ def _save_workspace_config(ws_id: str, data: Dict[str, Any]) -> None:
     _atomic_write_json(data, _workspace_dir(ws_id) / "config.json")
 
 
-def _resolve_workspace_permissions(cfg: Dict[str, Any], purpose: str) -> Dict[str, str]:
-    """Return the saved permission map, or the purpose preset as fallback."""
+def _resolve_workspace_permissions(cfg: Dict[str, Any], purpose: str) -> Dict[str, Any]:
+    """Return the saved permission map, or the purpose preset as fallback.
+
+    Real booleans are preserved verbatim: ``container`` is stored as a real
+    boolean (True == write-level enabled) once validated, and stringifying it
+    to 'True'/'False' would break the round trip (the PUT validator rejects
+    the string forms) and would be misread as an unknown level downstream.
+    """
     from agent.config.workspace_purpose import apply_purpose_preset
+    from web_ui.backend.config_manager import normalize_legacy_workspace_ceiling
 
     saved = cfg.get("permissions")
     if isinstance(saved, dict) and saved:
-        return {str(k): str(v) for k, v in saved.items()}
-    return apply_purpose_preset(purpose)
+        return normalize_legacy_workspace_ceiling(saved)
+    return normalize_legacy_workspace_ceiling(apply_purpose_preset(purpose))
 
 
 # ── GET /api/workspace/{ws_id}/permissions ─────────────────────────────────────
@@ -1404,6 +1423,8 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
     Falls back to the purpose preset (or catalog defaults) when the
     workspace has no saved permission map in ``config.json`` yet.
     """
+    from web_ui.backend.config_manager import normalize_legacy_workspace_ceiling
+
     ensure_workspace_dirs(ws_id)
     cfg = _load_workspace_config(ws_id)
     purpose = cfg.get("purpose", "general")
@@ -1415,6 +1436,8 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
         if isinstance(raw_cfg_permissions, dict) and raw_cfg_permissions
         else {}
     )
+    if raw:
+        raw = normalize_legacy_workspace_ceiling(raw)
     return {
         "workspace_id": ws_id,
         "purpose": purpose,

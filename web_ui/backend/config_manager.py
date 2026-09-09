@@ -18,6 +18,7 @@ Exported names (all public — no leading underscore):
     resolve_full_config
     session_config_from_merged
     agent_config_from_merged
+    normalize_legacy_workspace_ceiling
     CONFIG_LAYER_ORDER
     CONFIG_LAYER_OWNERSHIP
 """
@@ -595,6 +596,90 @@ def _resolve_provider_layer(
         return merged
 
 
+def normalize_legacy_workspace_ceiling(raw: dict) -> dict:
+    """Map legacy stored workspace ceiling values to canonical catalog values.
+
+    Old workspace ``config.json`` ``permissions`` maps were written with
+    pre-catalog vocabulary: ``container``/``docker`` ceilings as strings or
+    under the legacy ``docker`` alias key, ``full`` where ``write`` is
+    canonical, and per-grain values that predate the canonical level
+    vocabulary.  This helper rewrites them to the canonical values the PUT
+    validator (``validate_workspace_permissions``) and
+    ``security_gate.apply_workspace_ceiling`` understand:
+
+    - container & docker (docker is the legacy alias of container and is
+      emitted under the canonical ``container`` key, mirroring the PUT
+      validator): real bool passes through; 'True'/'False' -> bool;
+      'banned'|'read'|'ask' -> False; 'write'|'full' -> True; anything
+      else is left untouched.  The container ceiling is NEVER stringified.
+    - network: 'read' -> 'ask'
+    - mcp: 'read'|'ask' -> 'banned'; 'write' -> 'full'
+    - filesystem / system: 'full' -> 'write'
+    - git: 'full' -> 'write'; 'write_feature_branches' ->
+      'write_on_feature_branch'
+    - execution / git_read / git_write: kept iff the value is in
+      {banned, ask, read, write}, else left untouched
+    - host_bash: kept iff the value is in {banned, ask, allow}, else left
+      untouched
+    - unknown keys and values: left untouched (the runtime gate treats
+      them as fail-open with a WARN, so they degrade safely)
+
+    Returns a NEW dict (the input is never mutated).  Idempotent: canonical
+    input round-trips unchanged.  Logs a WARNING naming the resource, the
+    old value and the new value on every actual rewrite.
+    """
+    result: Dict[str, Any] = {}
+    for k, v in raw.items():
+        key = str(k)
+        out_key = key
+        new_v = v
+        if key in ("container", "docker"):
+            # docker is the legacy alias of container; like the PUT
+            # validator, emit the result under 'container' only so the
+            # gate never sees a non-canonical docker key with a bool value.
+            out_key = "container"
+            if isinstance(v, bool):
+                new_v = v
+            elif isinstance(v, str):
+                if v == "True":
+                    new_v = True
+                elif v == "False":
+                    new_v = False
+                elif v in ("banned", "read", "ask"):
+                    new_v = False
+                elif v in ("write", "full"):
+                    new_v = True
+                else:
+                    new_v = v
+            else:
+                new_v = v
+        elif key == "network" and v == "read":
+            new_v = "ask"
+        elif key == "mcp":
+            if v in ("read", "ask"):
+                new_v = "banned"
+            elif v == "write":
+                new_v = "full"
+        elif key in ("filesystem", "system") and v == "full":
+            new_v = "write"
+        elif key == "git":
+            if v == "full":
+                new_v = "write"
+            elif v == "write_feature_branches":
+                new_v = "write_on_feature_branch"
+        elif key in ("execution", "git_read", "git_write"):
+            if v not in ("banned", "ask", "read", "write"):
+                new_v = v
+        elif key == "host_bash":
+            if v not in ("banned", "ask", "allow"):
+                new_v = v
+        if new_v is not v:
+            log("WARNING", "server.config",
+                f"legacy workspace ceiling '{key}': {v!r} -> {new_v!r}")
+        result[out_key] = new_v
+    return result
+
+
 def _load_workspace_permission_ceiling(workspace_id: str) -> Dict[str, Any]:
     """Load the workspace permission ceiling for *workspace_id*.
 
@@ -620,12 +705,19 @@ def _load_workspace_permission_ceiling(workspace_id: str) -> Dict[str, Any]:
 
     saved = cfg.get("permissions")
     if isinstance(saved, dict) and saved:
-        return {str(k): str(v) for k, v in saved.items()}
+        # Normalise legacy stored vocabulary to the canonical catalog
+        # vocabulary (container as a real bool under the canonical
+        # container key, canonical level strings).  security_gate's
+        # apply_workspace_ceiling only ranks real bools and the canonical
+        # level vocabulary, so anything left unnormalised would be treated
+        # as an UNKNOWN level (fail-open with a WARN - silently dropping
+        # the ceiling).
+        return normalize_legacy_workspace_ceiling(saved)
 
     try:
         preset = apply_purpose_preset(cfg.get("purpose", "general"))
         if isinstance(preset, dict):
-            return preset
+            return normalize_legacy_workspace_ceiling(preset)
     except Exception:
         pass
     return {}

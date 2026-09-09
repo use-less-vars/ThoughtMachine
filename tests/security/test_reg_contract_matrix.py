@@ -41,12 +41,12 @@ from tools.git_write_tool import GitWriteTool
 # ---------------------------------------------------------------------------
 
 # 7-key permission dicts. The gate only runs when session_permissions is
-# present; network:"write" satisfies the network:outbound atomic check so the
-# clone URL validation is actually reached in the clone test below.
+# present; network:"outbound" satisfies the network:outbound atomic check so
+# the clone URL validation is actually reached in the clone test below.
 FULL_PERMISSIONS = {
     "git": "write",
     "container": False,
-    "network": "write",
+    "network": "outbound",
     "filesystem": "read",
     "system": "read",
     "execution": "banned",
@@ -224,7 +224,7 @@ def test_clone_ext_transport_rejected(tmp_path):
     """ext:: transport must be rejected before any git subprocess runs.
 
     NOTE: the atomic network:outbound check runs first, so the tool must be
-    given permissions satisfying it (network:"write"); otherwise execute()
+    given permissions satisfying it (network:"outbound"); otherwise execute()
     would return an error string instead of reaching URL validation.
     """
     workspace = tmp_path / "workspace"

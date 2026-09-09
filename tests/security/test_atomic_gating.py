@@ -30,8 +30,21 @@ class TestCheckAtomicOperation:
     def test_full_satisfies_write(self):
         assert check_atomic_operation("filesystem:write", {"filesystem": "full"}, "test") is True
 
-    def test_network_outbound_allowed(self):
-        assert check_atomic_operation("network:outbound", {"network": "write"}, "test") is True
+    def test_network_outbound_denied_with_write_grant(self):
+        # 'outbound' ranks above plain 'write' (3.5 > 3) on the shared grant
+        # scale: a bare write grant no longer satisfies an outbound-only
+        # network requirement.
+        assert check_atomic_operation("network:outbound", {"network": "write"}, "test") is False
+
+    def test_network_outbound_allowed_with_outbound_grant(self):
+        assert check_atomic_operation("network:outbound", {"network": "outbound"}, "test") is True
+
+    def test_outbound_grant_satisfies_network_write(self):
+        # outbound is a strict superset of write on network's scale.
+        assert check_atomic_operation("network:write", {"network": "outbound"}, "test") is True
+
+    def test_write_grant_satisfies_network_write(self):
+        assert check_atomic_operation("network:write", {"network": "write"}, "test") is True
 
     def test_network_outbound_denied(self):
         assert check_atomic_operation("network:outbound", {"network": "banned"}, "test") is False

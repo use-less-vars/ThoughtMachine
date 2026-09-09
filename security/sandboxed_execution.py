@@ -168,10 +168,21 @@ class SandboxedExecution:
         allowed = self.session_permissions.get(category)
         result = _value_satisfies(required_level, allowed)
         if result is False or result == "ASK":
-            raise PermissionError(
+            # Function-level import: security_gate imports tools, which in
+            # turn import this module -- a top-level import would be a
+            # circular dependency.
+            from security.security_gate import _ceiling_denial_note
+
+            note = _ceiling_denial_note(
+                category, required_level, self.session_permissions
+            )
+            message = (
                 f"Permission denied: requires {required_category}, "
                 f"but session allows {category}:{allowed}"
             )
+            if note:
+                message += f" (workspace ceiling: {note})"
+            raise PermissionError(message)
 
     def _reject_shell_metachars(self, command: List[str]) -> None:
         """Raise ``ValueError`` if any command string contains metacharacters."""

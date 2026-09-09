@@ -29,7 +29,7 @@ def test_purpose_presets_apply_default_permissions():
 
     research = preset_default_permissions("research")
     assert research["git_write"] == "banned"
-    assert research["container"] == "banned"
+    assert research["container"] is False
     assert research["network"] == "ask"
 
     assert preset_default_permissions("general") == catalog_default_permissions()

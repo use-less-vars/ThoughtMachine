@@ -1,9 +1,11 @@
 """Shared policy helper for host-execution resource gates.
 
 The workspace-level ``allow_host_resources`` top-level key (workspaces/<id>/config.json)
-no longer gates the host_bash tool (which is permission-grain gated). It still acts as an
-operator ceiling for *other* host-execution surfaces (e.g. host-side git fallback), and
-this module exposes the single reader for that policy so the semantics stay in one place.
+gates the host_bash tool -- checked in-tool by
+``tools.host_bash_tool.HostBashTool.execute`` before the permission-grain/approval
+flow -- and acts as an operator ceiling for *other* host-execution surfaces (e.g.
+host-side git fallback).  This module exposes the single reader for that policy so the
+semantics stay in one place.
 
 Reads are fail-closed: a missing workspace id, missing file, malformed JSON or a
 non-dict body all report ``False``.

@@ -28,7 +28,7 @@ PURPOSE_PRESETS: Dict[str, Dict[str, Any]] = {
             "git_read": "read",
             "git_write": "ask",
             "host_bash": "banned",
-            "container": "ask",
+            "container": False,
             "network": "ask",
             "filesystem": "write",
             "system": "read",
@@ -44,7 +44,7 @@ PURPOSE_PRESETS: Dict[str, Dict[str, Any]] = {
             "git_read": "read",
             "git_write": "banned",
             "host_bash": "banned",
-            "container": "banned",
+            "container": False,
             "network": "ask",
             "filesystem": "read",
             "system": "read",
@@ -69,7 +69,7 @@ def get_purpose_preset(purpose: str) -> Dict[str, Any]:
     return dict(PURPOSE_PRESETS.get(purpose, {}))
 
 
-def preset_default_permissions(purpose: str) -> Dict[str, str]:
+def preset_default_permissions(purpose: str) -> Dict[str, Any]:
     """Return the fully-resolved default permission map for *purpose*.
 
     ``general`` resolves to the catalog defaults; the other presets start
@@ -85,8 +85,8 @@ def preset_default_permissions(purpose: str) -> Dict[str, str]:
 
 def apply_purpose_preset(
     purpose: str,
-    custom_permissions: Optional[Dict[str, str]] = None,
-) -> Dict[str, str]:
+    custom_permissions: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Resolve a permission map for *purpose*, merging custom overrides.
 
     ``custom_permissions`` entries win over the preset defaults.  Unknown

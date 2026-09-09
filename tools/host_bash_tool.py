@@ -3,18 +3,23 @@
 
 ``host_bash`` runs a shell command on the host machine (outside the Docker
 sandbox) under explicit operator control.  It is disabled by default and
-gated solely on the effective ``host_bash`` permission grain:
+gated on TWO independent layers:
 
+* the workspace operator policy ``allow_host_resources``
+  (``workspaces/<id>/config.json``, read in-tool via
+  ``tools.host_resource_policy``) must be true -- checked before the
+  grain/approval flow and fail-closed when the config is missing or
+  unreadable; and
 * the effective permission grain for ``host_bash`` must be ``"ask"`` or
   ``"allow"`` (``effective_permissions['host_bash']`` /
   ``session_permissions['host_bash']``).  When unset the grain defaults to
   ``"banned"`` (fail closed).
 
-The legacy session-level ``allow_host_resources`` flag and the
-workspace-level gating of host_bash are removed: the workspace top-level
-``allow_host_resources`` key now only applies to other host-execution
-surfaces via ``tools.host_resource_policy``.  host_bash itself is never
-dependent on those flags and is never defaulted open.
+The workspace top-level ``allow_host_resources`` key is the operator
+ceiling, enforced in-tool; it also applies to other host-execution surfaces
+via ``tools.host_resource_policy``.  The legacy session-level
+``allow_host_resources`` flag is not consulted.  host_bash is never
+defaulted open.
 
 Every invocation is written to ``<log_root>/host_bash_audit.jsonl`` as a
 JSONL record with exactly six fields: ``timestamp``, ``workspace_id``,
@@ -27,6 +32,8 @@ Audit mapping (``outcome``, ``reason``):
 * empty command               -> (``"deny"``, ``"empty command"``)
 * permission grain not ask/allow
                               -> (``"deny"``, ``"<grain> not allowed ..."``)
+* workspace denies host resources
+                              -> (``"deny"``, ``"Host execution is disabled for this workspace (allow_host_resources=false)"``)
 * approval rejected           -> (``"deny"``, ``"host_bash: command rejected by user"``)
 * approval timed out          -> (``"deny"``, ``"host_bash: security approval timed out"``)
 * command executed            -> (``"allow"``, ``""``)
@@ -231,10 +238,25 @@ class HostBashTool(ToolBase):
                 default=str,
             )
 
-        # host_bash is gated solely on the effective host_bash permission
-        # grain (default 'banned'); the workspace/session allow_host_resources
-        # feature flags no longer apply.
+        # host_bash requires BOTH the effective host_bash permission grain
+        # (ask/allow; default 'banned') AND the workspace operator's
+        # allow_host_resources policy (workspaces/<id>/config.json, read via
+        # tools.host_resource_policy).  The workspace check runs first, so a
+        # workspace denial precedes the grain/approval flow; when no
+        # workspace is resolvable the grain gate alone applies.
         grain = self._effective_grain()
+        ws_id = self._workspace_id()
+        if ws_id:
+            try:
+                from tools.host_resource_policy import workspace_allows_host_resources
+
+                ws_ok = workspace_allows_host_resources(ws_id)
+            except Exception:
+                ws_ok = False
+            if not ws_ok:
+                msg = "Host execution is disabled for this workspace (allow_host_resources=false)"
+                self._audit_log("deny", msg, cmd)
+                return denied_json(msg, grain)
         if grain not in ("ask", "allow"):
             self._audit_log(
                 "deny",

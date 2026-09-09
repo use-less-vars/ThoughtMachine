@@ -59,7 +59,7 @@ _LEGACY_RESOURCES = {
     "container": {
         "name": "Container",
         "description": "Docker container lifecycle and code execution in sandboxes.",
-        "default_permission": "ask",
+        "default_permission": False,
         "required_workspace_switch": "allow_docker",
         "risk_level": "medium",
         "ui_category": "sandbox",
@@ -114,6 +114,36 @@ _LEGACY_RESOURCES = {
     },
 }
 
+#: Canonical per-resource permission vocabularies (workspace ceilings;
+#: mirrors ``security.resource_catalog.WORKSPACE_CEILING_VOCAB``).
+#: ``validate_workspace_permissions`` accepts exactly these levels per
+#: resource: ``git`` retains ``write_on_feature_branch`` (branch-restricted
+#: write ceiling); ``git``/``filesystem``/``system``/``execution`` do NOT
+#: accept ``full`` (a legacy stored ``full`` ceiling is normalised to
+#: ``write``); ``docker`` is handled as a legacy string alias of the
+#: boolean ``container`` ceiling and is NOT a table key.
+_PERMISSION_LEVELS_BY_RESOURCE: Dict[str, Tuple[str, ...]] = {
+    "git": ("banned", "ask", "read", "write_on_feature_branch", "write"),
+    "git_read": ("banned", "ask", "read", "write"),
+    "git_write": ("banned", "ask", "read", "write"),
+    "filesystem": ("banned", "ask", "read", "write"),
+    "system": ("banned", "ask", "read", "write"),
+    "execution": ("banned", "ask", "read", "write"),
+    "network": ("banned", "ask", "write", "outbound"),
+    "mcp": ("banned", "connect", "full"),
+    "host_bash": ("banned", "ask", "allow"),
+}
+
+#: Legacy string vocabulary accepted for the ``docker`` alias of the
+#: boolean ``container`` ceiling. ``banned``/``read``/``ask`` deny the
+#: container session grant (normalise to False); ``write``/``full`` allow
+#: it (normalise to True).  The ``container`` key itself accepts NO string
+#: levels: workspace permissions for it must be real booleans.
+_CONTAINER_LEGACY_STRINGS: Tuple[str, ...] = ("banned", "read", "ask", "write", "full")
+
+#: Legacy docker-alias strings that map to a granted (True) ceiling.
+_CONTAINER_GRANT_STRINGS: Tuple[str, ...] = ("write", "full")
+
 
 def load_resource_catalog() -> Dict[str, Any]:
     """Load the resource catalog JSON (uncached, always re-read).
@@ -156,9 +186,13 @@ def catalog_entry(name: str) -> Optional[Dict[str, Any]]:
     return get_resource_catalog().get("resources", {}).get(name)
 
 
-def catalog_default_permissions() -> Dict[str, str]:
-    """Return ``{resource_name: default_permission}`` for every resource."""
-    defaults: Dict[str, str] = {}
+def catalog_default_permissions() -> Dict[str, Any]:
+    """Return ``{resource_name: default_permission}`` for every resource.
+
+    Values are the per-resource defaults: strings for level-based resources
+    and a boolean for the ``container`` ceiling.
+    """
+    defaults: Dict[str, Any] = {}
     for name, entry in get_resource_catalog().get("resources", {}).items():
         defaults[name] = entry.get("default_permission", "banned")
     return defaults
@@ -167,68 +201,63 @@ def catalog_default_permissions() -> Dict[str, str]:
 def validate_workspace_permissions(
     permissions: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], List[str]]:
-    """Validate a workspace permission map against the resource catalog.
+    """Validate and normalise a workspace-permission mapping.
 
-    Returns ``(normalized, errors)``:
+    ``permissions`` maps a resource name to its requested ceiling.  Each
+    resource has its own canonical vocabulary (see
+    ``_PERMISSION_LEVELS_BY_RESOURCE``):
 
-    - ``normalized`` — dict with unknown resource names and invalid levels
-      dropped; string levels are coerced to ``str``, while the canonical
-      ``container`` boolean values (and the alias-derived booleans below)
-      are kept as real booleans.
-    - ``errors`` — human-readable problems (empty when the input is clean).
+    - ``git`` / ``git_read`` / ``git_write`` / ``filesystem`` / ``system`` /
+      ``execution`` accept the ceiling levels ``banned|ask|read|write``
+      (``git`` additionally retains ``write_on_feature_branch`` as its
+      branch-restricted-write ceiling; no ``full`` ceiling exists -- legacy
+      stored ``full`` ceilings are normalised to ``write``);
+    - ``network`` accepts ``banned|ask|write|outbound``;
+    - ``mcp`` accepts ``banned|connect|full`` (its own session scale);
+    - ``host_bash`` accepts ``banned|ask|allow``;
+    - ``container`` is a boolean-only ceiling: real booleans pass through;
+      any string level (including the legacy ``banned``/``read``/``ask``/
+      ``write``/``full`` forms) is rejected;
+    - ``docker`` is a legacy string alias of ``container``:
+      ``banned``/``read``/``ask`` normalise to ``False`` and
+      ``write``/``full`` to ``True``.
 
-    Callers should treat any non-empty ``errors`` as a hard rejection
-    (HTTP 422) rather than silently persisting the partial map.
-
-    ``container`` is the canonical workspace ceiling for sandboxed code
-    execution: real booleans (``True``/``False``) pass through verbatim and
-    legacy string levels (``banned|read|ask|write``, as used by purpose
-    presets) are accepted.  ``docker`` is a handled legacy alias of
-    ``container`` -- never an "unknown resource" error: a ``write`` docker
-    level normalises to ``container: True``, any other valid level
-    (``banned``/``read``/``ask``) normalises to ``container: False``, and
-    invalid docker levels produce an error.  The ``docker`` key never
-    survives into ``normalized`` (when both ``docker`` and ``container`` are
-    present, input order decides, last write wins).
-
-    ``host_bash`` accepts its own vocabulary ``banned|ask|allow`` (the
-    session-grant grain; ``allow`` doubles as the ceiling value, so it
-    must pass validation even though it is not a global legacy level).
+    Returns ``(normalized, errors)`` where *normalized* contains only
+    validated entries and *errors* lists every rejected one.  Unknown
+    resource names and invalid levels are reported, never silently dropped.
     """
     errors: List[str] = []
     normalized: Dict[str, Any] = {}
     if not isinstance(permissions, dict):
         return {}, ["permissions must be an object mapping resource name to level"]
-
     valid_levels = set(catalog_permission_levels())
     known = set(catalog_resource_names())
-
     for name, level in permissions.items():
         if name == "docker":
-            # Handled legacy alias of the canonical container ceiling: a
-            # write-level docker ceiling allows the container session grant
-            # (normalised to container: True); banned/read/ask deny it
-            # (container: False).  Anything else is an error -- never
-            # silently persisted.
-            if isinstance(level, str) and level.strip().lower() in valid_levels:
-                normalized["container"] = level.strip().lower() == "write"
+            if isinstance(level, str) and level.strip().lower() in _CONTAINER_LEGACY_STRINGS:
+                normalized["container"] = level.strip().lower() in _CONTAINER_GRANT_STRINGS
                 continue
             errors.append(
-                f"invalid level '{level}' for resource 'docker' "
-                f"(legacy alias of 'container'; expected one of "
-                f"{sorted(valid_levels)})"
+                f"invalid level '{level}' for resource 'docker' (legacy alias of "
+                f"'container'; expected one of {sorted(_CONTAINER_LEGACY_STRINGS)})"
             )
             continue
         if name not in known:
             errors.append(f"unknown resource '{name}'")
             continue
-        if name == "container" and isinstance(level, bool):
-            # Canonical boolean container ceiling.
-            normalized[name] = level
+        if name == "container":
+            if isinstance(level, bool):
+                normalized[name] = level
+                continue
+            # String ceilings are rejected (fail closed) rather than
+            # normalised: ``container`` is boolean-only.  Legacy string
+            # configs must use the ``docker`` alias (or the stored boolean
+            # form) to be accepted.
+            errors.append(
+                f"invalid level '{level}' for resource 'container' (expected a boolean)"
+            )
             continue
         if name == "host_bash":
-            # host_bash is a session-storable grain capped by this ceiling;
-            # its vocabulary is banned/ask/allow (not the global legacy set).
             if level in ("banned", "ask", "allow"):
                 normalized[name] = str(level)
                 continue
@@ -237,12 +266,18 @@ def validate_workspace_permissions(
                 f"(expected one of {sorted(('banned', 'ask', 'allow'))})"
             )
             continue
-        if not isinstance(level, str) or level not in valid_levels:
+        # Generic per-resource vocabulary check.  Every catalog name is either
+        # special-cased above or present in _PERMISSION_LEVELS_BY_RESOURCE, so
+        # the fallback below is purely defensive.
+        accepted = _PERMISSION_LEVELS_BY_RESOURCE.get(name)
+        if accepted is None:
+            accepted = tuple(sorted(valid_levels))
+        if not isinstance(level, str) or level not in accepted:
             errors.append(
                 f"invalid level '{level}' for resource '{name}' "
-                f"(expected one of {sorted(valid_levels)})"
+                f"(expected one of {sorted(accepted)})"
             )
             continue
         normalized[name] = str(level)
-
     return normalized, errors
+
