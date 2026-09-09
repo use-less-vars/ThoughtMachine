@@ -11,9 +11,10 @@
  *   (b) a worker:* event tagged with a DIFFERENT session_id arriving on wsA is
  *       dropped by SessionTab's session-mismatch filter — A's panel is
  *       unaffected and nothing crashes.
- *   (c) events stay per-session across tab switches + WS remount: B's panel
- *       shows only B's worker events, and after switching back to S1 (fresh WS)
- *       A's panel shows only A's worker events.
+ *   (c) events stay per-session across tab switches (keep-mounted deck): B's
+ *       panel shows only B's worker events, and switching back to S1 reuses
+ *       the kept-mounted pane/WS (no remount) — A's panel shows only A's
+ *       worker events.
  *
  * Worker selection is driven through the real UI: WorkerManagementPanel (inside
  * ConfigPanel → WorkspacePanel, mounted by every SessionTab) fetches
@@ -152,6 +153,10 @@ const panelHeader = () =>
   workerPanel()?.querySelector('.worker-output-header-label')?.textContent ?? null
 const panelCtx = () =>
   workerPanel()?.querySelector('.worker-output-header-ctx')?.textContent ?? null
+
+const dotEl = () => workerPanel()?.querySelector('.worker-status-dot') ?? null
+const dotLabel = () => workerPanel()?.querySelector('.worker-status-label')?.textContent ?? null
+
 
 // ── Async setup helpers ─────────────────────────────────────────────────────
 async function connectHub() {
@@ -369,17 +374,62 @@ describe('worker-event isolation between sessions (R6b)', () => {
     expect(panelText()).toContain('🟢 Worker spawned: wB')
     expect(panelText()).not.toContain('🟢 Worker spawned: wA')
 
-    // Back to S1 → fresh WS (wsA2) → A panel shows ONLY A's event
+    // Back to S1 → the keep-mounted deck reuses A's pane + WS, so NO fresh
+    // WS is created (instance count stays at 3) and A's panel shows ONLY
+    // A's event.
     fireEvent.click(within(tabBar()).getByText('S1'))
-    await waitFor(() => expect(MockWebSocket.instances.length).toBe(4))
-    const wsA2 = lastWs()
-    act(() => wsA2.open())
-    bindWorkspace(wsA2, 'sess-1')
     expect(activeTabLabel()).toBe('S1')
-
     await waitFor(() => expect(panelHeader()).toBe('Worker: wA'))
     await waitFor(() => expect(panelRows()).toBe(1))
+    expect(MockWebSocket.instances.length).toBe(3)
     expect(panelText()).toContain('🟢 Worker spawned: wA')
     expect(panelText()).not.toContain('🟢 Worker spawned: wB')
+  })
+})
+
+describe('worker panel status dot follows the worker runtime_status (F5)', () => {
+  it('defaults to Idle, then follows worker:worker_status → worker_paused → worker_completed on the live session', async () => {
+    render(<App />)
+    const { wsA } = await mountFirstTab()
+    await selectWorker('wA')
+
+    // No worker event yet → grey Idle dot, no pulse
+    expect(dotLabel()).toBe('Idle')
+    expect(dotEl().className).not.toContain('worker-status-dot-busy')
+
+    // Backend pushes status busy → green Running + pulse (regardless of how
+    // the session tab's own Running/Idle indicator behaves)
+    sendWorkerEvent(wsA, 'sess-1', 'wA', statusEvt('2025-01-01T00:00:02Z', { status: 'busy' }))
+    await waitFor(() => expect(dotLabel()).toBe('Running'))
+    expect(dotEl().className).toContain('worker-status-dot-busy')
+
+    // Worker pauses while the session stays open/running → amber Paused
+    sendWorkerEvent(wsA, 'sess-1', 'wA', {
+      type: 'worker:worker_paused',
+      timestamp: '2025-01-01T00:00:03Z',
+      data: {},
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Paused'))
+    expect(dotEl().className).not.toContain('worker-status-dot-busy')
+    expect(dotEl().style.background).toBe('rgb(249, 226, 175)')
+
+    // Completed → back to Idle
+    sendWorkerEvent(wsA, 'sess-1', 'wA', completedEvt('2025-01-01T00:00:04Z'))
+    await waitFor(() => expect(dotLabel()).toBe('Idle'))
+    expect(dotEl().className).not.toContain('worker-status-dot-busy')
+  })
+
+  it('shows a red Error dot when the worker errors', async () => {
+    render(<App />)
+    const { wsA } = await mountFirstTab()
+    await selectWorker('wA')
+
+    sendWorkerEvent(wsA, 'sess-1', 'wA', {
+      type: 'worker:worker_error',
+      timestamp: '2025-01-01T00:00:02Z',
+      data: { error: 'toolchain crashed' },
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Error'))
+    expect(dotEl().style.background).toBe('rgb(243, 139, 168)')
   })
 })

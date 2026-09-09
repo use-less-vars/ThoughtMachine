@@ -1,12 +1,31 @@
 import React, { memo, useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import { MessageBubble } from './chat/MessageBubble';
 import adaptWorkerEvent, { isWorkerEventRenderable } from './chat/adaptWorkerEvent';
-import useStore from '../store/useStore';
 
 const PANEL_MIN = 250;
 const PANEL_MAX = 600;
 const PANEL_DEFAULT = 350;
 const noop = () => {};
+// ── Status dot states (F5) ──────────────────────────────────────────────
+// The panel header dot derives from the worker's OWN runtime_status (see the
+// event loop below), NOT the owning session's isRunning flag. Mirrors the
+// backend vocabulary: grey idle/ready, green running/busy (pulse), amber
+// pausing/paused, red error, muted stopped/completed.
+const STATUS_DOT = {
+  ready: { color: '#585b70', busy: false, label: 'Idle', title: 'Worker is idle' },
+  idle: { color: '#585b70', busy: false, label: 'Idle', title: 'Worker is idle' },
+  running: { color: '#a6e3a1', busy: true, label: 'Running', title: 'Worker is running' },
+  busy: { color: '#a6e3a1', busy: true, label: 'Running', title: 'Worker is busy' },
+  pausing: { color: '#f9e2af', busy: false, label: 'Pausing…', title: 'Pausing worker…' },
+  paused: { color: '#f9e2af', busy: false, label: 'Paused', title: 'Worker is paused' },
+  error: { color: '#f38ba8', busy: false, label: 'Error', title: 'Worker error' },
+  stopped: { color: '#6c7086', busy: false, label: 'Stopped', title: 'Worker is stopped' },
+  terminated: { color: '#6c7086', busy: false, label: 'Stopped', title: 'Worker is stopped' },
+  completed: { color: '#6c7086', busy: false, label: 'Completed', title: 'Worker completed' },
+};
+
+const STATUS_DOT_FALLBACK = { color: '#585b70', busy: false, label: 'Idle', title: 'Worker is idle' };
+
 
 
 function relativeTime(isoString) {
@@ -129,10 +148,11 @@ function WorkerOutputPanel({
 
   const runtimeStatus = workerInfo?.runtime_status || 'ready';
 
-  // F5: the status dot follows the owning session's running state — the same
-  // signal as the session tab's Running/Idle indicator. It survives refreshes
-  // because it comes from the store, not from the (possibly empty) event list.
-  const isRunning = useStore((s) => (sessionId ? (s.sessionStates[sessionId]?.isRunning ?? false) : false));
+  // F5: the header status dot is derived from the worker's OWN runtime_status
+  // (worker WS events + optimistic control updates), NOT the owning session's
+  // isRunning flag — a session can be running while its worker is paused,
+  // idle, or stopped, and vice versa. See STATUS_DOT above.
+  const dot = STATUS_DOT[runtimeStatus] || STATUS_DOT_FALLBACK;
 
   // Worker info is updated via WebSocket incomingEvents (no polling)
 
@@ -734,17 +754,17 @@ function WorkerOutputPanel({
       >
         {/* ── Status bar (slim, matching main StatusBar) ────────────── */}
         <div className="worker-output-header">
-          {/* Status dot — always visible. Reflects the owning session's running
-              state (green + pulse when running, grey idle), matching the session
-              tab's Running/Idle indicator (F5). No longer event-heuristic based,
-              so it also renders correctly right after a browser refresh. */}
+          {/* Status dot — always visible. Reflects the worker's own runtime
+              status: green + pulse while busy/running, grey idle when ready,
+              amber while paused/pausing, red on error. Independent of the
+              owning session's isRunning flag (F5). */}
           <span
-            className={'worker-status-dot' + (isRunning ? ' worker-status-dot-busy' : '')}
-            style={{ background: isRunning ? '#4caf50' : '#9e9e9e' }}
-            title={isRunning ? 'Worker session is running' : 'Worker session is idle'}
+            className={'worker-status-dot' + (dot.busy ? ' worker-status-dot-busy' : '')}
+            style={{ background: dot.color }}
+            title={dot.title}
           />
           <span className="worker-status-label">
-            {isRunning ? 'Running' : 'Idle'}
+            {dot.label}
           </span>
           <span className="worker-output-header-label">
             Worker: {instanceLabel || workerName}

@@ -7,9 +7,9 @@
  *   ┌──────────────────────────────────────────────────────────────────────┐
  *   │  [WorkspacePanel | WorkspaceSelector]   route                        │
  *   │  [TabBar strip]  — per-workspace session tabs (frontend-only state)  │
- *   │  ┌─ SessionTab ─┐ (ONLY the active session tab is mounted; each      │
- *   │  │ (own WS)     │  keeps its own WebSocket; inactive tabs are strip  │
- *   │  └──────────────┘  entries only — no mount, no WS)                   │
+ *   │  ┌─ SessionTab ─┐ (tabs visited on the session layer stay mounted   │
+ *   │  │ (own WS)     │  as a hidden deck, so tab switches preserve state  │
+ *   │  └──────────────┘  (no remount); leaving the layer unmounts all)     │
  *   ├──────────────────────────────────────────────────────────────────────┤
  *   │           WorkerOutputPanel (sidebar)                                │
  *   └──────────────────────────────────────────────────────────────────────┘
@@ -143,6 +143,16 @@ export default function App() {
     }
   })
 
+  // ── Keep-mounted session deck (per workspace, in-memory only) ─────────
+  // mountedSessions[ws] = session ids whose SessionTab is currently mounted
+  // (visible or hidden) on the session layer. A tab is mounted on its first
+  // activation on this layer and STAYS mounted while the layer is active, so
+  // switching tabs preserves each session's in-memory state (query drafts,
+  // loaded conversation) instead of unmount/remount churn. Leaving the
+  // session layer (workspace/selector route) clears the deck — panes unmount
+  // and the next session entry mounts lazily again (workspace-panel model).
+  const [mountedSessions, setMountedSessions] = useState({})
+
   const [showLoggingPanel, setShowLoggingPanel] = useState(false)
   const [loggingConfig, setLoggingConfig] = useState(null)
   const [loggingConfigError, setLoggingConfigError] = useState(null)
@@ -171,14 +181,17 @@ export default function App() {
     if (focused != null && panels.some(p => workerPanelInstanceKey(p) === focused)) return focused
     return workerPanelInstanceKey(panels[panels.length - 1])
   }
-  const focusedInstanceKey = activeSessionId ? focusedPanelInstanceKeyFor(activeSessionId) : null
-  const selectedWorker = (activeSessionId && focusedInstanceKey)
-    ? (() => {
-        const panels = workerPanelsBySession[activeSessionId] || []
-        const entry = panels.find(p => workerPanelInstanceKey(p) === focusedInstanceKey) || null
-        return entry ? { ...entry, name: entry.worker_name, workspaceId: entry.workspaceId } : null
-      })()
-    : null
+  // Per-session selected worker — the keep-mounted deck renders several
+  // SessionTabs, each of which needs the worker selection of ITS session.
+  const selectedWorkerFor = (sid) => {
+    if (!sid) return null
+    const key = focusedPanelInstanceKeyFor(sid)
+    if (!key) return null
+    const panels = workerPanelsBySession[sid] || []
+    const entry = panels.find(p => workerPanelInstanceKey(p) === key) || null
+    return entry ? { ...entry, name: entry.worker_name, workspaceId: entry.workspaceId } : null
+  }
+  const selectedWorker = activeSessionId ? selectedWorkerFor(activeSessionId) : null
   // Worker events pre-routed to per-panel buckets ({ [instanceKey]: [event, ...] }).
   // Routing is pure — every event goes to EVERY panel it matches.
   const routedEvents = useMemo(
@@ -196,6 +209,25 @@ export default function App() {
     const s = useStore.getState().sessions.find(x => x.session_id === sessionId)
     return s?.name || ''
   }
+
+  // Central rename application. Session renames reach this component through
+  // two paths — the inline rename UI and WS session_renamed events (the tab
+  // WS via SessionTab's onSessionRenamed callback, or the hub when relayed).
+  // Both must update the persisted tab-strip title IMMEDIATELY (no reload),
+  // not just the shared sessions name store. updateSessionName is idempotent,
+  // so a rename applied twice (optimistic UI + echoed WS event) is harmless.
+  const applySessionRename = useCallback((sessionId, newName) => {
+    if (!sessionId || !newName) return
+    useStore.getState().updateSessionName(sessionId, newName)
+    const st = useSessionTabsStore.getState()
+    // Resolve the owning workspace: the learned mapping wins; otherwise look
+    // for any strip entry that already holds this session's tab; fall back to
+    // the last-known / current workspace.
+    const byWs = st.byWorkspace || {}
+    const foundWs = Object.keys(byWs).find(ws => (byWs[ws]?.tabs || []).some(t => t.sessionId === sessionId))
+    const ws = sessionWorkspacesRef.current[sessionId] || foundWs || lastKnownWorkspaceRef.current || currentWsRef.current
+    if (ws) st.setTabTitle(ws, sessionId, newName)
+  }, [])
 
   // ── Hub WebSocket (sessions list only) with auto-reconnect ────────────
   const reconnectTimeoutRef = useRef(null)
@@ -342,7 +374,10 @@ export default function App() {
         if (deletedId) {
           useStore.getState().removeSession(deletedId)
           const ws = sessionWorkspacesRef.current[deletedId] || currentWsRef.current
-          if (ws) useSessionTabsStore.getState().closeTab(ws, deletedId)
+          if (ws) {
+            useSessionTabsStore.getState().closeTab(ws, deletedId)
+            removeMounted(ws, deletedId)
+          }
           delete sessionWorkspacesRef.current[deletedId]
           // If the user is viewing the deleted session, drop back to the
           // workspace list (the tab is gone, so there is nothing left to show).
@@ -354,6 +389,12 @@ export default function App() {
         break
       }
       case 'session_renamed':
+        // Apply the new name immediately (tab strip + persisted tab state +
+        // shared name store) — no page reload — then re-fetch the full
+        // session list to keep the sidebar and mappings in sync.
+        if (msg.new_name) applySessionRename(msg.session_id, msg.new_name)
+        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        break
       case 'session_closed':
         // re-fetch the full session list to keep sidebar + mappings in sync
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
@@ -425,8 +466,30 @@ export default function App() {
         }
         break
 
+      case 'state_changed': {
+        // Hub-relayed session runtime state (IDLE/RUNNING/PAUSING/PAUSED/
+        // WAITING_FOR_USER). The hub broadcasts state_changed for sessions, so
+        // the tab strip shows live status even while no SessionTab is mounted
+        // (e.g. on the workspace route). SessionTab's own WebSocket also
+        // delivers state_changed — store writes are idempotent, so a duplicate
+        // is harmless.
+        const sid = msg.session_id
+        if (!sid) break
+        const rawState = typeof msg.state === 'string' ? msg.state.trim() : ''
+        if (!rawState) break
+        const state = rawState.toUpperCase()
+        const ws = sessionWorkspacesRef.current[sid] || currentWsRef.current || lastKnownWorkspaceRef.current
+        // Never paint a status for a session that belongs to another workspace
+        // (only tabs of the current strip should reflect live state).
+        if (currentWs && ws && ws !== currentWs) break
+        const st = useStore.getState()
+        st.receiveStateChanged(sid, state)
+        st.setTabRunningState(sid, state)
+        break
+      }
+
       default:
-        // Other events (state_changed, conversation_changed, etc.)
+        // Other events (conversation_changed, tokens_updated, etc.)
         // are handled by individual SessionTab WebSockets.
         break
     }
@@ -454,9 +517,13 @@ export default function App() {
   }, [])
 
   // ── Handle session renamed (triggered by SessionTab via callback) ─────
+  // Both the inline rename UI and the tab-WS session_renamed event funnel
+  // here: update the tab title (persisted strip) + shared name store
+  // immediately, then re-fetch the session list for sidebar consistency.
   const handleSessionRenamed = useCallback((sessionId, newName) => {
+    applySessionRename(sessionId, newName)
     hubSend('list_sessions')
-  }, [hubSend])
+  }, [applySessionRename, hubSend])
 
   // ── SessionTab reports the workspace it loaded into (session_loaded) ──
   const handleWorkspaceKnown = useCallback((sessionId, workspaceId) => {
@@ -495,6 +562,22 @@ export default function App() {
     }
   }, [navigate])
 
+  // Drop a session id from the mounted deck (tab closed / adopted /
+  // deleted). The pane unmounts; if the tab is later reopened it mounts
+  // fresh (lazy) instead of resurrecting a hidden pane.
+  const removeMounted = useCallback((ws, sessionId) => {
+    if (!ws || !sessionId) return
+    setMountedSessions(prev => {
+      const cur = prev[ws]
+      if (!cur || !cur.includes(sessionId)) return prev
+      const next = cur.filter(id => id !== sessionId)
+      const rest = { ...prev }
+      if (next.length === 0) delete rest[ws]
+      else rest[ws] = next
+      return rest
+    })
+  }, [])
+
   // Close a tab — FRONTEND ONLY: the session stays open server-side.
   // If the active tab is closed, activate the neighbor (store picks it) and
   // follow it; with no tabs left, leave the session view (or stay on the
@@ -504,6 +587,9 @@ export default function App() {
     const st = useSessionTabsStore.getState()
     const wasActive = st.byWorkspace[ws]?.activeSessionId === sessionId
     st.closeTab(ws, sessionId)
+    // The closed tab leaves the mounted deck too — reopening it later mounts
+    // a fresh SessionTab instead of resurrecting the hidden pane.
+    removeMounted(ws, sessionId)
     if (wasActive) {
       // Re-fetch: st is a pre-mutation snapshot (zustand set() replaces the
       // state object), so reading st.byWorkspace here would return the OLD
@@ -515,7 +601,7 @@ export default function App() {
         navigate('/workspaces')
       }
     }
-  }, [navigate])
+  }, [navigate, removeMounted])
 
   const openPanel = useCallback((sessionId, { name, workspaceId, instance_id, instance_label }) => {
     if (!sessionId || !name) return
@@ -721,14 +807,17 @@ export default function App() {
     const ws = sessionWorkspacesRef.current[newSessionId] || currentWsRef.current
     if (!ws) return
     const st = useSessionTabsStore.getState()
-    if (oldSessionId) st.closeTab(ws, oldSessionId)
+    if (oldSessionId) {
+      st.closeTab(ws, oldSessionId)
+      removeMounted(ws, oldSessionId)
+    }
     if (!st.byWorkspace[ws]?.tabs.some(t => t.sessionId === newSessionId)) {
       st.openTab(ws, { sessionId: newSessionId, title: nameFromStore(newSessionId) })
     }
     st.setActiveTab(ws, newSessionId)
     hubSend('list_sessions')
     navigate(`/workspace/${ws}/session/${encodeURIComponent(newSessionId)}`)
-  }, [hubSend, navigate])
+  }, [hubSend, navigate, removeMounted])
 
   const handleOpenNewTab = useCallback((sessionId, sessionName) => {
     // Called by SessionTab when a workspace switch creates a NEW session
@@ -883,6 +972,42 @@ export default function App() {
       lastKnownWorkspaceRef.current = route.id
     }
   }, [route, workspaceKnownTick, routeSessionConfig, currentWs])
+
+  // ── Keep-mounted session deck lifecycle ───────────────────────────────
+  // Sessions activated on the session layer stay mounted (hidden when not
+  // active) so tab switches preserve their state instead of remounting.
+  // Leaving the session layer clears the deck — every pane unmounts and the
+  // next session entry mounts fresh/lazy again. Entries are pruned whenever
+  // the underlying tab disappears (closed/adopted/deleted).
+  useEffect(() => {
+    if (route?.view !== 'session') {
+      setMountedSessions({})
+      return
+    }
+    if (!route.id || !currentWs) return
+    setMountedSessions(prev => {
+      const live = new Set(
+        (useSessionTabsStore.getState().byWorkspace[currentWs]?.tabs || []).map(t => t.sessionId)
+      )
+      const pruned = (prev[currentWs] || []).filter(id => live.has(id))
+      const next = pruned.includes(route.id) ? pruned : [...pruned, route.id]
+      const prevWs = prev[currentWs]
+      if (
+        prevWs &&
+        prevWs.length === next.length &&
+        prevWs.every((id, i) => id === next[i])
+      ) {
+        return prev
+      }
+      if (next.length === 0) {
+        if (prevWs === undefined) return prev
+        const rest = { ...prev }
+        delete rest[currentWs]
+        return rest
+      }
+      return { ...prev, [currentWs]: next }
+    })
+  }, [route?.view, route?.id, currentWs])
 
   // ── Persist worker panels state to localStorage (per session) ───────────
   useEffect(() => {
@@ -1097,6 +1222,14 @@ export default function App() {
       ? dockerHint
       : 'see the backend startup log for details'
 
+  // Keep-mounted session deck: every tab activated on the session layer
+  // stays mounted (hidden unless it is the active one), so switching tabs
+  // preserves per-session state without unmount/remount churn. The active
+  // session is always in the deck (first activation mounts immediately).
+  const deckSessions = tabs
+    .filter(t => t.sessionId === activeSessionId || (mountedSessions[currentWs] || []).includes(t.sessionId))
+    .map(t => t.sessionId)
+
   // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
@@ -1136,34 +1269,47 @@ export default function App() {
             />
           )}
 
-          {/* ONLY the active session tab is mounted (own WebSocket, own load),
-              and only while actually ON a session route — on the workspace
-              route the strip is visible but no session body mounts.
-              Inactive tabs are strip entries only — no mount, no WS. */}
-          {route?.view === 'session' && activeTab && (
-            <div className="tab-wrapper" key={activeTab.sessionId}>
-              <SessionTab
-                sessionId={activeTab.sessionId}
-                tabId={`tab-${activeTab.sessionId}`}
-                hubReady={hubReady}
-                isActive={true}
-                staggerMs={0}
-                loadOnConnect={true}
-                onClose={() => handleCloseTab(currentWs, activeTab.sessionId)}
-                onNewSession={handleNewSessionCreated}
-                onSessionAdopted={(newId) => handleSessionAdopted(activeSessionId, newId)}
-                onOpenNewTab={handleOpenNewTab}
-                onSessionSaved={handleSessionSaved}
-                onRegister={handleRegisterTab}
-                onSessionRenamed={handleSessionRenamed}
-                selectedWorker={selectedWorker}
-                onSelectWorker={handleSelectWorker}
-                activeSessionId={activeSessionId}
-                onClearWorker={handleCloseWorkerPanel}
-                onWorkerEvent={handleWorkerEvent}
-                onLoggingConfigChanged={(config) => setLoggingConfig(config)}
-                onWorkspaceKnown={handleWorkspaceKnown}
-              />
+          {/* Keep-mounted session deck (own WebSocket per pane). Rendered
+              only while actually ON a session route — on the workspace route
+              the strip is visible but no session body mounts. Tabs activated
+              on this layer stay mounted (hidden via .session-tab-pane-hidden)
+              so switching tabs preserves each session's in-memory state;
+              leaving the session layer unmounts the whole deck. */}
+          {route?.view === 'session' && currentWs && activeTab && tabs.length > 0 && (
+            <div className="tab-wrapper">
+              {deckSessions.map(sid => (
+                <div
+                  key={sid}
+                  className={
+                    sid === activeSessionId
+                      ? 'session-tab-pane'
+                      : 'session-tab-pane session-tab-pane-hidden'
+                  }
+                >
+                  <SessionTab
+                    sessionId={sid}
+                    tabId={`tab-${sid}`}
+                    hubReady={hubReady}
+                    isActive={sid === activeSessionId}
+                    staggerMs={0}
+                    loadOnConnect={true}
+                    onClose={() => handleCloseTab(currentWs, sid)}
+                    onNewSession={handleNewSessionCreated}
+                    onSessionAdopted={(newId) => handleSessionAdopted(sid, newId)}
+                    onOpenNewTab={handleOpenNewTab}
+                    onSessionSaved={handleSessionSaved}
+                    onRegister={handleRegisterTab}
+                    onSessionRenamed={handleSessionRenamed}
+                    selectedWorker={selectedWorkerFor(sid)}
+                    onSelectWorker={handleSelectWorker}
+                    onClearWorker={handleCloseWorkerPanel}
+                    onWorkerEvent={handleWorkerEvent}
+                    onLoggingConfigChanged={(config) => setLoggingConfig(config)}
+                    onWorkspaceKnown={handleWorkspaceKnown}
+                    routeWorkspaceId={route?.workspaceId || null}
+                  />
+                </div>
+              ))}
             </div>
           )}
 

@@ -523,8 +523,8 @@ describe('WorkspaceDetailPage', () => {
 
     expect(screen.queryByText(/risk score/i)).toBeNull()
     expect(screen.queryByText(/critical/i)).toBeNull()
-    // The old WorkspacePanel chrome (back link / risk badge) is gone as well.
-    expect(screen.queryByText('← Back to workspaces')).toBeNull()
+    // The detail page now carries its own back-to-workspaces nav link.
+    expect(screen.getByRole('link', { name: '← Back to workspaces' })).toHaveAttribute('href', '#/workspaces')
   })
 
   it('shows the exact placeholder strings in the Session Defaults and Credentials tabs', async () => {
@@ -550,8 +550,9 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getAllByText('Host execution').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByText('Active sessions')).toBeInTheDocument()
     expect(screen.getByText('Active containers')).toBeInTheDocument()
-    // ...and the old panel's chrome is not.
-    expect(screen.queryByText('← Back to workspaces')).toBeNull()
+    // ...and the legacy panel's error chrome is not; the new page's own back
+    // link IS present (three-layer nav: workspaces → workspace → session).
+    expect(screen.getByRole('link', { name: '← Back to workspaces' })).toHaveAttribute('href', '#/workspaces')
     expect(screen.queryByText('Workspace not found.')).toBeNull()
   })
 

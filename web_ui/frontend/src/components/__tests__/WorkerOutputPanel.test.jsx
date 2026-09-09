@@ -56,6 +56,15 @@ function taskInline() {
 function emptyState() {
   return document.querySelector('.worker-output-empty')?.textContent ?? null
 }
+function dotEl() {
+  return document.querySelector('.worker-status-dot')
+}
+
+function dotLabel() {
+  return document.querySelector('.worker-status-label')?.textContent ?? null
+}
+
+
 
 // ── Event fixtures (raw WebSocket shapes) ────────────────────────────────
 const ctxFor = (worker, length, ts) => ({
@@ -75,6 +84,25 @@ const statusFor = (worker, status, task, ts) => ({
   type: 'worker_status',
   worker_name: worker,
   data: { runtime_status: status, current_task: task },
+  timestamp: ts,
+})
+
+const pausedFor = (worker, ts) => ({
+  type: 'worker_paused',
+  worker_name: worker,
+  data: {},
+  timestamp: ts,
+})
+const errorFor = (worker, ts, message = 'worker exploded') => ({
+  type: 'worker_error',
+  worker_name: worker,
+  data: { error: message },
+  timestamp: ts,
+})
+const completedFor = (worker, ts) => ({
+  type: 'worker_completed',
+  worker_name: worker,
+  data: {},
   timestamp: ts,
 })
 
@@ -197,3 +225,102 @@ describe('WorkerOutputPanel — stale header on session switch (R6 fix)', () => 
     })
   })
 })
+
+describe('WorkerOutputPanel — header status dot follows the worker runtime_status (F5)', () => {
+  it('defaults to a grey Idle dot while no worker status has been reported', () => {
+    renderPanel()
+    expect(dotLabel()).toBe('Idle')
+    expect(dotEl()).not.toHaveClass('worker-status-dot-busy')
+    expect(dotEl().style.background).toBe('rgb(88, 91, 112)')
+    expect(dotEl().getAttribute('title')).toBe('Worker is idle')
+  })
+
+  it('shows a green Running dot (with pulse) while the worker is busy', async () => {
+    const { rerender } = renderPanel()
+    await act(async () => {
+      rerender(
+        <WorkerOutputPanel
+          {...panelProps({ incomingEvents: [statusFor('w1', 'busy', 'Write report', '2026-08-15T00:00:01.000Z')] })}
+        />
+      )
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Running'))
+    expect(dotEl()).toHaveClass('worker-status-dot-busy')
+    expect(dotEl().style.background).toBe('rgb(166, 227, 161)')
+    expect(dotEl().getAttribute('title')).toBe('Worker is busy')
+  })
+
+  it('maps a "running" status to the same green Running dot', async () => {
+    const { rerender } = renderPanel()
+    await act(async () => {
+      rerender(
+        <WorkerOutputPanel
+          {...panelProps({ incomingEvents: [statusFor('w1', 'running', 'Write report', '2026-08-15T00:00:01.000Z')] })}
+        />
+      )
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Running'))
+    expect(dotEl()).toHaveClass('worker-status-dot-busy')
+    expect(dotEl().style.background).toBe('rgb(166, 227, 161)')
+    expect(dotEl().getAttribute('title')).toBe('Worker is running')
+  })
+
+  it('is independent of the session isRunning flag: paused worker → amber Paused even while the session runs', async () => {
+    // The owning session is running, but the worker itself paused. The dot
+    // must follow the worker (amber Paused), NOT the session's isRunning
+    // (which is what the pre-F5 code rendered: green Running).
+    act(() => {
+      useStore.setState({ sessionStates: { 'sess-A': { isRunning: true } } })
+    })
+    const { rerender } = renderPanel()
+    await act(async () => {
+      rerender(
+        <WorkerOutputPanel
+          {...panelProps({ incomingEvents: [pausedFor('w1', '2026-08-15T00:00:01.000Z')] })}
+        />
+      )
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Paused'))
+    expect(dotLabel()).not.toBe('Running')
+    expect(dotEl()).not.toHaveClass('worker-status-dot-busy')
+    expect(dotEl().style.background).toBe('rgb(249, 226, 175)')
+    expect(dotEl().getAttribute('title')).toBe('Worker is paused')
+  })
+
+  it('shows a red Error dot when the worker errors', async () => {
+    const { rerender } = renderPanel()
+    await act(async () => {
+      rerender(
+        <WorkerOutputPanel
+          {...panelProps({ incomingEvents: [errorFor('w1', '2026-08-15T00:00:01.000Z')] })}
+        />
+      )
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Error'))
+    expect(dotEl().style.background).toBe('rgb(243, 139, 168)')
+    expect(dotEl().getAttribute('title')).toBe('Worker error')
+  })
+
+  it('returns to a grey Idle dot once the worker completes', async () => {
+    const { rerender } = renderPanel()
+    await act(async () => {
+      rerender(
+        <WorkerOutputPanel
+          {...panelProps({ incomingEvents: [statusFor('w1', 'busy', 'Write report', '2026-08-15T00:00:01.000Z')] })}
+        />
+      )
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Running'))
+    await act(async () => {
+      rerender(
+        <WorkerOutputPanel
+          {...panelProps({ incomingEvents: [completedFor('w1', '2026-08-15T00:00:02.000Z')] })}
+        />
+      )
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Idle'))
+    expect(dotEl()).not.toHaveClass('worker-status-dot-busy')
+    expect(dotEl().style.background).toBe('rgb(88, 91, 112)')
+  })
+})
+
