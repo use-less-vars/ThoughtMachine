@@ -1346,6 +1346,10 @@ body {
   border-bottom: 3px solid #f1c40f;
 }
 
+.tab-item.paused {
+  border-bottom: 3px solid #f39c12;
+}
+
 .tab-item.idle {
   border-bottom: 3px solid #3498db;
 }

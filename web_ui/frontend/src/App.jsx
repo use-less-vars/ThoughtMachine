@@ -441,8 +441,30 @@ export default function App() {
         }
         break
 
+      case 'state_changed': {
+        // Hub-relayed session runtime state (IDLE/RUNNING/PAUSING/PAUSED/
+        // WAITING_FOR_USER). The hub broadcasts state_changed for sessions, so
+        // the tab strip shows live status even while no SessionTab is mounted
+        // (e.g. on the workspace route). SessionTab's own WebSocket also
+        // delivers state_changed — store writes are idempotent, so a duplicate
+        // is harmless.
+        const sid = msg.session_id
+        if (!sid) break
+        const rawState = typeof msg.state === 'string' ? msg.state.trim() : ''
+        if (!rawState) break
+        const state = rawState.toUpperCase()
+        const ws = sessionWorkspacesRef.current[sid] || currentWsRef.current || lastKnownWorkspaceRef.current
+        // Never paint a status for a session that belongs to another workspace
+        // (only tabs of the current strip should reflect live state).
+        if (currentWs && ws && ws !== currentWs) break
+        const st = useStore.getState()
+        st.receiveStateChanged(sid, state)
+        st.setTabRunningState(sid, state)
+        break
+      }
+
       default:
-        // Other events (state_changed, conversation_changed, etc.)
+        // Other events (conversation_changed, tokens_updated, etc.)
         // are handled by individual SessionTab WebSockets.
         break
     }

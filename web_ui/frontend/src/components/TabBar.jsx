@@ -21,6 +21,8 @@ function _tabStatusClass(status) {
     case 'RUNNING':
       return 'running'
     case 'PAUSED':
+      return 'paused'
+    case 'PAUSING':
       return 'pausing'
     case 'WAITING_FOR_USER':
       return 'running'
