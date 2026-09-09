@@ -626,10 +626,13 @@ class ContainerRegistry:
 
     @staticmethod
     def resolve_network_mode(permissions) -> str:
-        """Permission -> network_mode: network in (True, "write") -> bridge,
-        else none (mirrors docker_executor L128-201 / security_gate L159-223)."""
+        """Permission -> network_mode: network in (True, "write", "outbound")
+        -> bridge, else none. Single mapping lives in
+        security.gate_helpers.resolve_network_mode (shared with docker_executor
+        and security_gate); this wrapper keeps the dict-arg interface."""
+        from security.gate_helpers import resolve_network_mode
         perms = permissions or {}
-        return "bridge" if perms.get("network") in (True, "write") else "none"
+        return resolve_network_mode(perms.get("network"))
 
     def _to_handle(self, name, state) -> dict:
         return {

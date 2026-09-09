@@ -503,9 +503,9 @@ class ContainerManager:
         # Explicit-grant guard: never silently fail-closed on a session that
         # explicitly granted write access — surface it loudly instead.
         sp = self.session_permissions or {}
-        if sp.get("network") == "write" and network_mode != "bridge":
+        if sp.get("network") in ("write", "outbound") and network_mode != "bridge":
             log("WARNING", "docker.container_manager",
-                f"Session grants network=write but gate returned "
+                f"Session grants network={sp.get('network')} but gate returned "
                 f"network_mode={network_mode} (workspace_id={self.workspace_id}) "
                 f"— fail-closed; workspace capabilities restrict this session "
                 f"or the security gate errored (see docker.security_gate).")

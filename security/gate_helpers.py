@@ -85,3 +85,24 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
         return allowed_str == required_lower
 
     return allowed_level >= required_level
+
+
+def resolve_network_mode(network_level) -> str:
+    """
+    Map a session/permission network grant to a Docker ``network_mode``.
+
+    ``True`` and the strings ``"write"`` / ``"outbound"`` (case-insensitive)
+    map to ``"bridge"``; everything else (``False``, ``"banned"``, ``"read"``,
+    ``"ask"``, ``None``, empty, unknown values) maps to ``"none"``.
+
+    Single source of truth, shared by:
+      - ``docker_executor`` (gate path + legacy fallback path),
+      - ``security.security_gate.get_expected_container_config``,
+      - ``infra.container_registry.ContainerRegistry.resolve_network_mode``.
+    """
+    if network_level is True:
+        return "bridge"
+    if isinstance(network_level, str) and network_level.lower() in ("write", "outbound"):
+        return "bridge"
+    return "none"
+

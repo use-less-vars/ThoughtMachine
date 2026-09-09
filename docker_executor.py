@@ -33,6 +33,7 @@ import time
 import threading
 import queue
 import sys
+from security.gate_helpers import resolve_network_mode
 
 # ── Audit log for network_mode debugging ───────────────────────────────────
 from thoughtmachine.audit_logger import audit_event
@@ -216,10 +217,7 @@ def _compute_container_config_from_permissions(
             caps = get_workspace_capabilities(workspace_id)
             eff = get_effective_permissions(SessionPermissions(**session_permissions), caps)
 
-            if eff.get("network") is True or eff.get("network") == "write":
-                network_mode = "bridge"
-            else:
-                network_mode = "none"
+            network_mode = resolve_network_mode(eff.get("network"))
 
             fs = eff.get("filesystem", "read")
             workspace_mode = "rw" if fs in ("write", "full") else "ro"
@@ -233,7 +231,7 @@ def _compute_container_config_from_permissions(
         # (they have already been vetted by ToolExecutor.check_required_categories).
         sp = session_permissions
         net = sp.get("network", "banned")
-        network_mode = "bridge" if net == "write" else "none"
+        network_mode = resolve_network_mode(net)
         fs = sp.get("filesystem", "read")
         workspace_mode = "rw" if fs in ("write", "full") else "ro"
         log("WARNING", "docker.security_gate",

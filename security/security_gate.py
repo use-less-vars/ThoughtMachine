@@ -31,7 +31,7 @@ from thoughtmachine.workspace_capabilities import (
 from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
 from agent.config.defaults import PROMPT_TIMEOUT, RESOURCE_REGISTRY
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
-from security.gate_helpers import _value_satisfies
+from security.gate_helpers import _value_satisfies, resolve_network_mode
 from security.resource_catalog import (
     RESOURCE_CATALOG,
     coerce_resource_permissions,
@@ -794,7 +794,8 @@ def get_expected_container_config(
         Dict with keys:
 
         - **network_mode** (``"bridge"`` or ``"none"``):
-          ``"bridge"`` when effective network is ``True`` or ``"write"``.
+          ``"bridge"`` when effective network is ``True``, ``"write"`` or
+          ``"outbound"`` (mapping: ``security.gate_helpers.resolve_network_mode``).
         - **workspace_mode** (``"rw"`` or ``"ro"``):
           ``"rw"`` when effective filesystem is ``"write"`` or ``"full"``.
         - **effective** (dict):
@@ -822,7 +823,7 @@ def get_expected_container_config(
 
     # Network mode
     net = eff.get("network")
-    network_mode = "bridge" if (net is True or net == "write") else "none"
+    network_mode = resolve_network_mode(net)
 
     # Workspace mount mode
     fs = eff.get("filesystem", "read")

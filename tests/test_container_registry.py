@@ -335,6 +335,10 @@ class TestRequestContainer:
     def test_request_network_resolution(self, registry, fake_client):
         registry.request_container("w", "s", {"network": "write"})
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
+        # separate session id: the per-session container limit is 4 and the
+        # baseline test already exhausts it on session "s"
+        registry.request_container("w", "s2", {"network": "outbound"})
+        assert _run_kwargs(fake_client)["network_mode"] == "bridge"
         registry.request_container("w", "s", {"network": True})
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
         registry.request_container("w", "s", {"network": False})
@@ -608,8 +612,12 @@ class TestFeatureFlagAndHelpers:
 
     def test_resolve_network_mode(self):
         assert ContainerRegistry.resolve_network_mode({"network": "write"}) == "bridge"
+        assert ContainerRegistry.resolve_network_mode({"network": "outbound"}) == "bridge"
+        assert ContainerRegistry.resolve_network_mode({"network": "OUTBOUND"}) == "bridge"
         assert ContainerRegistry.resolve_network_mode({"network": True}) == "bridge"
         assert ContainerRegistry.resolve_network_mode({"network": False}) == "none"
+        assert ContainerRegistry.resolve_network_mode({"network": "read"}) == "none"
+        assert ContainerRegistry.resolve_network_mode({"network": "banned"}) == "none"
         assert ContainerRegistry.resolve_network_mode({}) == "none"
         assert ContainerRegistry.resolve_network_mode(None) == "none"
 
