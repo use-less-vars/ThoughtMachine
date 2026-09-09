@@ -204,8 +204,6 @@ class CheckSystem(ToolBase):
                       "'event_log' (tail recent EventLogger entries), "
                       "'vault_status' (vault drift vs schema manifest), "
                       "'vault_repair_status' (full read-only vault repair dry-run report), "
-                      "'vault_repair_apply' (MUTATING: apply vault machine fixes — "
-                      "refuses without explicit approval; requires approved=True), "
                       "'runtime_state' (redacted runtime snapshot — token limits, worker caps, "
                       "container status, permissions, allowlist).",
     )
@@ -219,33 +217,6 @@ class CheckSystem(ToolBase):
         description="Explicit workspace ID override. If set, used directly instead of resolving from session.",
     )
 
-    # --- vault_repair_apply passthrough params (MUTATING query only) --------
-    # CheckSystem mirrors vault_status' root resolution (vault_root() / env) for
-    # both vault_repair queries — no explicit vault_root override, matching the
-    # existing vault_status pattern. These extra fields exist only because the
-    # apply query must pass operator intent + options through the pydantic
-    # tool invocation (ToolBase is extra="forbid"): they are inert for every
-    # read-only query.
-    quarantine_dir: Optional[str] = Field(
-        default=None,
-        description="vault_repair_apply only: quarantine directory for removed-node artifacts "
-                    "(defaults to <vault_root>/.quarantine). Ignored by read-only queries.",
-    )
-
-    restore_seeds: bool = Field(
-        default=False,
-        description="vault_repair_apply only: also restore missing seeded files after applying "
-                    "machine fixes. Ignored unless the apply is approved.",
-    )
-
-    approved: bool = Field(
-        default=False,
-        description="vault_repair_apply only: explicit operator approval for the mutating repair. "
-                    "vault_repair_apply REFUSES (and never mutates the vault) unless approved=True "
-                    "is passed on the invocation.",
-    )
-
-    # ------------------------------------------------------------------
     def _check_path_allowed(self, query_name: str) -> bool:
         """Check if a CheckSystem query name is allowed by the vault allowlist.
 
@@ -347,7 +318,6 @@ class CheckSystem(ToolBase):
                 "event_log": lambda: self._query_event_log(),
                 "vault_status": lambda: self._query_vault_status(),
                 "vault_repair_status": lambda: self._query_vault_repair_status(),
-                "vault_repair_apply": lambda: self._query_vault_repair_apply(),
                 "runtime_state": lambda: self._query_runtime_state(ws_id, workspace_path),
             }
 
@@ -993,9 +963,12 @@ class CheckSystem(ToolBase):
     def _query_vault_status(self) -> dict:
         """Run VaultDriftChecker against the vault root; returns a structured, secret-free report.
 
-        Strictly read-only: repairable drift is reported (with
-        ``pending_repairs``) but never auto-fixed — repairs require
-        explicit operator approval via check(apply_repairs=True).
+        Strictly read-only: repairable drift is reported but never auto-fixed.
+        ``repairs_available`` is the read-only count of machine-applyable
+        findings (vault_repair.run_inspection's by_classification.machine_apply);
+        manual-review and GAW findings never count. ``repair_hint`` points the
+        operator at the Vault Health panel in the landing page, where repairs
+        are applied. This query tool has no apply capability.
         """
         checker = None
         try:
@@ -1006,12 +979,31 @@ class CheckSystem(ToolBase):
         try:
             checker = VaultDriftChecker(vault_root=vault_root())
             # Read-only by design: never mutate the vault from a query tool.
-            return checker.check(apply_repairs=False)
+            report = checker.check(apply_repairs=False)
         except DriftAbortError:
             partial = checker.report() if checker is not None else None
             if isinstance(partial, dict):
-                return partial
-            return {"status": "error", "aborted": True, "error": "vault drift check aborted"}
+                report = partial
+            else:
+                return {"status": "error", "aborted": True, "error": "vault drift check aborted"}
+        if isinstance(report, dict):
+            report = dict(report)
+            repairs_available = None
+            try:
+                from thoughtmachine.vault_repair import run_inspection
+                inspection = run_inspection(vault_root())
+                summary = (inspection or {}).get("summary") or {}
+                repairs_available = int(
+                    summary.get("by_classification", {}).get("machine_apply", 0) or 0
+                )
+            except Exception:
+                # Engine unavailable (degraded env): count unknown, not zero.
+                repairs_available = None
+            report["repairs_available"] = repairs_available
+            report["repair_hint"] = (
+                "use the Vault Health panel in the landing page to apply repairs"
+            )
+        return report
 
     def _query_vault_repair_status(self) -> dict:
         """Full read-only vault repair dry run (vault_repair.run_inspection).
@@ -1020,8 +1012,9 @@ class CheckSystem(ToolBase):
         honoring THOUGHTMACHINE_VAULT_ROOT) but reports the whole repair
         pipeline: manifest drift + permission issues + extra files + seed
         tracking (run/summary/issues/extra_files/seeded_files). Strictly
-        read-only — never mutates the vault; fixing requires the separately
-        approved vault_repair_apply query.
+        read-only — never mutates the vault; fixes are applied only via the
+        CLI (python3 -m thoughtmachine.vault_repair --apply), never through
+        this agent-callable query.
         """
         try:
             from thoughtmachine.vault import vault_root
@@ -1036,52 +1029,6 @@ class CheckSystem(ToolBase):
         except Exception as exc:
             return {"status": "error",
                     "error": f"vault repair inspection failed: {exc}",
-                    "aborted": True}
-
-    def _query_vault_repair_apply(self) -> dict:
-        """Apply vault machine fixes — MUTATING; refuses without explicit approval.
-
-        The vault is only ever modified when the invocation carries
-        ``approved=True`` (an explicit operator opt-in given after reviewing the
-        vault_repair_status dry run). A bare invocation is refused and returns
-        WITHOUT calling run_repair, so no file is rewritten, no sibling backup
-        is created and no quarantine dir appears. On approval the params are
-        passed through to ``vault_repair.run_repair(apply=True, ...)``.
-        """
-        if not self.approved:
-            return {
-                "status": "refused",
-                "query": "vault_repair_apply",
-                "reason": "MUTATING query: vault_repair_apply rewrites vault files. "
-                          "Explicit operator approval is required — re-invoke with "
-                          "approved=True after reviewing vault_repair_status.",
-                "approved": False,
-                "applied": False,
-                "performed": [],
-                "backups": [],
-            }
-        try:
-            from thoughtmachine.vault import vault_root
-            from thoughtmachine.vault_repair import run_repair
-        except ImportError as exc:
-            return {"status": "error",
-                    "error": f"vault repair unavailable: {exc}",
-                    "aborted": True}
-        try:
-            root = Path(vault_root())
-            if not root.is_dir():
-                return {"status": "error",
-                        "error": f"vault root not found: {root}",
-                        "aborted": True}
-            # approved=True is the operator's explicit yes: it authorizes the
-            # mutation and acts as run_repair's yes for restore_seeds.
-            return run_repair(root, apply=True,
-                              quarantine_dir=self.quarantine_dir,
-                              restore_seeds=self.restore_seeds,
-                              yes=True)
-        except Exception as exc:
-            return {"status": "error",
-                    "error": f"vault repair failed: {exc}",
                     "aborted": True}
 
     def _query_runtime_state(self, ws_id: Optional[str], workspace_path: Optional[str] = None) -> dict:

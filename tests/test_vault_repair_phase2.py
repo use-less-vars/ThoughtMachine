@@ -510,7 +510,7 @@ def test_cli_apply_exit_codes(tmp_path):
     dirty = tmp_path / "dirty"
     dirty.mkdir()
     _dirty_vault(dirty)
-    assert main(["--vault-root", str(dirty), "--apply"]) == 2
+    assert main(["--vault-root", str(dirty), "--apply"]) == 4
     # A second apply finds nothing left to fix.
     assert main(["--vault-root", str(dirty), "--apply"]) == 0
 
@@ -548,10 +548,33 @@ def test_cli_apply_report_json_contains_repair(tmp_path):
     _dirty_vault(tmp_path)
     out = tmp_path / "out" / "report.json"
     code = main(["--vault-root", str(tmp_path), "--apply", "--report-json", str(out)])
-    assert code == 2
+    assert code == 4
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["run"]["dry_run"] is False
     assert data["repair"]["requested_apply"] is True
     assert len(data["repair"]["performed"]) == 2
     assert all(p["status"] == "applied" for p in data["repair"]["performed"])
     assert data["summary"]["total_issues"] == 0
+
+
+def test_cli_usage_error_exits_2(tmp_path):
+    # argparse usage errors (unknown flag / missing value) exit 2 before any
+    # vault work happens.
+    with pytest.raises(SystemExit) as ei:
+        main(["--bogus"])
+    assert ei.value.code == 2
+    with pytest.raises(SystemExit) as ei:
+        main(["--vault-root"])
+    assert ei.value.code == 2
+
+
+def test_cli_apply_without_fixes_leaves_findings_exits_1(tmp_path):
+    # A manual_review-only finding is never auto-applied: --apply performs no
+    # fixes and exits 1 with the finding still present.
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "user/defaults.json": {**_USER_DEFAULTS, "temperature": "hot"},
+    })
+    assert main(["--vault-root", str(tmp_path), "--apply"]) == 1
+    assert _vault_json(tmp_path, "user/defaults.json")["temperature"] == "hot"
+

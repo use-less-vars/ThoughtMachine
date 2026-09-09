@@ -41,9 +41,15 @@ artifacts are invisible to every later scan.
 | code | meaning |
 |---|---|
 | `0` | healthy — no findings |
-| `1` | findings present (read-only inspection; nothing changed) |
-| `2` | `--apply` performed at least one fix (argparse usage errors also exit 2) |
-| `3` | vault root missing/invalid, or repair errors occurred |
+| `1` | findings present, but no fixes performed (read-only/dry-run, or `--apply` left findings unfixed) |
+| `2` | usage/argument error (argparse; e.g. unknown flag or missing value) |
+| `3` | vault root missing/unreadable, or repair errors occurred |
+| `4` | `--apply` performed one or more fixes |
+
+Precedence: repair errors (`3`) override applied fixes (`4`); applied fixes
+(`4`) override remaining findings; `0` is returned only for a clean vault.
+`2` is raised by argparse before any vault work — a successful run never
+exits 2.
 
 ## Repair guardrails (`--apply`)
 
@@ -85,9 +91,45 @@ issue is collected. Missing vault files whose schema declares a
 - `vault_repair_status` — read-only full dry-run report; mirrors
   `vault_status` root resolution (`thoughtmachine.vault.vault_root`, env
   `THOUGHTMACHINE_VAULT_ROOT`).
-- `vault_repair_apply` — **mutating**; refuses unless `approved=True` (never
-  auto-applies). Params: `restore_seeds`, `quarantine_dir`; `approved`
-  doubles as the run-repair `yes`.
+
+Repair is never agent-callable: the mutating apply surface was removed from
+CheckSystem (dispatch entry, passthrough params and method deleted) — agents
+have no apply path (`vault_repair_apply` removed). Repairs are applied via
+the CLI (`python3 -m thoughtmachine.vault_repair --apply`) or through the
+UI REST endpoints below — never through an agent query.
+
+## REST endpoints (Vault Health panel)
+
+The web UI backend exposes two operator-facing endpoints for the Vault
+Health panel in the landing page. Both endpoints honour a local-origin guard:
+the `Origin`/`Referer` header must match `http(s)://localhost` or
+`http(s)://127.0.0.1` (any port) — anything else is refused with 403
+(`origin not allowed`). Neither endpoint is reachable by agents.
+
+### GET /api/vault/repair/status
+
+Read-only. Runs the full `run_inspection` dry run and returns the complete
+report (`run`, `summary`, `issues`, `extra_files`, `seeded_files`). Never
+mutates the vault.
+
+### POST /api/vault/repair/apply
+
+Applies machine repairs (same guardrails as CLI `--apply`: timestamped
+sibling backups, `.quarantine` artifacts, permission tightening only).
+Request body:
+
+- exactly one of `repair_ids` (list of issue ids) or `categories` (list of
+  issue categories) — not both, not neither;
+- `confirmed: true` — explicit operator confirmation.
+
+| code | condition |
+|---|---|
+| 200 | applied; body `{report, backups_created, files_changed, quarantine_moves, errors}` (`files_changed` sorted) |
+| 400 | body has both or neither of `repair_ids`/`categories` — `'exactly one of repair_ids or categories is required'` |
+| 400 | `confirmed` missing or not true — `'confirmation required (confirmed must be true)'` |
+| 400 | vault root missing/invalid |
+| 403 | request origin is not localhost / 127.0.0.1 — `'origin not allowed'` |
+| 500 | repair engine error |
 
 ## Report shape
 

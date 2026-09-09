@@ -1,10 +1,13 @@
-"""Tests for the CheckSystem 'vault_repair_status' / 'vault_repair_apply' queries.
+"""Tests for the CheckSystem 'vault_repair_status' query.
 
 ``vault_repair_status`` is strictly read-only: it returns the full
 vault_repair.run_inspection dry-run report and never mutates the vault.
-``vault_repair_apply`` is MUTATING: it refuses — never calling run_repair, never
-writing a backup or quarantine dir — unless the invocation carries explicit
-operator approval via ``approved=True``.
+
+There is deliberately NO agent-callable apply path. The old
+``vault_repair_apply`` query was removed from CheckSystem (dispatch entry,
+passthrough fields and handler are gone): machine fixes are applied only via
+the CLI (``python3 -m thoughtmachine.vault_repair --apply``), never through a
+CheckSystem query.
 """
 
 import json
@@ -13,6 +16,10 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+from pydantic import ValidationError
+
+from tools.workspace import check_system as check_system_module
 from tools.workspace.check_system import CheckSystem
 
 
@@ -20,9 +27,9 @@ BASE_KWARGS = {
     "session_permissions": {"filesystem": "read", "network": "write"},
 }
 
-# Allowlist patch value: both repair queries allowed (mirrors how the
-# vault_status tests patch _load_allowlist_from_vault).
-ALLOWED_REPAIR_QUERIES = ["vault_repair_status", "vault_repair_apply"]
+# Allowlist patch value: only the read-only status query is allowed (mirrors
+# how the vault_status tests patch _load_allowlist_from_vault).
+ALLOWED_REPAIR_QUERIES = ["vault_repair_status"]
 
 
 # --- clean vault contents (byte-verbatim from tests/test_vault_repair.py, so
@@ -127,26 +134,15 @@ def _bak_files(root):
                   if p.is_file() and bak_re.search(p.name))
 
 
-def _quarantine_artifacts(root):
-    """Parsed JSON artifacts under the default ``.quarantine`` dir."""
-    qdir = root / ".quarantine"
-    if not qdir.is_dir():
-        return []
-    out = []
-    for p in sorted(qdir.iterdir()):
-        if p.is_file() and p.suffix == ".json":
-            out.append((p.name, json.loads(p.read_text(encoding="utf-8"))))
-    return out
-
-
 def _vault_json(root, rel):
     return json.loads((root / rel).read_text(encoding="utf-8"))
 
 
-def _run_query(query, root, **kwargs):
+def _run_query(query, root, allowed=None, **kwargs):
     """Execute a CheckSystem query against *root* (allowlist + vault_root patched)."""
+    allowed = ALLOWED_REPAIR_QUERIES if allowed is None else allowed
     with patch.object(
-        CheckSystem, "_load_allowlist_from_vault", return_value=ALLOWED_REPAIR_QUERIES
+        CheckSystem, "_load_allowlist_from_vault", return_value=allowed
     ), patch("thoughtmachine.vault.vault_root", return_value=root):
         tool = CheckSystem(query=query, **BASE_KWARGS, **kwargs)
         return json.loads(tool.execute())
@@ -183,72 +179,36 @@ def test_vault_repair_status_never_mutates(tmp_path):
     assert not (tmp_vault / ".quarantine").exists()
 
 
-# --- vault_repair_apply: mutating, approval-gated ----------------------------
+# --- no agent-callable apply path -------------------------------------------
 
-def test_vault_repair_apply_without_approval_refuses(tmp_path):
-    """Bare vault_repair_apply refuses and never touches the vault."""
+def test_vault_repair_apply_query_is_unknown(tmp_path):
+    """vault_repair_apply no longer dispatches: even allowlisted it is Unknown."""
     tmp_vault = _dirty_vault(tmp_path)
     before = _snapshot(tmp_vault)
 
-    out = _run_query("vault_repair_apply", tmp_vault)  # approved defaults False
+    # Allowlist *includes* vault_repair_apply so the request clears the gate
+    # and reaches dispatch -- proving the handler is gone.
+    out = _run_query(
+        "vault_repair_apply", tmp_vault,
+        allowed=["vault_repair_status", "vault_repair_apply"],
+    )
 
-    assert out["status"] == "refused"
-    assert out["approved"] is False
-    assert out["applied"] is False
-    assert out["performed"] == []
-    assert out["backups"] == []
-    # Refusal path must not have mutated anything.
+    assert out["error"] == "Unknown query: vault_repair_apply"
+    assert "vault_repair_apply" not in out["valid_queries"]
+    assert "vault_repair_status" in out["valid_queries"]
+    # Read-only outcome: nothing was touched.
     assert _snapshot(tmp_vault) == before
     assert _bak_files(tmp_vault) == []
     assert not (tmp_vault / ".quarantine").exists()
-    # Findings are still there (nothing was fixed).
-    assert "frobnicate" in _vault_json(tmp_vault, "user/defaults.json")
 
 
-def test_vault_repair_apply_with_approval_repairs(tmp_path):
-    """approved=True runs the mutating repair: performed entries + on-disk fix."""
-    tmp_vault = _dirty_vault(tmp_path)
-    pre = _run_query("vault_repair_status", tmp_vault)
-    machine_ids = {i["id"] for i in pre["issues"] if i["classification"] == "machine_apply"}
-    assert machine_ids
-
-    out = _run_query("vault_repair_apply", tmp_vault, approved=True)
-
-    repair = out["repair"]
-    assert repair["requested_apply"] is True
-    performed = repair["performed"]
-    assert performed
-    assert {p["status"] for p in performed} == {"applied"}
-    assert {p["id"] for p in performed} == machine_ids
-    assert {p["file"] for p in performed} == {
-        "user/defaults.json",
-        "workspaces/ws1/sessions/s1/permissions.json",
-    }
-    # On-disk fixes applied.
-    doc = _vault_json(tmp_vault, "user/defaults.json")
-    assert "frobnicate" not in doc
-    perms = _vault_json(tmp_vault, "workspaces/ws1/sessions/s1/permissions.json")
-    assert perms == {"git": "write"}
-    # Guardrails left their trace: sibling backups + quarantine artifact.
-    assert _bak_files(tmp_vault)
-    assert _quarantine_artifacts(tmp_vault)
-    assert out["summary"]["total_issues"] == 0
+def test_check_system_source_has_no_vault_repair_apply():
+    """Source-level guard: check_system.py never references the removed query."""
+    src = Path(check_system_module.__file__).read_text(encoding="utf-8")
+    assert "vault_repair_apply" not in src
 
 
-def test_vault_repair_apply_approved_on_clean_vault_is_noop(tmp_path):
-    """Approved apply on a clean vault performs nothing and writes nothing."""
-    tmp_vault = _clean_vault(tmp_path)
-    before = _snapshot(tmp_vault)
-
-    out = _run_query("vault_repair_apply", tmp_vault, approved=True)
-
-    assert out["summary"]["total_issues"] == 0
-    assert out["repair"]["requested_apply"] is True
-    assert out["repair"]["restore_seeds"] is False
-    assert out["repair"]["performed"] == []
-    assert out["repair"]["backups"] == []
-    assert _snapshot(tmp_vault) == before
-    assert _bak_files(tmp_vault) == []
-    # run_repair(apply=True) materializes its quarantine dir even with zero
-    # performed fixes — it must stay empty (no artifacts, no mutations).
-    assert _quarantine_artifacts(tmp_vault) == []
+def test_vault_repair_apply_passthrough_params_rejected():
+    """Removed apply fields (approved/...) are extra='forbid'-rejected."""
+    with pytest.raises(ValidationError):
+        CheckSystem(query="vault_repair_status", approved=True, **BASE_KWARGS)

@@ -1052,28 +1052,294 @@ def _restore_seeded_seeds(root: Path, quarantine_dir: Path, report: dict,
     return performed
 
 
+# ---------------------------------------------------------------------------
+# Repair selection (run_repair's repair_ids / categories kwargs).
+#
+# An explicit selection names a SUBSET of the pre-apply findings to repair.
+# Selection overrides an issue's classification (manual_review issues are
+# attempted) but only for engine-safe categories; git_allow_worktree_commits
+# is never auto-removed and extra root files are quarantined by moving them
+# (no rewrite / no backup / nothing deleted).
+# ---------------------------------------------------------------------------
+
+# Public category aliases -> internal issue categories.
+_CATEGORY_ALIASES = {
+    "missing_field": frozenset(("missing_field",)),
+    "missing_file": frozenset(("missing_file",)),
+    "unknown_key": frozenset(("unknown_top_key", "unknown_nested_key")),
+    "legacy_permission": frozenset(("legacy_permission_key",)),
+    "unknown_root_file": frozenset(("extra_file",)),
+    "seeded_drift": frozenset(("seeded_drift",)),
+}
+
+# Internal issue categories with an engine-safe fix when explicitly
+# selected.  The raw engine names are accepted alongside the aliases above.
+_FIXABLE_SELECTABLE = frozenset(
+    ("missing_file", "missing_field", "unknown_top_key",
+     "unknown_nested_key", "legacy_permission_key", "extra_file",
+     "seeded_drift")
+)
+
+
+def _expand_selection_category(category: Any) -> Optional[frozenset]:
+    """Expand one public selection category into engine issue categories.
+
+    Returns None when *category* is neither a known alias nor an engine
+    issue category the engine can fix safely.
+    """
+    if not isinstance(category, str):
+        return None
+    key = category.strip()
+    if not key:
+        return None
+    if key in _CATEGORY_ALIASES:
+        return _CATEGORY_ALIASES[key]
+    if key in _FIXABLE_SELECTABLE:
+        return frozenset((key,))
+    return None
+
+
+def _parse_selection(repair_ids: Optional[Any],
+                     categories: Optional[Any]) -> Optional[dict]:
+    """Normalize the selection kwargs; None when nothing was selected.
+
+    The result echoes the RAW requested ids/categories (sorted, de-duplicated
+    strings) so the repair report can state exactly what was asked for.
+    Unknown category names are only detectable against the pre-apply issue
+    list and are resolved later by ``_resolve_selection``.
+    """
+    try:
+        ids_raw = list(repair_ids) if repair_ids is not None else []
+        cats_raw = list(categories) if categories is not None else []
+    except TypeError:  # pragma: no cover - defensive
+        ids_raw = []
+        cats_raw = []
+    ids = sorted({str(v).strip() for v in ids_raw
+                  if isinstance(v, (str, int)) and str(v).strip()})
+    cats = sorted({str(v).strip() for v in cats_raw
+                   if isinstance(v, (str, int)) and str(v).strip()})
+    if not ids and not cats:
+        return None
+    return {"ids": ids, "categories": cats}
+
+
+def _resolve_selection(report: dict, parsed: dict) -> dict:
+    """Resolve a parsed selection against the pre-apply report.
+
+    Expands category aliases to engine categories, splits repair ids into
+    known/unknown, detects unknown category names (these abort the whole
+    selection: the caller performs no fix when ``errors`` is non-empty) and
+    decides whether seed restoration was requested through the selection.
+    """
+    by_id = {i.get("id"): i for i in (report.get("issues") or [])
+             if i.get("id")}
+    cat_expanded: set = set()
+    errors: List[dict] = []
+    for cat in parsed["categories"]:
+        expanded = _expand_selection_category(cat)
+        if expanded is None:
+            errors.append({
+                "id": None, "file": "", "path_in_file": "",
+                "category": cat, "status": "error",
+                "error": "unknown category %s" % cat,
+            })
+        else:
+            cat_expanded.update(expanded)
+    known_ids = [rid for rid in parsed["ids"] if rid in by_id]
+    unknown_ids = [rid for rid in parsed["ids"] if rid not in by_id]
+    seed_restore = "seeded_drift" in cat_expanded
+    if not seed_restore:
+        for rid in known_ids:
+            if by_id[rid].get("category") == "seeded_drift":
+                seed_restore = True
+                break
+    return {
+        "known_ids": known_ids,
+        "unknown_ids": unknown_ids,
+        "cat_expanded": cat_expanded,
+        "seed_restore": seed_restore,
+        "errors": errors,
+    }
+
+
+def _is_gaw_target(path_in_file: str) -> bool:
+    """True when the issue addresses the engine-read GAW legacy flag."""
+    p = path_in_file or ""
+    return p == _GAW_KEY or p.endswith("." + _GAW_KEY)
+
+
+def _quarantine_root_file(root: Path, quarantine_dir: Path, name: str) -> Path:
+    """Move an unknown vault-root file into the quarantine dir.
+
+    The destination is uniquified (``<name>``, ``<name>-N``); the move is a
+    plain ``shutil.move`` -- no rewrite, no sibling backup, nothing deleted.
+    Raises on failure.
+    """
+    if not name or name != Path(name).name:
+        raise ValueError("unsafe file name for quarantine move: %r" % name)
+    source = root / name
+    if not source.is_file():
+        raise ValueError("unknown root file is not present: %s" % name)
+    dest = _unique_path(quarantine_dir / name)
+    try:
+        shutil.move(str(source), str(dest))
+    except OSError as exc:
+        raise ValueError("quarantine move failed for %s: %s" % (name, exc))
+    return dest
+
+
+def _repair_report(requested_apply: bool, restore_seeds: bool,
+                   performed: List[dict], backups: List[dict],
+                   selection: Optional[dict],
+                   error: Optional[str] = None) -> dict:
+    """Assemble the ``report['repair']`` dict.
+
+    The no-selection shape is fixed (``requested_apply``/``restore_seeds``/
+    ``performed``/``backups`` plus an optional ``error``); the
+    ``requested_ids``/``requested_categories`` metadata keys are only added
+    when a selection was given.
+    """
+    report: Dict[str, Any] = {
+        "requested_apply": bool(requested_apply),
+        "restore_seeds": bool(restore_seeds),
+    }
+    if error is not None:
+        report["error"] = error
+    if selection is not None:
+        report["requested_ids"] = list(selection["ids"])
+        report["requested_categories"] = list(selection["categories"])
+    report["performed"] = performed
+    report["backups"] = backups
+    return report
+
+
+def _apply_selected_fixes(root: Path, quarantine_dir: Path, report: dict,
+                          made: Dict[str, str], sel: dict) -> List[dict]:
+    """Apply exactly the issues selected by repair_ids/categories.
+
+    Never raises.  An explicit selection overrides an issue's classification
+    (manual_review issues are attempted), but only engine-safe categories:
+    extra_file issues are quarantined by moving the unknown root file,
+    ``git_allow_worktree_commits`` is never removed, and issues the engine
+    has no safe fix for (content, type_mismatch, ...) yield an error entry.
+    ``seeded_drift`` issues are left to ``_restore_seeded_seeds``.
+    """
+    performed: List[dict] = []
+    issues = report.get("issues") or []
+    by_id = {i.get("id"): i for i in issues if i.get("id")}
+    ordered: List[Tuple[str, Any]] = []
+    seen = set()
+    for rid in sel["known_ids"]:
+        issue = by_id[rid]
+        if issue.get("id") not in seen:
+            seen.add(issue.get("id"))
+            ordered.append(("issue", issue))
+    for rid in sel["unknown_ids"]:
+        ordered.append(("unknown_id", rid))
+    for issue in issues:
+        if (issue.get("category") or "") in sel["cat_expanded"] \
+                and issue.get("id") not in seen:
+            seen.add(issue.get("id"))
+            ordered.append(("issue", issue))
+    for kind, payload in ordered:
+        if kind == "unknown_id":
+            performed.append({
+                "id": payload, "file": "", "path_in_file": "",
+                "category": "", "status": "error",
+                "error": "unknown repair id",
+            })
+            continue
+        issue = payload
+        category = issue.get("category") or ""
+        entry: Dict[str, Any] = {
+            "id": issue.get("id"),
+            "file": issue.get("file"),
+            "path_in_file": issue.get("path_in_file") or "",
+            "category": category,
+        }
+        try:
+            if category == "seeded_drift":
+                # Restored (as a whole) by _restore_seeded_seeds.
+                continue
+            if category == "extra_file":
+                _quarantine_root_file(root, quarantine_dir,
+                                      issue.get("file") or "")
+                entry["status"] = "applied"
+                entry["action"] = "quarantined unknown root file"
+            elif _is_gaw_target(entry["path_in_file"]):
+                raise ValueError(
+                    "manual review only (engine-read flag; never auto-removed)")
+            elif category in _FIXABLE_SELECTABLE:
+                res = _fix_issue(root, quarantine_dir, issue, made)
+                entry["status"] = "applied"
+                entry["action"] = res["action"]
+            else:
+                raise ValueError("no safe fix for category %s" % category)
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+        performed.append(entry)
+    return performed
+
+
 def run_repair(vault_root: Any, apply: bool = False,
                quarantine_dir: Optional[Any] = None,
-               restore_seeds: bool = False, yes: bool = False) -> dict:
+               restore_seeds: bool = False, yes: bool = False,
+               repair_ids: Optional[List[str]] = None,
+               categories: Optional[List[str]] = None) -> dict:
     """Inspect the vault and optionally apply machine fixes / seed restores.
 
-    Never raises.  ``apply=False`` without ``restore_seeds --yes`` is a pure
-    inspection (identical to ``run_inspection``).  With ``apply=True`` every
-    machine_apply finding is fixed under the repair guardrails; seed
-    restoration only happens when *restore_seeds* AND *yes* are True.
+    Never raises.  ``apply=False`` without ``restore_seeds --yes`` (and with
+    no *repair_ids*/*categories* selection) is a pure inspection (identical
+    to ``run_inspection``).  With ``apply=True`` every machine_apply finding
+    is fixed under the repair guardrails; seed restoration only happens when
+    *restore_seeds* AND *yes* are True.
+
+    *repair_ids* (pre-apply ``VR-###`` issue ids) and *categories* (aliases
+    below) select a SUBSET of findings to repair.  A non-empty selection is
+    an explicit mutation request on its own (it overrides an issue's
+    classification -- manual_review findings are attempted -- but only for
+    categories the engine can fix safely; ``git_allow_worktree_commits`` is
+    never auto-removed).  When a selection is given it restricts the run:
+    unselected issues are left untouched even if ``apply=True``.
+
+    Category aliases:
+      missing_field, missing_file, unknown_key (top+nested),
+      legacy_permission (docker convert / legacy-key fold; never GAW),
+      unknown_root_file (extra root files are moved to .quarantine),
+      seeded_drift (seed restore, same guardrails as --restore-seeds --yes).
+    Engine category names (unknown_top_key, extra_file, ...) are accepted
+    directly as well; an unknown category aborts the selection with error
+    entries and no other fix is attempted.
     """
     root = Path(vault_root)
     made: Dict[str, str] = {}
+    selection = _parse_selection(repair_ids, categories)
     try:
-        want_repair = bool(apply) or (restore_seeds and yes)
+        want_repair = bool(apply) or (restore_seeds and yes) \
+            or selection is not None
         if not want_repair:
             return run_inspection(root)
         pre = run_inspection(root)
-        quarantine = _resolve_quarantine_dir(root, quarantine_dir)
-        performed = _apply_fixes(root, quarantine, pre, made) if apply else []
+        performed: List[dict] = []
         seed_perf: List[dict] = []
-        if restore_seeds and yes:
-            seed_perf = _restore_seeded_seeds(root, quarantine, pre, made)
+        if selection is not None:
+            sel = _resolve_selection(pre, selection)
+            if sel["errors"]:
+                performed = sel["errors"]
+            else:
+                quarantine = _resolve_quarantine_dir(root, quarantine_dir)
+                performed = _apply_selected_fixes(root, quarantine, pre,
+                                                  made, sel)
+                if (restore_seeds and yes) or sel["seed_restore"]:
+                    seed_perf = _restore_seeded_seeds(root, quarantine,
+                                                      pre, made)
+        else:
+            quarantine = _resolve_quarantine_dir(root, quarantine_dir)
+            performed = _apply_fixes(root, quarantine, pre, made) if apply \
+                else []
+            if restore_seeds and yes:
+                seed_perf = _restore_seeded_seeds(root, quarantine, pre, made)
         post = run_inspection(root)
         post["run"]["dry_run"] = False
         backups = []
@@ -1082,12 +1348,10 @@ def run_repair(vault_root: Any, apply: bool = False,
                 "backup": os.path.relpath(bak, str(root)),
                 "backup_of": os.path.relpath(orig, str(root)),
             })
-        post["repair"] = {
-            "requested_apply": bool(apply),
-            "restore_seeds": bool(restore_seeds and yes),
-            "performed": performed + seed_perf,
-            "backups": backups,
-        }
+        post["repair"] = _repair_report(bool(apply),
+                                        bool(restore_seeds and yes),
+                                        performed + seed_perf, backups,
+                                        selection)
         return post
     except Exception as exc:
         try:
@@ -1103,13 +1367,9 @@ def run_repair(vault_root: Any, apply: bool = False,
                 "extra_files": [],
                 "seeded_files": [],
             }
-        base["repair"] = {
-            "requested_apply": bool(apply),
-            "restore_seeds": bool(restore_seeds and yes),
-            "error": str(exc),
-            "performed": [],
-            "backups": [],
-        }
+        base["repair"] = _repair_report(bool(apply),
+                                        bool(restore_seeds and yes),
+                                        [], [], selection, error=str(exc))
         return base
 
 
@@ -1190,10 +1450,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point.
 
     Exit codes:
-      0  vault is healthy (no findings)
-      1  findings present (read-only)
-      2  --apply performed at least one fix
-      3  vault root missing, or repair errors occurred
+      0  healthy -- no findings
+      1  findings present, but no fixes performed (read-only/dry-run, or
+         --apply left findings unfixed)
+      2  usage/argument error (argparse; e.g. unknown flag or missing value)
+      3  vault root missing/unreadable, or repair errors occurred
+      4  --apply performed one or more fixes
+
+    Precedence: repair errors (3) override applied fixes (4); applied fixes
+    (4) override remaining findings; 0 is returned only for a clean vault.
     """
     parser = argparse.ArgumentParser(
         prog="thoughtmachine.vault_repair",
@@ -1268,7 +1533,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if apply_mut:
         performed = repair.get("performed") or []
         if any(p.get("status") == "applied" for p in performed):
-            return 2
+            # Exit 4: --apply performed at least one fix. (Usage errors exit 2
+            # via argparse; exit 2 is never returned by a successful run.)
+            return 4
         return 0 if summary["total_issues"] == 0 else 1
     return 0 if summary["total_issues"] == 0 else 1
 

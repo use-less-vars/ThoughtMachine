@@ -1,0 +1,108 @@
+"""vault_repair_routes.py -- REST endpoints for vault repair (chunk B).
+
+Read-only status endpoint plus an explicit, origin-guarded apply endpoint.
+All vault imports happen lazily inside the handlers so that tests can
+monkeypatch ``thoughtmachine.vault.vault_root`` / the engine attribute paths
+before any request runs; importing this module has no side effects on the
+vault or the engine.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+router = APIRouter(prefix="/api")
+
+_ORIGIN_RE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
+                        re.I)
+
+
+def _json_error(message: str, status_code: int = 500) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status_code)
+
+
+def _origin_allowed(request: Request) -> bool:
+    """True when the request comes from a local web origin.
+
+    Accepts a matching ``Origin`` header; falls back to the ``Referer``
+    header (scheme+host part) when Origin is absent.  No header -> False.
+    """
+    raw = request.headers.get("origin") or request.headers.get("referer") or ""
+    if not raw:
+        return False
+    if request.headers.get("referer") and not request.headers.get("origin"):
+        match = re.match(r"^https?://[^/]+", raw, re.I)
+        if not match:
+            return False
+        raw = match.group(0)
+    return bool(_ORIGIN_RE.match(raw))
+
+
+class _RepairApplyBody(BaseModel):
+    repair_ids: Optional[List[str]] = None
+    categories: Optional[List[str]] = None
+    confirmed: bool = False
+
+
+@router.get("/vault/repair/status")
+def vault_repair_status(request: Request) -> JSONResponse:
+    from thoughtmachine import vault_repair
+    from thoughtmachine.vault import vault_root
+
+    if not _origin_allowed(request):
+        return _json_error("origin not allowed", 403)
+    try:
+        root = Path(vault_root()).expanduser().resolve()
+        if not root.is_dir():
+            return _json_error("vault root %s does not exist" % root, 400)
+        return vault_repair.run_inspection(root)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@router.post("/vault/repair/apply")
+def vault_repair_apply(request: Request, body: _RepairApplyBody) -> JSONResponse:
+    from thoughtmachine import vault_repair
+    from thoughtmachine.vault import vault_root
+
+    if not _origin_allowed(request):
+        return _json_error("origin not allowed", 403)
+    ids = [v for v in (body.repair_ids or []) if v and str(v).strip()]
+    cats = [v for v in (body.categories or []) if v and str(v).strip()]
+    if bool(ids) == bool(cats):
+        return _json_error(
+            "exactly one of repair_ids or categories is required", 400)
+    if not body.confirmed:
+        return _json_error("confirmation required (confirmed must be true)",
+                           400)
+    try:
+        root = Path(vault_root()).expanduser().resolve()
+        if not root.is_dir():
+            return _json_error("vault root %s does not exist" % root, 400)
+        report = vault_repair.run_repair(
+            root, apply=True, restore_seeds=False, yes=False,
+            repair_ids=ids or None, categories=cats or None)
+        repair = report.get("repair") or {}
+        if repair.get("error"):
+            return _json_error(repair["error"], 500)
+        performed = repair.get("performed") or []
+        applied = [p for p in performed if p.get("status") == "applied"]
+        return {
+            "report": report,
+            "backups_created": len(repair.get("backups") or []),
+            "files_changed": sorted(
+                {p["file"] for p in applied if p.get("file")}),
+            "quarantine_moves": [
+                p for p in applied
+                if "quarantin" in str(p.get("action") or "").lower()
+            ],
+            "errors": [p for p in performed if p.get("status") == "error"],
+        }
+    except Exception as exc:
+        return _json_error(str(exc), 500)
