@@ -11,9 +11,10 @@
  *   (b) a worker:* event tagged with a DIFFERENT session_id arriving on wsA is
  *       dropped by SessionTab's session-mismatch filter — A's panel is
  *       unaffected and nothing crashes.
- *   (c) events stay per-session across tab switches + WS remount: B's panel
- *       shows only B's worker events, and after switching back to S1 (fresh WS)
- *       A's panel shows only A's worker events.
+ *   (c) events stay per-session across tab switches (keep-mounted deck): B's
+ *       panel shows only B's worker events, and switching back to S1 reuses
+ *       the kept-mounted pane/WS (no remount) — A's panel shows only A's
+ *       worker events.
  *
  * Worker selection is driven through the real UI: WorkerManagementPanel (inside
  * ConfigPanel → WorkspacePanel, mounted by every SessionTab) fetches
@@ -369,16 +370,14 @@ describe('worker-event isolation between sessions (R6b)', () => {
     expect(panelText()).toContain('🟢 Worker spawned: wB')
     expect(panelText()).not.toContain('🟢 Worker spawned: wA')
 
-    // Back to S1 → fresh WS (wsA2) → A panel shows ONLY A's event
+    // Back to S1 → the keep-mounted deck reuses A's pane + WS, so NO fresh
+    // WS is created (instance count stays at 3) and A's panel shows ONLY
+    // A's event.
     fireEvent.click(within(tabBar()).getByText('S1'))
-    await waitFor(() => expect(MockWebSocket.instances.length).toBe(4))
-    const wsA2 = lastWs()
-    act(() => wsA2.open())
-    bindWorkspace(wsA2, 'sess-1')
     expect(activeTabLabel()).toBe('S1')
-
     await waitFor(() => expect(panelHeader()).toBe('Worker: wA'))
     await waitFor(() => expect(panelRows()).toBe(1))
+    expect(MockWebSocket.instances.length).toBe(3)
     expect(panelText()).toContain('🟢 Worker spawned: wA')
     expect(panelText()).not.toContain('🟢 Worker spawned: wB')
   })
