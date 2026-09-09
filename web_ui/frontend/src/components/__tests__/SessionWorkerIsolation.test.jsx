@@ -154,6 +154,10 @@ const panelHeader = () =>
 const panelCtx = () =>
   workerPanel()?.querySelector('.worker-output-header-ctx')?.textContent ?? null
 
+const dotEl = () => workerPanel()?.querySelector('.worker-status-dot') ?? null
+const dotLabel = () => workerPanel()?.querySelector('.worker-status-label')?.textContent ?? null
+
+
 // ── Async setup helpers ─────────────────────────────────────────────────────
 async function connectHub() {
   await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0))
@@ -380,5 +384,52 @@ describe('worker-event isolation between sessions (R6b)', () => {
     expect(MockWebSocket.instances.length).toBe(3)
     expect(panelText()).toContain('🟢 Worker spawned: wA')
     expect(panelText()).not.toContain('🟢 Worker spawned: wB')
+  })
+})
+
+describe('worker panel status dot follows the worker runtime_status (F5)', () => {
+  it('defaults to Idle, then follows worker:worker_status → worker_paused → worker_completed on the live session', async () => {
+    render(<App />)
+    const { wsA } = await mountFirstTab()
+    await selectWorker('wA')
+
+    // No worker event yet → grey Idle dot, no pulse
+    expect(dotLabel()).toBe('Idle')
+    expect(dotEl().className).not.toContain('worker-status-dot-busy')
+
+    // Backend pushes status busy → green Running + pulse (regardless of how
+    // the session tab's own Running/Idle indicator behaves)
+    sendWorkerEvent(wsA, 'sess-1', 'wA', statusEvt('2025-01-01T00:00:02Z', { status: 'busy' }))
+    await waitFor(() => expect(dotLabel()).toBe('Running'))
+    expect(dotEl().className).toContain('worker-status-dot-busy')
+
+    // Worker pauses while the session stays open/running → amber Paused
+    sendWorkerEvent(wsA, 'sess-1', 'wA', {
+      type: 'worker:worker_paused',
+      timestamp: '2025-01-01T00:00:03Z',
+      data: {},
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Paused'))
+    expect(dotEl().className).not.toContain('worker-status-dot-busy')
+    expect(dotEl().style.background).toBe('rgb(249, 226, 175)')
+
+    // Completed → back to Idle
+    sendWorkerEvent(wsA, 'sess-1', 'wA', completedEvt('2025-01-01T00:00:04Z'))
+    await waitFor(() => expect(dotLabel()).toBe('Idle'))
+    expect(dotEl().className).not.toContain('worker-status-dot-busy')
+  })
+
+  it('shows a red Error dot when the worker errors', async () => {
+    render(<App />)
+    const { wsA } = await mountFirstTab()
+    await selectWorker('wA')
+
+    sendWorkerEvent(wsA, 'sess-1', 'wA', {
+      type: 'worker:worker_error',
+      timestamp: '2025-01-01T00:00:02Z',
+      data: { error: 'toolchain crashed' },
+    })
+    await waitFor(() => expect(dotLabel()).toBe('Error'))
+    expect(dotEl().style.background).toBe('rgb(243, 139, 168)')
   })
 })
