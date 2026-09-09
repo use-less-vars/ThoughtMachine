@@ -210,6 +210,25 @@ export default function App() {
     return s?.name || ''
   }
 
+  // Central rename application. Session renames reach this component through
+  // two paths — the inline rename UI and WS session_renamed events (the tab
+  // WS via SessionTab's onSessionRenamed callback, or the hub when relayed).
+  // Both must update the persisted tab-strip title IMMEDIATELY (no reload),
+  // not just the shared sessions name store. updateSessionName is idempotent,
+  // so a rename applied twice (optimistic UI + echoed WS event) is harmless.
+  const applySessionRename = useCallback((sessionId, newName) => {
+    if (!sessionId || !newName) return
+    useStore.getState().updateSessionName(sessionId, newName)
+    const st = useSessionTabsStore.getState()
+    // Resolve the owning workspace: the learned mapping wins; otherwise look
+    // for any strip entry that already holds this session's tab; fall back to
+    // the last-known / current workspace.
+    const byWs = st.byWorkspace || {}
+    const foundWs = Object.keys(byWs).find(ws => (byWs[ws]?.tabs || []).some(t => t.sessionId === sessionId))
+    const ws = sessionWorkspacesRef.current[sessionId] || foundWs || lastKnownWorkspaceRef.current || currentWsRef.current
+    if (ws) st.setTabTitle(ws, sessionId, newName)
+  }, [])
+
   // ── Hub WebSocket (sessions list only) with auto-reconnect ────────────
   const reconnectTimeoutRef = useRef(null)
   const reconnectAttemptsRef = useRef(0)
@@ -370,6 +389,12 @@ export default function App() {
         break
       }
       case 'session_renamed':
+        // Apply the new name immediately (tab strip + persisted tab state +
+        // shared name store) — no page reload — then re-fetch the full
+        // session list to keep the sidebar and mappings in sync.
+        if (msg.new_name) applySessionRename(msg.session_id, msg.new_name)
+        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        break
       case 'session_closed':
         // re-fetch the full session list to keep sidebar + mappings in sync
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
@@ -492,9 +517,13 @@ export default function App() {
   }, [])
 
   // ── Handle session renamed (triggered by SessionTab via callback) ─────
+  // Both the inline rename UI and the tab-WS session_renamed event funnel
+  // here: update the tab title (persisted strip) + shared name store
+  // immediately, then re-fetch the session list for sidebar consistency.
   const handleSessionRenamed = useCallback((sessionId, newName) => {
+    applySessionRename(sessionId, newName)
     hubSend('list_sessions')
-  }, [hubSend])
+  }, [applySessionRename, hubSend])
 
   // ── SessionTab reports the workspace it loaded into (session_loaded) ──
   const handleWorkspaceKnown = useCallback((sessionId, workspaceId) => {
