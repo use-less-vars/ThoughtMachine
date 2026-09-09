@@ -1163,6 +1163,7 @@ export default function App() {
                 onWorkerEvent={handleWorkerEvent}
                 onLoggingConfigChanged={(config) => setLoggingConfig(config)}
                 onWorkspaceKnown={handleWorkspaceKnown}
+                routeWorkspaceId={route?.workspaceId || null}
               />
             </div>
           )}

@@ -688,3 +688,16 @@
   color: #11111b;
 }
 
+
+/* ── Back to workspaces link (three-layer nav, TASK 1) ──────────────── */
+.wdp-back-link {
+  display: inline-block;
+  color: #89b4fa;
+  font-size: 0.85rem;
+  text-decoration: none;
+  margin: 0.6rem 1.1rem 0;
+}
+.wdp-back-link:hover {
+  text-decoration: underline;
+}
+

@@ -70,7 +70,7 @@ function messagesEqual(a, b) {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, onSessionAdopted, selectedWorker, onSelectWorker, onWorkerEvent, onWorkspaceKnown, onLoggingConfigChanged }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, onSessionAdopted, selectedWorker, onSelectWorker, onWorkerEvent, onWorkspaceKnown, onLoggingConfigChanged, routeWorkspaceId }) {
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [isRenaming, setIsRenaming] = useState(false)
   const renameInputRef = useRef(null)
@@ -127,11 +127,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const config = sessionConfig?.config ?? null
   const navigate = useNavigate()
   const workspaceList = useWorkspaceStore((s) => s.workspaceList)
-  // Workspace for the 'Back to Workspace' button: prefer the workspace_id the
-  // backend reported in session_loaded; fall back to matching the session
-  // config's workspace_path against known workspaces; final fallback null →
-  // navigate to the workspace selector ('/workspaces').
-  const backWorkspaceId = workspaceId || (() => {
+  // Workspace for the 'Back to Workspace' button: prefer the owning workspaceId
+  // carried by the nested session URL (#/workspace/:wsId/session/:sid) — it
+  // reaches the workspace level immediately, even before session_loaded; next
+  // prefer the workspace_id the backend reported in session_loaded; fall back
+  // to matching the session config's workspace_path against known workspaces;
+  // final fallback null → navigate to the workspace selector ('/workspaces').
+  const backWorkspaceId = routeWorkspaceId || workspaceId || (() => {
     const wsPath = config?.workspace_path
     if (!wsPath) return null
     const match = workspaceList.find((w) => w.root === wsPath || w.path === wsPath)
