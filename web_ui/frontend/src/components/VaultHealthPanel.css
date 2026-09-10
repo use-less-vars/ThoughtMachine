@@ -1,0 +1,572 @@
+/* --- VaultHealthPanel.css --- */
+/* Styles for the landing-page "Vault repair health" panel. Catppuccin (Mocha)
+   palette. All selectors are namespaced with the `vault-health-panel-` prefix to
+   avoid leaking into the rest of the app. The panel body is the single internal
+   scroll container; the page itself never scrolls as a result of this panel. */
+
+.vault-health-panel {
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 10px;
+  color: #cdd6f4;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+  font-size: 0.875rem;
+}
+
+/* --- Header ------------------------------------------------------------- */
+
+.vault-health-panel-header {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+}
+
+.vault-health-panel-title {
+  color: #cdd6f4;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  margin: 0;
+}
+
+.vault-health-panel-verdict {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 0.75rem;
+  font-weight: 600;
+  gap: 0.35rem;
+  padding: 0.15rem 0.6rem;
+}
+
+.vault-health-panel-verdict-ok {
+  background: rgba(166, 227, 161, 0.15);
+  color: #a6e3a1;
+}
+
+.vault-health-panel-verdict-drift {
+  background: rgba(249, 226, 175, 0.15);
+  color: #f9e2af;
+}
+
+.vault-health-panel-toggle {
+  align-items: center;
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #a6adc8;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 0.75rem;
+  gap: 0.35rem;
+  padding: 0.2rem 0.6rem;
+}
+
+.vault-health-panel-toggle:hover {
+  border-color: #585b70;
+  color: #cdd6f4;
+}
+
+.vault-health-panel-toggle-label {
+  line-height: 1;
+}
+
+.vault-health-panel-chevron {
+  color: #6c7086;
+  line-height: 1;
+}
+
+.vault-health-panel-refresh {
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #89b4fa;
+  cursor: pointer;
+  font-size: 0.75rem;
+  margin-left: auto;
+  padding: 0.2rem 0.7rem;
+}
+
+.vault-health-panel-refresh:hover:not(:disabled) {
+  border-color: #89b4fa;
+}
+
+.vault-health-panel-refresh:disabled {
+  color: #6c7086;
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* --- Notice (lives outside the collapsible body) ------------------------ */
+
+.vault-health-panel-notice {
+  border-radius: 6px;
+  font-size: 0.8rem;
+  margin: 0;
+  padding: 0.4rem 0.65rem;
+}
+
+.vault-health-panel-notice-error {
+  background: rgba(243, 139, 168, 0.12);
+  border: 1px solid rgba(243, 139, 168, 0.4);
+  color: #f38ba8;
+}
+
+.vault-health-panel-notice-success {
+  background: rgba(166, 227, 161, 0.12);
+  border: 1px solid rgba(166, 227, 161, 0.4);
+  color: #a6e3a1;
+}
+
+/* --- Unavailable frame -------------------------------------------------- */
+
+.vault-health-panel-unavailable {
+  border-style: dashed;
+}
+
+/* --- Scrollable body (single internal scroll container) ----------------- */
+
+.vault-health-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-height: min(50vh, 26rem);
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+/* --- Summary stats ------------------------------------------------------ */
+
+.vault-health-panel-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.vault-health-panel-stat {
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  color: #a6adc8;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+}
+
+.vault-health-panel-stat strong {
+  color: #cdd6f4;
+  font-weight: 600;
+}
+
+.vault-health-panel-hint {
+  color: #6c7086;
+  font-size: 0.78rem;
+  font-style: italic;
+  margin: 0;
+}
+
+.vault-health-panel-healthy {
+  color: #a6e3a1;
+  font-size: 0.82rem;
+  margin: 0;
+}
+
+.vault-health-panel-rescan {
+  align-self: flex-start;
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #89b4fa;
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.7rem;
+}
+
+.vault-health-panel-rescan:hover:not(:disabled) {
+  border-color: #89b4fa;
+}
+
+.vault-health-panel-rescan:disabled {
+  color: #6c7086;
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* --- Finding groups ----------------------------------------------------- */
+
+.vault-health-panel-group {
+  border-left: 3px solid #45475a;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding-left: 0.65rem;
+}
+
+.vault-health-panel-group-security-critical {
+  border-left-color: #f38ba8;
+}
+
+.vault-health-panel-group-permission-integrity {
+  border-left-color: #fab387;
+}
+
+.vault-health-panel-group-config-drift {
+  border-left-color: #f9e2af;
+}
+
+.vault-health-panel-group-cosmetic {
+  border-left-color: #89b4fa;
+}
+
+.vault-health-panel-group-other {
+  border-left-color: #cba6f7;
+}
+
+.vault-health-panel-group-title {
+  align-items: center;
+  color: #a6adc8;
+  display: flex;
+  font-size: 0.8rem;
+  font-weight: 600;
+  gap: 0.4rem;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.vault-health-panel-count {
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 999px;
+  color: #6c7086;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0 0.4rem;
+}
+
+/* --- Finding list ------------------------------------------------------- */
+
+.vault-health-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.vault-health-panel-item {
+  align-items: flex-start;
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.6rem;
+  padding: 0.45rem 0.6rem;
+}
+
+.vault-health-panel-item-security-critical {
+  border-left: 3px solid #f38ba8;
+}
+
+.vault-health-panel-item-permission-integrity {
+  border-left: 3px solid #fab387;
+}
+
+.vault-health-panel-item-config-drift {
+  border-left: 3px solid #f9e2af;
+}
+
+.vault-health-panel-item-cosmetic {
+  border-left: 3px solid #89b4fa;
+}
+
+.vault-health-panel-item-other {
+  border-left: 3px solid #cba6f7;
+}
+
+.vault-health-panel-sev {
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 0.1rem 0.4rem;
+  text-transform: uppercase;
+}
+
+.vault-health-panel-sev-error {
+  background: rgba(243, 139, 168, 0.15);
+  color: #f38ba8;
+}
+
+.vault-health-panel-sev-warning {
+  background: rgba(249, 226, 175, 0.15);
+  color: #f9e2af;
+}
+
+.vault-health-panel-sev-info {
+  background: rgba(137, 180, 250, 0.15);
+  color: #89b4fa;
+}
+
+.vault-health-panel-file {
+  color: #cdd6f4;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.vault-health-panel-message {
+  color: #a6adc8;
+  flex: 1 1 100%;
+  font-size: 0.78rem;
+}
+
+.vault-health-panel-fix {
+  color: #6c7086;
+  flex: 1 1 100%;
+  font-size: 0.74rem;
+  font-style: italic;
+}
+
+.vault-health-panel-select {
+  align-items: center;
+  color: #a6adc8;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 0.72rem;
+  gap: 0.3rem;
+}
+
+.vault-health-panel-select input {
+  accent-color: #89b4fa;
+  cursor: pointer;
+}
+
+.vault-health-panel-select-label {
+  line-height: 1;
+}
+
+.vault-health-panel-item-action {
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #89b4fa;
+  cursor: pointer;
+  font-size: 0.72rem;
+  padding: 0.15rem 0.55rem;
+}
+
+.vault-health-panel-item-action:hover {
+  border-color: #89b4fa;
+}
+
+.vault-health-panel-info-label {
+  color: #6c7086;
+  font-size: 0.7rem;
+  font-style: italic;
+}
+
+/* --- Bulk action bar ---------------------------------------------------- */
+
+.vault-health-panel-actions {
+  align-items: center;
+  border-top: 1px solid #313244;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding-top: 0.7rem;
+}
+
+.vault-health-panel-select-all {
+  align-items: center;
+  color: #a6adc8;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 0.75rem;
+  gap: 0.35rem;
+}
+
+.vault-health-panel-select-all input {
+  accent-color: #89b4fa;
+  cursor: pointer;
+}
+
+.vault-health-panel-apply {
+  background: #89b4fa;
+  border: 1px solid #89b4fa;
+  border-radius: 6px;
+  color: #1e1e2e;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-left: auto;
+  padding: 0.3rem 0.8rem;
+}
+
+.vault-health-panel-apply:hover:not(:disabled) {
+  background: #a6c8ff;
+  border-color: #a6c8ff;
+}
+
+.vault-health-panel-apply:disabled {
+  background: #313244;
+  border-color: #313244;
+  color: #6c7086;
+  cursor: not-allowed;
+}
+
+.vault-health-panel-applying {
+  color: #f9e2af;
+  font-size: 0.78rem;
+  font-style: italic;
+  margin: 0;
+}
+
+/* --- Footer (extra / seeded files) -------------------------------------- */
+
+.vault-health-panel-footer {
+  border-top: 1px solid #313244;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-top: 0.6rem;
+}
+
+.vault-health-panel-footer-line {
+  color: #6c7086;
+  font-size: 0.72rem;
+  margin: 0;
+  word-break: break-word;
+}
+
+/* --- Confirm-repairs dialog -------------------------------------------- */
+
+.vault-health-panel-overlay {
+  align-items: center;
+  background: rgba(17, 17, 27, 0.7);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 1rem;
+  position: fixed;
+  z-index: 1000;
+}
+
+.vault-health-panel-dialog {
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  color: #cdd6f4;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-height: 80vh;
+  max-width: 32rem;
+  overflow-y: auto;
+  padding: 1.1rem;
+  width: 100%;
+}
+
+.vault-health-panel-dialog-title {
+  color: #cdd6f4;
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.vault-health-panel-dialog-intro {
+  color: #a6adc8;
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.vault-health-panel-dialog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  list-style: none;
+  margin: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 0;
+}
+
+.vault-health-panel-dialog-item {
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.45rem 0.6rem;
+}
+
+.vault-health-panel-dialog-item .vault-health-panel-path {
+  color: #6c7086;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  word-break: break-all;
+}
+
+.vault-health-panel-dialog-item .vault-health-panel-fix {
+  color: #6c7086;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  font-style: normal;
+  word-break: break-word;
+}
+
+.vault-health-panel-dialog-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.vault-health-panel-dialog-cancel {
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #a6adc8;
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.8rem;
+}
+
+.vault-health-panel-dialog-cancel:hover:not(:disabled) {
+  border-color: #585b70;
+  color: #cdd6f4;
+}
+
+.vault-health-panel-dialog-cancel:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.vault-health-panel-dialog-confirm {
+  background: #89b4fa;
+  border: 1px solid #89b4fa;
+  border-radius: 6px;
+  color: #1e1e2e;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.3rem 0.9rem;
+}
+
+.vault-health-panel-dialog-confirm:hover:not(:disabled) {
+  background: #a6c8ff;
+  border-color: #a6c8ff;
+}
+
+.vault-health-panel-dialog-confirm:disabled {
+  background: #313244;
+  border-color: #313244;
+  color: #6c7086;
+  cursor: not-allowed;
+}
