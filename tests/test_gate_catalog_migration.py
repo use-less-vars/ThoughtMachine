@@ -159,9 +159,19 @@ def test_host_bash_ceiling_allow_without_grant_stays_banned():
     assert eff["host_bash"] == "banned"
 
 
-def test_host_bash_grant_allow_without_ceiling_passes():
+def test_host_bash_grant_allow_without_ceiling_passes(monkeypatch):
     """With no host_bash ceiling, an 'allow' session grant stands both in
-    the raw ceiling pass and in the effective profile."""
+    the raw ceiling pass and in the effective profile.
+
+    The workspace is assumed to opt into host resources (the orthogonal
+    allow_host_resources policy is stubbed True) so this test isolates the
+    ceiling mechanics; the ban when no opt-in exists is covered by
+    test_host_bash_denied_without_host_resource_optin below.
+    """
+    monkeypatch.setattr(
+        "tools.host_resource_policy.workspace_allows_host_resources",
+        lambda _ws: True,
+    )
     assert apply_workspace_ceiling({}, {"host_bash": "allow"}) == {
         "host_bash": "allow"
     }
@@ -178,9 +188,27 @@ def test_default_session_effective_contains_host_bash_banned():
     assert eff["host_bash"] == "banned"
 
 
-def test_disk_mode_host_bash_grant_capped_by_ceiling(hermetic_vault):
+def test_host_bash_denied_without_host_resource_optin():
+    """The resolution layer bans host_bash unless the workspace opts into
+    host resources (allow_host_resources: true), even when the session
+    grants 'allow' and no ceiling restricts it."""
+    eff = get_effective_permissions(
+        SessionPermissions(host_bash="allow"), _FULL_CAPS
+    )
+    assert eff["host_bash"] == "banned"
+
+
+def test_disk_mode_host_bash_grant_capped_by_ceiling(hermetic_vault, monkeypatch):
     """Disk mode: a stored 'ask' host_bash grant survives an 'allow'
-    ceiling and is capped to 'banned' by a 'banned' ceiling (control)."""
+    ceiling and is capped to 'banned' by a 'banned' ceiling (control).
+
+    The workspace is assumed to opt into host resources (the orthogonal
+    allow_host_resources policy is stubbed True) so this test isolates the
+    disk ceiling mechanics from the host-resource ban."""
+    monkeypatch.setattr(
+        "tools.host_resource_policy.workspace_allows_host_resources",
+        lambda _ws: True,
+    )
     ws_id, sid = "ws-a", "sess-1"
     write_session_permissions(hermetic_vault, ws_id, sid, {"host_bash": "ask"})
     _write_config(hermetic_vault, ws_id, {"host_bash": "allow"})

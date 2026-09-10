@@ -897,14 +897,44 @@ def get_effective_permissions(
     # The annotated result is a plain-dict subclass whose content is
     # identical; when nothing changed (or there is no ceiling) the plain
     # dict is returned, so the common path is byte-for-byte unchanged.
+    result: Dict[str, Any] = effective
     if workspace_permissions and session is not base_session:
         base_eff = _merge_with_capabilities(base_session, workspace)
         annotated = _annotate_ceiling_changes(
             base_eff, effective, workspace_permissions
         )
         if annotated is not None:
-            return annotated
-    return effective
+            result = annotated
+
+    # ── Workspace host-resource ceiling (allow_host_resources) ───────────
+    # The workspace operator's top-level ``allow_host_resources`` policy is a
+    # hard, absolute gate on the ``host_bash`` resource: a missing key, an
+    # absent / null / false value, or a missing/unreadable workspace config
+    # denies host execution regardless of what the session grant or worker
+    # footprint says, while ANY truthy value enables it -- the reader returns
+    # ``bool(data.get("allow_host_resources", False))``, so e.g. the string
+    # "yes" or the number 1 also enable host resources.  See
+    # tools.host_resource_policy.workspace_allows_host_resources, the single
+    # source of truth for the exact type semantics.  It is enforced HERE, in
+    # the resolution layer, so every consumer of the effective dict sees the
+    # denial -- the in-tool check in tools/host_bash_tool.py is skipped
+    # whenever no workspace id is attached, and resolving it here closes that
+    # gap without duplicating policy.  The reader is fail-closed; any reader
+    # error therefore denies.  The override
+    # is applied AFTER the ceiling annotation so a host_bash ban is never
+    # misattributed to the workspace *permissions* ceiling.
+    try:
+        from tools.host_resource_policy import workspace_allows_host_resources
+
+        _workspace_allows_host_resources = workspace_allows_host_resources(
+            workspace_id
+        )
+    except Exception:
+        _workspace_allows_host_resources = False
+    if not _workspace_allows_host_resources:
+        result["host_bash"] = "banned"
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
