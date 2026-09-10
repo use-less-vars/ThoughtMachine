@@ -2,8 +2,13 @@
 
 .ws-selector {
   display: flex;
+  flex-direction: column;
   height: 100%;
   min-height: 0;
+}
+
+.ws-selector > .vault-health-panel {
+  flex: none;
 }
 
 /* --- Sidebar: existing workspaces --- */
@@ -96,6 +101,7 @@
 
 .ws-main {
   flex: 1;
+  min-height: 0;
   padding: 1.5rem;
   overflow-y: auto;
 }
