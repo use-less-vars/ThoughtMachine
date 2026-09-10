@@ -85,6 +85,23 @@ def vault_repair_apply(request: Request, body: _RepairApplyBody) -> JSONResponse
         root = Path(vault_root()).expanduser().resolve()
         if not root.is_dir():
             return _json_error("vault root %s does not exist" % root, 400)
+        if not ids:
+            # categories-only selection is never an explicit selection, so it
+            # must not be able to sweep security_critical findings in: if the
+            # engine's own category expansion would include one, reject the
+            # whole request up front so nothing partial is applied.
+            pre = vault_repair.run_inspection(root)
+            sel = vault_repair._resolve_selection(
+                pre, vault_repair._parse_selection(None, cats))
+            if not sel.get("errors") and any(
+                    i.get("classification") == "machine_apply"
+                    and i.get("risk_category")
+                    == vault_repair._RISK_SECURITY_CRITICAL
+                    and (i.get("category") or "") in sel["cat_expanded"]
+                    for i in (pre.get("issues") or [])):
+                return _json_error(
+                    "security_critical findings require explicit "
+                    "repair_ids selection", 400)
         report = vault_repair.run_repair(
             root, apply=True, restore_seeds=False, yes=False,
             repair_ids=ids or None, categories=cats or None)

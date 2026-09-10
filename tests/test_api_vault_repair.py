@@ -275,6 +275,71 @@ def test_apply_rejects_disallowed_origins(client):
     assert _snapshot(vault) == before
 
 
+def test_apply_categories_rejected_when_selection_covers_security_critical(
+        client):
+    # Engine policy A3b: a categories filter is never an explicit selection,
+    # so it must not be able to sweep security_critical findings in -- the
+    # whole request is rejected up front (HTTP 400) and the vault stays
+    # untouched.
+    test_client, vault = client
+    _clean_vault(vault)
+    _write_vault_files(vault, {
+        "workspaces/ws1/config.json": {"permissions": {"git": "read"}},
+    })
+    before = _snapshot(vault)
+
+    resp = test_client.post(
+        "/api/vault/repair/apply",
+        json={"categories": ["missing_field"], "confirmed": True},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == (
+        "security_critical findings require explicit repair_ids selection")
+    assert _snapshot(vault) == before
+
+    # The finding is unchanged on a follow-up status check.
+    status = test_client.get("/api/vault/repair/status", headers=_HEADERS)
+    assert status.status_code == 200
+    assert any(
+        i["risk_category"] == "security_critical"
+        and i["path_in_file"] == "allow_host_resources"
+        for i in status.json()["issues"])
+
+
+def test_apply_repair_ids_allows_security_critical_backfill(client):
+    # Explicit repair_ids selection is the sanctioned route for
+    # security_critical findings: the backfill goes through.
+    test_client, vault = client
+    _clean_vault(vault)
+    _write_vault_files(vault, {
+        "workspaces/ws1/config.json": {"permissions": {"git": "read"}},
+    })
+    pre = vr.run_inspection(vault)
+    crit = [i for i in pre["issues"]
+            if i["risk_category"] == "security_critical"
+            and i["category"] == "missing_field"
+            and i["path_in_file"] == "allow_host_resources"]
+    assert len(crit) == 1
+    rid = crit[0]["id"]
+
+    resp = test_client.post(
+        "/api/vault/repair/apply",
+        json={"repair_ids": [rid], "confirmed": True},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["errors"] == []
+    assert body["backups_created"] == 1
+    assert "workspaces/ws1/config.json" in body["files_changed"]
+    assert body["report"]["summary"]["total_issues"] == 0
+    doc = json.loads((vault / "workspaces" / "ws1" / "config.json")
+                     .read_text(encoding="utf-8"))
+    assert doc["allow_host_resources"] is False
+    assert doc["permissions"] == {"git": "read"}
+
+
 def test_apply_maps_engine_errors(client, monkeypatch, tmp_path):
     test_client, vault = client
     payload = {"categories": ["missing_field"], "confirmed": True}
