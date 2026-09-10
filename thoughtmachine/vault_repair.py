@@ -525,6 +525,24 @@ def _collect_permission_issues(root: Path, sink: _IssueSink,
                                      severity="warning",
                                      message='Unknown permission key "%s" in session/agent permission dict — cleanup would drop it' % k,
                                      fix="drop on cleanup")
+            if (role, variant) == ("session", "session_metadata"):
+                # Session descriptor files (workspaces/<ws>/sessions/*.json,
+                # workspaces/<ws>/sessions/<sid>/session.json + _meta_*.json,
+                # legacy sessions/*.json) carry exactly ONE permission
+                # location -- the embedded
+                # metadata.session_config.session_permissions dict handled by
+                # the scoped scan above.  The remainder of the document is a
+                # session transcript + SessionConfig snapshot, never a
+                # permission map: an unbounded deep scan would treat a
+                # permission-named key anywhere in metadata.session_config
+                # (e.g. legacy git_write / git_read /
+                # git_allow_worktree_commits that agent/config folds at load)
+                # as a permission-shaped object and flag every config key
+                # (base_url, max_turns, ...) as an unknown permission key.
+                # Mirrors the dryrun source of truth: only scoped locations
+                # are examined -- no fallback into session_config or the
+                # whole document.
+                continue
             spec = _manifest_spec_for(rel, manifest_files)
             _deep_permission_scan(rel, doc, sink, scoped_ids,
                                   declared_fields=_declared_root_fields(spec))

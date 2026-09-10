@@ -309,3 +309,74 @@ def test_seeded_files_provider_entry_match(tmp_path):
     report = run_inspection(tmp_path)
     entry = next(s for s in report["seeded_files"] if s["file"] == "system/providers.json")
     assert entry["status"] == "match"
+
+
+# --- session descriptor files: metadata.session_config is a config snapshot,
+# not a permission map (regression for deep-scan false positives) -----------
+
+_SESSION_CONFIG = {
+    "base_url": "https://api.deepseek.com/v1/",
+    "enabled_tools": ["FileEditor", "FileSearchTool", "GlobTool", "DockerCodeRunner"],
+    "max_turns": 200,
+    "mode": "worker",
+    "model": "deepseek-chat",
+    "provider_id": "deepseek",
+    "system_prompt": "",
+    "temperature": 0.7,
+    "token_monitor_enabled": True,
+    "token_monitor_warning_threshold": 1200,
+    "token_monitor_critical_threshold": 1800,
+    "use_container_registry": True,
+    "use_workspace_lifecycle_manager": True,
+    "workspace_id": "ws1",
+    "workspace_path": "/some/ws",
+    "provider_config": {"timeout_seconds": 30},
+}
+
+
+def test_session_config_metadata_not_scanned_as_permissions(tmp_path):
+    """A session descriptor with NO session_permissions must produce zero
+    permission issues -- metadata.session_config is a SessionConfig snapshot,
+    not a permission-shaped object."""
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/sessions/s1.json": {
+            "session_id": "s1",
+            "name": "s1",
+            "metadata": {"session_config": deepcopy(_SESSION_CONFIG)},
+        },
+    })
+    report = run_inspection(tmp_path)
+    session_issues = [i for i in report["issues"]
+                      if i["file"] == "workspaces/ws1/sessions/s1.json"]
+    assert session_issues == []
+
+
+def test_session_config_embedded_session_permissions_still_flagged(tmp_path):
+    """The one real permission location of a session descriptor --
+    metadata.session_config.session_permissions -- is still scoped-scanned:
+    unknown keys are flagged at their scoped path only (never via a deep
+    scan of the whole metadata tree)."""
+    _clean_vault(tmp_path)
+    cfg = deepcopy(_SESSION_CONFIG)
+    cfg["session_permissions"] = {"git": "read", "root_shell": "write"}
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/sessions/s1.json": {
+            "session_id": "s1",
+            "name": "s1",
+            "metadata": {"session_config": cfg},
+        },
+    })
+    report = run_inspection(tmp_path)
+    file_issues = [i for i in report["issues"]
+                   if i["file"] == "workspaces/ws1/sessions/s1.json"]
+    assert len(file_issues) == 1
+    issue = file_issues[0]
+    assert issue["category"] == "unknown_nested_key"
+    assert issue["classification"] == "machine_apply"
+    assert issue["severity"] == "warning"
+    assert issue["path_in_file"] == (
+        "$.metadata.session_config.session_permissions.root_shell"
+    )
+    assert not any(i["path_in_file"].startswith("root.metadata")
+                  for i in file_issues)
