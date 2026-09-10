@@ -1134,6 +1134,9 @@ def _apply_fixes(root: Path, quarantine_dir: Path, report: dict,
     for issue in report.get("issues", []):
         if issue.get("classification") != "machine_apply":
             continue
+        if issue.get("risk_category") == _RISK_SECURITY_CRITICAL:
+            # security-critical requires explicit repair_ids selection
+            continue
         entry: Dict[str, Any] = {
             "id": issue.get("id"),
             "file": issue.get("file"),
@@ -1388,21 +1391,25 @@ def _apply_selected_fixes(root: Path, quarantine_dir: Path, report: dict,
     performed: List[dict] = []
     issues = report.get("issues") or []
     by_id = {i.get("id"): i for i in issues if i.get("id")}
-    ordered: List[Tuple[str, Any]] = []
+    # ordered items carry an ``explicit`` flag: issues named by repair_ids
+    # are explicitly requested and always attempted, while issues that only
+    # match a category expansion are gated on risk (security_critical issues
+    # require an explicit repair_ids selection).
+    ordered: List[Tuple[str, Any, bool]] = []
     seen = set()
     for rid in sel["known_ids"]:
         issue = by_id[rid]
         if issue.get("id") not in seen:
             seen.add(issue.get("id"))
-            ordered.append(("issue", issue))
+            ordered.append(("issue", issue, True))
     for rid in sel["unknown_ids"]:
-        ordered.append(("unknown_id", rid))
+        ordered.append(("unknown_id", rid, False))
     for issue in issues:
         if (issue.get("category") or "") in sel["cat_expanded"] \
                 and issue.get("id") not in seen:
             seen.add(issue.get("id"))
-            ordered.append(("issue", issue))
-    for kind, payload in ordered:
+            ordered.append(("issue", issue, False))
+    for kind, payload, explicit in ordered:
         if kind == "unknown_id":
             performed.append({
                 "id": payload, "file": "", "path_in_file": "",
@@ -1419,6 +1426,10 @@ def _apply_selected_fixes(root: Path, quarantine_dir: Path, report: dict,
             "category": category,
         }
         try:
+            if not explicit and issue.get("risk_category") == \
+                    _RISK_SECURITY_CRITICAL:
+                raise ValueError(
+                    "security_critical: requires explicit repair_ids selection")
             if category == "seeded_drift":
                 # Restored (as a whole) by _restore_seeded_seeds.
                 continue

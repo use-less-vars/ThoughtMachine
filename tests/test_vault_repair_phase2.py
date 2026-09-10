@@ -324,15 +324,47 @@ def test_apply_backfills_missing_field(tmp_path):
     assert "base_url" not in original
 
 
-def test_apply_backfills_pattern_file_missing_field(tmp_path):
-    # workspaces/*/config.json is a manifest PATTERN entry; a missing field
-    # with a declared default must backfill even though the relpath never
-    # equals the manifest glob key.
+def test_apply_security_critical_missing_field_not_auto_applied(tmp_path):
+    # allow_host_resources on a ceiling config is risk security_critical;
+    # engine policy A3a: the all-auto --apply path must never touch it
+    # (only an explicit repair_ids selection may).  The issue stays on the
+    # report and nothing is performed.
     _clean_vault(tmp_path)
     _write_vault_files(tmp_path, {
         "workspaces/ws1/config.json": {"permissions": {"git": "read"}},
     })
-    report = run_repair(tmp_path, apply=True)
+    pre = run_inspection(tmp_path)
+    assert len(pre["issues"]) == 1
+    issue = pre["issues"][0]
+    assert issue["category"] == "missing_field"
+    assert issue["classification"] == "machine_apply"
+    assert issue["risk_category"] == "security_critical"
+    assert issue["path_in_file"] == "allow_host_resources"
+    assert issue["default_value"] is False
+    report = run_repair(tmp_path, apply=True)  # no selection
+    assert report["repair"]["performed"] == []
+    assert _bak_files(tmp_path) == []
+    doc = _vault_json(tmp_path, "workspaces/ws1/config.json")
+    assert "allow_host_resources" not in doc
+    # The finding is unchanged on the post-run report.
+    assert report["summary"]["total_issues"] == 1
+    assert any(i["risk_category"] == "security_critical"
+               and i["path_in_file"] == "allow_host_resources"
+               for i in report["issues"])
+
+
+def test_apply_backfills_pattern_file_missing_field(tmp_path):
+    # workspaces/*/config.json is a manifest PATTERN entry; a missing field
+    # with a declared default must backfill even though the relpath never
+    # equals the manifest glob key.  Explicit repair_ids selection is the
+    # sanctioned way to fix a security_critical finding.
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/config.json": {"permissions": {"git": "read"}},
+    })
+    pre = run_inspection(tmp_path)
+    rid = pre["issues"][0]["id"]
+    report = run_repair(tmp_path, apply=True, repair_ids=[rid])
     assert report["summary"]["total_issues"] == 0
     performed = report["repair"]["performed"]
     assert len(performed) == 1
@@ -349,6 +381,28 @@ def test_apply_backfills_pattern_file_missing_field(tmp_path):
     assert len(baks) == 1
     original = json.loads((tmp_path / baks[0]).read_text(encoding="utf-8"))
     assert "allow_host_resources" not in original
+
+
+def test_apply_security_critical_category_expansion_requires_explicit_ids(tmp_path):
+    # Expanding a category (e.g. missing_field) is NOT an explicit selection:
+    # a security_critical issue reached that way records an error entry and
+    # the vault stays untouched.
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/config.json": {"permissions": {"git": "read"}},
+    })
+    report = run_repair(tmp_path, apply=True, categories=["missing_field"])
+    performed = report["repair"]["performed"]
+    assert len(performed) == 1
+    assert performed[0]["status"] == "error"
+    assert performed[0]["category"] == "missing_field"
+    assert performed[0]["path_in_file"] == "allow_host_resources"
+    assert ("security_critical: requires explicit repair_ids selection"
+            in performed[0]["error"])
+    assert _bak_files(tmp_path) == []
+    doc = _vault_json(tmp_path, "workspaces/ws1/config.json")
+    assert "allow_host_resources" not in doc
+    assert report["summary"]["total_issues"] == 1
 
 
 def test_apply_recreates_missing_file_from_safe_default(tmp_path):
