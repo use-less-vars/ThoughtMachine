@@ -157,7 +157,10 @@ class TestBannedCeilingDeniesWithoutPrompt:
 
         ok, msg = _run_gate(["host_bash:allow"], eff)
         assert ok is False
-        assert "but session allows host_bash:banned" in msg
+        assert (
+            "Session permission for host_bash is allow, but workspace ceiling "
+            "is banned." in msg
+        )
         # Hard denial — the ask/prompt branch must never be reached.
         assert "ask requires interactive" not in msg
 
@@ -199,7 +202,10 @@ class TestAskCeilingNeverFabricatesPrompt:
         ok, msg = _run_gate(["host_bash:allow"], eff)
         assert ok is False
         assert "ask requires interactive" not in msg
-        assert "but session allows host_bash:banned" in msg
+        assert (
+            "Session permission for host_bash is allow, but workspace ceiling "
+            "is ask." in msg
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -220,5 +226,8 @@ class TestCeilingDenialMessageCarriesSuffix:
 
         ok, msg = _run_gate(["network:write"], eff)
         assert ok is False
-        assert msg.endswith("(workspace ceiling: ask)")
+        assert (
+            "Session permission for network is write, but workspace ceiling "
+            "is ask." in msg
+        )
         assert json.loads(json.dumps(msg)) == msg  # JSON-safe string

@@ -440,6 +440,28 @@ def _compute_effective_session_permissions(
     return _gate_effective(session_obj, caps, ceiling)
 
 
+def _ceiling_provenance(effective: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the workspace-ceiling provenance for a REST response (additive).
+
+    Returns ``{"workspace_ceiling": {resource: level}, "contradictions": [...]}``
+    where ``workspace_ceiling`` is the ceiling level the gate actually enforced
+    per restricted resource, and ``contradictions`` flags every resource whose
+    SESSION grant sits strictly above its workspace ceiling.  The gate's ceiling
+    annotations are only READ here -- never altered.  On ImportError both keys
+    degrade to empty/neutral values (no silent fallback of the permissions
+    themselves).
+    """
+    try:
+        from security.security_gate import ceiling_contradictions, ceiling_levels
+
+        return {
+            "workspace_ceiling": ceiling_levels(effective),
+            "contradictions": ceiling_contradictions(effective),
+        }
+    except ImportError:
+        return {"workspace_ceiling": {}, "contradictions": []}
+
+
 @router.get("/{session_id}/permissions")
 async def get_session_permissions(session_id: str) -> Dict[str, Any]:
     """Return the session's stored (raw) and computed (effective) permissions:
@@ -479,6 +501,7 @@ async def get_session_permissions(session_id: str) -> Dict[str, Any]:
             "raw": raw,
             "effective": effective,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
+            **_ceiling_provenance(effective),
         }
     except HTTPException:
         raise
@@ -546,6 +569,7 @@ async def put_session_permissions(
             "raw": normalized,
             "effective": effective,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
+            **_ceiling_provenance(effective),
         }
     except HTTPException:
         raise

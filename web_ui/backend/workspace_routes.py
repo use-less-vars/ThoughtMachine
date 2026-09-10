@@ -875,7 +875,28 @@ async def get_effective_permissions(
                 "filesystem_write": caps.filesystem_write,
             },
         }
-    return {"workspace_id": ws_id, "effective_permissions": effective}
+    # ── Ceiling provenance (additive; existing keys unchanged) ───────────
+    # The gate records, on the returned dict, the workspace-ceiling levels it
+    # actually enforced and flags any resource whose SESSION grant sits above
+    # its ceiling (the "session exceeds workspace ceiling" contradiction).
+    # Exposed read-only so the GUI can warn inline; the gate's annotation
+    # contract itself is unchanged.  A missing gate degrades to empty/neutral
+    # values (never a silent fallback of the permissions themselves).
+    try:
+        from security.security_gate import ceiling_contradictions, ceiling_levels
+
+        workspace_ceiling = ceiling_levels(effective)
+        contradictions = ceiling_contradictions(effective)
+    except ImportError:
+        workspace_ceiling = {}
+        contradictions = []
+
+    return {
+        "workspace_id": ws_id,
+        "effective_permissions": effective,
+        "workspace_ceiling": workspace_ceiling,
+        "contradictions": contradictions,
+    }
 
 # ── GET /api/workspace/{ws_id}/workers/{name}/events ─────────────────────
 
