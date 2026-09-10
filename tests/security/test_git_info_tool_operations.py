@@ -817,3 +817,31 @@ class TestHostFallbackWorkspaceGate:
             tool._git_status(tmp_path)
         assert tool._last_execution_mode == "unavailable"
         assert not _FakeSandbox.instances
+
+    def test_denied_when_policy_helper_raises(
+        self, tmp_path, fake_sandbox, monkeypatch
+    ):
+        """Fail-closed: a raising host-resource helper must DENY host git.
+
+        The policy lookup is fail-closed everywhere else in this layer (see
+        ``tools.host_resource_policy.workspace_allows_host_resources``, whose
+        reader returns ``False`` on error, and the
+        ``security_gate.get_effective_permissions`` host_bash override, which
+        bans on any reader error).  A helper import/read error must therefore
+        DENY host execution, never silently allow it.
+        """
+
+        def _boom(_ws_id):
+            raise RuntimeError("policy helper unavailable")
+
+        monkeypatch.setattr(
+            "tools.host_resource_policy.workspace_allows_host_resources", _boom
+        )
+
+        tool = _read_host_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+        with pytest.raises(RuntimeError, match="could not be resolved"):
+            tool._git_status(tmp_path)
+        assert tool._last_execution_mode == "unavailable"
+        assert not _FakeSandbox.instances
+

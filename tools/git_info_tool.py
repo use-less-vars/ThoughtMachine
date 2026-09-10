@@ -105,17 +105,27 @@ class GitReadTool(ToolBase):
         ``allow_host_resources`` key (see ``tools.host_resource_policy``).
         With no resolvable workspace id there is no workspace ceiling, so
         the legacy host path stays allowed.  Any policy-lookup failure is
-        treated as "no ceiling" (fail open to the legacy path) so this gate
-        never makes git unusable when the policy helper is unavailable.
+        fail-CLOSED: a helper import/read error DENIES host execution rather
+        than silently allowing it, matching the rest of the permission layer
+        (``tools.host_resource_policy.workspace_allows_host_resources`` whose
+        reader returns ``False`` on error, and the
+        ``security_gate.get_effective_permissions`` host_bash override which
+        bans on any reader error).
         """
         ws_id = self._resolved_workspace_id or getattr(self, "workspace_id", None)
         if not ws_id:
             return None
         try:
             from tools.host_resource_policy import workspace_allows_host_resources
+
+            allowed = workspace_allows_host_resources(ws_id)
         except Exception:
-            return None
-        if workspace_allows_host_resources(ws_id):
+            return (
+                "GitReadTool: host-side git execution denied; the "
+                "allow_host_resources policy could not be resolved for "
+                f"workspace {ws_id} (workspaces/{ws_id}/config.json)"
+            )
+        if allowed:
             return None
         return (
             "GitReadTool: host-side git execution requires "
