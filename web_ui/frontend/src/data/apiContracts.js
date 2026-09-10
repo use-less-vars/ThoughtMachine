@@ -127,6 +127,20 @@ export const API_ENDPOINTS = {
       status: 'implemented',
       notes: 'backend source: web_ui/backend/session_routes.py (404 if session not found)',
     },
+
+    // --- Vault repair -------------------------------------------------------
+    {
+      method: 'GET',
+      path: '/api/vault/repair/status',
+      status: 'implemented',
+      notes: 'backend source: web_ui/backend/vault_repair_routes.py (origin-guarded: 403 unless Origin/Referer matches ^https?://(localhost|127.0.0.1)(:port)?$). Response { run, summary, issues, extra_files, seeded_files, findings, repairs_available }. findings[] = { id, category, issue_category, severity, file, message, suggested_fix, classification, path_in_file }; category is the RISK axis (security_critical|permission_integrity|config_drift|cosmetic) while issue_category is the internal engine category and is never surfaced in the UI. classification: machine_apply|manual_review; severity: error|warning|info; repairs_available = any(classification === "machine_apply").',
+    },
+    {
+      method: 'POST',
+      path: '/api/vault/repair/apply',
+      status: 'implemented',
+      notes: 'backend source: web_ui/backend/vault_repair_routes.py (origin-guarded). Body { repair_ids?: string[], categories?: string[], confirmed: boolean }. Exactly one of repair_ids/categories is required and confirmed must be true; a categories-only request that would sweep a machine_apply security_critical finding is rejected 400 ("security_critical findings require explicit repair_ids selection"). 200 -> { report, backups_created, files_changed, quarantine_moves, errors }.',
+    },
   ],
 
   pending: [

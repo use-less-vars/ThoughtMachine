@@ -11,6 +11,15 @@ import '@testing-library/jest-dom/vitest'
 import WorkspaceSelector from '../WorkspaceSelector'
 import useWorkspaceStore from '../../store/workspaceStore'
 
+vi.mock('../../globalApi', async (importOriginal) => {
+  const actual = await importOriginal()
+  return {
+    ...actual,
+    fetchVaultRepairStatus: vi.fn().mockResolvedValue(null),
+    fetchVaultRepairApply: vi.fn().mockResolvedValue(null),
+  }
+})
+
 function jsonOk(data, status = 200) {
   return { ok: true, status, json: async () => data, text: async () => JSON.stringify(data) }
 }

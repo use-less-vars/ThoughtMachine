@@ -10,6 +10,7 @@ import { useNavigate } from '../router'
 import useWorkspaceStore from '../store/workspaceStore'
 import FolderBrowser from './FolderBrowser'
 import VaultHealthBanner from './VaultHealthBanner'
+import VaultHealthPanel from './VaultHealthPanel'
 import GlobalSessions from './GlobalSessions'
 import GlobalContainers from './GlobalContainers'
 import GlobalResources from './GlobalResources'
@@ -153,6 +154,7 @@ export default function WorkspaceSelector() {
   return (
     <div className="ws-selector">
       <VaultHealthBanner />
+      <VaultHealthPanel defaultOpen={false} />
       <main className="ws-main">
         <div className="gms-header">
           <h2 className="ws-main-title">Global Management</h2>

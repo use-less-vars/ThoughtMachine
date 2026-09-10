@@ -63,3 +63,22 @@ export async function deleteCredential(name) {
     return false
   }
 }
+
+export async function fetchVaultRepairStatus() {
+  const data = await safeGet('/api/vault/repair/status')
+  return data && typeof data === 'object' ? data : null
+}
+
+export async function fetchVaultRepairApply(payload) {
+  try {
+    const res = await fetch(API_BASE + '/api/vault/repair/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
