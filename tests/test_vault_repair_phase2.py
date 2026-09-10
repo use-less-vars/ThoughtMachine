@@ -556,23 +556,29 @@ def test_allowlist_drift_quarantined_never_auto_fixed(tmp_path):
     assert any(i["category"] == "seeded_drift" for i in report["issues"])
 
 
-def test_cli_apply_exit_codes(tmp_path):
+def test_cli_apply_exit_codes(tmp_path, capsys):
     clean = tmp_path / "clean"
     clean.mkdir()
     _clean_vault(clean)
     assert main(["--vault-root", str(clean), "--apply"]) == 0
+    # A healthy vault prints no risk-breakdown line.
+    assert "  risk:" not in capsys.readouterr().out
     dirty = tmp_path / "dirty"
     dirty.mkdir()
     _dirty_vault(dirty)
     assert main(["--vault-root", str(dirty), "--apply"]) == 4
+    # After repair the vault is healthy again -> no risk line.
+    assert "  risk:" not in capsys.readouterr().out
     # A second apply finds nothing left to fix.
     assert main(["--vault-root", str(dirty), "--apply"]) == 0
 
 
-def test_cli_dry_run_neutralises_apply(tmp_path):
+def test_cli_dry_run_neutralises_apply(tmp_path, capsys):
     _dirty_vault(tmp_path)
     code = main(["--vault-root", str(tmp_path), "--apply", "--dry-run"])
     assert code == 1  # findings remain; read-only mode
+    assert ("  risk: security_critical=0 permission_integrity=1 "
+            "config_drift=1 cosmetic=0") in capsys.readouterr().out
     assert _bak_files(tmp_path) == []
     assert _quarantine_artifacts(tmp_path) == []
     assert _vault_json(tmp_path, "user/defaults.json")["frobnicate"] is True
@@ -587,6 +593,8 @@ def test_cli_restore_seeds_without_yes_leaves_seeds(tmp_path, capsys):
     assert code == 1  # seeded drift is still a finding
     out = capsys.readouterr().out
     assert "seed restoration requires --yes; seeds left untouched" in out
+    assert ("  risk: security_critical=0 permission_integrity=0 "
+            "config_drift=1 cosmetic=0") in out
     assert _vault_json(tmp_path, "system/providers.json")["active_profile_id"] == "x"
 
 
@@ -622,7 +630,7 @@ def test_cli_usage_error_exits_2(tmp_path):
     assert ei.value.code == 2
 
 
-def test_cli_apply_without_fixes_leaves_findings_exits_1(tmp_path):
+def test_cli_apply_without_fixes_leaves_findings_exits_1(tmp_path, capsys):
     # A manual_review-only finding is never auto-applied: --apply performs no
     # fixes and exits 1 with the finding still present.
     _clean_vault(tmp_path)
@@ -630,5 +638,24 @@ def test_cli_apply_without_fixes_leaves_findings_exits_1(tmp_path):
         "user/defaults.json": {**_USER_DEFAULTS, "temperature": "hot"},
     })
     assert main(["--vault-root", str(tmp_path), "--apply"]) == 1
+    assert ("  risk: security_critical=0 permission_integrity=0 "
+            "config_drift=1 cosmetic=0") in capsys.readouterr().out
     assert _vault_json(tmp_path, "user/defaults.json")["temperature"] == "hot"
+
+
+def test_cli_security_critical_only_apply_exits_1(tmp_path, capsys):
+    # A security_critical machine_apply finding whose fix is skipped on
+    # auto-apply leaves the vault with a live finding: --apply performs no
+    # genuine fix and exits 1 -- NOT 4 -- with the risk line showing
+    # security_critical >= 1.
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/config.json": {"permissions": {"git": "read"}},
+    })
+    assert main(["--vault-root", str(tmp_path), "--apply"]) == 1
+    out = capsys.readouterr().out
+    assert ("  risk: security_critical=1 permission_integrity=0 "
+            "config_drift=0 cosmetic=0") in out
+    match = re.search(r"  risk: security_critical=(\d+)\b", out)
+    assert match is not None and int(match.group(1)) >= 1
 

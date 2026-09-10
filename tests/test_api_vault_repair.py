@@ -149,12 +149,80 @@ def test_status_endpoint_reports_clean_vault(client):
     body = resp.json()
     assert set(body.keys()) == {
         "run", "summary", "issues", "extra_files", "seeded_files",
+        "findings", "repairs_available",
     }
     assert body["issues"] == []
+    assert body["findings"] == []
+    assert body["repairs_available"] is False
     assert body["summary"]["total_issues"] == 0
+    for risk_key in ("security_critical", "permission_integrity",
+                     "config_drift", "cosmetic"):
+        assert body["summary"][risk_key] == 0
+    # Engine passthrough fields are unchanged; only findings/repairs_available
+    # are added by the REST layer.
     expected = vr.run_inspection(vault)
     expected["run"]["now"] = body["run"]["now"]
-    assert body == expected
+    assert body["run"] == expected["run"]
+    assert body["summary"] == expected["summary"]
+    assert body["issues"] == expected["issues"]
+    assert body["extra_files"] == expected["extra_files"]
+    assert body["seeded_files"] == expected["seeded_files"]
+
+
+def test_status_findings_shape_maps_engine_issues(client):
+    # Every engine issue is projected 1:1 onto a UI-shaped finding with the
+    # risk_category surfaced as 'category' and the engine category preserved
+    # as 'issue_category'; a machine_apply issue flips repairs_available.
+    test_client, vault = client
+    _clean_vault(vault)
+    _write_vault_files(vault,
+                       {"user/defaults.json": _defaults_without_base_url()})
+
+    resp = test_client.get("/api/vault/repair/status", headers=_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    engine = vr.run_inspection(vault)
+    engine["run"]["now"] = body["run"]["now"]
+    assert body["issues"] == engine["issues"]
+    assert body["repairs_available"] is True
+    assert body["findings"]
+    assert len(body["findings"]) == len(body["issues"])
+    for finding, issue in zip(body["findings"], body["issues"]):
+        assert set(finding.keys()) == {
+            "id", "category", "issue_category", "severity", "file",
+            "message", "suggested_fix", "classification", "path_in_file",
+        }
+        assert finding == {
+            "id": issue["id"],
+            "category": issue["risk_category"],
+            "issue_category": issue["category"],
+            "severity": issue["severity"],
+            "file": issue["file"],
+            "message": issue["message"],
+            "suggested_fix": issue["fix"],
+            "classification": issue["classification"],
+            "path_in_file": issue["path_in_file"],
+        }
+
+
+def test_status_repairs_available_false_for_manual_review_only(client):
+    # An unknown root file surfaces as a manual_review extra_file finding:
+    # findings exist but no machine_apply repair is available.
+    test_client, vault = client
+    _clean_vault(vault)
+    _write_vault_files(vault, {"stray.json": {"note": "stray"}})
+
+    resp = test_client.get("/api/vault/repair/status", headers=_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["findings"]
+    assert body["repairs_available"] is False
+    assert all(f["classification"] == "manual_review"
+               for f in body["findings"])
+    assert any(f["issue_category"] == "extra_file" for f in body["findings"])
+    assert body["summary"]["by_classification"]["machine_apply"] == 0
+    assert body["summary"]["by_classification"]["manual_review"] == len(
+        body["findings"])
 
 
 def test_apply_missing_field_backfills_schema_default(client):

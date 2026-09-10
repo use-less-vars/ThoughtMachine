@@ -61,7 +61,33 @@ def vault_repair_status(request: Request) -> JSONResponse:
         root = Path(vault_root()).expanduser().resolve()
         if not root.is_dir():
             return _json_error("vault root %s does not exist" % root, 400)
-        return vault_repair.run_inspection(root)
+        report = vault_repair.run_inspection(root)
+        issues = report.get("issues") or []
+        findings = [
+            {
+                "id": issue.get("id"),
+                "category": issue.get("risk_category"),
+                "issue_category": issue.get("category"),
+                "severity": issue.get("severity"),
+                "file": issue.get("file"),
+                "message": issue.get("message"),
+                "suggested_fix": issue.get("fix"),
+                "classification": issue.get("classification"),
+                "path_in_file": issue.get("path_in_file"),
+            }
+            for issue in issues
+        ]
+        return {
+            "run": report.get("run"),
+            "summary": report.get("summary"),
+            "issues": issues,
+            "extra_files": report.get("extra_files"),
+            "seeded_files": report.get("seeded_files"),
+            "findings": findings,
+            "repairs_available": any(
+                (issue.get("classification") or "") == "machine_apply"
+                for issue in issues),
+        }
     except Exception as exc:
         return _json_error(str(exc), 500)
 

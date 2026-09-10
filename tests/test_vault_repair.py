@@ -294,15 +294,19 @@ def test_report_json_written(tmp_path):
     assert data["summary"]["total_issues"] == len(data["issues"])
 
 
-def test_cli_exit_codes(tmp_path):
+def test_cli_exit_codes(tmp_path, capsys):
     clean = tmp_path / "clean"
     clean.mkdir()
     _clean_vault(clean)
     assert main(["--vault-root", str(clean)]) == 0
+    # A healthy vault prints no risk-breakdown line.
+    assert "  risk:" not in capsys.readouterr().out
     dirty = tmp_path / "dirty"
     dirty.mkdir()
     _dirty_vault(dirty)
     assert main(["--vault-root", str(dirty)]) == 1
+    assert ("  risk: security_critical=0 permission_integrity=1 "
+            "config_drift=1 cosmetic=0") in capsys.readouterr().out
 
 
 def test_seeded_files_provider_entry_match(tmp_path):

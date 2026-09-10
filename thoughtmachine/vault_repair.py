@@ -1704,6 +1704,13 @@ def main(argv: Optional[List[str]] = None) -> int:
           % (summary["total_issues"],
              summary["by_classification"].get("machine_apply", 0),
              summary["by_classification"].get("manual_review", 0)))
+    if summary["total_issues"]:
+        print("  risk: security_critical=%d permission_integrity=%d "
+              "config_drift=%d cosmetic=%d"
+              % (summary["security_critical"],
+                 summary["permission_integrity"],
+                 summary["config_drift"],
+                 summary["cosmetic"]))
     if args.report_json:
         print("  report written to %s" % args.report_json)
     if args.restore_seeds and not args.yes:
