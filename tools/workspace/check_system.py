@@ -203,6 +203,7 @@ class CheckSystem(ToolBase):
                       "'event_bus_status' (EventBus subscriber info), "
                       "'event_log' (tail recent EventLogger entries), "
                       "'vault_status' (vault drift vs schema manifest), "
+                      "'vault_repair_status' (full read-only vault repair dry-run report), "
                       "'runtime_state' (redacted runtime snapshot — token limits, worker caps, "
                       "container status, permissions, allowlist).",
     )
@@ -216,7 +217,6 @@ class CheckSystem(ToolBase):
         description="Explicit workspace ID override. If set, used directly instead of resolving from session.",
     )
 
-    # ------------------------------------------------------------------
     def _check_path_allowed(self, query_name: str) -> bool:
         """Check if a CheckSystem query name is allowed by the vault allowlist.
 
@@ -317,6 +317,7 @@ class CheckSystem(ToolBase):
                 "event_bus_status": lambda: self._query_event_bus_status(),
                 "event_log": lambda: self._query_event_log(),
                 "vault_status": lambda: self._query_vault_status(),
+                "vault_repair_status": lambda: self._query_vault_repair_status(),
                 "runtime_state": lambda: self._query_runtime_state(ws_id, workspace_path),
             }
 
@@ -962,9 +963,12 @@ class CheckSystem(ToolBase):
     def _query_vault_status(self) -> dict:
         """Run VaultDriftChecker against the vault root; returns a structured, secret-free report.
 
-        Strictly read-only: repairable drift is reported (with
-        ``pending_repairs``) but never auto-fixed — repairs require
-        explicit operator approval via check(apply_repairs=True).
+        Strictly read-only: repairable drift is reported but never auto-fixed.
+        ``repairs_available`` is the read-only count of machine-applyable
+        findings (vault_repair.run_inspection's by_classification.machine_apply);
+        manual-review and GAW findings never count. ``repair_hint`` points the
+        operator at the Vault Health panel in the landing page, where repairs
+        are applied. This query tool has no apply capability.
         """
         checker = None
         try:
@@ -975,12 +979,57 @@ class CheckSystem(ToolBase):
         try:
             checker = VaultDriftChecker(vault_root=vault_root())
             # Read-only by design: never mutate the vault from a query tool.
-            return checker.check(apply_repairs=False)
+            report = checker.check(apply_repairs=False)
         except DriftAbortError:
             partial = checker.report() if checker is not None else None
             if isinstance(partial, dict):
-                return partial
-            return {"status": "error", "aborted": True, "error": "vault drift check aborted"}
+                report = partial
+            else:
+                return {"status": "error", "aborted": True, "error": "vault drift check aborted"}
+        if isinstance(report, dict):
+            report = dict(report)
+            repairs_available = None
+            try:
+                from thoughtmachine.vault_repair import run_inspection
+                inspection = run_inspection(vault_root())
+                summary = (inspection or {}).get("summary") or {}
+                repairs_available = int(
+                    summary.get("by_classification", {}).get("machine_apply", 0) or 0
+                )
+            except Exception:
+                # Engine unavailable (degraded env): count unknown, not zero.
+                repairs_available = None
+            report["repairs_available"] = repairs_available
+            report["repair_hint"] = (
+                "use the Vault Health panel in the landing page to apply repairs"
+            )
+        return report
+
+    def _query_vault_repair_status(self) -> dict:
+        """Full read-only vault repair dry run (vault_repair.run_inspection).
+
+        Mirrors vault_status' root resolution (thoughtmachine.vault.vault_root(),
+        honoring THOUGHTMACHINE_VAULT_ROOT) but reports the whole repair
+        pipeline: manifest drift + permission issues + extra files + seed
+        tracking (run/summary/issues/extra_files/seeded_files). Strictly
+        read-only — never mutates the vault; fixes are applied only via the
+        CLI (python3 -m thoughtmachine.vault_repair --apply), never through
+        this agent-callable query.
+        """
+        try:
+            from thoughtmachine.vault import vault_root
+            from thoughtmachine.vault_repair import run_inspection
+        except ImportError as exc:
+            return {"status": "error",
+                    "error": f"vault repair status unavailable: {exc}",
+                    "aborted": True}
+        try:
+            # Same resolution as _query_vault_status: vault_root() (env-aware).
+            return run_inspection(vault_root())
+        except Exception as exc:
+            return {"status": "error",
+                    "error": f"vault repair inspection failed: {exc}",
+                    "aborted": True}
 
     def _query_runtime_state(self, ws_id: Optional[str], workspace_path: Optional[str] = None) -> dict:
         """Return a REDACTED runtime snapshot: token limits, worker caps,

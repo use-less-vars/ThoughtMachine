@@ -93,6 +93,13 @@ def test_check_system_vault_status_returns_report_without_secrets(tmp_path):
     assert "files" in out
     assert out["status"] in ("ok", "warnings")
     assert out["vault_root"] == str(tmp_vault)
+    # repairs_available is read-only (vault_repair.run_inspection, machine_apply
+    # only): this fixture has 5 backfillable missing-field/missing-file findings;
+    # the extra_file + seeded_drift findings are manual-review and never count.
+    assert out["repairs_available"] == 5
+    assert out["repair_hint"] == (
+        "use the Vault Health panel in the landing page to apply repairs"
+    )
 
 
 def test_check_system_vault_status_not_gated_by_session_permissions():

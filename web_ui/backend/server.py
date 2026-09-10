@@ -154,6 +154,7 @@ from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.prompt_routes import router as prompt_router
 from web_ui.backend.global_routes import router as global_router
 from web_ui.backend.provider_routes import router as provider_router
+from web_ui.backend.vault_repair_routes import router as vault_repair_router
 
 # ── ConfigManager (facade for all config operations) ────────────────────────
 from web_ui.backend.config_manager import (
@@ -2449,6 +2450,7 @@ app.include_router(session_router)
 app.include_router(prompt_router)
 app.include_router(global_router)
 app.include_router(provider_router)
+app.include_router(vault_repair_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

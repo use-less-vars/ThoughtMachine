@@ -22,6 +22,7 @@ module-level so tests can monkeypatch them.
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -158,6 +159,38 @@ def _check_vault() -> Dict[str, Any]:
     return {"check": name, "status": "FAIL", "fix": "sudo chown -R $USER ~/.thoughtmachine"}
 
 
+def _check_vault_repair() -> Dict[str, Any]:
+    """Report machine-applyable vault drift; fixes happen via CLI/UI REST only.
+
+    Read-only: runs vault_repair.run_inspection() and FAILs when findings
+    that can be machine-applied exist, pointing the operator at the CLI
+    command and the Vault Health REST endpoints. A missing vault root (or an
+    engine that is not importable here, e.g. installer preflight) is PASS.
+    """
+    name = "Vault repair"
+    fix = (
+        "apply via CLI: python3 -m thoughtmachine.vault_repair --apply; "
+        "UI REST: /api/vault/repair/status, /api/vault/repair/apply"
+    )
+    try:
+        from thoughtmachine.vault_repair import run_inspection
+    except Exception:
+        return {"check": name, "status": "PASS", "fix": ""}
+    env_root = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
+    root = env_root if env_root else os.path.expanduser("~/.thoughtmachine")
+    if not os.path.isdir(root):
+        return {"check": name, "status": "PASS", "fix": ""}
+    try:
+        report = run_inspection(root)
+        summary = (report or {}).get("summary") or {}
+        machine = int(summary.get("by_classification", {}).get("machine_apply", 0) or 0)
+    except Exception:
+        machine = -1
+    if machine:
+        return {"check": name, "status": "FAIL", "fix": fix}
+    return {"check": name, "status": "PASS", "fix": ""}
+
+
 def run_checks() -> List[Dict[str, Any]]:
     """Run all checks in order and return the list of result dicts."""
     return [
@@ -169,6 +202,7 @@ def run_checks() -> List[Dict[str, Any]]:
         _check_port(5173),
         _check_venv(),
         _check_vault(),
+        _check_vault_repair(),
     ]
 
 

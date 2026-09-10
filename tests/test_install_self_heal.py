@@ -274,6 +274,7 @@ def test_doctor_reports_docker_daemon_fail_with_fix(monkeypatch, capsys):
         "_check_port",
         "_check_venv",
         "_check_vault",
+        "_check_vault_repair",
     ):
         monkeypatch.setattr(tm_doctor, helper, fake_pass)
 
@@ -301,6 +302,9 @@ def test_doctor_all_pass_prints_table(monkeypatch, capsys):
     monkeypatch.setattr(tm_doctor, "_check_port", lambda port: pass_result("Port %d free" % port))
     monkeypatch.setattr(tm_doctor, "_check_venv", lambda: pass_result("Venv healthy"))
     monkeypatch.setattr(tm_doctor, "_check_vault", lambda: pass_result("Vault writable"))
+    monkeypatch.setattr(
+        tm_doctor, "_check_vault_repair", lambda: pass_result("Vault repair")
+    )
 
     rc = tm_doctor.main([])
     assert rc == 0
