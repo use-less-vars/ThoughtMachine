@@ -659,3 +659,69 @@ def test_cli_security_critical_only_apply_exits_1(tmp_path, capsys):
     match = re.search(r"  risk: security_critical=(\d+)\b", out)
     assert match is not None and int(match.group(1)) >= 1
 
+
+
+# --- host_resources_type (non-boolean allow_host_resources gate) -----------
+
+
+def test_host_resources_non_bool_flagged_permission_integrity(tmp_path):
+    # A ceiling config whose allow_host_resources key is PRESENT but not a JSON
+    # boolean is flagged as a manual_review permission-integrity finding -- it
+    # is distinct from the security_critical missing-field finding (the key
+    # exists, so nothing is missing).
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/config.json": {
+            "permissions": {"git": "read"},
+            "allow_host_resources": "true",
+        },
+    })
+    report = run_inspection(tmp_path)
+    issues = [i for i in report["issues"]
+              if i["category"] == "host_resources_type"]
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue["file"] == "workspaces/ws1/config.json"
+    assert issue["path_in_file"] == "allow_host_resources"
+    assert issue["classification"] == "manual_review"
+    assert issue["severity"] == "warning"
+    assert issue["risk_category"] == "permission_integrity"
+    assert issue["fix"] == (
+        "normalize `allow_host_resources` to a boolean (`true` / `false`)")
+    assert report["summary"]["permission_integrity"] >= 1
+    # The key is present, so no missing-field finding for it.
+    assert not [i for i in report["issues"]
+                if i["category"] == "missing_field"
+                and i["path_in_file"] == "allow_host_resources"]
+
+
+def test_host_resources_valid_bool_or_absent_not_flagged(tmp_path):
+    # Only a present non-boolean trips the finding; valid booleans and an
+    # absent key are all fine.
+    _clean_vault(tmp_path)
+    for value in (True, False, "ABSENT"):
+        doc = {"permissions": {"git": "read"}}
+        if value != "ABSENT":
+            doc["allow_host_resources"] = value
+        _write_vault_files(tmp_path, {"workspaces/ws1/config.json": doc})
+        report = run_inspection(tmp_path)
+        assert not [i for i in report["issues"]
+                    if i["category"] == "host_resources_type"], value
+
+
+def test_host_resources_non_bool_never_auto_applied(tmp_path):
+    # manual_review findings are never auto-fixed by the all-auto --apply path;
+    # the non-boolean value is left untouched.
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/config.json": {
+            "permissions": {"git": "read"},
+            "allow_host_resources": "true",
+        },
+    })
+    report = run_repair(tmp_path, apply=True)
+    performed = report["repair"]["performed"]
+    assert not [p for p in performed if p.get("category") == "host_resources_type"]
+    assert _vault_json(tmp_path, "workspaces/ws1/config.json")["allow_host_resources"] == "true"
+    assert any(i["category"] == "host_resources_type" for i in report["issues"])
+

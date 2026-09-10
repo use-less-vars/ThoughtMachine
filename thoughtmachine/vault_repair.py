@@ -292,6 +292,39 @@ def _is_ceiling_config(rel: Optional[str]) -> bool:
     return len(parts) == 3 and parts[0] == "workspaces" and parts[-1] == "config.json"
 
 
+def _collect_host_resources_type_issue(rel: str, doc: Any,
+                                       sink: "_IssueSink") -> None:
+    """Flag a ceiling config whose ``allow_host_resources`` is present but not a
+    JSON boolean.
+
+    The key is the operator gate for host-resource execution
+    (``tools.host_resource_policy``) whose contract is strictly boolean: only a
+    literal ``true`` enables host resources, so a string / number / ``null``
+    silently changes the gate's meaning.  A *missing* key is the ordinary
+    optional-field case and is never reported here.
+    """
+    if not isinstance(doc, dict):
+        return
+    if "allow_host_resources" not in doc:
+        return
+    value = doc["allow_host_resources"]
+    if isinstance(value, bool):
+        return
+    sink.add(
+        file=rel,
+        path_in_file="allow_host_resources",
+        category="host_resources_type",
+        classification="manual_review",
+        severity="warning",
+        message=(
+            "`allow_host_resources` in a workspace config is not a boolean "
+            "(found %r); only a literal `true` enables host resources."
+            % (value,)
+        ),
+        fix="normalize `allow_host_resources` to a boolean (`true` / `false`)",
+    )
+
+
 def _risk_category(file: Optional[str], path_in_file: str,
                    engine_category: str, message: str) -> str:
     """Bucket an issue into one of the four report risk categories.
@@ -313,6 +346,11 @@ def _risk_category(file: Optional[str], path_in_file: str,
         or pif in ("git_read", "git_write", "execution",
                    "git_allow_worktree_commits")
     )
+    if engine_category == "host_resources_type":
+        # A present-but-non-boolean operator gate is permission-dict damage on
+        # a ceiling config -- distinct from the security_critical missing-field
+        # / unsafe-permission findings, and never auto-applied.
+        return _RISK_PERMISSION_INTEGRITY
     if engine_category == "unsafe_file_permissions":
         return _RISK_SECURITY_CRITICAL
     if _is_allowlist_file(rel):
@@ -566,6 +604,8 @@ def _collect_permission_issues(root: Path, sink: _IssueSink,
                              fix="fix or remove file")
                 continue
             role, variant = classify(rel)
+            if (role, variant) == ("ceiling", "config"):
+                _collect_host_resources_type_issue(rel, doc, sink)
             locations = locate(role, variant, doc)
             scoped_ids = set()
             for label, perm_dict, vocab in locations:
