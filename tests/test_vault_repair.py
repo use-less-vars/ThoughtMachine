@@ -6,6 +6,7 @@ so the suite doubles as an integration check of the manifest itself.
 """
 
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -380,3 +381,76 @@ def test_session_config_embedded_session_permissions_still_flagged(tmp_path):
     )
     assert not any(i["path_in_file"].startswith("root.metadata")
                   for i in file_issues)
+
+
+# --- risk_category axis + unsafe-file-permissions scan ----------------------
+
+
+def test_world_readable_credentials_dir_reported_security_critical(tmp_path):
+    """World-readable files under a credentials/ dir are surfaced as
+    security_critical unsafe_file_permissions findings (read-only scan with a
+    chmod suggestion; never auto-fixed)."""
+    _clean_vault(tmp_path)
+    cred = tmp_path / "credentials"
+    cred.mkdir()
+    (cred / "service_account.json").write_text("{}", encoding="utf-8")
+    os.chmod(cred, 0o755)
+    os.chmod(cred / "service_account.json", 0o644)
+    report = run_inspection(tmp_path)
+    matches = [i for i in report["issues"]
+               if i["category"] == "unsafe_file_permissions"]
+    assert len(matches) == 1
+    issue = matches[0]
+    assert issue["file"] == "credentials/service_account.json"
+    assert issue["path_in_file"] == ""
+    assert issue["classification"] == "manual_review"
+    assert issue["severity"] == "error"
+    assert issue["risk_category"] == "security_critical"
+    assert issue["fix"].startswith("chmod 0o700 ")
+    assert report["summary"]["security_critical"] >= 1
+    assert report["summary"]["by_category"]["unsafe_file_permissions"] == 1
+    # Tightening the modes clears the finding on the next inspection.
+    os.chmod(cred, 0o700)
+    os.chmod(cred / "service_account.json", 0o600)
+    again = run_inspection(tmp_path)
+    assert not any(i["category"] == "unsafe_file_permissions"
+                   for i in again["issues"])
+
+
+def test_legacy_git_read_permission_issue_is_permission_integrity(tmp_path):
+    """Legacy keys in a session permissions.json keep their machine_apply
+    classification and are bucketed permission_integrity."""
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/sessions/s1/permissions.json": {"git_read": "read"},
+    })
+    report = run_inspection(tmp_path)
+    matches = [i for i in report["issues"]
+               if i["category"] == "legacy_permission_key"
+               and i["file"] == "workspaces/ws1/sessions/s1/permissions.json"]
+    assert len(matches) == 1
+    issue = matches[0]
+    assert issue["path_in_file"] == "root.git_read"
+    assert issue["classification"] == "machine_apply"
+    assert issue["risk_category"] == "permission_integrity"
+    assert report["summary"]["permission_integrity"] >= 1
+
+
+def test_harmless_extra_session_config_field_not_flagged(tmp_path):
+    """Session descriptor session_config is not field-checked by the manifest
+    ('workspaces/*/sessions/*.json' declares no fields): an extra harmless
+    key at the session_config top level must produce zero issues for the
+    file."""
+    _clean_vault(tmp_path)
+    cfg = deepcopy(_SESSION_CONFIG)
+    cfg["ui_theme"] = "dark"
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/sessions/s1.json": {
+            "session_id": "s1",
+            "name": "s1",
+            "metadata": {"session_config": cfg},
+        },
+    })
+    report = run_inspection(tmp_path)
+    assert [i for i in report["issues"]
+            if i["file"] == "workspaces/ws1/sessions/s1.json"] == []

@@ -112,6 +112,15 @@ _DEFAULT_QUARANTINE_REL = ".quarantine"
 # Key-name hints used to redact secret material from repair artifacts.
 _SECRET_HINTS = ("api_key", "apikey", "secret", "token", "password", "credential")
 
+# Risk categories assigned to every issue (report summary keys).  From most to
+# least severe: credential/unsafe-permission exposure (security_critical),
+# permission-dict drift (permission_integrity), ordinary config drift
+# (config_drift), and benign extras such as config_audit.jsonl (cosmetic).
+_RISK_SECURITY_CRITICAL = "security_critical"
+_RISK_PERMISSION_INTEGRITY = "permission_integrity"
+_RISK_CONFIG_DRIFT = "config_drift"
+_RISK_COSMETIC = "cosmetic"
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -238,6 +247,103 @@ def _classify_abort(message: str) -> str:
     if "expected JSON root type" in message or "has type" in message:
         return "type_mismatch"
     return "schema_error"
+
+
+def _has_secret_signal(*texts: str) -> bool:
+    """True when any *texts* carries a credential-ish signal.
+
+    Used by the risk categoriser and the unsafe-file-permissions scan to
+    decide whether a path/name is credential material worth protecting.
+    Matches lowercased ``_SECRET_HINTS`` substrings anywhere, plus segment
+    checks on '/'-separated path parts (a ``credentials`` directory, ``.pem``
+    / ``.env`` suffix files, ``id_rsa``, and api_key/secret/token parts).
+    """
+    for text in texts:
+        if not text:
+            continue
+        low = text.lower()
+        if any(h in low for h in _SECRET_HINTS):
+            return True
+        for seg in low.split("/"):
+            if seg == "credentials" or seg == ".env" or seg == "id_rsa":
+                return True
+            if seg.endswith(".pem") or seg.endswith(".env"):
+                return True
+            if "api_key" in seg or "secret" in seg or "token" in seg:
+                return True
+    return False
+
+
+def _is_allowlist_file(rel: Optional[str]) -> bool:
+    """True for the engine's CheckSystem allowlist (system/..._allowlist.json)."""
+    return bool(rel) and rel.startswith("system/") and rel.endswith("checksystem_allowlist.json")
+
+
+def _is_permissions_file(rel: Optional[str]) -> bool:
+    """True for a session permissions.json (any depth)."""
+    return bool(rel) and os.path.basename(rel) == "permissions.json"
+
+
+def _is_ceiling_config(rel: Optional[str]) -> bool:
+    """True for a workspace ceiling config (workspaces/<ws>/config.json)."""
+    if not rel:
+        return False
+    parts = rel.split("/")
+    return len(parts) == 3 and parts[0] == "workspaces" and parts[-1] == "config.json"
+
+
+def _risk_category(file: Optional[str], path_in_file: str,
+                   engine_category: str, message: str) -> str:
+    """Bucket an issue into one of the four report risk categories.
+
+    security_critical    -- credential exposure / unsafe permissions
+                            (the engine surfaces these at severity 'error')
+    permission_integrity -- drift in permission dicts proper (legacy keys,
+                            unknown permission keys, structural damage to a
+                            permissions.json / ceiling config)
+    config_drift         -- schema drift of ordinary config (the default)
+    cosmetic             -- benign extras (e.g. config_audit.jsonl)
+    """
+    rel = file or ""
+    pif = path_in_file or ""
+    msg = message or ""
+    permission_scoped = (
+        pif.startswith("$.permissions")
+        or "session_permissions" in pif
+        or pif in ("git_read", "git_write", "execution",
+                   "git_allow_worktree_commits")
+    )
+    if engine_category == "unsafe_file_permissions":
+        return _RISK_SECURITY_CRITICAL
+    if _is_allowlist_file(rel):
+        # Allowlist tampering is quarantined, never auto-fixed: the engine
+        # forces severity 'error' for every issue on this file.
+        return _RISK_SECURITY_CRITICAL
+    if "allow_host_resources" in pif or "allow_host_resources" in msg:
+        return _RISK_SECURITY_CRITICAL
+    if _has_secret_signal(rel, pif, msg):
+        return _RISK_SECURITY_CRITICAL
+    if engine_category == "legacy_permission_key":
+        return _RISK_PERMISSION_INTEGRITY
+    if engine_category in ("unknown_top_key", "unknown_nested_key"):
+        if permission_scoped or _is_permissions_file(rel) or "permission-shaped" in msg:
+            return _RISK_PERMISSION_INTEGRITY
+    if engine_category in ("type_mismatch", "content", "invalid_json",
+                           "schema_error"):
+        if _is_permissions_file(rel) or _is_ceiling_config(rel):
+            return _RISK_PERMISSION_INTEGRITY
+    if ("git_allow_worktree_commits" in pif or "git_allow_worktree_commits" in msg
+            or "git_write" in pif or "git_read" in pif):
+        return _RISK_PERMISSION_INTEGRITY
+    if engine_category == "extra_file":
+        # Root audit/journal artifacts the tool itself writes elsewhere are
+        # expected noise; anything else extra is cosmetic.
+        return _RISK_CONFIG_DRIFT if "config_audit" in rel else _RISK_COSMETIC
+    if engine_category == "seeded_drift":
+        return _RISK_CONFIG_DRIFT
+    if _is_permissions_file(rel) or permission_scoped:
+        return _RISK_PERMISSION_INTEGRITY
+    return _RISK_CONFIG_DRIFT
 
 
 class _IssueSink:
@@ -608,6 +714,43 @@ def _deep_permission_scan(rel: str, doc: Any, sink: _IssueSink,
                 walk(item, "%s[%d]" % (path, idx))
 
     walk(doc, "root")
+
+
+def _collect_unsafe_permission_issues(root: Path, sink: _IssueSink) -> None:
+    """Report world-readable credential files/dirs (read-only filesystem scan).
+
+    A file is in scope when its parent directory is named ``credentials`` or
+    the file name itself carries a secret signal (``_has_secret_signal``).
+    Any in-scope regular file whose mode grants other-read (0o004) is
+    reported as ``unsafe_file_permissions`` with classification
+    ``manual_review`` -- the tool never rewrites modes; the suggested
+    ``chmod 0o700`` is for the user.  Hidden/pruned directories are skipped
+    (mirrors every other vault scan) and symlinks are never followed.
+    """
+    if not root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".")
+                       and d not in (".quarantine", ".bak", ".git")]
+        dir_path = Path(dirpath)
+        for name in sorted(filenames):
+            if not (dir_path.name == "credentials" or _has_secret_signal(name)):
+                continue
+            full = dir_path / name
+            try:
+                mode = stat.S_IMODE(os.stat(full).st_mode)
+            except OSError:
+                continue
+            if mode & stat.S_IROTH:
+                rel = str(full.relative_to(root))
+                sink.add(file=rel, path_in_file="",
+                         category="unsafe_file_permissions",
+                         classification="manual_review", severity="error",
+                         message=("world-readable credentials path: %s -- "
+                                  "chmod 0o700 recommended" % rel),
+                         fix="chmod 0o700 %s" % rel)
 
 
 def _collect_seeded_files(root: Path) -> List[dict]:
@@ -1380,7 +1523,11 @@ def run_repair(vault_root: Any, apply: bool = False,
                         "tool_version": TOOL_VERSION, "now": _utcnow_iso()},
                 "summary": {"total_issues": 0, "by_category": {},
                             "by_classification": {"machine_apply": 0,
-                                                   "manual_review": 0}},
+                                                   "manual_review": 0},
+                            "security_critical": 0,
+                            "permission_integrity": 0,
+                            "config_drift": 0,
+                            "cosmetic": 0},
                 "issues": [],
                 "extra_files": [],
                 "seeded_files": [],
@@ -1427,10 +1574,27 @@ def run_inspection(vault_root: Any, manifest_path: Optional[Any] = None) -> dict
     extra_files: List[str] = []
     _collect_drift_issues(drift_report or {}, manifest, sink, extra_files)
     _collect_permission_issues(root, sink, manifest.get("files") or {})
+    _collect_unsafe_permission_issues(root, sink)
 
     issues = sink.issues
     issues.sort(key=lambda i: (i.get("file") or "", i.get("path_in_file") or "",
                                i.get("category") or "", i.get("message") or ""))
+    by_risk: Dict[str, int] = {
+        _RISK_SECURITY_CRITICAL: 0,
+        _RISK_PERMISSION_INTEGRITY: 0,
+        _RISK_CONFIG_DRIFT: 0,
+        _RISK_COSMETIC: 0,
+    }
+    for issue in issues:
+        risk = _risk_category(issue.get("file"),
+                              issue.get("path_in_file") or "",
+                              issue.get("category") or "",
+                              issue.get("message") or "")
+        issue["risk_category"] = risk
+        by_risk[risk] = by_risk.get(risk, 0) + 1
+        if _is_allowlist_file(issue.get("file") or "") \
+                and issue.get("severity") != "error":
+            issue["severity"] = "error"
     for idx, issue in enumerate(issues, start=1):
         issue["id"] = "VR-%03d" % idx
 
@@ -1456,6 +1620,10 @@ def run_inspection(vault_root: Any, manifest_path: Optional[Any] = None) -> dict
             "total_issues": len(issues),
             "by_category": dict(sorted(by_category.items())),
             "by_classification": dict(sorted(by_classification.items())),
+            "security_critical": by_risk[_RISK_SECURITY_CRITICAL],
+            "permission_integrity": by_risk[_RISK_PERMISSION_INTEGRITY],
+            "config_drift": by_risk[_RISK_CONFIG_DRIFT],
+            "cosmetic": by_risk[_RISK_COSMETIC],
         },
         "issues": issues,
         "extra_files": extra_files,
