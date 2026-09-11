@@ -60,17 +60,31 @@ class TestSessionUserHistoryGuardrail:
         session.user_history = data2
         assert list(session.user_history) == data2
 
-    def test_conversation_version_not_incremented_by_plain_assign(self):
-        """Plain-list assignment auto-wraps but does NOT bump conversation_version."""
+    def test_construction_with_plain_list_leaves_version_untouched(self):
+        """Construction-time plain-list wrap leaves conversation_version untouched."""
+        session = Session(user_history=[{"role": "user", "content": "test"}])
+        assert session._conversation_version == 0, (
+            f"Expected version 0 after construction, got {session._conversation_version}"
+        )
+
+    def test_live_plain_assign_increments_version_exactly_once(self):
+        """A live plain-list assignment bumps conversation_version by exactly 1."""
         session = Session()
-        # __post_init__ may bump the version, so grab the value after construction
         before = session._conversation_version
         session.user_history = [{"role": "user", "content": "test"}]
-        # The version should not have changed (the guardrail uses object.__setattr__
-        # which skips ObservableList.__setitem__)
-        assert session._conversation_version == before, (
-            f"Expected version {before}, got {session._conversation_version}"
+        assert session._conversation_version == before + 1, (
+            f"Expected version {before + 1}, got {session._conversation_version}"
         )
+
+    def test_live_plain_assign_notifies_connected_callback_once(self):
+        """A live plain-list assignment invokes a connected callback exactly once."""
+        session = Session()
+        calls = []
+        session.connect_conversation_changed(lambda: calls.append(1))
+        before = session._conversation_version
+        session.user_history = [{"role": "user", "content": "test"}]
+        assert calls == [1], f"Expected callback invoked exactly once, got {calls}"
+        assert session._conversation_version == before + 1
 
     def test_callback_preserved_on_wrap(self):
         """After auto-wrap, the ObservableList's callback points to the session method."""
@@ -81,3 +95,82 @@ class TestSessionUserHistoryGuardrail:
         assert session.user_history.callback.__self__ is session, (
             "Callback should be bound to the same session instance"
         )
+
+
+class TestSessionConstructionAwareGuard:
+    """The user_history guard must distinguish construction-time wraps from live ones.
+
+    Construction-time plain-list wraps are expected and logged at DEBUG; only a
+    post-construction (live) plain-list assignment keeps the WARNING.
+    """
+
+    @staticmethod
+    def _recording_log(records):
+        """Build a stand-in for session.models.log that records (level, tag, message)."""
+        def _record(level, tag, message, *args, **kwargs):
+            records.append((level, tag, message))
+        return _record
+
+    def _core_history_warnings(self, records):
+        return [r for r in records if r[0] == "WARNING" and r[1] == "core.history"]
+
+    def _patch_session_log(self, monkeypatch, records):
+        # Patch the exact globals mapping the guard reads: Session.__setattr__
+        # resolves `log` out of session.models' module dict at call time.
+        # Patching a *module by name* is fragile because pytest binds `Session`
+        # at collection time -- a later re-registration of "session.models" in
+        # sys.modules would redirect the patch to a NEW module object that the
+        # already-bound Session class never reads. Patching the guard function's
+        # own __globals__ is immune to that re-registration.
+        monkeypatch.setitem(
+            Session.__setattr__.__globals__, "log", self._recording_log(records)
+        )
+
+    def test_construction_default_is_silent(self, monkeypatch):
+        """Constructing Session() with the default list logs no WARNING."""
+        records = []
+        self._patch_session_log(monkeypatch, records)
+        session = Session()
+        assert records, "log recorder not active — patch target is wrong"
+        assert self._core_history_warnings(records) == []
+        assert isinstance(session.user_history, ObservableList)
+        assert list(session.user_history) == []
+
+    def test_construction_with_plain_list_is_silent(self, monkeypatch):
+        """Passing a plain list to the constructor logs no WARNING."""
+        records = []
+        self._patch_session_log(monkeypatch, records)
+        plain = [{"role": "user", "content": "hello"}]
+        session = Session(user_history=plain)
+        assert records, "log recorder not active — patch target is wrong"
+        assert self._core_history_warnings(records) == []
+        assert isinstance(session.user_history, ObservableList)
+        assert list(session.user_history) == plain
+
+    def test_from_persistable_dict_plain_list_is_silent(self, monkeypatch):
+        """Reconstruction via from_persistable_dict (plain list) logs no WARNING."""
+        records = []
+        self._patch_session_log(monkeypatch, records)
+        data = Session().to_persistable_dict()
+        data["user_history"] = [{"role": "user", "content": "hello"}]
+        session = Session.from_persistable_dict(data)
+        assert records, "log recorder not active — patch target is wrong"
+        assert self._core_history_warnings(records) == []
+        assert isinstance(session.user_history, ObservableList)
+        assert len(session.user_history) == 1
+        assert session.user_history[0]["content"] == "hello"
+
+    def test_live_plain_list_assignment_still_warns(self, monkeypatch):
+        """A post-construction plain-list assignment logs exactly one WARNING."""
+        session = Session()
+        records = []
+        self._patch_session_log(monkeypatch, records)
+        payload = [{"role": "user", "content": "hello"}]
+        session.user_history = payload
+        warnings = self._core_history_warnings(records)
+        assert len(warnings) == 1, f"Expected exactly one WARNING, got {warnings}"
+        assert "Plain list assignment to user_history intercepted" in warnings[0][2]
+        assert isinstance(session.user_history, ObservableList)
+        assert list(session.user_history) == payload
+        assert session.user_history.callback is not None
+        assert session.user_history.callback.__self__ is session
