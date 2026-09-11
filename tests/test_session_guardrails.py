@@ -114,11 +114,24 @@ class TestSessionConstructionAwareGuard:
     def _core_history_warnings(self, records):
         return [r for r in records if r[0] == "WARNING" and r[1] == "core.history"]
 
+    def _patch_session_log(self, monkeypatch, records):
+        # Patch the exact globals mapping the guard reads: Session.__setattr__
+        # resolves `log` out of session.models' module dict at call time.
+        # Patching a *module by name* is fragile because pytest binds `Session`
+        # at collection time -- a later re-registration of "session.models" in
+        # sys.modules would redirect the patch to a NEW module object that the
+        # already-bound Session class never reads. Patching the guard function's
+        # own __globals__ is immune to that re-registration.
+        monkeypatch.setitem(
+            Session.__setattr__.__globals__, "log", self._recording_log(records)
+        )
+
     def test_construction_default_is_silent(self, monkeypatch):
         """Constructing Session() with the default list logs no WARNING."""
         records = []
-        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        self._patch_session_log(monkeypatch, records)
         session = Session()
+        assert records, "log recorder not active — patch target is wrong"
         assert self._core_history_warnings(records) == []
         assert isinstance(session.user_history, ObservableList)
         assert list(session.user_history) == []
@@ -126,9 +139,10 @@ class TestSessionConstructionAwareGuard:
     def test_construction_with_plain_list_is_silent(self, monkeypatch):
         """Passing a plain list to the constructor logs no WARNING."""
         records = []
-        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        self._patch_session_log(monkeypatch, records)
         plain = [{"role": "user", "content": "hello"}]
         session = Session(user_history=plain)
+        assert records, "log recorder not active — patch target is wrong"
         assert self._core_history_warnings(records) == []
         assert isinstance(session.user_history, ObservableList)
         assert list(session.user_history) == plain
@@ -136,10 +150,11 @@ class TestSessionConstructionAwareGuard:
     def test_from_persistable_dict_plain_list_is_silent(self, monkeypatch):
         """Reconstruction via from_persistable_dict (plain list) logs no WARNING."""
         records = []
-        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        self._patch_session_log(monkeypatch, records)
         data = Session().to_persistable_dict()
         data["user_history"] = [{"role": "user", "content": "hello"}]
         session = Session.from_persistable_dict(data)
+        assert records, "log recorder not active — patch target is wrong"
         assert self._core_history_warnings(records) == []
         assert isinstance(session.user_history, ObservableList)
         assert len(session.user_history) == 1
@@ -149,7 +164,7 @@ class TestSessionConstructionAwareGuard:
         """A post-construction plain-list assignment logs exactly one WARNING."""
         session = Session()
         records = []
-        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        self._patch_session_log(monkeypatch, records)
         payload = [{"role": "user", "content": "hello"}]
         session.user_history = payload
         warnings = self._core_history_warnings(records)
