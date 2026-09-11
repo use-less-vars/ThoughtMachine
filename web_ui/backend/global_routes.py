@@ -26,7 +26,6 @@ written with mode ``0o600`` and never returned by the API (GET
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +36,7 @@ from pydantic import BaseModel
 from thoughtmachine.vault import vault_root
 from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
+from tools.host_resource_policy import workspace_allows_host_resources
 
 # Module-level reference for monkeypatchability in tests; the import is
 # guarded so a failing worker module can never break router import.
@@ -83,18 +83,11 @@ def _session_worker_count(worker_manager, session_id: str) -> int:
 def _workspace_allow_host_resources(workspace_id: str) -> bool:
     """Read allow_host_resources from the workspace config.json; never raises.
 
-    This is the server's canonical source for the flag (workspace_routes
-    persists it there); the registry entry carries no such field.
+    Delegates to the shared policy helper -- the single source of truth for the
+    strict, fail-closed ``allow_host_resources`` gate (workspace_routes persists
+    the flag to that config.json; the registry entry carries no such field).
     """
-    try:
-        cfg_path = vault_root() / "workspaces" / workspace_id / "config.json"
-        if cfg_path.is_file():
-            data = json.loads(cfg_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return bool(data.get("allow_host_resources", False))
-    except (OSError, ValueError):
-        pass
-    return False
+    return workspace_allows_host_resources(workspace_id)
 
 
 def _workspace_root_mountable(entry) -> bool:

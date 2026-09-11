@@ -42,6 +42,8 @@ from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
 _worker_registry = _WorkerRegistry.get_instance()._worker_registry
 _registry_lock = _WorkerRegistry.get_instance()._registry_lock
 
+from tools.host_resource_policy import load_workspace_config
+
 from agent.models.worker_definition import WorkerDefinition
 
 # Module-level reference for monkeypatchability in tests; the import is
@@ -66,13 +68,9 @@ class ResolvePathBody(BaseModel):
 
 
 # ── Path confinement helpers (mirror of web_ui/backend/server.py) ───────────────────────────────────────────────────────────────────
-# Duplicated here rather than imported from server.py to avoid a circular
-# import (server.py imports this router at module level).  Keep both copies
-# in sync — or extract into a shared helper module.
-
-def _vault_root_path() -> Path:
-    """Return the vault root — the trust anchor for this server."""
-    return Path.home() / ".thoughtmachine"
+# The vault trust anchor is resolved through the canonical
+# ``thoughtmachine.vault.vault_root`` (imported at module top); the former
+# local ``_vault_root_path`` helper has been removed.
 
 
 def _path_is_within(path: str, prefix: str) -> bool:
@@ -104,7 +102,7 @@ def _confine_to_home(path: str) -> str:
             f"Path '{path}' resolves to '{resolved}', which is not an "
             f"absolute path"
         )
-    vault = os.path.realpath(str(_vault_root_path()))
+    vault = os.path.realpath(str(vault_root()))
     if _path_is_within(resolved, vault):
         raise ValueError(
             f"Path '{path}' resolves into the protected vault directory '{vault}'"
@@ -1401,16 +1399,7 @@ class WorkspaceCreateBody(BaseModel):
 
 def _load_workspace_config(ws_id: str) -> Dict[str, Any]:
     """Load vault ``workspaces/<id>/config.json`` (``{}`` if missing/unparsable)."""
-    cfg_path = _workspace_dir(ws_id) / "config.json"
-    if not cfg_path.exists():
-        return {}
-    try:
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+    return load_workspace_config(ws_id)
 
 
 def _save_workspace_config(ws_id: str, data: Dict[str, Any]) -> None:
@@ -1608,7 +1597,7 @@ def _workspace_root_mountable(entry) -> bool:
     """
     try:
         root = os.path.abspath(os.path.expanduser(entry.root_path))
-        vault = str(_vault_root_path())
+        vault = str(vault_root())
         if root == vault or root.startswith(vault + os.sep):
             return False
         return bool(root)

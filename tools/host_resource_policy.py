@@ -19,6 +19,30 @@ from __future__ import annotations
 from typing import Optional
 
 
+def load_workspace_config(workspace_id: str) -> dict:
+    """Return the parsed ``<vault_root>/workspaces/<id>/config.json`` as a dict.
+
+    Single source of truth for reading a workspace ``config.json``. Fail-closed
+    on any lookup error (missing/empty workspace id, missing file, invalid JSON,
+    non-dict body) by returning an empty dict -- this function never raises.
+    """
+    if not workspace_id:
+        return {}
+    import json
+    from pathlib import Path
+
+    from thoughtmachine.vault import vault_root
+
+    cfg_path = Path(vault_root()) / "workspaces" / workspace_id / "config.json"
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
 def workspace_allows_host_resources(workspace_id: Optional[str]) -> bool:
     """Return whether the workspace config allows host-resource execution.
 
@@ -32,16 +56,4 @@ def workspace_allows_host_resources(workspace_id: Optional[str]) -> bool:
     """
     if not workspace_id:
         return False
-    import json
-    from pathlib import Path
-
-    from thoughtmachine.vault import vault_root
-
-    cfg_path = Path(vault_root()) / "workspaces" / workspace_id / "config.json"
-    try:
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    return data.get("allow_host_resources") is True
+    return load_workspace_config(workspace_id).get("allow_host_resources") is True

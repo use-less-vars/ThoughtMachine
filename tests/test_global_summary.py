@@ -4,9 +4,13 @@ Hermetic: the route handler is exercised through a lightweight FastAPI app
 that includes only ``global_routes.router`` (importing the router module is
 side-effect-free).  All runtime singletons (WorkspaceRegistry /
 SessionRegistry / worker manager / docker listing) are monkeypatched at the
-module level — the handler looks them up at call time — and
-``global_routes.vault_root`` is pointed at a throwaway tmp vault so the
-per-workspace ``allow_host_resources`` lookup stays hermetic.
+module level — the handler looks them up at call time.  The per-workspace
+``allow_host_resources`` lookup stays hermetic because the ``_patch_summary_deps``
+fixture sets the ``THOUGHTMACHINE_VAULT_ROOT`` env override, which the shared
+``tools.host_resource_policy.workspace_allows_host_resources`` gate resolves via
+``thoughtmachine.vault.vault_root()`` at call time.  The module-level
+``global_routes.vault_root`` patch is kept because it still redirects other
+``global_routes`` paths that use ``vault_root``.
 """
 
 import json
@@ -87,6 +91,9 @@ def _patch_summary_deps(
     """Point every summary input at fakes; returns the tmp vault path."""
     vault = tmp_path / "vault"
     vault.mkdir(exist_ok=True)
+    # Canonical seam: point the vault root (honoured by the SSOT config
+    # reader ``tools.host_resource_policy.load_workspace_config``) at *vault*.
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
 
     if registry_raises:
 

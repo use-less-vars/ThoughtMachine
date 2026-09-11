@@ -337,9 +337,26 @@ def check_venv(path: str = ".venv") -> Dict[str, Any]:
     }
 
 
+def _default_dot_thoughtmachine_dir() -> str:
+    """Resolve the default vault directory via the canonical vault resolver.
+
+    Prefers ``thoughtmachine.vault.vault_root()`` so the checked directory
+    tracks ``THOUGHTMACHINE_VAULT_ROOT`` / ``$HOME`` rather than a hard-coded
+    path.  Falls back to ``~/.thoughtmachine`` when the project package is not
+    importable: this installer helper is stdlib-only and must keep working
+    standalone (before/without an installed venv).  Mirrors the guarded
+    import in ``scripts/migrate_vault.py``.
+    """
+    try:
+        from thoughtmachine.vault import vault_root
+    except ImportError:
+        return os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+    return str(vault_root())
+
+
 def check_dot_thoughtmachine_writable(path: Optional[str] = None) -> Dict[str, Any]:
     """Check ~/.thoughtmachine exists and is writable by the current user."""
-    target = path or os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+    target = path or _default_dot_thoughtmachine_dir()
     hint = "sudo chown -R $USER %s" % target
     if not os.path.isdir(target):
         return {"ok": False, "reason": "missing", "hint": hint, "detail": "%s does not exist — %s" % (target, hint)}

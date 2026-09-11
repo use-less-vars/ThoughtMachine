@@ -62,7 +62,7 @@ class TestResolveConfigDefaultsFreshVault:
         )
 
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault_root,
         )
         yield vault_root
@@ -79,7 +79,7 @@ class TestResolveConfigDefaultsFreshVault:
         vault_root = tmp_path / ".thoughtmachine"
         vault_root.mkdir(parents=True)
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault_root,
         )
         result = resolve_config_defaults("nonexistent-ws")

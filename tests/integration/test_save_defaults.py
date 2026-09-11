@@ -16,7 +16,7 @@ class TestSaveDefaults:
         (vault_root / "user").mkdir(parents=True)
         (vault_root / "workspaces" / "ws-1").mkdir(parents=True)
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault_root,
         )
         yield vault_root
@@ -57,7 +57,7 @@ class TestSaveDefaultsAtomicity:
         (vault_root / "user").mkdir(parents=True)
         (vault_root / "workspaces" / "ws-1").mkdir(parents=True)
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault_root,
         )
         yield vault_root

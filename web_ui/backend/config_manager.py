@@ -44,6 +44,8 @@ from agent.config.config_manager import (
 from agent.config.deep_merge import deep_merge
 from agent.config.service import create_agent_config_service
 
+from tools.host_resource_policy import load_workspace_config
+
 # ── Project-root discovery (same logic as server.py) ──────────────────────
 _project_root: str = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -161,7 +163,9 @@ def load_global_defaults() -> Dict[str, Any]:
 
     Auto-creates the file with sensible defaults on first run.
     """
-    config_dir = Path.home() / ".thoughtmachine"
+    from thoughtmachine.vault import vault_root
+
+    config_dir = vault_root()
     config_path = config_dir / "user" / "defaults.json"
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1319,24 +1323,10 @@ class ConfigManager:
         from agent.config.workspace_purpose import apply_purpose_preset
         from agent.config.risk_model import compute_workspace_risk
 
-        cfg_path = (
-            Path.home()
-            / ".thoughtmachine"
-            / "workspaces"
-            / workspace_id
-            / "config.json"
-        )
-        cfg: Dict[str, Any] = {}
-        try:
-            if cfg_path.exists():
-                raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    cfg = raw
-        except (OSError, json.JSONDecodeError):
-            cfg = {}
+        cfg = load_workspace_config(workspace_id)
 
         purpose = cfg.get("purpose", "general")
-        allow_host_resources = bool(cfg.get("allow_host_resources", False))
+        allow_host_resources = cfg.get("allow_host_resources") is True
         saved = cfg.get("permissions")
         if isinstance(saved, dict) and saved:
             permissions = {str(k): str(v) for k, v in saved.items()}

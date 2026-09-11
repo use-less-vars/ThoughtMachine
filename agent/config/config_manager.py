@@ -10,6 +10,8 @@ from pathlib import Path
 
 from agent.config.deep_merge import deep_merge
 
+import thoughtmachine.vault as _vault
+
 
 logger = logging.getLogger(__name__)
 
@@ -17,20 +19,16 @@ logger = logging.getLogger(__name__)
 # ── Path helpers ────────────────────────────────────────────────────────────
 
 
-def _vault_root() -> Path:
-    return Path.home() / ".thoughtmachine"
-
-
 def _factory_defaults_path() -> Path:
-    return _vault_root() / "system" / "factory_defaults.json"
+    return _vault.vault_root() / "system" / "factory_defaults.json"
 
 
 def _user_defaults_path() -> Path:
-    return _vault_root() / "user" / "defaults.json"
+    return _vault.vault_root() / "user" / "defaults.json"
 
 
 def _workspace_defaults_path(workspace_id: str) -> Path:
-    return _vault_root() / "workspaces" / workspace_id / "defaults.json"
+    return _vault.vault_root() / "workspaces" / workspace_id / "defaults.json"
 
 
 # ── Public API ──────────────────────────────────────────────────────────────

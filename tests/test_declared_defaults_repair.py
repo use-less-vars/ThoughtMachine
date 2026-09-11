@@ -30,7 +30,11 @@ _FIELDS = {"model_override", "stop_check"}
 def _install_into(tmp_path, monkeypatch) -> None:
     """Point the whole bootstrap/vault install at *tmp_path*."""
     monkeypatch.delenv("THOUGHTMACHINE_VAULT_ROOT", raising=False)
-    monkeypatch.setattr(bootstrap, "USER_DIR", tmp_path)
+    # Patch bootstrap's resolver (not a bare ``USER_DIR``): assigning USER_DIR
+    # would write a concrete module-dict entry that importlib.reload() cannot
+    # clear, leaking the tmp_path into later tests.  ``_user_dir`` is a real
+    # function, so monkeypatch restores it cleanly.
+    monkeypatch.setattr(bootstrap, "_user_dir", lambda: tmp_path)
     # ensure_user_defaults imports vault_root from the vault module *inside* the
     # function body, so patch the module attribute (not a bootstrap-local name).
     monkeypatch.setattr(vault, "vault_root", lambda: tmp_path)
