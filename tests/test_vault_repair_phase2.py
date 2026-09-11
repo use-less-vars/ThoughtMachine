@@ -479,7 +479,8 @@ def test_repair_report_shape_and_backup_mapping(tmp_path):
     report = run_repair(tmp_path, apply=True)
     assert report["run"]["dry_run"] is False
     repair = report["repair"]
-    assert set(repair) == {"requested_apply", "restore_seeds", "performed", "backups"}
+    assert set(repair) == {"requested_apply", "restore_seeds", "performed",
+                           "backups", "ok", "error_count"}
     assert repair["requested_apply"] is True
     assert repair["restore_seeds"] is False
     performed = repair["performed"]

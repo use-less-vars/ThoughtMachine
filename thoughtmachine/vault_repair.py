@@ -1414,6 +1414,16 @@ def _repair_report(requested_apply: bool, restore_seeds: bool,
         report["requested_categories"] = list(selection["categories"])
     report["performed"] = performed
     report["backups"] = backups
+    # RC10: surface per-item failures at the summary level.  ``performed``
+    # already carries selection-level error entries (``_resolve_selection``
+    # errors are passed through verbatim by ``run_repair``), so counting
+    # ``status == "error"`` here covers both apply failures and selection
+    # errors without double-counting.  ``report["error"]`` remains reserved
+    # for the fatal outer-except path, where ``performed`` is empty -- in
+    # that case we still report at least one error.
+    failed = sum(1 for p in performed if p.get("status") == "error")
+    report["ok"] = (error is None) and failed == 0
+    report["error_count"] = failed if error is None else max(1, failed)
     return report
 
 

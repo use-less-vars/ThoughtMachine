@@ -138,6 +138,8 @@ def vault_repair_apply(request: Request, body: _RepairApplyBody) -> JSONResponse
         applied = [p for p in performed if p.get("status") == "applied"]
         return {
             "report": report,
+            "ok": bool(repair.get("ok", True)),
+            "error_count": int(repair.get("error_count", 0)),
             "backups_created": len(repair.get("backups") or []),
             "files_changed": sorted(
                 {p["file"] for p in applied if p.get("file")}),
