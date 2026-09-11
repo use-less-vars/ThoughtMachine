@@ -39,6 +39,8 @@ from pydantic import Field
 
 from .base import ToolBase
 
+from agent.config.defaults import DEFAULT_IMAGE
+
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the container tools keep working outside a worker turn.
 try:
@@ -128,7 +130,7 @@ class _ContainerControlBase(ToolBase):
             session_id=getattr(self, "session_id", None),
             workspace_id=workspace_id,
             session_permissions=getattr(self, "session_permissions", None),
-            image=getattr(self, "image", None) or "agent-executor",
+            image=getattr(self, "image", None) or DEFAULT_IMAGE,
             mem_limit=getattr(self, "mem_limit", "512m"),
             cpu_quota=getattr(self, "cpu_quota", 50000),
         )
@@ -180,8 +182,8 @@ class ContainerStartTool(_ContainerControlBase):
     tool: Literal["ContainerStartTool"] = "ContainerStartTool"
 
     image: str = Field(
-        default="agent-executor",
-        description="Docker image name (default: agent-executor)"
+        default=DEFAULT_IMAGE,
+        description=f"Docker image name (default: {DEFAULT_IMAGE})"
     )
     name: Optional[str] = Field(
         default=None,
