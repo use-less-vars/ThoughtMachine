@@ -115,6 +115,11 @@ worker_live_test.txt
 # Workspace auto-generated files
 .thoughtmachine/workers.json
 .thoughtmachine/working_docs/
+!.thoughtmachine/working_docs/
+.thoughtmachine/working_docs/*
+!.thoughtmachine/working_docs/reproduce_p0.py
+!.thoughtmachine/working_docs/reproduce_p0.sh
+!.thoughtmachine/working_docs/P0_REPRODUCER_README.md
 .thoughtmachine/knowledge/project/test_protocols.md
 
 # Node.js binary distribution (vendored)
@@ -142,6 +147,7 @@ docs/container_registry_design.md
 !docs/resource_execution_contract.md
 !docs/git_resource_execution_audit.md
 !docs/param_ownership_map.md
+!docs/container_p0_bug4_git_fallback.md
 
 # Hygiene cleanup (2026-08-28): vendored pytest site-packages + pytest cache
 pytest_install/

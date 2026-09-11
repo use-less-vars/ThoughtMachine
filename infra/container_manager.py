@@ -110,6 +110,7 @@ from infra.container_env import merge_container_identity_env
 from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
     CONTAINER_TYPE_LABEL,
+    DEFAULT_IMAGE,
     EXEC_OUTPUT_LIMIT_BYTES,
 )
 _TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
@@ -214,7 +215,7 @@ class ContainerManager:
         session_id=None,
         workspace_id=None,
         session_permissions=None,
-        image="agent-executor",
+        image=DEFAULT_IMAGE,
         mem_limit="1g",
         cpu_quota=100000,
         vault_root=None,
@@ -239,7 +240,6 @@ class ContainerManager:
         # Borrow the shared decision helpers from docker_executor —
         # single source of truth, imported once (never reloaded).
         dex = _load_docker_executor()
-        self._compute_config = dex._compute_container_config_from_permissions
         self._resolve_workspace_id = dex._resolve_workspace_id
         if workspace_id is None:
             workspace_id = self._resolve_workspace_id(self.workspace_path)
@@ -332,6 +332,20 @@ class ContainerManager:
                 f"Configured max_containers ({value}) is invalid; clamping to 1")
             return 1
         return value
+
+    def _counts_toward_limit(self, entry) -> bool:
+        """Whether a container entry occupies a limit slot.
+
+        Terminal states (exited/dead/removing) free a slot so a stuck or
+        crashed container never blocks a fresh create. Unknown/new statuses
+        count toward the limit (fail-safe: default to occupying a slot).
+        """
+        status = str((entry or {}).get("status", "")).lower()
+        return status not in ("exited", "dead", "removing")
+
+    def _active_containers(self, entries):
+        """Filter container entries down to those that occupy a limit slot."""
+        return [e for e in (entries or []) if self._counts_toward_limit(e)]
 
     @staticmethod
     def _resolve_vault_root(vault_root=None):
@@ -450,6 +464,9 @@ class ContainerManager:
         match. A drifted container is recreated with the computed modes instead
         of being silently reused (mirrors docker_executor's integrity check).
         """
+        # Capture the caller-supplied image BEFORE defaulting, so image-reuse
+        # honesty can tell an explicit request from the manager default.
+        explicit_image = image
         image = image or self.image
         if name is None:
             ws_hash = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
@@ -463,17 +480,58 @@ class ContainerManager:
 
         # Phase 3: workspace-scoped reuse + container-limit enforcement BEFORE
         # any create. An existing container with the same name is reused as-is
-        # (never counted against the limit); otherwise the running container
-        # count for THIS workspace decides whether a new one may be created.
+        # (never counted against the limit); otherwise the active (non-terminal)
+        # container count for THIS workspace decides whether a new one may be
+        # created.
+        # Desired isolation (all paths). Computed here so the workspace-label
+        # reuse path can honour a newly-granted network/workspace mode instead
+        # of silently reusing a drifted container.
+        want_network, want_workspace = self._compute_config(
+            self.workspace_path, self.workspace_id, self.session_permissions
+        )
         containers = self.list_containers()
         for entry in containers:
             if entry["name"] == name:
                 note_value = note if note is not None else entry.get("note", "")
+                container = None
                 try:
                     container = self.client.containers.get(entry["container_id"])
-                    self._ensure_running(container)
                 except Exception:
-                    pass
+                    container = None
+                # Image honesty: an explicitly-requested image that differs from
+                # the existing container's image cannot be honoured by reuse (the
+                # image is fixed at create). Surface it instead of silently
+                # returning a container running the wrong image. Do NOT remove
+                # the container on mismatch.
+                if (container is not None and explicit_image is not None
+                        and not self._image_matches(container, explicit_image)):
+                    actual = self._image_ref(container)
+                    msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
+                           f"with image {explicit_image}. Remove it first or use a different name.")
+                    log("WARNING", "docker.container_manager", msg)
+                    _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
+                           f"name={name} id={container.id} actual={actual} "
+                           f"requested={explicit_image} source=workspace-label")
+                    return {"error": msg}
+                # A drifted container (network or /workspace mount no longer
+                # matches the session permissions) is recreated, never silently
+                # reused (mirrors the registry/label drift checks below).
+                if container is not None and not self._config_matches(
+                    container, want_network, want_workspace
+                ):
+                    log("WARNING", "docker.container_manager",
+                        f"Workspace-label container {container.id[:12]} config drifted "
+                        f"(network={want_network} workspace={want_workspace}) - recreating")
+                    _audit("CONTAINER_RECREATE_MISMATCH",
+                           f"name={name} id={container.id} source=workspace-label "
+                           f"network={want_network} workspace={want_workspace}")
+                    self._remove_container(container)
+                    continue
+                if container is not None:
+                    try:
+                        self._ensure_running(container)
+                    except Exception:
+                        pass
                 if note is not None:
                     self.container_notes[name] = {"note": note}
                     self._save_container_notes()
@@ -482,16 +540,23 @@ class ContainerManager:
                        f"session={self.session_id}")
                 log_container_event("started", container_id=entry["container_id"],
                                     session_id=self.session_id or "",
-                                    data={"image": image, "name": name, "status": "reused"})
+                                    data={"image": self._image_ref(container),
+                                          "name": name, "status": "reused"})
                 return {**entry, "status": "reused", "id": entry["container_id"],
                         "note": note_value}
         limit = self._get_max_containers()
         # When the registry is active it owns the per-session limit; the
         # legacy workspace-scoped check is skipped so the registry is the
         # single source of truth for container counts.
-        if len(containers) >= limit and not is_registry_active(getattr(self, "_session_config", None)):
-            return {"error": f"Workspace container limit ({limit}) reached. "
-                             f"Stop an unused container first."}
+        active_containers = self._active_containers(containers)
+        if len(active_containers) >= limit and not is_registry_active(getattr(self, "_session_config", None)):
+            log("WARNING", "docker.container_manager",
+                f"Workspace container limit reached: active={len(active_containers)} "
+                f"exited={len(containers) - len(active_containers)} limit={limit} "
+                f"workspace_id={self.workspace_id}")
+            return {"error": f"Workspace container limit ({limit}) reached "
+                             f"({len(active_containers)} active container(s)). "
+                             f"Stop or remove a running container to free a slot."}
 
         # ── Desired isolation from session permissions (all paths) ─────────
         network_mode, workspace_mode = self._compute_config(
@@ -522,6 +587,18 @@ class ContainerManager:
         if container_id:
             container = self._reuse_container(container_id)
             if container is not None:
+                # Image honesty (see workspace-label path): reject reuse when an
+                # explicitly-requested image differs from the container's image.
+                if (explicit_image is not None
+                        and not self._image_matches(container, explicit_image)):
+                    actual = self._image_ref(container)
+                    msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
+                           f"with image {explicit_image}. Remove it first or use a different name.")
+                    log("WARNING", "docker.container_manager", msg)
+                    _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
+                           f"name={name} id={container.id} actual={actual} "
+                           f"requested={explicit_image} source=registry")
+                    return {"error": msg}
                 if self._config_matches(container, network_mode, workspace_mode):
                     if note is not None:
                         self.container_notes[name] = {"note": note}
@@ -533,7 +610,8 @@ class ContainerManager:
                            f"source=registry name={name} id={container.id} session={self.session_id}")
                     log_container_event("started", container_id=container.id,
                                         session_id=self.session_id or "",
-                                        data={"image": image, "name": name, "status": "reused"})
+                                        data={"image": self._image_ref(container),
+                                              "name": name, "status": "reused"})
                     return {"id": container.id, "name": name, "status": "reused",
                             "note": note_value}
                 log("WARNING", "docker.container_manager",
@@ -548,6 +626,17 @@ class ContainerManager:
         # 2) Label lookup (survives manager restarts)
         container = self._find_by_labels(name)
         if container is not None:
+            # Image honesty (see workspace-label path).
+            if (explicit_image is not None
+                    and not self._image_matches(container, explicit_image)):
+                actual = self._image_ref(container)
+                msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
+                       f"with image {explicit_image}. Remove it first or use a different name.")
+                log("WARNING", "docker.container_manager", msg)
+                _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
+                       f"name={name} id={container.id} actual={actual} "
+                       f"requested={explicit_image} source=label")
+                return {"error": msg}
             if not self._config_matches(container, network_mode, workspace_mode):
                 log("WARNING", "docker.container_manager",
                     f"Labeled container {container.id[:12]} config drifted "
@@ -570,7 +659,8 @@ class ContainerManager:
                        f"source=label name={name} id={container.id} session={self.session_id}")
                 log_container_event("started", container_id=container.id,
                                     session_id=self.session_id or "",
-                                    data={"image": image, "name": name, "status": "reused"})
+                                    data={"image": self._image_ref(container),
+                                          "name": name, "status": "reused"})
                 return {"id": container.id, "name": name, "status": "reused",
                         "note": note_value}
 
@@ -1509,6 +1599,82 @@ class ContainerManager:
             return "bridge"
         return network_mode
 
+    def _image_ref(self, container):
+        """Best-effort human-readable image reference for ``container``.
+
+        Prefers the first tag (``container.image.tags[0]``), then the image
+        reference recorded in ``attrs['Config']['Image']``, then the image's
+        short id, else ``"<unknown>"``. Returns ``""`` on ANY exception (and
+        for ``container is None``) so callers can treat "unknown" distinctly.
+        """
+        try:
+            if container is None:
+                return ""
+            img = getattr(container, "image", None)
+            tags = getattr(img, "tags", None) or []
+            if tags:
+                return tags[0]
+            cfg_image = (
+                (getattr(container, "attrs", None) or {}).get("Config", {}) or {}
+            ).get("Image", "")
+            if cfg_image:
+                return cfg_image
+            short_id = getattr(img, "short_id", None)
+            if short_id:
+                return short_id
+            return "<unknown>"
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_image_ref(ref):
+        """Normalize an image reference for comparison.
+
+        Strips whitespace and appends ``':latest'`` when the repository part
+        carries no explicit tag (so ``nginx`` == ``nginx:latest``). A ':' inside
+        the registry host:port segment is NOT a tag.
+        """
+        if not ref:
+            return ""
+        ref = str(ref).strip()
+        last_slash = ref.rfind("/")
+        if ":" not in ref[last_slash + 1:]:
+            ref = f"{ref}:latest"
+        return ref
+
+    def _image_matches(self, container, image):
+        """True if ``container`` runs an image matching the requested ``image``.
+
+        Conservative: returns True when the container's image cannot be
+        determined (no tags/Config.Image), so an unknown image never blocks a
+        legitimate reuse. Any exception is treated as a match (fail-open on
+        comparison, fail-closed on the safety guard only when we KNOW the
+        images differ).
+        """
+        try:
+            wanted = self._normalize_image_ref(image)
+            if not wanted:
+                return True
+            candidates = []
+            ref = self._image_ref(container)
+            if ref and ref != "<unknown>":
+                candidates.append(ref)
+            try:
+                cfg_image = (
+                    (getattr(container, "attrs", None) or {}).get("Config", {}) or {}
+                ).get("Image")
+                if cfg_image:
+                    candidates.append(cfg_image)
+            except Exception:
+                pass
+            if not candidates:
+                return True
+            return any(
+                self._normalize_image_ref(c) == wanted for c in candidates
+            )
+        except Exception:
+            return True
+
     def _config_matches(self, container, network_mode, workspace_mode):
         """True if the container's actual network + /workspace mount match
         the desired isolation (mirrors docker_executor's integrity check).
@@ -1536,6 +1702,23 @@ class ContainerManager:
             self._normalize_network_mode(actual_network) == network_mode
             and bool(workspace_rw) == expected_rw
         )
+
+    def _compute_config(self, workspace_path, workspace_id, session_permissions):
+        """Desired (network_mode, workspace_mode) from the security-gate SSOT.
+
+        Routes through ``security.security_gate.get_expected_container_config``
+        - the canonical container-config resolver - instead of the fail-closed
+        ``docker_executor._compute_container_config_from_permissions`` helper,
+        which returned ``none``/``ro`` for a workspace with no capabilities.json
+        (ignoring an explicitly granted ``outbound`` network). Fail-closed to
+        ``("none", "ro")`` only if the SSOT is unavailable or raises.
+        """
+        try:
+            from security.security_gate import get_expected_container_config
+            cfg = get_expected_container_config(session_permissions or {})
+        except Exception:
+            return "none", "ro"
+        return cfg["network_mode"], cfg["workspace_mode"]
 
     def _remove_container(self, container):
         """Stop and remove a container; best-effort, NEVER raises."""

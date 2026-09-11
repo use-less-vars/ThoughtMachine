@@ -43,8 +43,9 @@ def test_start_error_dict_surfaces_limit_message(tmp_path, monkeypatch):
             # Real ContainerManager.start() signature: accepts worker_name
             # (thoughtmachine.worker ownership label on fresh creates).
             return {
-                "error": "Workspace container limit (4) reached. "
-                         "Stop an unused container first."
+                "error": "Workspace container limit (4) reached "
+                         "(4 active container(s)). "
+                         "Stop or remove a running container to free a slot."
             }
 
         def exec(self, *args, **kwargs):

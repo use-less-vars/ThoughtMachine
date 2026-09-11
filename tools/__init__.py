@@ -152,6 +152,7 @@ try:
         ContainerStartTool,
         ContainerExecTool,
         ContainerStopTool,
+        ContainerRemoveTool,
         ContainerStatusTool,
         ContainerListTool,
         ContainerBuildTool,
@@ -160,6 +161,7 @@ try:
     TOOL_CLASSES.append(ContainerStartTool)
     TOOL_CLASSES.append(ContainerExecTool)
     TOOL_CLASSES.append(ContainerStopTool)
+    TOOL_CLASSES.append(ContainerRemoveTool)
     TOOL_CLASSES.append(ContainerStatusTool)
     TOOL_CLASSES.append(ContainerListTool)
     TOOL_CLASSES.append(ContainerBuildTool)

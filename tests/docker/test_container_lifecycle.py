@@ -319,8 +319,9 @@ class TestContainerLifecycle:
 
         r_b = manager.start(name=name_b)
         assert r_b == {
-            "error": "Workspace container limit (1) reached. "
-                      "Stop an unused container first."
+            "error": "Workspace container limit (1) reached "
+                      "(1 active container(s)). "
+                      "Stop or remove a running container to free a slot."
         }, f"unexpected limit result: {r_b!r}"
 
         r_a_again = manager.start(name=name_a)
@@ -590,7 +591,7 @@ class TestContainerNoteFileStore:
         manager.max_containers = 4
         manager.client = SimpleNamespace(containers=fake_containers)
         manager.container_notes = manager._load_container_notes()
-        manager._compute_config = lambda ws, wid, sp: ("none", "ro")
+        manager._compute_config = lambda ws, wid, sp: ("none", "rw")
         return manager
 
     def _notes_file(self, vault_root, workspace_id):
@@ -734,7 +735,7 @@ class TestContainerWorkerLabel:
         manager.max_containers = 4
         manager.client = SimpleNamespace(containers=fake_containers)
         manager.container_notes = manager._load_container_notes()
-        manager._compute_config = lambda ws, wid, sp: ("none", "ro")
+        manager._compute_config = lambda ws, wid, sp: ("none", "rw")
         return manager
 
     def test_worker_label_stamped_on_fresh_create(self):

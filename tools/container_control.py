@@ -6,6 +6,7 @@ These tools expose a persistent, composable container lifecycle to the agent:
 - ``ContainerStartTool``   - start (or reuse) a container for the session
 - ``ContainerExecTool``    - run a shell command inside an existing container
 - ``ContainerStopTool``    - stop a container (idempotent)
+- ``ContainerRemoveTool``  - remove a container (stop + delete; idempotent)
 - ``ContainerStatusTool``  - report a container's status
 - ``ContainerListTool``    - list this session's containers
 - ``ContainerBuildTool``   - build a Docker image from the host workspace
@@ -37,6 +38,8 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional
 from pydantic import Field
 
 from .base import ToolBase
+
+from agent.config.defaults import DEFAULT_IMAGE
 
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the container tools keep working outside a worker turn.
@@ -127,7 +130,7 @@ class _ContainerControlBase(ToolBase):
             session_id=getattr(self, "session_id", None),
             workspace_id=workspace_id,
             session_permissions=getattr(self, "session_permissions", None),
-            image=getattr(self, "image", None) or "agent-executor",
+            image=getattr(self, "image", None) or DEFAULT_IMAGE,
             mem_limit=getattr(self, "mem_limit", "512m"),
             cpu_quota=getattr(self, "cpu_quota", 50000),
         )
@@ -179,8 +182,8 @@ class ContainerStartTool(_ContainerControlBase):
     tool: Literal["ContainerStartTool"] = "ContainerStartTool"
 
     image: str = Field(
-        default="agent-executor",
-        description="Docker image name (default: agent-executor)"
+        default=DEFAULT_IMAGE,
+        description=f"Docker image name (default: {DEFAULT_IMAGE})"
     )
     name: Optional[str] = Field(
         default=None,
@@ -578,6 +581,57 @@ class ContainerLogsTool(_ContainerControlBase):
             return self._respond(
                 True,
                 **result,
+                duration=time.time() - start_time,
+            )
+        except RuntimeError as e:
+            return self._respond(False, error=str(e), duration=time.time() - start_time)
+        except Exception as e:
+            return self._respond(
+                False,
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+
+
+
+
+class ContainerRemoveTool(_ContainerControlBase):
+    """Remove a container started by ContainerStartTool.
+
+    Stops the container (best-effort) and then deletes it with ``force=True``.
+    Idempotent: removing an already-removed (or never-created) container reports
+    status "removed". This tool never raises — failures are returned in the JSON
+    response.
+
+    Returns JSON with structure:
+    {
+      "success": bool,
+      "container_id": str,
+      "status": "removed" | "error",
+      "name": str (optional),
+      "error": str (optional),
+      "duration": float
+    }
+    """
+    tool: Literal["ContainerRemoveTool"] = "ContainerRemoveTool"
+
+    container_id: str = Field(
+        ...,
+        min_length=1,
+        description="ID or name of the container to remove (returned by ContainerStartTool)."
+    )
+
+    def execute(self) -> str:
+        start_time = time.time()
+        try:
+            manager = self._make_manager()
+            result = manager.remove(self.container_id)
+            return self._respond(
+                result.get("status") == "removed",
+                container_id=self.container_id,
+                status=result.get("status"),
+                name=result.get("name"),
+                error=result.get("error"),
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
