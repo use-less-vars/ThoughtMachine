@@ -239,7 +239,6 @@ class ContainerManager:
         # Borrow the shared decision helpers from docker_executor —
         # single source of truth, imported once (never reloaded).
         dex = _load_docker_executor()
-        self._compute_config = dex._compute_container_config_from_permissions
         self._resolve_workspace_id = dex._resolve_workspace_id
         if workspace_id is None:
             workspace_id = self._resolve_workspace_id(self.workspace_path)
@@ -480,15 +479,40 @@ class ContainerManager:
         # (never counted against the limit); otherwise the active (non-terminal)
         # container count for THIS workspace decides whether a new one may be
         # created.
+        # Desired isolation (all paths). Computed here so the workspace-label
+        # reuse path can honour a newly-granted network/workspace mode instead
+        # of silently reusing a drifted container.
+        want_network, want_workspace = self._compute_config(
+            self.workspace_path, self.workspace_id, self.session_permissions
+        )
         containers = self.list_containers()
         for entry in containers:
             if entry["name"] == name:
                 note_value = note if note is not None else entry.get("note", "")
+                container = None
                 try:
                     container = self.client.containers.get(entry["container_id"])
-                    self._ensure_running(container)
                 except Exception:
-                    pass
+                    container = None
+                # A drifted container (network or /workspace mount no longer
+                # matches the session permissions) is recreated, never silently
+                # reused (mirrors the registry/label drift checks below).
+                if container is not None and not self._config_matches(
+                    container, want_network, want_workspace
+                ):
+                    log("WARNING", "docker.container_manager",
+                        f"Workspace-label container {container.id[:12]} config drifted "
+                        f"(network={want_network} workspace={want_workspace}) - recreating")
+                    _audit("CONTAINER_RECREATE_MISMATCH",
+                           f"name={name} id={container.id} source=workspace-label "
+                           f"network={want_network} workspace={want_workspace}")
+                    self._remove_container(container)
+                    continue
+                if container is not None:
+                    try:
+                        self._ensure_running(container)
+                    except Exception:
+                        pass
                 if note is not None:
                     self.container_notes[name] = {"note": note}
                     self._save_container_notes()
@@ -1557,6 +1581,23 @@ class ContainerManager:
             self._normalize_network_mode(actual_network) == network_mode
             and bool(workspace_rw) == expected_rw
         )
+
+    def _compute_config(self, workspace_path, workspace_id, session_permissions):
+        """Desired (network_mode, workspace_mode) from the security-gate SSOT.
+
+        Routes through ``security.security_gate.get_expected_container_config``
+        - the canonical container-config resolver - instead of the fail-closed
+        ``docker_executor._compute_container_config_from_permissions`` helper,
+        which returned ``none``/``ro`` for a workspace with no capabilities.json
+        (ignoring an explicitly granted ``outbound`` network). Fail-closed to
+        ``("none", "ro")`` only if the SSOT is unavailable or raises.
+        """
+        try:
+            from security.security_gate import get_expected_container_config
+            cfg = get_expected_container_config(session_permissions or {})
+        except Exception:
+            return "none", "ro"
+        return cfg["network_mode"], cfg["workspace_mode"]
 
     def _remove_container(self, container):
         """Stop and remove a container; best-effort, NEVER raises."""
