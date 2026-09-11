@@ -337,7 +337,7 @@
       }
     },
     "user/defaults.json": {
-      "description": "Global default config persisted by the web UI (GLOBAL_DEFAULT_KEYS subset). Auto-created by web_ui/backend/config_manager.py load_global_defaults.",
+      "description": "Global default config persisted by the web UI (GLOBAL_DEFAULT_KEYS subset). Created by the manifest seeder thoughtmachine.bootstrap.ensure_user_defaults() from this entry's safe_default and kept in sync by drift backfill; web_ui/backend/config_manager.load_global_defaults is read-only.",
       "required": true,
       "backfill_on_missing": true,
       "safe_default": {
