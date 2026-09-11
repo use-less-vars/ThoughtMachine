@@ -126,8 +126,8 @@ def ensure_vault_defaults(
     * ``system/default_system_prompt.txt``      — from ``resources/default_system_prompt.txt``
     * ``system/engineer_system_prompt.txt``     — from ``resources/engineer_system_prompt.txt``
     * ``system/.vault_version``                 — from ``get_version()``
-    * ``state/session_registry.json``           — written as ``[]``
-    * ``state/workspace_registry.json``         — written as ``[]``
+    * ``state/session_registry.json``           — written as ``{}``
+    * ``state/workspace_registry.json``         — written as ``{}``
 
     Args:
         resources_dir: Absolute path to the project-level ``resources/``
@@ -190,12 +190,12 @@ def ensure_vault_defaults(
 
     # 8–9. Write empty state registry files
     _write_file(
-        "[]\n",
+        "{}\n",
         root / "state" / "session_registry.json",
         overwrite_existing, created,
     )
     _write_file(
-        "[]\n",
+        "{}\n",
         root / "state" / "workspace_registry.json",
         overwrite_existing, created,
     )
