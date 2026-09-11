@@ -333,6 +333,20 @@ class ContainerManager:
             return 1
         return value
 
+    def _counts_toward_limit(self, entry) -> bool:
+        """Whether a container entry occupies a limit slot.
+
+        Terminal states (exited/dead/removing) free a slot so a stuck or
+        crashed container never blocks a fresh create. Unknown/new statuses
+        count toward the limit (fail-safe: default to occupying a slot).
+        """
+        status = str((entry or {}).get("status", "")).lower()
+        return status not in ("exited", "dead", "removing")
+
+    def _active_containers(self, entries):
+        """Filter container entries down to those that occupy a limit slot."""
+        return [e for e in (entries or []) if self._counts_toward_limit(e)]
+
     @staticmethod
     def _resolve_vault_root(vault_root=None):
         """Resolve the vault root directory (bulletin board + config storage).
@@ -463,8 +477,9 @@ class ContainerManager:
 
         # Phase 3: workspace-scoped reuse + container-limit enforcement BEFORE
         # any create. An existing container with the same name is reused as-is
-        # (never counted against the limit); otherwise the running container
-        # count for THIS workspace decides whether a new one may be created.
+        # (never counted against the limit); otherwise the active (non-terminal)
+        # container count for THIS workspace decides whether a new one may be
+        # created.
         containers = self.list_containers()
         for entry in containers:
             if entry["name"] == name:
@@ -489,9 +504,15 @@ class ContainerManager:
         # When the registry is active it owns the per-session limit; the
         # legacy workspace-scoped check is skipped so the registry is the
         # single source of truth for container counts.
-        if len(containers) >= limit and not is_registry_active(getattr(self, "_session_config", None)):
-            return {"error": f"Workspace container limit ({limit}) reached. "
-                             f"Stop an unused container first."}
+        active_containers = self._active_containers(containers)
+        if len(active_containers) >= limit and not is_registry_active(getattr(self, "_session_config", None)):
+            log("WARNING", "docker.container_manager",
+                f"Workspace container limit reached: active={len(active_containers)} "
+                f"exited={len(containers) - len(active_containers)} limit={limit} "
+                f"workspace_id={self.workspace_id}")
+            return {"error": f"Workspace container limit ({limit}) reached "
+                             f"({len(active_containers)} active container(s)). "
+                             f"Stop or remove a running container to free a slot."}
 
         # ── Desired isolation from session permissions (all paths) ─────────
         network_mode, workspace_mode = self._compute_config(

@@ -319,8 +319,9 @@ class TestContainerLifecycle:
 
         r_b = manager.start(name=name_b)
         assert r_b == {
-            "error": "Workspace container limit (1) reached. "
-                      "Stop an unused container first."
+            "error": "Workspace container limit (1) reached "
+                      "(1 active container(s)). "
+                      "Stop or remove a running container to free a slot."
         }, f"unexpected limit result: {r_b!r}"
 
         r_a_again = manager.start(name=name_a)
