@@ -33,6 +33,32 @@ import pytest
 from tools.git_info_tool import GitInfoTool
 from tools.git_write_tool import GitWriteTool
 
+# Workspace the host-path helpers bind so the workspace ceiling admits host
+# git; its ``allow_host_resources`` config is provisioned by the autouse
+# ``_allow_host_resources_gate`` fixture below (mirrors
+# tests/test_permission_routing_fix.py / test_worker_permission_hardening.py).
+HOST_TEST_WS = "host-test-ws"
+
+
+@pytest.fixture(autouse=True)
+def _allow_host_resources_gate(tmp_path, monkeypatch):
+    """Provision an ``allow_host_resources`` config for ``HOST_TEST_WS``.
+
+    Host-side git is fail-CLOSED on an unbound workspace id: with no workspace
+    id there is no ``allow_host_resources`` ceiling to resolve, so the host path
+    is denied.  This suite exercises the hermetic HOST fallback (direct
+    ``workspace_path=`` callers), so its tools bind ``HOST_TEST_WS`` and this
+    fixture gives that workspace an ``allow_host_resources: true`` config.
+    """
+    vault = tmp_path / "_host_gate_vault"
+    cfg_dir = vault / "workspaces" / HOST_TEST_WS
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True}), encoding="utf-8"
+    )
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+
 # Canonical fail-closed gate denial returned by GitWriteTool for direct calls
 # when the session git permission is not write-capable (byte-identical to
 # test_git_info_tool_operations.FLAG_ERROR and to the tool's
@@ -95,6 +121,7 @@ def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
         file_path=file_path,
         working_dir=str(repo),
         workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
         agent_config={"session_permissions": {"git": "write"}},
     )
 
@@ -181,6 +208,7 @@ def test_repo_root_outside_workspace_rejected(tmp_path):
         operation="status",
         working_dir=str(proj),
         workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
     )
     result = tool.execute()
     assert isinstance(result, str)
@@ -196,6 +224,7 @@ def test_status_still_works(hardened_repo):
         operation="status",
         working_dir=str(repo),
         workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
     )
     result = tool.execute()
     assert "a.txt" in result
@@ -280,6 +309,7 @@ def test_fsmonitor_config_not_executed(hardened_repo):
         operation="status",
         working_dir=str(repo),
         workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
     )
     result = tool.execute()
     assert "a.txt" in result
@@ -420,6 +450,7 @@ def test_normal_git_operations(hardened_repo):
             operation=op,
             working_dir=str(repo),
             workspace_path=str(workspace),
+            workspace_id=HOST_TEST_WS,
             **kwargs,
         )
         result = tool.execute()
@@ -459,6 +490,7 @@ def test_textconv_driver_never_executes_via_show(tmp_path):
         commit="HEAD",
         working_dir=str(nested),
         workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
     )
     result = tool.execute()
     assert "Git command failed" not in result
@@ -487,6 +519,7 @@ def test_textconv_disabled_but_builtin_diff_works(tmp_path):
         operation="diff",
         working_dir=str(repo),
         workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
     )
     result = tool.execute()
     assert "Git command failed" not in result

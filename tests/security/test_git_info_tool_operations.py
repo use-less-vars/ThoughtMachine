@@ -24,6 +24,7 @@ Security properties asserted per operation:
   (no trailer).
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,11 @@ from tools.git_info_tool import GitInfoTool
 from tools.git_write_tool import GitWriteTool
 
 FLAG_ERROR = 'Error: git:write denied: session git_write permission is not "write"'
+
+# Workspace the host-path helpers bind so the workspace ceiling admits host
+# git; its ``allow_host_resources`` config is provisioned by the autouse
+# ``_allow_host_resources_gate`` fixture below.
+HOST_TEST_WS = "host-test-ws"
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +101,27 @@ def fake_manager():
     return _FakeManager(mode="containerized")
 
 
+@pytest.fixture(autouse=True)
+def _allow_host_resources_gate(tmp_path, monkeypatch):
+    """Provision an ``allow_host_resources`` config for ``HOST_TEST_WS``.
+
+    Host-side git is now fail-CLOSED on an unbound workspace id: with no
+    workspace id there is no ``allow_host_resources`` ceiling to resolve, so the
+    legacy ``workspace_path``-only host path is denied.  The host-path helpers
+    (``_host_tool`` / ``_read_host_tool``) therefore bind ``HOST_TEST_WS``, and
+    this fixture gives it an ``allow_host_resources: true`` config so the
+    hardened host path stays exercisable.  The no-workspace deny itself is
+    covered by ``TestHostFallbackNoWorkspaceIdGate``; the workspace-gate tests
+    override ``THOUGHTMACHINE_VAULT_ROOT`` to exercise the deny branches.
+    """
+    vault = tmp_path / "_host_gate_vault"
+    cfg_dir = vault / "workspaces" / HOST_TEST_WS
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True}), encoding="utf-8")
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+
 def _tool(tmp_path, **params):
     """Construct a GitWriteTool wired to the workspace for path validation.
 
@@ -115,13 +142,22 @@ def _read_tool(tmp_path, **params):
 
 
 def _host_tool(tmp_path, **params):
-    """Write tool that runs git on the hardened host path (no registry workspace)."""
-    return _tool(tmp_path, **params)
+    """Write tool on the hardened host path, bound to an allowing workspace.
+
+    ``HOST_TEST_WS`` is bound so the workspace ceiling admits host git (see the
+    autouse ``_allow_host_resources_gate`` fixture); an unbound workspace id now
+    denies the host path outright.
+    """
+    tool = _tool(tmp_path, **params)
+    object.__setattr__(tool, "_resolved_workspace_id", HOST_TEST_WS)
+    return tool
 
 
 def _read_host_tool(tmp_path, **params):
-    """Read tool that runs git on the hardened host path (no registry workspace)."""
-    return _read_tool(tmp_path, **params)
+    """Read tool on the hardened host path, bound to an allowing workspace."""
+    tool = _read_tool(tmp_path, **params)
+    object.__setattr__(tool, "_resolved_workspace_id", HOST_TEST_WS)
+    return tool
 
 
 def _container_tool(tmp_path, manager, **params):
@@ -841,6 +877,48 @@ class TestHostFallbackWorkspaceGate:
         tool = _read_host_tool(tmp_path, operation="status")
         object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
         with pytest.raises(RuntimeError, match="could not be resolved"):
+            tool._git_status(tmp_path)
+        assert tool._last_execution_mode == "unavailable"
+        assert not _FakeSandbox.instances
+
+
+# ---------------------------------------------------------------------------
+# host-side git is fail-CLOSED when no workspace id is bound
+# ---------------------------------------------------------------------------
+class TestHostFallbackNoWorkspaceIdGate:
+    """Host-side git DENIES when no workspace id is bound to the session.
+
+    With no workspace id there is no ``allow_host_resources`` ceiling to
+    resolve, and this state is production-reachable (the deprecated
+    ``workspace_path`` fallback and direct callers), so
+    ``_host_execution_denied_reason`` must DENY the legacy host path rather than
+    silently allow it.  Driven through the real ``_run_git_raw`` path.
+    """
+
+    DENY = (
+        "GitReadTool: host-side git execution denied; no workspace id "
+        "is bound to this session, so no host-resource policy can be "
+        "resolved for host-side git"
+    )
+
+    def test_denied_when_no_workspace_id(self, tmp_path, fake_sandbox):
+        # The production no-workspace shape: a workspace_path is set but no
+        # workspace id is resolvable (no registry session, no executor-bound id).
+        tool = _read_tool(tmp_path, operation="status")
+        assert not tool._use_container_mode()  # would otherwise run host git
+
+        with pytest.raises(RuntimeError, match="no workspace id") as exc:
+            tool._git_status(tmp_path)
+
+        assert str(exc.value) == self.DENY
+        assert tool._last_execution_mode == "unavailable"
+        assert not _FakeSandbox.instances  # no host-side git actually ran
+
+    def test_denied_when_workspace_id_blank(self, tmp_path, fake_sandbox):
+        tool = _read_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resolved_workspace_id", "")
+
+        with pytest.raises(RuntimeError, match="no workspace id"):
             tool._git_status(tmp_path)
         assert tool._last_execution_mode == "unavailable"
         assert not _FakeSandbox.instances
