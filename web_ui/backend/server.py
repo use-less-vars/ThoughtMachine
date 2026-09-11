@@ -3169,6 +3169,70 @@ def workspace_container_delete(workspace_id: str, container_name: str,
         return _json_error(str(exc), status_code=503)
 
 
+# Container logs: upper bound on ``tail`` accepted by the REST route. The
+# ContainerLogsTool imposes no upper bound, so the route clamps defensively
+# to keep a single request from streaming an unbounded number of lines.
+_CONTAINER_LOGS_MAX_TAIL = 10000
+
+
+@app.get("/api/workspace/{workspace_id}/containers/{container_name}/logs")
+def workspace_container_logs(workspace_id: str, container_name: str,
+                             workspace_path: str = "",
+                             tail: int = 200):
+    """Fetch the stdout/stderr logs of a single named container.
+
+    Mirrors the ContainerLogsTool payload shape
+    (``success``/``stdout``/``stderr``/``duration``) and adds the requested
+    ``container`` name. ``tail`` defaults to 200 and is clamped to
+    ``_CONTAINER_LOGS_MAX_TAIL``; negative values are rejected.
+    """
+    if tail < 0:
+        return _json_error("tail must be >= 0", status_code=400)
+    if tail > _CONTAINER_LOGS_MAX_TAIL:
+        tail = _CONTAINER_LOGS_MAX_TAIL
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_logs",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_logs",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    start_time = time.time()
+    try:
+        result = manager.get_logs(container_id=container_id, tail=tail,
+                                  since=None)
+    except RuntimeError as exc:
+        log("ERROR", "server.workspace_container_logs", f"Logs failed: {exc}")
+        status_code = 404 if "not found" in str(exc) else 503
+        return _json_error(str(exc), status_code=status_code)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_logs", f"Logs failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    return {
+        "container": container_name,
+        "success": True,
+        "stdout": result.get("stdout", ""),
+        "stderr": result.get("stderr", ""),
+        "duration": time.time() - start_time,
+    }
+
+
 @app.get("/api/health/containers")
 def health_containers():
     """Report whether the Docker daemon is reachable from the server.
