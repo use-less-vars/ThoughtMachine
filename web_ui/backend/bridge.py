@@ -2120,7 +2120,7 @@ class WebAgentBridge:
             self._loaded_session.session_id if self._loaded_session else None
         )
         if sid is None:
-            log('WARNING', 'server.bridge', "save_open_session: no session ID available")
+            log('DEBUG', 'server.bridge', "save_open_session: no session ID available")
             return
         # Save the session first (so it exists on disk)
         self.save_session()
