@@ -56,9 +56,11 @@ VAULT_SUBDIRS: tuple[str, ...] = (
 def ensure_vault_structure() -> list[str]:
     """Create the vault compartment structure under ``~/.thoughtmachine/``.
 
-    Each subdirectory is created only if it does not already exist
-    (idempotent).  Newly created directories get permissions ``0o700``
-    (owner-only access).
+    The vault root itself is created (with permissions ``0o700``) when it is
+    missing; each subdirectory is likewise created only if it does not already
+    exist (idempotent).  Newly created directories get permissions ``0o700``
+    (owner-only access).  An existing vault is left exactly as it is -- never
+    widened or narrowed.
 
     Returns:
         A list of absolute paths to directories that were **created**
@@ -66,6 +68,16 @@ def ensure_vault_structure() -> list[str]:
     """
     root = vault_root()
     created: list[str] = []
+
+    # Create the vault root itself first so its own permissions are
+    # owner-only. ``mode=0o700`` only applies to directories mkdir actually
+    # creates and can be masked by the process umask, so an explicit chmod is
+    # applied as well -- but ONLY when this call created the root (an existing
+    # vault is never re-chmod'd, i.e. never widened or narrowed).
+    if not root.exists():
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        created.append(str(root))
 
     for subdir in VAULT_SUBDIRS:
         target = root / subdir

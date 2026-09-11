@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 
@@ -206,5 +207,50 @@ def load_user_config() -> dict:
         except (json.JSONDecodeError, OSError):
             pass
     return _read_default_json("default_config.json")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    """Entry point for ``python -m thoughtmachine.bootstrap``.
+
+    Idempotently materialise the user vault (``~/.thoughtmachine``) with the
+    bundled factory defaults (via the existing :func:`ensure_user_defaults`
+    creator), so a fresh machine has a usable, writable vault before the
+    launcher's read-only doctor check runs.  The vault root is created with
+    owner-only (``0o700``) permissions; an existing vault is left exactly as
+    it is (never widened or narrowed).
+
+    Returns:
+        ``0`` on success, ``1`` when the vault could not be initialised.
+    """
+    from thoughtmachine.vault import vault_root
+
+    root = vault_root()
+    existed_before = root.is_dir()
+    try:
+        created = ensure_user_defaults()
+    except Exception as exc:  # noqa: BLE001 - surface any failure clearly
+        print(
+            f"thoughtmachine.bootstrap: failed to initialise vault at {root}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        mode_str = f"0o{root.stat().st_mode & 0o777:03o}"
+    except OSError:
+        mode_str = "unknown"
+
+    print(f"Vault: {root}")
+    print(f"  status: {'already present' if existed_before else 'created'}")
+    print(f"  mode:   {mode_str}")
+    print(f"  written this run: {len(created)} path(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
