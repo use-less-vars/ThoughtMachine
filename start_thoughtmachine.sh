@@ -318,6 +318,15 @@ echo "      ok."
 
 # ------------------------------------------------ [6/8] ~/.thoughtmachine writable
 echo "[6/8] ~/.thoughtmachine writable ..."
+# Ensure the vault exists with factory defaults BEFORE we check writability,
+# so a fresh machine (no ~/.thoughtmachine) can start. Idempotent; the
+# read-only doctor check below then verifies the vault as a post-condition.
+BOOTSTRAP_OUT="$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -m thoughtmachine.bootstrap 2>&1)"
+BOOTSTRAP_RC=$?
+if [ "$BOOTSTRAP_RC" -ne 0 ]; then
+    echo "      WARNING: vault bootstrap failed; continuing to the read-only vault check below."
+    printf '%s\n' "$BOOTSTRAP_OUT" | sed 's/^/      /'
+fi
 TM_OUT="$(doctor --check-dotthoughtmachine 2>&1)"
 TM_RC=$?
 if [ "$TM_RC" -ne 0 ]; then

@@ -290,6 +290,27 @@ else
 fi
 
 # ── Make scripts executable ────────────────────────────────────────────
+echo "[+] Initialising user vault (~/.thoughtmachine) ..."
+DOCTOR="$PROJECT_DIR/scripts/doctor_checks.py"
+if [[ -x "$VENV_DIR/Scripts/python.exe" ]]; then
+    VAULT_PY="$VENV_DIR/Scripts/python.exe"
+else
+    VAULT_PY="$VENV_DIR/bin/python"
+fi
+[[ -x "$VAULT_PY" ]] || VAULT_PY="$PYTHON"
+if (cd "$PROJECT_DIR" && "$VAULT_PY" -m thoughtmachine.bootstrap); then
+    echo "  ✓ User vault initialised"
+else
+    echo "  ✗ Failed to initialise the user vault (~/.thoughtmachine)"
+    exit 1
+fi
+# Read-only post-condition: the vault must now be present and writable.
+if (cd "$PROJECT_DIR" && "$VAULT_PY" "$DOCTOR" --check-dotthoughtmachine >/dev/null 2>&1); then
+    echo "  ✓ Vault present and writable"
+else
+    echo "  ✗ Vault not writable. Fix with: sudo chown -R $USER ~/.thoughtmachine"
+    exit 1
+fi
 echo ""
 echo "[+] Making scripts executable..."
 chmod +x "$PROJECT_DIR/start_thoughtmachine.sh" 2>/dev/null || true
