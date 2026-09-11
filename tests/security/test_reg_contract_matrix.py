@@ -36,6 +36,11 @@ from tools.git_info_tool import GitInfoTool
 from tools.git_write_tool import GitWriteTool
 
 
+# Workspace id bound by the host-path git tests below; its provisioned config
+# (written by ``allow_host_resources_gate``) permits host resources.
+HOST_TEST_WS = "host-test-ws"
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror test_git_hardening.py / test_mcp_server_connect.py)
 # ---------------------------------------------------------------------------
@@ -130,12 +135,29 @@ def git_available():
         pytest.skip("git binary not available in this environment")
 
 
+@pytest.fixture
+def allow_host_resources_gate(tmp_path, monkeypatch):
+    """Provision an ``allow_host_resources`` config for ``HOST_TEST_WS``.
+
+    Host-side git is fail-CLOSED on an unbound workspace id, so the
+    host-path tests below bind ``HOST_TEST_WS`` and this fixture gives that
+    workspace an ``allow_host_resources: true`` config.
+    """
+    vault = tmp_path / "_host_gate_vault"
+    cfg_dir = vault / "workspaces" / HOST_TEST_WS
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True}), encoding="utf-8"
+    )
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+
 # ---------------------------------------------------------------------------
 # 1. GitInfoTool hardening contracts
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.usefixtures("git_available")
+@pytest.mark.usefixtures("git_available", "allow_host_resources_gate")
 def test_post_commit_hook_never_executes(tmp_path):
     """A planted .git/hooks/post-commit must never run during a tool commit."""
     workspace = tmp_path / "workspace"
@@ -150,6 +172,7 @@ def test_post_commit_hook_never_executes(tmp_path):
         message="add hello",
         file_path="hello.txt",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
         agent_config={"session_permissions": {"git": "write"}},
     )
@@ -164,7 +187,7 @@ def test_post_commit_hook_never_executes(tmp_path):
     assert "add hello" in log.stdout, "commit did not land"
 
 
-@pytest.mark.usefixtures("git_available")
+@pytest.mark.usefixtures("git_available", "allow_host_resources_gate")
 def test_fsmonitor_never_executes(tmp_path):
     """A configured core.fsmonitor hook must never be invoked by the tool."""
     workspace = tmp_path / "workspace"
@@ -182,6 +205,7 @@ def test_fsmonitor_never_executes(tmp_path):
     tool = GitInfoTool(
         operation="status",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
     )
     result = tool.execute()
@@ -189,7 +213,7 @@ def test_fsmonitor_never_executes(tmp_path):
     assert not marker.exists(), "core.fsmonitor executed despite -c core.fsmonitor="
 
 
-@pytest.mark.usefixtures("git_available")
+@pytest.mark.usefixtures("git_available", "allow_host_resources_gate")
 def test_textconv_never_executes(tmp_path):
     """A configured diff.textconv driver must never be invoked by the tool."""
     workspace = tmp_path / "workspace"
@@ -213,6 +237,7 @@ def test_textconv_never_executes(tmp_path):
     tool = GitInfoTool(
         operation="diff",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
     )
     result = tool.execute()
@@ -242,7 +267,7 @@ def test_clone_ext_transport_rejected(tmp_path):
     assert "Unsupported git protocol" in result
 
 
-@pytest.mark.usefixtures("git_available")
+@pytest.mark.usefixtures("git_available", "allow_host_resources_gate")
 def test_host_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
     """HOST path: a pre-commit hook planted via Path.write_text is ignored.
 
@@ -262,6 +287,7 @@ def test_host_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
         message="add hello",
         file_path="hello.txt",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
         agent_config={"session_permissions": {"git": "write"}},
     )
@@ -308,7 +334,7 @@ def test_container_commit_does_not_skip_hooks(tmp_path):
     assert "--no-verify" not in command
 
 
-@pytest.mark.usefixtures("git_available")
+@pytest.mark.usefixtures("git_available", "allow_host_resources_gate")
 def test_git_add_status_diff_log_work(tmp_path):
     """add/status/diff/log all succeed through the hardened runner.
 
@@ -327,6 +353,7 @@ def test_git_add_status_diff_log_work(tmp_path):
         message="base",
         file_path="base.txt",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
         agent_config={"session_permissions": {"git": "write"}},
     )
@@ -340,6 +367,7 @@ def test_git_add_status_diff_log_work(tmp_path):
     tool = GitInfoTool(
         operation="status",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
     )
     status = tool.execute()
@@ -352,6 +380,7 @@ def test_git_add_status_diff_log_work(tmp_path):
     tool = GitInfoTool(
         operation="diff",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
     )
     diff = tool.execute()
@@ -361,6 +390,7 @@ def test_git_add_status_diff_log_work(tmp_path):
     tool = GitInfoTool(
         operation="log",
         working_dir=str(repo),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
     )
     log = tool.execute()
@@ -444,7 +474,7 @@ def test_mcp_connect_valid_server_works(tmp_path, monkeypatch):
     assert parsed["server"] == "mock"
     assert "tools" in parsed["capabilities"]
 
-@pytest.mark.usefixtures("git_available")
+@pytest.mark.usefixtures("git_available", "allow_host_resources_gate")
 def test_nested_repo_textconv_blocked(tmp_path):
     """Nested-repo textconv exploit chain: no execution via git show.
 
@@ -478,6 +508,7 @@ def test_nested_repo_textconv_blocked(tmp_path):
         operation="show",
         commit="HEAD",
         working_dir=str(nested),
+        workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
     )
     result = tool.execute()
