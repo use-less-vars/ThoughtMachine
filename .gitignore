@@ -148,6 +148,7 @@ docs/container_registry_design.md
 !docs/git_resource_execution_audit.md
 !docs/param_ownership_map.md
 !docs/container_p0_bug4_git_fallback.md
+!docs/container_subsystem_audit.md
 
 # Hygiene cleanup (2026-08-28): vendored pytest site-packages + pytest cache
 pytest_install/
