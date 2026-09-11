@@ -103,10 +103,13 @@ class GitReadTool(ToolBase):
 
         Host-side git execution remains gated on the workspace top-level
         ``allow_host_resources`` key (see ``tools.host_resource_policy``).
-        With no resolvable workspace id there is no workspace ceiling, so
-        the legacy host path stays allowed.  Any policy-lookup failure is
-        fail-CLOSED: a helper import/read error DENIES host execution rather
-        than silently allowing it, matching the rest of the permission layer
+        With no resolvable workspace id there is no workspace ceiling to
+        consult, so the legacy host path is DENIED fail-closed: an unbound
+        workspace id is a production-reachable state, and allowing host git
+        there would bypass the workspace policy entirely.  Any policy-lookup
+        failure is likewise fail-CLOSED: a helper import/read error DENIES
+        host execution rather than silently allowing it, matching the rest
+        of the permission layer
         (``tools.host_resource_policy.workspace_allows_host_resources`` whose
         reader returns ``False`` on error, and the
         ``security_gate.get_effective_permissions`` host_bash override which
@@ -114,7 +117,11 @@ class GitReadTool(ToolBase):
         """
         ws_id = self._resolved_workspace_id or getattr(self, "workspace_id", None)
         if not ws_id:
-            return None
+            return (
+                "GitReadTool: host-side git execution denied; no workspace id "
+                "is bound to this session, so no host-resource policy can be "
+                "resolved for host-side git"
+            )
         try:
             from tools.host_resource_policy import workspace_allows_host_resources
 

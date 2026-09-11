@@ -18,6 +18,7 @@ This suite verifies the routing fix in GitInfoTool and Agent:
   pending; permissions are not mirrored onto the live config until the pending
   config is applied via hot swap or restart.
 """
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,32 @@ from agent.core.agent import Agent
 from thoughtmachine.security import SessionPermissions
 from tools.git_info_tool import GitInfoTool
 from tools.git_write_tool import GitWriteTool
+
+
+# Workspace the execute()-path helper binds so the workspace ceiling admits
+# host git; its ``allow_host_resources`` config is provisioned by the autouse
+# ``_allow_host_resources_gate`` fixture below (mirrors
+# tests/security/test_git_info_tool_operations.py).
+HOST_TEST_WS = "host-test-ws"
+
+
+@pytest.fixture(autouse=True)
+def _allow_host_resources_gate(tmp_path, monkeypatch):
+    """Provision an ``allow_host_resources`` config for ``HOST_TEST_WS``.
+
+    Host-side git is fail-CLOSED on an unbound workspace id: with no workspace
+    id there is no ``allow_host_resources`` ceiling to resolve, so the host path
+    is denied.  The execute()-path helper (``_tool``) binds ``HOST_TEST_WS`` so
+    the network/git 'ask' defers-gate routing stays exercisable; this fixture
+    gives that workspace an ``allow_host_resources: true`` config.
+    """
+    vault = tmp_path / "_host_gate_vault"
+    cfg_dir = vault / "workspaces" / HOST_TEST_WS
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True}), encoding="utf-8"
+    )
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
 
 
 class FakeSandboxExecution:
@@ -83,12 +110,17 @@ def _tool(operation, session_perms=None, effective_perms=None, **kwargs):
         in ("commit", "init", "clone", "branch_create", "checkout", "stage", "unstage")
         else GitInfoTool
     )
-    return tool_cls(
+    tool = tool_cls(
         operation=operation,
         session_permissions=session_perms,
         effective_permissions=effective_perms,
         **kwargs,
     )
+    # Bind an allowing workspace so the ``execute()`` host path (which now
+    # fail-CLOSES on an unbound workspace id) admits git; the autouse
+    # ``_allow_host_resources_gate`` fixture provisions its config.
+    object.__setattr__(tool, "_resolved_workspace_id", HOST_TEST_WS)
+    return tool
 
 
 class TestHostPath:
