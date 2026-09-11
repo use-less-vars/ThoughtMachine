@@ -178,6 +178,9 @@ class Session:
                 # Wrap plain list back into ObservableList, preserving callback.
                 new_list = ObservableList(list(value), callback=self._on_conversation_changed)
                 object.__setattr__(self, name, new_list)
+                # A live wholesale replacement bypasses ObservableList's mutation callback, so announce it now.
+                if getattr(self, _SESSION_INITIALISED_FLAG, False):
+                    self._on_conversation_changed()
                 return
         # Guard workspace_id from being changed once set (immutable after initial assignment).
         if name == 'workspace_id':

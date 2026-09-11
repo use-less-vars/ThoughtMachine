@@ -60,17 +60,31 @@ class TestSessionUserHistoryGuardrail:
         session.user_history = data2
         assert list(session.user_history) == data2
 
-    def test_conversation_version_not_incremented_by_plain_assign(self):
-        """Plain-list assignment auto-wraps but does NOT bump conversation_version."""
+    def test_construction_with_plain_list_leaves_version_untouched(self):
+        """Construction-time plain-list wrap leaves conversation_version untouched."""
+        session = Session(user_history=[{"role": "user", "content": "test"}])
+        assert session._conversation_version == 0, (
+            f"Expected version 0 after construction, got {session._conversation_version}"
+        )
+
+    def test_live_plain_assign_increments_version_exactly_once(self):
+        """A live plain-list assignment bumps conversation_version by exactly 1."""
         session = Session()
-        # __post_init__ may bump the version, so grab the value after construction
         before = session._conversation_version
         session.user_history = [{"role": "user", "content": "test"}]
-        # The version should not have changed (the guardrail uses object.__setattr__
-        # which skips ObservableList.__setitem__)
-        assert session._conversation_version == before, (
-            f"Expected version {before}, got {session._conversation_version}"
+        assert session._conversation_version == before + 1, (
+            f"Expected version {before + 1}, got {session._conversation_version}"
         )
+
+    def test_live_plain_assign_notifies_connected_callback_once(self):
+        """A live plain-list assignment invokes a connected callback exactly once."""
+        session = Session()
+        calls = []
+        session.connect_conversation_changed(lambda: calls.append(1))
+        before = session._conversation_version
+        session.user_history = [{"role": "user", "content": "test"}]
+        assert calls == [1], f"Expected callback invoked exactly once, got {calls}"
+        assert session._conversation_version == before + 1
 
     def test_callback_preserved_on_wrap(self):
         """After auto-wrap, the ObservableList's callback points to the session method."""
