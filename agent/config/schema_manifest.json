@@ -408,14 +408,14 @@
         "model_override": {
           "type": "string",
           "required": false,
-          "default": null,
-          "description": "Model name override (null = use provider default)."
+          "default": "",
+          "description": "Model name override (null or empty = use provider default)."
         },
         "stop_check": {
           "type": "bool",
           "required": false,
-          "default": null,
-          "description": "Whether to stop after first response (null = unset)."
+          "default": false,
+          "description": "Whether to stop after first response (null or false = unset)."
         }
       }
     },
