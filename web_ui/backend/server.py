@@ -104,6 +104,7 @@ if _sys.stderr is None:
 del _sys, _os
 
 import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -122,7 +123,7 @@ from fastapi import Body, FastAPI, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
 from agent.config.presets import get_tools_for_mode
@@ -411,6 +412,50 @@ def _sweep_exited_workspace_containers():
         log('WARNING', 'server', f'Startup workspace sweep skipped: {exc}')
 
 
+# ── Periodic container sweep (Phase 1.1) ───────────────────────────────
+# Startup runs both sweeps once; a background task then re-runs them on a
+# fixed interval so idle/orphan containers are reclaimed during long-lived
+# server sessions. Best-effort: recurring failures are logged, never fatal.
+_CONTAINER_SWEEP_INTERVAL_S = float(
+    os.environ.get('THOUGHTMACHINE_CONTAINER_SWEEP_INTERVAL_S', '300')
+)
+
+
+def _run_container_sweeps():
+    """Run both container sweeps once. Best-effort; NEVER raises."""
+    for _label, _fn in (
+        ('exited-workspace', _sweep_exited_workspace_containers),
+        ('orphan-resource', _sweep_orphan_resource_containers),
+    ):
+        try:
+            _fn()
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Periodic container sweep ({_label}) failed: {exc}')
+        else:
+            log('INFO', 'server',
+                f'Periodic container sweep ({_label}) completed')
+
+
+async def _periodic_container_sweep_loop(
+    interval_s: float = _CONTAINER_SWEEP_INTERVAL_S,
+) -> None:
+    """Run ``_run_container_sweeps`` every ``interval_s`` seconds.
+
+    The blocking (docker-API) sweeps run in a worker thread so the event
+    loop is never stalled. The loop body is fully guarded so the task
+    cannot terminate with an unhandled exception; cancellation propagates.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await asyncio.to_thread(_run_container_sweeps)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log('WARNING', 'server', f'Periodic container sweep error: {exc}')
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
@@ -528,8 +573,30 @@ async def lifespan(app: FastAPI):
     # Best-effort: a failing sweep must never break startup.
     _sweep_exited_workspace_containers()
 
+    # ── Background periodic container sweep (Phase 1.1) ─────────────────────
+    # Re-run both sweeps on an interval so idle/orphan containers are
+    # reclaimed during long-running sessions (startup is one-shot).
+    sweep_task = asyncio.create_task(
+        _periodic_container_sweep_loop(),
+        name='container-sweep',
+    )
+    app.state.container_sweep_task = sweep_task
+    log('INFO', 'server',
+        f'Periodic container sweep scheduled every '
+        f'{_CONTAINER_SWEEP_INTERVAL_S:.0f}s')
+
     yield
     log('INFO', 'server', 'Server shutting down.')
+
+    # Stop the periodic container sweep task.
+    try:
+        sweep_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweep_task
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Container sweep task shutdown error: {exc}')
+
     # Stop EventLogger
     try:
         el = getattr(app.state, 'event_logger', None)
