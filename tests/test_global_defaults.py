@@ -29,6 +29,19 @@ def _read_json(path: Path):
         return json.load(f)
 
 
+def _manifest_declared_keys() -> set:
+    """Top-level keys declared for ``user/defaults.json`` in the schema manifest."""
+    manifest_path = (
+        Path(__file__).resolve().parents[1]
+        / "agent"
+        / "config"
+        / "schema_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    spec = manifest["files"]["user/defaults.json"]
+    return set(spec.get("fields") or spec.get("safe_default") or {})
+
+
 def _vault_file_snapshot(vault: Path) -> dict:
     """Map relative path -> raw bytes for every file under the vault."""
     snapshot = {}
@@ -143,6 +156,63 @@ class TestSaveGlobalDefaults:
         calls.clear()
         server_mod.save_global_defaults({"temperature": 0.1})
         assert calls[0][1] == ""
+
+    def test_t6_absent_user_defaults_seeds_manifest_not_frontend_fallback(
+        self, hermetic_vault
+    ):
+        """Regression (guard in ``server.save_global_defaults``): with
+        ``user/defaults.json`` ABSENT, saving global defaults must seed the layer
+        from the manifest ``safe_default`` -- the in-memory 39-key
+        ``FALLBACK_FRONTEND_CONFIG`` must never be persisted as ``existing``.
+
+        Consequence: every top-level key written is a manifest-declared key.
+        """
+        defaults_path = hermetic_vault / "user" / "defaults.json"
+        # Arrange: the fixture pre-writes an empty defaults.json; remove it so
+        # this test exercises the absent-file (fallback-leak) path.
+        defaults_path.unlink()
+        assert not defaults_path.exists()
+
+        saved = server_mod.save_global_defaults({
+            "provider_id": "p1",
+            "model": "m1",
+            "base_url": "http://b",
+            "temperature": 0.2,
+            "max_turns": 11,
+            "system_prompt": "sp",
+            # Junk that must never persist into the global-default layer:
+            "workspace_path": "/nope",
+            "mode": "agent",
+        })
+
+        assert saved == defaults_path
+        assert defaults_path.exists()
+        data = _read_json(defaults_path)
+
+        declared = _manifest_declared_keys()
+        assert declared, "manifest must declare user/defaults.json keys"
+        # The whole point: the file is the manifest seed, not the fallback.
+        leaked = set(data) - declared
+        assert not leaked, (
+            f"frontend fallback leaked into on-disk defaults: {sorted(leaked)}"
+        )
+        # Discriminator keys present only in FALLBACK_FRONTEND_CONFIG:
+        for fallback_only in (
+            "timeout_seconds", "workspace_path", "mode", "enabled_tools",
+        ):
+            assert fallback_only not in data
+
+        # Positive case: the save updated the (freshly seeded) file.
+        assert data["provider_id"] == "p1"
+        assert data["model"] == "m1"
+        assert data["temperature"] == 0.2
+        assert data["max_turns"] == 11
+
+        # Positive case 2: a subsequent save updates the existing file in place.
+        server_mod.save_global_defaults({"temperature": 0.42})
+        updated = _read_json(defaults_path)
+        assert updated["temperature"] == 0.42
+        assert set(updated) <= declared
 
 
 class TestSessionManagerGlobalDefaults:

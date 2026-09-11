@@ -128,7 +128,7 @@ from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
 from agent.config.presets import get_tools_for_mode
 from agent.config.session_config import SessionConfig
-from agent.config.config_manager import save_config_defaults
+from agent.config.config_manager import save_config_defaults, _user_defaults_path
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 # ── Shared session store singleton ────────────────────────────────────────────
@@ -182,6 +182,21 @@ def save_global_defaults(cfg_dict: Dict[str, Any]) -> Path:
     ``~/.thoughtmachine/agent_config.json``, which is now read-compat only and
     never written by the server.  See ``docs/architecture/config_ownership.md``.
     """
+    # Guard (config-ownership Path A): the global-default layer must already be
+    # manifest-seeded on disk before we read it.  If ``user/defaults.json`` is
+    # absent, ``load_global_defaults()`` returns its in-memory 39-key fallback
+    # and we would then persist that fallback as ``existing``.  Re-run the very
+    # same seeder the server lifespan uses at startup (see ``lifespan``) so the
+    # on-disk file holds the manifest ``safe_default`` instead.  Only runs when
+    # the file is missing; never raises (a failed seed just logs a warning and
+    # the save proceeds).
+    if not _user_defaults_path().exists():
+        try:
+            from thoughtmachine.bootstrap import ensure_user_defaults
+            ensure_user_defaults()
+        except Exception as exc:
+            log('WARNING', 'server.config',
+                f'Could not seed user defaults before save: {exc}')
     subset = {k: v for k, v in cfg_dict.items() if k in GLOBAL_DEFAULT_KEYS}
     existing = load_global_defaults()
     merged = dict(existing)
