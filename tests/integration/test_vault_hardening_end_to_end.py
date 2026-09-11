@@ -314,7 +314,7 @@ class TestDefaultsResolutionChain:
         )
 
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault,
         )
         return vault
@@ -344,7 +344,7 @@ class TestDefaultsResolutionChain:
                      {"temperature": 0.3})
 
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault,
         )
         from agent.config.config_manager import resolve_config_defaults
@@ -363,7 +363,7 @@ class TestDefaultsResolutionChain:
                      {"temperature": 0.3})
 
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault,
         )
         from agent.config.config_manager import resolve_config_defaults
@@ -384,7 +384,7 @@ class TestDefaultsResolutionChain:
                      {"enabled_tools": ["tool_c", "tool_d"]})
 
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault,
         )
         from agent.config.config_manager import resolve_config_defaults
@@ -407,7 +407,7 @@ class TestSaveDefaults:
         _make_dirs(vault, "user")
         _make_dirs(vault, "workspaces", "ws-1")
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault,
         )
         return vault
@@ -513,9 +513,11 @@ class TestSecurityBoundaryCapstone:
         # --- checksystem allowlist (does NOT include "workspace_registry") ---
         _make_vault_with_allowlist(vault, ["my_config", "dockerfile"])
 
-        # Patch config_manager._vault_root to use our test vault
+        # Redirect vault-root resolution to our test vault by patching the
+        # canonical module attribute thoughtmachine.vault.vault_root (resolved
+        # at call time).
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault,
         )
 

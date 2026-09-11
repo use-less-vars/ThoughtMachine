@@ -130,6 +130,7 @@ from agent.config.presets import get_tools_for_mode
 from agent.config.session_config import SessionConfig
 from agent.config.config_manager import save_config_defaults
 from thoughtmachine.workspace_registry import WorkspaceRegistry
+import thoughtmachine.vault as _vault
 
 # ── Shared session store singleton ────────────────────────────────────────────
 # All WebSocket connections and bridges share ONE FileSystemSessionStore so that
@@ -2533,15 +2534,6 @@ app.include_router(vault_repair_router)
 # drives (e.g. D:\Coding on Windows), so paths anywhere else on the machine
 # are now allowed.
 
-def _vault_root_path() -> str:
-    """Absolute, normalized vault root (~/.thoughtmachine)."""
-    root = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
-    try:
-        return os.path.realpath(root)
-    except Exception:
-        return root
-
-
 def _path_is_within(path: str, prefix: str) -> bool:
     """True when *path* equals *prefix* or lies beneath it (component-aware)."""
     path = os.path.normpath(path)
@@ -2571,7 +2563,11 @@ def _confine_to_home(path: str) -> str:
             f"Path '{path}' resolves to '{resolved}', which is not an "
             f"absolute path"
         )
-    vault = _vault_root_path()
+    raw = str(_vault.vault_root())
+    try:
+        vault = os.path.realpath(raw)
+    except Exception:
+        vault = raw
     if _path_is_within(resolved, vault):
         raise ValueError(
             f"Path '{path}' resolves into the protected vault directory '{vault}'"

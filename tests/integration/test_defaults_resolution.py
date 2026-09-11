@@ -51,7 +51,7 @@ class TestDefaultsResolution:
         )
 
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: vault_root,
         )
         yield vault_root
@@ -71,7 +71,7 @@ class TestDefaultsResolution:
 
     def test_empty_vault(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "agent.config.config_manager._vault_root",
+            "thoughtmachine.vault.vault_root",
             lambda: tmp_path / ".thoughtmachine",
         )
         result = resolve_config_defaults("ws-1")

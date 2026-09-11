@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from agent.presenter.state_bridge import StateBridge
+import thoughtmachine.vault as _vault
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
@@ -38,19 +39,14 @@ class ModeSwitchBody(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _get_thoughtmachine_dir() -> Path:
-    """Return the ``~/.thoughtmachine/`` directory path."""
-    return Path.home() / ".thoughtmachine"
-
-
 def _get_custom_prompt_path() -> Path:
     """Return the path to ``custom_system_prompt.txt``."""
-    return _get_thoughtmachine_dir() / "custom_system_prompt.txt"
+    return _vault.vault_root() / "custom_system_prompt.txt"
 
 
 def _get_engineer_prompt_path() -> Path:
     """Return the path to ``engineer_system_prompt.txt``."""
-    return _get_thoughtmachine_dir() / "engineer_system_prompt.txt"
+    return _vault.vault_root() / "engineer_system_prompt.txt"
 
 
 def _is_engineer_mode() -> bool:
@@ -149,7 +145,7 @@ async def set_mode(body: ModeSwitchBody) -> Dict[str, str]:
         )
 
     try:
-        tm_dir = _get_thoughtmachine_dir()
+        tm_dir = _vault.vault_root()
         tm_dir.mkdir(parents=True, exist_ok=True)
 
         custom_path = _get_custom_prompt_path()

@@ -68,13 +68,9 @@ class ResolvePathBody(BaseModel):
 
 
 # ── Path confinement helpers (mirror of web_ui/backend/server.py) ───────────────────────────────────────────────────────────────────
-# Duplicated here rather than imported from server.py to avoid a circular
-# import (server.py imports this router at module level).  Keep both copies
-# in sync — or extract into a shared helper module.
-
-def _vault_root_path() -> Path:
-    """Return the vault root — the trust anchor for this server."""
-    return Path.home() / ".thoughtmachine"
+# The vault trust anchor is resolved through the canonical
+# ``thoughtmachine.vault.vault_root`` (imported at module top); the former
+# local ``_vault_root_path`` helper has been removed.
 
 
 def _path_is_within(path: str, prefix: str) -> bool:
@@ -106,7 +102,7 @@ def _confine_to_home(path: str) -> str:
             f"Path '{path}' resolves to '{resolved}', which is not an "
             f"absolute path"
         )
-    vault = os.path.realpath(str(_vault_root_path()))
+    vault = os.path.realpath(str(vault_root()))
     if _path_is_within(resolved, vault):
         raise ValueError(
             f"Path '{path}' resolves into the protected vault directory '{vault}'"
@@ -1601,7 +1597,7 @@ def _workspace_root_mountable(entry) -> bool:
     """
     try:
         root = os.path.abspath(os.path.expanduser(entry.root_path))
-        vault = str(_vault_root_path())
+        vault = str(vault_root())
         if root == vault or root.startswith(vault + os.sep):
             return False
         return bool(root)

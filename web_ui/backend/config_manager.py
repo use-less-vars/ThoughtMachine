@@ -163,7 +163,9 @@ def load_global_defaults() -> Dict[str, Any]:
 
     Auto-creates the file with sensible defaults on first run.
     """
-    config_dir = Path.home() / ".thoughtmachine"
+    from thoughtmachine.vault import vault_root
+
+    config_dir = vault_root()
     config_path = config_dir / "user" / "defaults.json"
 
     config_path.parent.mkdir(parents=True, exist_ok=True)

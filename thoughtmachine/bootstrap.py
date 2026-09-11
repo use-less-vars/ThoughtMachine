@@ -16,7 +16,43 @@ from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-USER_DIR = Path.home() / ".thoughtmachine"
+def _user_dir() -> Path:
+    """Resolve the user vault directory lazily.
+
+    An explicit ``bootstrap.USER_DIR`` override still wins (callers and tests
+    may assign the module attribute directly); otherwise the value defers to
+    ``thoughtmachine.vault.vault_root()`` so there is a single source of truth
+    (``THOUGHTMACHINE_VAULT_ROOT`` env var, else ``$HOME/.thoughtmachine``).
+    """
+    override = globals().get("USER_DIR")
+    if override is not None:
+        return Path(override)
+    import thoughtmachine.vault as _vault
+
+    return _vault.vault_root()
+
+
+def __getattr__(name: str) -> Path:
+    """PEP 562 lazy module attribute for ``bootstrap.USER_DIR``.
+
+    ``USER_DIR`` stays a plain, *assignable* module attribute: assigning it
+    writes the module dict, so ordinary attribute lookup then wins and this
+    hook is bypassed.  While unset, reading ``bootstrap.USER_DIR`` resolves
+    through ``vault_root()`` on every access, tracking the live vault root
+    instead of an import-time constant.
+
+    Caveat: assigning ``bootstrap.USER_DIR`` writes a real module-dict entry
+    that ``importlib.reload()`` will NOT clear (reload re-executes into the
+    same dict, so pre-existing keys survive).  Unlike the lazy attribute
+    above, such an entry freezes the value and masks ``vault_root()`` for the
+    rest of the process, so test code that assigns it must remove its own
+    entry (``bootstrap.__dict__.pop("USER_DIR", None)``) before reloading.
+    """
+    if name == "USER_DIR":
+        import thoughtmachine.vault as _vault
+
+        return _vault.vault_root()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # ── Manifest ────────────────────────────────────────────────────────────────
 
@@ -60,7 +96,7 @@ def _resolve_source(source_name: str, base: str = "resources") -> Path:
 
 def _resolve_dest(dest_name: str) -> Path:
     """Resolve a manifest dest name under the user directory."""
-    return USER_DIR / dest_name
+    return _user_dir() / dest_name
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -200,7 +236,7 @@ def load_user_config() -> dict:
     Returns:
         A ``dict`` with all keys that the project-level defaults provide.
     """
-    config_path = USER_DIR / "user" / "defaults.json"
+    config_path = _user_dir() / "user" / "defaults.json"
     if config_path.exists():
         try:
             return json.loads(config_path.read_text(encoding="utf-8"))

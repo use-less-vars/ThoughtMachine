@@ -42,6 +42,11 @@ class TestVaultBootstrap:
         import importlib
         from thoughtmachine import bootstrap
 
+        # PEP-562 + monkeypatch teardown may leave a concrete stale USER_DIR in
+        # the module dict; importlib.reload() re-executes into the *same* dict so
+        # the stale key survives and would mask the monkeypatched Path.home().
+        # Drop it first so USER_DIR re-resolves lazily through vault_root().
+        bootstrap.__dict__.pop("USER_DIR", None)
         # Reload to re-evaluate the module-level USER_DIR constant
         bootstrap = importlib.reload(bootstrap)
         return bootstrap
