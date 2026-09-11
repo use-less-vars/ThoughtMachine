@@ -46,7 +46,12 @@ sys.path.insert(1, "/workspace")
 
 import pytest
 
-from security.security_gate import check_requires_resource, get_effective_permissions
+from security.security_gate import (
+    REASON_SESSION_EXCEEDS_WORKSPACE_CEILING,
+    ceiling_contradictions,
+    check_requires_resource,
+    get_effective_permissions,
+)
 from security.sandboxed_execution import SandboxedExecution
 from tools.git_info_tool import GitReadTool
 from thoughtmachine.security import SessionPermissions
@@ -79,10 +84,20 @@ class TestResourceGateDenialMessages:
         ok, msg = check_requires_resource("git", eff, tool_name="GitReadTool")
         assert ok is False
         assert msg == (
-            "Permission denied: Tool requires resource 'git' "
-            "(permission git:read), but session does not allow it. "
-            "(workspace ceiling: banned)"
+            "Permission denied: Session permission for git is write, but "
+            "workspace ceiling is banned. The session exceeds the ceiling. "
+            "Correct either the workspace ceiling or the session grant."
         )
+        # First-class structured reason (not a string match on the message).
+        assert ceiling_contradictions(eff) == [
+            {
+                "resource": "git",
+                "session_value": "write",
+                "workspace_value": "banned",
+                "reason": REASON_SESSION_EXCEEDS_WORKSPACE_CEILING,
+                "guidance": "Correct either the workspace ceiling or the session grant.",
+            }
+        ]
         assert json.loads(json.dumps(msg)) == msg
 
     def test_session_grant_denial_without_ceiling_is_unchanged(self):
@@ -170,8 +185,9 @@ class TestSandboxedExecutionDenialMessages:
             )
         msg = str(excinfo.value)
         assert msg == (
-            "Permission denied: requires git:read, but session allows "
-            "git:banned (workspace ceiling: banned)"
+            "Permission denied: Session permission for git is write, but "
+            "workspace ceiling is banned. The session exceeds the ceiling. "
+            "Correct either the workspace ceiling or the session grant."
         )
 
     def test_session_denial_without_ceiling_is_unchanged(self):

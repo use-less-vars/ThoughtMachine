@@ -44,6 +44,7 @@ sys.path.insert(1, "/workspace")
 
 from security.security_gate import (
     _CeilingAnnotatedDict,
+    ceiling_contradictions,
     check_required_categories,
     get_effective_permissions,
 )
@@ -96,10 +97,21 @@ class TestCeilingCausedFilesystemDenial:
 
         msg = _deny(["filesystem:write"], eff)
         assert msg == (
-            "Permission denied: Tool requires filesystem:write, "
-            "but session allows filesystem:read (workspace ceiling: read)"
+            "Permission denied: Session permission for filesystem is write, "
+            "but workspace ceiling is read. The session exceeds the ceiling. "
+            "Correct either the workspace ceiling or the session grant."
         )
-        assert "workspace ceiling: read" in msg
+        # The reason is first-class (structured), not a string match: the same
+        # provenance yields the canonical reason payload.
+        assert ceiling_contradictions(eff) == [
+            {
+                "resource": "filesystem",
+                "session_value": "write",
+                "workspace_value": "read",
+                "reason": "session_exceeds_workspace_ceiling",
+                "guidance": "Correct either the workspace ceiling or the session grant.",
+            }
+        ]
 
     def test_ask_ceiling_caps_to_read_but_labels_ask(self):
         eff = get_effective_permissions(
@@ -109,7 +121,10 @@ class TestCeilingCausedFilesystemDenial:
         )
         assert eff["filesystem"] == "read"
         msg = _deny(["filesystem:write"], eff)
-        assert msg.endswith("(workspace ceiling: ask)")
+        assert (
+            "Session permission for filesystem is write, but workspace ceiling "
+            "is ask. The session exceeds the ceiling." in msg
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,11 +197,9 @@ class TestContainerCeilingDenial:
         }
         msg = _deny(["container:true"], eff)
         assert msg == (
-            "Permission denied: Tool requires container:true, "
-            # NB: the historical message prints the raw session value, so
-            # the bool grant renders as 'False' (only the ceiling label is
-            # lowercased).
-            "but session allows container:False (workspace ceiling: false)"
+            "Permission denied: Session permission for container is True, "
+            "but workspace ceiling is false. The session exceeds the ceiling. "
+            "Correct either the workspace ceiling or the session grant."
         )
 
     def test_legacy_docker_ceiling_alias_annotates_container(self):
@@ -197,7 +210,10 @@ class TestContainerCeilingDenial:
         )
         assert eff["container"] is False
         msg = _deny(["container:true"], eff)
-        assert msg.endswith("(workspace ceiling: read)")
+        assert (
+            "Session permission for container is True, but workspace ceiling "
+            "is read. The session exceeds the ceiling." in msg
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,7 +258,10 @@ class TestWorkerFootprintAttribution:
             permission_footprint={"filesystem": "write"},
             is_worker_context=True,
         )
-        assert msg.endswith("(workspace ceiling: read)")
+        assert (
+            "Session permission for filesystem is write, but workspace ceiling "
+            "is read. The session exceeds the ceiling." in msg
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,8 +282,9 @@ class TestGitCeilingDenials:
         # ceiling binds.
         assert ann.get("git") == {"pre": "write", "level": "read"}
         msg = _deny(["git:write"], eff)
-        assert msg.endswith(
-            "but session allows git:read (workspace ceiling: read)"
+        assert (
+            "Session permission for git is write, but workspace ceiling "
+            "is read. The session exceeds the ceiling." in msg
         )
 
     def test_git_write_denial_by_banned_ceiling(self):
@@ -282,8 +302,9 @@ class TestGitCeilingDenials:
             "level": "banned",
         }
         msg = _deny(["git:write"], eff)
-        assert msg.endswith(
-            "but session allows git:banned (workspace ceiling: banned)"
+        assert (
+            "Session permission for git is write, but workspace ceiling "
+            "is banned. The session exceeds the ceiling." in msg
         )
 
     def test_plain_git_write_denial_by_read_ceiling(self):
@@ -293,8 +314,9 @@ class TestGitCeilingDenials:
             {"git": "read"},
         )
         msg = _deny(["git:write"], eff)
-        assert msg.endswith(
-            "but session allows git:read (workspace ceiling: read)"
+        assert (
+            "Session permission for git is write, but workspace ceiling "
+            "is read. The session exceeds the ceiling." in msg
         )
 
 

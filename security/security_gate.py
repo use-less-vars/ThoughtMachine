@@ -611,6 +611,152 @@ def _ceiling_denial_note(
     return str(annotation["level"])
 
 
+# ── Session-exceeds-workspace-ceiling contradiction ───────────────────────────────────
+# A first-class classification for the case where the SESSION grant sits
+# strictly ABOVE the workspace ceiling for a resource: the ceiling (not the
+# session grant) is what denies the call, yet the session profile itself is
+# the inconsistency -- it was granted more than the workspace permits, so one
+# of the two sides must be corrected.  The human denial text and the REST/GUI
+# contract both derive from this value rather than a string match on the
+# message, so the reason is machine-readable.
+REASON_SESSION_EXCEEDS_WORKSPACE_CEILING = "session_exceeds_workspace_ceiling"
+
+#: Operator-facing corrective guidance emitted with every
+#: :data:`REASON_SESSION_EXCEEDS_WORKSPACE_CEILING` contradiction.
+SESSION_EXCEEDS_WORKSPACE_CEILING_GUIDANCE = (
+    "Correct either the workspace ceiling or the session grant."
+)
+
+#: ``host_bash`` ranks on its own scale -- ``banned < ask < allow`` -- which is
+#: NOT the shared ``WORKSPACE_CEILING_LEVELS_RANKS`` table (``allow`` is absent
+#: there and ``ask`` means something else).  Mirrors the private map used
+#: inside :func:`apply_workspace_ceiling` so the strict-above test agrees with
+#: the capping the gate actually performed.
+_HOST_BASH_CEILING_RANKS: Dict[str, float] = {
+    "banned": 0.0,
+    "ask": 1.0,
+    "allow": 2.0,
+}
+
+
+def _ceiling_scale_rank(session_key: str, value: Any) -> Optional[float]:
+    """Rank a session *or* ceiling *value* on *session_key*'s ceiling scale.
+
+    Uses the SAME rank table the ceiling machinery uses
+    (``WORKSPACE_CEILING_LEVELS_RANKS`` for the generic scale; the private
+    ``banned < ask < allow`` scale for ``host_bash``; the boolean scale for
+    ``container``) so a "session is strictly above the ceiling" test agrees
+    with :func:`apply_workspace_ceiling`.  Returns ``None`` when the value is
+    not on the key's scale (rank undecidable).
+    """
+    if session_key == "host_bash":
+        if isinstance(value, bool):
+            return 2.0 if value else 0.0
+        label = str(value).lower()
+        if label == "true":
+            return 2.0
+        if label == "false":
+            return 0.0
+        return _HOST_BASH_CEILING_RANKS.get(label)
+    if isinstance(value, bool):
+        return 3.0 if value else 0.0
+    label = str(value).lower()
+    if label == "true":
+        return 3.0
+    if label == "false":
+        return 0.0
+    return _WORKSPACE_CEILING_LEVELS.get(label)
+
+
+def _ceiling_contradiction_for(
+    session_key: str, annotation: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Classify one ceiling annotation as a session-exceeds-ceiling case.
+
+    Returns the structured reason dict when the annotation's pre-ceiling
+    SESSION value ranks strictly ABOVE the annotation's ceiling level, else
+    ``None`` (equal / below / undecidable ranks are not a contradiction).
+    """
+    if not annotation:
+        return None
+    pre = annotation.get("pre")
+    level = annotation.get("level")
+    session_rank = _ceiling_scale_rank(session_key, pre)
+    ceiling_rank = _ceiling_scale_rank(session_key, level)
+    if session_rank is None or ceiling_rank is None:
+        return None
+    if session_rank <= ceiling_rank:
+        return None
+    return {
+        "resource": session_key,
+        "session_value": pre,
+        "workspace_value": level,
+        "reason": REASON_SESSION_EXCEEDS_WORKSPACE_CEILING,
+        "guidance": SESSION_EXCEEDS_WORKSPACE_CEILING_GUIDANCE,
+    }
+
+
+def _ceiling_annotations_of(effective: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the ceiling-annotation map carried by *effective*, or ``{}``."""
+    return getattr(effective, "_ceiling_annotations", None) or {}
+
+
+def ceiling_levels(effective: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``{resource: ceiling_level}`` for every resource the workspace
+    ceiling actually restricted (derived from the gate's ceiling provenance),
+    or ``{}`` when no ceiling applied.
+
+    Read-only: this only reads ``_ceiling_annotations``; it never changes how
+    the gate writes or interprets them.
+    """
+    return {
+        key: annotation.get("level")
+        for key, annotation in _ceiling_annotations_of(effective).items()
+        if isinstance(annotation, dict)
+    }
+
+
+def ceiling_contradictions(effective: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return one structured reason dict per resource whose session grant sits
+    strictly above its workspace ceiling (see
+    :data:`REASON_SESSION_EXCEEDS_WORKSPACE_CEILING`).
+
+    Each entry carries ``resource``, ``session_value`` (the pre-ceiling SESSION
+    grant), ``workspace_value`` (the ceiling level), ``reason`` (the canonical
+    code) and ``guidance`` (operator-facing corrective text).  Dependency-free
+    and first-class -- it reads the gate's ceiling provenance, not the human
+    message.  Empty list when there is no contradiction.
+    """
+    result: List[Dict[str, Any]] = []
+    for session_key, annotation in _ceiling_annotations_of(effective).items():
+        contradiction = _ceiling_contradiction_for(session_key, annotation)
+        if contradiction is not None:
+            result.append(contradiction)
+    return result
+
+
+def _session_exceeds_ceiling_message(
+    session_key: str, effective: Dict[str, Any]
+) -> str:
+    """Return the operator-approved contradiction sentence for *session_key*
+    when its SESSION grant sits strictly above the workspace ceiling, else ``""``.
+
+    The sentence names the SESSION's pre-ceiling value and the CEILING value --
+    never the capped/effective value -- so the denial no longer mislabels the
+    post-cap value as the session's own grant.
+    """
+    annotation = _ceiling_annotations_of(effective).get(session_key)
+    contradiction = _ceiling_contradiction_for(session_key, annotation)
+    if contradiction is None:
+        return ""
+    return (
+        f"Session permission for {contradiction['resource']} is "
+        f"{contradiction['session_value']}, but workspace ceiling is "
+        f"{contradiction['workspace_value']}. The session exceeds the ceiling. "
+        f"{contradiction['guidance']}"
+    )
+
+
 def get_effective_permissions(
     session: SessionPermissions,
     workspace: WorkspaceCapabilities,
@@ -751,14 +897,44 @@ def get_effective_permissions(
     # The annotated result is a plain-dict subclass whose content is
     # identical; when nothing changed (or there is no ceiling) the plain
     # dict is returned, so the common path is byte-for-byte unchanged.
+    result: Dict[str, Any] = effective
     if workspace_permissions and session is not base_session:
         base_eff = _merge_with_capabilities(base_session, workspace)
         annotated = _annotate_ceiling_changes(
             base_eff, effective, workspace_permissions
         )
         if annotated is not None:
-            return annotated
-    return effective
+            result = annotated
+
+    # ── Workspace host-resource ceiling (allow_host_resources) ───────────
+    # The workspace operator's top-level ``allow_host_resources`` policy is a
+    # hard, absolute gate on the ``host_bash`` resource: a missing key, an
+    # absent / null / false value, or a missing/unreadable workspace config
+    # denies host execution regardless of what the session grant or worker
+    # footprint says, while ANY truthy value enables it -- the reader returns
+    # ``bool(data.get("allow_host_resources", False))``, so e.g. the string
+    # "yes" or the number 1 also enable host resources.  See
+    # tools.host_resource_policy.workspace_allows_host_resources, the single
+    # source of truth for the exact type semantics.  It is enforced HERE, in
+    # the resolution layer, so every consumer of the effective dict sees the
+    # denial -- the in-tool check in tools/host_bash_tool.py is skipped
+    # whenever no workspace id is attached, and resolving it here closes that
+    # gap without duplicating policy.  The reader is fail-closed; any reader
+    # error therefore denies.  The override
+    # is applied AFTER the ceiling annotation so a host_bash ban is never
+    # misattributed to the workspace *permissions* ceiling.
+    try:
+        from tools.host_resource_policy import workspace_allows_host_resources
+
+        _workspace_allows_host_resources = workspace_allows_host_resources(
+            workspace_id
+        )
+    except Exception:
+        _workspace_allows_host_resources = False
+    if not _workspace_allows_host_resources:
+        result["host_bash"] = "banned"
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -920,11 +1096,21 @@ def check_requires_resource(
         description=description,
     )
     if not allowed:
+        ceiling_level = _ceiling_denial_note(permission, "read", effective_permissions)
+        contradiction = (
+            _session_exceeds_ceiling_message(permission, effective_permissions)
+            if ceiling_level
+            else ""
+        )
+        if contradiction:
+            # The session grant sits ABOVE the workspace ceiling: the ceiling
+            # (not the capped session value) denies the call, and the session
+            # profile itself is the inconsistency -- name both sides truthfully.
+            return (False, f"Permission denied: {contradiction}")
         message = (
             f"Permission denied: Tool requires resource '{requires_resource}' "
             f"(permission {permission}:read), but session does not allow it."
         )
-        ceiling_level = _ceiling_denial_note(permission, "read", effective_permissions)
         if ceiling_level:
             # The workspace permission ceiling is what blocks this call (the
             # session grant alone would allow it) — name it so the denial
@@ -1027,12 +1213,22 @@ def check_required_categories(
         result = _value_satisfies(required_value, allowed)
 
         if result is False:
+            ceiling_level = _ceiling_denial_note(
+                category, required_value, effective, permission_footprint
+            )
+            contradiction = (
+                _session_exceeds_ceiling_message(category, effective)
+                if ceiling_level
+                else ""
+            )
+            if contradiction:
+                # The session grant sits ABOVE the workspace ceiling: name the
+                # SESSION's pre-ceiling value and the CEILING value instead of
+                # mislabelling the capped value as the session's own grant.
+                return False, f"Permission denied: {contradiction}"
             message = (
                 f"Permission denied: Tool requires {category}:{required_value}, "
                 f"but session allows {category}:{allowed}"
-            )
-            ceiling_level = _ceiling_denial_note(
-                category, required_value, effective, permission_footprint
             )
             if ceiling_level:
                 # The workspace permission ceiling is what blocks this call

@@ -78,7 +78,14 @@ def _run_gate(required, effective, **kwargs):
 # 1. Full-grant levels execute without any prompt
 # ──────────────────────────────────────────────────────────────────────────
 class TestAllowLevelExecutesWithoutPrompt:
-    def test_host_bash_allow_grant_runs_without_prompt(self):
+    def test_host_bash_allow_grant_runs_without_prompt(self, monkeypatch):
+        # A host-resource-enabled workspace is assumed: the orthogonal
+        # allow_host_resources policy is stubbed True to isolate the
+        # allow/ceiling mechanics under test.
+        monkeypatch.setattr(
+            "tools.host_resource_policy.workspace_allows_host_resources",
+            lambda _ws: True,
+        )
         # No ceiling -> plain dict on the common path. The requirement is
         # 'host_bash:allow' (exact match: host_bash has no ranked ladder, so
         # the display spelling 'host_bash:execute' would never be satisfied
@@ -107,7 +114,13 @@ class TestAllowLevelExecutesWithoutPrompt:
 #    denies it as a prompt-gated requirement (never blocks silently).
 # ──────────────────────────────────────────────────────────────────────────
 class TestGenuineAskPreservedAndWorkerDenied:
-    def test_equal_ask_ceiling_passes_session_ask_through(self):
+    def test_equal_ask_ceiling_passes_session_ask_through(self, monkeypatch):
+        # Host-resource-enabled workspace assumed (stub the orthogonal
+        # allow_host_resources policy) to isolate the ceiling mechanics.
+        monkeypatch.setattr(
+            "tools.host_resource_policy.workspace_allows_host_resources",
+            lambda _ws: True,
+        )
         assert apply_workspace_ceiling(
             {"host_bash": "ask"}, {"host_bash": "ask"}
         ) == {"host_bash": "ask"}
@@ -122,7 +135,13 @@ class TestGenuineAskPreservedAndWorkerDenied:
         # _ceiling_annotations provenance to carry).
         assert type(eff) is dict
 
-    def test_ask_grant_in_worker_context_denies_without_blocking(self):
+    def test_ask_grant_in_worker_context_denies_without_blocking(self, monkeypatch):
+        # Host-resource-enabled workspace assumed (stub the orthogonal
+        # allow_host_resources policy) to isolate the worker-context ask path.
+        monkeypatch.setattr(
+            "tools.host_resource_policy.workspace_allows_host_resources",
+            lambda _ws: True,
+        )
         eff = get_effective_permissions(
             SessionPermissions(host_bash="ask"),
             _PERMISSIVE_CAPS,
@@ -157,7 +176,10 @@ class TestBannedCeilingDeniesWithoutPrompt:
 
         ok, msg = _run_gate(["host_bash:allow"], eff)
         assert ok is False
-        assert "but session allows host_bash:banned" in msg
+        assert (
+            "Session permission for host_bash is allow, but workspace ceiling "
+            "is banned." in msg
+        )
         # Hard denial — the ask/prompt branch must never be reached.
         assert "ask requires interactive" not in msg
 
@@ -199,7 +221,10 @@ class TestAskCeilingNeverFabricatesPrompt:
         ok, msg = _run_gate(["host_bash:allow"], eff)
         assert ok is False
         assert "ask requires interactive" not in msg
-        assert "but session allows host_bash:banned" in msg
+        assert (
+            "Session permission for host_bash is allow, but workspace ceiling "
+            "is ask." in msg
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -220,5 +245,8 @@ class TestCeilingDenialMessageCarriesSuffix:
 
         ok, msg = _run_gate(["network:write"], eff)
         assert ok is False
-        assert msg.endswith("(workspace ceiling: ask)")
+        assert (
+            "Session permission for network is write, but workspace ceiling "
+            "is ask." in msg
+        )
         assert json.loads(json.dumps(msg)) == msg  # JSON-safe string

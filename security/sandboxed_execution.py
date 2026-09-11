@@ -171,11 +171,25 @@ class SandboxedExecution:
             # Function-level import: security_gate imports tools, which in
             # turn import this module -- a top-level import would be a
             # circular dependency.
-            from security.security_gate import _ceiling_denial_note
+            from security.security_gate import (
+                _ceiling_denial_note,
+                _session_exceeds_ceiling_message,
+            )
 
             note = _ceiling_denial_note(
                 category, required_level, self.session_permissions
             )
+            if note:
+                # The session grant sits ABOVE the workspace ceiling: the
+                # ceiling -- not the session grant -- denies the call, and the
+                # session profile itself is the inconsistency.  Name both sides
+                # truthfully instead of mislabelling the capped value as the
+                # session's own grant.
+                contradiction = _session_exceeds_ceiling_message(
+                    category, self.session_permissions
+                )
+                if contradiction:
+                    raise PermissionError(f"Permission denied: {contradiction}")
             message = (
                 f"Permission denied: requires {required_category}, "
                 f"but session allows {category}:{allowed}"
