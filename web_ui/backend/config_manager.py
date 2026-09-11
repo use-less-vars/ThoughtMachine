@@ -159,12 +159,11 @@ CONFIG_LAYER_OWNERSHIP: Dict[str, str] = {
 def load_global_defaults() -> Dict[str, Any]:
     """Load global defaults from ``~/.thoughtmachine/user/defaults.json``.
 
-    Auto-creates the file with sensible defaults on first run.
+    Read-only: on-disk creation is owned by the manifest seeder
+    (ensure_user_defaults / drift backfill), so the 39-key fallback never lands on disk.
     """
     config_dir = Path.home() / ".thoughtmachine"
     config_path = config_dir / "user" / "defaults.json"
-
-    config_path.parent.mkdir(parents=True, exist_ok=True)
 
     if config_path.exists():
         try:
@@ -174,11 +173,7 @@ def load_global_defaults() -> Dict[str, Any]:
             log("ERROR", "server.config",
                 f"Could not parse {config_path}, using fallback")
             return dict(FALLBACK_FRONTEND_CONFIG)
-    else:
-        log("INFO", "server.config", f"Creating default config at {config_path}")
-        with open(config_path, "w") as f:
-            json.dump(FALLBACK_FRONTEND_CONFIG, f, indent=2)
-        return dict(FALLBACK_FRONTEND_CONFIG)
+    return dict(FALLBACK_FRONTEND_CONFIG)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
