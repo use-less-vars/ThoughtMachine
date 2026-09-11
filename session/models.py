@@ -17,6 +17,12 @@ from thoughtmachine.security import merge_security_config, get_default_security_
 from agent.logging import log
 from agent.core.message import Message
 
+# Sentinel attribute name marking that a Session instance has finished
+# __post_init__. Its ABSENCE means "still under construction": a plain-list wrap
+# performed during construction is expected and logged at DEBUG, whereas a live
+# (post-construction) wrap keeps the original WARNING.
+_SESSION_INITIALISED_FLAG = '_tm_session_initialised'
+
 class ObservableList(list):
     """A list that notifies a callback when mutated."""
 
@@ -163,7 +169,12 @@ class Session:
         # Intercept assignment to user_history to ensure it always stays ObservableList.
         if name == 'user_history':
             if not isinstance(value, ObservableList):
-                log('WARNING', 'core.history', f"Plain list assignment to user_history intercepted — auto-wrapped to ObservableList")
+                if getattr(self, _SESSION_INITIALISED_FLAG, False):
+                    # Live (post-construction) assignment: keep the original WARNING.
+                    log('WARNING', 'core.history', f"Plain list assignment to user_history intercepted — auto-wrapped to ObservableList")
+                else:
+                    # Construction-time wrap is expected: log at DEBUG (original text kept for greps).
+                    log('DEBUG', 'core.history', f"Construction-time plain list assignment to user_history intercepted — auto-wrapped to ObservableList")
                 # Wrap plain list back into ObservableList, preserving callback.
                 new_list = ObservableList(list(value), callback=self._on_conversation_changed)
                 object.__setattr__(self, name, new_list)
@@ -184,6 +195,7 @@ class Session:
         # total_input_tokens + total_output_tokens is the cumulative total,
         # NOT the current conversation's context length, so do NOT use it as fallback.
         self._wrap_user_history()
+        object.__setattr__(self, _SESSION_INITIALISED_FLAG, True)
         self.ensure_name()
         try:
             conv_str = self._normalize_conversation_for_hash(self.user_history)

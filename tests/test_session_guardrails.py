@@ -81,3 +81,67 @@ class TestSessionUserHistoryGuardrail:
         assert session.user_history.callback.__self__ is session, (
             "Callback should be bound to the same session instance"
         )
+
+
+class TestSessionConstructionAwareGuard:
+    """The user_history guard must distinguish construction-time wraps from live ones.
+
+    Construction-time plain-list wraps are expected and logged at DEBUG; only a
+    post-construction (live) plain-list assignment keeps the WARNING.
+    """
+
+    @staticmethod
+    def _recording_log(records):
+        """Build a stand-in for session.models.log that records (level, tag, message)."""
+        def _record(level, tag, message, *args, **kwargs):
+            records.append((level, tag, message))
+        return _record
+
+    def _core_history_warnings(self, records):
+        return [r for r in records if r[0] == "WARNING" and r[1] == "core.history"]
+
+    def test_construction_default_is_silent(self, monkeypatch):
+        """Constructing Session() with the default list logs no WARNING."""
+        records = []
+        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        session = Session()
+        assert self._core_history_warnings(records) == []
+        assert isinstance(session.user_history, ObservableList)
+        assert list(session.user_history) == []
+
+    def test_construction_with_plain_list_is_silent(self, monkeypatch):
+        """Passing a plain list to the constructor logs no WARNING."""
+        records = []
+        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        plain = [{"role": "user", "content": "hello"}]
+        session = Session(user_history=plain)
+        assert self._core_history_warnings(records) == []
+        assert isinstance(session.user_history, ObservableList)
+        assert list(session.user_history) == plain
+
+    def test_from_persistable_dict_plain_list_is_silent(self, monkeypatch):
+        """Reconstruction via from_persistable_dict (plain list) logs no WARNING."""
+        records = []
+        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        data = Session().to_persistable_dict()
+        data["user_history"] = [{"role": "user", "content": "hello"}]
+        session = Session.from_persistable_dict(data)
+        assert self._core_history_warnings(records) == []
+        assert isinstance(session.user_history, ObservableList)
+        assert len(session.user_history) == 1
+        assert session.user_history[0]["content"] == "hello"
+
+    def test_live_plain_list_assignment_still_warns(self, monkeypatch):
+        """A post-construction plain-list assignment logs exactly one WARNING."""
+        session = Session()
+        records = []
+        monkeypatch.setattr("session.models.log", self._recording_log(records))
+        payload = [{"role": "user", "content": "hello"}]
+        session.user_history = payload
+        warnings = self._core_history_warnings(records)
+        assert len(warnings) == 1, f"Expected exactly one WARNING, got {warnings}"
+        assert "Plain list assignment to user_history intercepted" in warnings[0][2]
+        assert isinstance(session.user_history, ObservableList)
+        assert list(session.user_history) == payload
+        assert session.user_history.callback is not None
+        assert session.user_history.callback.__self__ is session
