@@ -8,7 +8,10 @@ host-side git fallback).  This module exposes the single reader for that policy 
 semantics stay in one place.
 
 Reads are fail-closed: a missing workspace id, missing file, malformed JSON or a
-non-dict body all report ``False``.
+non-dict body all report ``False``.  The gate is also strict: only the JSON
+boolean ``true`` enables host resources -- every other present value (e.g. the
+strings ``"true"``/``"yes"``/``"false"``, the numbers ``1``/``0``, ``null``)
+reports ``False``.
 """
 
 from __future__ import annotations
@@ -22,6 +25,10 @@ def workspace_allows_host_resources(workspace_id: Optional[str]) -> bool:
     Reads the top-level ``allow_host_resources`` key of
     ``<vault_root>/workspaces/<workspace_id>/config.json``. Fail-closed on any
     lookup error (missing workspace id, missing file, invalid JSON, non-dict).
+
+    Only the JSON boolean ``true`` enables host resources. Any other present
+    value -- including the strings ``"true"``/``"yes"``/``"false"``, the
+    numbers ``1``/``0`` and ``null`` -- reports ``False`` (an absent key too).
     """
     if not workspace_id:
         return False
@@ -37,4 +44,4 @@ def workspace_allows_host_resources(workspace_id: Optional[str]) -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    return bool(data.get("allow_host_resources", False))
+    return data.get("allow_host_resources") is True
