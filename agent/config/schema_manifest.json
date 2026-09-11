@@ -346,7 +346,11 @@
         "base_url": "https://api.deepseek.com/v1/",
         "temperature": 1.0,
         "max_turns": 200,
-        "system_prompt": ""
+        "system_prompt": "",
+        "provider_type": "openai_compatible",
+        "provider_config": {},
+        "model_override": "",
+        "stop_check": false
       },
       "root_type": "dict",
       "fields": {
