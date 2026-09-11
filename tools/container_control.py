@@ -6,6 +6,7 @@ These tools expose a persistent, composable container lifecycle to the agent:
 - ``ContainerStartTool``   - start (or reuse) a container for the session
 - ``ContainerExecTool``    - run a shell command inside an existing container
 - ``ContainerStopTool``    - stop a container (idempotent)
+- ``ContainerRemoveTool``  - remove a container (stop + delete; idempotent)
 - ``ContainerStatusTool``  - report a container's status
 - ``ContainerListTool``    - list this session's containers
 - ``ContainerBuildTool``   - build a Docker image from the host workspace
@@ -578,6 +579,57 @@ class ContainerLogsTool(_ContainerControlBase):
             return self._respond(
                 True,
                 **result,
+                duration=time.time() - start_time,
+            )
+        except RuntimeError as e:
+            return self._respond(False, error=str(e), duration=time.time() - start_time)
+        except Exception as e:
+            return self._respond(
+                False,
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+
+
+
+
+class ContainerRemoveTool(_ContainerControlBase):
+    """Remove a container started by ContainerStartTool.
+
+    Stops the container (best-effort) and then deletes it with ``force=True``.
+    Idempotent: removing an already-removed (or never-created) container reports
+    status "removed". This tool never raises — failures are returned in the JSON
+    response.
+
+    Returns JSON with structure:
+    {
+      "success": bool,
+      "container_id": str,
+      "status": "removed" | "error",
+      "name": str (optional),
+      "error": str (optional),
+      "duration": float
+    }
+    """
+    tool: Literal["ContainerRemoveTool"] = "ContainerRemoveTool"
+
+    container_id: str = Field(
+        ...,
+        min_length=1,
+        description="ID or name of the container to remove (returned by ContainerStartTool)."
+    )
+
+    def execute(self) -> str:
+        start_time = time.time()
+        try:
+            manager = self._make_manager()
+            result = manager.remove(self.container_id)
+            return self._respond(
+                result.get("status") == "removed",
+                container_id=self.container_id,
+                status=result.get("status"),
+                name=result.get("name"),
+                error=result.get("error"),
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
