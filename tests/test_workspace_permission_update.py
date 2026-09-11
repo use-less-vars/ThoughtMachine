@@ -23,8 +23,14 @@ from web_ui.backend import workspace_routes
 
 
 def _use_tmp_workspace(monkeypatch, tmp_path):
-    """Point workspace_routes at the pytest tmp_path."""
-    monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path)
+    """Point the vault root at the pytest tmp_path (canonical seam).
+
+    The SSOT config reader (``tools.host_resource_policy.load_workspace_config``)
+    and the routes' writer (_workspace_dir) both resolve
+    ``<vault_root>/workspaces/<id>/config.json``, so a single
+    ``THOUGHTMACHINE_VAULT_ROOT`` override keeps them in agreement.
+    """
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
     monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
 
 
@@ -34,7 +40,11 @@ def _write_json(path, data):
 
 
 def _read_config(tmp_path):
-    return json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    return json.loads(
+        (tmp_path / "workspaces" / "ws-1" / "config.json").read_text(
+            encoding="utf-8"
+        )
+    )
 
 
 def _put(ws_id, permissions, allow_host_resources=None):
@@ -62,15 +72,11 @@ def _patch_registry(monkeypatch, ws_id="ws-1"):
 def _patch_summary_deps(monkeypatch, tmp_path):
     """Patch every external dependency the summary touches onto tmp_path /
     fakes so the payload is fully deterministic.  The permission ceiling is
-    left REAL (config_manager reads ``_workspace_dir`` from
-    thoughtmachine.workspace_capabilities at call time, so redirecting that
-    one attribute makes it read tmp_path/config.json)."""
-    monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path)
+    left REAL: both the SSOT config reader and config_manager's
+    ``_workspace_dir`` resolve ``<vault_root>/workspaces/<id>/config.json``,
+    so overriding the vault root is enough."""
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
     monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
-
-    import thoughtmachine.workspace_capabilities as wcap
-
-    monkeypatch.setattr(wcap, "_workspace_dir", lambda ws_id: tmp_path)
 
     # Capability loader returns None -> fully-permissive default.
     monkeypatch.setattr(workspace_routes, "load_workspace_capabilities",
@@ -105,7 +111,7 @@ def test_update_workspace_permissions_persists_and_reflects_in_summary(
     """A valid update merges into config.json (other keys preserved) and the
     saved map becomes the permission ceiling reported by the summary."""
     _use_tmp_workspace(monkeypatch, tmp_path)
-    _write_json(tmp_path / "config.json", {
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {
         "purpose": "general",
         "capabilities": {"fs": True, "net": False},
         "domain_allowlist": ["example.com"],
@@ -135,7 +141,7 @@ def test_update_workspace_permissions_rejects_unknown_resource(
         tmp_path, monkeypatch):
     """An unknown resource name is a 422 and nothing is persisted."""
     _use_tmp_workspace(monkeypatch, tmp_path)
-    _write_json(tmp_path / "config.json", {"purpose": "general"})
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {"purpose": "general"})
 
     with pytest.raises(HTTPException) as exc:
         _put("ws-1", {"nonexistent_resource": "read"})
@@ -151,7 +157,7 @@ def test_workspace_permissions_survive_restart(tmp_path, monkeypatch):
     config read, the GET route, and the permission-ceiling loader used by
     config resolution — no in-memory state is required."""
     _use_tmp_workspace(monkeypatch, tmp_path)
-    _write_json(tmp_path / "config.json", {"purpose": "general"})
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {"purpose": "general"})
 
     saved = {"git": "write", "filesystem": "ask", "network": "banned"}
     result = _put("ws-1", saved)
@@ -167,10 +173,8 @@ def test_workspace_permissions_survive_restart(tmp_path, monkeypatch):
     assert got["allow_host_resources"] is False
 
     # The saved map is the ceiling config resolution applies to sessions.
-    import thoughtmachine.workspace_capabilities as wcap
     from web_ui.backend import config_manager as cm
 
-    monkeypatch.setattr(wcap, "_workspace_dir", lambda ws_id: tmp_path)
     assert cm._load_workspace_permission_ceiling("ws-1") == saved
 
 
@@ -178,7 +182,7 @@ def test_update_workspace_permissions_rejects_invalid_level(tmp_path, monkeypatc
     """An invalid permission level for a known resource is a 422 and nothing
     is persisted."""
     _use_tmp_workspace(monkeypatch, tmp_path)
-    _write_json(tmp_path / "config.json", {"purpose": "general"})
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {"purpose": "general"})
 
     with pytest.raises(HTTPException) as exc:
         _put("ws-1", {"git": "superuser"})

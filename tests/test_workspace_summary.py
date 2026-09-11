@@ -45,11 +45,12 @@ def _patch_registry(monkeypatch, ws_id="ws-1"):
 def _patch_summary_deps(monkeypatch, tmp_path):
     """Patch every external dependency the summary touches onto tmp_path /
     fakes so the payload is fully deterministic."""
-    monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path)
+    # Canonical seam: point the vault root at tmp_path so the SSOT config
+    # reader and ``_workspace_dir`` agree on ``<vault_root>/workspaces/<id>``.
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
     monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
 
     import web_ui.backend.config_manager as config_manager
-
     monkeypatch.setattr(
         config_manager,
         "_load_workspace_permission_ceiling",
@@ -119,10 +120,11 @@ def test_summary_full_payload(tmp_path, monkeypatch):
     _patch_registry(monkeypatch)
     _patch_summary_deps(monkeypatch, tmp_path)
 
-    _write_json(tmp_path / "config.json",
+    ws_dir = tmp_path / "workspaces" / "ws-1"
+    _write_json(ws_dir / "config.json",
                 {"purpose": "general", "allow_host_resources": True})
-    (tmp_path / "Dockerfile").write_text("FROM x\n", encoding="utf-8")
-    _write_json(tmp_path / "workers.json",
+    (ws_dir / "Dockerfile").write_text("FROM x\n", encoding="utf-8")
+    _write_json(ws_dir / "workers.json",
                 [{"name": "w1", "system_prompt": "p1"}])
 
     result = asyncio.run(workspace_routes.get_workspace_overview("ws-1"))
@@ -141,7 +143,7 @@ def test_summary_full_payload(tmp_path, monkeypatch):
     assert result["permissions"] == {"fs_read": "read", "fs_write": "write"}
     assert result["capabilities"] == WorkspaceCapabilities.default().to_dict()
     assert result["dockerfile"] == {
-        "path": str(tmp_path / "Dockerfile"),
+        "path": str(tmp_path / "workspaces" / "ws-1" / "Dockerfile"),
         "content": "FROM x\n",
     }
     assert result["worker_templates"] == [{"name": "w1", "system_prompt": "p1"}]
@@ -197,7 +199,8 @@ def test_summary_missing_assets_and_empty_sections(tmp_path, monkeypatch):
 
     assert result["allow_host_resources"] is False
     assert result["dockerfile"] == {
-        "path": str(tmp_path / "Dockerfile"), "content": None,
+        "path": str(tmp_path / "workspaces" / "ws-1" / "Dockerfile"),
+        "content": None,
     }
     assert result["worker_templates"] == []
     assert result["active_workers"] == []

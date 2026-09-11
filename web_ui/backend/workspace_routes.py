@@ -42,6 +42,8 @@ from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
 _worker_registry = _WorkerRegistry.get_instance()._worker_registry
 _registry_lock = _WorkerRegistry.get_instance()._registry_lock
 
+from tools.host_resource_policy import load_workspace_config
+
 from agent.models.worker_definition import WorkerDefinition
 
 # Module-level reference for monkeypatchability in tests; the import is
@@ -1401,16 +1403,7 @@ class WorkspaceCreateBody(BaseModel):
 
 def _load_workspace_config(ws_id: str) -> Dict[str, Any]:
     """Load vault ``workspaces/<id>/config.json`` (``{}`` if missing/unparsable)."""
-    cfg_path = _workspace_dir(ws_id) / "config.json"
-    if not cfg_path.exists():
-        return {}
-    try:
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+    return load_workspace_config(ws_id)
 
 
 def _save_workspace_config(ws_id: str, data: Dict[str, Any]) -> None:

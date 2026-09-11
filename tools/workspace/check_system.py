@@ -30,6 +30,7 @@ from typing import Any, ClassVar, Dict, List, Optional
 from pydantic import Field
 
 from tools.base import ToolBase
+from tools.host_resource_policy import load_workspace_config
 
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 
@@ -492,22 +493,15 @@ class CheckSystem(ToolBase):
         if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
             ws_dir = _workspace_dir(ws_id)
 
-            # Load config.json
-            config_path = ws_dir / "config.json"
-            if config_path.exists():
-                try:
-                    config_data = json.loads(config_path.read_text(encoding="utf-8"))
-                    capabilities = config_data.get("capabilities", {})
-                    domain_allowlist = config_data.get("domain_allowlist", [])
-                    purpose = config_data.get("purpose")
-                    saved_permissions = config_data.get("permissions")
-                    if isinstance(saved_permissions, dict):
-                        permissions = saved_permissions
-                    allow_host_resources = bool(
-                        config_data.get("allow_host_resources", False)
-                    )
-                except (json.JSONDecodeError, OSError):
-                    pass
+            # Load config.json (single source of truth for the read)
+            config_data = load_workspace_config(ws_id)
+            capabilities = config_data.get("capabilities", {})
+            domain_allowlist = config_data.get("domain_allowlist", [])
+            purpose = config_data.get("purpose")
+            saved_permissions = config_data.get("permissions")
+            if isinstance(saved_permissions, dict):
+                permissions = saved_permissions
+            allow_host_resources = config_data.get("allow_host_resources") is True
 
             # Load workers.json
             workers_path = ws_dir / "workers.json"
