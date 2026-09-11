@@ -183,7 +183,7 @@
         "session_permissions": {
           "type": "dict",
           "required": false,
-          "description": "Session permission profile (container, network, filesystem, system, git, execution)."
+          "description": "Session permission profile (container, network, filesystem, git, mcp, host_bash)."
         },
         "enabled_tools": {
           "type": "list",
