@@ -43,9 +43,24 @@ _PURGE_PREFIXES = (
 
 
 def _purge_modules() -> None:
-    """Drop every app module so the next import is a cold start."""
+    """Drop every app module so the next import is a cold start.
+
+    Deleting a submodule from ``sys.modules`` alone leaves a stale attribute on
+    its parent package: ``from package import submodule`` keeps binding that
+    stale object, so a later ``importlib.reload(<stale submodule>)`` raises
+    ``ImportError: module <submodule> not in sys.modules``.  Drop the parent
+    package attribute too so the next ``import`` re-imports the submodule
+    cleanly.
+    """
     for name in [m for m in sys.modules if m.startswith(_PURGE_PREFIXES)]:
         del sys.modules[name]
+        parent_name, _, leaf = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and leaf:
+            try:
+                delattr(parent, leaf)
+            except AttributeError:
+                pass
 
 
 def _snapshot_provider_registry():
