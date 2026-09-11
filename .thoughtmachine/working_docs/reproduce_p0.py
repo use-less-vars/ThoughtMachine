@@ -106,7 +106,7 @@ def assert_p0_name(name):
 
 def make_manager(session_id, workspace_id, sp, **kw):
     from infra.container_manager import ContainerManager
-    kw.setdefault("vault_root", P0_VAULT)
+    kw.setdefault("vault_root", P0_SCRATCH if REAL_MODE else P0_VAULT)
     kw.setdefault("image", P0_IMAGE)
     return ContainerManager(
         workspace_path=REPO_ROOT,
@@ -158,6 +158,12 @@ def real_vault_readonly():
 
     Guarantees NOTHING is written under the real vault root.
     """
+    if not REAL_MODE:
+        # Scratch mode: the "real" root would resolve to the throwaway
+        # /tmp/tm-p0-vault, so the containment assertion below would wrongly
+        # fire, and there is no real-vault write to guard against. No-op.
+        yield None
+        return
     real_root = _real_vault_root()
     # Rooted at P0_SCRATCH (always throwaway), NEVER at P0_VAULT: in REAL_MODE
     # P0_VAULT *is* the real vault, so deriving scratch from it would create and
@@ -190,9 +196,30 @@ def real_vault_readonly():
         if hasattr(mod, "get_log_root"):
             patched.append((mod, mod.get_log_root))
             mod.get_log_root = (lambda _s: (lambda *a, **k: pathlib.Path(_s)))(scratch)
+    # Fail-loud write barrier on the KNOWN real-vault write vectors: any attempt
+    # to persist under a vault_root that resolves inside the real root raises.
+    from infra.container_manager import ContainerManager
+    orig_save_notes = ContainerManager._save_container_notes
+    orig_save_config = ContainerManager._save_workspace_config
+
+    def _barrier(orig):
+        def _guard(self, *a, **k):
+            target = pathlib.Path(str(self.vault_root)).expanduser().resolve()
+            if target == real_root_path or real_root_path in target.parents:
+                raise RuntimeError(
+                    "SAFETY VIOLATION: write attempted under the real vault %s"
+                    % target
+                )
+            return orig(self, *a, **k)
+        return _guard
+
+    ContainerManager._save_container_notes = _barrier(orig_save_notes)
+    ContainerManager._save_workspace_config = _barrier(orig_save_config)
     try:
         yield real_root
     finally:
+        ContainerManager._save_container_notes = orig_save_notes
+        ContainerManager._save_workspace_config = orig_save_config
         for mod, orig in patched:
             mod.get_log_root = orig
         if prev_env is None:
@@ -727,7 +754,8 @@ def main():
     image_ok = image_available(client, P0_IMAGE)
     section_gate_view(client)
     try:
-        section0d_real_workspace()
+        with real_vault_readonly():
+            section0d_real_workspace()
     except Exception:
         print(traceback.format_exc())
     try:
