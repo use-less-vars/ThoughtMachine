@@ -31,9 +31,7 @@
     "container": true,
     "network": true,
     "filesystem": "write",
-    "system": "read",
-    "git": "read",
-    "execution": "banned"
+    "git": "read"
   },
   "rag_enabled": false,
   "rag_embedding_model": "BAAI/bge-small-en-v1.5",

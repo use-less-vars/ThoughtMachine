@@ -183,7 +183,7 @@
         "session_permissions": {
           "type": "dict",
           "required": false,
-          "description": "Session permission profile (container, network, filesystem, system, git, execution)."
+          "description": "Session permission profile (container, network, filesystem, git, mcp, host_bash)."
         },
         "enabled_tools": {
           "type": "list",
@@ -228,6 +228,111 @@
           "required": false,
           "min": 0,
           "description": "Token count threshold for critical state."
+        },
+        "max_workers_per_session": {
+          "type": "int",
+          "required": false,
+          "description": "Maximum concurrent workers per session."
+        },
+        "worker_timeout_seconds": {
+          "type": "int",
+          "required": false,
+          "description": "Timeout (seconds) for a single worker run."
+        },
+        "worker_max_retries": {
+          "type": "int",
+          "required": false,
+          "description": "Maximum retries for a failed worker task."
+        },
+        "turn_monitor_enabled": {
+          "type": "bool",
+          "required": false,
+          "description": "Enable the per-turn token monitor."
+        },
+        "agent_soft_budget_seconds": {
+          "type": "int",
+          "required": false,
+          "description": "Soft wall-clock budget (seconds) for an agent turn."
+        },
+        "enable_logging": {
+          "type": "bool",
+          "required": false,
+          "description": "Enable agent logging."
+        },
+        "log_dir": {
+          "type": "string",
+          "required": false,
+          "description": "Directory for log files."
+        },
+        "log_level": {
+          "type": "string",
+          "required": false,
+          "description": "Logging level (e.g. INFO, DEBUG)."
+        },
+        "enable_file_logging": {
+          "type": "bool",
+          "required": false,
+          "description": "Enable logging to files."
+        },
+        "jsonl_format": {
+          "type": "bool",
+          "required": false,
+          "description": "Emit logs in JSON Lines format."
+        },
+        "log_categories": {
+          "type": "list",
+          "required": false,
+          "description": "Log categories to enable (e.g. SESSION, LLM, TOOLS)."
+        },
+        "max_file_size_mb": {
+          "type": "int",
+          "required": false,
+          "description": "Maximum log file size (MB) before rotation."
+        },
+        "max_backup_files": {
+          "type": "int",
+          "required": false,
+          "description": "Maximum number of rotated log backups to retain."
+        },
+        "rag_enabled": {
+          "type": "bool",
+          "required": false,
+          "description": "Enable retrieval-augmented generation."
+        },
+        "rag_embedding_model": {
+          "type": "string",
+          "required": false,
+          "description": "Embedding model used for RAG."
+        },
+        "rag_chunk_size": {
+          "type": "int",
+          "required": false,
+          "description": "RAG chunk size in characters."
+        },
+        "rag_chunk_overlap": {
+          "type": "int",
+          "required": false,
+          "description": "RAG chunk overlap in characters."
+        },
+        "rag_batch_size": {
+          "type": "int",
+          "required": false,
+          "description": "RAG embedding batch size."
+        },
+        "rag_truncate_dim": {
+          "type": "int",
+          "required": false,
+          "description": "Dimensionality to truncate RAG embeddings to."
+        },
+        "kb_enabled": {
+          "type": "bool",
+          "required": false,
+          "description": "Enable the knowledge base."
+        },
+        "detail": {
+          "type": "string",
+          "required": false,
+          "description": "Response detail level (e.g. normal)."
         }
       }
     },
@@ -241,7 +346,11 @@
         "base_url": "https://api.deepseek.com/v1/",
         "temperature": 1.0,
         "max_turns": 200,
-        "system_prompt": ""
+        "system_prompt": "",
+        "provider_type": "openai_compatible",
+        "provider_config": {},
+        "model_override": "",
+        "stop_check": false
       },
       "root_type": "dict",
       "fields": {
@@ -299,14 +408,14 @@
         "model_override": {
           "type": "string",
           "required": false,
-          "default": null,
-          "description": "Model name override (null = use provider default)."
+          "default": "",
+          "description": "Model name override (null or empty = use provider default)."
         },
         "stop_check": {
           "type": "bool",
           "required": false,
-          "default": null,
-          "description": "Whether to stop after first response (null = unset)."
+          "default": false,
+          "description": "Whether to stop after first response (null or false = unset)."
         }
       }
     },

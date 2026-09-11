@@ -56,9 +56,11 @@ VAULT_SUBDIRS: tuple[str, ...] = (
 def ensure_vault_structure() -> list[str]:
     """Create the vault compartment structure under ``~/.thoughtmachine/``.
 
-    Each subdirectory is created only if it does not already exist
-    (idempotent).  Newly created directories get permissions ``0o700``
-    (owner-only access).
+    The vault root itself is created (with permissions ``0o700``) when it is
+    missing; each subdirectory is likewise created only if it does not already
+    exist (idempotent).  Newly created directories get permissions ``0o700``
+    (owner-only access).  An existing vault is left exactly as it is -- never
+    widened or narrowed.
 
     Returns:
         A list of absolute paths to directories that were **created**
@@ -66,6 +68,16 @@ def ensure_vault_structure() -> list[str]:
     """
     root = vault_root()
     created: list[str] = []
+
+    # Create the vault root itself first so its own permissions are
+    # owner-only. ``mode=0o700`` only applies to directories mkdir actually
+    # creates and can be masked by the process umask, so an explicit chmod is
+    # applied as well -- but ONLY when this call created the root (an existing
+    # vault is never re-chmod'd, i.e. never widened or narrowed).
+    if not root.exists():
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        created.append(str(root))
 
     for subdir in VAULT_SUBDIRS:
         target = root / subdir
@@ -111,6 +123,37 @@ def _write_file(
         created.append(str(dst))
 
 
+def _seed_manifest_safe_default(
+    resources_dir: Path,
+    relpath: str,
+    root: Path,
+    overwrite_existing: bool,
+    created: list[str],
+) -> None:
+    """Write *relpath* from the schema manifest's own ``safe_default``.
+
+    Used for manifest-declared default files that have no bundled resource
+    file (e.g. ``vault_version.json``, ``user/defaults.json``): the
+    ``safe_default`` in ``agent/config/schema_manifest.json`` stays the single
+    source of truth for their contents.  Fails soft -- a missing/unreadable
+    manifest, or an absent entry/``safe_default``, is a quiet no-op so the
+    bootstrap can never break on it.
+    """
+    try:
+        manifest_path = (
+            resources_dir.parent / "agent" / "config" / "schema_manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        spec = (manifest.get("files") or {}).get(relpath) or {}
+        safe_default = spec.get("safe_default")
+        if not isinstance(safe_default, dict):
+            return
+        content = json.dumps(safe_default, indent=2) + "\n"
+    except Exception:  # pragma: no cover - fail soft by design
+        return
+    _write_file(content, root / relpath, overwrite_existing, created)
+
+
 def ensure_vault_defaults(
     resources_dir: Path,
     overwrite_existing: bool = False,
@@ -126,8 +169,8 @@ def ensure_vault_defaults(
     * ``system/default_system_prompt.txt``      — from ``resources/default_system_prompt.txt``
     * ``system/engineer_system_prompt.txt``     — from ``resources/engineer_system_prompt.txt``
     * ``system/.vault_version``                 — from ``get_version()``
-    * ``state/session_registry.json``           — written as ``[]``
-    * ``state/workspace_registry.json``         — written as ``[]``
+    * ``state/session_registry.json``           — written as ``{}``
+    * ``state/workspace_registry.json``         — written as ``{}``
 
     Args:
         resources_dir: Absolute path to the project-level ``resources/``
@@ -190,14 +233,24 @@ def ensure_vault_defaults(
 
     # 8–9. Write empty state registry files
     _write_file(
-        "[]\n",
+        "{}\n",
         root / "state" / "session_registry.json",
         overwrite_existing, created,
     )
     _write_file(
-        "[]\n",
+        "{}\n",
         root / "state" / "workspace_registry.json",
         overwrite_existing, created,
+    )
+
+    # 10–11. Manifest-declared default files that have no bundled resource
+    # file; seed them from the manifest's own safe_default (single source of
+    # truth for their contents).
+    _seed_manifest_safe_default(
+        resources_dir, "vault_version.json", root, overwrite_existing, created,
+    )
+    _seed_manifest_safe_default(
+        resources_dir, "user/defaults.json", root, overwrite_existing, created,
     )
 
     return created
