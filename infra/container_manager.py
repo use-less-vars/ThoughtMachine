@@ -501,7 +501,10 @@ class ContainerManager:
         # reuse path can honour a newly-granted network/workspace mode instead
         # of silently reusing a drifted container.
         want_network, want_workspace = self._compute_config(
-            self.workspace_path, self.workspace_id, self.session_permissions
+            self.workspace_path,
+            self.workspace_id,
+            self.session_permissions,
+            lifecycle_class,
         )
         containers = self.list_containers()
         for entry in containers:
@@ -574,7 +577,10 @@ class ContainerManager:
 
         # ── Desired isolation from session permissions (all paths) ─────────
         network_mode, workspace_mode = self._compute_config(
-            self.workspace_path, self.workspace_id, self.session_permissions
+            self.workspace_path,
+            self.workspace_id,
+            self.session_permissions,
+            lifecycle_class,
         )
         _audit("CONTAINER_CONFIG",
                f"name={name} network={network_mode} workspace={workspace_mode} "
@@ -1725,22 +1731,37 @@ class ContainerManager:
             and bool(workspace_rw) == expected_rw
         )
 
-    def _compute_config(self, workspace_path, workspace_id, session_permissions):
+    def _compute_config(
+        self,
+        workspace_path,
+        workspace_id,
+        session_permissions,
+        lifecycle_class=LIFECYCLE_PERSISTENT,
+    ):
         """Desired (network_mode, workspace_mode) from the security-gate SSOT.
 
-        Routes through ``security.security_gate.get_expected_container_config``
-        - the canonical container-config resolver - instead of the fail-closed
-        ``docker_executor._compute_container_config_from_permissions`` helper,
-        which returned ``none``/``ro`` for a workspace with no capabilities.json
-        (ignoring an explicitly granted ``outbound`` network). Fail-closed to
-        ``("none", "ro")`` only if the SSOT is unavailable or raises.
+        Routes through ``security.security_gate.resolve_container_config`` -
+        the canonical, pure container-config resolver - merging the session
+        permissions with the workspace's (fail-closed) capabilities. Fail-closed
+        to ``("none", "ro")`` only if the SSOT is unavailable, raises, or
+        reports a ``ContainerConfigError``.
         """
         try:
-            from security.security_gate import get_expected_container_config
-            cfg = get_expected_container_config(session_permissions or {})
+            from security.security_gate import (
+                ContainerConfig,
+                get_workspace_capabilities,
+                resolve_container_config,
+            )
+
+            capabilities = get_workspace_capabilities(workspace_id)
+            cfg = resolve_container_config(
+                session_permissions or {}, capabilities, lifecycle_class
+            )
         except Exception:
             return "none", "ro"
-        return cfg["network_mode"], cfg["workspace_mode"]
+        if not isinstance(cfg, ContainerConfig):
+            return "none", "ro"
+        return cfg.network_mode, cfg.workspace_mode
 
     def _remove_container(self, container):
         """Stop and remove a container; best-effort, NEVER raises."""

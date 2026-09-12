@@ -840,12 +840,34 @@ class GitReadTool(ToolBase):
                     None,
                 )
             try:
-                from security.security_gate import get_expected_container_config
-
-                expected = get_expected_container_config(
-                    self.session_permissions or {}, None
+                from security.security_gate import (
+                    ContainerConfig,
+                    get_workspace_capabilities,
+                    resolve_container_config,
                 )
-                network_mode = expected.get("network_mode", "none")
+                from thoughtmachine.container_record import LIFECYCLE_RESOURCE
+
+                # Never fabricate a "default" workspace id (loading caps for a
+                # made-up workspace is misleading).  With no real id we pass
+                # ``capabilities=None`` so the resolver returns
+                # ``ContainerConfigError("capabilities_required")`` and the
+                # ``network_mode`` below stays the locked-down "none".
+                workspace_id = (
+                    self._resolved_workspace_id or self.workspace_id or None
+                )
+                capabilities = (
+                    get_workspace_capabilities(workspace_id)
+                    if workspace_id is not None
+                    else None
+                )
+                expected = resolve_container_config(
+                    self.session_permissions or {}, capabilities, LIFECYCLE_RESOURCE
+                )
+                network_mode = (
+                    expected.network_mode
+                    if isinstance(expected, ContainerConfig)
+                    else "none"
+                )
             except Exception:
                 network_mode = "none"
 

@@ -31,7 +31,7 @@ Security model
 - No docker socket: ``/var/run/docker.sock`` is never mounted, so a
   compromised hook cannot reach the daemon (verified by the sandbox test).
 - Network: disabled by default (``network_mode='none'``). The caller may
-  resolve a graded mode via ``security_gate.get_expected_container_config``;
+  resolve a graded mode via ``security_gate.resolve_container_config``;
   anything other than an explicit grant must stay ``'none'``.
 - Hardening: identical to ``ContainerManager.start`` /
   ``docker_executor.DockerExecutor._ensure_container`` — ``cap_drop=["ALL"]``,
@@ -846,7 +846,7 @@ class ResourceContainerManager:
         workspace_path: Host path bind-mounted (rw) at ``/workspace``.
         network_mode: Docker network mode for the container ('none' default).
             The caller should resolve this from
-            ``security_gate.get_expected_container_config``; anything other
+            ``security_gate.resolve_container_config``; anything other
             than an explicit grant must stay 'none'.
         image: Image to run. Default 'tm-resource-git' — the git resource
             overlay image, auto-built in two stages from the VAULT's pinned
@@ -873,7 +873,7 @@ class ResourceContainerManager:
             under (registry bookkeeping only).
         session_permissions: Optional session/workspace permissions dict.
             When supplied, ``ensure_resource`` consults
-            ``security_gate.get_expected_container_config`` and reports the
+            ``security_gate.resolve_container_config`` and reports the
             resource as 'unavailable' when the effective container grant is
             False (hard deny). When None, the caller gates container usage
             itself (mirror of ``network_mode`` gating).
@@ -1531,14 +1531,25 @@ def _container_policy_denied(session_permissions=None):
     Uses the shared security gate via a LAZY import — a module-level import
     would create a circular import through the tool registry.
 
+    Fail-closed: no ``workspace_id`` is available at this call site, so the
+    workspace capabilities cannot be loaded — the resolver is called with
+    ``capabilities=None`` and returns ``ContainerConfigError(
+    "capabilities_required")``.  That error (or any non-``ContainerConfig``
+    result / bad session input) maps to an explicit DENY reason string, NOT
+    the ``None`` "no policy opinion / allowed" skip path.
+
     Returns:
-        str or None: the denial reason, or None when containers are allowed
-            or the gate is unavailable.
+        str or None: the denial reason.  ``None`` is returned only when the
+            gate is genuinely unavailable (import failure) or when the
+            resolved session grant explicitly permits containers.
     """
     if not session_permissions:
         return None
     try:
-        from security.security_gate import get_expected_container_config
+        from security.security_gate import (
+            ContainerConfig,
+            resolve_container_config,
+        )
     except Exception as exc:
         _LOG.warning(
             "Security gate unavailable; skipping container policy check: %s",
@@ -1546,16 +1557,31 @@ def _container_policy_denied(session_permissions=None):
         )
         return None
     try:
-        effective = get_expected_container_config(session_permissions)
+        # No ``workspace_id`` is available at this call site, so capabilities
+        # cannot be loaded: pass ``capabilities=None``.  The resolver then
+        # returns ``ContainerConfigError("capabilities_required")``, which the
+        # fail-closed mapping below turns into an explicit DENY.
+        cfg = resolve_container_config(
+            session_permissions, None, LIFECYCLE_RESOURCE
+        )
     except Exception as exc:
         _LOG.warning("Security gate container policy check failed: %s", exc)
         return None
-    if (effective.get("effective") or {}).get("container") is False:
-        return (
-            "session/workspace policy denies container usage "
-            "(effective container=False)"
-        )
-    return None
+    if isinstance(cfg, ContainerConfig):
+        if cfg.effective.get("container") is False:
+            return (
+                "session/workspace policy denies container usage "
+                "(effective container=False)"
+            )
+        return None
+    # ContainerConfigError (e.g. ``capabilities_required``) or any other
+    # non-ContainerConfig result: capabilities are unavailable -> deny
+    # (fail closed).  NEVER fall through to ``return None``.
+    _error_code = getattr(cfg, "code", "capabilities_required")
+    return (
+        "container policy check unavailable "
+        f"({_error_code}); denying container usage (fail closed)"
+    )
 
 
 def _resource_policy_denied(session_permissions=None, resource_name=None):
@@ -1968,7 +1994,7 @@ def provision_workspace_resource(workspace_id, workspace_path, session_permissio
 
     Thin lifecycle wrapper used by registration call-sites (the resolve-path
     endpoint, setup_workspace, ...): resolves the graded network mode via
-    ``security_gate.get_expected_container_config`` (anything other than an
+    ``security_gate.resolve_container_config`` (anything other than an
     explicit ``bridge`` grant stays ``'none'``), builds a
     :class:`ResourceContainerManager` for the workspace and calls
     ``ensure_resource('git')``.
@@ -1991,12 +2017,20 @@ def provision_workspace_resource(workspace_id, workspace_path, session_permissio
     """
     network_mode = "none"
     try:
-        from security.security_gate import get_expected_container_config
+        from security.security_gate import (
+            ContainerConfig,
+            get_workspace_capabilities,
+            resolve_container_config,
+        )
 
-        config = get_expected_container_config(session_permissions or {})
-        resolved = config.get("network_mode")
-        if resolved in ("bridge", "none"):
-            network_mode = resolved
+        capabilities = get_workspace_capabilities(workspace_id)
+        config = resolve_container_config(
+            session_permissions or {}, capabilities, LIFECYCLE_RESOURCE
+        )
+        if isinstance(config, ContainerConfig):
+            resolved = config.network_mode
+            if resolved in ("bridge", "none"):
+                network_mode = resolved
     except Exception as exc:
         _LOG.warning(
             "provision_workspace_resource: could not resolve network mode for "

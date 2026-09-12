@@ -10,15 +10,15 @@ checked to ensure it still matches the current session permissions:
     WebAgentBridge.load_session() / WebAgentBridge.apply_config()
         → _maybe_re_sync_container()
             → verify_container_integrity()
-                → _compute_container_config_from_permissions()
+                → resolve_container_config()
                     → get_workspace_capabilities() + get_effective_permissions()
                         (security/security_gate.py)
 
-The unified function ``_compute_container_config_from_permissions`` is the
-single source of truth for computing desired (network_mode, workspace_mode)
-from session permissions. It is called by both ``verify_container_integrity``
-and ``DockerExecutor._compute_container_config``, ensuring consistency
-between integrity checks and container creation/recreation.
+The single source of truth for computing desired (network_mode, workspace_mode)
+from session permissions is ``security.security_gate.resolve_container_config``
+(a pure, total, fail-closed resolver). Both ``verify_container_integrity`` and
+``DockerExecutor._compute_container_config`` call it directly, ensuring
+consistency between integrity checks and container creation/recreation.
 
 """
 
@@ -173,79 +173,6 @@ def _resolve_workspace_id(workspace_path: str):
         return None
 
 
-def _compute_container_config_from_permissions(
-    workspace_path: str,
-    workspace_id,
-    session_permissions,
-) -> tuple:
-    """Unified function: compute desired (network_mode, workspace_mode) from session permissions.
-
-    Replaces both ``_compute_desired_config`` and ``DockerExecutor._compute_container_config``
-    with a single standalone implementation that all callers share.
-
-    Logic:
-    1. If workspace_id and session_permissions are available, use the unified security gate
-       (``get_effective_permissions``) to compute the config.
-    2. If workspace_id is None but session_permissions are available, fall back to deriving
-       directly from the session_permissions dict (with audit events for visibility).
-    3. If neither is available, return safe defaults ("none", "ro").
-
-    Args:
-        workspace_path: Absolute path to the workspace (used for audit logging).
-        workspace_id: Resolved workspace ID (str), or None — coerced to str.
-        session_permissions: The session permissions dict, or None.
-
-    Returns:
-        Tuple of (network_mode: str, workspace_mode: str).
-    """
-    network_mode = "none"
-    workspace_mode = "ro"
-
-    # Normalize workspace_id to str: callers may pass a uuid.UUID object
-    # (e.g. integration tests); pathlib.Path rejects non-str operands with
-    # TypeError, which previously short-circuited the gate into fail-closed
-    # ("none","ro") instead of falling through to session permissions.
-    workspace_id = str(workspace_id) if workspace_id is not None else None
-
-    if workspace_id and session_permissions is not None:
-        try:
-            from security.security_gate import (
-                get_workspace_capabilities,
-                get_effective_permissions,
-            )
-            from thoughtmachine.security import SessionPermissions
-            caps = get_workspace_capabilities(workspace_id)
-            eff = get_effective_permissions(SessionPermissions(**session_permissions), caps)
-
-            network_mode = resolve_network_mode(eff.get("network"))
-
-            fs = eff.get("filesystem", "read")
-            workspace_mode = "rw" if fs in ("write", "full") else "ro"
-        except Exception as e:
-            log("WARN", "docker.security_gate",
-                f"Gate lookup failed, using safe defaults: {e}")
-            network_mode = "none"
-            workspace_mode = "ro"
-    elif session_permissions is not None:
-        # workspace_id resolution failed — fall back to session permissions
-        # (they have already been vetted by ToolExecutor.check_required_categories).
-        sp = session_permissions
-        net = sp.get("network", "banned")
-        network_mode = resolve_network_mode(net)
-        fs = sp.get("filesystem", "read")
-        workspace_mode = "rw" if fs in ("write", "full") else "ro"
-        log("WARNING", "docker.security_gate",
-            f"workspace_id resolution failed for {workspace_path}; "
-            f"falling back to session_permissions (network={net}, fs={fs}).")
-        audit_event("FALLBACK_NETWORK_RESTRICTION",
-                   f"workspace={workspace_path} "
-                   f"workspace_id=None session_network={net} session_fs={fs}")
-
-    audit_event("NETWORK_DECISION", f"workspace={workspace_path} network_mode={network_mode}")
-
-    return network_mode, workspace_mode
-
-
 def verify_container_integrity(
     workspace_path: str,
     session_permissions: dict = None,
@@ -286,9 +213,40 @@ def verify_container_integrity(
     # Resolve workspace_id for config computation
     workspace_id = _resolve_workspace_id(workspace_path)
 
-    # Compute desired config via unified function
-    desired_network, desired_mode = _compute_container_config_from_permissions(
-        workspace_path, workspace_id, session_permissions
+    # Compute desired config via the security-gate SSOT resolver
+    # (``resolve_container_config``) — the surviving, pure, fail-closed path.
+    # This mirrors ``DockerExecutor._compute_container_config`` exactly:
+    # normalize the workspace id, load capabilities with the SAME expression
+    # (``get_workspace_capabilities(str(workspace_id))``), then resolve. Fail
+    # closed to ("none", "ro") on a missing id, a ContainerConfigError, or any
+    # exception.
+    desired_network = "none"
+    desired_mode = "ro"
+    _wsid = str(workspace_id) if workspace_id is not None else None
+    if _wsid and session_permissions is not None:
+        try:
+            from security.security_gate import (
+                ContainerConfig,
+                get_workspace_capabilities,
+                resolve_container_config,
+            )
+            from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+
+            _caps = get_workspace_capabilities(_wsid)
+            _cfg = resolve_container_config(
+                session_permissions, _caps, LIFECYCLE_PERSISTENT
+            )
+            if isinstance(_cfg, ContainerConfig):
+                desired_network = _cfg.network_mode
+                desired_mode = _cfg.workspace_mode
+        except Exception as e:
+            log("WARN", "docker.security_gate",
+                f"Gate lookup failed, using safe defaults: {e}")
+            desired_network = "none"
+            desired_mode = "ro"
+    audit_event(
+        "NETWORK_DECISION",
+        f"workspace={workspace_path} network_mode={desired_network}",
     )
 
     # Connect to Docker
@@ -435,20 +393,52 @@ class DockerExecutor:
     def _compute_container_config(self):
         """Compute desired network_mode and workspace mount mode from session permissions.
 
-        Thin wrapper that delegates to the unified standalone function
-        ``_compute_container_config_from_permissions`` so all callers share
-        a single implementation.
+        Thin wrapper over the security-gate SSOT resolver
+        ``security.security_gate.resolve_container_config`` (pure, total,
+        fail-closed).  Capabilities are loaded with
+        ``get_workspace_capabilities(str(workspace_id))`` — the SAME
+        workspace-id expression the retired SSOT#2 gate path used — after
+        normalising ``workspace_id`` to ``str`` (callers may pass a
+        ``uuid.UUID``).  Fail-closed: a missing workspace id, a
+        ``ContainerConfigError``, or any exception returns ("none", "ro").
 
         Returns:
             Tuple of (network_mode: str, workspace_mode: str)
             where network_mode is "bridge" or "none"
             and workspace_mode is "rw" or "ro".
         """
-        return _compute_container_config_from_permissions(
-            self.workspace_path,
-            self.workspace_id,
-            self.session_permissions,
+        workspace_id = (
+            str(self.workspace_id) if self.workspace_id is not None else None
         )
+        network_mode = "none"
+        workspace_mode = "ro"
+        if workspace_id and self.session_permissions is not None:
+            try:
+                from security.security_gate import (
+                    ContainerConfig,
+                    get_workspace_capabilities,
+                    resolve_container_config,
+                )
+                from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+
+                capabilities = get_workspace_capabilities(workspace_id)
+                cfg = resolve_container_config(
+                    self.session_permissions, capabilities, LIFECYCLE_PERSISTENT
+                )
+                if isinstance(cfg, ContainerConfig):
+                    network_mode = cfg.network_mode
+                    workspace_mode = cfg.workspace_mode
+            except Exception as e:
+                log("WARN", "docker.security_gate",
+                    f"Gate lookup failed, using safe defaults: {e}")
+                network_mode = "none"
+                workspace_mode = "ro"
+
+        audit_event(
+            "NETWORK_DECISION",
+            f"workspace={self.workspace_path} network_mode={network_mode}",
+        )
+        return network_mode, workspace_mode
 
     def _ensure_container(self):
         # Ensure the Docker image exists
