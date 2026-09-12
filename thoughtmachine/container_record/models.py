@@ -89,6 +89,10 @@ INTENT_SNAPSHOT_KEYS: tuple[str, ...] = (
     "mem_limit",
     "cpu_quota",
     "oom_score_adj",
+    # ``image_ref`` preserves the human-facing image reference recorded at
+    # container start (e.g. ``python:3.12``); it is re-taggable and can drift
+    # from the immutable digest captured in ``image_hash`` below.
+    "image_ref",
     "image_hash",
     "hardening",
 )

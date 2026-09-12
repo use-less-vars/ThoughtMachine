@@ -8,6 +8,7 @@ import pytest
 
 from thoughtmachine.container_record import api, migration, storage
 from thoughtmachine.container_record.models import SCHEMA_VERSION_LEGACY
+from thoughtmachine.container_record.snapshot import snapshot_from_attrs
 
 WS = "ws-1"
 
@@ -263,3 +264,40 @@ def test_container_without_label_creates_new_record(vault):
     assert len(records) == 1
     assert records[0]["id"]
     assert records[0]["id"] != "d1"
+
+
+# ── Intent snapshot: migration now delegates to the pure helper ─────────────
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        make_payload("d1", ws_labels(WS, "free_use")),
+        make_payload("d1", ws_labels(WS, "free_use"), network="bridge"),
+        make_payload("d1", ws_labels(WS, "free_use"), mem=0, cpu=0, oom=0),
+        make_payload("d1", ws_labels(WS, "free_use"), image="sha256:deadbeef"),
+    ],
+)
+def test_migrated_snapshot_equals_pure_helper(vault, payload):
+    """The migrated intent_snapshot is exactly ``snapshot_from_attrs(payload)``."""
+    migration.migrate_records(
+        WS, docker_source=FakeDockerClient([payload]), vault_root=vault
+    )
+    rec = _records(WS, vault)[0]
+    assert rec["intent_snapshot"] == snapshot_from_attrs(payload)
+    assert rec["schema_version"] == SCHEMA_VERSION_LEGACY
+    assert rec["inferred"] is True
+
+
+@pytest.mark.parametrize("rw,expected", [(True, "rw"), (False, "ro")])
+def test_workspace_mount_derives_workspace_mode(vault, rw, expected):
+    payload = make_payload("d1", ws_labels(WS, "free_use"))
+    payload["Mounts"] = [{"Destination": "/workspace", "RW": rw}]
+    migration.migrate_records(
+        WS, docker_source=FakeDockerClient([payload]), vault_root=vault
+    )
+    rec = _records(WS, vault)[0]
+    assert rec["intent_snapshot"]["workspace_mode"] == expected
+    assert rec["schema_version"] == SCHEMA_VERSION_LEGACY
+    assert rec["inferred"] is True
+
