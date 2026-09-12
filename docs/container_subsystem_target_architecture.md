@@ -126,6 +126,8 @@ The shipped subsystem has no restart policy anywhere; Docker's default is `resta
 
 **This is deliberate and approved.** A container that is stopped at boot because of drift is *not* a "silent kill". "No silent kills" governs *mutating a running container* — the subsystem must never change or destroy something that is already running behind the user's back. A container that failed its drift check and therefore never started was never running to be killed; leaving it stopped is the honest, visible outcome. The rule also does not forbid starting a container that *does* still match its record: a matching container may be silently restarted.
 
+**The detector only detects.** The boot drift detector is read-only — it classifies and records drift findings, and never mutates or restarts a container; the "compare and leave the container STOPPED" behaviour belongs to the restart-policy work (§9, `feat/restart-policy`), not to the detector.
+
 ```
   boot ──▶ for each record:  intent_snapshot  vs  live config
                 │ match                        │ drift
