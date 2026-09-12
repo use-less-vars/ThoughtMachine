@@ -1,3 +1,21 @@
+> **STATUS: SUPERSEDED (2026-09-12).**
+> This document predates and is superseded by
+> `docs/container_subsystem_target_architecture.md`, which is canonical.
+> Read with the target architecture open.
+>
+> Two semantics in this document contradict the target architecture and
+> must not be implemented as written:
+>
+>   - L471-472, L515-543 — auto-recreate of running containers on permission
+>     change. The target architecture forbids silent mutation of running
+>     containers. Drift is an event; recreate is a user action.
+>   - L598-600 — auto-destroy of oldest idle containers on limit drop. Same
+>     class of silent destruction; forbidden by the target architecture.
+>
+> The profile/factory detail and the `resolve_container_config()` SSOT
+> proposal remain useful reference material. Historical interest only; not
+> a contract.
+
 # Container Registry — Design Document
 
 **Status:** Design draft (not implemented)
