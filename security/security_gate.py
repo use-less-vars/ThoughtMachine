@@ -18,9 +18,11 @@ This module is always active — there is no fallback path.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import queue
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +33,7 @@ from thoughtmachine.workspace_capabilities import (
 from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
 from agent.config.defaults import PROMPT_TIMEOUT, RESOURCE_REGISTRY
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
+from thoughtmachine.container_record.models import LIFECYCLE_CLASSES
 from security.gate_helpers import _value_satisfies, resolve_network_mode
 from security.resource_catalog import (
     RESOURCE_CATALOG,
@@ -942,74 +945,114 @@ def get_effective_permissions(
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def get_expected_container_config(
-    session_permissions: Dict[str, Any],
-    workspace_caps: Optional[WorkspaceCapabilities] = None,
-) -> Dict[str, Any]:
+@dataclasses.dataclass(frozen=True)
+class ContainerConfig:
+    """Resolved, immutable container configuration for a single container.
+
+    Produced by :func:`resolve_container_config`. All fields are derived purely
+    from the supplied permissions + capabilities; nothing here performs IO.
     """
-    Compute the expected Docker container config from session permissions.
 
-    Uses ``get_effective_permissions()`` to merge session permissions with
-    workspace capabilities, then translates the merged result into container
-    configuration values that match what ``DockerExecutor._compute_container_config()``
-    would produce.
+    network_mode: str
+    workspace_mode: str
+    effective: dict
+    lifecycle_class: str
 
-    This is the canonical reference for container config — all callers
-    (``_compute_container_config``, ``_compute_desired_config``,
-    ``verify_container_integrity``) derive their config through the same logic.
+
+@dataclasses.dataclass(frozen=True)
+class ContainerConfigError:
+    """Fail-closed error result for :func:`resolve_container_config`.
+
+    A plain frozen dataclass — it deliberately implements *no* mapping
+    protocol (no ``__getitem__``/``__contains__``/``get``) so that callers
+    cannot accidentally treat an error as a successful config.
+    """
+
+    code: str
+    message: str = ""
+
+
+def resolve_container_config(
+    permissions: Any,
+    capabilities: Optional[WorkspaceCapabilities],
+    lifecycle_class: str,
+) -> ContainerConfig | ContainerConfigError:
+    """Resolve the container configuration from permissions + capabilities.
+
+    This is a **pure**, **total** and **fail-closed** replacement for the old
+    ``get_expected_container_config`` helper:
+
+    * **Pure** — no filesystem, vault, environment or network IO. Everything is
+      derived from the three arguments supplied by the caller.
+    * **Total** — it never raises; every input maps to exactly one
+      :class:`ContainerConfig` or :class:`ContainerConfigError` value.
+    * **Fail-closed** — any ambiguity (unknown lifecycle class, missing
+      capabilities, malformed permissions) yields a
+      :class:`ContainerConfigError` rather than a permissive default. In
+      particular ``capabilities`` is *required* and is **never** silently
+      replaced by a permissive ``WorkspaceCapabilities()`` default.
 
     Args:
-        session_permissions:
-            Dict with keys like ``"network"``, ``"filesystem"``, ``"container"``
-            (the same dict that ``SessionPermissions`` accepts).
-        workspace_caps:
-            ``WorkspaceCapabilities`` instance. When ``None``, a fully-permissive
-            default is used (all capabilities ``True``).
+        permissions: Either an existing ``SessionPermissions`` instance or a
+            mapping of ``SessionPermissions`` field values (e.g. ``"network"``,
+            ``"filesystem"``, ``"container"``).
+        capabilities: A ``WorkspaceCapabilities`` instance. ``None`` is rejected
+            with ``ContainerConfigError("capabilities_required")``.
+        lifecycle_class: One of :data:`LIFECYCLE_CLASSES`.
 
     Returns:
-        Dict with keys:
-
-        - **network_mode** (``"bridge"`` or ``"none"``):
-          ``"bridge"`` when effective network is ``True``, ``"write"`` or
-          ``"outbound"`` (mapping: ``security.gate_helpers.resolve_network_mode``).
-        - **workspace_mode** (``"rw"`` or ``"ro"``):
-          ``"rw"`` when effective filesystem is ``"write"`` or ``"full"``.
-        - **effective** (dict):
-          The full effective permissions dict from ``get_effective_permissions()``.
+        A :class:`ContainerConfig` on success, otherwise a
+        :class:`ContainerConfigError`.
     """
-    from thoughtmachine.security import SessionPermissions
+    # 1. Validate lifecycle class first — cheap, deterministic, no IO.
+    if not isinstance(lifecycle_class, str) or lifecycle_class not in LIFECYCLE_CLASSES:
+        return ContainerConfigError(
+            "unknown_lifecycle_class",
+            f"lifecycle_class must be one of {LIFECYCLE_CLASSES}, got {lifecycle_class!r}",
+        )
 
-    if workspace_caps is None:
-        workspace_caps = WorkspaceCapabilities()
+    # 2. Capabilities are required — reject rather than defaulting permissively.
+    if capabilities is None:
+        return ContainerConfigError(
+            "capabilities_required",
+            "capabilities must not be None; callers must supply WorkspaceCapabilities",
+        )
 
-    # Attempt to construct SessionPermissions; fall back to safe defaults if
-    # the dict contains values that Pydantic rejects (e.g. unknown literals).
-    # This mirrors the try/except in _compute_container_config and
-    # _compute_desired_config.
     try:
-        session = SessionPermissions(**session_permissions)
-        eff = get_effective_permissions(session, workspace_caps)
-    except Exception:
-        # Validation or merge failure → safe defaults
-        return {
-            "network_mode": "none",
-            "workspace_mode": "ro",
-            "effective": {},
-        }
+        # 3. Normalise permissions into a SessionPermissions instance.
+        if isinstance(permissions, SessionPermissions):
+            session = permissions
+        elif isinstance(permissions, Mapping):
+            try:
+                session = SessionPermissions(**permissions)
+            except Exception as exc:
+                return ContainerConfigError("bad_permissions", str(exc))
+        else:
+            return ContainerConfigError(
+                "bad_permissions",
+                "permissions must be a Mapping or SessionPermissions, "
+                f"got {type(permissions).__name__}",
+            )
 
-    # Network mode
-    net = eff.get("network")
-    network_mode = resolve_network_mode(net)
+        # 4. Merge permissions with capabilities.
+        eff = get_effective_permissions(session, capabilities)
 
-    # Workspace mount mode
-    fs = eff.get("filesystem", "read")
-    workspace_mode = "rw" if fs in ("write", "full") else "ro"
+        # 5. Network mode.
+        network_mode = resolve_network_mode(eff.get("network"))
 
-    return {
-        "network_mode": network_mode,
-        "workspace_mode": workspace_mode,
-        "effective": eff,
-    }
+        # 6. Workspace mount mode.
+        fs = eff.get("filesystem", "read")
+        workspace_mode = "rw" if fs in ("write", "full") else "ro"
+
+        # 7. Success.
+        return ContainerConfig(
+            network_mode=network_mode,
+            workspace_mode=workspace_mode,
+            effective=dict(eff),
+            lifecycle_class=lifecycle_class,
+        )
+    except Exception as exc:  # 8. Any unexpected failure is fail-closed.
+        return ContainerConfigError("resolution_failed", str(exc))
 
 
 # ══════════════════════════════════════════════════════════════════════════
