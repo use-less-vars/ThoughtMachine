@@ -88,22 +88,19 @@ def _load_payloads(source: Any) -> list[dict]:
 
 
 def _extract(payload: dict) -> dict:
-    """Pull docker_id / labels / host config / state status from a payload."""
+    """Pull docker_id / labels / state status from a payload."""
     config = payload.get("Config") or {}
     labels = {}
     if isinstance(config, dict):
         labels = config.get("Labels") or {}
     if not labels and isinstance(payload.get("labels"), dict):
         labels = payload["labels"]
-
-    host = payload.get("HostConfig") or {}
     state = payload.get("State") or {}
     status = state.get("Status") if isinstance(state, dict) else ""
 
     return {
         "docker_id": str(payload.get("Id") or payload.get("id") or ""),
         "labels": labels if isinstance(labels, dict) else {},
-        "host": host if isinstance(host, dict) else {},
         "state": str(status or ""),
     }
 

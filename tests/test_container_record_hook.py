@@ -6,10 +6,13 @@ Covers the hook in isolation plus its two integration seams:
   C. a failure DURING attach tears down the container + deletes the stub;
   D. a clean exit leaves the record in place;
   E. ContainerManager.start fresh-create injects the label + records;
-  F. ContainerRegistry.request_container injects the label + records.
+  F. ContainerRegistry.request_container injects the label + records;
+  G. attach-time intent-snapshot capture (derive / preserve / no-evidence /
+     failure / evidence-rule / end-to-end).
 """
 
 import copy
+import logging
 
 import pytest
 
@@ -37,12 +40,16 @@ WS = "ws-hook"
 class _FakeCtr:
     """Minimal stand-in for a docker container returned by containers.run."""
 
-    def __init__(self, container_id="docker-1", name="ctr", labels=None):
+    def __init__(self, container_id="docker-1", name="ctr", labels=None, attrs=None):
         self.id = container_id
         self.name = name
         self.status = "created"
         self.labels = dict(labels or {})
-        self.attrs = {"State": {"Status": "created"}}
+        # Thin default inspect payload: carries NO intent evidence, so
+        # snapshot_from_attrs yields an all-empty snapshot.
+        self.attrs = (
+            attrs if attrs is not None else {"State": {"Status": "created"}}
+        )
         self.stopped = []
         self.removed = []
 
@@ -67,6 +74,9 @@ class _FakeContainers:
         self.containers = list(containers or [])
         self.run_calls = []
         self.list_calls = []
+        # Inspect payload handed to containers created by ``run``.  ``None``
+        # means the thin default (no intent evidence).
+        self.run_attrs = None
 
     def list(self, all=False, filters=None):
         self.list_calls.append({"all": all, "filters": filters})
@@ -81,7 +91,12 @@ class _FakeContainers:
     def run(self, *args, **kwargs):
         self.run_calls.append({"args": args, "kwargs": kwargs})
         name = kwargs.get("name") or "run-ctr"
-        ctr = _FakeCtr("c-run-1", name=name, labels=kwargs.get("labels") or {})
+        ctr = _FakeCtr(
+            "c-run-1",
+            name=name,
+            labels=kwargs.get("labels") or {},
+            attrs=self.run_attrs,
+        )
         self.containers.append(ctr)
         return ctr
 
@@ -89,6 +104,37 @@ class _FakeContainers:
 class _FakeDockerClient:
     def __init__(self, containers=None):
         self.containers = _FakeContainers(containers or [])
+
+
+class _RaisingCtr:
+    """Container whose inspect ``attrs`` access blows up (best-effort capture)."""
+
+    id = "d-raise"
+
+    @property
+    def attrs(self):
+        raise RuntimeError("inspect unavailable")
+
+
+def _realistic_attrs():
+    """A Docker inspect payload carrying full intent evidence (design §1.1)."""
+    return {
+        "Id": "abc123hash",
+        "Image": "sha256:deadbeef",
+        "Config": {"Image": "agent-executor:latest", "Labels": {}},
+        "HostConfig": {
+            "NetworkMode": "bridge",
+            "Memory": 1073741824,
+            "CpuQuota": 50000,
+            "OomScoreAdj": 1000,
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges:true"],
+            "ReadonlyRootfs": True,
+        },
+        "Mounts": [
+            {"Destination": "/workspace", "RW": True, "Source": "/tmp/ws"},
+        ],
+    }
 
 
 def _make_container_manager(client=None, *, workspace_id="w1", session_id="s1"):
@@ -343,3 +389,136 @@ def test_container_manager_start_explicit_ephemeral(monkeypatch):
     assert record is not None
     assert record.docker_id == "c-run-1"
     assert record.lifecycle_class == LIFECYCLE_EPHEMERAL
+
+
+# ===========================================================================
+# G. attach-time intent-snapshot capture
+# ===========================================================================
+
+
+def test_attach_derives_snapshot_from_attrs():
+    """(a) An empty record snapshot is filled from the live inspect payload."""
+    with record_creation(
+        workspace_id=WS, lifecycle_class=LIFECYCLE_EPHEMERAL
+    ) as rec:
+        record_id = rec.id
+        assert rec.record.intent_snapshot == {}
+        rec.attach(_FakeCtr("d-snap", attrs=_realistic_attrs()))
+
+    record = load_record(WS, record_id)
+    snap = record.intent_snapshot
+    assert snap["network_mode"] == "bridge"
+    assert snap["workspace_mode"] == "rw"
+    assert snap["mem_limit"] == "1073741824"
+    assert snap["cpu_quota"] == 50000
+    assert snap["oom_score_adj"] == 1000
+    assert snap["image_ref"] == "agent-executor:latest"
+    assert snap["image_hash"] == "sha256:deadbeef"
+    assert snap["hardening"]["cap_drop"] == ["ALL"]
+    assert snap["hardening"]["security_opt"] == ["no-new-privileges:true"]
+    assert snap["hardening"]["readonly_rootfs"] is True
+
+
+def test_attach_does_not_overwrite_existing_snapshot():
+    """(b) A natively-authored snapshot wins over one derived at attach time."""
+    authored = {"network_mode": "host", "hardening": {"cap_add": ["NET_ADMIN"]}}
+    with record_creation(
+        workspace_id=WS,
+        lifecycle_class=LIFECYCLE_EPHEMERAL,
+        intent_snapshot=authored,
+    ) as rec:
+        record_id = rec.id
+        rec.attach(_FakeCtr("d-preserve", attrs=_realistic_attrs()))
+
+    record = load_record(WS, record_id)
+    assert record.intent_snapshot == authored
+
+
+def test_attach_without_evidence_leaves_snapshot_empty():
+    """(c) A thin inspect payload yields no snapshot; the attach still binds."""
+    with record_creation(
+        workspace_id=WS, lifecycle_class=LIFECYCLE_EPHEMERAL
+    ) as rec:
+        record_id = rec.id
+        rec.attach(_FakeCtr("d-thin"))  # default thin attrs -> no evidence
+
+    record = load_record(WS, record_id)
+    assert record.intent_snapshot == {}
+    assert record.docker_id == "d-thin"
+
+
+def test_attach_snapshot_failure_logs_and_still_binds(caplog):
+    """(d) A raising inspect access is logged; attach must not be blocked."""
+    with record_creation(
+        workspace_id=WS, lifecycle_class=LIFECYCLE_EPHEMERAL
+    ) as rec:
+        record_id = rec.id
+        with caplog.at_level(logging.WARNING, logger="infra.container_record.hook"):
+            rec.attach(_RaisingCtr())
+
+    record = load_record(WS, record_id)
+    assert record.docker_id == "d-raise"
+    assert record.intent_snapshot == {}
+    assert any(
+        "failed to derive intent snapshot" in m for m in caplog.messages
+    )
+
+
+def test_snapshot_has_evidence_truth_table():
+    """(e) The evidence rule: any truthy scalar / non-empty hardening counts."""
+    has_evidence = hook_mod._snapshot_has_evidence
+    assert has_evidence(None) is False
+    assert has_evidence("nope") is False
+    assert has_evidence({}) is False
+    assert has_evidence({"network_mode": ""}) is False
+    assert has_evidence({"hardening": {}}) is False
+    assert has_evidence({"network_mode": "bridge"}) is True
+    assert has_evidence({"image_hash": "sha256:x"}) is True
+    assert has_evidence({"oom_score_adj": 0}) is False
+    assert has_evidence({"oom_score_adj": 1000}) is True
+    assert has_evidence({"hardening": {"cap_drop": ["ALL"]}}) is True
+
+
+def test_container_manager_start_persists_snapshot(monkeypatch):
+    """(f) End-to-end: ContainerManager.start records the derived snapshot."""
+    monkeypatch.setattr(
+        container_manager, "is_registry_active", lambda cfg: False
+    )
+    client = _FakeDockerClient()
+    client.containers.run_attrs = _realistic_attrs()
+    cm = _make_container_manager(client, workspace_id="ws-cm-snap")
+    result = cm.start(image="agent-executor", name="agent-exec-snap")
+
+    assert result["id"] == "c-run-1"
+    run_kwargs = client.containers.run_calls[-1]["kwargs"]
+    record_id = run_kwargs["labels"][RECORD_LABEL_KEY]
+    record = load_record("ws-cm-snap", record_id)
+    assert record is not None
+    assert record.intent_snapshot["image_ref"] == "agent-executor:latest"
+    assert record.intent_snapshot["network_mode"] == "bridge"
+    assert record.intent_snapshot["hardening"]["readonly_rootfs"] is True
+
+
+def test_registry_request_container_persists_snapshot():
+    """(g) End-to-end: ContainerRegistry.request_container records the snapshot."""
+    client = _FakeDockerClient()
+    client.containers.run_attrs = _realistic_attrs()
+    registry = ContainerRegistry(
+        docker_client=client, feature_flag_check=lambda: True
+    )
+    handle = registry.request_container(
+        "worker-1",
+        "sess-1",
+        {},
+        image="agent-executor",
+        workspace_id="ws-reg-snap",
+    )
+    run_kwargs = client.containers.run_calls[-1]["kwargs"]
+    record_id = run_kwargs["labels"][RECORD_LABEL_KEY]
+    record = load_record("ws-reg-snap", record_id)
+    assert record is not None
+    assert record.docker_id == handle["id"]
+    assert record.intent_snapshot["network_mode"] == "bridge"
+    assert record.intent_snapshot["workspace_mode"] == "rw"
+    assert record.intent_snapshot["hardening"]["cap_drop"] == ["ALL"]
+
