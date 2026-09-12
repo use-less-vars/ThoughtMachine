@@ -338,3 +338,154 @@ class TestReturnStructure:
 
         assert "network" in result["desired"]
         assert "mode" in result["desired"]
+
+
+# ===================================================================
+# Record-label lookup (primary) + resource-container guard
+# ===================================================================
+
+class TestRecordLabelLookup:
+    """``verify_container_integrity`` resolves the container through the
+    container-record store's Docker label (``thoughtmachine.container_id``),
+    not brittle ``agent-exec-<sha256(path)[:12]>`` name arithmetic.
+
+    These tests set up a *hermetic* record vault (``tmp_path``) and patch the
+    workspace-id resolver so the record-store lookup path is exercised, while
+    keeping the legacy name lookup unreachable.
+    """
+
+    _WS = "ws-records"
+
+    def _patches(self, tmp_path):
+        return (
+            patch("thoughtmachine.vault.vault_root", return_value=str(tmp_path)),
+            patch("docker_executor._resolve_workspace_id", return_value=self._WS),
+        )
+
+    def test_lookup_via_label_when_name_drifted(
+        self, tmp_path, patch_docker, mock_docker_client
+    ):
+        """A container whose name is NOT ``agent-exec-<sha256(path)[:12]>`` is
+        still found when it carries the record's ``thoughtmachine.container_id``
+        label — proving the lookup is record-driven, not name-driven."""
+        import docker.errors
+        from thoughtmachine.container_record import (
+            LIFECYCLE_PERSISTENT,
+            RECORD_LABEL_KEY,
+            create_record,
+        )
+
+        record = create_record(
+            self._WS, LIFECYCLE_PERSISTENT, "workspace-owned",
+            id="rec-persist-1", vault_root=str(tmp_path),
+        )
+
+        container = MagicMock()
+        # Deliberately NOT sha256("/tmp/workspace")[:12] — the old name math.
+        container.name = "agent-exec-000000000000"
+        container.attrs = {
+            "Mounts": [
+                {"Destination": "/workspace", "Mode": "ro", "Type": "bind"},
+            ],
+            "HostConfig": {"NetworkMode": "none"},
+        }
+        # The record's label resolves to this live container.
+        mock_docker_client.containers.list.return_value = [container]
+        # The legacy name lookup must NOT be consulted.
+        mock_docker_client.containers.get.side_effect = docker.errors.NotFound(
+            "no name match"
+        )
+
+        p1, p2 = self._patches(tmp_path)
+        with p1, p2:
+            result = verify_container_integrity("/tmp/workspace", None)
+
+        # Found via the record label, not via the (drifted) name.
+        mock_docker_client.containers.get.assert_not_called()
+        mock_docker_client.containers.list.assert_called_once_with(
+            all=True,
+            filters={"label": f"{RECORD_LABEL_KEY}={record.id}"},
+        )
+        assert result["container_exists"] is True
+        assert result["matches_config"] is True
+        assert result["action_taken"] == "none"
+        container.reload.assert_called_once()
+
+    def test_resource_record_is_never_inspected_or_removed(
+        self, tmp_path, patch_docker, mock_docker_client
+    ):
+        """A RESOURCE-lifecycle record's container is never treated as an
+        integrity candidate — even when a live container carries its label."""
+        import docker.errors
+        from thoughtmachine.container_record import (
+            LIFECYCLE_RESOURCE,
+            create_record,
+        )
+
+        create_record(
+            self._WS, LIFECYCLE_RESOURCE, "system-owned",
+            id="rec-res-1", vault_root=str(tmp_path),
+        )
+
+        resource = MagicMock()
+        resource.name = "tm-res-000000000000-git"
+        resource.attrs = {
+            "Mounts": [
+                {"Destination": "/workspace", "Mode": "rw", "Type": "bind"},
+            ],
+            "HostConfig": {"NetworkMode": "bridge"},
+        }
+        mock_docker_client.containers.list.return_value = [resource]
+        mock_docker_client.containers.get.side_effect = docker.errors.NotFound(
+            "none"
+        )
+
+        p1, p2 = self._patches(tmp_path)
+        with p1, p2:
+            result = verify_container_integrity("/tmp/workspace", None)
+
+        assert result["container_exists"] is False
+        assert result["action_taken"] == "none"
+        resource.reload.assert_not_called()
+        resource.stop.assert_not_called()
+        resource.remove.assert_not_called()
+
+    def test_tm_res_named_container_skipped_for_persistent_record(
+        self, tmp_path, patch_docker, mock_docker_client
+    ):
+        """Even for a PERSISTENT record, a ``tm-res-``-named live container is
+        rejected by the defensive name guard and left untouched."""
+        import docker.errors
+        from thoughtmachine.container_record import (
+            LIFECYCLE_PERSISTENT,
+            create_record,
+        )
+
+        create_record(
+            self._WS, LIFECYCLE_PERSISTENT, "workspace-owned",
+            id="rec-persist-2", vault_root=str(tmp_path),
+        )
+
+        resource = MagicMock()
+        resource.name = "tm-res-000000000000-git"
+        resource.attrs = {
+            "Mounts": [
+                {"Destination": "/workspace", "Mode": "rw", "Type": "bind"},
+            ],
+            "HostConfig": {"NetworkMode": "bridge"},
+        }
+        mock_docker_client.containers.list.return_value = [resource]
+        mock_docker_client.containers.get.side_effect = docker.errors.NotFound(
+            "none"
+        )
+
+        p1, p2 = self._patches(tmp_path)
+        with p1, p2:
+            result = verify_container_integrity("/tmp/workspace", None)
+
+        assert result["container_exists"] is False
+        assert result["action_taken"] == "none"
+        resource.reload.assert_not_called()
+        resource.stop.assert_not_called()
+        resource.remove.assert_not_called()
+

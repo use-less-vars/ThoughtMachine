@@ -16,7 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from thoughtmachine.container_record import api
+from thoughtmachine.container_record import RECORD_LABEL_KEY, api
 from web_ui.backend import container_record_routes
 
 
@@ -168,3 +168,143 @@ def test_get_is_read_only(vault, client):
     assert client.get("/api/container-records/unknown").status_code == 400
 
     assert _snapshot(vault) == before
+
+
+# ---------------------------------------------------------------------------
+# computed ``drift`` field (read-only)
+# ---------------------------------------------------------------------------
+
+
+class _FakeContainer:
+    """Minimal stand-in for a docker-py ``Container`` (read-only surface)."""
+
+    def __init__(self, container_id, labels=None, attrs=None):
+        self.id = container_id
+        self.labels = dict(labels or {})
+        self.attrs = dict(attrs or {})
+
+
+class _FakeContainerCollection:
+    def __init__(self, containers):
+        self._containers = list(containers)
+        self.calls = []
+
+    def list(self, all=True, filters=None):  # noqa: A002 - mirrors docker-py
+        self.calls.append({"all": all, "filters": filters})
+        return list(self._containers)
+
+
+class _FakeDockerClient:
+    def __init__(self, containers):
+        self.containers = _FakeContainerCollection(containers)
+
+
+def _fake_docker(monkeypatch, containers):
+    """Make ``docker.from_env()`` return a fake client listing *containers*."""
+    fake = _FakeDockerClient(containers)
+    monkeypatch.setattr("docker.from_env", lambda: fake)
+    return fake
+
+
+def test_serialise_drift_present_lists_findings(vault, client, monkeypatch):
+    api.create_record("ws1", "ephemeral", "workspace-owned", id="rec-a", vault_root=vault)
+    api.attach_container("ws1", "rec-a", "docker-aaa", vault_root=vault)
+    fake = _fake_docker(
+        monkeypatch,
+        [_FakeContainer("docker-zzz", labels={RECORD_LABEL_KEY: "rec-a"})],
+    )
+
+    resp = client.get("/api/container-records/rec-a", params={"workspace_id": "ws1"})
+    assert resp.status_code == 200
+    drift = resp.json()["drift"]
+    assert isinstance(drift, list) and len(drift) == 1
+    finding = drift[0]
+    assert set(finding) == {
+        "drift_class",
+        "event_type",
+        "expected",
+        "actual",
+        "signature",
+    }
+    assert finding["drift_class"] == "identity"
+    assert finding["event_type"] == "drift.identity_changed"
+    assert finding["expected"] == "docker-aaa"
+    assert finding["actual"] == "docker-zzz"
+    # the record-owned label drove the live lookup
+    assert fake.containers.calls == [
+        {"all": True, "filters": {"label": f"{RECORD_LABEL_KEY}=rec-a"}}
+    ]
+
+    # the list route carries the same computed field
+    listed = client.get("/api/container-records", params={"workspace_id": "ws1"})
+    assert listed.status_code == 200
+    assert listed.json()["records"][0]["drift"] == drift
+
+
+def test_serialise_drift_empty_when_no_drift(vault, client, monkeypatch):
+    api.create_record("ws1", "ephemeral", "workspace-owned", id="rec-a", vault_root=vault)
+    api.attach_container("ws1", "rec-a", "docker-aaa", vault_root=vault)
+    _fake_docker(
+        monkeypatch,
+        [_FakeContainer("docker-aaa", labels={RECORD_LABEL_KEY: "rec-a"}, attrs={})],
+    )
+
+    resp = client.get("/api/container-records/rec-a", params={"workspace_id": "ws1"})
+    assert resp.status_code == 200
+    assert resp.json()["drift"] == []
+
+
+def test_serialise_drift_none_when_docker_unavailable(vault, client, monkeypatch):
+    api.create_record("ws1", "ephemeral", "workspace-owned", id="rec-a", vault_root=vault)
+    api.attach_container("ws1", "rec-a", "docker-aaa", vault_root=vault)
+
+    def _no_docker():
+        raise RuntimeError("docker unavailable")
+
+    monkeypatch.setattr("docker.from_env", _no_docker)
+
+    resp = client.get("/api/container-records/rec-a", params={"workspace_id": "ws1"})
+    assert resp.status_code == 200  # an unresolved drift never fails the request
+    assert resp.json()["drift"] is None
+
+
+def test_serialise_drift_is_read_only(vault, client, monkeypatch):
+    """Computing drift on BOTH routes must never append an event.
+
+    The pure detector is stubbed so we can prove it -- not the emitting
+    ``scan_record`` -- is the one invoked, and every write path (``append_event``
+    in either ``api`` or ``drift``, plus ``emit_drift_findings``/``scan_record``)
+    is spied on. The on-disk store must also stay byte-for-byte untouched.
+    """
+    api.create_record("ws1", "ephemeral", "workspace-owned", id="rec-a", vault_root=vault)
+    api.attach_container("ws1", "rec-a", "docker-aaa", vault_root=vault)
+    _fake_docker(
+        monkeypatch,
+        [_FakeContainer("docker-zzz", labels={RECORD_LABEL_KEY: "rec-a"})],
+    )
+
+    from thoughtmachine.container_record import api as cr_api
+    from thoughtmachine.container_record import drift as drift_mod
+
+    detected = []
+    writes = []
+
+    def _spy_detect(record, containers):
+        detected.append(record.id)
+        return []
+
+    monkeypatch.setattr(drift_mod, "detect_record_drift", _spy_detect)
+    monkeypatch.setattr(drift_mod, "emit_drift_findings", lambda *a, **k: writes.append("emit"))
+    monkeypatch.setattr(drift_mod, "scan_record", lambda *a, **k: writes.append("scan"))
+    monkeypatch.setattr(drift_mod, "append_event", lambda *a, **k: writes.append("drift.append"))
+    monkeypatch.setattr(cr_api, "append_event", lambda *a, **k: writes.append("api.append"))
+
+    before = _snapshot(vault)
+    assert client.get("/api/container-records", params={"workspace_id": "ws1"}).status_code == 200
+    assert client.get(
+        "/api/container-records/rec-a", params={"workspace_id": "ws1"}
+    ).status_code == 200
+
+    assert detected == ["rec-a", "rec-a"]  # pure detector used on both routes
+    assert writes == []  # nothing was ever appended
+    assert _snapshot(vault) == before  # store untouched on disk
