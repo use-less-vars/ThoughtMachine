@@ -11,8 +11,14 @@ Phase-1 scope
 -------------
 This file defines the dataclasses, the :data:`REASON_CODES` vocabulary, the
 :func:`admit` entry point, the :func:`_narrow` policy transform and the real
-probe implementation.  Integration (wiring this into the container-create
-call sites) is intentionally deferred.
+probe implementation.
+
+Phase-2 additions (this file)
+-----------------------------
+:class:`AdmissionDenied` is the ``RuntimeError`` subclass a wired create site
+raises on a ``Deny`` verdict (carrying ``code`` / ``message``), and
+:class:`ClientProbes` adapts an already-resolved docker client into the
+:class:`Probes` interface (so admission and the create path share one daemon).
 
 Relationship to :mod:`security.security_gate`
 ---------------------------------------------
@@ -62,8 +68,10 @@ from security.security_gate import (
 )
 
 __all__ = [
+    "AdmissionDenied",
     "AdmissionRequest",
     "Allow",
+    "ClientProbes",
     "ContainerSpec",
     "Decision",
     "Deny",
@@ -168,6 +176,24 @@ class Transform:
 Decision = Union[Allow, Deny, Transform]
 
 
+class AdmissionDenied(RuntimeError):
+    """Raised by a create site when the admission verdict is ``Deny``.
+
+    Carries the admission ``code`` (one of :data:`REASON_CODES`) and the
+    human-readable ``message`` so a caller can fail *closed* with an
+    actionable reason.  ``str(exc)`` is the message when present, otherwise
+    the code.
+    """
+
+    def __init__(self, code: str, message: str = "") -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message or code)
+
+    def __str__(self) -> str:
+        return self.message or self.code
+
+
 # ─═ Probes ══════════════════════════════════════════════════════════════════
 class Probes(Protocol):
     """Host-observation seam so :func:`admit` is unit-testable and hermetic."""
@@ -209,22 +235,80 @@ class _RealProbes:
         return time.time()
 
 
-# ─═ Workspace-root resolution ═══════════════════════════════════════════════
-def _resolve_workspace_root() -> Any:
-    """Resolve the ThoughtMachine vault root for the disk check.
+class ClientProbes:
+    """Live probes backed by an *injected* docker client (create-site wiring).
 
-    Mirrors the established pattern in :mod:`security.security_gate`: the vault
-    root is resolved lazily via ``thoughtmachine.vault.vault_root()`` (honours
-    ``THOUGHTMACHINE_VAULT_ROOT``, else ``~/.thoughtmachine``).  Any failure
-    falls back to the current working directory so the disk probe always has a
-    concrete path to measure.
+    Unlike :class:`_RealProbes` (which opens its own daemon connection), this
+    probe uses the caller's already-resolved ``client`` so admission observes
+    the *same* daemon the create path will talk to.  It is deliberately
+    tolerant of test doubles: a client without ``ping`` is presumed live, and
+    a listing failure is reported as zero containers (never trips the limit).
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def disk_usage(self, path: Any) -> Any:
+        """``shutil.disk_usage`` for *path*, walking up to an existing
+        ancestor (and finally the cwd) when *path* does not exist yet."""
+        try:
+            return shutil.disk_usage(path)
+        except OSError:
+            cur = os.path.abspath(path)
+            while True:
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+                try:
+                    return shutil.disk_usage(cur)
+                except OSError:
+                    continue
+            return shutil.disk_usage(os.getcwd())
+
+    def docker_reachable(self) -> bool:
+        ping = getattr(self._client, "ping", None)
+        if not callable(ping):
+            # Injected client (fake/test double) is presumed live.
+            return True
+        try:
+            return bool(ping())
+        except Exception:
+            return False
+
+    def workspace_container_count(self, workspace_id: str) -> int:
+        try:
+            return len(
+                self._client.containers.list(
+                    all=True,
+                    filters={"label": f"thoughtmachine.workspace_id={workspace_id}"},
+                )
+            )
+        except Exception:
+            return 0
+
+    def now(self) -> float:
+        return time.time()
+
+
+# ─═ Disk-probe path resolution ══════════════════════════════════════════════
+def _resolve_disk_path() -> Any:
+    """Resolve the path whose filesystem the disk-headroom check measures.
+
+    The precondition (audit §2) guards the *host* disk the containers are
+    created on: the Docker daemon's data root and the workspace bind-mount
+    sources both live on the filesystem backing the running process -- i.e.
+    the current working directory.  The ThoughtMachine *vault* is deliberately
+    NOT used here: it is a relocatable user-data directory (``~/.thoughtmachine``
+    or ``THOUGHTMACHINE_VAULT_ROOT``) that may sit on a different filesystem
+    from the one containers consume -- and under the hermetic test HOME it is a
+    tiny ``tmpfs``, which would spuriously deny every create.  Falling back to
+    the home directory keeps the probe concrete if the cwd is unreadable.
     """
     try:
-        import thoughtmachine.vault as _vault_module
-
-        return _vault_module.vault_root()
-    except Exception:
         return os.getcwd()
+    except OSError:
+        return os.path.expanduser("~") or os.sep
 
 
 # ─═ Public entry point ══════════════════════════════════════════════════════
@@ -269,7 +353,7 @@ def _admit(request: Any, probes: Optional[Any]) -> Decision:
     notes = []
 
     # ── step 3: disk headroom (two-tier) ───────────────────────────────────
-    root = _resolve_workspace_root()
+    root = _resolve_disk_path()
     total, used, free = probes.disk_usage(root)
     used_pct = (used / total) * 100.0 if total and total > 0 else 0.0
     if used_pct > ADMISSION_DISK_MAX_USED_PCT or free < ADMISSION_DISK_MIN_FREE_BYTES:
