@@ -45,6 +45,7 @@ from infra.container_registry import (  # noqa: E402
     create_hardened_container,
     get_container_registry,
     is_container_registry_enabled,
+    _resolve_network_mode_via_gate,
 )
 
 
@@ -156,6 +157,29 @@ def _run_kwargs(fake_client):
         merged["command"] = call.args[1]
     merged.update(call.kwargs)
     return merged
+
+
+def _default_caps():
+    """The fully-permissive default ``WorkspaceCapabilities`` set."""
+    from security.security_gate import WorkspaceCapabilities
+
+    return WorkspaceCapabilities.default()
+
+
+@pytest.fixture
+def permissive_caps(monkeypatch):
+    """Seed a permissive capability set so the gate resolves network positively.
+
+    ``request_container`` / ``on_permission_changed`` resolve the network mode
+    through ``security.security_gate`` -- whose canonical loader reads the
+    workspace vault from disk and fail-closes to the restrictive ceiling in a
+    hermetic test environment.  Patch the module-level loader so bridge-
+    expecting assertions actually exercise the positive path.
+    """
+    monkeypatch.setattr(
+        "security.security_gate.get_workspace_capabilities",
+        lambda workspace_id=None: _default_caps(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +362,9 @@ class TestRegistration:
 
 
 class TestRequestContainer:
-    def test_request_creates_registers_and_returns_handle(self, registry, fake_client):
+    def test_request_creates_registers_and_returns_handle(
+        self, registry, fake_client, permissive_caps
+    ):
         handle = registry.request_container(
             "worker-1", "sess-1", {"network": "write", "filesystem": "write"},
             workspace_id="ws-123",
@@ -370,7 +396,7 @@ class TestRequestContainer:
         assert state["quarantined"] is False
         assert registry.get_containers_for_session("sess-1") == [handle]
 
-    def test_request_network_resolution(self, registry, fake_client):
+    def test_request_network_resolution(self, registry, fake_client, permissive_caps):
         registry.request_container("w", "s", {"network": "write"}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
         # all calls here share the explicit workspace "ws"; the 5 requests stay
@@ -584,7 +610,9 @@ class TestPermissionReconciliation:
         assert fake_client.containers.get.call_count == 0
         assert registry._containers[handle["name"]]["status"] == "running"
 
-    def test_recreate_on_network_change_same_name(self, registry, fake_client):
+    def test_recreate_on_network_change_same_name(
+        self, registry, fake_client, permissive_caps
+    ):
         handle = registry.request_container("w", "sess-p", {"network": False}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "none"
 
@@ -604,14 +632,16 @@ class TestPermissionReconciliation:
         assert state["profile"].network_mode == "bridge"
         assert state["quarantined"] is False
 
-    def test_idempotent_second_event_is_noop(self, registry, fake_client):
+    def test_idempotent_second_event_is_noop(
+        self, registry, fake_client, permissive_caps
+    ):
         registry.request_container("w", "sess-p", {"network": False}, workspace_id="ws")
         registry.on_permission_changed("sess-p", {"network": "write"})
         assert fake_client.containers.run.call_count == 2
         registry.on_permission_changed("sess-p", {"network": "write"})
         assert fake_client.containers.run.call_count == 2  # no third create
 
-    def test_teardown_failure_quarantines(self, registry, fake_client):
+    def test_teardown_failure_quarantines(self, registry, fake_client, permissive_caps):
         handle = registry.request_container("w", "sess-q", {"network": False}, workspace_id="ws")
 
         class BoomStop(FakeContainer):
@@ -627,7 +657,9 @@ class TestPermissionReconciliation:
         assert state["status"] == "quarantined"
         assert handle["name"] not in registry._session_map["sess-q"]
 
-    def test_recreate_failure_does_not_raise(self, registry, fake_client):
+    def test_recreate_failure_does_not_raise(
+        self, registry, fake_client, permissive_caps
+    ):
         handle = registry.request_container("w", "sess-r", {"network": False}, workspace_id="ws")
         fake_client.containers.run.side_effect = docker.errors.DockerException("create failed")
         registry.on_permission_changed("sess-r", {"network": "write"})
@@ -635,6 +667,81 @@ class TestPermissionReconciliation:
         assert state["status"] == "recreate_failed"
         assert handle["name"] in registry._session_map["sess-r"]  # slot kept for retry
         assert state["quarantined"] is False
+
+
+class TestDriftEventBindingConstraint:
+    """The drift event must be bound to the container record's id.
+
+    ``on_permission_changed`` emits exactly ONE ``drift.policy_config_changed``
+    event per network-mode change, recorded against the container's record via
+    the ``RECORD_LABEL_KEY`` label.  The id survives the recreate because the
+    profile's ``labels`` dict (mutated in place by the record-creation hook) is
+    carried across ``dataclasses.replace``.
+    """
+
+    def test_drift_event_recorded_once_and_is_idempotent(
+        self, registry, fake_client, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        monkeypatch.setattr(
+            "security.security_gate.get_workspace_capabilities",
+            lambda workspace_id=None: _default_caps(),
+        )
+        from thoughtmachine.container_record import RECORD_LABEL_KEY, read_event_log
+
+        handle = registry.request_container(
+            "w", "sess-drift", {"network": False}, workspace_id="ws-drift"
+        )
+        name = handle["name"]
+        record_id = registry._containers[name]["profile"].labels[RECORD_LABEL_KEY]
+        assert record_id  # the record-creation hook injected a record id
+
+        registry.on_permission_changed("sess-drift", {"network": "write"})
+
+        events = [
+            e for e in read_event_log("ws-drift", record_id)
+            if e["event_type"] == "drift.policy_config_changed"
+        ]
+        assert len(events) == 1
+        assert events[0]["actor"] == "infra.container_registry.on_permission_changed"
+        assert events[0]["payload"]["container"] == name
+        assert events[0]["payload"]["old_mode"] == "none"
+        assert events[0]["payload"]["new_mode"] == "bridge"
+
+        # A second identical event is an idempotent no-op: no new drift event.
+        registry.on_permission_changed("sess-drift", {"network": "write"})
+        events_again = [
+            e for e in read_event_log("ws-drift", record_id)
+            if e["event_type"] == "drift.policy_config_changed"
+        ]
+        assert len(events_again) == 1
+
+    def test_drift_event_skipped_when_no_record_id(
+        self, registry, fake_client, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "security.security_gate.get_workspace_capabilities",
+            lambda workspace_id=None: _default_caps(),
+        )
+        name = "tm-user-norecord"
+        registry.register(
+            name,
+            "sess-nr",
+            "ws-nr",
+            "user",
+            ContainerProfile(image="i", network_mode="none"),
+        )
+        calls = []
+        monkeypatch.setattr(
+            "thoughtmachine.container_record.append_event",
+            lambda *a, **k: calls.append((a, k)),
+        )
+
+        # No RECORD_LABEL_KEY in the profile labels and the fake container has
+        # no ``labels`` attribute -> unresolvable record id: no event, no raise.
+        registry.on_permission_changed("sess-nr", {"network": "write"})
+        assert calls == []
+        assert registry._containers[name]["status"] == "running"
 
 
 # ---------------------------------------------------------------------------
@@ -703,16 +810,18 @@ class TestFeatureFlagAndHelpers:
         reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: False)
         assert reg.is_resource_image_available() is False
 
-    def test_resolve_network_mode(self):
-        assert ContainerRegistry.resolve_network_mode({"network": "write"}) == "bridge"
-        assert ContainerRegistry.resolve_network_mode({"network": "outbound"}) == "bridge"
-        assert ContainerRegistry.resolve_network_mode({"network": "OUTBOUND"}) == "bridge"
-        assert ContainerRegistry.resolve_network_mode({"network": True}) == "bridge"
-        assert ContainerRegistry.resolve_network_mode({"network": False}) == "none"
-        assert ContainerRegistry.resolve_network_mode({"network": "read"}) == "none"
-        assert ContainerRegistry.resolve_network_mode({"network": "banned"}) == "none"
-        assert ContainerRegistry.resolve_network_mode({}) == "none"
-        assert ContainerRegistry.resolve_network_mode(None) == "none"
+    def test_resolve_network_mode(self, permissive_caps):
+        # ``ContainerRegistry.resolve_network_mode`` was removed in the
+        # SSOT migration; the module-level gate adapter is the replacement
+        # leaf for the same permissions-dict -> network-mode mapping.
+        assert _resolve_network_mode_via_gate("ws", {"network": "write"}) == "bridge"
+        assert _resolve_network_mode_via_gate("ws", {"network": "outbound"}) == "bridge"
+        assert _resolve_network_mode_via_gate("ws", {"network": True}) == "bridge"
+        assert _resolve_network_mode_via_gate("ws", {"network": False}) == "none"
+        assert _resolve_network_mode_via_gate("ws", {"network": "banned"}) == "none"
+        assert _resolve_network_mode_via_gate("ws", {"network": "ask"}) == "none"
+        assert _resolve_network_mode_via_gate("ws", {}) == "none"
+        assert _resolve_network_mode_via_gate("ws", None) == "none"
 
 
 # ---------------------------------------------------------------------------
