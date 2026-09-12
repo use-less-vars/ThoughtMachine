@@ -25,20 +25,23 @@ A container becomes a **first-class, durable object**: one record, one resolver,
 
 **The Container Record** (one JSON document per container, in the vault) carries a deliberately small set of fields:
 
-| Field | Meaning |
-|---|---|
-| `id` | Container identity — the Docker container id once created; absent on an intent record before create |
-| `lifecycle_class` | One of the four classes (§3, move 5) |
-| `owner` | `workspace-owned` (free-use) or `system-owned` (resource); audit §6 |
-| `purpose` | Why it exists: free-use worker, `resource:<name>`, … |
-| `intent_snapshot` | The configuration the container was *created* with — the reference for drift detection (§3, move 3) |
-| `notes` | Free text. Replaces the shared `container_notes.json` file (§3, move 1) |
-| `event_log` | Append-only record of lifecycle and drift events (§3, move 6) |
-| `schema_version` | Record-format version; `0` for synthesised legacy records (§5) |
-| `inferred` | `true` when the record was synthesised from live state rather than captured at create (§5) |
-| `state` | Last observed state |
+| Field | Meaning | Read by |
+|---|---|---|
+| `id` | Record-owned opaque identifier (UUID4); stable across recreate | every function |
+| `docker_id` | Current Docker container id; empty on an intent record before create | create, start, `find_by_docker_label` |
+| `lifecycle_class` | One of the four classes (§3, move 5) | restart policy, admission gate, GC |
+| `owner` | `workspace-owned` (free-use) or `system-owned` (resource); audit §6 | UI display, agent ownership |
+| `purpose` | Why it exists: free-use worker, `resource:<name>`, … | UI display |
+| `intent_snapshot` | The configuration the container was *created* with — the reference for drift detection (§3, move 3) | drift check |
+| `notes` | Free text. Replaces the shared `container_notes.json` file (§3, move 1) | UI, agent handoff |
+| `event_log` | Append-only record of lifecycle and drift events (§3, move 6) | UI, audit |
+| `schema_version` | Record-format version; `0` for synthesised legacy records (§5) | migration, integrity |
+| `inferred` | `true` when the record was synthesised from live state rather than captured at create (§5) | integrity (provenance), migration |
+| `state` | Last observed state | boot-drift |
+| `created_at` | Record creation time | UI ordering (`list_records`) |
+| `updated_at` | Last mutation time | UI staleness (drift events) |
 
-The proposal's field list is exactly `id`, `lifecycle_class`, `owner`, `purpose`, `intent_snapshot`, `notes`, `event_log`; `schema_version`, `inferred` and `state` are the only additions, and each is labelled for the move that reads it. No other field exists.
+Every field above has a named reader, so the guardrail in §10 — "a field that no move reads does not exist" — holds: there is no metadata bag and no other field. `schema_version` and `inferred` record the record's format version and provenance (§5); `state` is read by boot-drift (§6); `created_at` and `updated_at` order the record list and flag drift staleness in the UI. No other field exists.
 
 Notes, ownership, drift evidence and history all live *on the container* instead of in side channels keyed by name. That single decision is what removes the notes race, the ownership ambiguity and the inventory blindness at once.
 
