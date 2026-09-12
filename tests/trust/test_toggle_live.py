@@ -319,6 +319,7 @@ class TestAskPermissionRestrictive:
         self,
         mock_docker: MagicMock,
         mock_container: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         """ask→write triggers recreation (none→bridge)."""
         mock_container.attrs["HostConfig"]["NetworkMode"] = "none"
@@ -329,6 +330,19 @@ class TestAskPermissionRestrictive:
             mock_docker,
             session_permissions={"network": "ask", "filesystem": "ask", "container": True},
             workspace_id=None,
+        )
+
+        # The admission gate re-derives container policy from the capability
+        # SSOT (get_workspace_capabilities), NOT from the _compute_container_config
+        # patched below. Make that source permissive so the gate agrees with this
+        # test's proposed ("bridge", "rw") config; otherwise the gate correctly
+        # narrows 'bridge' -> 'none' and the run never receives 'bridge'.
+        import security.security_gate as _security_gate
+        from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+        monkeypatch.setattr(
+            _security_gate,
+            "get_workspace_capabilities",
+            lambda workspace_id: WorkspaceCapabilities.default(),
         )
 
         with patch.object(
