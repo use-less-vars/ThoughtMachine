@@ -403,10 +403,21 @@ class TestRequestContainer:
         assert kwargs["mem_limit"] == "512m"
         assert kwargs["cpu_quota"] == 50000
         assert kwargs["oom_score_adj"] == 500
-        assert kwargs["labels"] == {
+        # The record-creation hook (§7) injects the record-owned label into the
+        # SAME dict that reaches containers.run; pop it off and assert the rest
+        # is unchanged, then confirm the injected id names a real record.
+        from thoughtmachine.container_record import RECORD_LABEL_KEY, load_record
+
+        run_labels = dict(kwargs["labels"])
+        record_id = run_labels.pop(RECORD_LABEL_KEY)
+        assert record_id  # non-empty record id was injected
+        assert run_labels == {
             "a": "b",
             "thoughtmachine.container_type": "free_use",
         }
+        record = load_record("ws9", record_id)
+        assert record is not None
+        assert record.docker_id == handle["id"]
         assert kwargs["environment"] == {"X": "1"}
         assert kwargs["tmpfs"] == {"/tmp": "rw,size=4m"}
         assert kwargs["extra_hosts"] == {"h": "1.2.3.4"}

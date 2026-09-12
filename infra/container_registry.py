@@ -52,6 +52,11 @@ __all__ = [
 
 log = logging.getLogger("infra.container_registry")
 from agent.logging.lifecycle import log_container_event
+from thoughtmachine.container_record import (
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_RESOURCE,
+)
+from thoughtmachine.container_record.hook import record_creation
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -371,9 +376,15 @@ class ContainerRegistry:
             self._session_map.setdefault(session_id, set()).add(container_name)
 
         try:
-            container = create_hardened_container(
-                self._docker_client, profile, container_name
-            )
+            with record_creation(
+                workspace_id=workspace_id,
+                lifecycle_class=LIFECYCLE_EPHEMERAL,
+                labels=profile.labels,
+            ) as record:
+                container = create_hardened_container(
+                    self._docker_client, profile, container_name
+                )
+                record.attach(container)
         except Exception:
             # Roll back the reservation so a failed create frees its slot.
             self.unregister(container_name)
@@ -485,7 +496,13 @@ class ContainerRegistry:
                 {"environment": dict(environment)} if environment is not None else {}
             ),
         )
-        container = create_hardened_container(self._docker_client, profile, name)
+        with record_creation(
+            workspace_id=workspace_id,
+            lifecycle_class=LIFECYCLE_RESOURCE,
+            labels=profile.labels,
+        ) as record:
+            container = create_hardened_container(self._docker_client, profile, name)
+            record.attach(container)
         container_id = getattr(container, "id", "") or ""
         self.register(name, session_id, workspace_id, "resource", profile)
         with self._lock:
