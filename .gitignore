@@ -134,6 +134,7 @@ docs/*
 !docs/decisions/logging-architecture.md
 !docs/audit_resource_container_isolation_2026_08_13.md
 !docs/container_registry_design.md
+!docs/container_record_design.md
 
 # Root-only Dockerfile pattern: ignores the repo-root Dockerfile (a stray
 # build artifact) but NOT resources/resource_dockerfile.txt — the tracked seed
