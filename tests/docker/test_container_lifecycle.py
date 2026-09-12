@@ -591,7 +591,7 @@ class TestContainerNoteFileStore:
         manager.max_containers = 4
         manager.client = SimpleNamespace(containers=fake_containers)
         manager.container_notes = manager._load_container_notes()
-        manager._compute_config = lambda ws, wid, sp: ("none", "rw")
+        manager._compute_config = lambda ws, wid, sp, lc=None: ("none", "rw")
         return manager
 
     def _notes_file(self, vault_root, workspace_id):
@@ -735,7 +735,7 @@ class TestContainerWorkerLabel:
         manager.max_containers = 4
         manager.client = SimpleNamespace(containers=fake_containers)
         manager.container_notes = manager._load_container_notes()
-        manager._compute_config = lambda ws, wid, sp: ("none", "rw")
+        manager._compute_config = lambda ws, wid, sp, lc=None: ("none", "rw")
         return manager
 
     def test_worker_label_stamped_on_fresh_create(self):
