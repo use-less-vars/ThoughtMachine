@@ -18,6 +18,7 @@ from infra.container_manager import ContainerManager
 from infra.container_registry import ContainerRegistry
 from thoughtmachine.container_record import (
     LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     RECORD_LABEL_KEY,
     load_record,
@@ -288,7 +289,7 @@ def test_container_manager_start_injects_label_and_records(monkeypatch):
     record = load_record("ws-cm", record_id)
     assert record is not None
     assert record.docker_id == "c-run-1"
-    assert record.lifecycle_class == LIFECYCLE_EPHEMERAL
+    assert record.lifecycle_class == LIFECYCLE_PERSISTENT
 
 
 # ===========================================================================
@@ -314,4 +315,31 @@ def test_registry_request_container_injects_label_and_records():
     record = load_record("ws-reg", record_id)
     assert record is not None
     assert record.docker_id == handle["id"]
+    assert record.lifecycle_class == LIFECYCLE_PERSISTENT
+
+
+def test_container_manager_start_explicit_ephemeral(monkeypatch):
+    """An explicit lifecycle_class=ephemeral is honoured on a fresh create.
+
+    The start() default is persistent (non-destructive); only a caller that
+    KNOWS the container is ephemeral passes ``lifecycle_class`` explicitly.
+    """
+    monkeypatch.setattr(
+        container_manager, "is_registry_active", lambda cfg: False
+    )
+    client = _FakeDockerClient()
+    cm = _make_container_manager(client, workspace_id="ws-cm-eph")
+    result = cm.start(
+        image="agent-executor",
+        name="agent-exec-ephemeral",
+        lifecycle_class=LIFECYCLE_EPHEMERAL,
+    )
+
+    assert result["id"] == "c-run-1"
+    run_kwargs = client.containers.run_calls[-1]["kwargs"]
+    assert RECORD_LABEL_KEY in run_kwargs["labels"]
+    record_id = run_kwargs["labels"][RECORD_LABEL_KEY]
+    record = load_record("ws-cm-eph", record_id)
+    assert record is not None
+    assert record.docker_id == "c-run-1"
     assert record.lifecycle_class == LIFECYCLE_EPHEMERAL

@@ -53,6 +53,8 @@ try:
 except ImportError:
     ContainerManager = None
 
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
+
 
 class DockerCodeRunner(ToolBase):
     required_categories: ClassVar[List[str]] = ["filesystem:write", "container:true"]
@@ -407,6 +409,7 @@ chmod +x "{script_path}"
             info = manager.start(
                 image=self.image,
                 worker_name=getattr(self, "worker_name", None) or current_worker_name(),
+                lifecycle_class=LIFECYCLE_EPHEMERAL,
             )
             # start() returns {"error": ...} (no "id") when the per-workspace
             # container limit is reached or any pre-create check fails -

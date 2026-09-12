@@ -54,6 +54,7 @@ log = logging.getLogger("infra.container_registry")
 from agent.logging.lifecycle import log_container_event
 from thoughtmachine.container_record import (
     LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
 )
 from thoughtmachine.container_record.hook import record_creation
@@ -257,6 +258,7 @@ class ContainerRegistry:
 
     def request_container(self, worker_id, session_id, permissions, *,
                           image=None, command=None, workspace_id=None,
+                          lifecycle_class=LIFECYCLE_PERSISTENT,
                           **kwargs) -> dict:
         """Create + register a hardened container.
 
@@ -378,7 +380,7 @@ class ContainerRegistry:
         try:
             with record_creation(
                 workspace_id=workspace_id,
-                lifecycle_class=LIFECYCLE_EPHEMERAL,
+                lifecycle_class=lifecycle_class,
                 labels=profile.labels,
             ) as record:
                 container = create_hardened_container(

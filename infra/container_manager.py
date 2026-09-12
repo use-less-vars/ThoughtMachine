@@ -105,7 +105,11 @@ except ImportError:  # pragma: no cover - defensive
 
 
 from infra.container_env import merge_container_identity_env
-from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL, LIFECYCLE_RESOURCE
+from thoughtmachine.container_record import (
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
+)
 from thoughtmachine.container_record.hook import record_creation
 
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
@@ -446,10 +450,15 @@ class ContainerManager:
                 return handle
         return None
 
-    def start(self, image=None, name=None, note=None, worker_name=None):
+    def start(self, image=None, name=None, note=None, worker_name=None, *,
+              lifecycle_class: str = LIFECYCLE_PERSISTENT):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
+
+        ``lifecycle_class`` records the lifecycle of a FRESH-created container's
+        record; the default (``persistent``) is non-destructive, so only callers
+        that KNOW the container is ephemeral pass ``ephemeral`` explicitly.
 
         ``worker_name`` (optional) stamps the container with the
         ``thoughtmachine.worker`` ownership label - but only on a FRESH
@@ -746,6 +755,7 @@ class ContainerManager:
                     }],
                     volumes=[f"tm-packages-{self.workspace_id}:/home/agent/.local"],
                     tmpfs=tmpfs,
+                    lifecycle_class=lifecycle_class,
                     name=name,
                 )
             except RuntimeError as exc:
@@ -769,7 +779,7 @@ class ContainerManager:
 
         with record_creation(
             workspace_id=self.workspace_id,
-            lifecycle_class=LIFECYCLE_EPHEMERAL,
+            lifecycle_class=lifecycle_class,
             labels=labels,
         ) as record:
             container = self.client.containers.run(
