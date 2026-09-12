@@ -1081,6 +1081,71 @@ class ResourceContainerManager:
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
         }
+        # Admission gate (site 4/4 of the terminal container-create sites):
+        # gate the legacy RAW create only.  This block deliberately sits
+        # BEFORE the try/except below because that handler re-wraps every
+        # exception as a RuntimeError -- an AdmissionDenied must propagate
+        # unchanged.  When the registry facade is active its own create path
+        # (site 3) already applies admission, so skip here to avoid a
+        # double-admit.  Fail closed: a Deny raises AdmissionDenied; a
+        # Transform may only narrow, so we adopt the gate's network mode for
+        # the run below.
+        #
+        # Permissions: pass an EMPTY Mapping, not self.session_permissions.
+        # Mirroring the registry's own resource-container factory (site 3,
+        # container_registry.create_resource_container), the resource
+        # container does NOT feed the session permission blob to admission:
+        # the per-resource grant was already enforced upstream
+        # (ensure_resource -> _resource_policy_denied, and
+        # provision_workspace_resource -> resolve_container_config for the
+        # network mode).  self.session_permissions here is the *resource*
+        # permission mapping (e.g. {"network": "none", "git": True}), whose
+        # keys/values are not SessionPermissions fields -- feeding it would
+        # make resolve_container_config reject it with bad_permissions.
+        # Empty Mapping (not None): resolve_container_config rejects a None
+        # permissions value with ContainerConfigError; {} admits.
+        network_mode = self.network_mode
+        if not self._registry_active:
+            from security.admission_gate import (
+                AdmissionDenied,
+                AdmissionRequest,
+                ClientProbes,
+                ContainerSpec,
+                Deny,
+                Transform,
+                admit,
+            )
+
+            _admission_wsid = (
+                str(self.workspace_id)
+                if self.workspace_id is not None
+                else "default"
+            )
+            _admission = admit(
+                AdmissionRequest(
+                    spec=ContainerSpec(
+                        container_type="resource",
+                        lifecycle_class=LIFECYCLE_RESOURCE,
+                        workspace_id=_admission_wsid,
+                        session_id=self.session_id,
+                        image=self.image,
+                        name=name,
+                        mem_limit=self.mem_limit,
+                        cpu_quota=self.cpu_quota,
+                        oom_score_adj=500,
+                        network_mode=network_mode,
+                        read_only=True,
+                    ),
+                    permissions={},
+                    capabilities=_load_capabilities(_admission_wsid),
+                    session_config=self.session_config,
+                ),
+                probes=ClientProbes(self.client),
+            )
+            if isinstance(_admission, Deny):
+                raise AdmissionDenied(_admission.code, _admission.message)
+            if isinstance(_admission, Transform):
+                network_mode = _admission.spec.network_mode
         try:
             # Phase 2 identity env: session/workspace ids are injected into
             # the resource container at create time on BOTH paths (registry
@@ -1126,7 +1191,7 @@ class ResourceContainerManager:
                     name=name,
                     mounts=mounts,
                     tmpfs=tmpfs,
-                    network_mode=self.network_mode,
+                    network_mode=network_mode,
                     cap_drop=["ALL"],
                     security_opt=["no-new-privileges:true"],
                     oom_score_adj=500,  # resource (git) containers get a moderate OOM score
@@ -1516,6 +1581,22 @@ class ResourceContainerManager:
 # docker client directly (no ResourceContainerManager instance) and NEVER
 # build or create containers — building/creating stays exclusive to
 # ``_ensure_resource_image`` / ``ResourceContainerManager``.
+
+
+def _load_capabilities(workspace_id):
+    """Best-effort load of a workspace's capabilities for admission.
+
+    Runtime import so a test that monkeypatches
+    ``security.security_gate.get_workspace_capabilities`` is honoured.  Any
+    failure returns ``None``; admission then fails closed on the
+    ``capabilities_required`` code (mirrors the fail-closed network resolver).
+    """
+    try:
+        from security.security_gate import get_workspace_capabilities
+
+        return get_workspace_capabilities(workspace_id)
+    except Exception:  # noqa: BLE001 - admission fails closed on None
+        return None
 
 
 def _container_policy_denied(session_permissions=None):
