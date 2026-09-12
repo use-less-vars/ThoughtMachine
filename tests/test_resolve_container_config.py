@@ -24,6 +24,7 @@ import pytest
 from security.security_gate import (
     ContainerConfig,
     ContainerConfigError,
+    LIFECYCLE_CLASSES,
     WorkspaceCapabilities,
     resolve_container_config,
     resolve_network_mode,
@@ -71,6 +72,43 @@ def test_pure_does_not_mutate_input_permissions():
     assert perms == snapshot
 
 
+def test_pure_performs_no_io(monkeypatch):
+    """Resolving a config touches no filesystem, vault or environment state.
+
+    Every IO entry point (``open``, ``io.open``, ``os.getenv``,
+    ``pathlib.Path.open`` and ``os.environ`` item access) is booby-trapped to
+    raise ; a correct resolver therefore must not trip any of them.
+    """
+    import builtins
+    import io
+    import os
+    import pathlib
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "resolve_container_config performed IO via %r / %r" % (args, kwargs)
+        )
+
+    monkeypatch.setattr(builtins, "open", _boom)
+    monkeypatch.setattr(io, "open", _boom)
+    monkeypatch.setattr(os, "getenv", _boom)
+    monkeypatch.setattr(pathlib.Path, "open", _boom, raising=False)
+    # Block env reads without swapping the ``os.environ`` object itself (a swap
+    # breaks pytest's own bookkeeping); patch the mapping's *read* hooks instead.
+    environ_type = type(os.environ)
+    monkeypatch.setattr(environ_type, "__getitem__", _boom)
+    monkeypatch.setattr(environ_type, "get", _boom)
+
+    # Only the resolver call runs under the guard; monkeypatch restores the real
+    # hooks on teardown.
+    cfg = resolve_container_config(
+        {"network": "outbound", "filesystem": "write"}, PERMISSIVE, "persistent"
+    )
+    assert isinstance(cfg, ContainerConfig)
+    assert cfg.network_mode == "bridge"
+    assert cfg.workspace_mode == "rw"
+
+
 @pytest.mark.parametrize(
     "perms,caps,lifecycle",
     [
@@ -108,6 +146,24 @@ def test_fail_closed_unknown_lifecycle_class(lifecycle):
     err = resolve_container_config({"network": "write"}, PERMISSIVE, lifecycle)
     assert isinstance(err, ContainerConfigError)
     assert err.code == "unknown_lifecycle_class"
+
+
+def test_lifecycle_class_does_not_change_resolved_axes():
+    """The ``(network_mode, workspace_mode)`` pair is orthogonal to lifecycle.
+
+    For a fixed permission/capability pair that resolves to a ``ContainerConfig``
+    every known lifecycle class yields the *same* axes; only ``lifecycle_class``
+    echoes the requested class.  (Unknown classes are the fail-closed counterpart,
+    covered by :func:`test_fail_closed_unknown_lifecycle_class`.)
+    """
+    perms = {"network": "outbound", "filesystem": "write"}
+    axes = set()
+    for lifecycle in LIFECYCLE_CLASSES:
+        cfg = resolve_container_config(perms, PERMISSIVE, lifecycle)
+        assert isinstance(cfg, ContainerConfig)
+        assert cfg.lifecycle_class == lifecycle
+        axes.add((cfg.network_mode, cfg.workspace_mode))
+    assert axes == {("bridge", "rw")}
 
 
 def test_restrictive_capabilities_clamp_to_locked_down():

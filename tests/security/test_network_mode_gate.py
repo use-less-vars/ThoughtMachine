@@ -59,7 +59,7 @@ class TestResolveNetworkModeMapping:
 # ---------------------------------------------------------------------------
 
 
-class TestComputeContainerConfigFromPermissions:
+class TestResolveContainerConfigFromPermissions:
     def test_outbound_via_gate_gives_bridge_rw(self):
         with patch(
             "security.security_gate.get_workspace_capabilities",
@@ -117,7 +117,7 @@ class TestComputeContainerConfigFromPermissions:
 # ---------------------------------------------------------------------------
 
 
-class TestGetExpectedContainerConfig:
+class TestResolveContainerConfigSlice:
     def test_outbound_session_expected_bridge(self):
         cfg = resolve_container_config(PERMS_OUTBOUND, PERMISSIVE_CAPS, LIFECYCLE_PERSISTENT)
         assert cfg.network_mode == "bridge"

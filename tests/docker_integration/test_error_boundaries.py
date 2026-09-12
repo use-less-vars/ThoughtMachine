@@ -60,7 +60,7 @@ class TestResolveWorkspaceId:
 # _resolve_container_config_via_gate edge cases
 # ===================================================================
 
-class TestComputeContainerConfigFromPermissions:
+class TestResolveContainerConfigFromPermissions:
     """Standalone config computation with various permission/capability combos."""
 
     def test_no_workspace_id_and_no_permissions(self):

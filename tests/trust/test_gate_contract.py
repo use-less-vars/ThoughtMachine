@@ -154,7 +154,7 @@ class TestContainerConfigEdgeValues:
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class TestGetExpectedContainerConfig:
+class TestResolveContainerConfigSlice:
     """Tests for the canonical container-config resolver."""
 
     def test_write_all_allowed(self):
@@ -317,7 +317,7 @@ class TestGetExpectedContainerConfig:
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class TestComputeContainerConfigFromPermissions:
+class TestResolveContainerConfigFromPermissions:
     """Tests for the standalone ``_resolve_container_config_via_gate``
     function in ``docker_executor.py``.
 
