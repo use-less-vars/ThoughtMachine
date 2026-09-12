@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from . import storage
+from .api import RECORD_LABEL_KEY
 from .models import (
     INTENT_SNAPSHOT_KEYS,
     LIFECYCLE_EPHEMERAL,
@@ -307,8 +308,21 @@ def migrate_records(
             docker_id = info["docker_id"]
             mapping, log_path = _log_for(ws)
 
+            # The label injected by write-on-create is ground truth: it names the
+            # record the container already belongs to.  It takes precedence over
+            # the migrations.log mapping (whose ids are migration-authored).
+            labelled_id = labels.get(RECORD_LABEL_KEY)
+
             rematerialise = False
-            if docker_id and docker_id in mapping:
+            if labelled_id:
+                # Write-on-create record: no migration-authored WAL line.
+                existing = storage.record_path(ws, labelled_id, vault_root)
+                if existing.is_file():
+                    summary["skipped"] += 1
+                    continue
+                record_id = labelled_id
+                rematerialise = True  # record file lost after create; rebuild it
+            elif docker_id and docker_id in mapping:
                 record_id = mapping[docker_id]
                 existing = storage.record_path(ws, record_id, vault_root)
                 if existing.is_file():

@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from thoughtmachine.container_record import migration, storage
+from thoughtmachine.container_record import api, migration, storage
 from thoughtmachine.container_record.models import SCHEMA_VERSION_LEGACY
 
 WS = "ws-1"
@@ -199,3 +199,67 @@ def test_iterable_source_is_accepted(vault):
     payloads = [make_payload("d1", ws_labels(WS, "free_use"))]
     summary = migration.migrate_records(WS, docker_source=payloads, vault_root=vault)
     assert summary["created"] == 1
+
+
+def test_label_with_existing_record_is_skipped(vault):
+    """A container already labelled with a record id is never re-synthesised."""
+    record_id = "rec-existing"
+    api.create_record(
+        WS, "persistent", "workspace-owned", id=record_id, vault_root=vault
+    )
+
+    payloads = [
+        make_payload(
+            "d1",
+            {**ws_labels(WS, "free_use"), api.RECORD_LABEL_KEY: record_id},
+        )
+    ]
+    summary = migration.migrate_records(
+        WS, docker_source=FakeDockerClient(payloads), vault_root=vault
+    )
+
+    assert summary["created"] == 0
+    assert summary["skipped"] >= 1
+    records = _records(WS, vault)
+    assert len(records) == 1
+    assert records[0]["id"] == record_id
+
+
+def test_label_missing_record_rematerialises_same_id(vault):
+    """The label's record id is ground truth: rebuild the SAME id if lost."""
+    record_id = "rec-lost"
+    api.create_record(
+        WS, "persistent", "workspace-owned", id=record_id, vault_root=vault
+    )
+    storage.record_path(WS, record_id, vault).unlink()
+    assert _records(WS, vault) == []
+
+    payloads = [
+        make_payload(
+            "d1",
+            {**ws_labels(WS, "free_use"), api.RECORD_LABEL_KEY: record_id},
+        )
+    ]
+    summary = migration.migrate_records(
+        WS, docker_source=FakeDockerClient(payloads), vault_root=vault
+    )
+
+    assert summary["rematerialised"] == 1
+    assert summary["created"] == 0
+    records = _records(WS, vault)
+    assert len(records) == 1
+    assert records[0]["id"] == record_id
+
+
+def test_container_without_label_creates_new_record(vault):
+    """With no label and no WAL entry, a fresh migration-authored id is minted."""
+    payloads = [make_payload("d1", ws_labels(WS, "free_use"))]
+    summary = migration.migrate_records(
+        WS, docker_source=FakeDockerClient(payloads), vault_root=vault
+    )
+
+    assert summary["created"] == 1
+    records = _records(WS, vault)
+    assert len(records) == 1
+    assert records[0]["id"]
+    assert records[0]["id"] != "d1"
