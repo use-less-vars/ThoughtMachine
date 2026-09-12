@@ -327,6 +327,21 @@ def admit(request: Any, *, probes: Optional[Any] = None) -> Decision:
         )
 
 
+# ─═ Image reference normalisation ═══════════════════════════════════════════
+def _image_repo_name(image: Any) -> Any:
+    """Return the repository name of a Docker image reference (pure, total).
+
+    Non-``str`` inputs are returned unchanged so the allowlist membership test
+    still type-mismatches and denies.  For strings, the last path segment is
+    kept (dropping any registry/path prefix) and any ``:tag`` suffix on that
+    segment is stripped.  Never raises.
+    """
+    if not isinstance(image, str):
+        return image
+    repo = image.rsplit("/", 1)[-1]
+    return repo.split(":", 1)[0]
+
+
 def _admit(request: Any, probes: Optional[Any]) -> Decision:
     if probes is None:
         probes = _RealProbes()
@@ -347,7 +362,13 @@ def _admit(request: Any, probes: Optional[Any]) -> Decision:
 
     # ── step 2: image allowlist ────────────────────────────────────────────
     image = getattr(spec, "image", None)
-    if image is not None and image != "" and image not in ADMISSION_IMAGE_ALLOWLIST:
+    # Compare repo name only (strip the ':tag' suffix, never a name prefix) so
+    # tag/registry variants of allowlisted images pass; prefix impostors deny.
+    if (
+        image is not None
+        and image != ""
+        and _image_repo_name(image) not in ADMISSION_IMAGE_ALLOWLIST
+    ):
         return Deny(REASON_IMAGE_NOT_ALLOWED, f"image not allowed: {image!r}")
 
     notes = []
