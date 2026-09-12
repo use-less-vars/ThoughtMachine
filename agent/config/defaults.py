@@ -141,6 +141,20 @@ CONTAINER_TYPES = ("user", "resource", "mcp", "proxy")
 #   resource ->  500  moderate score (resource_container_manager L536)
 DEFAULT_USER_OOM_SCORE_ADJ = 1000
 DEFAULT_RESOURCE_OOM_SCORE_ADJ = 500
+
+# ── security/admission_gate.py ──────────────────────────────────────────────
+# Admission-control disk policy (two-tier).  WARN is advisory: it is attached
+# as a note on an otherwise-admitted container.  DENY blocks container
+# creation.  EITHER axis tripping its threshold triggers the tier, so the
+# more aggressive of the two conditions wins.
+ADMISSION_DISK_MAX_USED_PCT = 95
+ADMISSION_DISK_MIN_FREE_BYTES = 2 * 1024 ** 3
+ADMISSION_DISK_WARN_USED_PCT = 90
+ADMISSION_DISK_WARN_MIN_FREE_BYTES = 10 * 1024 ** 3
+# Images an admitted container may run.  Derived from the two base images the
+# runtime actually builds; no proxy/mcp dedicated base image exists yet
+# (mcp/proxy are future CONTAINER_TYPES reserved by the registry).
+ADMISSION_IMAGE_ALLOWLIST = (DEFAULT_IMAGE, RESOURCE_IMAGE_TAG)
 # Hardening recipe — the union of the three create stacks (design doc §1.1).
 HARDENED_CAP_DROP = ["ALL"]
 HARDENED_SECURITY_OPT = ["no-new-privileges:true"]
