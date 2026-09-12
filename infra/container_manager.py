@@ -111,6 +111,7 @@ from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
     CONTAINER_TYPE_LABEL,
     DEFAULT_IMAGE,
+    DEFAULT_MAX_CONTAINERS,
     EXEC_OUTPUT_LIMIT_BYTES,
 )
 _TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
@@ -252,7 +253,9 @@ class ContainerManager:
         # Phase 2: per-workspace config (max_containers, disk_quota_mb) loaded
         # from <vault_root>/workspaces/<workspace_id>/config.json.
         self.workspace_config = self._load_workspace_config()
-        self.max_containers = self.workspace_config.get("max_containers", 4)
+        self.max_containers = self.workspace_config.get(
+            "max_containers", DEFAULT_MAX_CONTAINERS
+        )
 
         # Phase 4.5: sticky-note bulletin board (per-workspace JSON file, NOT
         # Docker labels - labels are immutable after create on real daemons).
@@ -267,7 +270,7 @@ class ContainerManager:
         Missing file -> defaults in memory (nothing written to disk — construction
         performs no I/O). Corrupt file -> defaults in memory (file untouched).
         """
-        defaults = {"max_containers": 4, "disk_quota_mb": 4096}
+        defaults = {"max_containers": DEFAULT_MAX_CONTAINERS, "disk_quota_mb": 4096}
         config_dir = Path(self.vault_root) / "workspaces" / str(self.workspace_id)
         config_path = config_dir / "config.json"
         self.workspace_config_path = config_path
@@ -1844,7 +1847,7 @@ def _container_name(container):
 
 
 def sweep_exited_workspace_containers(registered_workspace_ids=None,
-                                      max_age_s=3600, dry_run=False):
+                                      max_age_s=86400, dry_run=False):
     """Sweep EXITED ``thoughtmachine.workspace_id``-labelled containers that
     have been idle for at least ``max_age_s`` seconds.
 

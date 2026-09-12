@@ -39,9 +39,9 @@ MAX_WORKERS_PER_SESSION = 3
 HEARTBEAT_INTERVAL_S = 30
 # A worker whose last heartbeat is older than this is considered stale.
 HEARTBEAT_STALE_AFTER_S = 600
-# Default per-worker container budget (aligns with
-# infra.container_registry.DEFAULT_MAX_CONTAINERS).
-WORKER_DEFAULT_MAX_CONTAINERS = 4
+# Default per-worker container budget (unified with the workspace budget
+# DEFAULT_MAX_CONTAINERS, below).
+WORKER_DEFAULT_MAX_CONTAINERS = 6
 # Default system prompt for worker sub-agents.
 DEFAULT_WORKER_SYSTEM_PROMPT = (
     "You are a capable autonomous sub-agent of ThoughtMachine. "
@@ -132,7 +132,7 @@ RESOURCE_CPU_QUOTA = 50000
 # Default image used by container_manager.
 DEFAULT_IMAGE = "agent-executor"
 # Workspace config.json default max_containers (container_manager L228/243).
-DEFAULT_MAX_CONTAINERS = 4
+DEFAULT_MAX_CONTAINERS = 6
 # Valid container_type values ("git" is represented as "resource"; mcp/proxy
 # are future types reserved by the registry).
 CONTAINER_TYPES = ("user", "resource", "mcp", "proxy")

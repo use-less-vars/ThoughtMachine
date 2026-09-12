@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover - defensive
 try:
     from infra.container_registry import DEFAULT_MAX_CONTAINERS
 except ImportError:  # pragma: no cover - defensive
-    DEFAULT_MAX_CONTAINERS = 4
+    DEFAULT_MAX_CONTAINERS = 6
 
 # Resource container name convention (see ResourceContainerManager.container_name).
 _RESOURCE_NAME_PREFIX = "tm-res-"
@@ -234,7 +234,7 @@ class WorkerSupervisor:
 
         # Per-worker container budget (Phase 3, item 6): the maximum number of
         # containers this worker may keep active simultaneously.  Defaults to
-        # DEFAULT_MAX_CONTAINERS (4) — the same default the registry and the
+        # DEFAULT_MAX_CONTAINERS (6) — the same default the registry and the
         # legacy container manager apply per session.
         self._max_container_count: int = (
             max_container_count if max_container_count is not None else DEFAULT_MAX_CONTAINERS

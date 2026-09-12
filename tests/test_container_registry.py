@@ -97,6 +97,44 @@ class FakeClient:
         return container
 
 
+class _RecordingLock:
+    """A real lock wrapper that records acquire/release and exposes ``.held``."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.held = False
+        self.events = []
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.held = True
+        self.events.append("acquire")
+        return self
+
+    def __exit__(self, *exc):
+        self.held = False
+        self.events.append("release")
+        self._lock.release()
+        return False
+
+
+class _TracingDict(dict):
+    """A dict that records, at each read/write, whether the lock was held."""
+
+    def __init__(self, trace, lock):
+        super().__init__()
+        self._trace = trace
+        self._lock = lock
+
+    def values(self):
+        self._trace.append(("read", self._lock.held))
+        return super().values()
+
+    def __setitem__(self, key, value):
+        self._trace.append(("write", self._lock.held))
+        super().__setitem__(key, value)
+
+
 @pytest.fixture
 def fake_client():
     return FakeClient()
@@ -335,8 +373,8 @@ class TestRequestContainer:
     def test_request_network_resolution(self, registry, fake_client):
         registry.request_container("w", "s", {"network": "write"})
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
-        # separate session id: the per-session container limit is 4 and the
-        # baseline test already exhausts it on session "s"
+        # all calls here share the default workspace "ws"; the 5 requests stay
+        # under DEFAULT_MAX_CONTAINERS (6) so the budget is never reached
         registry.request_container("w", "s2", {"network": "outbound"})
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
         registry.request_container("w", "s", {"network": True})
@@ -406,10 +444,42 @@ class TestRequestContainer:
             registry.request_container(
                 "w", "sess-c", {}, session_config={"container_limits": {"max_containers": 1}}
             )
-        # different session is unaffected
+        # a different WORKSPACE has its own budget (the limit is per-workspace,
+        # not per-session)
         registry.request_container(
-            "w", "sess-d", {}, session_config={"container_limits": {"max_containers": 1}}
+            "w", "sess-d", {}, workspace_id="ws-other",
+            session_config={"container_limits": {"max_containers": 1}},
         )
+
+    def test_limit_is_per_workspace_not_per_session(self, registry, fake_client):
+        profile = ContainerProfile(image="i")
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            registry.register(f"c{i}", f"sess-{i}", "ws-shared", "user", profile)
+        assert fake_client.containers.run.call_count == 0
+        # a NEW session in the SAME workspace is blocked by the shared budget
+        with pytest.raises(RuntimeError, match="Container limit reached"):
+            registry.request_container("w", "sess-new", {}, workspace_id="ws-shared")
+        assert fake_client.containers.run.call_count == 0
+        # a DIFFERENT workspace has its own, independent budget
+        handle = registry.request_container("w", "sess-new", {}, workspace_id="ws-other")
+        assert handle["status"] == "running"
+        assert fake_client.containers.run.call_count == 1
+
+    def test_request_budget_read_and_reserve_are_atomic(self, registry, fake_client):
+        """The per-workspace count read and the reservation write must happen
+        under ONE held lock (deterministic -- no threads/timing)."""
+        lock = _RecordingLock()
+        trace = []
+        registry._lock = lock
+        registry._containers = _TracingDict(trace, lock)
+        registry.request_container("w", "sess-atomic", {}, workspace_id="ws-a")
+        assert trace == [("read", True), ("write", True)]
+        # request_container takes the lock twice (budget+reserve, then the
+        # post-create status update); a read/write SPLIT would add a third
+        # acquisition pair, so pin the exact two-pair sequence.
+        assert lock.events == ["acquire", "release", "acquire", "release"]
+        assert lock.events[0] == "acquire"
+        assert lock.events[-1] == "release"
 
     def test_request_invalid_type_raises_before_docker(self, registry, fake_client):
         with pytest.raises(ValueError, match="Unknown container type"):

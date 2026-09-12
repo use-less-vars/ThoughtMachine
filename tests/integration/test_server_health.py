@@ -238,11 +238,11 @@ def test_list_containers_endpoint(contract_server):
     # NOTE: the endpoint now also reports container capacity alongside the
     # list — containers_in_use (running) and containers_available (capacity
     # minus in-use). The fake manager has no max_containers, so capacity
-    # defaults to 4: 1 running container leaves 3 available.
+    # defaults to 6: 1 running container leaves 5 available.
     payload = resp.json()
     assert payload["containers"] == fake.list_containers()
     assert payload["containers_in_use"] == 1
-    assert payload["containers_available"] == 3
+    assert payload["containers_available"] == 5
     assert fake.list_calls >= 1
 
 

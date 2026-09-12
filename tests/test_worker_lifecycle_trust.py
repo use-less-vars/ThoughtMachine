@@ -414,7 +414,7 @@ def test_worker_timeout_constants_single_source():
     assert defaults.MAX_WORKERS_PER_SESSION == 3
     assert defaults.HEARTBEAT_INTERVAL_S == 30
     assert defaults.HEARTBEAT_STALE_AFTER_S == 600
-    assert defaults.WORKER_DEFAULT_MAX_CONTAINERS == 4
+    assert defaults.WORKER_DEFAULT_MAX_CONTAINERS == 6
     assert defaults.PER_WORKER_RING_SIZE == 50
     assert defaults.GLOBAL_RING_SIZE == 500
     assert defaults.WORKER_HUNG_GRACE_S == 0
