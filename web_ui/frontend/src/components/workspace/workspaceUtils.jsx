@@ -16,7 +16,7 @@ export const PERM_RANK = { banned: 0, read: 1, write: 2, ask: 3, full: 4, enable
 export const PROVIDERS = ['Local LLM', 'OpenAI', 'Anthropic', 'DeepSeek']
 export const PRESET_OPTIONS = ['Agent (full)', 'Engineer (read-only)', 'Custom']
 
-export const CONTAINER_LIMIT = 4          // workspace container limit (matches the backend)
+export const CONTAINER_LIMIT = 6          // workspace container limit (sync-only; live source is backend containers_available)
 export const PROMPT_PREVIEW_LENGTH = 120  // worker systemPrompt truncation
 
 // --- Permissions reconciliation ---

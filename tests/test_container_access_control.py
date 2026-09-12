@@ -159,11 +159,17 @@ class TestContainerTypeLabeling:
 
     def test_request_container_rejects_resource_requests(self, registry):
         with pytest.raises(PermissionError, match="Resource container access denied"):
-            registry.request_container("w", "s", {}, container_type="resource")
+            registry.request_container(
+                "w", "s", {}, container_type="resource", workspace_id="ws1"
+            )
         with pytest.raises(PermissionError, match="Resource container access denied"):
-            registry.request_container("w", "s", {}, image=RESOURCE_IMAGE_TAG)
+            registry.request_container(
+                "w", "s", {}, image=RESOURCE_IMAGE_TAG, workspace_id="ws1"
+            )
         with pytest.raises(PermissionError, match="Resource container access denied"):
-            registry.request_container("w", "s", {}, name="tm-res-x")
+            registry.request_container(
+                "w", "s", {}, name="tm-res-x", workspace_id="ws1"
+            )
 
     def test_resource_container_manager_labels(self):
         # object.__new__ avoids __init__'s docker.from_env() call.

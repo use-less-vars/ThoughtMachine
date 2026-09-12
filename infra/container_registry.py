@@ -251,7 +251,8 @@ class ContainerRegistry:
             return True
 
     def request_container(self, worker_id, session_id, permissions, *,
-                          image=None, command=None, **kwargs) -> dict:
+                          image=None, command=None, workspace_id=None,
+                          **kwargs) -> dict:
         """Create + register a hardened container.
 
         Mirrors WorkerSupervisor.request_container
@@ -259,7 +260,8 @@ class ContainerRegistry:
         profile fields (``mem_limit``, ``cpu_quota``, ``oom_score_adj``,
         ``labels``, ``environment``, ``mounts``, ``tmpfs``, ``extra_hosts``,
         ``volumes``), plus ``container_type`` (default "user"),
-        ``workspace_id`` (default "ws") and ``session_config`` (used for
+        ``workspace_id`` (REQUIRED — no default; fails closed on a
+        missing/blank value) and ``session_config`` (used for
         ``container_limits.max_containers``).
 
         Raises:
@@ -268,7 +270,8 @@ class ContainerRegistry:
           PermissionError  for resource-container requests (image ==
                         RESOURCE_IMAGE_TAG, container_type == "resource", or
                         a tm-res-* name hint).
-          ValueError   for an unknown container_type.
+          ValueError   for an unknown container_type, or a missing/blank
+                        workspace_id (required; fail-closed, no default).
 
         Returns a handle dict: {"id", "name", "status": "running",
         "container_type"}.
@@ -283,7 +286,15 @@ class ContainerRegistry:
             raise ValueError(f"Unknown container type: {container_type!r}")
 
         session_config = kwargs.pop("session_config", None)
-        workspace_id = kwargs.pop("workspace_id", None) or "ws"
+
+        # workspace_id is REQUIRED and fail-closed: there is no default
+        # workspace bucket, so a missing/blank id must never silently collapse
+        # every caller onto one shared "ws" budget/label namespace.
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError(
+                "request_container: workspace_id is required and must be a "
+                "non-empty string (fail-closed: no default 'ws' bucket)"
+            )
 
         # Resource guard (design doc §2.7; mirrors WLM L575-594): worker
         # sub-agents cannot request resource containers.
@@ -295,12 +306,9 @@ class ContainerRegistry:
         ):
             raise PermissionError("Resource container access denied")
 
-        # Limits: session config container_limits.max_containers -> default 4.
+        # Limits: per-WORKSPACE budget. Session config
+        # container_limits.max_containers -> DEFAULT_MAX_CONTAINERS, clamped >= 1.
         max_containers = self._get_max_containers(session_id, session_config)
-        with self._lock:
-            current = len(self._session_map.get(session_id, ()))
-        if current >= max_containers:
-            raise RuntimeError("Container limit reached")
 
         # Permission-derived network mode wins over any kwargs network_mode.
         network_mode = self.resolve_network_mode(permissions)
@@ -333,14 +341,56 @@ class ContainerRegistry:
             container_type, workspace_id[:12], uuid.uuid4().hex[:8]
         )
 
-        container = create_hardened_container(self._docker_client, profile, container_name)
+        # Atomic read-and-reserve under ONE lock acquisition: the per-workspace
+        # count and the reservation placeholder are decided together so
+        # concurrent requests for the same workspace cannot both pass the budget
+        # check and overshoot the limit. The placeholder is inserted BEFORE the
+        # (slow) docker create so it immediately occupies a slot (use
+        # ``status="registering"``); a failed create rolls the slot back.
+        with self._lock:
+            current = sum(
+                1 for st in self._containers.values()
+                if st.get("workspace_id") == workspace_id
+            )
+            if current >= max_containers:
+                raise RuntimeError("Container limit reached")
+            # Parity with register(): refuse a duplicate name instead of
+            # silently overwriting an existing entry.
+            if container_name in self._containers:
+                raise ValueError(f"Container already registered: {container_name}")
+            self._containers[container_name] = {
+                "profile": profile,
+                "status": "registering",
+                "session_id": session_id,
+                "workspace_id": workspace_id,
+                "container_type": container_type,
+                "created_at": time.time(),
+                "quarantined": False,
+                "container_id": "",
+            }
+            self._session_map.setdefault(session_id, set()).add(container_name)
+
+        try:
+            container = create_hardened_container(
+                self._docker_client, profile, container_name
+            )
+        except Exception:
+            # Roll back the reservation so a failed create frees its slot.
+            self.unregister(container_name)
+            raise
+
         container_id = getattr(container, "id", "") or ""
-        self.register(container_name, session_id, workspace_id, container_type, profile)
         with self._lock:
             state = self._containers.get(container_name)
             if state is not None:
                 state["status"] = "running"
                 state["container_id"] = container_id
+        log_container_event(
+            "registered",
+            container_id=container_name,
+            session_id=session_id or "",
+            data={"container_type": container_type},
+        )
         log.info(
             "request_container: created %s (type=%s, network=%s) for session %s",
             container_name, container_type, network_mode, session_id,
@@ -609,8 +659,9 @@ class ContainerRegistry:
     # -- limits / helpers -----------------------------------------------
 
     def _get_max_containers(self, session_id, session_config=None) -> int:
-        """Session config ``container_limits.max_containers`` -> default 4,
-        clamped to >= 1 (mirrors container_manager.py L273-291)."""
+        """Session config ``container_limits.max_containers`` ->
+        DEFAULT_MAX_CONTAINERS, clamped to >= 1 (mirrors container_manager.py
+        L273-291)."""
         if session_config:
             limits = session_config.get("container_limits") or {}
             raw = limits.get("max_containers")

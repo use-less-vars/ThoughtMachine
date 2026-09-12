@@ -1,7 +1,7 @@
 """Tests for per-worker resource budgets (Phase 3, item 6).
 
 Covers:
-  1. default budgets applied when nothing is configured (containers=4,
+  1. default budgets applied when nothing is configured (containers=6,
      tokens=runtime=unlimited — existing behaviour unchanged);
   2. the per-worker container budget is enforced in
      ``WorkerSupervisor.request_container`` (fail closed) and freed by
@@ -76,7 +76,7 @@ def make_worker(tmp_path, **kwargs):
 
 def test_defaults_applied_and_generous(tmp_path):
     worker = make_worker(tmp_path)
-    assert worker._max_container_count == WORKER_DEFAULT_MAX_CONTAINERS == 4
+    assert worker._max_container_count == WORKER_DEFAULT_MAX_CONTAINERS == 6
     assert worker._max_token_usage is WORKER_DEFAULT_MAX_TOKENS is None
     assert worker._max_runtime_s is WORKER_DEFAULT_MAX_RUNTIME_S is None
     assert worker._budget_started_at > 0
@@ -120,7 +120,7 @@ def test_container_budget_enforced():
 
 def test_supervisor_default_container_budget_matches_module_default():
     sup = WorkerSupervisor("w-dflt", FakeCM(), None, feature_flag_check=lambda: True)
-    assert sup._max_container_count == DEFAULT_MAX_CONTAINERS == 4
+    assert sup._max_container_count == DEFAULT_MAX_CONTAINERS == 6
 
 
 # ---------------------------------------------------------------------------

@@ -372,7 +372,7 @@ def _sweep_orphan_resource_containers():
 # Idle TTL (seconds) after which an EXITED generic workspace container is
 # removed at startup. Tune via env override if needed.
 _EXITED_CONTAINER_SWEEP_MAX_AGE_S = int(
-    os.environ.get('THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S', '3600')
+    os.environ.get('THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S', '86400')
 )
 
 
@@ -3013,13 +3013,13 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
         containers = manager.list_containers() or []
         containers_in_use = len(containers)
         # Session container cap: ContainerManager.max_containers (workspace
-        # config.json, default 4; clamped >= 1, mirroring
+        # config.json, default 6; clamped >= 1, mirroring
         # ContainerManager._get_max_containers()).
-        raw_cap = getattr(manager, "max_containers", 4)
+        raw_cap = getattr(manager, "max_containers", 6)
         try:
             cap = max(1, int(raw_cap))
         except (TypeError, ValueError):
-            cap = 4
+            cap = 6
         return {
             "containers": containers,
             "containers_in_use": containers_in_use,
