@@ -627,6 +627,7 @@ class WorkerSupervisor:
                 session_id or self.worker_id,
                 permissions if isinstance(permissions, dict) else {},
                 image=image,
+                workspace_id=getattr(cm, "workspace_id", None),
             )
         else:
             result = cm.start(image=image, name=name, note=note)

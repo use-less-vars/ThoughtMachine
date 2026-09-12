@@ -251,7 +251,8 @@ class ContainerRegistry:
             return True
 
     def request_container(self, worker_id, session_id, permissions, *,
-                          image=None, command=None, **kwargs) -> dict:
+                          image=None, command=None, workspace_id=None,
+                          **kwargs) -> dict:
         """Create + register a hardened container.
 
         Mirrors WorkerSupervisor.request_container
@@ -259,7 +260,8 @@ class ContainerRegistry:
         profile fields (``mem_limit``, ``cpu_quota``, ``oom_score_adj``,
         ``labels``, ``environment``, ``mounts``, ``tmpfs``, ``extra_hosts``,
         ``volumes``), plus ``container_type`` (default "user"),
-        ``workspace_id`` (default "ws") and ``session_config`` (used for
+        ``workspace_id`` (REQUIRED — no default; fails closed on a
+        missing/blank value) and ``session_config`` (used for
         ``container_limits.max_containers``).
 
         Raises:
@@ -268,7 +270,8 @@ class ContainerRegistry:
           PermissionError  for resource-container requests (image ==
                         RESOURCE_IMAGE_TAG, container_type == "resource", or
                         a tm-res-* name hint).
-          ValueError   for an unknown container_type.
+          ValueError   for an unknown container_type, or a missing/blank
+                        workspace_id (required; fail-closed, no default).
 
         Returns a handle dict: {"id", "name", "status": "running",
         "container_type"}.
@@ -283,7 +286,15 @@ class ContainerRegistry:
             raise ValueError(f"Unknown container type: {container_type!r}")
 
         session_config = kwargs.pop("session_config", None)
-        workspace_id = kwargs.pop("workspace_id", None) or "ws"
+
+        # workspace_id is REQUIRED and fail-closed: there is no default
+        # workspace bucket, so a missing/blank id must never silently collapse
+        # every caller onto one shared "ws" budget/label namespace.
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError(
+                "request_container: workspace_id is required and must be a "
+                "non-empty string (fail-closed: no default 'ws' bucket)"
+            )
 
         # Resource guard (design doc §2.7; mirrors WLM L575-594): worker
         # sub-agents cannot request resource containers.

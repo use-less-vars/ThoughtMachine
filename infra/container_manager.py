@@ -727,6 +727,7 @@ class ContainerManager:
                     self.session_id or "default",
                     self.session_permissions or {},
                     image=image,
+                    workspace_id=self.workspace_id,
                     mem_limit=self.mem_limit,
                     cpu_quota=self.cpu_quota,
                     oom_score_adj=1000,
