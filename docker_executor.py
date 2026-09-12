@@ -212,6 +212,93 @@ def _resolve_container_config_via_gate(workspace_id, session_permissions):
     return network_mode, workspace_mode
 
 
+def _integrity_container_name(obj):
+    """Return *obj*'s container name when it is a real string, else empty.
+
+    Mocked / partially-populated container objects expose a non-string
+    ``name``; such objects are treated as "no name" rather than misclassified.
+    """
+    name = getattr(obj, "name", None)
+    return name if isinstance(name, str) else ""
+
+
+def _is_resource_container(obj):
+    """True when *obj* is a hidden resource container that must be left alone.
+
+    Resource containers (``tm-res-*`` names / the ``thoughtmachine.resource``
+    label) are shared workspace infrastructure owned by the resource container
+    manager.  ``verify_container_integrity`` must never inspect them for
+    integrity drift nor stop/remove them.
+    """
+    if _integrity_container_name(obj).startswith("tm-res-"):
+        return True
+    labels = getattr(obj, "labels", None)
+    if isinstance(labels, dict) and labels.get("thoughtmachine.resource"):
+        return True
+    return False
+
+
+def _find_container_via_record(client, workspace_id):
+    """Return the workspace's integrity-managed container via the record store.
+
+    Primary lookup path.  Each persistent record owns exactly one Docker label
+    (``thoughtmachine.container_id`` → record id, §7).  We enumerate the
+    workspace's records, resolve each persistent record's live container by
+    that label, and return the first candidate that survives the integrity
+    guards (persistent lifecycle + non-resource name).  Returns ``None`` when no
+    record-owned container is found (the caller then falls back to name math).
+    """
+    if not workspace_id:
+        return None
+    try:
+        from thoughtmachine.container_record import (
+            LIFECYCLE_PERSISTENT,
+            RECORD_LABEL_KEY,
+            list_records,
+        )
+    except Exception:
+        return None
+    try:
+        records = list_records(workspace_id)
+    except Exception as exc:
+        log("WARNING", "docker.verify_integrity",
+            f"record store lookup failed for workspace {workspace_id}: {exc}")
+        return None
+    for record in records:
+        # Resource / ephemeral / service records are never integrity-managed,
+        # even when a live container carries the record label.
+        if getattr(record, "lifecycle_class", None) != LIFECYCLE_PERSISTENT:
+            continue
+        try:
+            live = client.containers.list(
+                all=True,
+                filters={"label": f"{RECORD_LABEL_KEY}={record.id}"},
+            )
+        except Exception as exc:
+            log("WARNING", "docker.verify_integrity",
+                f"label lookup failed for record {record.id}: {exc}")
+            continue
+        for candidate in live or []:
+            if _is_resource_container(candidate):
+                continue
+            return candidate
+    return None
+
+
+def _resolve_integrity_container(client, workspace_id, container_name):
+    """Resolve the live container to verify for *workspace_id*.
+
+    Primary: the record-store label lookup (:func:`_find_container_via_record`).
+    Fallback: the legacy ``agent-exec-<hash>`` name lookup, kept for containers
+    that predate the record store (or workspaces with no resolvable id).
+    Raises ``docker.errors.NotFound`` when the fallback name lookup misses.
+    """
+    container = _find_container_via_record(client, workspace_id)
+    if container is not None:
+        return container
+    return client.containers.get(container_name)
+
+
 def verify_container_integrity(
     workspace_path: str,
     session_permissions: dict = None,
@@ -280,11 +367,21 @@ def verify_container_integrity(
             "mismatch_reason": f"Docker unavailable: {exc}",
         }
 
-    # Look up container
+    # Look up container.
+    #
+    # Primary: resolve via the container-record store (durable, label-driven
+    # identity) so lookup is robust to the container name drifting from the
+    # path-derived ``agent-exec-<hash>`` convention.  Fallback: the legacy
+    # name-based lookup, kept for containers that predate the record store.
     try:
-        container = client.containers.get(container_name)
-        container.reload()
+        container = _resolve_integrity_container(
+            client, workspace_id, container_name
+        )
+        if container is not None:
+            container.reload()
     except docker.errors.NotFound:
+        container = None
+    if container is None:
         log("DEBUG", "docker.verify_integrity",
             f"No existing container for {workspace_path}",
             {"container_name": container_name})
