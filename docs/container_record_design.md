@@ -25,7 +25,7 @@ sync as it lands.
 6. [Scope Guardrails](#6-scope-guardrails)
 7. [Docker Label Contract](#7-docker-label-contract)
 8. [Non-Goals](#8-non-goals)
-9. [Open Questions for Main](#9-open-questions-for-main)
+9. [Questions Resolved](#9-questions-resolved)
 
 ---
 
@@ -36,7 +36,8 @@ per container** (target arch §10). The authoritative field list is:
 
 | Field | Type | Required | Default | Meaning |
 |---|---|---|---|---|
-| `id` | string | yes | — (UUID4, generated at create) | Opaque subsystem identifier; stable across container recreate. See §2 for UUID4-vs-short-hash. |
+| `id` | string | yes | — (UUID4, generated at create) | **Record-owned** opaque identifier; stable across container recreate. See §2.2. |
+| `docker_id` | string | yes | `""` | Current Docker container id; empty on an intent record before create. |
 | `lifecycle_class` | string enum | yes | — | One of the four classes in target arch §3 move5: `ephemeral`, `persistent`, `resource`, `service`. |
 | `owner` | string enum | yes | — | `workspace-owned` \| `system-owned` (target arch §2). |
 | `purpose` | string | yes | `""` | Human-readable reason the container exists. |
@@ -45,9 +46,9 @@ per container** (target arch §10). The authoritative field list is:
 | `event_log` | array | yes | `[]` | Append-only lifecycle + drift events (target arch §2, §3 move6). Entry shape below. |
 | `schema_version` | int | yes | `0` | `0` for records synthesised from live legacy state (target arch §2, §5). |
 | `inferred` | bool | yes | `false` | `true` when the record was synthesised from live Docker state rather than authored (target arch §2, §5). |
-| `migrated` | bool | yes | `false` | **Addition (deviation — see §1.3).** `true` when the record came from the legacy synthesis pass. |
-| `created_at` | string (ISO-8601) | yes | now | **Addition (deviation — see §1.3).** Record creation time. |
-| `updated_at` | string (ISO-8601) | yes | now | **Addition (deviation — see §1.3).** Last mutation time. |
+| `state` | string | yes | `""` | Last observed container state; read by boot-drift (target arch §6). |
+| `created_at` | string (ISO-8601) | yes | now | Record creation time; read by UI ordering in `list_records()` (§1.3). |
+| `updated_at` | string (ISO-8601) | yes | now | Last mutation time; read by staleness display in drift events (§1.3). |
 
 ### 1.1 `intent_snapshot` nested fields
 
@@ -77,27 +78,36 @@ needs; not full configs":
 | `actor` | string | Who/what produced the event (`user`, `system`, `migration`, worker name). |
 | `payload` | object | Minimal UI/decision payload — never a full config dump. |
 
-### 1.3 Deviations from target arch §2
+**Embedded with a size ceiling.** The log stays embedded in `<id>.json` while it is below
+**256 KiB**; once an append would push the file past that threshold, the log moves to a
+sidecar `<id>.events.jsonl` (see §2.4). This keeps the common case self-contained without
+letting the record grow without bound.
 
-The target arch §2 states the field list is "exactly `id`, `lifecycle_class`, `owner`,
-`purpose`, `intent_snapshot`, `notes`, `event_log`", that "`schema_version`, `inferred` and
-`state` are the only additions", and that **"No other field exists."** It repeats the fence
-in §10: a record "carries ONLY fields that a named move reads. A field that no move reads
-does not exist."
+### 1.3 Field list, with readers
 
-This design's checklist-driven field list deviates in three directions, all flagged for Main
-(§9):
+Every field has a named reader; nothing is carried without one (target arch §10). This is the
+settled field list — target arch §2's "No other field exists" and §10's "A field that no move
+reads does not exist" are satisfied:
 
-1. **Three additions.** `migrated`, `created_at` and `updated_at` are **not** in §2, so they
-   contradict "No other field exists" / §10 unless a named reader is identified. Either a
-   reader must be named (e.g. `updated_at` for staleness display, `created_at` for ordering,
-   `migrated` to mark synthesis provenance) or the fields must be dropped.
-2. **One omission.** §2 lists `state` (the last observed state) — read by boot-drift (§6).
-   The checklist omits it. **Recommendation: keep `state`.** Moved to open questions (§9).
-3. **`id` redefinition.** `id` is deliberately redefined as a record-owned opaque identifier
-   (UUID4 / short hash), with the Docker id carried in a separate `docker_id` field; target
-   arch §2 instead defines `id` as *the Docker container id once created*. This redefinition is
-   not what §2's field list contemplates — see §9 Q1 for Main to confirm.
+| Field | Reader |
+|---|---|
+| `id` | every function (§3) |
+| `docker_id` | create, start, `find_by_docker_label` (§3) |
+| `lifecycle_class` | restart policy, admission gate, GC (target arch §3 moves 4–5) |
+| `owner` | UI display, agent ownership |
+| `purpose` | UI display |
+| `intent_snapshot` | drift check (target arch §6) |
+| `notes` | UI, agent handoff |
+| `event_log` | UI, audit |
+| `schema_version` | migration, integrity |
+| `inferred` | integrity (provenance), migration |
+| `state` | boot-drift (target arch §6) |
+| `created_at` | UI ordering (`list_records`) |
+| `updated_at` | UI staleness (drift events) |
+
+`id` is record-owned and opaque (UUID4, §2.2); the Docker container id lives in the separate
+`docker_id` field. Synthesis provenance is fully expressed by `schema_version >= 1` together
+with `inferred`; no separate flag is carried (see §9 Q3).
 
 ---
 
@@ -118,45 +128,50 @@ Records live under the resolved vault root, one directory per workspace:
 `container_notes.json`, `Dockerfile` and `requirements.txt`, so the record is co-located
 with the workspace it belongs to.
 
-### 2.2 The `<id>` token — UUID4 (chosen)
+### 2.2 The `<id>` token — record-owned UUID4 (settled)
 
-**Decision: `<id>` is an opaque UUID4 string.**
+**Decision: `<id>` is a record-owned, opaque UUID4 string.**
 
-- **Why.** Collision-free, generated without a central counter, stable across container
-  recreate, and it leaks no coordinates (it is not derivable from the Docker id, name, or
-  workspace). It is also the natural primary key for the label contract in §7 — the value
-  must be a token that the record, not Docker, owns.
+- **Why.** The record owns its own identity: no coordination or collision key is required, the
+  id is generated without a central counter, it stays stable across container recreate, and it
+  leaks no coordinates (not derivable from the Docker id, name, or workspace). It is also the
+  natural primary key for the label contract in §7 — the value must be a token the record, not
+  Docker, owns. The Docker container id is carried separately in `docker_id` (§1).
 - **Rejected alternative — short hash** (e.g. `sha256(docker_id)[:12]`). Deterministic, so
   migration could re-derive an id without a log — but it *derives from an external key*, so
   it changes if the container is recreated, and it leaks the Docker id's coordinates into
-  the filesystem path. Rejected; retained as an open question (§9).
+  the filesystem path. Rejected (settled).
 
-### 2.3 Lock file
+### 2.3 Lock file (settled)
 
 **Decision: a sidecar lock `<id>.json.lock` held via `fcntl.flock(..., LOCK_EX)` with a
 bounded timeout; on timeout raise (fail closed).**
 
 - The lock is acquired around every read-modify-write of `<id>.json` (§3).
-- **Cross-platform caveat.** `fcntl` is POSIX-only; it does not exist on Windows. The
-  project supports Windows (`docs/windows_installation_saga.md`,
-  `docs/windows_stability_contract.md`), so on Windows the design degrades to the atomic
-  write (`temp file + os.replace`) **alone**, which gives crash-safety but **no cross-process
-  exclusion**, or an `msvcrt`/`portalocker` shim. This gap is an open question (§9).
+- **Windows is best-effort, not a target.** `fcntl` is POSIX-only. Windows is explicitly
+  **not** a target platform for the record subsystem, so on Windows the design degrades to
+  the atomic write (`temp file + os.replace`) **alone** — crash-safety but **no cross-process
+  exclusion**. This is documented as best-effort, not a supported guarantee.
 - **Windows meaning:** without a lock, concurrent writers can lose updates; atomic replace
   bounds the damage to "last writer wins" and never a torn file.
 
-### 2.4 Event-log location — embedded (chosen)
+### 2.4 Event-log location — embedded, with a 256 KiB ceiling (settled)
 
-**Decision: the event log is the embedded `event_log` array inside `<id>.json`.**
+**Decision: the event log is the embedded `event_log` array inside `<id>.json`, until it
+exceeds 256 KiB; above that threshold it moves to a sidecar `<id>.events.jsonl`.**
 
 - Target arch §2 models `event_log` as a field of the record, and §3 move6 / §6 describe the
   record as carrying the append-only log. Embedding keeps the record self-contained.
+- **Threshold.** While the log is below **256 KiB** it stays embedded (§1.2). Once an append
+  would push the file past 256 KiB, the log moves to a sidecar `<id>.events.jsonl` and the
+  embedded `event_log` becomes a pointer to it. This bounds the record file size without
+  splitting the common (small) case.
 - **Tradeoff:** appending rewrites the whole file — the same class of race as the
   `container_notes.json` lost-update defect (audit probe-v2: `LOST_UPDATES=19 of 24`). The
   lock (§2.3) plus atomic replace is therefore **mandatory**, not optional.
-- **Rejected alternative — sidecar `.events.jsonl`.** Append-only and cheap, but splits the
-  record and invites divergence. Rejected; retained as an open question (§9). Note target
-  arch §8's phrase "the append-only event log is a file" is ambiguous about which file.
+- **Rejected alternative — always-sidecar `.events.jsonl`.** Append-only and cheap, but it
+  splits the record for the common case and invites divergence. Rejected (settled); the
+  sidecar is used only above the 256 KiB ceiling.
 
 ### 2.5 Notes location — field (confirmed)
 
@@ -228,32 +243,32 @@ a container or its labels.
 2. `docker inspect` all containers carrying `thoughtmachine.workspace_id`.
 3. For each container, compute its `docker_id`. **Skip if already logged** in
    `migrations.log` (§4.2) *and* the corresponding record file is present.
-4. Synthesise the record: `schema_version: 0`, `inferred: true`, `migrated: true`,
+4. Synthesise the record: `schema_version: 0`, `inferred: true`,
    `lifecycle_class`/`owner` derived from container type (§4.1), `intent_snapshot` = the
    **partial** snapshot recoverable from inspect (missing keys left empty — never
-   fabricated), `event_log` seeded with a `migrated` event.
+   fabricated), `event_log` seeded with a `synthesised` event.
 5. **Write-ahead:** append `{docker_id, record_id, ts}` to `migrations.log` and `fsync`
    **before** writing the record file.
 6. Write `<id>.json` atomically (temp + `os.replace`).
 7. Continue to the next container; repeat per workspace.
 
-### 4.1 Label reality check (deviation)
+### 4.1 Label reality check (settled)
 
-The checklist specifies reading `thoughtmachine.workspace_id`, `thoughtmachine.session_id`
-and `thoughtmachine.resource`. **`thoughtmachine.session_id` is absent from the production label set**
-(`thoughtmachine.workspace_id` / `thoughtmachine.worker` / `thoughtmachine.container_type` /
-`thoughtmachine.resource`); it appears only as a test mock
-(`tests/docker_integration/test_startup_check.py:312`). Session ownership is encoded inside
-`thoughtmachine.worker` =
-`<session_id or 'unknown'>:<worker_name>`, and container type is carried by
-`thoughtmachine.container_type` (`free_use` / `resource`). Migration must therefore derive
-session from `thoughtmachine.worker` (or leave it empty) and use `thoughtmachine.container_type`
-+ `thoughtmachine.resource` to classify. Flagged (§9).
+The production Docker label set is `thoughtmachine.workspace_id` / `thoughtmachine.worker` /
+`thoughtmachine.container_type` / `thoughtmachine.resource`. `thoughtmachine.session_id` is
+**not** a production Docker label: it appears only as a test mock
+(`tests/docker_integration/test_startup_check.py:312`) and as an unrelated environment
+variable (`infra/container_env.py:18`). Migration therefore derives session from
+`thoughtmachine.worker` when present — session owner is encoded there as
+`thoughtmachine.worker = <session_id or 'unknown'>:<worker_name>` — and leaves it empty when
+the label is absent; it never assumes `thoughtmachine.session_id` exists. Container type is
+carried by `thoughtmachine.container_type` (`free_use` / `resource`), and resource
+containers are identified by `thoughtmachine.resource`.
 
 ### 4.2 Idempotency — write-ahead log under UUID4
 
-Because `id` is an opaque UUID4 (§2.2), a migration re-run cannot re-derive the id from the
-container. The durable **write-ahead** entry in `migrations.log` closes this gap:
+Because `id` is a record-owned opaque UUID4 (§2.2), a migration re-run cannot re-derive the
+id from the container. The durable **write-ahead** entry in `migrations.log` closes this gap:
 
 - A `docker_id` already present in the log is skipped (no duplicate record).
 - A `docker_id` present in the log whose **record file is missing** (crash between step 5
@@ -323,25 +338,35 @@ the thing that acts on containers.
 
 ## 7. Docker Label Contract
 
-**The record owns exactly one label on the container:**
+**The record owns exactly one *record* label on the container:**
 
 ```
 thoughtmachine.container_id=<id>
 ```
 
-- **Nothing else.** The record does not add labels beyond this single lookup key.
+- **One record-owned label.** The *record* system adds exactly this single lookup key
+  (`thoughtmachine.container_id`, value = the record's `id`). It adds no other record label.
+- **Existing infrastructure labels remain (dual-label transition).** The infra labels current
+  readers depend on — `thoughtmachine.workspace_id`, `thoughtmachine.resource`,
+  `thoughtmachine.container_type` — stay on the container during the transition. They are
+  consumed today by `ContainerManager.cleanup_workspace()` (`infra/container_manager.py`
+  label filter ~L1748–1750) and `sweep_exited_workspace_containers()` (`_WORKSPACE_LABEL`
+  defined ~L1833 and applied ~L1900, skipping `_RESOURCE_LABEL` ~L1859), and are defined in
+  `agent/config/defaults.py:118` (`RESOURCE_LABEL = "thoughtmachine.resource"`) and `:120`
+  (`WORKSPACE_ID_LABEL = "thoughtmachine.workspace_id"`). The record label and the infra
+  labels coexist; nothing breaks.
 - **All lookups go through the record.** Given a label value, `find_by_docker_label(label_value)`
   (§3) resolves the record; callers do not re-encode state in labels.
 - **The label is a lookup key, not the source of truth.** The `<id>.json` file is the source
   of truth; the label is only a pointer to it. If the two disagree, the record wins.
 
-> **Conflict to resolve (flagged, §9).** "Exactly one label" collides with existing sweep
-> machinery that **depends on `thoughtmachine.workspace_id`**:
-> `ContainerManager.cleanup_workspace()` and `sweep_exited_workspace_containers()`
-> (`infra/container_manager.py` ~L1749, L1850) filter by `thoughtmachine.workspace_id`, and
-> resource containers are identified by `thoughtmachine.resource`. Reducing the contract to a
-> single label would break those sweeps. Either the "one label" rule is scoped to *record
-> labels* (leaving infrastructure labels intact) or the sweeps must be migrated first.
+**Retirement criteria for the infrastructure labels.** The infra labels may be dropped only
+once **all three** hold:
+
+1. Every container has a record with `schema_version >= 1` **and** `inferred: false` (natively captured, not synthesised).
+2. **Both** sweeps — `cleanup_workspace()` and `sweep_exited_workspace_containers()` — read
+   the record instead of the label, verified by a test.
+3. Four weeks of production with no orphan found by a record-only sweep.
 
 ---
 
@@ -360,21 +385,26 @@ Consistent with the target arch §8 fence, the Container Record subsystem does *
 
 ---
 
-## 9. Open Questions for Main
+## 9. Questions Resolved
 
-1. **UUID vs short hash** — pick UUID4 or a deterministic short hash? (Blocks §2.2 and the
-   migration idempotency strategy in §4.2.) Also confirm whether `id` may be redefined as
-   record-owned at all, since target arch §2 defines `id` as the Docker container id (see §1.3).
-2. **`state` field** — §2 lists `state` and boot-drift (§6) reads it, but the checklist omits
-   it; do we keep `state`? (Blocks the §1 schema table.)
-3. **`migrated` / `created_at` / `updated_at`** — §2 says "No other field exists"; name a
-   reader for each or drop them? (Blocks §1.)
-4. **Event-log location** — embedded `event_log` array vs sidecar `.events.jsonl`? (Blocks
-   §2.4.)
-5. **Lock semantics** — is `fcntl.flock` + bounded timeout acceptable given the Windows
-   fallback loses cross-process exclusion? (Blocks §2.3.)
-6. **Single-label contract** — does "exactly one label" supersede the existing
-   `thoughtmachine.workspace_id` sweeps, or are the two label sets reconciled first? (Blocks
-   §7.)
-7. **Session signal** — since `thoughtmachine.session_id` does not exist, derive session from
-   `thoughtmachine.worker`, or leave it empty? (Blocks §4.1.)
+Each question below was open at draft time. All seven are now **resolved**; the list is kept
+for history.
+
+1. **UUID vs short hash** — **RESOLVED: UUID4.** `id` is a record-owned opaque UUID4 string
+   (§2.2); the Docker container id lives in the separate `docker_id` field (§1). See §1.3 /
+   §2.2.
+2. **`state` field** — **RESOLVED: keep `state`.** It is in the §1 field list; its reader is
+   boot-drift (target arch §6). See §1.3.
+3. **`migrated` / `created_at` / `updated_at`** — **RESOLVED: drop `migrated`; keep
+   `created_at` and `updated_at`.** `migrated` was redundant with `schema_version >= 1` +
+   `inferred`; `created_at` is read by UI ordering in `list_records()` and `updated_at` by
+   staleness display in drift events. See §1.3.
+4. **Event-log location** — **RESOLVED: embedded `event_log`, with a 256 KiB ceiling.** Above
+   256 KiB the log moves to a sidecar `<id>.events.jsonl`. See §1.2 / §2.4.
+5. **Lock semantics** — **RESOLVED: accept `fcntl.flock` with a bounded timeout.** Windows is
+   best-effort and explicitly not a target platform. See §2.3.
+6. **Single-label contract** — **RESOLVED: the "one label" rule is scoped to record-owned
+   labels only.** Infra labels stay during the transition; retirement criteria are in §7. See
+   §7.
+7. **Session signal** — **RESOLVED: derive session from `thoughtmachine.worker` when present;
+   empty otherwise.** `thoughtmachine.session_id` is not a production label. See §4.1.
