@@ -8,6 +8,8 @@ A container is a WORKSPACE MACHINE — the runtime for computational work the us
 
 This audit reads the shipped container code against that intent and records where the two diverge. The headline is that the subsystem works, but it is **fragmented**: four independent create paths, two competing configuration sources-of-truth, and a described "contract" whose numbers and guarantees do not match the source in several load-bearing places.
 
+**Companion document.** A separate **Target Architecture** document sets out where the container subsystem is going; this audit is *where we are*, that document is *where we're going*.
+
 ---
 
 ## 1. Container taxonomy
@@ -52,11 +54,17 @@ A container's life, end to end (with the host-level events the contract asks abo
 
 **Host reboot.** **No container carries a restart policy** — see §5 / §11(f). After a reboot or Docker daemon restart all containers (workspace and resource) remain stopped and are re-created on demand.
 
+**Finding:** The lifecycle performs no preflight host free-disk check, so a full host disk is an unhandled failure mode.
+
 **Host out of disk.** **There is no host free-disk check anywhere in `infra/`** — confirmed by both source and live probe v2. Source: **0** host-free-disk-check patterns (`disk_usage`/`statvfs`/free-space) in `infra/`+`tools/`; the only disk introspection is an in-container `du` (`container_manager.py:1083-1089,1196-1203`), and `disk_quota_mb` governs only the `/home/agent/.local` package-cache volume (the 6 generic `disk_usage` hits measure container-volume usage only). Live: host `/` is **368 G with 20.99 GiB free (94 % used)**. A full host disk is therefore an unhandled failure mode — now a **live-confirmed** gap, not merely a source-level fact.
+
+**Disposition:** CHANGED — DECISION: the precondition moves into the admission gate (move 4); no longer a parking-lot item. Today 94% used / ~21 GiB free.
 
 ---
 
 ## 3. Limits
+
+**Finding:** The shipped per-workspace container limit is 4 (`DEFAULT_MAX_CONTAINERS`), and the limit axes disagree across paths.
 
 **The contract says "one persistent-container count per workspace, default 6." The source says 4.**
 
@@ -72,11 +80,15 @@ A container's life, end to end (with the host-level events the contract asks abo
 
 **At the limit.** The manager refuses the create and returns an error to the caller (tool surface). The user-facing counter exists only in the ORPHANED frontend tab (§7), so the live UI does not display remaining capacity. *(the exact refusal error text is tool-surface dependent — unverified — needs runtime check.)*
 
+**Disposition:** CHANGED — DECISION: the limit becomes 6, per-workspace, user-configurable; DEFAULT_MAX_CONTAINERS is the single source of truth across all sites, and the worker default unifies with the workspace budget.
+
 ---
 
 ## 4. Permissions and drift
 
 **The contract says every container "carries a snapshot of the permissions it was created with," drift is computed from that snapshot and surfaced where the user can act on it, and the user decides keep-vs-recreate — "NO SILENT KILLS, EVER." The source does not match this.**
+
+**Finding:** Containers do NOT carry a permission snapshot; drift is recomputed against live Docker state, and on drift the manager silently recreates (contradicting "NO SILENT KILLS, EVER").
 
 **No per-container permission snapshot was found** (*unverified — needs runtime check*). Instead, drift is computed by comparing **live Docker state** (actual `NetworkMode` + `/workspace` mount mode) against a **freshly recomputed** desired config: `_config_matches` (`infra/container_manager.py:1678-1704`) and the integrity recompute (`docker_executor.py:508-557`).
 
@@ -97,15 +109,25 @@ A container's life, end to end (with the host-level events the contract asks abo
 
 **mem/cpu axis.** It is not permission-derived and has no recompute helper, but it shows the same class of divergence as **static per-path defaults** (§8); `_config_matches` does not compare mem/cpu, so mem/cpu drift is silently reused.
 
+**Disposition:** SUPERSEDED — TARGET ARCHITECTURE (move 2: one fail-closed config function replaces both SSOTs; move 6: drift becomes discrete recorded events the user decides on, so no silent kills). The interim branch fix/container-permission-snapshot is superseded by feat/drift-events.
+
 ---
 
 ## 5. GC policy
+
+**Finding:** The EXITED-container sweeper's default max age is 1 hour (`max_age_s=3600`), not the contract's 24 hours.
 
 **The contract says "only stopped containers, after N hours (default 24h)." The source says 1 hour.**
 
 **FINDING (D2).** `sweep_exited_workspace_containers(..., max_age_s=3600)` (`container_manager.py:1846-1985`); env override `THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S`, default `'3600'` (`server.py:374-376`). **24h appears nowhere found.**
 
+**Disposition:** CHANGED — DECISION: 24 h (max_age_s=86400, env default 86400).
+
+**Finding:** The sweeper removes only EXITED containers and always skips resource (and running) containers.
+
 Mechanics: the sweeper removes **only `status=="exited"`** containers past the age (`:1936,1949`). It always **skips resource containers** (`:1921-1925`) and running containers. It skips unparseable/future `FinishedAt` for clock-skew safety (`:1940-1948`). Removal is `force=True` (`:1965`). It is **label-based** (`thoughtmachine.workspace_id`, `:1829,1896`), so it covers BOTH the legacy `agent-exec-*` (which stamps the workspace label, `docker_executor.py:675-680`) and the manager's `tm-user-*` (`container_manager.py:689-693`). **Running containers are never GC'd.** Workspace files persist on disk regardless — the sweeper does not delete host workspace files (`container_manager.py:678`). `registered_workspace_ids==[]` → no-op; `None` → TTL-only. Resource side: `sweep_stale_resource_containers` (`resource_container_manager.py:1896-1954`, only unregistered workspace ids), `prune_unreferenced_resource_images` (`:2020-2098`), `_sweep_orphan_resource_containers` (`server.py:331-366`).
+
+**Disposition:** ADOPTED AS-IS (resource containers are skipped by the workspace sweeper — correct).
 
 Wiring: `_sweep_exited_workspace_containers` (`server.py:379-428`), `_run_container_sweeps` (`:440-453`), `_periodic_container_sweep_loop` (`:456-472`); interval env `THOUGHTMACHINE_CONTAINER_SWEEP_INTERVAL_S` default 300 (`:435-437`); wired in the lifespan (`:583,:590`, task `:595-597`).
 
@@ -119,9 +141,13 @@ Containers have names (§1) and, by design, **sticky notes that are NOT Docker l
 
 **Save (`_save_container_notes`, `:403-417`) DOES create its own parent directory.** L404 docstring "Atomically persist the bulletin board; NEVER raises"; L405 `notes_path = self._notes_path()`; L406 `try:`; **L407 `notes_path.parent.mkdir(parents=True, exist_ok=True)`**; L408 `tmp_path = notes_path.with_suffix(".json.tmp")`; L409 `with open(tmp_path, "w", encoding="utf-8") as f:`; L410 `json.dump(...)`; L411 `os.replace(tmp_path, notes_path)`; L412 `except (OSError, ValueError)` → WARNING L413-414 (blame origin `3067fe39`). **Any claim that a save fails to create its parent is WRONG** — L407's `mkdir(parents=True, exist_ok=True)` self-heals a missing parent (live-confirmed below). Written on fresh create (`:535-537`) and on reuse (`:603-608`); read by `list_containers` (`:1281-1282`). The legacy path stamps an **always-empty** `thoughtmachine.note` label (`docker_executor.py:675-680`).
 
+**Finding:** The notes file's temp name is a fixed, shared path opened without `O_EXCL`, and the read-modify-write is unlocked — concurrent saves lose updates.
+
 **REAL notes defect — CONFIRMED LIVE (probe v2).** The "atomic via tmp + `os.replace`" framing hides **two distinct races**: (i) the temp filename is a **fixed, shared** per-workspace name (`tmp_path = notes_path.with_suffix(".json.tmp")` → `container_notes.json.tmp`, identical for every writer) opened `"w"` with **no exclusive create** (no `O_EXCL`), and (ii) the read-modify-write cycle around it is **unlocked**. Live **phase A** (parent dir EXISTS; 3 forked processes × 8 non-dry writes; 0.064 s): expected 24 notes, **5 surviving, LOST_UPDATES=19**; `os.replace` was called 24 times with **8 FAILED** (source tmp already renamed away by another writer), all `ENOENT` — first message `FileNotFoundError: [Errno 2] No such file or directory: '…/container_notes.json.tmp' -> '…/container_notes.json'`; per-process replace_fails **3/4/1**. A **second, independent** mechanism is visible in the `_diag_` traces: a **stale in-memory snapshot clobber** — the surviving key count moved 8 → 1/2 mid-run (proc0 iter6 nkeys=8, then proc1 iter4 nkeys=1) because each writer dumps back its whole stale dict. Live **phase B** (single writer, parent MISSING) shows the mkdir self-heal: `parent existed_before=False → after=True`, **8/8 surviving, SILENT_WRITE_FAILURES=0**. The two headline numbers must **not** be conflated: (a) `lost_updates(parent EXISTS)=19` versus (b) `silent_write_failures(parent MISSING)=0`. Additional live corruption evidence: one `Failed to read container notes … Expecting value: line 1 column 1 (char 0)` plus 8 real `Failed to write container notes` WARNINGs ⇒ a non-exclusive truncating open can publish a partial document under interleaving.
 
 **Agent surface.** Notes are readable/writable **only** through `ContainerStartTool.note` (`tools/container_control.py:192-195,:222,:236`) and readable via `ContainerListTool` (`:456`). `ContainerManager.set_note` exists but is **not** exposed as an agent tool. There are **no rename / claim / handoff / release tools.** The only "claim" concept is worker teardown reclaiming containers by exact `thoughtmachine.worker` label (`tools/workspace/worker_container.py:22-30`; `tools/docker_code_runner.py:188-195`; `ContainerStartTool.worker_name` `:206-213`). ⇒ the contract's "hand off containers between sessions, mark containers free" tool surface is **not implemented**.
+
+**Disposition:** SUPERSEDED — TARGET ARCHITECTURE (move 1: notes become a field in the Container Record; move 7: fix/notes-as-record-field). Ownership: free-use containers are workspace-owned, resource containers are system-owned; ContainerManager.set_note is exposed as an agent tool; rename/claim/handoff/release are Phase 3.
 
 ---
 
@@ -139,6 +165,8 @@ Three surfaces exist. The full lifecycle REST API (§9) is present on the backen
 ---
 
 ## 8. Resource allocation
+
+**Finding:** Memory/CPU/OOM defaults disagree by create path, and there is no user-facing mem/cpu configuration surface.
 
 Axes: **memory (`mem_limit`), CPU (`cpu_quota`), and OOM adjustment** only. There is **no `pids_limit` and no `nano_cpus` anywhere** in `infra/` (grep).
 
@@ -158,11 +186,15 @@ Defaults disagree by path:
 
 **Disk is out of scope.** There is no host-disk enforcement; `disk_quota_mb` governs only the `/home/agent/.local` package-cache volume; the workspace is a bind mount and `/tmp`+`/home/agent` are tmpfs (64M / 256M). Any disk story is deferred.
 
-**Registry feature flag — CONFIRMED LIVE (probe v2).** Registry activation is derived from `session_config["use_container_registry"]` and reported consistently by two flag helpers: `is_registry_active` (`infra/registry_wiring.py:55`) and `is_container_registry_enabled` (`infra/container_registry.py:663-667`, `:667 return bool((session_config or {}).get("use_container_registry", False))`) both return **True / False / False** for configs **True / False / `{}`**. **Latent trap:** `get_active_registry` (`infra/registry_wiring.py:29`) returns a real `ContainerRegistry` object for **all three** configs — including `False`, where it builds a disabled, docker-free registry — so callers must gate on `is_registry_active` / `is_container_registry_enabled`, **never on the truthiness of the registry object**. *(Probe-v2 pin note: the probe listed `registry_wiring.py:27`/`:53` and `container_registry.py:661`/`:668`; the read-verified lines are `registry_wiring.py:29`/`:55` and `container_registry.py:663-667` — cited here after re-reading.)*
+**Registry feature flag — CONFIRMED LIVE (probe v2).** Registry activation is derived from `session_config["use_container_registry"]` and reported consistently by two flag helpers: `is_registry_active` (`infra/registry_wiring.py:55`) and `is_container_registry_enabled` (`infra/container_registry.py:663-667`, `:667 return bool((session_config or {}).get("use_container_registry", False))`) both return **True / False / False** for configs **True / False / `{}`**. **Latent trap:** `get_active_registry` (`infra/registry_wiring.py:29`) returns a real `ContainerRegistry` object for **all three** configs — including `False`, where it builds a disabled, docker-free registry — so callers must gate on `is_registry_active` / `is_container_registry_enabled`, **never on the truthiness of the registry object**.
+
+**Disposition:** ADOPTED AS-IS (live-confirmed); mem/cpu/oom drift handling is covered by the §4 disposition. *(Probe-v2 pin note: the probe listed `registry_wiring.py:27`/`:53` and `container_registry.py:661`/`:668`; the read-verified lines are `registry_wiring.py:29`/`:55` and `container_registry.py:663-667` — cited here after re-reading.)*
 
 ---
 
 ## 9. Network model
+
+**Finding:** Worker/runtime containers honour the workspace `network` permission (`bridge` iff the value ∈ {True,"write","outbound"}, else `none`); resource (git) containers default to `"none"`.
 
 **Worker/runtime containers honour the workspace `network` permission.** The desired `network_mode` is derived once by `security/gate_helpers.py:90` `resolve_network_mode` → `"bridge"` **iff** the value is in `{True,"write","outbound"}`, else `"none"`, reached end-to-end via `security_gate.get_expected_container_config:945-1011` (net `:1002`) → `docker_executor.py:176-246` / `ContainerManager._compute_config:1718-1721` → create (`container_manager.py:764-788`; `docker_executor.py:658-681`; registry `container_registry.py:144-165`/`:628-635`).
 
@@ -175,6 +207,8 @@ Defaults disagree by path:
 **Live confirmation (probe v2).** Under `network_mode='none'` an in-container HTTP call is blocked (`HTTP_NET_BLOCKED: URLError`) while the **same** call under a bridge control container succeeds (`HTTP_NET_OK`) ⇒ the binary switch is real at runtime, not merely in config. `resolve_git_execution_mode`'s **five-input table is unchanged** (`containerized` / `host_fallback` / `host_fallback` / `host_fallback` / `unavailable` across the probed inputs). Both images are present; in-container **local** git succeeds from the resource image (`LOCAL_GIT_OK`, commit `0a1a596`); a network-requiring git op fails in-container (`NET_GIT_EXIT=128`, `fatal: … Could not resolve host: github.com`) with **no silent host fallback**.
 
 **Bug-4 implication.** Local git works inside a `'none'` container; network-requiring git is **blocked** in the sandbox (non-zero exit, **no silent host fallback**); host fallback happens only on container-INFRA outage, is loudly surfaced, and is gated fail-closed (see §11(b)).
+
+**Disposition:** ADOPTED AS-IS
 
 ---
 
@@ -215,15 +249,27 @@ Each item states the code-level verdict and, separately, what still needs a runt
 
 **(a) Network SSOT split-brain class — CONFIRMED BY READING (code) AND LIVE.** Two helpers decide the same network + workspace axes: `get_expected_container_config` (`security/security_gate.py:945-1011`, permissive when `caps=None` `:982-983`) and `_compute_container_config_from_permissions` (`docker_executor.py:176-246`, fail-closed). `ContainerManager._compute_config` uses the former (`container_manager.py:1706-1721`) while `verify_container_integrity` uses the latter (`docker_executor.py:290`), so they can disagree. The class also exists on mem/cpu as static per-path defaults (§8). **The live winner is now settled (probe v2): the creator path — SSOT#1, the permissive source — wins.** A live `ContainerManager.start()` container came up `bridge`/`rw` matching SSOT#1 while `verify_container_integrity` computed the opposite `{'network':'none','mode':'ro'}` (§4).
 
+**Disposition:** SUPERSEDED — TARGET ARCHITECTURE (move 2: the two SSOTs collapse into one fail-closed config function; SSOT #2 wins, caps=None never permissive).
+
 **(b) Bug 4 — git containerized fallback — CONFIRMED BY READING (code) AND LIVE.** `resolve_git_execution_mode` (`tools/git_info_tool.py:16-43`) and `_resolve_resource_execution` (`:799-859`) degrade to host only when the mode is `host` / no workspace id; `ResourceContainerManager.ensure_resource` returns `host_fallback` only on container-INFRA outage (image/build/Docker/start failure, `~:1222-1350`) — **no branch falls back for missing network**. Under `network_mode='none'`, a network-requiring git op exits non-zero inside the container; any host fallback is loudly surfaced and gated (`_host_execution_denied_reason()`, fail-closed). **CONFIRMED LIVE (probe v2):** under `network_mode='none'` the network op fails in-container (`NET_GIT_EXIT=128`, `Could not resolve host: github.com`) with **no silent host fallback**, while the bridge control reaches the network (`HTTP_NET_OK`). `docs/container_p0_bug4_git_fallback.md` was inferred-static; its conclusion is now live-confirmed.
+
+**Disposition:** ADOPTED AS-IS
 
 **(c) `DockerCodeRunner` ephemerals — CONFIRMED BY READING (code).** `tools/docker_code_runner.py:389-425` does start→exec→`finally: manager.stop(...)`; `stop` (`container_manager.py:897`) only stops, so **each call leaves an EXITED container that accumulates**. They carry the `thoughtmachine.workspace_id` label (`:689-693`), so the label-based sweeper DOES reach them — they are the **same leak vector as workspace containers, not a separate one**. **No `tm-p0-*` prefix logic exists anywhere** in the current tree; the sweeper is label-based. (The spec's "tm-p0-* prefix logic" is a historical/renamed detail; confirming via git history is out of scope here.)
 
+**Disposition:** ADOPTED AS-IS
+
 **(d) Resource container network today — CONFIRMED BY READING (code) AND LIVE.** Git resource containers run on the network mode supplied by the caller, **default `"none"`** (`resource_container_manager.py:845`, applied `:1102,:1121`; `container_registry.py:380` fail-closed). So "git-in-container is non-functional / everything host-fallbacks" is **false**: local git works in-container; network-requiring git is blocked in-container (non-zero, no host fallback). **CONFIRMED LIVE (probe v2):** from the resource image under `network_mode='none'`, local git succeeds (`LOCAL_GIT_OK`, commit `0a1a596`) while a network git op fails (`NET_GIT_EXIT=128`); both images are present.
+
+**Disposition:** ADOPTED AS-IS
 
 **(e) Fresh-install image build — CONFIRMED BY READING (code): NO eager build; ALL LAZY.** `install.sh:1-120` runs only prerequisite checks (no `docker build`); `bootstrap.py:176-187` seeds only build *sources*. `agent-executor-<hash>` is built lazily by `docker_executor._ensure_image:774-810`; `tm-workspace-runtime`/`tm-resource-git` are built lazily on first git use (`resource_container_manager.py:522-548`). Whether lazy auto-build runs **reliably** on a truly fresh machine (registry egress during first use, base-image availability, build-context perms) is *unverified — needs runtime check*. The launcher work is confirmed for vault creation (bootstrap seeds build files) but **not** for image warming (no evidence in `install.sh`). *(Probe v2 added: `install.sh` has **0** `docker build` occurrences, and `tm-workspace-runtime:latest` is present in `docker images`. Caveat: probe 7 printed `image tm-resource-git listed=False` while `docker images` shows `tm-resource-git:latest` — a tag/substring wart; its dry-run `present=False` lines merely reflect the dry run skipping the image listing.)*
 
+**Disposition:** DEFERRED — PARKING LOT (the code-level fact is adopted — no eager build, everything lazy — but the fresh-machine reliability check on a true fresh install remains unverified and unscheduled).
+
 **(f) Host reboot / restart policy — CONFIRMED BY READING (code): NO restart policy exists anywhere.** No `restart_policy`/`restart=` at `docker_executor.py:658`, `container_manager.py:764`, `container_registry.py:144`, `resource_container_manager.py:1116`; no compose files. Docker default `restart=no` → after a reboot all containers (workspace and resource) stay stopped and do not auto-restart; they are re-created on demand. Whether they *should* auto-restart is a design decision for §5.
+
+**Disposition:** DEFERRED — DESIGN (target architecture §6; unless-stopped for persistent, no for ephemeral, drift blocks auto-restart)
 
 **Resolved by the v2 live probe:**
 
@@ -235,12 +281,30 @@ Each item states the code-level verdict and, separately, what still needs a runt
 - **(H) Network + git** — HTTP blocked under `none` (`HTTP_NET_BLOCKED: URLError`) and OK under bridge (`HTTP_NET_OK`); local git succeeds in-container (`LOCAL_GIT_OK`, commit `0a1a596`), network git fails (`NET_GIT_EXIT=128`) with no silent host fallback (§9).
 - **(Earlier, by reading) Sweeper invocation site** — startup wiring `web_ui/backend/server.py:583-598` (`_sweep_orphan_resource_containers()` `:583`, `_sweep_exited_workspace_containers()` `:590`, asyncio task `:595-598`), periodic loop `:456-472` interval default 300 s (`:435-437`). No session-load entry point exists.
 
+**Disposition:** ADOPTED AS-IS — the probe-settled items above are adopted as the record; no further runtime check is required.
+
 **Additional open items:**
 
 - **mem/cpu/oom drift does not force a recreate** — `_config_matches` compares only network + workspace-RW (`container_manager.py:1678-1704`) *confirmed by reading*; the runtime consequence (a container silently keeping stale limits) is *unverified — probe 5's ignored-field check was inconclusive* (its verdict line contradicts its own printed excerpt; §8).
+
+**Disposition:** ADOPTED AS-IS (mem/cpu/oom drift handling is covered by the §4 disposition).
 - **`container_notes.json` concurrent write safety — now CONFIRMED (was open, §6).** No longer "unverified": 24 concurrent unlocked RMW saves produced 19 lost updates (5/24 surviving), 8 `os.replace` failures (all `ENOENT`, source tmp already renamed away), a stale-snapshot clobber (key count 8 → 1/2 mid-run), and a partial-read/write corruption. The "atomic via tmp + `os.replace`" wording is thin: the temp name is fixed/shared and non-exclusive, and the RMW is unlocked.
+
+**Disposition:** SUPERSEDED — TARGET ARCHITECTURE (move 1: notes become a field in the Container Record; move 7: fix/notes-as-record-field); see §6.
 - **Registry `get_active_registry` truthiness trap (new, §8).** `get_active_registry` returns a `ContainerRegistry` object even when `use_container_registry` is `False`, so callers must gate on `is_registry_active`/`is_container_registry_enabled`. Whether any shipped caller tests the object's truthiness directly is *unverified — needs read/runtime check*.
+
+**Disposition:** DEFERRED — PARKING LOT (unverified whether any shipped caller gates on the object's truthiness)
 - **`ContainerManager` construction hard-requires a live Docker daemon (operability fact).** `infra/container_manager.py:259 self.container_notes = self._load_container_notes()` runs first and L261 `self.client = docker.from_env()` follows; constructing daemonless aborts with `DockerException: Error while fetching server API version … FileNotFoundError`. Only the socket connect is attempted — nothing is started or removed.
+
+**Disposition:** DEFERRED — PARKING LOT for now; it belongs in the admission-gate design (move 4)
+
+- **Comm Gate enforcement.** No comm-gate / egress-allowlist / message-bus module exists; `domain_allowlist.json` is stored but never enforced (§9).
+
+**Disposition:** DEFERRED — PARKING LOT (domain_allowlist.json UI gets a "not yet enforced" label)
+
+- **Vault-path sweep.**
+
+**Disposition:** DEFERRED — PARKING LOT (into the chore/config-reader-ssot family)
 
 **Evidence provenance and probe caveats (v2).** run_id `20260912-030511-0a15`; host `jojo-Swift-SFG16-71`; docker `29.1.3`; cgroup v2; image `tm-workspace-runtime:latest`; probe cleanup reported `Containers cleaned: 5`. Probe script hashes: v1 `f898502408d281e52e9e08866c18338de062e611d943479423723cffe1788df1`; v2 `b0e203bfa2221d1ad5aa7b73fb509ef5f79984ee6b195fc2379165b224aff542`. Artefacts (scripts + result JSON) live under `working_docs/`, which is gitignored (`.gitignore:160`), so they cannot be committed — this document is the evidence of record. The **v1 results JSON was overwritten by a v2 dry run** (the probe writes `--json-out` by default), so v1's surviving evidence is its stdout in the session record only. Known probe warts, flagged rather than silently trusted:
 
@@ -250,7 +314,23 @@ Each item states the code-level verdict and, separately, what still needs a runt
 
 ---
 
-*End of DRAFT. No implementation proposed; the §11 runtime checks the v2 probe settled (split-brain winner, integrity-check blindness, notes races, host-disk, mem/cpu enforcement, network/git) are now closed — dispatch a separate build task once §3 (limit value), §4 (snapshot-vs-silent-recreate), §5 (GC age + restart policy) and the remaining §11 open items (lazy auto-build reliability, the "at the limit" refusal text, the registry truthiness trap, and mem/cpu/oom drift not forcing a recreate) are resolved.*
+## Decisions Recorded
+
+One line per decision; each cross-references the finding section that carries it.
+
+1. Container limit is **6**, per-workspace and user-configurable; `DEFAULT_MAX_CONTAINERS` is the single source of truth across all sites → §3.
+2. GC age is **24 h** (`max_age_s=86400`, env default `86400`) → §5.
+3. No-silent-kills becomes discrete drift events the **user** decides on → §4.
+4. The two SSOTs collapse to one fail-closed config function — SSOT #2 wins, `caps=None` never permissive → §4.
+5. Restart policy `unless-stopped` for persistent / `no` for ephemeral → DEFERRED — DESIGN (§11).
+6. Notes-race fix direction: unique per-writer temp + `O_EXCL` + a real lock → §6.
+7. Integrity-check blindness — CONFIRMED live by probe v2 → §4.
+8. The split-brain (two competing config sources-of-truth) → §4.
+9. Ownership: free-use containers workspace-owned / resource containers system-owned; `set_note` exposed as an agent tool → §6.
+10. Comm Gate parking lot + "not yet enforced" UI label on `domain_allowlist.json` → §11.
+11. Host disk moves into the admission gate (move 4) → §2.
+12. `ContainerManager.__init__` daemon precondition — parking lot for now / admission gate (move 4) → §11.
+13. Vault-path sweep deferred into the `chore/config-reader-ssot` family → §11.
 
 ---
 
@@ -263,3 +343,5 @@ Permanent corrections folded into this revision (from the v2 live probe and re-v
 3. **Registry pins verified** — `is_registry_active` (`infra/registry_wiring.py:55`), `get_active_registry` (`infra/registry_wiring.py:29`), `is_container_registry_enabled` (`infra/container_registry.py:663-667`). `get_active_registry` returns a `ContainerRegistry` object **even when the flag is `False`**, so callers must never gate on the object's truthiness. *(Probe-v2 pins 27/53/661/668 were 2 lines off; these are the read-verified lines.)*
 4. **Integrity-check blindness CONFIRMED live** — the lookup name omits the `-<session_tag>` suffix (existing `agent-exec-9939d92abc3f-anon` vs looked-up `agent-exec-9939d92abc3f`, `equal=False`); it is blind to hot-path containers and computes the opposite `desired` from the creator.
 5. **Host `/` is 94 % used** (368 G / 20.99 GiB free) with **zero** host-disk precondition checks in `infra/`+`tools/`.
+
+6. **Revision 2026-09-12 — findings/dispositions restructure.** Every numbered finding section (§2, §3, §4, §5, §6, §8, §9, §11) now carries a `**Finding:**` label (the existing statement of code behaviour, left intact) and one `**Disposition:**` line per distinct finding, drawn from a fixed vocabulary: `ADOPTED AS-IS`, `CHANGED — DECISION:`, `FIX — PHASE 4 BRANCH:`, `DEFERRED — PARKING LOT`, `DEFERRED — DESIGN`, `SUPERSEDED — TARGET ARCHITECTURE`. The stale tail that deferred the open decisions was replaced by a flat `## Decisions Recorded` index (13 one-line decisions, each cross-referenced to its finding section). A top-of-doc cross-reference to the companion **Target Architecture** document was added. The `SUPERSEDED — TARGET ARCHITECTURE` disposition value is introduced here. No prior evidence, `file:line` pin, number, or quoted string was altered or duplicated, and sections were not renumbered.
