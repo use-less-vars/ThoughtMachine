@@ -4,7 +4,8 @@
 > Read with the target architecture open.
 >
 > Two semantics in this document contradict the target architecture and
-> must not be implemented as written:
+> must not be implemented as written (body line numbers as of pre-header
+> revision):
 >
 >   - L471-472, L515-543 — auto-recreate of running containers on permission
 >     change. The target architecture forbids silent mutation of running
