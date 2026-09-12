@@ -34,6 +34,62 @@ def _json_error(message: str, status_code: int = 500) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status_code)
 
 
+def _finding_dict(finding: Any) -> dict[str, Any]:
+    """Return a :class:`~...drift.DriftFinding` as its wire dict (5 keys)."""
+    return {
+        "drift_class": finding.drift_class,
+        "event_type": finding.event_type,
+        "expected": finding.expected,
+        "actual": finding.actual,
+        "signature": finding.signature,
+    }
+
+
+def _compute_drift(record: Any) -> Optional[list[dict[str, Any]]]:
+    """Return the record's *live* drift as JSON-ready findings (read-only).
+
+    Resolves the record's live container(s) through the Docker client -- matched
+    by the durable record-owned ``thoughtmachine.container_id`` label -- and
+    delegates to the pure, side-effect-free
+    :func:`thoughtmachine.container_record.drift.detect_record_drift`.
+
+    Semantics:
+        * a list of finding dicts when the live state **was resolved** (each
+          dict carries ``drift_class``, ``event_type``, ``expected``,
+          ``actual`` and ``signature``). A clean record yields ``[]``; a
+          record whose container cannot be found still yields a one-element
+          list carrying ``drift.container_absent`` ("resolved = absent");
+        * ``None`` when the live state could **not** be resolved -- the Docker
+          package/client is unavailable or any error occurred.
+
+    Strictly read-only: only the non-emitting detector is used, so no drift
+    event is appended and no record is mutated. ``docker`` is imported lazily
+    so importing this module has no side effects. Never raises.
+    """
+    try:
+        import docker
+
+        from thoughtmachine.container_record import RECORD_LABEL_KEY
+        from thoughtmachine.container_record.drift import detect_record_drift
+
+        client = docker.from_env()
+        resolved = client.containers.list(
+            all=True,
+            filters={"label": f"{RECORD_LABEL_KEY}={record.id}"},
+        )
+
+        class _ResolvedContainers:
+            """Duck-typed client exposing only the containers resolved above."""
+
+            def list(self, all: bool = True) -> list[Any]:  # noqa: A002 - docker API
+                return list(resolved)
+
+        findings = detect_record_drift(record, _ResolvedContainers())
+        return [_finding_dict(finding) for finding in findings]
+    except Exception:
+        return None
+
+
 def _serialise(record: Any, workspace_id: str) -> dict[str, Any]:
     """Return a record as a plain dict, tagged with its owning workspace.
 
@@ -41,10 +97,16 @@ def _serialise(record: Any, workspace_id: str) -> dict[str, Any]:
     the route adds both: ``workspace_id`` (the workspace the record lives in)
     and ``container_id`` (the record ``id`` -- the value Docker carries under
     the record-owned ``thoughtmachine.container_id`` label).
+
+    It also attaches a computed, **read-only** ``drift`` field: the record's
+    live drift findings (see :func:`_compute_drift`), or ``None`` when the live
+    state could not be inspected. The field is computed on the fly and is never
+    persisted -- the stored record's shape is unchanged.
     """
     data = record.to_dict()
     data["workspace_id"] = workspace_id
     data["container_id"] = record.id
+    data["drift"] = _compute_drift(record)
     return data
 
 
