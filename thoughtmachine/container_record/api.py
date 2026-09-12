@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -198,16 +199,23 @@ def attach_container(
     docker_id: str,
     state: str | None = None,
     *,
+    intent_snapshot: Mapping[str, Any] | None = None,
     vault_root: str | os.PathLike | None = None,
 ) -> Record:
     """Complete a pre-run record once Docker has assigned a container id.
 
     ``state`` (when supplied) overwrites the record's ``state``; when ``None``
     the existing state is left unchanged.
+
+    ``intent_snapshot`` (when supplied) is written into the record's
+    ``intent_snapshot`` field in the *same* ``update_record`` call; when
+    ``None`` the existing snapshot is left untouched (no-op).
     """
     changes: dict[str, Any] = {"docker_id": docker_id}
     if state is not None:
         changes["state"] = state
+    if intent_snapshot is not None:
+        changes["intent_snapshot"] = intent_snapshot
     return update_record(workspace_id, id, vault_root=vault_root, **changes)
 
 

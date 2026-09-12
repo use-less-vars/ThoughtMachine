@@ -59,10 +59,11 @@ diffed against it:
 | Nested field | Type | Meaning |
 |---|---|---|
 | `network_mode` | string | Docker network mode at create (`none`, `bridge`, …). |
-| `workspace_mode` | string | Workspace ownership mode recorded at create. |
+| `workspace_mode` | string | Workspace mount mode (`rw`/`ro`) recorded at create. |
 | `mem_limit` | string | Memory limit (`512m`, `1g`, …) — cf. `RESOURCE_MEM_LIMIT` in `agent/config/defaults.py`. |
 | `cpu_quota` | int | CPU quota (microseconds per period). |
 | `oom_score_adj` | int | OOM score adjustment applied at create. |
+| `image_ref` | string | Image reference (tag) the container was created from (`agent-executor:latest`) — the human-readable counterpart to `image_hash`; not normalised. |
 | `image_hash` | string | Content hash / image id the container was created from. |
 | `hardening` | object | The hardening recipe applied (capabilities dropped, `no-new-privileges`, read-only root, tmpfs mounts, non-root user, idle command). Shape mirrors the creation path in `infra/container_manager.py`. |
 

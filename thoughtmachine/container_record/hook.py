@@ -33,6 +33,7 @@ ownership/attribution).
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -43,12 +44,41 @@ from .api import (
     record_label,
 )
 from .models import OWNER_WORKSPACE
+from .snapshot import snapshot_from_attrs
 
 log = logging.getLogger("infra.container_record.hook")
 
 #: Seconds to wait for a graceful stop before force-removing a rolled-back
 #: container.
 _STOP_TIMEOUT = 5
+
+#: Snapshot keys whose truthiness counts as "the inspect payload told us
+#: something".  A snapshot carrying none of these (and an empty ``hardening``
+#: mapping) is all-empty and must not overwrite a natively-authored snapshot.
+_EVIDENCE_KEYS: tuple[str, ...] = (
+    "network_mode",
+    "workspace_mode",
+    "mem_limit",
+    "cpu_quota",
+    "oom_score_adj",
+    "image_ref",
+    "image_hash",
+)
+
+
+def _snapshot_has_evidence(snapshot: Any) -> bool:
+    """Return True when *snapshot* carries any recoverable intent evidence.
+
+    A snapshot is evidence-bearing when any scalar key in
+    :data:`_EVIDENCE_KEYS` is truthy, or when the nested ``hardening`` mapping
+    is non-empty.  Non-mappings return False.
+    """
+    if not isinstance(snapshot, Mapping):
+        return False
+    for key in _EVIDENCE_KEYS:
+        if snapshot.get(key):
+            return True
+    return bool(snapshot.get("hardening"))
 
 
 class _RecordHandle:
@@ -101,11 +131,29 @@ class _RecordHandle:
         if self.record is None:
             return None
         docker_id = getattr(container, "id", "") or ""
+        snapshot: dict | None = None
+        # Capture the intent snapshot at attach time only when the record does
+        # not already carry one (a natively authored snapshot wins).  Deriving
+        # it from the live container's inspect ``attrs`` is best-effort: any
+        # failure is logged and the attach proceeds without a snapshot.
+        if not self.record.intent_snapshot:
+            try:
+                attrs = getattr(container, "attrs", None)
+                candidate = snapshot_from_attrs(attrs)
+                if _snapshot_has_evidence(candidate):
+                    snapshot = candidate
+            except Exception:  # noqa: BLE001 - snapshot capture must never block attach
+                log.warning(
+                    "record attach: failed to derive intent snapshot for %s",
+                    self.record.id,
+                    exc_info=True,
+                )
         self.record = attach_container(
             self.workspace_id,
             self.record.id,
             docker_id,
             state,
+            intent_snapshot=snapshot,
             vault_root=self.vault_root,
         )
         self._attached = True

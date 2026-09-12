@@ -49,6 +49,10 @@ from .models import (
     RecordLocked,
     RecordNotFound,
 )
+from .snapshot import (
+    HARDENING_KEYS,
+    snapshot_from_attrs,
+)
 
 __all__ = [
     # exceptions (§3.1)
@@ -72,6 +76,9 @@ __all__ = [
     "OWNER_WORKSPACE",
     "OWNER_SYSTEM",
     "STATE_CREATING",
+    # snapshot extraction (§1.1 / §4)
+    "snapshot_from_attrs",
+    "HARDENING_KEYS",
     # api (§3 / §7)
     "RECORD_LABEL_KEY",
     "record_label",

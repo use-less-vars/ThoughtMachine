@@ -26,7 +26,6 @@ from typing import Any
 from . import storage
 from .api import RECORD_LABEL_KEY
 from .models import (
-    INTENT_SNAPSHOT_KEYS,
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
@@ -36,6 +35,7 @@ from .models import (
     iso_now,
     new_record_id,
 )
+from .snapshot import snapshot_from_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -88,22 +88,19 @@ def _load_payloads(source: Any) -> list[dict]:
 
 
 def _extract(payload: dict) -> dict:
-    """Pull docker_id / labels / host config / state status from a payload."""
+    """Pull docker_id / labels / state status from a payload."""
     config = payload.get("Config") or {}
     labels = {}
     if isinstance(config, dict):
         labels = config.get("Labels") or {}
     if not labels and isinstance(payload.get("labels"), dict):
         labels = payload["labels"]
-
-    host = payload.get("HostConfig") or {}
     state = payload.get("State") or {}
     status = state.get("Status") if isinstance(state, dict) else ""
 
     return {
         "docker_id": str(payload.get("Id") or payload.get("id") or ""),
         "labels": labels if isinstance(labels, dict) else {},
-        "host": host if isinstance(host, dict) else {},
         "state": str(status or ""),
     }
 
@@ -120,44 +117,6 @@ def _derive_class_owner(labels: dict) -> tuple[str, str, bool]:
         return LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE, False
     # Unknown / absent type: safest class, never abort (§4.3).
     return LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, True
-
-
-def _intent_snapshot(payload: dict, host: dict) -> dict:
-    """Build the *partial* intent snapshot recoverable from inspect.
-
-    Missing keys are left empty — never fabricated (§4 step 4).
-    """
-    snapshot: dict[str, Any] = {key: "" for key in INTENT_SNAPSHOT_KEYS}
-    snapshot["hardening"] = {}
-
-    network_mode = host.get("NetworkMode")
-    if network_mode:
-        snapshot["network_mode"] = str(network_mode)
-    memory = host.get("Memory")
-    if memory:
-        snapshot["mem_limit"] = str(memory)
-    cpu_quota = host.get("CpuQuota")
-    if cpu_quota:
-        snapshot["cpu_quota"] = cpu_quota
-    oom = host.get("OomScoreAdj")
-    if oom is not None:
-        snapshot["oom_score_adj"] = oom
-    image = payload.get("Image")
-    if image:
-        snapshot["image_hash"] = str(image)
-
-    hardening: dict[str, Any] = {}
-    for src_key, dst_key in (
-        ("CapDrop", "cap_drop"),
-        ("CapAdd", "cap_add"),
-        ("SecurityOpt", "security_opt"),
-        ("ReadonlyRootfs", "readonly_rootfs"),
-    ):
-        value = host.get(src_key)
-        if value:
-            hardening[dst_key] = value
-    snapshot["hardening"] = hardening
-    return snapshot
 
 
 # ── Write-ahead log (§4.2) ──────────────────────────────────────────────────
@@ -333,7 +292,7 @@ def migrate_records(
                 record_id = new_record_id()
 
             lifecycle_class, owner, unknown = _derive_class_owner(labels)
-            intent = _intent_snapshot(payload, info["host"])
+            intent = snapshot_from_attrs(payload)
             note = (
                 "unknown container type; defaulted to persistent/workspace-owned"
                 if unknown
