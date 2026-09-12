@@ -10,8 +10,8 @@ Gaps filled here:
   - filesystem="ask"   → "ro"   (ask is treated restrictively at config level)
   - Container config with invalid session values → safe defaults
 
-Also tests the new ``get_expected_container_config()`` function as the
-canonical reference for container config derivation.
+Also tests ``resolve_container_config()`` as the canonical reference for
+container config derivation.
 """
 
 from __future__ import annotations
@@ -19,11 +19,13 @@ from __future__ import annotations
 import pytest
 
 from security.security_gate import (
+    ContainerConfigError,
     check_required_categories,
     get_effective_permissions,
-    get_expected_container_config,
+    resolve_container_config,
 )
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
 from thoughtmachine.security import SessionPermissions
 
 
@@ -148,107 +150,122 @@ class TestContainerConfigEdgeValues:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  get_expected_container_config — canonical reference
+#  resolve_container_config — canonical reference
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class TestGetExpectedContainerConfig:
+class TestResolveContainerConfigSlice:
     """Tests for the canonical container-config resolver."""
 
     def test_write_all_allowed(self):
         """write permissions + fully-permissive workspace → bridge + rw."""
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "write", "filesystem": "write", "container": True},
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "bridge"
-        assert result["workspace_mode"] == "rw"
-        assert result["effective"]["network"] == "write"
-        assert result["effective"]["filesystem"] == "write"
+        assert result.network_mode == "bridge"
+        assert result.workspace_mode == "rw"
+        assert result.effective["network"] == "write"
+        assert result.effective["filesystem"] == "write"
 
     def test_write_downgraded_by_workspace(self):
         """write + workspace denies filesystem_write → bridge + ro."""
         ws = _make_workspace(filesystem_write=False)
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "write", "filesystem": "write", "container": True},
-            workspace_caps=ws,
+            ws,
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "bridge"
-        assert result["workspace_mode"] == "ro"
-        assert result["effective"]["filesystem"] == "read"
+        assert result.network_mode == "bridge"
+        assert result.workspace_mode == "ro"
+        assert result.effective["filesystem"] == "read"
 
     def test_banned_network(self):
         """banned + fully-permissive → none + rw."""
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "banned", "filesystem": "write", "container": True},
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "none"
-        assert result["workspace_mode"] == "rw"
+        assert result.network_mode == "none"
+        assert result.workspace_mode == "rw"
 
     def test_full_filesystem(self):
         """full filesystem → rw."""
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "write", "filesystem": "full", "container": True},
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "bridge"
-        assert result["workspace_mode"] == "rw"
-        assert result["effective"]["filesystem"] == "full"
+        assert result.network_mode == "bridge"
+        assert result.workspace_mode == "rw"
+        assert result.effective["filesystem"] == "full"
 
     def test_ask_filesystem(self):
         """ask filesystem → ro (ask is not write-level)."""
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "write", "filesystem": "ask", "container": True},
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "bridge"
-        assert result["workspace_mode"] == "ro"
+        assert result.network_mode == "bridge"
+        assert result.workspace_mode == "ro"
 
     def test_ask_network(self):
         """ask network → none."""
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "ask", "filesystem": "write", "container": True},
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "none"
-        assert result["workspace_mode"] == "rw"
+        assert result.network_mode == "none"
+        assert result.workspace_mode == "rw"
 
     def test_full_filesystem_not_downgraded_by_workspace(self):
         """full filesystem stays rw even when workspace denies write."""
         ws = _make_workspace(filesystem_write=False)
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "write", "filesystem": "full", "container": True},
-            workspace_caps=ws,
+            ws,
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["workspace_mode"] == "rw"
-        assert result["effective"]["filesystem"] == "full"
+        assert result.workspace_mode == "rw"
+        assert result.effective["filesystem"] == "full"
 
     def test_workspace_denies_network(self):
         """Workspace network deny overrides session write."""
         ws = _make_workspace(allow_network=False)
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "write", "filesystem": "write", "container": True},
-            workspace_caps=ws,
+            ws,
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "none"
-        assert result["effective"]["network"] is False
+        assert result.network_mode == "none"
+        assert result.effective["network"] is False
 
     def test_workspace_denies_container(self):
         """Workspace container deny overrides session container."""
         ws = _make_workspace(allow_docker=False)
-        result = get_expected_container_config(
+        result = resolve_container_config(
             {"network": "write", "filesystem": "write", "container": True},
-            workspace_caps=ws,
+            ws,
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["effective"]["container"] is False
+        assert result.effective["container"] is False
 
     def test_default_workspace_caps(self):
-        """When workspace_caps is None, fully-permissive defaults are used."""
-        result = get_expected_container_config(
+        """Fully-permissive workspace caps → bridge + rw."""
+        result = resolve_container_config(
             {"network": "write", "filesystem": "write", "container": True},
-            workspace_caps=None,
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "bridge"
-        assert result["workspace_mode"] == "rw"
+        assert result.network_mode == "bridge"
+        assert result.workspace_mode == "rw"
 
     def test_matches_expected_config_helper(self):
-        """get_expected_container_config must match _expected_config helper."""
+        """resolve_container_config must match _expected_config helper."""
         test_cases = [
             ({"network": "write", "filesystem": "write", "container": True}, "bridge", "rw"),
             ({"network": "banned", "filesystem": "read", "container": True}, "none", "ro"),
@@ -256,50 +273,57 @@ class TestGetExpectedContainerConfig:
             ({"network": "write", "filesystem": "ask", "container": True}, "bridge", "ro"),
         ]
         for sp, exp_net, exp_fs in test_cases:
-            result = get_expected_container_config(sp)
-            assert result["network_mode"] == exp_net, (
-                f"network_mode: {sp} → {result['network_mode']!r}, expected {exp_net!r}"
+            result = resolve_container_config(
+                sp, WorkspaceCapabilities.default(), LIFECYCLE_PERSISTENT
             )
-            assert result["workspace_mode"] == exp_fs, (
-                f"workspace_mode: {sp} → {result['workspace_mode']!r}, expected {exp_fs!r}"
+            assert result.network_mode == exp_net, (
+                f"network_mode: {sp} → {result.network_mode!r}, expected {exp_net!r}"
+            )
+            assert result.workspace_mode == exp_fs, (
+                f"workspace_mode: {sp} → {result.workspace_mode!r}, expected {exp_fs!r}"
             )
 
-    def test_invalid_network_value_returns_safe_defaults(self):
-        """Unknown network value (not in SessionPermissions enum) → safe defaults."""
-        result = get_expected_container_config(
+    def test_invalid_network_value_returns_error(self):
+        """Unknown network value → ContainerConfigError(bad_permissions)."""
+        result = resolve_container_config(
             {"network": "invalid", "filesystem": "write", "container": True},
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "none"
-        assert result["workspace_mode"] == "ro"
+        assert isinstance(result, ContainerConfigError)
+        assert result.code == "bad_permissions"
 
-    def test_invalid_filesystem_value_returns_safe_defaults(self):
-        """Unknown filesystem value → safe defaults."""
-        result = get_expected_container_config(
+    def test_invalid_filesystem_value_returns_error(self):
+        """Unknown filesystem value → ContainerConfigError(bad_permissions)."""
+        result = resolve_container_config(
             {"network": "write", "filesystem": "bogus", "container": True},
+            WorkspaceCapabilities.default(),
+            LIFECYCLE_PERSISTENT,
         )
-        assert result["network_mode"] == "none"
-        assert result["workspace_mode"] == "ro"
+        assert isinstance(result, ContainerConfigError)
+        assert result.code == "bad_permissions"
 
     def test_empty_session_permissions_returns_safe_defaults(self):
         """Empty dict for session_permissions → safe defaults."""
-        result = get_expected_container_config({})
-        assert result["network_mode"] == "none"
-        assert result["workspace_mode"] == "ro"
+        result = resolve_container_config(
+            {}, WorkspaceCapabilities.default(), LIFECYCLE_PERSISTENT
+        )
+        assert result.network_mode == "none"
+        assert result.workspace_mode == "ro"
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  _compute_container_config_from_permissions — standalone function
+#  _resolve_container_config_via_gate — standalone function
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class TestComputeContainerConfigFromPermissions:
-    """Tests for the standalone ``_compute_container_config_from_permissions``
+class TestResolveContainerConfigFromPermissions:
+    """Tests for the standalone ``_resolve_container_config_via_gate``
     function in ``docker_executor.py``.
 
-    Three code paths:
-      1. workspace_id + session_permissions → security gate
-      2. no workspace_id + session_permissions → fallback to raw perms
-      3. no workspace_id + no session_permissions → safe defaults ("none", "ro")
+    Two code paths:
+      1. workspace_id + session_permissions → security gate SSOT
+      2. no workspace_id (or no permissions) → safe defaults ("none", "ro")
 
     Uses ``monkeypatch`` (built-in pytest) rather than ``pytest-mock`` because
     ``pytest-mock`` is not installed in the CI/test environment.
@@ -315,9 +339,9 @@ class TestComputeContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w: {"network": "write", "filesystem": "write", "container": True},
         )
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            "ws-123", {"network": "write", "filesystem": "write"},
         )
         assert net == "bridge"
         assert mode == "rw"
@@ -333,9 +357,9 @@ class TestComputeContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w: {"network": False, "filesystem": "write", "container": True},
         )
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            "ws-123", {"network": "write", "filesystem": "write"},
         )
         assert net == "none"
         assert mode == "rw"
@@ -351,9 +375,9 @@ class TestComputeContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w: {"network": "write", "filesystem": "read", "container": False},
         )
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            "ws-123", {"network": "write", "filesystem": "write"},
         )
         assert net == "bridge"
         assert mode == "ro"
@@ -366,9 +390,9 @@ class TestComputeContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w: {"network": "write", "filesystem": "ask", "container": True},
         )
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", "ws-123", {"network": "write", "filesystem": "ask"},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            "ws-123", {"network": "write", "filesystem": "ask"},
         )
         assert net == "bridge"
         assert mode == "ro"
@@ -381,9 +405,9 @@ class TestComputeContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w: {"network": "write", "filesystem": "full", "container": True},
         )
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", "ws-123", {"network": "write", "filesystem": "full"},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            "ws-123", {"network": "write", "filesystem": "full"},
         )
         assert net == "bridge"
         assert mode == "rw"
@@ -396,9 +420,9 @@ class TestComputeContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w: {"network": "banned", "filesystem": "write", "container": True},
         )
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", "ws-123", {"network": "banned", "filesystem": "write"},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            "ws-123", {"network": "banned", "filesystem": "write"},
         )
         assert net == "none"
         assert mode == "rw"
@@ -409,9 +433,9 @@ class TestComputeContainerConfigFromPermissions:
         def _raise(*a):
             raise RuntimeError("gate down")
         monkeypatch.setattr(sg, "get_workspace_capabilities", _raise)
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            "ws-123", {"network": "write", "filesystem": "write"},
         )
         assert net == "none"
         assert mode == "ro"
@@ -419,64 +443,64 @@ class TestComputeContainerConfigFromPermissions:
     # ── Path 2: no workspace_id + session_permissions → fallback ───
 
     def test_fallback_write_network_and_fs(self, monkeypatch):
-        """No workspace_id, write perms → bridge + rw."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, {"network": "write", "filesystem": "write"},
+        """No workspace_id, write perms → fail-closed none + ro."""
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, {"network": "write", "filesystem": "write"},
         )
-        assert net == "bridge"
-        assert mode == "rw"
+        assert net == "none"
+        assert mode == "ro"
 
     def test_fallback_banned_network(self, monkeypatch):
-        """No workspace_id, banned network → none."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, {"network": "banned", "filesystem": "write"},
+        """No workspace_id, banned network → fail-closed none + ro."""
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, {"network": "banned", "filesystem": "write"},
         )
         assert net == "none"
-        assert mode == "rw"
+        assert mode == "ro"
 
     def test_fallback_ask_network(self, monkeypatch):
-        """No workspace_id, ask network → none."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, {"network": "ask", "filesystem": "write"},
+        """No workspace_id, ask network → fail-closed none + ro."""
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, {"network": "ask", "filesystem": "write"},
         )
         assert net == "none"
-        assert mode == "rw"
+        assert mode == "ro"
 
     def test_fallback_read_filesystem(self, monkeypatch):
-        """No workspace_id, read filesystem → ro."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, {"network": "write", "filesystem": "read"},
+        """No workspace_id, read filesystem → fail-closed none + ro."""
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, {"network": "write", "filesystem": "read"},
         )
-        assert net == "bridge"
+        assert net == "none"
         assert mode == "ro"
 
     def test_fallback_ask_filesystem_ro(self, monkeypatch):
-        """No workspace_id, ask filesystem → ro."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, {"network": "write", "filesystem": "ask"},
+        """No workspace_id, ask filesystem → fail-closed none + ro."""
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, {"network": "write", "filesystem": "ask"},
         )
-        assert net == "bridge"
+        assert net == "none"
         assert mode == "ro"
 
     def test_fallback_full_filesystem(self, monkeypatch):
-        """No workspace_id, full filesystem → rw."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, {"network": "write", "filesystem": "full"},
+        """No workspace_id, full filesystem → fail-closed none + ro."""
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, {"network": "write", "filesystem": "full"},
         )
-        assert net == "bridge"
-        assert mode == "rw"
+        assert net == "none"
+        assert mode == "ro"
 
     def test_fallback_defaults_when_missing_keys(self, monkeypatch):
         """No workspace_id, empty perms dict → defaults (none + ro)."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, {},
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, {},
         )
         assert net == "none"
         assert mode == "ro"
@@ -485,18 +509,18 @@ class TestComputeContainerConfigFromPermissions:
 
     def test_safe_defaults_no_permissions(self, monkeypatch):
         """Both None → none + ro."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, None,
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, None,
         )
         assert net == "none"
         assert mode == "ro"
 
     def test_safe_defaults_no_workspace_id_no_permissions(self, monkeypatch):
         """workspace_id None + permissions None → none + ro."""
-        from docker_executor import _compute_container_config_from_permissions
-        net, mode = _compute_container_config_from_permissions(
-            "/ws/test", None, None,
+        from docker_executor import _resolve_container_config_via_gate
+        net, mode = _resolve_container_config_via_gate(
+            None, None,
         )
         assert net == "none"
         assert mode == "ro"

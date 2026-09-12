@@ -120,16 +120,30 @@ class TestContainerMatches:
 
     def test_matches_permissive_config(self, patch_docker, make_container):
         """Container with ``bridge`` network and ``rw`` mount when permitted."""
+        from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+
         make_container(network_mode="bridge", mount_mode="rw")
 
         perms = {"network": "write", "filesystem": "write"}
-        result = verify_container_integrity("/tmp/workspace", perms)
 
-        # If workspace capabilities allow it, desired will be permissive
-        # (In the test environment, caps lookup may fall back)
+        # The SSOT resolver is fail-closed: a permissive desired config needs
+        # BOTH a resolvable workspace id AND capabilities granting network +
+        # filesystem write. Grant both so the bridge/rw container matches.
+        permissive = WorkspaceCapabilities(
+            allow_network=True, filesystem_write=True
+        )
+        with patch(
+            "thoughtmachine.workspace_capabilities.resolve_workspace_id",
+            return_value="ws-permissive",
+        ), patch(
+            "security.security_gate.get_workspace_capabilities",
+            return_value=permissive,
+        ):
+            result = verify_container_integrity("/tmp/workspace", perms)
+
         assert result["container_exists"] is True
         assert result["action_taken"] == "none"
-        # We just confirm it didn't error; actual match depends on caps stub
+        assert result["desired"] == {"network": "bridge", "mode": "rw"}
 
     def test_container_reload_called(self, patch_docker, make_container, mock_docker_client):
         """The function calls ``container.reload()`` before inspection."""

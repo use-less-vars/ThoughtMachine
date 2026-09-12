@@ -13,9 +13,10 @@ table is always printed.
 What it exercises (in order):
   1. setup            — docker daemon reachable + smoke image built
   2. gate             — permission gate -> (network_mode, workspace_mode)
-                        for (fs=write,net=none), (fs=read,net=none),
-                        (fs=write,net=bridge) — both the workspace_id path
-                        (security_gate) and the workspace_id=None fallback
+                        via the surviving security_gate SSOT
+                        (resolve_container_config); an unregistered
+                        workspace_id fail-closes to (none, ro), as does the
+                        workspace_id=None path
   3. volume           — host workspace bind-mounted at /workspace: host
                         marker visible immediately; host-side file changes
                         visible in running containers (no population)
@@ -66,7 +67,7 @@ try:
     from docker.types import Mount  # noqa: E402
 
     from docker_executor import (  # noqa: E402
-        _compute_container_config_from_permissions,
+        _resolve_container_config_via_gate,
     )
     # from tools import ... also verifies the tools/__init__.py re-exports
     from tools import (  # noqa: E402
@@ -203,21 +204,19 @@ def main() -> int:
         # ---------------- STEP 2: permission gate -> config ----------------
         def _gate():
             cases = [
-                ({"network": "banned", "filesystem": "write", "container": True}, ("none", "rw")),
+                ({"network": "banned", "filesystem": "write", "container": True}, ("none", "ro")),
                 ({"network": "banned", "filesystem": "read", "container": True}, ("none", "ro")),
-                ({"network": "write", "filesystem": "write", "container": True}, ("bridge", "rw")),
+                ({"network": "write", "filesystem": "write", "container": True}, ("none", "ro")),
             ]
             details = []
             for sp, expected in cases:
-                got_gate = _compute_container_config_from_permissions(
-                    str(workspace_dir), str(uuid.uuid4()), sp)
-                got_fb = _compute_container_config_from_permissions(
-                    str(workspace_dir), None, sp)
+                got_gate = _resolve_container_config_via_gate(str(uuid.uuid4()), sp)
+                got_fb = _resolve_container_config_via_gate(None, sp)
                 ok(got_gate == expected,
                    "gate path %r -> %r, expected %r" % (sp, got_gate, expected))
                 ok(got_fb == expected,
                    "fallback path %r -> %r, expected %r" % (sp, got_fb, expected))
-                details.append("%s/%s -> %s/%s (gate+fallback)"
+                details.append("%s/%s -> %s/%s (gate+fallback, fail-closed)"
                                % (sp["network"], sp["filesystem"],
                                   expected[0], expected[1]))
             return "; ".join(details)
