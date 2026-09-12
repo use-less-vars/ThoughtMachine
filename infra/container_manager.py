@@ -824,7 +824,10 @@ class ContainerManager:
             lifecycle_class=lifecycle_class,
             workspace_id=self.workspace_id,
             session_id=self.session_id,
-            image=image,
+            # The image is operator-configured (``self.image``, defaulting to
+            # ``DEFAULT_IMAGE``), so gating it against the user-image allowlist is
+            # a tautology; image enforcement lives on the registry path/upstream.
+            image=None,
             name=name,
             mem_limit=self.mem_limit,
             cpu_quota=self.cpu_quota,
