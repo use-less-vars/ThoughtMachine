@@ -473,6 +473,14 @@ async def _periodic_container_sweep_loop(
             log('WARNING', 'server', f'Periodic container sweep error: {exc}')
 
 
+# ── Boot container drift scan ──────────────────────────────────────────────
+# Hard cap on how many container records the boot-time drift scan inspects in
+# a single pass.  Bounds startup work on hosts with many records; when the cap
+# truncates the work the scan logs one WARNING naming inspected + skipped
+# counts (the remainder are picked up on later boots).
+_BOOT_DRIFT_SCAN_LIMIT = 100
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
@@ -605,6 +613,65 @@ async def lifespan(app: FastAPI):
                         f'{result["container_name"]}: {result.get("mismatch_reason")}')
     except Exception as exc:
         log('DEBUG', 'server', f'Startup container scan skipped: {exc}')
+
+    # ── Startup container drift scan ─────────────────────────────────────
+    # Compare every container record against its live container (read-only
+    # detection; drift findings are appended to the record's own event log by
+    # the sanctioned drift helper).  Bounded by _BOOT_DRIFT_SCAN_LIMIT so a
+    # host with many records cannot stall startup.  Best-effort: any failure
+    # (e.g. no Docker daemon) is logged and startup continues.
+    try:
+        import docker
+        from thoughtmachine.container_record import RECORD_LABEL_KEY
+        from thoughtmachine.container_record import api as _cr_api
+        from thoughtmachine.container_record import storage as _cr_storage
+        from thoughtmachine.container_record.drift import scan_record
+
+        client = docker.from_env()
+        # ONE server-side-narrowed list call: only containers owned by the
+        # record system (those carrying the record-owned label).  Resource
+        # containers (tm-res-*) never carry this label, so they are excluded
+        # from the drift scan without any extra filtering.
+        live_containers = client.containers.list(
+            all=True, filters={"label": RECORD_LABEL_KEY}
+        )
+
+        class _BootDriftContainers:
+            """Client-like shim exposing ``list(all=True)`` for detection."""
+
+            def __init__(self, items):
+                self._items = list(items)
+
+            def list(self, all=True, filters=None):  # noqa: A002 - docker sig
+                return list(self._items)
+
+        containers = _BootDriftContainers(live_containers)
+
+        # Every container-bearing record across all workspaces.  The cap
+        # bounds the number of RECORDS scanned (never the resolved live set:
+        # truncating that would fabricate false container_absent findings).
+        pending = []
+        for ws in _cr_storage.iter_workspace_ids():
+            for record in _cr_api.list_records(ws):
+                if getattr(record, "docker_id", ""):
+                    pending.append((ws, record))
+
+        inspected = 0
+        for ws, record in pending[:_BOOT_DRIFT_SCAN_LIMIT]:
+            scan_record(record, containers, workspace_id=ws)
+            inspected += 1
+
+        skipped = len(pending) - inspected
+        if skipped:
+            log('WARNING', 'server',
+                f'Startup container drift scan capped at '
+                f'{_BOOT_DRIFT_SCAN_LIMIT}: inspected {inspected} record(s), '
+                f'skipped {skipped} record(s).')
+        else:
+            log('INFO', 'server',
+                f'Startup container drift scan inspected {inspected} record(s).')
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup container drift scan skipped: {exc}')
 
     # ── Startup orphan resource-container sweep ──────────────────────────
     # Remove hidden git resource containers (thoughtmachine.resource label)

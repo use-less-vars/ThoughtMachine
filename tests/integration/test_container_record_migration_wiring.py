@@ -28,6 +28,7 @@ import pytest
 import infra.container_manager as container_manager
 from infra.container_manager import ContainerManager
 from tests.test_container_record_migration import make_payload, ws_labels
+from thoughtmachine.container_record import api as cr_api
 from thoughtmachine.container_record import migration, storage
 
 # Reuse the production label constant (the migration reads it from labels).
@@ -125,6 +126,16 @@ def _records(ws, vault):
 
 def _migration_lines(events):
     return [e for e in events if "Container-record migration:" in e[2]]
+
+
+def _make_container_record(ws, docker_id, vault):
+    """Create a natively-authored record, optionally bound to a container id."""
+    rec = cr_api.create_record(
+        ws, "persistent", "workspace-owned", vault_root=str(vault)
+    )
+    if docker_id is not None:
+        cr_api.attach_container(ws, rec.id, docker_id, vault_root=str(vault))
+    return rec
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────
@@ -500,3 +511,106 @@ def test_migration_rematerialises_write_on_create_record_after_crash(
     assert summary["rematerialised"] == 1
     assert summary["created"] == 0
     assert rebuilt["id"] == original["id"]
+
+
+# ── Boot container drift scan ───────────────────────────────────────────────
+#
+# The lifespan must, immediately after the container-record migration, compare
+# every container-bearing record against its live container (read-only) using
+# the sanctioned ``drift.scan_record`` helper.  The step is bounded by
+# ``server._BOOT_DRIFT_SCAN_LIMIT`` and must never abort startup.
+
+
+def test_lifespan_boot_drift_scan_inspects_each_container_record(
+    monkeypatch, vault
+):
+    """scan_record runs once per container-bearing record (skips id-less ones)."""
+    server = _load_server()
+    ws = "ws-drift"
+    rec_a = _make_container_record(ws, "cid-a", vault)
+    rec_b = _make_container_record(ws, "cid-b", vault)
+    _make_container_record(ws, None, vault)  # no docker_id → not scanned
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    events = _record_log(monkeypatch, server)
+
+    from thoughtmachine.container_record import drift as drift_module
+
+    scanned = []
+
+    def fake_scan(record, containers, *, workspace_id):
+        scanned.append((workspace_id, record.id))
+
+    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+
+    _run_lifespan(server)
+
+    assert {rid for _ws, rid in scanned} == {rec_a.id, rec_b.id}
+    assert all(ws_id == ws for ws_id, _rid in scanned)
+
+    info = [e for e in events if "Startup container drift scan" in e[2]]
+    assert info, events
+    assert info[0][0] == "INFO"
+    assert "inspected 2 record(s)" in info[0][2]
+
+
+def test_lifespan_boot_drift_scan_is_capped(monkeypatch, vault):
+    """The cap bounds records scanned; a WARNING names inspected + skipped."""
+    server = _load_server()
+    monkeypatch.setattr(server, "_BOOT_DRIFT_SCAN_LIMIT", 2)
+    ws = "ws-cap"
+    for i in range(3):
+        _make_container_record(ws, f"cid-{i}", vault)
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    events = _record_log(monkeypatch, server)
+
+    from thoughtmachine.container_record import drift as drift_module
+
+    scanned = []
+
+    def fake_scan(record, containers, *, workspace_id):
+        scanned.append(record.id)
+
+    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+
+    _run_lifespan(server)
+
+    assert len(scanned) == 2
+
+    capped = [e for e in events if e[0] == "WARNING" and "capped at 2" in e[2]]
+    assert capped, events
+    assert "inspected 2 record(s)" in capped[0][2]
+    assert "skipped 1 record(s)" in capped[0][2]
+
+
+def test_boot_drift_scan_exception_does_not_break_startup(monkeypatch, vault):
+    """A raising detector is logged and startup still completes."""
+    server = _load_server()
+    ws = "ws-drift-boom"
+    _make_container_record(ws, "cid-boom", vault)
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    events = _record_log(monkeypatch, server)
+
+    from thoughtmachine.container_record import drift as drift_module
+
+    def boom(record, containers, *, workspace_id):
+        raise RuntimeError("drift detector exploded")
+
+    monkeypatch.setattr(drift_module, "scan_record", boom)
+
+    _run_lifespan(server)  # must not raise
+
+    warned = [
+        e
+        for e in events
+        if e[0] == "WARNING" and "Startup container drift scan skipped:" in e[2]
+    ]
+    assert warned, events
+    # Startup continued past the failure (later lifecycle steps still ran).
+    assert any("sweep scheduled" in e[2] for e in events), events
+
