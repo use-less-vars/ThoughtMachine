@@ -95,10 +95,8 @@ def resolve_network_mode(network_level) -> str:
     map to ``"bridge"``; everything else (``False``, ``"banned"``, ``"read"``,
     ``"ask"``, ``None``, empty, unknown values) maps to ``"none"``.
 
-    Single source of truth, shared by:
-      - ``docker_executor`` (gate path + legacy fallback path),
-      - ``security.security_gate.get_expected_container_config``,
-      - ``infra.container_registry.ContainerRegistry.resolve_network_mode``.
+    Single source of truth for the network-grant -> ``network_mode`` mapping,
+    consumed by ``security.security_gate.resolve_container_config``.
     """
     if network_level is True:
         return "bridge"

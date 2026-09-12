@@ -59,6 +59,11 @@ from thoughtmachine.container_record import (
 )
 from thoughtmachine.container_record.hook import record_creation
 
+# Drift event emitted when a permission change reconciles a live container's
+# network mode; recorded via the container record event log (best-effort).
+_EVENT_DRIFT_POLICY_CONFIG_CHANGED = "drift.policy_config_changed"
+_DRIFT_ACTOR = "infra.container_registry.on_permission_changed"
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -318,7 +323,7 @@ class ContainerRegistry:
         max_containers = self._get_max_containers(session_id, session_config)
 
         # Permission-derived network mode wins over any kwargs network_mode.
-        network_mode = self.resolve_network_mode(permissions)
+        network_mode = _resolve_network_mode_via_gate(workspace_id, permissions)
 
         profile_kwargs = {}
         for field_name in (
@@ -620,7 +625,6 @@ class ContainerRegistry:
         """
         if not self.is_enabled():
             return
-        new_mode = self.resolve_network_mode(new_permissions)
         with self._lock:
             names = list(self._session_map.get(session_id, ()))
         for name in names:
@@ -628,7 +632,11 @@ class ContainerRegistry:
                 state = self._containers.get(name)
             if state is None:
                 continue
-            if state["profile"].network_mode == new_mode:
+            old_mode = state["profile"].network_mode
+            new_mode = _resolve_network_mode_via_gate(
+                state["workspace_id"], new_permissions
+            )
+            if old_mode == new_mode:
                 continue  # still compliant — idempotent no-op
 
             # Teardown: graceful stop -> remove.  Failure => quarantine.
@@ -674,6 +682,13 @@ class ContainerRegistry:
                 "on_permission_changed: recreated %s with network_mode=%s",
                 name, new_mode,
             )
+            _emit_policy_drift_event(
+                state=state,
+                container=container,
+                container_name=name,
+                old_mode=old_mode,
+                new_mode=new_mode,
+            )
 
     # -- limits / helpers -----------------------------------------------
 
@@ -693,16 +708,6 @@ class ContainerRegistry:
                         raw, DEFAULT_MAX_CONTAINERS,
                     )
         return DEFAULT_MAX_CONTAINERS
-
-    @staticmethod
-    def resolve_network_mode(permissions) -> str:
-        """Permission -> network_mode: network in (True, "write", "outbound")
-        -> bridge, else none. Single mapping lives in
-        security.gate_helpers.resolve_network_mode (shared with docker_executor
-        and security_gate); this wrapper keeps the dict-arg interface."""
-        from security.gate_helpers import resolve_network_mode
-        perms = permissions or {}
-        return resolve_network_mode(perms.get("network"))
 
     def _to_handle(self, name, state) -> dict:
         return {
@@ -728,6 +733,95 @@ class ContainerRegistry:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _resolve_network_mode_via_gate(workspace_id, permissions) -> str:
+    """Resolve a container network mode via the SSoT security gate.
+
+    Delegates to ``security.security_gate`` (``resolve_container_config`` plus
+    the canonical ``get_workspace_capabilities`` loader) using the persistent
+    lifecycle class.  Fail-closed: a gate rejection or any error yields the
+    locked-down ``"none"`` mode.
+    """
+    try:
+        from security.security_gate import (
+            ContainerConfig,
+            ContainerConfigError,
+            get_workspace_capabilities,
+            resolve_container_config,
+        )
+
+        capabilities = get_workspace_capabilities(workspace_id)
+        cfg = resolve_container_config(
+            permissions or {}, capabilities, LIFECYCLE_PERSISTENT
+        )
+        if isinstance(cfg, ContainerConfig):
+            return cfg.network_mode
+        if isinstance(cfg, ContainerConfigError):
+            log.warning(
+                "_resolve_network_mode_via_gate: gate rejected workspace %s "
+                "(%s); using 'none'",
+                workspace_id, getattr(cfg, "code", "error"),
+            )
+        else:
+            log.warning(
+                "_resolve_network_mode_via_gate: unexpected gate result %r for "
+                "workspace %s; using 'none'",
+                cfg, workspace_id,
+            )
+    except Exception as exc:  # noqa: BLE001 - fail closed on any error
+        log.warning(
+            "_resolve_network_mode_via_gate: falling back to 'none' for "
+            "workspace %s: %s",
+            workspace_id, exc,
+        )
+    return "none"
+
+
+def _emit_policy_drift_event(
+    *, state, container, container_name, old_mode, new_mode
+) -> None:
+    """Best-effort append of a drift event to the container's record log.
+
+    Reads the record id off the current (pre-teardown) container's labels,
+    falling back to the stored profile labels.  Never raises: a missing record
+    id or a write failure is logged and swallowed so reconciliation continues.
+    """
+    try:
+        from thoughtmachine.container_record import (
+            RECORD_LABEL_KEY,
+            append_event,
+        )
+
+        labels = getattr(container, "labels", None)
+        labels = labels if isinstance(labels, dict) else {}
+        record_id = labels.get(RECORD_LABEL_KEY)
+        if not record_id:
+            profile = state.get("profile")
+            profile_labels = getattr(profile, "labels", None) or {}
+            record_id = profile_labels.get(RECORD_LABEL_KEY)
+        if not record_id:
+            log.warning(
+                "on_permission_changed: no container record id for %s; "
+                "skipping drift event (old_mode=%s new_mode=%s)",
+                container_name, old_mode, new_mode,
+            )
+            return
+        append_event(
+            state["workspace_id"],
+            str(record_id),
+            _EVENT_DRIFT_POLICY_CONFIG_CHANGED,
+            _DRIFT_ACTOR,
+            container=container_name,
+            old_mode=old_mode,
+            new_mode=new_mode,
+        )
+    except Exception as exc:  # noqa: BLE001 - drift event is best-effort
+        log.warning(
+            "on_permission_changed: could not record drift event for %s "
+            "(old_mode=%s new_mode=%s): %s",
+            container_name, old_mode, new_mode, exc,
+        )
 
 
 def is_container_registry_enabled(session_config) -> bool:

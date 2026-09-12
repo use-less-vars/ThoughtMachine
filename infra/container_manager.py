@@ -20,7 +20,7 @@ workspace is decommissioned.
 Security posture (identical to docker_executor.DockerExecutor)
 --------------------------------------------------------------
 - network disabled unless the session permissions allow a bridge network
-  (decided by the shared ``_compute_container_config_from_permissions`` gate)
+  (decided by the shared ``security.security_gate.resolve_container_config`` gate)
 - all capabilities dropped, no-new-privileges, read-only root filesystem
 - non-root user (1000:1000), tight memory + CPU quotas
 - bind-mounts the host session workspace at ``/workspace`` (read-only when

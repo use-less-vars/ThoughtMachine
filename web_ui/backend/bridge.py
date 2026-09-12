@@ -55,7 +55,7 @@ The full resolution chain:
 
     _maybe_re_sync_container
       → verify_container_integrity (docker_executor.py)
-           → _compute_container_config_from_permissions
+           → _resolve_container_config_via_gate
                 → get_workspace_capabilities + get_effective_permissions
                      (security/security_gate.py)
 """

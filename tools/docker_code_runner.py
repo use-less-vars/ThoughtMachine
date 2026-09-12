@@ -383,7 +383,7 @@ chmod +x "{script_path}"
         try:
             # Re-route through the per-session ContainerManager:
             # start(manager) -> exec -> stop. Network/mount decisions still
-            # come from docker_executor._compute_container_config_from_permissions
+            # come from docker_executor._resolve_container_config_via_gate
             # (single source of truth), and named volumes are populated from
             # the host workspace on first use. No per-execute reload of
             # docker_executor (the old importlib.reload pattern) — the
