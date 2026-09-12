@@ -532,6 +532,36 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log('WARNING', 'server', f'Workspace migration error: {exc}')
 
+    # ── Container-record migration ────────────────────────────────────────
+    # Backfill container records from any pre-existing (legacy) containers so
+    # the record store reflects live containers even for workspaces that never
+    # wrote their own record.  Best-effort: a missing Docker daemon (or any
+    # other failure) is logged and startup continues.  The migration is
+    # idempotent — already-recorded containers are skipped on later runs.
+    try:
+        import docker as _docker
+        from thoughtmachine.container_record import migrate_records
+        summary = migrate_records(docker_source=_docker.from_env())
+        if summary.get('aborted'):
+            log('WARNING', 'server',
+                'Container-record migration: aborted (Docker source '
+                'unavailable); no records written.')
+        elif summary.get('failed'):
+            log('WARNING', 'server',
+                'Container-record migration: '
+                f"{summary.get('created', 0)} created, "
+                f"{summary.get('rematerialised', 0)} rematerialised, "
+                f"{summary.get('skipped', 0)} skipped, "
+                f"{summary.get('failed', 0)} failed.")
+        else:
+            log('INFO', 'server',
+                'Container-record migration: '
+                f"{summary.get('created', 0)} created, "
+                f"{summary.get('rematerialised', 0)} rematerialised, "
+                f"{summary.get('skipped', 0)} skipped.")
+    except Exception as exc:
+        log('WARNING', 'server', f'Container-record migration skipped: {exc}')
+
     # ── Auto-register project root as a default workspace ──────────────
     try:
         from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
