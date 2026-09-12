@@ -3,10 +3,10 @@ Unit tests for the network 'outbound' -> 'bridge' mapping (Task 2).
 
 Covers the single shared mapping ``security.gate_helpers.resolve_network_mode``
 and its consumers:
-  - ``docker_executor._compute_container_config_from_permissions`` (gate path
-    + legacy session-permissions fallback path),
-  - ``security.security_gate.get_expected_container_config``,
-  - ``infra.container_registry.ContainerRegistry.resolve_network_mode``.
+  - ``docker_executor._resolve_container_config_via_gate`` (gate SSOT path;
+    the former legacy session-permissions fallback now fail-closes),
+  - ``security.security_gate.resolve_container_config``,
+  - ``infra.container_registry._resolve_network_mode_via_gate``.
 
 tests/security/conftest.py fixes ``sys.path`` (repo root first) so the real
 ``security`` package is imported, never a shadowing ``tests/security``.
@@ -19,10 +19,11 @@ from unittest.mock import patch
 import pytest  # noqa: F401  (pytest fixtures/raises used across the file)
 
 from security.gate_helpers import resolve_network_mode
-from docker_executor import _compute_container_config_from_permissions
+from docker_executor import _resolve_container_config_via_gate
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
-from security.security_gate import get_expected_container_config
-from infra.container_registry import ContainerRegistry
+from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+from security.security_gate import resolve_container_config
+from infra.container_registry import _resolve_network_mode_via_gate
 
 PERMS_OUTBOUND = {"network": "outbound", "filesystem": "write"}
 PERMS_BANNED = {"network": "banned", "filesystem": "write"}
@@ -54,7 +55,7 @@ class TestResolveNetworkModeMapping:
 
 
 # ---------------------------------------------------------------------------
-# 2-4. docker_executor._compute_container_config_from_permissions
+# 2-4. docker_executor._resolve_container_config_via_gate
 # ---------------------------------------------------------------------------
 
 
@@ -64,8 +65,8 @@ class TestComputeContainerConfigFromPermissions:
             "security.security_gate.get_workspace_capabilities",
             return_value=PERMISSIVE_CAPS,
         ):
-            result = _compute_container_config_from_permissions(
-                "/tmp/ws", "ws-1", PERMS_OUTBOUND
+            result = _resolve_container_config_via_gate(
+                "ws-1", PERMS_OUTBOUND
             )
         assert result == ("bridge", "rw")
 
@@ -74,8 +75,8 @@ class TestComputeContainerConfigFromPermissions:
             "security.security_gate.get_workspace_capabilities",
             return_value=RESTRICTIVE_CAPS,
         ):
-            result = _compute_container_config_from_permissions(
-                "/tmp/ws", "ws-1", PERMS_OUTBOUND
+            result = _resolve_container_config_via_gate(
+                "ws-1", PERMS_OUTBOUND
             )
         assert result == ("none", "ro")
 
@@ -87,8 +88,8 @@ class TestComputeContainerConfigFromPermissions:
             "security.security_gate.get_workspace_capabilities",
             return_value=PERMISSIVE_CAPS,
         ):
-            result = _compute_container_config_from_permissions(
-                "/tmp/ws", "ws-1", PERMS_BANNED
+            result = _resolve_container_config_via_gate(
+                "ws-1", PERMS_BANNED
             )
         assert result == ("none", "rw")
 
@@ -97,41 +98,45 @@ class TestComputeContainerConfigFromPermissions:
             "security.security_gate.get_workspace_capabilities",
             return_value=RESTRICTIVE_CAPS,
         ):
-            result = _compute_container_config_from_permissions(
-                "/tmp/ws", "ws-1", PERMS_BANNED
+            result = _resolve_container_config_via_gate(
+                "ws-1", PERMS_BANNED
             )
         assert result == ("none", "ro")
 
-    def test_legacy_fallback_path_outbound_gives_bridge_rw(self):
-        # workspace_id=None routes through the session-permissions fallback,
-        # which previously only recognised "write" for bridge.
-        result = _compute_container_config_from_permissions(
-            "/tmp/ws", None, PERMS_OUTBOUND
+    def test_legacy_fallback_path_outbound_gives_none_ro(self):
+        # workspace_id=None no longer routes through a legacy session-permissions
+        # fallback: the SSOT fail-closes to the most restrictive config.
+        result = _resolve_container_config_via_gate(
+            None, PERMS_OUTBOUND
         )
-        assert result == ("bridge", "rw")
+        assert result == ("none", "ro")
 
 
 # ---------------------------------------------------------------------------
-# 5. security.security_gate.get_expected_container_config
+# 5. security.security_gate.resolve_container_config
 # ---------------------------------------------------------------------------
 
 
 class TestGetExpectedContainerConfig:
     def test_outbound_session_expected_bridge(self):
-        cfg = get_expected_container_config(PERMS_OUTBOUND, PERMISSIVE_CAPS)
-        assert cfg["network_mode"] == "bridge"
+        cfg = resolve_container_config(PERMS_OUTBOUND, PERMISSIVE_CAPS, LIFECYCLE_PERSISTENT)
+        assert cfg.network_mode == "bridge"
 
     def test_outbound_session_with_restrictive_caps_expected_none(self):
-        cfg = get_expected_container_config(PERMS_OUTBOUND, RESTRICTIVE_CAPS)
-        assert cfg["network_mode"] == "none"
+        cfg = resolve_container_config(PERMS_OUTBOUND, RESTRICTIVE_CAPS, LIFECYCLE_PERSISTENT)
+        assert cfg.network_mode == "none"
 
 
 # ---------------------------------------------------------------------------
-# 6. infra.container_registry.ContainerRegistry.resolve_network_mode
+# 6. infra.container_registry._resolve_network_mode_via_gate
 # ---------------------------------------------------------------------------
 
 
 class TestRegistryResolveNetworkMode:
     def test_outbound_bridge_and_banned_none(self):
-        assert ContainerRegistry.resolve_network_mode({"network": "outbound"}) == "bridge"
-        assert ContainerRegistry.resolve_network_mode({"network": "banned"}) == "none"
+        with patch(
+            "security.security_gate.get_workspace_capabilities",
+            return_value=PERMISSIVE_CAPS,
+        ):
+            assert _resolve_network_mode_via_gate("ws-1", {"network": "outbound"}) == "bridge"
+            assert _resolve_network_mode_via_gate("ws-1", {"network": "banned"}) == "none"
