@@ -105,6 +105,12 @@ except ImportError:  # pragma: no cover - defensive
 
 
 from infra.container_env import merge_container_identity_env
+from thoughtmachine.container_record import (
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
+)
+from thoughtmachine.container_record.hook import record_creation
 
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
 from agent.config.defaults import (
@@ -444,10 +450,15 @@ class ContainerManager:
                 return handle
         return None
 
-    def start(self, image=None, name=None, note=None, worker_name=None):
+    def start(self, image=None, name=None, note=None, worker_name=None, *,
+              lifecycle_class: str = LIFECYCLE_PERSISTENT):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
+
+        ``lifecycle_class`` records the lifecycle of a FRESH-created container's
+        record; the default (``persistent``) is non-destructive, so only callers
+        that KNOW the container is ephemeral pass ``ephemeral`` explicitly.
 
         ``worker_name`` (optional) stamps the container with the
         ``thoughtmachine.worker`` ownership label - but only on a FRESH
@@ -744,6 +755,7 @@ class ContainerManager:
                     }],
                     volumes=[f"tm-packages-{self.workspace_id}:/home/agent/.local"],
                     tmpfs=tmpfs,
+                    lifecycle_class=lifecycle_class,
                     name=name,
                 )
             except RuntimeError as exc:
@@ -765,31 +777,37 @@ class ContainerManager:
             return {"id": container_id, "name": name, "status": "created",
                     "note": note or ""}
 
-        container = self.client.containers.run(
-            image=image,
-            name=name,
-            volumes=volumes,
-            mounts=mounts,
-            tmpfs=tmpfs,
-            network=network_mode,
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges:true"],
-            oom_score_adj=1000,  # user containers are the first OOM-kill victims
-            read_only=True,
-            user="1000:1000",
-            detach=True,
-            tty=True,
-            stdin_open=True,
-            command=["tail", "-f", "/dev/null"],
-            mem_limit=self.mem_limit,
-            cpu_quota=self.cpu_quota,
-            environment=merge_container_identity_env(
-                {"PYTHONUSERBASE": "/home/agent/.local"},
-                session_id=self.session_id,
-                workspace_id=self.workspace_id,
-            ),
+        with record_creation(
+            workspace_id=self.workspace_id,
+            lifecycle_class=lifecycle_class,
             labels=labels,
-        )
+        ) as record:
+            container = self.client.containers.run(
+                image=image,
+                name=name,
+                volumes=volumes,
+                mounts=mounts,
+                tmpfs=tmpfs,
+                network=network_mode,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                oom_score_adj=1000,  # user containers are the first OOM-kill victims
+                read_only=True,
+                user="1000:1000",
+                detach=True,
+                tty=True,
+                stdin_open=True,
+                command=["tail", "-f", "/dev/null"],
+                mem_limit=self.mem_limit,
+                cpu_quota=self.cpu_quota,
+                environment=merge_container_identity_env(
+                    {"PYTHONUSERBASE": "/home/agent/.local"},
+                    session_id=self.session_id,
+                    workspace_id=self.workspace_id,
+                ),
+                labels=labels,
+            )
+            record.attach(container)
         try:
             container.reload()
         except Exception:

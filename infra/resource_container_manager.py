@@ -184,6 +184,8 @@ except Exception:  # pragma: no cover - registry not wired
     is_registry_active = lambda session_config: False  # noqa: E731
 
 from infra.container_env import merge_container_identity_env
+from thoughtmachine.container_record import LIFECYCLE_RESOURCE
+from thoughtmachine.container_record.hook import record_creation
 
 # Module-level image-readiness cache + single-flight lock. Only SUCCESS is
 # cached (_RESOURCE_IMAGE_READY=True); a failed check/build is retried on the
@@ -1113,26 +1115,33 @@ class ResourceContainerManager:
                     environment=identity_env,
                 )
                 return _ResourceContainerHandle(handle["id"])
-            container = self.client.containers.run(
-                image=self.image,
-                name=name,
-                mounts=mounts,
-                tmpfs=tmpfs,
-                network_mode=self.network_mode,
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                oom_score_adj=500,  # resource (git) containers get a moderate OOM score
-                read_only=True,
-                user="1000:1000",  # must match the agent user in the Dockerfile
-                detach=True,
-                tty=True,
-                stdin_open=True,
-                command=["tail", "-f", "/dev/null"],
-                mem_limit=self.mem_limit,
-                cpu_quota=self.cpu_quota,
-                environment=identity_env,
-                labels=self._labels(name),
-            )
+            ctr_labels = self._labels(name)
+            with record_creation(
+                workspace_id=self.workspace_id,
+                lifecycle_class=LIFECYCLE_RESOURCE,
+                labels=ctr_labels,
+            ) as record:
+                container = self.client.containers.run(
+                    image=self.image,
+                    name=name,
+                    mounts=mounts,
+                    tmpfs=tmpfs,
+                    network_mode=self.network_mode,
+                    cap_drop=["ALL"],
+                    security_opt=["no-new-privileges:true"],
+                    oom_score_adj=500,  # resource (git) containers get a moderate OOM score
+                    read_only=True,
+                    user="1000:1000",  # must match the agent user in the Dockerfile
+                    detach=True,
+                    tty=True,
+                    stdin_open=True,
+                    command=["tail", "-f", "/dev/null"],
+                    mem_limit=self.mem_limit,
+                    cpu_quota=self.cpu_quota,
+                    environment=identity_env,
+                    labels=ctr_labels,
+                )
+                record.attach(container)
         except Exception as e:
             # Wrap image-missing with actionable build instructions.
             raise RuntimeError(
