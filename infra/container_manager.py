@@ -72,6 +72,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,6 +110,7 @@ from thoughtmachine.container_record import (
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
+    RECORD_LABEL_KEY,
 )
 from thoughtmachine.container_record.hook import record_creation
 
@@ -159,6 +161,120 @@ def _load_docker_executor():
             import docker_executor  # noqa: F401 — deliberately NOT reloaded
             _docker_executor_module = docker_executor
         return _docker_executor_module
+
+
+# ── Exec-path drift admission ─────────────────────────────────────────────────────────
+# ``exec()`` refuses to run a command when the LIVE container's network/workspace
+# isolation is MORE PERMISSIVE than the session policy desires (a command must
+# never run under weaker isolation than the gate asked for).  A container that
+# differs but is NOT more permissive — or whose isolation cannot be read — is
+# WARNING-logged and allowed through, preserving today's behaviour.
+#
+# The drift EVENT + WARNING + audit fire ONCE per distinct signature.  Because a
+# fresh ``ContainerManager`` is built for every tool call, the "already reported"
+# memo lives at MODULE scope so deduplication actually holds across calls.  The
+# DECISION, by contrast, is applied on every call (a drifted container keeps
+# being denied).
+_EXEC_DRIFT_MEMO_MAX = 256
+_EXEC_DRIFT_SEEN = OrderedDict()  # (container_id, signature) -> True, oldest evicted
+_EXEC_DRIFT_LOCK = threading.Lock()
+_EXEC_DRIFT_EVENT = "drift.exec_on_drifted_container"
+_EXEC_DRIFT_ACTOR = "infra.container_manager.exec"
+_EXEC_DRIFT_AUDIT = "CONTAINER_EXEC_DRIFT"
+_EXEC_DRIFT_EXIT_CODE = 126  # distinct from -2 (timeout) and -1 (generic error)
+
+# Isolation ranks: higher == more permissive.  Network "default" is normalized
+# to "bridge" upstream (see ContainerManager._normalize_network_mode); any other
+# PRESENT network mode (host / container:<id> / ...) is treated as the most
+# permissive.  For the workspace bind: ro(0) < rw(1) < absent(2) — an absent
+# /workspace bind is MORE permissive because writes then land on the container's
+# own layer instead of the (read-only) host bind.
+_EXEC_NETWORK_RANK = {"none": 0, "bridge": 1}
+_EXEC_WORKSPACE_RANK = {"ro": 0, "rw": 1, "absent": 2}
+
+
+def _exec_network_rank(network_mode):
+    """Isolation rank for a network mode (None -> None, unknown -> 2)."""
+    if network_mode is None:
+        return None
+    normalized = ContainerManager._normalize_network_mode(network_mode)
+    return _EXEC_NETWORK_RANK.get(normalized, 2)
+
+
+def _exec_workspace_rank(workspace_mode):
+    """Isolation rank for a workspace mode (None -> None, unknown -> 2)."""
+    if workspace_mode is None:
+        return None
+    return _EXEC_WORKSPACE_RANK.get(workspace_mode, 2)
+
+
+def _exec_live_isolation(container):
+    """Read (live_network_mode, live_workspace_mode) from a container's attrs.
+
+    Returns ``(None, None)`` when attrs is unreadable or not a dict.  A key that
+    is STRUCTURALLY ABSENT (no ``HostConfig`` dict, no ``Mounts`` list) yields
+    ``None`` for that axis — "cannot determine", i.e. no observable drift, so
+    pre-existing callers whose fakes omit these keys are unaffected.  A present
+    ``Mounts`` list without a ``/workspace`` destination yields ``"absent"``.
+    """
+    try:
+        attrs = getattr(container, "attrs", None)
+    except Exception:
+        return None, None
+    if not isinstance(attrs, dict):
+        return None, None
+
+    live_net = None
+    host_config = attrs.get("HostConfig")
+    if isinstance(host_config, dict):
+        raw_net = host_config.get("NetworkMode")
+        if raw_net is not None:
+            live_net = ContainerManager._normalize_network_mode(raw_net)
+
+    live_ws = None
+    mounts = attrs.get("Mounts")
+    if isinstance(mounts, list):
+        live_ws = "absent"
+        for mount in mounts:
+            if isinstance(mount, dict) and mount.get("Destination") == "/workspace":
+                live_ws = "rw" if mount.get("RW") else "ro"
+                break
+    return live_net, live_ws
+
+
+def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
+    """Classify live isolation vs desired policy; returns (decision, reason).
+
+    * ``("run", None)``  — nothing determinable.
+    * ``("deny", "<axis>_more_permissive")`` — live is MORE permissive on at
+      least one axis (network checked first, then workspace).
+    * ``("warn", "config_differs_not_more_permissive")`` — diff the other way.
+
+    A ``None``/unknown WANT on an axis means "no opinion" on that axis: it can
+    never prove live is MORE permissive, so it never forces a deny.  The
+    comparison is therefore total — it never relies on ``int > None`` raising.
+    """
+    net_known = live_net is not None
+    ws_known = live_ws is not None
+    if not net_known and not ws_known:
+        return "run", None
+
+    # A ``None``/unknown WANT rank (or an unknown WANT mode) is "no opinion":
+    # that axis cannot make live MORE permissive, so it never forces a deny.
+    want_net_rank = _exec_network_rank(want_net)
+    want_ws_rank = _exec_workspace_rank(want_ws)
+    net_more = (
+        net_known and want_net_rank is not None
+        and _exec_network_rank(live_net) > want_net_rank
+    )
+    ws_more = (
+        ws_known and want_ws_rank is not None
+        and _exec_workspace_rank(live_ws) > want_ws_rank
+    )
+    if net_more or ws_more:
+        reason = "network_more_permissive" if net_more else "workspace_more_permissive"
+        return "deny", reason
+    return "warn", "config_differs_not_more_permissive"
 
 
 def _truncate_output(output):
@@ -898,6 +1014,16 @@ class ContainerManager:
         if self._is_resource_container(container):
             raise PermissionError("Resource container access denied")
 
+        # ── Exec-path drift admission (fail-safe) ─────────────────────────────────
+        # Deny when the LIVE container is more permissive than a RESOLVED session
+        # policy; warn (and continue) when it differs but is not more
+        # permissive.  An UNRESOLVABLE policy proves nothing, so it (like any
+        # other classifier error) degrades to "run as today".
+        _drift_action, _drift_payload = self._check_exec_drift(container, container_id)
+        if _drift_action == "deny":
+            return _drift_payload
+        _exec_drift = _drift_payload if _drift_action == "warn" else None
+
         # Phase 2: disk quota guard for the persistent package cache.
         quota_mb = (getattr(self, "workspace_config", None) or {}).get("disk_quota_mb", 4096)
         if quota_mb and quota_mb > 0 and self._exceeds_disk_quota(container, quota_mb):
@@ -959,11 +1085,151 @@ class ContainerManager:
         stderr = output[1].decode(errors="replace") if output and output[1] else ""
         # Phase 6: persistent usage log (best-effort; never affects the result).
         self._append_usage_log(container_id, command)
-        return {
+        result = {
             "stdout": _truncate_output(stdout),
             "stderr": _truncate_output(stderr),
             "exit_code": exit_code,
         }
+        if _exec_drift is not None:
+            result["drift"] = _exec_drift
+        return result
+
+    def _check_exec_drift(self, container, container_id):
+        """Classify the live container's isolation vs the session policy.
+
+        Returns one of:
+          ("run", None)           — no observable drift; run as today.
+          ("warn", drift_dict)    — drift seen; run, attaching drift_dict.
+          ("deny", response_dict) — live is MORE permissive; return the dict
+                                    WITHOUT running the command.
+
+        The session policy is resolved with ``strict=True``: when the policy
+        SSOT is unavailable, an unresolvable policy PROVES NOTHING about the
+        live container, so we have no drift opinion and run as today (a deny
+        requires a genuinely RESOLVED policy proving live is more permissive).
+        Any OTHER unexpected exception likewise degrades to ("run", None) as a
+        last-resort so a classifier bug can never block legitimate exec.
+        """
+        try:
+            try:
+                want_net, want_ws = self._compute_config(
+                    getattr(self, "workspace_path", None),
+                    getattr(self, "workspace_id", None),
+                    getattr(self, "session_permissions", None),
+                    LIFECYCLE_PERSISTENT,
+                    strict=True,
+                )
+            except Exception as exc:
+                # The policy SSOT could NOT be resolved at all.  This proves
+                # nothing about the live container, so we form no drift opinion
+                # and MUST NOT deny (deny requires a RESOLVED policy).
+                try:
+                    log("WARNING", "docker.container_manager",
+                        "session policy could not be resolved "
+                        f"({exc!r}); proceeding without exec drift opinion")
+                except Exception:
+                    pass
+                return "run", None
+
+            if self._config_matches(container, want_net, want_ws):
+                return "run", None
+
+            live_net, live_ws = _exec_live_isolation(container)
+            decision, reason = _exec_drift_decision(
+                live_net, live_ws, want_net, want_ws
+            )
+            if decision == "run":
+                return "run", None
+
+            drift = {
+                "drifted": True,
+                "decision": decision,
+                "reason": reason,
+                "network_mode": live_net,
+                "workspace_mode": live_ws,
+            }
+            signature = hashlib.sha256(
+                f"{want_net}|{want_ws}|{live_net}|{live_ws}|{decision}".encode()
+            ).hexdigest()
+            self._emit_exec_drift_once(
+                container_id, container, signature, decision, reason,
+                want_net, want_ws, live_net, live_ws,
+            )
+
+            if decision == "deny":
+                message = (
+                    "Container isolation is MORE PERMISSIVE than the session "
+                    f"policy ({reason}); refusing to run the command. "
+                    f"expected network={want_net} workspace={want_ws}; "
+                    f"live network={live_net} workspace={live_ws}. "
+                    "Recreate the container to restore the desired isolation."
+                )
+                return "deny", {
+                    "stdout": "",
+                    "stderr": f"{message}\nreason={reason}",
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                    "drift": drift,
+                }
+            return "warn", drift
+        except Exception as exc:  # fail-safe: never block exec on classifier error
+            try:
+                log("WARNING", "docker.container_manager",
+                    f"exec drift check failed ({exc!r}); proceeding")
+            except Exception:
+                pass
+            return "run", None
+
+    def _emit_exec_drift_once(self, container_id, container, signature, decision,
+                              reason, want_net, want_ws, live_net, live_ws):
+        """Emit drift EVENT + WARNING + audit ONCE per (container_id, signature).
+
+        Best-effort: every sub-step is individually guarded so a logging/record
+        failure never affects the exec decision.  Repeat calls with the same
+        signature skip emission entirely (the decision is still applied by the
+        caller).
+        """
+        key = (container_id, signature)
+        with _EXEC_DRIFT_LOCK:
+            if key in _EXEC_DRIFT_SEEN:
+                return
+            _EXEC_DRIFT_SEEN[key] = True
+            while len(_EXEC_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _EXEC_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"container_id={container_id} decision={decision} reason={reason} "
+            f"expected(network={want_net},workspace={want_ws}) "
+            f"actual(network={live_net},workspace={live_ws})"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"exec on drifted container: {summary}")
+        except Exception:
+            pass
+
+        try:
+            self._audit(_EXEC_DRIFT_AUDIT, summary)
+        except Exception:
+            pass
+
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id is not None and getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    _EXEC_DRIFT_EVENT,
+                    _EXEC_DRIFT_ACTOR,
+                    decision=decision,
+                    reason=reason,
+                    expected={"network_mode": want_net, "workspace_mode": want_ws},
+                    actual={"network_mode": live_net, "workspace_mode": live_ws},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
 
     def _exceeds_disk_quota(self, container, quota_mb):
         """True if /home/agent/.local usage (KB) exceeds quota_mb MB.
@@ -1801,6 +2067,8 @@ class ContainerManager:
         workspace_id,
         session_permissions,
         lifecycle_class=LIFECYCLE_PERSISTENT,
+        *,
+        strict=False,
     ):
         """Desired (network_mode, workspace_mode) from the security-gate SSOT.
 
@@ -1809,6 +2077,14 @@ class ContainerManager:
         permissions with the workspace's (fail-closed) capabilities. Fail-closed
         to ``("none", "ro")`` only if the SSOT is unavailable, raises, or
         reports a ``ContainerConfigError``.
+
+        ``strict`` (keyword-only, default ``False``): when ``True`` the method
+        does NOT fail-closed to the ``("none", "ro")`` sentinel; instead it
+        PROPAGATES the resolution failure (re-raises / raises ``RuntimeError``)
+        so the caller can tell "the policy genuinely resolved to none/ro" apart
+        from "the policy could not be resolved at all".  Only the exec-path
+        drift admission passes ``strict=True``; every other caller keeps the
+        historical fail-closed behaviour byte-for-byte.
         """
         try:
             from security.security_gate import (
@@ -1822,8 +2098,15 @@ class ContainerManager:
                 session_permissions or {}, capabilities, lifecycle_class
             )
         except Exception:
+            if strict:
+                raise
             return "none", "ro"
         if not isinstance(cfg, ContainerConfig):
+            if strict:
+                raise RuntimeError(
+                    "resolve_container_config did not return a ContainerConfig "
+                    f"(got {type(cfg).__name__}); cannot resolve session policy"
+                )
             return "none", "ro"
         return cfg.network_mode, cfg.workspace_mode
 

@@ -312,8 +312,7 @@ class ContainerExecTool(_ContainerControlBase):
                 environment=self.environment,
             )
             timed_out = result["exit_code"] == -2
-            return self._respond(
-                result["exit_code"] == 0,
+            fields = dict(
                 exit_code=result["exit_code"],
                 stdout=result["stdout"],
                 stderr=result["stderr"],
@@ -321,6 +320,11 @@ class ContainerExecTool(_ContainerControlBase):
                 duration=time.time() - start_time,
                 timed_out=timed_out,
             )
+            # Additive, optional: surface exec-path drift info when present.
+            drift = result.get("drift")
+            if drift is not None:
+                fields["drift"] = drift
+            return self._respond(result["exit_code"] == 0, **fields)
         except TimeoutError:
             return self._respond(
                 False,
