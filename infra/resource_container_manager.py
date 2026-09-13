@@ -187,6 +187,7 @@ from infra.container_env import merge_container_identity_env
 from thoughtmachine.container_record import (
     LIFECYCLE_RESOURCE,
     RESOURCE_NAME_PREFIX,
+    docker_restart_policy,
 )
 from thoughtmachine.container_record import RESOURCE_LABEL as _SHARED_RESOURCE_LABEL
 from thoughtmachine.container_record.hook import record_creation
@@ -1211,6 +1212,7 @@ class ResourceContainerManager:
                     cpu_quota=self.cpu_quota,
                     environment=identity_env,
                     labels=ctr_labels,
+                    restart_policy=docker_restart_policy(LIFECYCLE_RESOURCE),
                 )
                 record.attach(container)
         except Exception as e:

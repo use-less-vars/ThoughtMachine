@@ -56,6 +56,7 @@ from thoughtmachine.container_record import (
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
+    docker_restart_policy,
 )
 from thoughtmachine.container_record.hook import record_creation
 
@@ -177,12 +178,12 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
     container was first created -- so the recreate re-validates POLICY
     (network/permission narrowing) only, with ``image=None`` on the spec.
     """
+    lifecycle = lifecycle_class or (
+        LIFECYCLE_RESOURCE
+        if profile.container_type == "resource"
+        else LIFECYCLE_PERSISTENT
+    )
     if workspace_id is not None:
-        lifecycle = lifecycle_class or (
-            LIFECYCLE_RESOURCE
-            if profile.container_type == "resource"
-            else LIFECYCLE_PERSISTENT
-        )
         if capabilities is None:
             capabilities = _load_capabilities(workspace_id)
         spec = ContainerSpec(
@@ -243,6 +244,7 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
         extra_hosts=dict(profile.extra_hosts),
         volumes=list(profile.volumes),
         mounts=mounts,
+        restart_policy=docker_restart_policy(lifecycle),
     )
 
 

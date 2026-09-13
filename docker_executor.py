@@ -741,7 +741,10 @@ class DockerExecutor:
             Transform,
             admit,
         )
-        from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+        from thoughtmachine.container_record import (
+            LIFECYCLE_PERSISTENT,
+            docker_restart_policy,
+        )
 
         _admission_wsid = str(self.workspace_id) if self.workspace_id is not None else "default"
         _admission = admit(
@@ -791,6 +794,7 @@ class DockerExecutor:
                 "thoughtmachine.note": "",
                 CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
             },
+            restart_policy=docker_restart_policy(LIFECYCLE_PERSISTENT),
         )
         # Workspace bind mount already has correct UID (matches host)
         self.last_used = time.time()

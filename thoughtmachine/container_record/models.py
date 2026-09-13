@@ -43,7 +43,8 @@ class RecordLocked(ContainerRecordError):
 SCHEMA_VERSION_LEGACY = 0
 
 #: ``schema_version`` for records authored natively (never synthesised).
-SCHEMA_VERSION_CURRENT = 1
+#: v2 adds the ``restart_policy`` intent field (absent in v1 records).
+SCHEMA_VERSION_CURRENT = 2
 
 LIFECYCLE_EPHEMERAL = "ephemeral"
 LIFECYCLE_PERSISTENT = "persistent"
@@ -80,6 +81,9 @@ SCHEMA_FIELD_NAMES: tuple[str, ...] = (
     "state",
     "created_at",
     "updated_at",
+    # ``restart_policy`` is the *intent* restart policy applied at container
+    # creation (``None`` = the record predates the field, i.e. unset).
+    "restart_policy",
 )
 
 #: Nested ``intent_snapshot`` field order (§1.1).
@@ -95,6 +99,9 @@ INTENT_SNAPSHOT_KEYS: tuple[str, ...] = (
     "image_ref",
     "image_hash",
     "hardening",
+    # ``restart_policy`` records the restart policy observed in the live
+    # container's ``HostConfig.RestartPolicy.Name`` (``""`` when unset).
+    "restart_policy",
 )
 
 #: ``event_log`` entry field order (§1.2).
@@ -162,6 +169,7 @@ class Record:
     state: str = ""
     created_at: str = ""
     updated_at: str = ""
+    restart_policy: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the record as a plain dict in §1 field order."""
@@ -179,6 +187,7 @@ class Record:
             "state": self.state,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "restart_policy": self.restart_policy,
         }
 
     @classmethod
@@ -195,6 +204,11 @@ class Record:
         if not isinstance(event_log, list):
             event_log = []
 
+        # Absent / blank -> ``None`` (unset); a non-empty string is kept as-is.
+        restart_policy = data.get("restart_policy")
+        if not isinstance(restart_policy, str) or not restart_policy:
+            restart_policy = None
+
         return cls(
             id=str(data.get("id", "")),
             lifecycle_class=str(data.get("lifecycle_class", "")),
@@ -209,4 +223,5 @@ class Record:
             state=str(data.get("state", "") or ""),
             created_at=str(data.get("created_at", "") or ""),
             updated_at=str(data.get("updated_at", "") or ""),
+            restart_policy=restart_policy,
         )
