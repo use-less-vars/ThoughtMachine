@@ -727,6 +727,47 @@ class DockerExecutor:
             mounts.append(pkg_mount)
         container_env = ["PYTHONUSERBASE=/home/agent/.local"]
 
+        # ── Admission control (phase 2 gate) ─────────────────────────────
+        # Route this terminal create through the pure admission gate so the
+        # container is created with the gate-approved (possibly narrowed)
+        # network mode.  A Deny raises AdmissionDenied; a Transform only ever
+        # narrows, so we adopt the gate's network mode.
+        from security.admission_gate import (
+            AdmissionDenied,
+            AdmissionRequest,
+            ClientProbes,
+            ContainerSpec,
+            Deny,
+            Transform,
+            admit,
+        )
+        from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+
+        _admission_wsid = str(self.workspace_id) if self.workspace_id is not None else "default"
+        _admission = admit(
+            AdmissionRequest(
+                spec=ContainerSpec(
+                    container_type="user",
+                    lifecycle_class=LIFECYCLE_PERSISTENT,
+                    workspace_id=_admission_wsid,
+                    image=None,
+                    name=container_name,
+                    mem_limit=self.mem_limit,
+                    cpu_quota=self.cpu_quota,
+                    network_mode=network_mode,
+                    read_only=True,
+                ),
+                permissions=self.session_permissions or {},
+                capabilities=_load_admission_capabilities(_admission_wsid),
+                session_config=getattr(self, "_session_config", None),
+            ),
+            probes=ClientProbes(self.client),
+        )
+        if isinstance(_admission, Deny):
+            raise AdmissionDenied(_admission.code, _admission.message)
+        if isinstance(_admission, Transform):
+            network_mode = _admission.spec.network_mode
+
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
@@ -1300,6 +1341,21 @@ def _compute_effective_capabilities(workspace_path: str) -> dict:
     via the security gate.
     """
     return _load_capabilities(workspace_path)
+
+
+def _load_admission_capabilities(workspace_id):
+    """Load a workspace's capabilities for the admission gate.
+
+    Lazy import so a test that monkeypatches
+    ``security.security_gate.get_workspace_capabilities`` is honoured.  Any
+    failure returns ``None``; the admission gate then fails closed on the
+    ``capabilities_required`` code (mirrors the fail-closed config resolver).
+    """
+    try:
+        from security.security_gate import get_workspace_capabilities
+        return get_workspace_capabilities(workspace_id)
+    except Exception:
+        return None
 
 
 def _default_capabilities() -> dict:

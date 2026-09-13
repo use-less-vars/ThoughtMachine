@@ -112,6 +112,20 @@ from thoughtmachine.container_record import (
 )
 from thoughtmachine.container_record.hook import record_creation
 
+# Admission control (phase 2): the legacy (registry-inactive) fresh create is a
+# terminal container-create site, so it consults the pure admission gate before
+# touching the daemon (a Deny returns an error dict; a Transform narrows the
+# network_mode).  When the registry is active this code is unreachable -- the
+# registry already applies admission on its own create path.
+from security.admission_gate import (
+    AdmissionRequest,
+    ClientProbes,
+    ContainerSpec,
+    Deny,
+    Transform,
+    admit,
+)
+
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
 from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
@@ -211,6 +225,22 @@ def _safe_session_tag(session_id):
     if cleaned:
         return cleaned
     return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:8]
+
+
+def _load_capabilities(workspace_id):
+    """Best-effort load of a workspace's capabilities for admission.
+
+    Runtime import so a test that monkeypatches
+    ``security.security_gate.get_workspace_capabilities`` is honoured.  Any
+    failure returns ``None``; admission then fails closed on the
+    ``capabilities_required`` code (mirrors the fail-closed network resolver).
+    """
+    try:
+        from security.security_gate import get_workspace_capabilities
+
+        return get_workspace_capabilities(workspace_id)
+    except Exception:  # noqa: BLE001 - admission fails closed on None
+        return None
 
 
 class ContainerManager:
@@ -782,6 +812,40 @@ class ContainerManager:
                                 data={"image": image, "name": name, "status": "created"})
             return {"id": container_id, "name": name, "status": "created",
                     "note": note or ""}
+
+        # Admission control (phase 2): the legacy (registry-inactive) create is a
+        # terminal container-create site, so gate it through the pure admission
+        # gate before touching the daemon.  Fail closed: a ``Deny`` returns an
+        # error dict; a ``Transform`` may only narrow the network mode.
+        # (When the registry is active this code is unreachable - the registry
+        # already applied admission on its own create path.)
+        _admission_spec = ContainerSpec(
+            container_type="user",
+            lifecycle_class=lifecycle_class,
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+            # The image is operator-configured (``self.image``, defaulting to
+            # ``DEFAULT_IMAGE``), so gating it against the user-image allowlist is
+            # a tautology; image enforcement lives on the registry path/upstream.
+            image=None,
+            name=name,
+            mem_limit=self.mem_limit,
+            cpu_quota=self.cpu_quota,
+            oom_score_adj=1000,
+            network_mode=network_mode,
+            read_only=True,
+        )
+        _admission_request = AdmissionRequest(
+            spec=_admission_spec,
+            permissions=self.session_permissions or {},
+            capabilities=_load_capabilities(self.workspace_id),
+            session_config=getattr(self, "_session_config", None),
+        )
+        _decision = admit(_admission_request, probes=ClientProbes(self.client))
+        if isinstance(_decision, Deny):
+            return {"error": _decision.message, "code": _decision.code}
+        if isinstance(_decision, Transform):
+            network_mode = _decision.spec.network_mode
 
         with record_creation(
             workspace_id=self.workspace_id,

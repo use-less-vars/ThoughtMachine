@@ -59,6 +59,20 @@ from thoughtmachine.container_record import (
 )
 from thoughtmachine.container_record.hook import record_creation
 
+# Admission control (phase 2): the hardened create path is the single
+# container-create chokepoint, so it consults the pure admission gate before
+# touching the daemon (a Deny raises AdmissionDenied; a Transform narrows the
+# profile's network_mode).
+from security.admission_gate import (
+    AdmissionDenied,
+    AdmissionRequest,
+    ClientProbes,
+    ContainerSpec,
+    Deny,
+    Transform,
+    admit,
+)
+
 # Drift event emitted when a permission change reconciles a live container's
 # network mode; recorded via the container record event log (best-effort).
 _EVENT_DRIFT_POLICY_CONFIG_CHANGED = "drift.policy_config_changed"
@@ -134,15 +148,71 @@ class ContainerProfile:
                 self.oom_score_adj = DEFAULT_RESOURCE_OOM_SCORE_ADJ
 
 
-def create_hardened_container(client, profile: ContainerProfile, container_name: str):
+def create_hardened_container(client, profile: ContainerProfile, container_name: str, *,
+                              workspace_id=None, lifecycle_class=None, session_id=None,
+                              permissions=None, capabilities=None, session_config=None,
+                              probes=None, revalidate_image=True):
     """THE single hardened create path (design doc §2.3, dispatch form).
 
-    Pure function: takes a docker client, a profile and a container name and
-    runs ``client.containers.run`` with EVERY profile field plus the full
+    Runs ``client.containers.run`` with EVERY profile field plus the full
     hardening recipe.  ``profile.mounts`` entries (``{"source", "target",
     "mode": "rw"|"ro"}`` dicts) are converted to docker bind-mount dicts
     ``{"source", "target", "type": "bind", "read_only": bool}``.
+
+    Admission hook (phase 2): when ``workspace_id`` is supplied the call is
+    first gated through :func:`security.admission_gate.admit` -- a ``Deny``
+    raises :class:`AdmissionDenied`, a ``Transform`` rewrites the profile's
+    (only narrowed) ``network_mode``, and an ``Allow`` proceeds unchanged.
+    When ``workspace_id`` is ``None`` the function stays a *pure* create (the
+    legacy 3-arg call used by unit tests): no admission, no daemon probes.
+    ``capabilities`` is best-effort loaded via
+    :func:`_load_capabilities` when omitted (runtime import, so a patched
+    ``security.security_gate.get_workspace_capabilities`` is honoured).
+
+    ``revalidate_image`` controls the image-allowlist axis of admission.  It
+    stays True for *caller-selected* creates (``request_container`` /
+    ``create_resource_container``): the image being chosen right now must be on
+    ``ADMISSION_IMAGE_ALLOWLIST``.  A permission-change *recreate* passes False:
+    the image is not being selected -- it was already admitted when the
+    container was first created -- so the recreate re-validates POLICY
+    (network/permission narrowing) only, with ``image=None`` on the spec.
     """
+    if workspace_id is not None:
+        lifecycle = lifecycle_class or (
+            LIFECYCLE_RESOURCE
+            if profile.container_type == "resource"
+            else LIFECYCLE_PERSISTENT
+        )
+        if capabilities is None:
+            capabilities = _load_capabilities(workspace_id)
+        spec = ContainerSpec(
+            container_type=profile.container_type,
+            lifecycle_class=lifecycle,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            image=profile.image if revalidate_image else None,
+            name=container_name,
+            mem_limit=profile.mem_limit,
+            cpu_quota=profile.cpu_quota,
+            oom_score_adj=profile.oom_score_adj,
+            network_mode=profile.network_mode,
+            read_only=HARDENED_READ_ONLY,
+        )
+        request = AdmissionRequest(
+            spec=spec,
+            permissions=permissions,
+            capabilities=capabilities,
+            session_config=session_config,
+        )
+        decision = admit(request, probes=probes or ClientProbes(client))
+        if isinstance(decision, Deny):
+            raise AdmissionDenied(decision.code, decision.message)
+        if isinstance(decision, Transform):
+            # ``network_mode`` is the only axis admission can narrow here; the
+            # hardening ``read_only`` flag is a fixed constant (already the
+            # narrowest value), so it never needs applying to the profile.
+            profile = replace(profile, network_mode=decision.spec.network_mode)
+
     mounts = [
         {
             "source": m["source"],
@@ -389,7 +459,12 @@ class ContainerRegistry:
                 labels=profile.labels,
             ) as record:
                 container = create_hardened_container(
-                    self._docker_client, profile, container_name
+                    self._docker_client, profile, container_name,
+                    workspace_id=workspace_id,
+                    lifecycle_class=lifecycle_class,
+                    session_id=session_id,
+                    permissions=permissions,
+                    session_config=session_config,
                 )
                 record.attach(container)
         except Exception:
@@ -508,7 +583,16 @@ class ContainerRegistry:
             lifecycle_class=LIFECYCLE_RESOURCE,
             labels=profile.labels,
         ) as record:
-            container = create_hardened_container(self._docker_client, profile, name)
+            container = create_hardened_container(
+                self._docker_client, profile, name,
+                workspace_id=workspace_id,
+                lifecycle_class=LIFECYCLE_RESOURCE,
+                session_id=session_id,
+                # Empty Mapping (not None): resolve_container_config rejects a
+                # None permissions value with ContainerConfigError; {} admits.
+                permissions={},
+                session_config=None,
+            )
             record.attach(container)
         container_id = getattr(container, "id", "") or ""
         self.register(name, session_id, workspace_id, "resource", profile)
@@ -658,7 +742,22 @@ class ContainerRegistry:
             # Recreate with the SAME name and an updated profile.
             try:
                 new_profile = replace(state["profile"], network_mode=new_mode)
-                fresh = create_hardened_container(self._docker_client, new_profile, name)
+                fresh = create_hardened_container(
+                    self._docker_client, new_profile, name,
+                    workspace_id=state["workspace_id"],
+                    # Persistent lifecycle: _resolve_network_mode_via_gate (which
+                    # produced new_mode) is hardcoded to LIFECYCLE_PERSISTENT, so
+                    # admission must resolve with the same class or it would
+                    # spuriously Transform/Deny.
+                    lifecycle_class=LIFECYCLE_PERSISTENT,
+                    session_id=session_id,
+                    permissions=new_permissions,
+                    session_config=None,
+                    # The image was admitted at first create; a permission-change
+                    # recreate re-validates policy (network/permission
+                    # narrowing), not the image allowlist (see the docstring).
+                    revalidate_image=False,
+                )
             except Exception as exc:  # noqa: BLE001 - do not raise; retry next event
                 log.error(
                     "on_permission_changed: recreate of %s failed: %s", name, exc,
@@ -733,6 +832,22 @@ class ContainerRegistry:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _load_capabilities(workspace_id):
+    """Best-effort load of a workspace's capabilities for admission.
+
+    Runtime import so a test that monkeypatches
+    ``security.security_gate.get_workspace_capabilities`` is honoured.  Any
+    failure returns ``None``; admission then fails closed on the
+    ``capabilities_required`` code (mirrors the fail-closed network resolver).
+    """
+    try:
+        from security.security_gate import get_workspace_capabilities
+
+        return get_workspace_capabilities(workspace_id)
+    except Exception:  # noqa: BLE001 - admission fails closed on None
+        return None
 
 
 def _resolve_network_mode_via_gate(workspace_id, permissions) -> str:
