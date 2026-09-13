@@ -78,16 +78,19 @@ def test_guard_blocks_persist_write_under_real_vault(repro):
         )
     except Exception:
         # Fallback (no docker daemon): construct WITHOUT running __init__ so we
-        # can still exercise the guard's write-barrier code path. The guard only
-        # inspects self.vault_root, so a bare instance with that attribute set
-        # is sufficient to reach the barrier.
+        # can still exercise the guard's write-barrier code path. Under Design B
+        # the guard keys on the vault the call RESOLVES to (the DEFAULT
+        # resolution, since _write_note passes no explicit vault_root) -- and the
+        # real_vault_readonly() context pins $THOUGHTMACHINE_VAULT_ROOT at the
+        # real root -- so a bare instance with workspace_id set reaches the
+        # barrier.
         mgr = object.__new__(ContainerManager)
         mgr.vault_root = str(real_vault)
         mgr.workspace_id = "p0-ws"
 
     with mod.real_vault_readonly():
         with pytest.raises(RuntimeError, match="SAFETY VIOLATION"):
-            mgr._save_container_notes()
+            mgr._write_note("<some-id>", "x")
 
     # Nothing may have been created anywhere under the real vault.
     assert list(real_vault.rglob("*")) == []
@@ -121,3 +124,40 @@ def test_guard_restores_env(repro, monkeypatch):
 
     assert os.environ["THOUGHTMACHINE_VAULT_ROOT"] == "sentinel-root"
     assert os.environ["CONTAINER_AUDIT_LOG_PATH"] == "sentinel-audit"
+
+
+
+def test_guard_allows_record_write_under_temp_vault(repro, tmp_path):
+    """NEGATIVE CONTROL: a record write whose vault RESOLVES to a temp dir is
+    ALLOWED (no RuntimeError) -- the barrier discriminates by resolved path and
+    is therefore not vacuous."""
+    mod, real_vault, scratch = repro
+    from thoughtmachine.container_record import (
+        LIFECYCLE_PERSISTENT,
+        OWNER_WORKSPACE,
+        create_record,
+        update_record,
+        load_record,
+    )
+
+    temp_vault = tmp_path / "temp_vault"
+    temp_vault.mkdir()
+    rid = create_record(
+        "p0-ws",
+        LIFECYCLE_PERSISTENT,
+        OWNER_WORKSPACE,
+        id="rec-neg",
+        vault_root=str(temp_vault),
+    ).id
+
+    # Inside the guard the DEFAULT env is pinned at the real root, so the temp
+    # vault must be passed explicitly -- proving the barrier keys on the
+    # RESOLVED path, not on "always raise".
+    with mod.real_vault_readonly():
+        rec = update_record("p0-ws", rid, vault_root=str(temp_vault), notes="ok")
+        assert rec.notes == "ok"
+
+    got = load_record("p0-ws", rid, vault_root=str(temp_vault))
+    assert got is not None and got.notes == "ok"
+    assert list(real_vault.rglob("*")) == []
+

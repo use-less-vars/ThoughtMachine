@@ -45,15 +45,18 @@ never touch resource containers (see tools/workspace/worker.py). Reuse
 paths never re-label an existing container: the worker label is only
 stamped at create.
 
-Sticky notes (vault bulletin board)
------------------------------------
-Container notes are NOT stored in Docker labels (labels are immutable after
-create on stock daemons - there is no label-update API). They live in a
-per-workspace JSON file, ``<vault_root>/workspaces/<workspace_id>/container_notes.json``,
-where the vault root is the ``vault_root`` kwarg, else the
-``THOUGHTMACHINE_VAULT_ROOT`` env var, else ``~/.thoughtmachine``. Notes are
-shared by every manager/session for the same workspace and survive container
-recreation.
+Sticky notes (a container RECORD field)
+---------------------------------------
+A container's sticky note lives on its container RECORD -- the ``notes`` field
+of ``<vault_root>/workspaces/<workspace_id>/containers/<record_id>.json`` --
+keyed by the record id carried in the ``thoughtmachine.container_id`` Docker
+label. The record store owns the note, so it survives container recreation and
+is shared by every manager/session for the same workspace. Notes are NOT
+written to Docker labels (labels are immutable after create on stock daemons -
+there is no label-update API). A legacy per-workspace ``container_notes.json``
+sidecar (``<vault_root>/workspaces/<workspace_id>/container_notes.json``) is
+treated as READ-ONLY history: its entries are adopted onto records once (see
+``_migrate_legacy_notes_once``) and never written again.
 
 No-reload guarantee
 -------------------
@@ -107,16 +110,21 @@ except ImportError:  # pragma: no cover - defensive
 
 from infra.container_env import merge_container_identity_env
 from thoughtmachine.container_record import (
+    ContainerRecordError,
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     RECORD_LABEL_KEY,
     RESOURCE_LABEL,
     RESOURCE_NAME_PREFIX,
+    RecordLocked,
+    RecordNotFound,
     UnknownLifecycleClass,
     find_by_docker_label,
     is_resource_like,
+    load_record,
     policy_for,
+    update_record,
 )
 from thoughtmachine.container_record.hook import record_creation
 
@@ -204,6 +212,16 @@ _START_DRIFT_LOCK = threading.Lock()
 _START_DRIFT_EVENT = "drift.start_on_drifted_container"
 _START_DRIFT_ACTOR = "infra.container_manager.start"
 _START_DRIFT_AUDIT = "CONTAINER_START_DRIFT"
+
+# Sticky-note migration/warning memos (module scope so dedup holds across the
+# fresh ContainerManager instances built for every tool call). ``_NOTES_WARNED``
+# dedupes the once-per-condition WARNINGs (a legacy sidecar note served, a write
+# refused for lack of a record); ``_NOTES_MIGRATED`` records the workspaces whose
+# legacy container_notes.json has already been adopted onto records (so the
+# one-shot migration is idempotent).
+_NOTES_MEMO_LOCK = threading.Lock()
+_NOTES_WARNED = set()
+_NOTES_MIGRATED = set()
 
 # Isolation ranks: higher == more permissive.  Network "default" is normalized
 # to "bridge" upstream (see ContainerManager._normalize_network_mode); any other
@@ -431,10 +449,6 @@ class ContainerManager:
             "max_containers", DEFAULT_MAX_CONTAINERS
         )
 
-        # Phase 4.5: sticky-note bulletin board (per-workspace JSON file, NOT
-        # Docker labels - labels are immutable after create on real daemons).
-        self.container_notes = self._load_container_notes()
-
         self.client = docker.from_env()
 
     def _load_workspace_config(self):
@@ -472,7 +486,7 @@ class ContainerManager:
 
         Writes ``self.workspace_config`` to ``self.workspace_config_path``
         (parent directory created on demand).  Failures are logged, never
-        raised, mirroring ``_save_container_notes``.
+        raised.
         """
         config_path = getattr(self, "workspace_config_path", None)
         if config_path is None:
@@ -577,21 +591,205 @@ class ContainerManager:
                 f"Unexpected error loading container notes {notes_path}: {e}")
             return {}
 
-    def _save_container_notes(self):
-        """Atomically persist the bulletin board; NEVER raises."""
+    def _warn_note_once(self, key, message):
+        """Log *message* at WARNING at most once per *key* (module-scoped).
+
+        Because a fresh ``ContainerManager`` is built for every tool call, the
+        "already warned" memo lives at MODULE scope (``_NOTES_WARNED``) so the
+        dedup actually holds across calls.
+        """
+        with _NOTES_MEMO_LOCK:
+            if key in _NOTES_WARNED:
+                return
+            _NOTES_WARNED.add(key)
+        log("WARNING", "docker.container_manager", message)
+
+    def _record_id_from_labels(self, labels):
+        """Return the record id carried by *labels*, or None.
+
+        The record id is the value of the ``RECORD_LABEL_KEY``
+        (``thoughtmachine.container_id``) label; an absent or empty value yields
+        None. Never raises.
+        """
+        try:
+            value = (labels or {}).get(RECORD_LABEL_KEY)
+        except Exception:
+            return None
+        if not value:
+            return None
+        return str(value)
+
+    def _record_id_for(self, container):
+        """Return the record id for a docker *container* object, or None.
+
+        Reads the container's labels (``container.labels`` when available, else
+        ``container.attrs["Config"]["Labels"]``). Never raises: any lookup
+        failure yields None.
+        """
+        if container is None:
+            return None
+        labels = getattr(container, "labels", None)
+        if not labels:
+            try:
+                attrs = getattr(container, "attrs", None) or {}
+                labels = (attrs.get("Config") or {}).get("Labels")
+            except Exception:
+                labels = None
+        return self._record_id_from_labels(labels)
+
+    def _record_id_for_name(self, name):
+        """Resolve a record id for a container *name* via the docker client.
+
+        Returns None when the name is falsy, the lookup fails, or the container
+        carries no record label. Never raises.
+        """
+        if not name:
+            return None
+        try:
+            container = self.client.containers.get(name)
+        except Exception:
+            return None
+        return self._record_id_for(container)
+
+    def _read_note(self, container_or_name):
+        """Return the sticky note for a container; returns '' and NEVER raises.
+
+        A docker container OBJECT is preferred (no extra daemon round-trip):
+        the note is read from the container RECORD, located via the
+        ``thoughtmachine.container_id`` label. When no record id can be
+        resolved, a READ-ONLY look at the legacy ``container_notes.json``
+        sidecar is used as a fallback (a WARNING is logged once).
+        """
+        if isinstance(container_or_name, str):
+            name = container_or_name
+            record_id = self._record_id_for_name(name)
+        else:
+            container = container_or_name
+            name = getattr(container, "name", None)
+            record_id = self._record_id_for(container)
+        if record_id:
+            try:
+                # Records live in the DEFAULT vault (SSOT); never thread a
+                # manager vault_root into the record store.
+                record = load_record(self.workspace_id, record_id)
+            except Exception:
+                return ""
+            if record is None:
+                return ""
+            return str(getattr(record, "notes", "") or "")
+        # No record: read-only legacy sidecar fallback (never written).
+        if name:
+            try:
+                entry = (self._load_container_notes() or {}).get(name) or {}
+                note = str(entry.get("note") or "")
+            except Exception:
+                note = ""
+            if note:
+                self._warn_note_once(
+                    ("notes.legacy_sidecar_read", self.workspace_id, name),
+                    f"Container note for {name!r} served from the legacy "
+                    f"container_notes.json sidecar (no container record); "
+                    f"recreate the container to adopt the note onto its record.")
+                return note
+        return ""
+
+    def _write_note(self, record_id, note):
+        """Persist *note* as the container RECORD's ``notes`` field; NEVER raises.
+
+        The note is record-owned, so it survives container recreation. FAIL
+        CLOSED: with no record id the write is REFUSED (a WARNING is logged) and
+        NOTHING is persisted -- the legacy sidecar is never written. A real
+        error from the record store is logged, not raised (a ``RuntimeError``
+        such as a safety barrier is NOT swallowed).
+        """
+        if not record_id:
+            self._warn_note_once(
+                ("notes.no_record_write_refused", self.workspace_id),
+                f"Refusing to persist a container note for workspace "
+                f"{self.workspace_id!r}: no container record id (the container "
+                f"carries no {RECORD_LABEL_KEY} label).")
+            return
+        try:
+            # Records live in the DEFAULT vault (SSOT); never thread a
+            # manager vault_root into the record store.
+            update_record(self.workspace_id, record_id, notes=note)
+        except (ContainerRecordError, RecordLocked, RecordNotFound,
+                OSError, ValueError) as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to write note for record {record_id} "
+                f"(workspace {self.workspace_id}): {e}")
+
+    def _migrate_legacy_notes_once(self):
+        """Adopt legacy ``container_notes.json`` notes onto records (once).
+
+        For every sidecar entry whose container resolves to a record with an
+        EMPTY ``notes`` field, copy the sidecar note onto the record; a record
+        that already has a note WINS (never overwritten). Adopted/rederived
+        names are dropped from the sidecar, which is rewritten atomically (or
+        removed once empty). Idempotent: a second run is a fixed point, and a
+        workspace with no sidecar returns immediately.
+        """
+        if self.workspace_id in _NOTES_MIGRATED:
+            return
+        with _NOTES_MEMO_LOCK:
+            if self.workspace_id in _NOTES_MIGRATED:
+                return
+            _NOTES_MIGRATED.add(self.workspace_id)
+        try:
+            legacy = self._load_container_notes()
+        except Exception:
+            legacy = {}
+        if not legacy:
+            return
+        remaining = dict(legacy)
+        changed = False
+        for name, entry in legacy.items():
+            note = str((entry or {}).get("note") or "")
+            record_id = self._record_id_for_name(name)
+            if not record_id:
+                continue
+            try:
+                # Records live in the DEFAULT vault (SSOT); never thread a
+                # manager vault_root into the record store.
+                record = load_record(self.workspace_id, record_id)
+            except Exception:
+                continue
+            if record is None:
+                continue
+            existing = str(getattr(record, "notes", "") or "")
+            if existing == "" and note != "":
+                try:
+                    # Records live in the DEFAULT vault (SSOT); never thread a
+                    # manager vault_root into the record store.
+                    update_record(self.workspace_id, record_id, notes=note)
+                except Exception as e:
+                    log("WARNING", "docker.container_manager",
+                        f"Failed to adopt legacy note for record {record_id}: {e}")
+                    continue
+            # The record now owns the note (adopted, or already present).
+            remaining.pop(name, None)
+            changed = True
+        if changed:
+            self._rewrite_legacy_notes(remaining)
+
+    def _rewrite_legacy_notes(self, remaining):
+        """Rewrite (or remove) the legacy sidecar after migration; NEVER raises."""
         notes_path = self._notes_path()
         try:
-            notes_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = notes_path.with_suffix(".json.tmp")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(getattr(self, "container_notes", {}) or {}, f, indent=2)
-            os.replace(tmp_path, notes_path)
-        except (OSError, ValueError) as e:
+            if remaining:
+                notes_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = notes_path.with_suffix(".json.tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(remaining, f, indent=2)
+                os.replace(tmp_path, notes_path)
+            else:
+                try:
+                    os.unlink(notes_path)
+                except FileNotFoundError:
+                    pass
+        except OSError as e:
             log("WARNING", "docker.container_manager",
-                f"Failed to write container notes {notes_path}: {e}")
-        except Exception as e:
-            log("WARNING", "docker.container_manager",
-                f"Unexpected error writing container notes {notes_path}: {e}")
+                f"Failed to rewrite legacy container notes {notes_path}: {e}")
 
     # ── Public API ─────────────────────────────────────────────────────────
     @property
@@ -635,10 +833,11 @@ class ContainerManager:
         use this label to reclaim their containers at teardown (see
         tools/workspace/worker.py).
 
-        ``note`` is an optional sticky note: it is written to the per-workspace
-        bulletin board (``<vault_root>/workspaces/<workspace_id>/container_notes.json``)
-        - not to Docker labels - and returned in the response. On reuse, a new
-        note overwrites the bulletin-board entry for the container name.
+        ``note`` is an optional sticky note: it is persisted as the ``notes``
+        field of the container's RECORD (located via the
+        ``thoughtmachine.container_id`` Docker label) - never to Docker labels -
+        and returned in the response. On reuse, a new note overwrites the
+        record's note.
 
         Desired isolation (network_mode, workspace_mode) is computed ONCE from
         the session permissions BEFORE any reuse path.  A drifted container is
@@ -648,6 +847,10 @@ class ContainerManager:
         policy the container is REFUSED (``{"error": ..., "drift": ...}``) so
         the caller can act, instead of being silently reused or removed.
         """
+        # Adopt any legacy container_notes.json entries onto records before we
+        # read/write notes below (idempotent; a no-op once per workspace).
+        self._migrate_legacy_notes_once()
+
         # Capture the caller-supplied image BEFORE defaulting, so image-reuse
         # honesty can tell an explicit request from the manager default.
         explicit_image = image
@@ -720,8 +923,10 @@ class ContainerManager:
                     except Exception:
                         pass
                 if note is not None:
-                    self.container_notes[name] = {"note": note}
-                    self._save_container_notes()
+                    _rid = (self._record_id_for(container)
+                            if container is not None
+                            else self._record_id_for_name(name))
+                    self._write_note(_rid, note)
                 _audit("CONTAINER_REUSE_OK",
                        f"source=workspace-label name={name} id={entry['container_id']} "
                        f"session={self.session_id}")
@@ -798,11 +1003,9 @@ class ContainerManager:
                 if _action == "deny":
                     return _payload
                 if note is not None:
-                    self.container_notes[name] = {"note": note}
-                    self._save_container_notes()
-                note_value = note if note is not None else (
-                    (getattr(self, "container_notes", {}) or {}).get(name) or {}
-                ).get("note", "")
+                    self._write_note(self._record_id_for(container), note)
+                note_value = (note if note is not None
+                              else self._read_note(container))
                 _audit("CONTAINER_REUSE_OK",
                        f"source=registry name={name} id={container.id} session={self.session_id}")
                 log_container_event("started", container_id=container.id,
@@ -838,11 +1041,9 @@ class ContainerManager:
             self._ensure_running(container)
             self._containers[name] = container.id
             if note is not None:
-                self.container_notes[name] = {"note": note}
-                self._save_container_notes()
-            note_value = note if note is not None else (
-                (getattr(self, "container_notes", {}) or {}).get(name) or {}
-            ).get("note", "")
+                self._write_note(self._record_id_for(container), note)
+            note_value = (note if note is not None
+                          else self._read_note(container))
             _audit("CONTAINER_REUSE_OK",
                    f"source=label name={name} id={container.id} session={self.session_id}")
             log_container_event("started", container_id=container.id,
@@ -943,8 +1144,7 @@ class ContainerManager:
             container_name = handle["name"]
             self._containers[name] = container_id
             if note is not None:
-                self.container_notes[name] = {"note": note}
-                self._save_container_notes()
+                self._write_note(self._record_id_for_name(container_id), note)
             _audit("CONTAINER_CREATE",
                    f"source=registry image={image} name={container_name} "
                    f"session={self.session_id} workspace_id={self.workspace_id}")
@@ -1025,8 +1225,7 @@ class ContainerManager:
             pass
         self._containers[name] = container.id
         if note is not None:
-            self.container_notes[name] = {"note": note}
-            self._save_container_notes()
+            self._write_note(self._record_id_for(container), note)
         log_container_event("started", container_id=container.id,
                             session_id=self.session_id or "",
                             data={"image": image, "name": name, "status": "created"})
@@ -1532,8 +1731,7 @@ class ContainerManager:
             "status": container.status,
             "uptime_seconds": uptime_seconds,
             "memory_usage_bytes": memory_usage_bytes,
-            "note": ((getattr(self, "container_notes", {}) or {}).get(container.name)
-                     or {}).get("note", ""),
+            "note": self._read_note(container),
         }
 
         # Phase 6: live introspection only for running containers. Every probe
@@ -1729,9 +1927,10 @@ class ContainerManager:
         Queries the daemon for all containers (running or not) whose
         ``thoughtmachine.workspace_id`` label matches this manager's workspace
         id (the exact label source ``start()`` applies), so containers from
-        other workspaces — or unlabeled ones — never appear. ``note`` comes
-        from the per-workspace bulletin board (container_notes.json), not from
-        Docker labels. Returns a list of dicts with EXACTLY: ``container_id``,
+        other workspaces — or unlabeled ones — never appear. ``note`` is the
+        container's RECORD sticky note (a legacy container_notes.json sidecar is
+        consulted read-only as a fallback when the container has no record).
+        Returns a list of dicts with EXACTLY: ``container_id``,
         ``name``, ``image``, ``status``, ``uptime_seconds``, ``workspace_id``,
         ``note``, ``labels``.
         """
@@ -1779,8 +1978,7 @@ class ContainerManager:
                 "workspace_id": (container.labels.get("thoughtmachine.workspace_id")
                                  or self.workspace_id),
                 "labels": dict(container.labels or {}),
-                "note": ((getattr(self, "container_notes", {}) or {}).get(container.name)
-                         or {}).get("note", ""),
+                "note": self._read_note(container),
             })
         return result
 
@@ -2099,19 +2297,24 @@ class ContainerManager:
             pass
 
     def set_note(self, container_id, note):
-        """Set the sticky note in the per-workspace bulletin board; NEVER raises.
+        """Set the container's sticky note on its RECORD; NEVER raises.
 
-        Writes ``<vault_root>/workspaces/<workspace_id>/container_notes.json``
-        (name -> {"note": str}) — the same file ``start()`` reads on reuse, so
-        the note survives manager/session restarts and is visible to every
-        manager of the workspace. Docker labels are never touched (they are
-        immutable after create on stock daemons).
+        Persists the note as the ``notes`` field of the container's RECORD
+        (located via the ``thoughtmachine.container_id`` Docker label), so it
+        survives manager/session restarts and container recreation and is
+        visible to every manager of the workspace. Fail-closed: a container
+        with no record id is REFUSED and nothing is written. Docker labels are
+        never touched (they are immutable after create on stock daemons).
 
         Returns {"success": True, "note": note} on success; on failure an error
         dict following the existing convention:
         {"success": False, "container_id": ..., "error": "container not found"}
+        or {"success": False, "container_id": ..., "error": "no container record"}
         or {"success": False, "container_id": ..., "error": str(e)}.
         """
+        # Adopt any legacy container_notes.json entries onto records first
+        # (idempotent; a no-op once per workspace).
+        self._migrate_legacy_notes_once()
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
@@ -2123,8 +2326,15 @@ class ContainerManager:
             container.reload()
         except Exception:
             pass
-        self.container_notes[container.name] = {"note": note}
-        self._save_container_notes()
+        record_id = self._record_id_for(container)
+        if not record_id:
+            self._warn_note_once(
+                ("notes.set_note_no_record", self.workspace_id),
+                f"Refusing set_note for container {container_id!r}: the container "
+                f"carries no {RECORD_LABEL_KEY} label (no container record).")
+            return {"success": False, "container_id": container_id,
+                    "error": "no container record"}
+        self._write_note(record_id, note)
         return {"success": True, "note": note}
 
     def _drop_container(self, container_id):

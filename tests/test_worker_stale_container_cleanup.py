@@ -166,7 +166,7 @@ class StaleWorkerContainerCleanupTest(unittest.TestCase):
             manager._get_max_containers = lambda: 4
             manager._compute_config = lambda *a, **k: ("none", "rw")
             manager._find_by_labels = lambda name: None
-            manager._save_container_notes = lambda: None
+            manager._write_note = lambda *a, **k: None
 
             with mock.patch.object(
                     self.container_manager, "cleanup_stale_worker_containers",
@@ -243,7 +243,7 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
         manager._get_max_containers = lambda: limit
         manager._compute_config = lambda *a, **k: ("none", "rw")
         manager._find_by_labels = lambda name: None
-        manager._save_container_notes = lambda: None
+        manager._write_note = lambda *a, **k: None
         return manager
 
     def _start(self, manager, worker_name=None):
