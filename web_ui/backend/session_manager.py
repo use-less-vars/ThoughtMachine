@@ -39,6 +39,12 @@ LEGACY_TO_RESPOND = {
 ALL_RESPOND_NAMES = FINAL_TOOL_NAMES | set(LEGACY_TO_RESPOND.keys())
 SUMMARY_TOOL_NAMES = {"SummarizeTool", "summarize", "Summarize"}
 
+# Hardcoded last-resort provider/model used when neither the caller, the saved
+# global defaults, nor an active provider profile supply a non-empty value.
+# Mirrors FALLBACK_FRONTEND_CONFIG in web_ui/backend/config_manager.py.
+_DEFAULT_PROVIDER_ID = "v4_flash"
+_DEFAULT_MODEL = "deepseek-v4-flash"
+
 
 def merge_session_permissions(stored_raw: Any, new_dump: Dict[str, Any]) -> Dict[str, Any]:
     """Fold stored ``session_permissions`` under a new config dump.
@@ -101,6 +107,8 @@ class SessionManager:
         mode: str = "custom",
         workspace_path: Optional[str] = None,
         audit_source: str = 'user',
+        provider_id: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Create a new empty ``Session``, build a matching ``SessionConfig``,
@@ -147,6 +155,13 @@ class SessionManager:
         for key in GLOBAL_DEFAULT_KEYS:
             if key in defaults_be and defaults_be[key]:
                 setattr(session_config, key, defaults_be[key])
+
+        # A new session must carry a non-empty provider/model: resolve from the
+        # caller, the saved global defaults, the active provider profile, or the
+        # hardcoded fallback (last resort).
+        session_config.provider_id, session_config.model = (
+            self._resolve_provider_and_model(provider_id, model, defaults_be)
+        )
 
         # Persist session + config metadata
         new_session.metadata["session_config"] = session_config.model_dump(
@@ -655,6 +670,40 @@ class SessionManager:
             m.setdefault("response_type", None)
 
         return normalized
+
+    @staticmethod
+    def _resolve_provider_and_model(
+        provider_id: Optional[str],
+        model: Optional[str],
+        defaults_be: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """Resolve a non-empty ``(provider_id, model)`` for a new session.
+
+        Precedence (first non-empty wins):
+
+        1. explicit caller arguments (``provider_id`` / ``model``)
+        2. saved global defaults (``user/defaults.json`` via ``defaults_be``)
+        3. the active provider profile (``ProviderManager``)
+        4. the hardcoded fallback pairs (last resort)
+        """
+        resolved_provider = provider_id or defaults_be.get("provider_id") or ""
+        resolved_model = model or defaults_be.get("model") or ""
+
+        if not resolved_provider or not resolved_model:
+            try:
+                profile = ProviderManager().get_active_profile()
+            except Exception:
+                profile = None
+            if profile is not None:
+                resolved_provider = resolved_provider or getattr(profile, "id", "") or ""
+                resolved_model = (
+                    resolved_model or getattr(profile, "default_model", "") or ""
+                )
+
+        resolved_provider = resolved_provider or _DEFAULT_PROVIDER_ID
+        resolved_model = resolved_model or _DEFAULT_MODEL
+        return str(resolved_provider), str(resolved_model)
+
     def repair_session(self, session: Session) -> Session:
         """
     Apply role repair and config migration to an already-loaded session.

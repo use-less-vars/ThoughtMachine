@@ -260,7 +260,52 @@ class TestSessionManagerGlobalDefaults:
 
         assert cfg["max_turns"] == 100
         assert cfg["temperature"] == 0.7
-        assert cfg["provider_id"] == ""
-        assert cfg["model"] == ""
+        # provider/model are resolved to a usable pair even when the saved
+        # defaults are empty (hardcoded last-resort fallback).
+        assert cfg["provider_id"] == "v4_flash"
+        assert cfg["model"] == "deepseek-v4-flash"
         assert cfg["base_url"] == ""
         assert "system_prompt" not in cfg
+
+    def test_t7_explicit_args_override_empty_defaults(self, hermetic_vault):
+        """Caller-supplied provider/model win over empty global defaults."""
+        store, manager = self._make_manager()
+        session_id, _ = manager.create_session(
+            mode="custom", provider_id="caller_p", model="caller_m"
+        )
+        loaded = store.load_session(session_id)
+        assert loaded is not None
+        cfg = loaded.metadata["session_config"]
+        assert cfg["provider_id"] == "caller_p"
+        assert cfg["model"] == "caller_m"
+
+    def test_t8_active_profile_supplies_provider_and_model(
+        self, hermetic_vault, monkeypatch
+    ):
+        """Empty caller/defaults -> the active provider profile supplies the pair."""
+
+        class _FakeProfile:
+            id = "profile_p"
+            default_model = "profile_m"
+
+        class _FakeProviderManager:
+            def get_active_profile(self):
+                return _FakeProfile()
+
+        # Patch the global in the module that actually defines the SessionManager
+        # under test -- robust even if another test purged/reimported
+        # ``web_ui.backend`` (which would leave ``sys.modules`` pointing at a
+        # different module object than the class's own ``__globals__``).
+        monkeypatch.setitem(
+            SessionManager.create_session.__globals__,
+            "ProviderManager",
+            _FakeProviderManager,
+        )
+
+        store, manager = self._make_manager()
+        session_id, _ = manager.create_session(mode="custom")
+        loaded = store.load_session(session_id)
+        assert loaded is not None
+        cfg = loaded.metadata["session_config"]
+        assert cfg["provider_id"] == "profile_p"
+        assert cfg["model"] == "profile_m"

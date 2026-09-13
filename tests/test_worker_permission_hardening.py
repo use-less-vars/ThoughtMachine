@@ -1153,7 +1153,9 @@ class TestGlobalDefaultsWorkerConfig:
         cfg = loaded.metadata["session_config"]
         assert cfg["max_turns"] == 100
         assert cfg["temperature"] == 0.7
-        assert cfg["provider_id"] == ""
-        assert cfg["model"] == ""
+        # provider/model always resolve to a usable pair (hardcoded fallback
+        # when the saved defaults are empty).
+        assert cfg["provider_id"] == "v4_flash"
+        assert cfg["model"] == "deepseek-v4-flash"
         assert cfg["base_url"] == ""
         assert "system_prompt" not in cfg
