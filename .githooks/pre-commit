@@ -16,10 +16,9 @@
 #   4. Contract test  — pytest tests/integration/test_session_creation_contract.py
 #                       ONLY when steps 1-3 finished in < 3 s combined
 #                       (otherwise skipped with the reason, to respect the
-#                       10 s total budget).  The RED stage-1 contract test is
-#                       excluded via --ignore until the Tasks 1-2 routing fixes
-#                       land (pytest then collects nothing and exits 5, which
-#                       this hook treats as a SKIP, not a FAIL).
+#                       10 s total budget).  The contract test is no longer
+#                       excluded: it is now enforced, having gone green once
+#                       create_session began resolving a non-empty provider_id/model.
 #
 # Robustness:
 #   * Every subprocess is wrapped in `timeout` — no step can hang a commit.
@@ -268,15 +267,14 @@ S4_START="$(now_ns)"
 if [ "$STEPS123_MS" -ge 3000 ]; then
     echo "  SKIP — steps 1-3 took ${STEPS123_MS} ms (>= 3000 ms); pytest would exceed the 10 s budget"
 else
-    # RED contract test excluded deterministically via --ignore until the
-    # Tasks 1-2 routing fixes land.  Targeting the file while ignoring it makes
-    # pytest collect nothing and exit 5, which is treated as a SKIP, not a FAIL.
-    if run_limited 6 "$PYTHON" -m pytest "$CONTRACT_TEST" --ignore="$CONTRACT_TEST" -x --tb=short -q; then
+    # Enforced: the session-creation contract test went green once
+    # create_session began resolving a non-empty provider_id/model.
+    if run_limited 6 "$PYTHON" -m pytest "$CONTRACT_TEST" -x --tb=short -q; then
         echo "  PASS ($(elapsed_ms "$S4_START" "$(now_ns)") ms)"
     else
         rc=$?
         if [ "$rc" -eq 5 ]; then
-            echo "  SKIP — RED contract test excluded via --ignore until Tasks 1-2 routing lands ($(elapsed_ms "$S4_START" "$(now_ns)") ms)"
+            echo "  SKIP — pytest collected nothing (0 tests) ($(elapsed_ms "$S4_START" "$(now_ns)") ms)"
         else
             echo "  FAIL ($(elapsed_ms "$S4_START" "$(now_ns)") ms) — $CONTRACT_TEST failed" >&2
             STEP_FAILURES=$((STEP_FAILURES + 1))
