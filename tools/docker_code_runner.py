@@ -414,6 +414,32 @@ chmod +x "{script_path}"
             # start() returns {"error": ...} (no "id") when the per-workspace
             # container limit is reached or any pre-create check fails -
             # surface that as a clear RuntimeError instead of a KeyError('id').
+            #
+            # Drift refusal is the one error start() does NOT resolve on its own:
+            # it refuses to hand back a reused container whose live isolation is
+            # MORE PERMISSIVE than the resolved policy, WITHOUT mutating it. This
+            # ephemeral caller owns the container lifecycle, so it removes the
+            # drifted container explicitly and creates a fresh one under the
+            # resolved policy (start() never removes on the drift path).
+            _drift = info.get("drift")
+            if "error" in info and _drift and _drift.get("decision") == "deny":
+                # The drifted container id rides INSIDE ``drift`` (the deny
+                # payload mirrors exec's exactly: no top-level ``container_id``).
+                # A drift deny with no recoverable id is unrecoverable - fail
+                # loudly instead of silently skipping the remove/restart.
+                _drift_cid = _drift.get("container_id")
+                if not _drift_cid:
+                    raise RuntimeError(
+                        "Container start was denied for isolation drift but the "
+                        "drift payload carried no container_id; cannot remove or "
+                        "recreate the drifted container."
+                    )
+                manager.remove(_drift_cid)
+                info = manager.start(
+                    image=self.image,
+                    worker_name=getattr(self, "worker_name", None) or current_worker_name(),
+                    lifecycle_class=LIFECYCLE_EPHEMERAL,
+                )
             if "error" in info:
                 raise RuntimeError(info["error"])
             try:
