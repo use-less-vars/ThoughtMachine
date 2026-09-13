@@ -479,13 +479,15 @@ class TestContainerLifecycle:
 # ─────────────────────────────────────────────────────────────────────────────
 # Sticky-note tests (mock-based, no daemon needed).
 #
-# Notes live on a per-workspace vault bulletin board
-# (<vault_root>/workspaces/<workspace_id>/container_notes.json), NOT in Docker
-# labels (docker SDK 7.1.0 has no update_labels; Container.update(**kwargs)
-# forwards to POST /containers/{id}/update which ignores unknown fields), so
-# these tests verify the API contract with a fake client: note persisted to the
-# JSON file on create/reuse/set_note, note in the start/status/list responses,
-# no thoughtmachine.note label anywhere, and per-workspace isolation.
+# Notes live on the container RECORD (the ``notes`` field of
+# <vault_root>/workspaces/<workspace_id>/containers/<record_id>.json, located
+# via the ``thoughtmachine.container_id`` Docker label), NOT in Docker labels
+# (docker SDK 7.1.0 has no update_labels; Container.update(**kwargs) forwards
+# to POST /containers/{id}/update which ignores unknown fields), so these tests
+# verify the API contract with a fake client: note persisted to the record on
+# create/reuse/set_note, note in the start/status/list responses, no
+# thoughtmachine.note label anywhere, and per-workspace isolation.  (The legacy
+# container_notes.json sidecar is READ-ONLY history, adopted once onto records.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -565,11 +567,14 @@ class FakeContainers:
 
 
 class TestContainerNoteFileStore:
-    """Mock-based tests for the sticky-note vault bulletin board (no daemon needed).
+    """Mock-based tests for the sticky note carried on a container RECORD.
 
-    Notes are persisted to ``<vault_root>/workspaces/<workspace_id>/container_notes.json``
-    and shared by every manager of the workspace; Docker labels never carry the
-    note (docker has no label-update API, so labels are immutable after create).
+    A note is persisted as the ``notes`` field of the container's record
+    (``<vault_root>/workspaces/<workspace_id>/containers/<record_id>.json``,
+    located via the ``thoughtmachine.container_id`` Docker label) and shared by
+    every manager of the workspace. Docker labels never carry the note (docker
+    has no label-update API, so labels are immutable after create), and the
+    record-owned note survives container recreation.
     """
 
     def _make_manager(self, fake_containers, workspace_id, vault_root):
@@ -590,7 +595,6 @@ class TestContainerNoteFileStore:
         manager.workspace_config = {}
         manager.max_containers = 4
         manager.client = SimpleNamespace(containers=fake_containers)
-        manager.container_notes = manager._load_container_notes()
         manager._compute_config = lambda ws, wid, sp, lc=None: ("none", "rw")
         return manager
 
@@ -603,7 +607,24 @@ class TestContainerNoteFileStore:
             return {}
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def test_set_note_writes_bulletin_board_file(self):
+    def _record_notes(self, manager, container):
+        """Read the ``notes`` field of *container*'s container record.
+
+        The record id is carried in the ``thoughtmachine.container_id`` Docker
+        label; the note lives on the record (so it survives recreation), never
+        on a Docker label or a sidecar file.
+        """
+        from thoughtmachine.container_record import RECORD_LABEL_KEY, load_record
+
+        record_id = (container.labels or {}).get(RECORD_LABEL_KEY)
+        assert record_id, "container carries no thoughtmachine.container_id label"
+        # Records live in the DEFAULT vault (SSOT); never thread a
+        # manager vault_root into the record store.
+        record = load_record(manager.workspace_id, record_id)
+        assert record is not None, "container record not found"
+        return str(record.notes or "")
+
+    def test_set_note_writes_record_field(self):
         vault_root = tempfile.mkdtemp(prefix="tm-note-")
         try:
             workspace_id = str(uuid.uuid4())
@@ -613,14 +634,10 @@ class TestContainerNoteFileStore:
             assert r["status"] == "created"
             container = fake.get(r["id"])
             assert "thoughtmachine.note" not in container.labels
-            assert self._read_notes(vault_root, workspace_id) == {
-                "note-write": {"note": "hello"}
-            }
+            assert self._record_notes(manager, container) == "hello"
             sn = manager.set_note(r["id"], "sticky")
             assert sn == {"success": True, "note": "sticky"}
-            assert self._read_notes(vault_root, workspace_id) == {
-                "note-write": {"note": "sticky"}
-            }
+            assert self._record_notes(manager, container) == "sticky"
         finally:
             shutil.rmtree(vault_root, ignore_errors=True)
 
@@ -734,7 +751,6 @@ class TestContainerWorkerLabel:
         manager.workspace_config = {}
         manager.max_containers = 4
         manager.client = SimpleNamespace(containers=fake_containers)
-        manager.container_notes = manager._load_container_notes()
         manager._compute_config = lambda ws, wid, sp, lc=None: ("none", "rw")
         return manager
 

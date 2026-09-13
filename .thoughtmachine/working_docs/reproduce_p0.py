@@ -196,16 +196,56 @@ def real_vault_readonly():
         if hasattr(mod, "get_log_root"):
             patched.append((mod, mod.get_log_root))
             mod.get_log_root = (lambda _s: (lambda *a, **k: pathlib.Path(_s)))(scratch)
-    # Fail-loud write barrier on the KNOWN real-vault write vectors: any attempt
-    # to persist under a vault_root that resolves inside the real root raises.
+    # Fail-loud write barrier on the record WRITE vector. Under Design B the
+    # record helpers take NO explicit vault_root: they RESOLVE the DEFAULT vault
+    # at call time (explicit arg -> $THOUGHTMACHINE_VAULT_ROOT -> ~/.thoughtmachine).
+    # This context pins $THOUGHTMACHINE_VAULT_ROOT at the real root (set above),
+    # so a record write that resolves with no explicit vault_root lands INSIDE the
+    # real vault and MUST blow up. The barrier keys on the RESOLVED vault of the
+    # call -- never on an explicit vault_root kwarg (that mechanism is dead here).
+    import infra.container_manager as _cm_mod
     from infra.container_manager import ContainerManager
-    orig_save_notes = ContainerManager._save_container_notes
+    import thoughtmachine.container_record.storage as _rec_storage
+    orig_update = _cm_mod.update_record
+    orig_write_record_file = _rec_storage.write_record_file
     orig_save_config = ContainerManager._save_workspace_config
+
+    def _resolved_vault(vault_root):
+        """Vault a record call resolves to: explicit arg -> env -> ~/.thoughtmachine."""
+        if vault_root is not None:
+            return pathlib.Path(str(vault_root)).expanduser().resolve()
+        from thoughtmachine.vault import vault_root as _vr
+        return pathlib.Path(_vr()).expanduser().resolve()
+
+    def _under_real(candidate):
+        return candidate == real_root_path or real_root_path in candidate.parents
+
+    def _barrier_update_record(orig):
+        def _guard(workspace_id, record_id, vault_root=None, **changes):
+            target = _resolved_vault(vault_root)
+            if _under_real(target):
+                raise RuntimeError(
+                    "SAFETY VIOLATION: record write attempted under the real "
+                    "vault %s" % target
+                )
+            return orig(workspace_id, record_id, vault_root, **changes)
+        return _guard
+
+    def _barrier_write_record_file(orig):
+        def _guard(path, data):
+            target = pathlib.Path(str(path)).expanduser().resolve()
+            if _under_real(target):
+                raise RuntimeError(
+                    "SAFETY VIOLATION: record write attempted under the real "
+                    "vault %s" % target
+                )
+            return orig(path, data)
+        return _guard
 
     def _barrier(orig):
         def _guard(self, *a, **k):
             target = pathlib.Path(str(self.vault_root)).expanduser().resolve()
-            if target == real_root_path or real_root_path in target.parents:
+            if _under_real(target):
                 raise RuntimeError(
                     "SAFETY VIOLATION: write attempted under the real vault %s"
                     % target
@@ -213,12 +253,14 @@ def real_vault_readonly():
             return orig(self, *a, **k)
         return _guard
 
-    ContainerManager._save_container_notes = _barrier(orig_save_notes)
+    _cm_mod.update_record = _barrier_update_record(orig_update)
+    _rec_storage.write_record_file = _barrier_write_record_file(orig_write_record_file)
     ContainerManager._save_workspace_config = _barrier(orig_save_config)
     try:
         yield real_root
     finally:
-        ContainerManager._save_container_notes = orig_save_notes
+        _cm_mod.update_record = orig_update
+        _rec_storage.write_record_file = orig_write_record_file
         ContainerManager._save_workspace_config = orig_save_config
         for mod, orig in patched:
             mod.get_log_root = orig
