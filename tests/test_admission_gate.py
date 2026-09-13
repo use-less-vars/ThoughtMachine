@@ -158,6 +158,33 @@ def test_allow_with_disk_warning_note():
     assert "disk_usage_high" in decision.notes
 
 
+# ─═ Image allowlist: tag/registry normalisation ═════════════════════════════
+def test_admit_accepts_tagged_allowlisted_image():
+    # Regression: a ':tag' suffix must not defeat the image allowlist.
+    spec = make_spec(network_mode="bridge", image="agent-executor:latest")
+    decision = admit(make_request(spec=spec), probes=FakeProbes(count=0))
+    assert isinstance(decision, Allow)
+
+
+@pytest.mark.parametrize("image", ["agent-executor-evil", "evil"])
+def test_admit_rejects_similar_prefix_imposter(image):
+    decision = admit(
+        AdmissionRequest(spec=make_spec(image=image)), probes=FakeProbes()
+    )
+    assert isinstance(decision, Deny)
+    assert decision.code == REASON_IMAGE_NOT_ALLOWED
+
+
+def test_admit_accepts_registry_qualified_allowlisted_image():
+    # Regression: a registry/path prefix must not defeat the image allowlist.
+    spec = make_spec(
+        network_mode="bridge",
+        image="registry.io:5000/agent-executor:latest",
+    )
+    decision = admit(make_request(spec=spec), probes=FakeProbes(count=0))
+    assert isinstance(decision, Allow)
+
+
 # ─═ One scenario per reason code ════════════════════════════════════════════
 @pytest.mark.parametrize(
     "name, req, probes, expected_kind, expected_code",
