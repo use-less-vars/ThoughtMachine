@@ -184,7 +184,11 @@ except Exception:  # pragma: no cover - registry not wired
     is_registry_active = lambda session_config: False  # noqa: E731
 
 from infra.container_env import merge_container_identity_env
-from thoughtmachine.container_record import LIFECYCLE_RESOURCE
+from thoughtmachine.container_record import (
+    LIFECYCLE_RESOURCE,
+    RESOURCE_NAME_PREFIX,
+)
+from thoughtmachine.container_record import RESOURCE_LABEL as _SHARED_RESOURCE_LABEL
 from thoughtmachine.container_record.hook import record_creation
 
 # Module-level image-readiness cache + single-flight lock. Only SUCCESS is
@@ -881,7 +885,9 @@ class ResourceContainerManager:
 
     # Resource marker label: any value of ``thoughtmachine.resource`` marks a
     # container as hidden infrastructure (excluded from agent-facing listing).
-    RESOURCE_LABEL = "thoughtmachine.resource"
+    # Single-sourced from :data:`thoughtmachine.container_record.RESOURCE_LABEL`
+    # (imported above as the private alias ``_SHARED_RESOURCE_LABEL``).
+    RESOURCE_LABEL = _SHARED_RESOURCE_LABEL
     RESOURCE_KIND = "git"
     CONTAINER_NAME_LABEL = "thoughtmachine.container_name"
     WORKSPACE_LABEL = "thoughtmachine.workspace_id"
@@ -946,7 +952,7 @@ class ResourceContainerManager:
         executor paths.
         """
         ws_hash = hashlib.sha256(self.workspace_path.encode("utf-8")).hexdigest()[:12]
-        return f"tm-res-{ws_hash}-git"
+        return f"{RESOURCE_NAME_PREFIX}{ws_hash}-git"
 
     def _labels(self, name=None):
         """Labels applied to the container at create time."""
