@@ -123,6 +123,7 @@ from thoughtmachine.container_record import (
     docker_restart_policy,
     find_by_docker_label,
     is_resource_like,
+    list_records,
     load_record,
     normalise_restart_policy,
     policy_for,
@@ -147,6 +148,7 @@ from security.admission_gate import (
 
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
 from agent.config.defaults import (
+    CONTAINER_NAME_LABEL,
     CONTAINER_TYPE_FREE_USE,
     CONTAINER_TYPE_LABEL,
     CONTAINER_TYPE_RESOURCE,
@@ -232,6 +234,19 @@ _START_DRIFT_RESTART_AUDIT = "CONTAINER_RESTART_DRIFT"
 _NOTES_MEMO_LOCK = threading.Lock()
 _NOTES_WARNED = set()
 _NOTES_MIGRATED = set()
+
+# Container-name index memos (module scope, same dedup discipline as the notes
+# memos above). ``_NAME_INDEX`` maps ``(workspace_id, name) -> record id`` and is
+# built from ``list_records`` ONCE per workspace (``_NAME_INDEX_BUILT``) so it is
+# never a boot cost; ``_NAME_INDEX_COLLISIONS`` records ``(workspace_id, name)``
+# keys claimed by two-or-more records (ambiguous identity -> start refuses);
+# ``_NAME_MIGRATED`` records the workspaces whose v1/v2 records have already
+# been name-backfilled (one-shot, idempotent).
+_NAME_INDEX_LOCK = threading.Lock()
+_NAME_INDEX = {}
+_NAME_INDEX_COLLISIONS = set()
+_NAME_INDEX_BUILT = set()
+_NAME_MIGRATED = set()
 
 # Isolation ranks: higher == more permissive.  Network "default" is normalized
 # to "bridge" upstream (see ContainerManager._normalize_network_mode); any other
@@ -840,6 +855,126 @@ class ContainerManager:
             log("WARNING", "docker.container_manager",
                 f"Failed to rewrite legacy container notes {notes_path}: {e}")
 
+    # ── Container-name index (record-first identity, schema v3) ─────────
+    def _ensure_name_index(self):
+        """Build the workspace-scoped ``(name) -> record id`` index ONCE.
+
+        Mirrors the notes memo discipline (module-scoped so dedup holds across
+        the fresh ``ContainerManager`` built per tool call).  Building from
+        ``list_records`` keeps it off the boot path (first start/set_note in a
+        workspace triggers it).  Never raises.
+        """
+        if self.workspace_id in _NAME_INDEX_BUILT:
+            return
+        with _NAME_INDEX_LOCK:
+            if self.workspace_id in _NAME_INDEX_BUILT:
+                return
+            _NAME_INDEX_BUILT.add(self.workspace_id)
+        try:
+            records = list_records(self.workspace_id)
+        except Exception:
+            records = []
+        for record in records or []:
+            self._name_index_add(record)
+
+    def _name_index_add(self, record):
+        """Record *record*'s name in the (workspace, name) index.
+
+        The record-first create paths hold a record id (not a record object),
+        so they call :meth:`_name_index_register` directly; this thin adapter
+        keeps the ``list_records``/migration callers unchanged.
+        """
+        self._name_index_register(
+            getattr(record, "name", ""), getattr(record, "id", None))
+
+    def _name_index_register(self, name, record_id):
+        """Index ``(workspace, name) -> record_id`` (in-memory).
+
+        A second record id claiming the same (workspace, name) marks the key as
+        COLLIDED (ambiguous identity) rather than silently overwriting.  A
+        falsy name or record id is ignored (an unbound identity is never
+        indexed).
+        """
+        name = str(name or "")
+        if not name or not record_id:
+            return
+        key = (self.workspace_id, name)
+        with _NAME_INDEX_LOCK:
+            existing = _NAME_INDEX.get(key)
+            if existing is None:
+                _NAME_INDEX[key] = record_id
+            elif existing != record_id:
+                _NAME_INDEX_COLLISIONS.add(key)
+
+    def _name_index_forget(self, record_id):
+        """Drop every index entry pointing at *record_id*."""
+        with _NAME_INDEX_LOCK:
+            for key in [k for k, v in _NAME_INDEX.items() if v == record_id]:
+                _NAME_INDEX.pop(key, None)
+
+    def _record_for_name(self, name):
+        """Return the record id indexed for *name* in this workspace, or None.
+
+        Returns None when the name is falsy, unindexed, or AMBIGUOUS (a
+        collision recorded for the same (workspace, name)).
+        """
+        if not name:
+            return None
+        key = (self.workspace_id, name)
+        with _NAME_INDEX_LOCK:
+            if key in _NAME_INDEX_COLLISIONS:
+                return None
+            return _NAME_INDEX.get(key)
+
+    def _name_collision(self, name):
+        """Return True when *name* is ambiguous (>=2 records) in this ws."""
+        if not name:
+            return False
+        with _NAME_INDEX_LOCK:
+            return (self.workspace_id, name) in _NAME_INDEX_COLLISIONS
+
+    def _migrate_records_v3_once(self):
+        """Backfill the ``name`` identity field onto v1/v2 records (once).
+
+        Sources each record's name from the LIVE container's
+        ``thoughtmachine.container_name`` label (record WINS: a record that
+        already carries a name is never overwritten). A record whose container
+        cannot be located / carries no name label is LEFT UNSET (no synthesis,
+        per the migration constraint). One-shot per workspace; idempotent.
+        """
+        if self.workspace_id in _NAME_MIGRATED:
+            return
+        with _NAME_INDEX_LOCK:
+            if self.workspace_id in _NAME_MIGRATED:
+                return
+            _NAME_MIGRATED.add(self.workspace_id)
+        try:
+            records = list_records(self.workspace_id)
+        except Exception:
+            records = []
+        labels_by_docker_id = {}
+        try:
+            for entry in self.list_containers():
+                cid = str(entry.get("container_id") or "")
+                cname = (entry.get("labels") or {}).get(CONTAINER_NAME_LABEL)
+                if cid and cname:
+                    labels_by_docker_id[cid] = str(cname)
+        except Exception:
+            labels_by_docker_id = {}
+        for record in records or []:
+            if str(getattr(record, "name", "") or ""):
+                self._name_index_add(record)  # record wins; just (re)index it
+                continue
+            cname = labels_by_docker_id.get(
+                str(getattr(record, "docker_id", "") or ""))
+            if not cname:
+                continue  # leave UNSET (no synthesis)
+            try:
+                updated = update_record(self.workspace_id, record.id, name=cname)
+            except Exception:
+                continue
+            self._name_index_add(updated)
+
     # ── Public API ─────────────────────────────────────────────────────────
     @property
     def _registry(self):
@@ -928,6 +1063,106 @@ class ContainerManager:
             self.session_permissions,
             lifecycle_class,
         )
+
+        # ── Record-first identity ladder (schema v3) ─────────────────────────
+        # The container RECORD is the source of truth for identity: a name
+        # resolves to a record via the workspace-scoped index, and the record's
+        # ``docker_id`` names the live container.  The in-memory
+        # ``self._containers`` dict is a read-through CACHE only.  The old
+        # ``_find_by_labels`` lookup stays available but is deliberately NOT on
+        # the identity path here.
+        self._ensure_name_index()
+        self._migrate_records_v3_once()
+
+        # (d) Ambiguous name: >=2 records share (workspace, name) -> REFUSE.
+        if self._name_collision(name):
+            self._warn_note_once(
+                ("name.collision", self.workspace_id, name),
+                f"Refusing start({name!r}) in workspace {self.workspace_id!r}: "
+                f"multiple container records share this name (ambiguous "
+                f"identity).")
+            _audit("CONTAINER_NAME_COLLISION",
+                   f"name={name} workspace_id={self.workspace_id}")
+            return {"error": (f"Container name {name!r} is ambiguous in this "
+                              f"workspace: multiple records share it."),
+                    "code": "container_name_collision"}
+
+        record_id = self._record_for_name(name)
+        if record_id:
+            record = None
+            try:
+                record = load_record(self.workspace_id, record_id)
+            except Exception:
+                record = None
+            docker_id = str(getattr(record, "docker_id", "") or "") if record else ""
+            if not docker_id:
+                # (b) Record exists but names no container yet -> REFUSE.
+                self._warn_note_once(
+                    ("name.record_without_container", self.workspace_id, name),
+                    f"Refusing start({name!r}): its record {record_id} carries no "
+                    f"docker_id (no bound container).")
+                _audit("CONTAINER_START_NO_CONTAINER_RECORD",
+                       f"name={name} record_id={record_id} "
+                       f"workspace_id={self.workspace_id}")
+                return {"error": (f"Container {name!r} has a record with no bound "
+                                  f"container; refusing to start."),
+                        "code": "container_record_unbound"}
+            # (a) Record + docker_id: reuse via the record's docker id.
+            container = self._reuse_container(docker_id)
+            if container is None:
+                return {"error": (f"Container {name!r} record {record_id} names "
+                                  f"docker_id {docker_id!r} but no such container "
+                                  f"exists."),
+                        "code": "container_record_container_missing"}
+            self._containers[name] = container.id  # warm the read-through cache
+            if (explicit_image is not None
+                    and not self._image_matches(container, explicit_image)):
+                actual = self._image_ref(container)
+                msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
+                       f"with image {explicit_image}. Remove it first or use a different name.")
+                log("WARNING", "docker.container_manager", msg)
+                _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
+                       f"name={name} id={container.id} actual={actual} "
+                       f"requested={explicit_image} source=record")
+                return {"error": msg}
+            _action, _payload = self._start_drift_decision(
+                container, want_network, want_workspace, "record",
+                lifecycle_class=lifecycle_class,
+            )
+            if _action == "deny":
+                return _payload
+            if note is not None:
+                self._write_note(self._record_id_for(container), note)
+            note_value = (note if note is not None else self._read_note(container))
+            _audit("CONTAINER_REUSE_OK",
+                   f"source=record name={name} id={container.id} session={self.session_id}")
+            log_container_event("started", container_id=container.id,
+                                session_id=self.session_id or "",
+                                data={"image": self._image_ref(container),
+                                      "name": name, "status": "reused"})
+            _reuse_resp = {"id": container.id, "name": name, "status": "reused",
+                           "note": note_value}
+            if _payload is not None:
+                _reuse_resp["drift"] = _payload
+            return _reuse_resp
+
+        # (c) Cached name with NO record -> drift: REFUSE (no-container-record).
+        if name in self._containers:
+            container_id = self._containers.get(name)
+            self._warn_note_once(
+                ("name.cache_without_record", self.workspace_id, name),
+                f"Refusing start({name!r}): cached container {container_id!r} has "
+                f"no container record (drift: cache/record divergence).")
+            _audit("CONTAINER_START_NO_CONTAINER_RECORD",
+                   f"name={name} container_id={container_id} "
+                   f"workspace_id={self.workspace_id} source=cache")
+            return {"error": (f"Container {name!r} has no container record; "
+                              f"refusing to start (drift)."),
+                    "code": "container_no_record",
+                    "drift": {"reason": "cached container without a record"}}
+
+        # No record for *name*: fall through to the legacy reuse/create paths
+        # below (a fresh create records the name via record_creation).
         containers = self.list_containers()
         for entry in containers:
             if entry["name"] == name:
@@ -1131,7 +1366,7 @@ class ContainerManager:
         ]
 
         labels = {
-            "thoughtmachine.container_name": name,
+            CONTAINER_NAME_LABEL: name,
             "thoughtmachine.workspace_id": self.workspace_id,
             CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
         }
@@ -1194,6 +1429,11 @@ class ContainerManager:
                 raise
             container_id = handle["id"]
             container_name = handle["name"]
+            # Record-first identity: the registry minted the record on its own
+            # create path; index it here so a subsequent start(name=...) reuses
+            # it.  Resolve the record id from the live container label.
+            self._name_index_register(
+                name, self._record_id_for_name(container_name))
             self._containers[name] = container_id
             if note is not None:
                 self._write_note(self._record_id_for_name(container_id), note)
@@ -1244,6 +1484,7 @@ class ContainerManager:
             workspace_id=self.workspace_id,
             lifecycle_class=lifecycle_class,
             labels=labels,
+            name=name,
         ) as record:
             container = self.client.containers.run(
                 image=image,
@@ -1272,6 +1513,9 @@ class ContainerManager:
                 labels=labels,
             )
             record.attach(container)
+            # Record-first identity: index the freshly minted record so a
+            # subsequent start(name=...) reuses it instead of re-creating.
+            self._name_index_register(name, getattr(record, "id", ""))
         try:
             container.reload()
         except Exception:

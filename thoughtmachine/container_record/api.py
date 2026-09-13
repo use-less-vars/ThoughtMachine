@@ -103,6 +103,7 @@ def _create(
     id: str | None,
     state: str,
     vault_root: str | os.PathLike | None,
+    name: str = "",
 ) -> Record:
     """Shared create path for :func:`create_record` / :func:`begin_record`."""
     validate_lifecycle_class(lifecycle_class)
@@ -131,6 +132,7 @@ def _create(
             state=state,
             created_at=now,
             updated_at=now,
+            name=name,
         )
         storage.write_record_file(path, record.to_dict())
     return record
@@ -144,14 +146,17 @@ def create_record(
     intent_snapshot: dict | None = None,
     id: str | None = None,
     *,
+    name: str = "",
     vault_root: str | os.PathLike | None = None,
 ) -> Record:
     """Create (or idempotently re-materialise) a record (§3, doc signature).
 
-    Natively authored records carry ``schema_version=1`` / ``inferred=False``;
-    ``docker_id`` is empty (§1 default) and ``state`` takes its §1 default
-    (``""``, "last observed container state").  Supplying ``id`` for an existing
-    record returns it unchanged (idempotent re-materialisation, §3).
+    Natively authored records carry ``schema_version=SCHEMA_VERSION_CURRENT``
+    (currently 3) / ``inferred=False``; ``docker_id`` is empty (§1 default)
+    and ``state`` takes its §1 default (``""``, "last observed container
+    state").  ``name`` is the workspace-scoped container identity (``""`` when
+    unset).  Supplying ``id`` for an existing record returns it unchanged
+    (idempotent re-materialisation, §3).
     """
     return _create(
         workspace_id,
@@ -162,6 +167,7 @@ def create_record(
         id,
         state="",
         vault_root=vault_root,
+        name=name,
     )
 
 
@@ -173,13 +179,15 @@ def begin_record(
     intent_snapshot: dict | None = None,
     id: str | None = None,
     *,
+    name: str = "",
     vault_root: str | os.PathLike | None = None,
 ) -> Record:
     """Persist a pre-run intent stub: ``state="creating"``, ``docker_id=""``.
 
     §1 names no pre-run state; ``"creating"`` is a **proposal** pending operator
     ratification.  Idempotent on a caller-supplied ``id`` (returns the existing
-    record unchanged).
+    record unchanged).  ``name`` is the workspace-scoped container identity
+    (``""`` when unset).
     """
     return _create(
         workspace_id,
@@ -190,6 +198,7 @@ def begin_record(
         id,
         state=STATE_CREATING,
         vault_root=vault_root,
+        name=name,
     )
 
 

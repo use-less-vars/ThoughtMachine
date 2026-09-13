@@ -11,10 +11,12 @@ The drift EVENT + WARNING + audit fire ONCE per distinct signature (its own
 module-level memo, ``container_manager._START_DRIFT_SEEN``), while the DECISION
 is applied on *every* call.
 
-All three reuse sources are exercised: ``"workspace-label"``, ``"registry"`` and
-``"label"``.  Fakes mirror ``tests/test_container_exec_drift.py``; the manager is
-built via ``ContainerManager.__new__`` so the real Docker client is never
-touched.
+All three reuse sources are exercised: ``"workspace-label"``, ``"record"`` and
+``"label"``.  (The old in-memory ``"registry"`` cache is NO LONGER an identity
+source: a cached name with no record now REFUSES, so the record-driven reuse
+path takes its place.)  Fakes mirror ``tests/test_container_exec_drift.py``; the
+manager is built via ``ContainerManager.__new__`` so the real Docker client is
+never touched.
 """
 
 from unittest.mock import MagicMock
@@ -23,9 +25,16 @@ import pytest
 
 import infra.container_manager as container_manager
 from infra.container_manager import ContainerManager
-from thoughtmachine.container_record import LIFECYCLE_CLASSES, RECORD_LABEL_KEY
+from thoughtmachine.container_record import (
+    LIFECYCLE_CLASSES,
+    LIFECYCLE_PERSISTENT,
+    OWNER_WORKSPACE,
+    RECORD_LABEL_KEY,
+    create_record,
+    update_record,
+)
 
-_SITES = ["workspace-label", "registry", "label"]
+_SITES = ["workspace-label", "record", "label"]
 _EVENT = "drift.start_on_drifted_container"
 _ACTOR = "infra.container_manager.start"
 
@@ -130,7 +139,24 @@ def _make_cm(container, want, name="agent-x", workspace_id="w1"):
     cm._get_max_containers = lambda: 10
     cm._find_by_labels = lambda n: None
     cm.list_containers = lambda: []
+    cm.vault_root = _VAULT.get("root")
     return cm
+
+
+# Set by the ``_tmp_vault`` autouse fixture (below); the record-driven reuse
+# site mints a REAL record into this vault so ``start`` resolves identity from
+# the record (name -> docker_id -> live container), not from a label lookup.
+_VAULT = {}
+
+
+def _mint_record(workspace_id, name, docker_id):
+    """Mint a container RECORD binding *name* to the live container's id."""
+    vault = _VAULT["root"]
+    create_record(
+        workspace_id, LIFECYCLE_PERSISTENT, OWNER_WORKSPACE,
+        id="rec-1", name=name, vault_root=vault,
+    )
+    update_record(workspace_id, "rec-1", vault_root=vault, docker_id=docker_id)
 
 
 def _arrange(cm, container, name, site):
@@ -139,8 +165,8 @@ def _arrange(cm, container, name, site):
         cm.list_containers = (
             lambda: [{"name": name, "container_id": container.id, "note": ""}]
         )
-    elif site == "registry":
-        cm._containers = {name: container.id}
+    elif site == "record":
+        _mint_record(cm.workspace_id, name, container.id)
     elif site == "label":
         cm._find_by_labels = lambda n: container
     else:  # pragma: no cover - guards against a typo in the parametrisation
@@ -166,6 +192,33 @@ def _clear_memo():
     yield
     container_manager._EXEC_DRIFT_SEEN.clear()
     container_manager._START_DRIFT_SEEN.clear()
+
+
+@pytest.fixture(autouse=True)
+def _tmp_vault(tmp_path, monkeypatch):
+    """A tmp DEFAULT vault + isolated name-index/notes memos.
+
+    The record-driven reuse site mints/reads records through the DEFAULT vault
+    (``THOUGHTMACHINE_VAULT_ROOT``); the ``(workspace, name) -> record id`` index
+    and the notes memos are module-scoped, so they must be cleared per test or a
+    freshly minted record in the same workspace would never be indexed.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+    _VAULT["root"] = str(vault)
+
+    def _reset():
+        container_manager._NAME_INDEX.clear()
+        container_manager._NAME_INDEX_COLLISIONS.clear()
+        container_manager._NAME_INDEX_BUILT.clear()
+        container_manager._NAME_MIGRATED.clear()
+        container_manager._NOTES_WARNED.clear()
+        container_manager._NOTES_MIGRATED.clear()
+
+    _reset()
+    yield
+    _reset()
 
 
 @pytest.fixture(autouse=True)

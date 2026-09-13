@@ -204,6 +204,7 @@ def record_creation(
     purpose: str = "",
     intent_snapshot: dict | None = None,
     labels: dict[str, str] | None = None,
+    name: str = "",
     vault_root: str | Any | None = None,
 ) -> Iterator[_RecordHandle]:
     """Two-phase record context manager for a fresh container creation.
@@ -226,6 +227,7 @@ def record_creation(
         purpose: free-text purpose for the record.
         intent_snapshot: optional intent snapshot dict.
         labels: optional Docker label dict to augment with the record label.
+        name: optional workspace-scoped container identity ("" = unset).
         vault_root: optional vault root override.
     """
     # Fail closed: if the intent stub cannot be persisted, propagate and let the
@@ -237,6 +239,7 @@ def record_creation(
         owner,
         purpose,
         intent_snapshot,
+        name=name,
         vault_root=vault_root,
     )
 

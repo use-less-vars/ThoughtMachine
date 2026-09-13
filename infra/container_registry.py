@@ -424,6 +424,11 @@ class ContainerRegistry:
         container_name = "tm-{}-{}-{}".format(
             container_type, workspace_id[:12], uuid.uuid4().hex[:8]
         )
+        # Name parity with create_resource_container: the free-use profile
+        # carries the workspace-scoped container name label so the record and
+        # the container agree on identity (labels is the same dict bound into
+        # ``profile`` above).
+        labels[CONTAINER_NAME_LABEL] = container_name
 
         # Atomic read-and-reserve under ONE lock acquisition: the per-workspace
         # count and the reservation placeholder are decided together so
@@ -459,6 +464,7 @@ class ContainerRegistry:
                 workspace_id=workspace_id,
                 lifecycle_class=lifecycle_class,
                 labels=profile.labels,
+                name=container_name,
             ) as record:
                 container = create_hardened_container(
                     self._docker_client, profile, container_name,
@@ -584,6 +590,7 @@ class ContainerRegistry:
             workspace_id=workspace_id,
             lifecycle_class=LIFECYCLE_RESOURCE,
             labels=profile.labels,
+            name=name,
         ) as record:
             container = create_hardened_container(
                 self._docker_client, profile, name,
@@ -708,6 +715,12 @@ class ContainerRegistry:
         ``_session_map``, never recreated next to a stale twin).  Recreate
         failure -> log, keep the slot, retry on the next event.  One failure
         never blocks the rest.
+
+        UNWIRED: no event-bus producer calls this yet — the handler is inert
+        until the phase-3 wiring lands.  When it does, treat its output as
+        drift events only: per docs/container_subsystem_target_architecture.md
+        "Move 3 — Drift as events", these events never stop, mutate, or
+        destroy a running container; the user decides.
         """
         if not self.is_enabled():
             return

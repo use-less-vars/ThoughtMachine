@@ -295,3 +295,44 @@ def hermetic_vault(tmp_path, monkeypatch):
     monkeypatch.setattr(thoughtmachine.vault, "vault_root", lambda: vault_path)
 
     yield vault_path
+
+
+# ---------------------------------------------------------------------------
+# Isolation of the module-scope container-identity memos.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_container_manager_memos():
+    """Isolate the module-scope identity / notes memos in ``infra.container_manager``.
+
+    ``_NAME_INDEX`` / ``_NAME_INDEX_COLLISIONS`` / ``_NAME_INDEX_BUILT`` /
+    ``_NAME_MIGRATED`` / ``_NOTES_WARNED`` / ``_NOTES_MIGRATED`` are module
+    globals keyed by ``(workspace_id, name)``.  Test modules across the suite
+    reuse workspace ids (``w1``, ``ws-rp``, ``ws-cm``, ...) and container names
+    (``my-box``, ``n``, ...), so a stale ``_NAME_INDEX`` entry left by one test
+    makes a later test with the same (workspace, name) resolve a record id that
+    never existed on its own fresh per-test vault, yielding a spurious
+    ``container_record_unbound`` refusal (the fake docker client is then never
+    asked to run).  Clear the memos before and after every test so each test's
+    identity ladder starts from a clean, disk-backed state.
+
+    ``infra.container_manager`` is imported lazily to preserve this conftest's
+    "no repo module imported at conftest import time" invariant.
+    """
+    import infra.container_manager as _cm
+
+    memos = (
+        _cm._NAME_INDEX,
+        _cm._NAME_INDEX_COLLISIONS,
+        _cm._NAME_INDEX_BUILT,
+        _cm._NAME_MIGRATED,
+        _cm._NOTES_WARNED,
+        _cm._NOTES_MIGRATED,
+    )
+    for memo in memos:
+        memo.clear()
+    yield
+    for memo in memos:
+        memo.clear()
+

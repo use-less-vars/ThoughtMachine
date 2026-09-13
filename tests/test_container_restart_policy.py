@@ -164,6 +164,34 @@ def _clear_memo():
 
 
 @pytest.fixture(autouse=True)
+def _tmp_vault(tmp_path, monkeypatch):
+    """A tmp DEFAULT vault + isolated name-index/notes memos.
+
+    The record store resolves its vault lazily from
+    ``THOUGHTMACHINE_VAULT_ROOT`` (else ``~/.thoughtmachine``) when a call does
+    not pass an explicit ``vault_root``; the shared default would leak
+    ``(workspace, name) -> record`` identity across tests, making a fresh create
+    spuriously REUSE an earlier test's record.  The ``(workspace, name) ->
+    record id`` index and the notes memos are module-scoped, so clear them too.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+    def _reset():
+        container_manager._NAME_INDEX.clear()
+        container_manager._NAME_INDEX_COLLISIONS.clear()
+        container_manager._NAME_INDEX_BUILT.clear()
+        container_manager._NAME_MIGRATED.clear()
+        container_manager._NOTES_WARNED.clear()
+        container_manager._NOTES_MIGRATED.clear()
+
+    _reset()
+    yield
+    _reset()
+
+
+@pytest.fixture(autouse=True)
 def _no_registry(monkeypatch):
     """Never let the registry facade intercept the stubbed start() paths."""
     monkeypatch.setattr(
