@@ -44,7 +44,8 @@ SCHEMA_VERSION_LEGACY = 0
 
 #: ``schema_version`` for records authored natively (never synthesised).
 #: v2 adds the ``restart_policy`` intent field (absent in v1 records).
-SCHEMA_VERSION_CURRENT = 2
+#: v3 adds the ``name`` identity field (absent in v1/v2 records).
+SCHEMA_VERSION_CURRENT = 3
 
 LIFECYCLE_EPHEMERAL = "ephemeral"
 LIFECYCLE_PERSISTENT = "persistent"
@@ -84,6 +85,10 @@ SCHEMA_FIELD_NAMES: tuple[str, ...] = (
     # ``restart_policy`` is the *intent* restart policy applied at container
     # creation (``None`` = the record predates the field, i.e. unset).
     "restart_policy",
+    # ``name`` is the workspace-scoped container identity ("" = the record
+    # predates the field, i.e. unset). Appended last to keep the on-disk key
+    # order of v1/v2 records stable.
+    "name",
 )
 
 #: Nested ``intent_snapshot`` field order (§1.1).
@@ -170,6 +175,8 @@ class Record:
     created_at: str = ""
     updated_at: str = ""
     restart_policy: str | None = None
+    #: Workspace-scoped container identity ("" = unset).
+    name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return the record as a plain dict in §1 field order."""
@@ -188,6 +195,7 @@ class Record:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "restart_policy": self.restart_policy,
+            "name": self.name,
         }
 
     @classmethod
@@ -224,4 +232,5 @@ class Record:
             created_at=str(data.get("created_at", "") or ""),
             updated_at=str(data.get("updated_at", "") or ""),
             restart_policy=restart_policy,
+            name=str(data.get("name", "") or ""),
         )

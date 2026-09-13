@@ -25,6 +25,7 @@ if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
 
 from infra.container_registry import (  # noqa: E402
+    CONTAINER_NAME_LABEL,
     CONTAINER_TYPES,
     DEFAULT_COMMAND,
     DEFAULT_CPU_QUOTA,
@@ -437,6 +438,10 @@ class TestRequestContainer:
         run_labels = dict(kwargs["labels"])
         record_id = run_labels.pop(RECORD_LABEL_KEY)
         assert record_id  # non-empty record id was injected
+        # v3 identity: the free-use path stamps the workspace-scoped
+        # container-name label so the record and container agree on identity;
+        # assert it names this handle, then the rest of the labels are unchanged.
+        assert run_labels.pop(CONTAINER_NAME_LABEL) == handle["name"]
         assert run_labels == {
             "a": "b",
             "thoughtmachine.container_type": "free_use",

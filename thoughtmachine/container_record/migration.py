@@ -46,6 +46,9 @@ WORKSPACE_ID_LABEL = "thoughtmachine.workspace_id"
 WORKER_LABEL = "thoughtmachine.worker"
 CONTAINER_TYPE_LABEL = "thoughtmachine.container_type"
 RESOURCE_LABEL = "thoughtmachine.resource"
+#: Workspace-scoped container name label (value matches
+#: ``agent.config.defaults.CONTAINER_NAME_LABEL``).
+CONTAINER_NAME_LABEL = "thoughtmachine.container_name"
 
 CONTAINER_TYPE_FREE_USE = "free_use"
 CONTAINER_TYPE_RESOURCE = "resource"
