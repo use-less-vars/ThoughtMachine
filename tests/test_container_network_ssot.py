@@ -1,6 +1,11 @@
 """Bug 2: ContainerManager must derive container isolation from the security
 gate SSOT (``security.security_gate.resolve_container_config``) and must never
 silently reuse a drifted container on the workspace-label path.
+
+A container whose LIVE isolation is MORE permissive than the resolved policy is
+REFUSED (an error carrying the drift detail) and left UNTOUCHED - ``start`` no
+longer REMOVES or recreates it on drift.  A non-more-permissive drift is reused
+with a ``drift`` detail attached.
 """
 from unittest.mock import MagicMock
 
@@ -50,9 +55,13 @@ class _FakeContainer:
             "HostConfig": {"NetworkMode": network},
             "Mounts": [{"Destination": "/workspace", "RW": workspace_rw}],
         }
+        self.removed = []
 
     def reload(self):
         pass
+
+    def remove(self, **kwargs):
+        self.removed.append(kwargs)
 
     @property
     def status(self):
@@ -88,22 +97,41 @@ def _drive_start(fake_container, monkeypatch):
     mgr.client = client
     mgr._remove_container = MagicMock()
     mgr._find_by_labels = lambda n: None
-    mgr._get_max_containers = lambda: 0
+    # High limit: the drift REFUSAL must come from the drift decision itself,
+    # NOT from the workspace container-limit guard.
+    mgr._get_max_containers = lambda: 100
     mgr._active_containers = lambda cs: []
     monkeypatch.setattr(cm, "is_registry_active", lambda *a, **k: False)
     return mgr, mgr.start(name="agent-x")
 
 
 def test_drifted_workspace_label_container_is_not_silently_reused(monkeypatch, permissive_caps):
-    drifted = _FakeContainer("c" * 16, network="none", workspace_rw=False)
+    # Live "host" network is MORE permissive than the resolved ("bridge")
+    # policy -> the workspace-label reuse path must REFUSE, never mutate.
+    drifted = _FakeContainer("c" * 16, network="host", workspace_rw=True)
     mgr, result = _drive_start(drifted, monkeypatch)
     assert result.get("status") != "reused"
     assert "error" in result
-    assert mgr._remove_container.called
+    assert result["drift"]["decision"] == "deny"
+    assert result["drift"]["source"] == "workspace-label"
+    # The new policy does NOT remove/recreate on drift: left untouched.
+    assert drifted.removed == []
+    assert not mgr._remove_container.called
 
 
 def test_matching_workspace_label_container_is_reused(monkeypatch, permissive_caps):
+    import thoughtmachine.container_record as cr
+
+    emitted = []
+    monkeypatch.setattr(
+        cr, "append_event",
+        lambda *a, **k: emitted.append(a[2] if len(a) > 2 else k.get("event_type")),
+        raising=True,
+    )
     matching = _FakeContainer("d" * 16, network="bridge", workspace_rw=True)
     mgr, result = _drive_start(matching, monkeypatch)
     assert result.get("status") == "reused"
+    assert "drift" not in result
     assert not mgr._remove_container.called
+    # A NON-drifted container publishes NO start-drift event.
+    assert "drift.start_on_drifted_container" not in emitted

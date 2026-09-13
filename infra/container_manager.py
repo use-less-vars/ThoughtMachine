@@ -191,6 +191,20 @@ _EXEC_DRIFT_ACTOR = "infra.container_manager.exec"
 _EXEC_DRIFT_AUDIT = "CONTAINER_EXEC_DRIFT"
 _EXEC_DRIFT_EXIT_CODE = 126  # distinct from -2 (timeout) and -1 (generic error)
 
+# Start-path drift admission (mirrors the exec-path memo above): ``start()`` no
+# longer MUTATES a drifted container (no remove/recreate).  A container whose
+# live isolation differs from the resolved policy but is NOT more permissive is
+# REUSED with the drift attached to the response; a container that IS more
+# permissive is REFUSED (an error response carrying the drift detail) WITHOUT
+# touching it.  Same module-scope memo discipline as exec: the drift EVENT +
+# WARNING + audit fire ONCE per distinct signature, while the DECISION is
+# applied on every call.
+_START_DRIFT_SEEN = OrderedDict()  # (container_id, signature) -> True, oldest evicted
+_START_DRIFT_LOCK = threading.Lock()
+_START_DRIFT_EVENT = "drift.start_on_drifted_container"
+_START_DRIFT_ACTOR = "infra.container_manager.start"
+_START_DRIFT_AUDIT = "CONTAINER_START_DRIFT"
+
 # Isolation ranks: higher == more permissive.  Network "default" is normalized
 # to "bridge" upstream (see ContainerManager._normalize_network_mode); any other
 # PRESENT network mode (host / container:<id> / ...) is treated as the most
@@ -627,10 +641,12 @@ class ContainerManager:
         note overwrites the bulletin-board entry for the container name.
 
         Desired isolation (network_mode, workspace_mode) is computed ONCE from
-        the session permissions BEFORE any reuse path, so an existing container
-        is only reused when its actual network + /workspace mount mode still
-        match. A drifted container is recreated with the computed modes instead
-        of being silently reused (mirrors docker_executor's integrity check).
+        the session permissions BEFORE any reuse path.  A drifted container is
+        NEVER mutated here: when its live isolation differs from the resolved
+        policy but is not MORE permissive it is REUSED with a ``drift`` detail
+        attached to the response; when it is MORE permissive than the resolved
+        policy the container is REFUSED (``{"error": ..., "drift": ...}``) so
+        the caller can act, instead of being silently reused or removed.
         """
         # Capture the caller-supplied image BEFORE defaulting, so image-reuse
         # honesty can tell an explicit request from the manager default.
@@ -685,20 +701,20 @@ class ContainerManager:
                            f"requested={explicit_image} source=workspace-label")
                     return {"error": msg}
                 # A drifted container (network or /workspace mount no longer
-                # matches the session permissions) is recreated, never silently
-                # reused (mirrors the registry/label drift checks below).
-                if container is not None and not self._config_matches(
-                    container, want_network, want_workspace
-                ):
-                    log("WARNING", "docker.container_manager",
-                        f"Workspace-label container {container.id[:12]} config drifted "
-                        f"(network={want_network} workspace={want_workspace}) - recreating")
-                    _audit("CONTAINER_RECREATE_MISMATCH",
-                           f"name={name} id={container.id} source=workspace-label "
-                           f"network={want_network} workspace={want_workspace}")
-                    self._remove_container(container)
-                    continue
+                # matches the session permissions) is never silently reused and
+                # never mutated here: a not-more-permissive mismatch is reused
+                # with a drift detail attached; a more-permissive one is refused
+                # (see _start_drift_decision; mirrors the registry/label checks
+                # below).
+                _start_drift = None
                 if container is not None:
+                    _action, _payload = self._start_drift_decision(
+                        container, want_network, want_workspace, "workspace-label"
+                    )
+                    if _action == "deny":
+                        return _payload
+                    if _action == "reuse":
+                        _start_drift = _payload
                     try:
                         self._ensure_running(container)
                     except Exception:
@@ -713,8 +729,11 @@ class ContainerManager:
                                     session_id=self.session_id or "",
                                     data={"image": self._image_ref(container),
                                           "name": name, "status": "reused"})
-                return {**entry, "status": "reused", "id": entry["container_id"],
-                        "note": note_value}
+                _reuse_resp = {**entry, "status": "reused", "id": entry["container_id"],
+                               "note": note_value}
+                if _start_drift is not None:
+                    _reuse_resp["drift"] = _start_drift
+                return _reuse_resp
         limit = self._get_max_containers()
         # When the registry is active it owns the per-session limit; the
         # legacy workspace-scoped check is skipped so the registry is the
@@ -773,28 +792,28 @@ class ContainerManager:
                            f"name={name} id={container.id} actual={actual} "
                            f"requested={explicit_image} source=registry")
                     return {"error": msg}
-                if self._config_matches(container, network_mode, workspace_mode):
-                    if note is not None:
-                        self.container_notes[name] = {"note": note}
-                        self._save_container_notes()
-                    note_value = note if note is not None else (
-                        (getattr(self, "container_notes", {}) or {}).get(name) or {}
-                    ).get("note", "")
-                    _audit("CONTAINER_REUSE_OK",
-                           f"source=registry name={name} id={container.id} session={self.session_id}")
-                    log_container_event("started", container_id=container.id,
-                                        session_id=self.session_id or "",
-                                        data={"image": self._image_ref(container),
-                                              "name": name, "status": "reused"})
-                    return {"id": container.id, "name": name, "status": "reused",
-                            "note": note_value}
-                log("WARNING", "docker.container_manager",
-                    f"Registry container {container.id[:12]} config drifted "
-                    f"(network={network_mode} workspace={workspace_mode}) — recreating")
-                _audit("CONTAINER_RECREATE_MISMATCH",
-                       f"name={name} id={container.id} source=registry "
-                       f"network={network_mode} workspace={workspace_mode}")
-                self._remove_container(container)
+                _action, _payload = self._start_drift_decision(
+                    container, network_mode, workspace_mode, "registry"
+                )
+                if _action == "deny":
+                    return _payload
+                if note is not None:
+                    self.container_notes[name] = {"note": note}
+                    self._save_container_notes()
+                note_value = note if note is not None else (
+                    (getattr(self, "container_notes", {}) or {}).get(name) or {}
+                ).get("note", "")
+                _audit("CONTAINER_REUSE_OK",
+                       f"source=registry name={name} id={container.id} session={self.session_id}")
+                log_container_event("started", container_id=container.id,
+                                    session_id=self.session_id or "",
+                                    data={"image": self._image_ref(container),
+                                          "name": name, "status": "reused"})
+                _reuse_resp = {"id": container.id, "name": name, "status": "reused",
+                               "note": note_value}
+                if _payload is not None:
+                    _reuse_resp["drift"] = _payload
+                return _reuse_resp
             self._containers.pop(name, None)  # stale entry
 
         # 2) Label lookup (survives manager restarts)
@@ -811,32 +830,30 @@ class ContainerManager:
                        f"name={name} id={container.id} actual={actual} "
                        f"requested={explicit_image} source=label")
                 return {"error": msg}
-            if not self._config_matches(container, network_mode, workspace_mode):
-                log("WARNING", "docker.container_manager",
-                    f"Labeled container {container.id[:12]} config drifted "
-                    f"(network={network_mode} workspace={workspace_mode}) — recreating")
-                _audit("CONTAINER_RECREATE_MISMATCH",
-                       f"name={name} id={container.id} source=label "
-                       f"network={network_mode} workspace={workspace_mode}")
-                self._remove_container(container)
-                container = None
-            else:
-                self._ensure_running(container)
-                self._containers[name] = container.id
-                if note is not None:
-                    self.container_notes[name] = {"note": note}
-                    self._save_container_notes()
-                note_value = note if note is not None else (
-                    (getattr(self, "container_notes", {}) or {}).get(name) or {}
-                ).get("note", "")
-                _audit("CONTAINER_REUSE_OK",
-                       f"source=label name={name} id={container.id} session={self.session_id}")
-                log_container_event("started", container_id=container.id,
-                                    session_id=self.session_id or "",
-                                    data={"image": self._image_ref(container),
-                                          "name": name, "status": "reused"})
-                return {"id": container.id, "name": name, "status": "reused",
-                        "note": note_value}
+            _action, _payload = self._start_drift_decision(
+                container, network_mode, workspace_mode, "label"
+            )
+            if _action == "deny":
+                return _payload
+            self._ensure_running(container)
+            self._containers[name] = container.id
+            if note is not None:
+                self.container_notes[name] = {"note": note}
+                self._save_container_notes()
+            note_value = note if note is not None else (
+                (getattr(self, "container_notes", {}) or {}).get(name) or {}
+            ).get("note", "")
+            _audit("CONTAINER_REUSE_OK",
+                   f"source=label name={name} id={container.id} session={self.session_id}")
+            log_container_event("started", container_id=container.id,
+                                session_id=self.session_id or "",
+                                data={"image": self._image_ref(container),
+                                      "name": name, "status": "reused"})
+            _reuse_resp = {"id": container.id, "name": name, "status": "reused",
+                           "note": note_value}
+            if _payload is not None:
+                _reuse_resp["drift"] = _payload
+            return _reuse_resp
 
         # 3) Fresh create
         tmpfs = {
@@ -1231,6 +1248,119 @@ class ContainerManager:
                     str(record_id),
                     _EXEC_DRIFT_EVENT,
                     _EXEC_DRIFT_ACTOR,
+                    decision=decision,
+                    reason=reason,
+                    expected={"network_mode": want_net, "workspace_mode": want_ws},
+                    actual={"network_mode": live_net, "workspace_mode": live_ws},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+
+    def _start_drift_decision(self, container, want_net, want_ws, source):
+        """Classify a reused container's isolation vs the resolved start policy.
+
+        Start-path twin of :meth:`_check_exec_drift`, but for the REUSE decision
+        (there is no command to run).  Returns one of:
+
+          ("ok", None)             — no observable drift; reuse as today.
+          ("reuse", drift_dict)    — drift seen but NOT more permissive; reuse
+                                     the container, attaching drift_dict.
+          ("deny", response_dict)  — live is MORE permissive; REFUSE (return an
+                                     error response carrying the drift) WITHOUT
+                                     running, mutating or handing back the
+                                     container.
+
+        The container is NEVER removed or recreated here: start() no longer
+        MUTATES on drift.  A caller that must replace a more-permissive drifted
+        container (e.g. the ephemeral runner) acts on the refusal itself.
+        """
+        if self._config_matches(container, want_net, want_ws):
+            return "ok", None
+
+        live_net, live_ws = _exec_live_isolation(container)
+        decision, reason = _exec_drift_decision(live_net, live_ws, want_net, want_ws)
+        if decision == "run":
+            return "ok", None
+
+        drift = {
+            "drifted": True,
+            "decision": decision,
+            "reason": reason,
+            "network_mode": live_net,
+            "workspace_mode": live_ws,
+            "source": source,
+        }
+        signature = hashlib.sha256(
+            f"{source}|{want_net}|{want_ws}|{live_net}|{live_ws}|{decision}".encode()
+        ).hexdigest()
+        container_id = getattr(container, "id", None)
+        self._emit_start_drift_once(
+            container_id, container, signature, decision, reason,
+            want_net, want_ws, live_net, live_ws, source,
+        )
+
+        if decision == "deny":
+            message = (
+                "Container isolation is MORE PERMISSIVE than the session "
+                f"policy ({reason}); refusing to reuse the container. "
+                f"expected network={want_net} workspace={want_ws}; "
+                f"live network={live_net} workspace={live_ws}. "
+                "Recreate the container to restore the desired isolation."
+            )
+            # Mirror the exec deny payload EXACTLY: the drifted container id
+            # rides INSIDE ``drift`` (never a top-level ``container_id``, which a
+            # lifecycle consumer would mistake for a successfully-tracked
+            # container).
+            drift["container_id"] = container_id
+            return "deny", {"error": message, "drift": drift}
+        return "reuse", drift
+
+    def _emit_start_drift_once(self, container_id, container, signature, decision,
+                               reason, want_net, want_ws, live_net, live_ws, source):
+        """Emit drift EVENT + WARNING + audit ONCE per (container_id, signature).
+
+        Start-path twin of :meth:`_emit_exec_drift_once` (its own module-scope
+        memo + lock, same dedup/discipline).  Best-effort: every sub-step is
+        individually guarded so a logging/record failure never affects the
+        start decision.
+        """
+        key = (container_id, signature)
+        with _START_DRIFT_LOCK:
+            if key in _START_DRIFT_SEEN:
+                return
+            _START_DRIFT_SEEN[key] = True
+            while len(_START_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _START_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"container_id={container_id} source={source} decision={decision} "
+            f"reason={reason} "
+            f"expected(network={want_net},workspace={want_ws}) "
+            f"actual(network={live_net},workspace={live_ws})"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"start on drifted container: {summary}")
+        except Exception:
+            pass
+
+        try:
+            self._audit(_START_DRIFT_AUDIT, summary)
+        except Exception:
+            pass
+
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id is not None and getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    _START_DRIFT_EVENT,
+                    _START_DRIFT_ACTOR,
+                    source=source,
                     decision=decision,
                     reason=reason,
                     expected={"network_mode": want_net, "workspace_mode": want_ws},

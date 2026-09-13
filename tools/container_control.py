@@ -223,18 +223,28 @@ class ContainerStartTool(_ContainerControlBase):
                 worker_name=getattr(self, "worker_name", None) or current_worker_name(),
             )
             if "error" in info:
+                error_fields = {"error": info["error"]}
+                # Additive, optional: surface start-path drift refusal detail.
+                if info.get("drift") is not None:
+                    error_fields["drift"] = info["drift"]
                 return self._respond(
                     False,
-                    error=info["error"],
                     duration=time.time() - start_time,
+                    **error_fields,
                 )
+            start_fields = {
+                "container_id": info["id"],
+                "name": info["name"],
+                "status": info["status"],
+                "note": info.get("note"),
+            }
+            # Additive, optional: surface start-path drift info when present.
+            if info.get("drift") is not None:
+                start_fields["drift"] = info["drift"]
             return self._respond(
                 True,
-                container_id=info["id"],
-                name=info["name"],
-                status=info["status"],
-                note=info.get("note"),
                 duration=time.time() - start_time,
+                **start_fields,
             )
         except RuntimeError as e:
             return self._respond(False, error=str(e), duration=time.time() - start_time)
