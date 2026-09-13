@@ -47,6 +47,14 @@ _EXPECTED = {
     LIFECYCLE_SERVICE: (False, True, None, {"image"}),
 }
 
+#: ``lifecycle_class -> expected container restart policy``.
+_EXPECTED_RESTART = {
+    LIFECYCLE_PERSISTENT: "unless-stopped",
+    LIFECYCLE_EPHEMERAL: "no",
+    LIFECYCLE_RESOURCE: "unless-stopped",
+    LIFECYCLE_SERVICE: "unless-stopped",
+}
+
 
 # ── (a) four-class field matrix ─────────────────────────────────────────────
 
@@ -60,7 +68,7 @@ def test_policy_field_matrix(cls, expected):
     assert policy.own_lifecycle is own_lifecycle
     assert policy.workspace_gc_max_age_s == gc_age
     assert policy.drift_axes == frozenset(axes)
-    assert policy.restart_policy is None
+    assert policy.restart_policy == _EXPECTED_RESTART[cls]
 
 
 def test_policy_field_order_and_frozen():
@@ -81,8 +89,8 @@ def test_positional_construction_and_restart_default():
     assert policy.restart_policy is None
 
 
-def test_restart_policy_inert_for_every_class():
-    assert all(p.restart_policy is None for p in POLICY_BY_CLASS.values())
+def test_restart_policy_per_class():
+    assert {c: p.restart_policy for c, p in POLICY_BY_CLASS.items()} == _EXPECTED_RESTART
 
 
 # ── (b) keys == constants & policy_for round-trip ───────────────────────────

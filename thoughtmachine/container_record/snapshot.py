@@ -128,4 +128,20 @@ def snapshot_from_attrs(attrs: Any) -> dict:
 
     snapshot["workspace_mode"] = _workspace_mode(attrs.get("Mounts"))
     snapshot["hardening"] = hardening_from_host_config(host)
+
+    # Docker reports an unset restart policy as an empty ``Name`` (the "no"
+    # policy).  The key is written whenever ``HostConfig`` is READABLE, holding
+    # the normalised value ("" / missing ``Name`` -> ``"no"``), so the key's
+    # PRESENCE means "the live restart policy was readable" and its ABSENCE
+    # means the attribute could not be read at all.  Omitting the key on an
+    # empty value would silently hide the single most important real drift: a
+    # persistent container that LOST its restart policy (expected
+    # "unless-stopped").
+    host_config_raw = attrs.get("HostConfig")
+    if isinstance(host_config_raw, dict):
+        _restart_raw = _mapping(host_config_raw.get("RestartPolicy")).get("Name")
+        snapshot["restart_policy"] = (
+            str(_restart_raw).strip() or "no"
+        ) if _restart_raw else "no"
+
     return snapshot

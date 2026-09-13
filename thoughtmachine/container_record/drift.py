@@ -25,7 +25,7 @@ Axis semantics
 Every axis is only compared when its *expected* value is present **and**
 non-empty in the snapshot, so an empty/unrecorded axis is never reported as
 drift.  Axes are emitted in a fixed order: identity, policy, runtime, image,
-hardening.
+hardening, restart policy.
 
 * **identity** -- the record's ``docker_id`` vs. the live container id.
 * **policy** -- the desired ``config`` network/workspace mode vs. the recorded
@@ -34,6 +34,11 @@ hardening.
 * **runtime / image / hardening** -- the recorded snapshot value vs. the live
   container's current value.  These require a live container; when the live
   inspection failed they are skipped.
+* **restart policy** -- the restart policy *intended* for the record (its own
+  ``restart_policy`` field, falling back to the lifecycle-class default for
+  records that predate the field) vs. the live container's
+  ``HostConfig.RestartPolicy.Name``.  Docker reports an unset policy as
+  ``""``, which is normalised to ``"no"`` before comparison.
 
 Read-only guarantee
 -------------------
@@ -56,6 +61,7 @@ from security.security_gate import (
 )
 
 from .api import RECORD_LABEL_KEY, append_event, read_event_log
+from .lifecycle_policy import normalise_restart_policy, policy_for
 from .models import iso_now
 from .snapshot import snapshot_from_attrs
 
@@ -70,6 +76,7 @@ CLASS_POLICY = "policy"
 CLASS_RUNTIME = "runtime"
 CLASS_IMAGE = "image"
 CLASS_HARDENING = "hardening"
+CLASS_RESTART_POLICY = "restart_policy"
 
 #: Drift event types.
 EVENT_IDENTITY_CHANGED = "drift.identity_changed"
@@ -78,6 +85,7 @@ EVENT_POLICY_CONFIG_CHANGED = "drift.policy_config_changed"
 EVENT_RUNTIME_MISMATCH = "drift.runtime_mismatch"
 EVENT_IMAGE_CHANGED = "drift.image_changed"
 EVENT_HARDENING_LOST = "drift.hardening_lost"
+EVENT_RESTART_POLICY_MISMATCH = "drift.restart_policy_mismatch"
 
 #: Axis sets, in the order axes within a class are compared.
 _POLICY_AXES = ("network_mode", "workspace_mode")
@@ -174,7 +182,7 @@ def classify_drift(record: Any, live: Any, config: Any) -> list[DriftFinding]:
 
     Returns:
         The list of :class:`DriftFinding` values, ordered identity, policy,
-        runtime, image, hardening.
+        runtime, image, hardening, restart policy.
     """
     findings: list[DriftFinding] = []
     try:
@@ -260,6 +268,36 @@ def classify_drift(record: Any, live: Any, config: Any) -> list[DriftFinding]:
                         actual,
                     )
                 )
+
+        # ── restart policy ───────────────────────────────
+        # Only evaluated when the live mapping actually carries the axis: a
+        # partial or hand-built mapping is not evidence of a missing policy.
+        if live_present and CLASS_RESTART_POLICY in live_map:
+            expected = getattr(record, "restart_policy", None)
+            if not _nonempty(expected):
+                # A record predating the field falls back to the default for
+                # its lifecycle class: that is the *class default* value, not
+                # a fail-open "no drift" verdict.
+                try:
+                    expected = policy_for(
+                        getattr(record, "lifecycle_class", "")
+                    ).restart_policy
+                except Exception:  # noqa: BLE001 - unknown class -> skip axis
+                    expected = None
+            if _nonempty(expected):
+                expected_name = normalise_restart_policy(expected)
+                actual_name = normalise_restart_policy(
+                    live_map.get(CLASS_RESTART_POLICY)
+                )
+                if expected_name != actual_name:
+                    findings.append(
+                        _make_finding(
+                            CLASS_RESTART_POLICY,
+                            EVENT_RESTART_POLICY_MISMATCH,
+                            expected_name,
+                            actual_name,
+                        )
+                    )
     except Exception:  # pragma: no cover - defensive; classify must never raise
         logger.warning("classify_drift encountered an unexpected error", exc_info=True)
     return findings
@@ -444,12 +482,14 @@ __all__ = [
     "CLASS_RUNTIME",
     "CLASS_IMAGE",
     "CLASS_HARDENING",
+    "CLASS_RESTART_POLICY",
     "EVENT_IDENTITY_CHANGED",
     "EVENT_CONTAINER_ABSENT",
     "EVENT_POLICY_CONFIG_CHANGED",
     "EVENT_RUNTIME_MISMATCH",
     "EVENT_IMAGE_CHANGED",
     "EVENT_HARDENING_LOST",
+    "EVENT_RESTART_POLICY_MISMATCH",
     "DriftFinding",
     "signature_for",
     "classify_drift",

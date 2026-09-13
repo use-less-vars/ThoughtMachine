@@ -122,7 +122,9 @@ class LifecyclePolicy:
         workspace_gc_max_age_s: age, in seconds, after which an unowned
             workspace container may be garbage-collected (``None`` = exempt).
         drift_axes: the drift classes compared for this lifecycle class.
-        restart_policy: reserved restart semantics (``None`` = unset).
+        restart_policy: the Docker restart policy applied when a container of
+            this class is created (``None`` = unset, i.e. Docker's default
+            ``no``).
     """
 
     class_name: str
@@ -144,6 +146,7 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         own_lifecycle=False,
         workspace_gc_max_age_s=86400,
         drift_axes=_ALL_DRIFT_AXES,
+        restart_policy="unless-stopped",
     ),
     LIFECYCLE_EPHEMERAL: LifecyclePolicy(
         class_name=LIFECYCLE_EPHEMERAL,
@@ -151,6 +154,7 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         own_lifecycle=False,
         workspace_gc_max_age_s=None,
         drift_axes=_IMAGE_AXIS,
+        restart_policy="no",
     ),
     LIFECYCLE_RESOURCE: LifecyclePolicy(
         class_name=LIFECYCLE_RESOURCE,
@@ -158,6 +162,7 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         own_lifecycle=True,
         workspace_gc_max_age_s=None,
         drift_axes=_IMAGE_AXIS,
+        restart_policy="unless-stopped",
     ),
     LIFECYCLE_SERVICE: LifecyclePolicy(
         class_name=LIFECYCLE_SERVICE,
@@ -165,6 +170,7 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         own_lifecycle=True,
         workspace_gc_max_age_s=None,
         drift_axes=_IMAGE_AXIS,
+        restart_policy="unless-stopped",
     ),
 }
 
@@ -185,3 +191,39 @@ def policy_for(lifecycle_class: str) -> LifecyclePolicy:
         raise UnknownLifecycleClass(
             f"unknown lifecycle class: {lifecycle_class!r}"
         ) from exc
+
+
+# ── Restart-policy plumbing ──────────────────────────────────────────────────
+
+
+def normalise_restart_policy(value: Any) -> str:
+    """Return the Docker restart-policy name for *value*.
+
+    Docker reports an unset restart policy as ``""`` (live inspect) or
+    ``None`` (a missing ``HostConfig.RestartPolicy``); both mean *do not
+    restart* and normalise to ``"no"``.  Any other value is stripped and
+    returned verbatim — unknown names are *not* mapped, the caller decides
+    how to rank them.  Never raises.
+    """
+    if value is None:
+        return "no"
+    text = str(value).strip()
+    return text or "no"
+
+
+def docker_restart_policy(lifecycle_class: str) -> dict | None:
+    """Return the docker-py ``HostConfig.restart_policy`` for a class.
+
+    ``containers.run(restart_policy=...)`` takes the *dict* form of Docker's
+    ``RestartPolicy`` (``{"Name": ..., "MaximumRetryCount": N}``), not the
+    bare name.  Returns ``None`` — so the caller omits the keyword and Docker
+    applies its own default (``no``) — when the class has no restart policy or
+    cannot be resolved.  Never raises.
+    """
+    try:
+        policy = policy_for(lifecycle_class).restart_policy
+    except UnknownLifecycleClass:
+        return None
+    if policy is None:
+        return None
+    return {"Name": normalise_restart_policy(policy), "MaximumRetryCount": 0}

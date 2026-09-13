@@ -57,6 +57,8 @@ from .lifecycle_policy import (
     LifecyclePolicy,
     UnknownLifecycleClass,
     is_resource_like,
+    docker_restart_policy,
+    normalise_restart_policy,
     policy_for,
 )
 from .snapshot import (
@@ -110,6 +112,8 @@ __all__ = [
     "policy_for",
     "UnknownLifecycleClass",
     "is_resource_like",
+    "docker_restart_policy",
+    "normalise_restart_policy",
     "RESOURCE_LABEL",
     "RESOURCE_NAME_PREFIX",
     "RESOURCE_IMAGE",

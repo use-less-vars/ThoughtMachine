@@ -120,9 +120,11 @@ from thoughtmachine.container_record import (
     RecordLocked,
     RecordNotFound,
     UnknownLifecycleClass,
+    docker_restart_policy,
     find_by_docker_label,
     is_resource_like,
     load_record,
+    normalise_restart_policy,
     policy_for,
     update_record,
 )
@@ -213,6 +215,14 @@ _START_DRIFT_EVENT = "drift.start_on_drifted_container"
 _START_DRIFT_ACTOR = "infra.container_manager.start"
 _START_DRIFT_AUDIT = "CONTAINER_START_DRIFT"
 
+# Restart-policy drift (third admission axis on the start path).  A reused
+# container whose live Docker restart policy is MORE permissive than the
+# resolved lifecycle policy is REFUSED; a less-permissive difference is a
+# WARNING-only drift.  Its own event/audit codes so the signal is greppable.
+_START_DRIFT_RESTART_EVENT = "drift.restart_policy_mismatch"
+_START_DRIFT_RESTART_ACTOR = "infra.container_manager.start"
+_START_DRIFT_RESTART_AUDIT = "CONTAINER_RESTART_DRIFT"
+
 # Sticky-note migration/warning memos (module scope so dedup holds across the
 # fresh ContainerManager instances built for every tool call). ``_NOTES_WARNED``
 # dedupes the once-per-condition WARNINGs (a legacy sidecar note served, a write
@@ -231,6 +241,11 @@ _NOTES_MIGRATED = set()
 # own layer instead of the (read-only) host bind.
 _EXEC_NETWORK_RANK = {"none": 0, "bridge": 1}
 _EXEC_WORKSPACE_RANK = {"ro": 0, "rw": 1, "absent": 2}
+
+# Restart-policy ranks: higher == more permissive (keeps the container alive
+# across failures/daemon restarts more aggressively).  "no"(0) is the most
+# restrictive; anything unknown is treated as the most permissive (3).
+_RESTART_POLICY_RANK = {"no": 0, "on-failure": 1, "unless-stopped": 2, "always": 3}
 
 
 def _exec_network_rank(network_mode):
@@ -315,6 +330,40 @@ def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
         reason = "network_more_permissive" if net_more else "workspace_more_permissive"
         return "deny", reason
     return "warn", "config_differs_not_more_permissive"
+
+
+def _restart_policy_rank(restart_policy):
+    """Permissiveness rank for a restart policy (None -> None, unknown -> 3)."""
+    if restart_policy is None:
+        return None
+    return _RESTART_POLICY_RANK.get(str(restart_policy).strip(), 3)
+
+
+def _live_restart_policy(container):
+    """Read the container's live Docker restart policy name from its attrs.
+
+    Returns ``None`` when it cannot be determined: unreadable/absent attrs, no
+    ``HostConfig`` dict, or a STRUCTURALLY ABSENT ``RestartPolicy`` key.  The
+    absent-key case is deliberate: fakes that predate this axis omit the key,
+    which must read as "no observable drift" rather than a mismatch.
+    """
+    try:
+        attrs = getattr(container, "attrs", None)
+    except Exception:
+        return None
+    if not isinstance(attrs, dict):
+        return None
+    host_config = attrs.get("HostConfig")
+    if not isinstance(host_config, dict):
+        return None
+    if "RestartPolicy" not in host_config:
+        return None
+    policy = host_config.get("RestartPolicy")
+    if policy is None:
+        return "no"
+    if isinstance(policy, dict):
+        return normalise_restart_policy(policy.get("Name"))
+    return normalise_restart_policy(policy)
 
 
 def _truncate_output(output):
@@ -912,7 +961,8 @@ class ContainerManager:
                 _start_drift = None
                 if container is not None:
                     _action, _payload = self._start_drift_decision(
-                        container, want_network, want_workspace, "workspace-label"
+                        container, want_network, want_workspace, "workspace-label",
+                        lifecycle_class=lifecycle_class,
                     )
                     if _action == "deny":
                         return _payload
@@ -998,7 +1048,8 @@ class ContainerManager:
                            f"requested={explicit_image} source=registry")
                     return {"error": msg}
                 _action, _payload = self._start_drift_decision(
-                    container, network_mode, workspace_mode, "registry"
+                    container, network_mode, workspace_mode, "registry",
+                    lifecycle_class=lifecycle_class,
                 )
                 if _action == "deny":
                     return _payload
@@ -1034,7 +1085,8 @@ class ContainerManager:
                        f"requested={explicit_image} source=label")
                 return {"error": msg}
             _action, _payload = self._start_drift_decision(
-                container, network_mode, workspace_mode, "label"
+                container, network_mode, workspace_mode, "label",
+                lifecycle_class=lifecycle_class,
             )
             if _action == "deny":
                 return _payload
@@ -1216,6 +1268,7 @@ class ContainerManager:
                     session_id=self.session_id,
                     workspace_id=self.workspace_id,
                 ),
+                restart_policy=docker_restart_policy(lifecycle_class),
                 labels=labels,
             )
             record.attach(container)
@@ -1456,31 +1509,155 @@ class ContainerManager:
         except Exception:
             pass
 
-    def _start_drift_decision(self, container, want_net, want_ws, source):
+    def _expected_restart_policy(self, container, lifecycle_class):
+        """Resolve the restart policy a container SHOULD carry.
+
+        Prefers the persisted record's ``restart_policy`` (authoritative for a
+        container that already has a record), falling back to the lifecycle
+        class policy.  ``None`` when neither is determinable (e.g. an unknown
+        class) --- which reads as "no opinion" on this axis.
+        """
+        record_policy = None
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id:
+                record = find_by_docker_label(record_id)
+                record_policy = getattr(record, "restart_policy", None)
+        except Exception:
+            record_policy = None
+        if record_policy:
+            return normalise_restart_policy(record_policy)
+        try:
+            return policy_for(lifecycle_class).restart_policy
+        except UnknownLifecycleClass:
+            return None
+
+    def _restart_drift_axis(self, container, lifecycle_class):
+        """Classify restart-policy drift for a reused container.
+
+        Returns ``None`` (no drift / not determinable) or a tuple
+        ``(decision, reason, detail)`` where decision is ``"deny"`` (live is
+        MORE permissive) or ``"warn"`` (differs, not more permissive).
+        """
+        expected = self._expected_restart_policy(container, lifecycle_class)
+        actual = _live_restart_policy(container)
+        if expected is None or actual is None:
+            return None
+        if actual == expected:
+            return None
+        detail = {"expected": expected, "actual": actual}
+        if _restart_policy_rank(actual) > _restart_policy_rank(expected):
+            return "deny", "restart_policy_more_permissive", detail
+        return "warn", "restart_policy_differs_not_more_permissive", detail
+
+    def _emit_restart_drift_once(self, container_id, container, source, detail,
+                                 decision):
+        """Emit restart-policy drift EVENT + WARNING + audit ONCE per signature.
+
+        Same module-scope memo/lock discipline as :meth:`_emit_start_drift_once`
+        (separate signature namespace via the "restart" tag).  Best-effort:
+        every sub-step is individually guarded.
+        """
+        expected = detail.get("expected")
+        actual = detail.get("actual")
+        signature = hashlib.sha256(
+            f"{source}|restart|{expected}|{actual}".encode()
+        ).hexdigest()
+        key = (container_id, signature)
+        with _START_DRIFT_LOCK:
+            if key in _START_DRIFT_SEEN:
+                return
+            _START_DRIFT_SEEN[key] = True
+            while len(_START_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _START_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"container_id={container_id} source={source} decision={decision} "
+            f"expected_restart_policy={expected} actual_restart_policy={actual}"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"start on restart-policy-drifted container: {summary}")
+        except Exception:
+            pass
+
+        try:
+            self._audit(_START_DRIFT_RESTART_AUDIT, summary)
+        except Exception:
+            pass
+
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id is not None and getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    _START_DRIFT_RESTART_EVENT,
+                    _START_DRIFT_RESTART_ACTOR,
+                    source=source,
+                    decision=decision,
+                    expected={"restart_policy": expected},
+                    actual={"restart_policy": actual},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+
+    def _start_drift_decision(self, container, want_net, want_ws, source,
+                              lifecycle_class=None):
         """Classify a reused container's isolation vs the resolved start policy.
 
         Start-path twin of :meth:`_check_exec_drift`, but for the REUSE decision
-        (there is no command to run).  Returns one of:
+        (there is no command to run).  Two axes are evaluated: container
+        isolation (network + /workspace mount) and --- when ``lifecycle_class``
+        is supplied --- the Docker restart policy.  Returns one of:
 
           ("ok", None)             — no observable drift; reuse as today.
           ("reuse", drift_dict)    — drift seen but NOT more permissive; reuse
                                      the container, attaching drift_dict.
-          ("deny", response_dict)  — live is MORE permissive; REFUSE (return an
-                                     error response carrying the drift) WITHOUT
-                                     running, mutating or handing back the
-                                     container.
+          ("deny", response_dict)  — live is MORE permissive on either axis;
+                                     REFUSE (return an error response carrying
+                                     the drift) WITHOUT running, mutating or
+                                     handing back the container.
 
         The container is NEVER removed or recreated here: start() no longer
         MUTATES on drift.  A caller that must replace a more-permissive drifted
         container (e.g. the ephemeral runner) acts on the refusal itself.
         """
-        if self._config_matches(container, want_net, want_ws):
+        config_ok = self._config_matches(container, want_net, want_ws)
+        restart_axis = None
+        if lifecycle_class is not None:
+            restart_axis = self._restart_drift_axis(container, lifecycle_class)
+        if config_ok and restart_axis is None:
             return "ok", None
 
         live_net, live_ws = _exec_live_isolation(container)
-        decision, reason = _exec_drift_decision(live_net, live_ws, want_net, want_ws)
-        if decision == "run":
+        isolation_decision = None
+        reason = None
+        if not config_ok:
+            _decision, _reason = _exec_drift_decision(
+                live_net, live_ws, want_net, want_ws
+            )
+            if _decision != "run":
+                isolation_decision, reason = _decision, _reason
+
+        restart_decision = None
+        restart_reason = None
+        restart_detail = None
+        if restart_axis is not None:
+            restart_decision, restart_reason, restart_detail = restart_axis
+
+        if isolation_decision is None and restart_decision is None:
             return "ok", None
+
+        decision = (
+            "deny" if "deny" in (isolation_decision, restart_decision) else "warn"
+        )
+        if reason is None:
+            reason = restart_reason
 
         drift = {
             "drifted": True,
@@ -1490,28 +1667,56 @@ class ContainerManager:
             "workspace_mode": live_ws,
             "source": source,
         }
-        signature = hashlib.sha256(
-            f"{source}|{want_net}|{want_ws}|{live_net}|{live_ws}|{decision}".encode()
-        ).hexdigest()
+        if restart_detail is not None:
+            drift["restart_policy"] = restart_detail
         container_id = getattr(container, "id", None)
-        self._emit_start_drift_once(
-            container_id, container, signature, decision, reason,
-            want_net, want_ws, live_net, live_ws, source,
-        )
+        if isolation_decision is not None:
+            signature = hashlib.sha256(
+                f"{source}|{want_net}|{want_ws}|{live_net}|{live_ws}|"
+                f"{isolation_decision}".encode()
+            ).hexdigest()
+            self._emit_start_drift_once(
+                container_id, container, signature, isolation_decision, reason,
+                want_net, want_ws, live_net, live_ws, source,
+            )
+        if restart_detail is not None:
+            self._emit_restart_drift_once(
+                container_id, container, source, restart_detail,
+                restart_decision,
+            )
 
         if decision == "deny":
-            message = (
-                "Container isolation is MORE PERMISSIVE than the session "
-                f"policy ({reason}); refusing to reuse the container. "
-                f"expected network={want_net} workspace={want_ws}; "
-                f"live network={live_net} workspace={live_ws}. "
-                "Recreate the container to restore the desired isolation."
-            )
             # Mirror the exec deny payload EXACTLY: the drifted container id
             # rides INSIDE ``drift`` (never a top-level ``container_id``, which a
             # lifecycle consumer would mistake for a successfully-tracked
             # container).
             drift["container_id"] = container_id
+            if restart_decision == "deny" and isolation_decision == "deny":
+                message = (
+                    "Container isolation and restart policy are MORE PERMISSIVE "
+                    f"than policy (isolation={reason}; "
+                    f"restart={restart_reason}: expected "
+                    f"{restart_detail['expected']} got "
+                    f"{restart_detail['actual']}); refusing to reuse the "
+                    "container."
+                )
+            elif restart_decision == "deny":
+                message = (
+                    "Container restart policy is MORE PERMISSIVE than the "
+                    f"lifecycle policy ({restart_reason}: expected "
+                    f"{restart_detail['expected']} got "
+                    f"{restart_detail['actual']}); refusing to reuse the "
+                    "container. Recreate the container to restore the desired "
+                    "restart policy."
+                )
+            else:
+                message = (
+                    "Container isolation is MORE PERMISSIVE than the session "
+                    f"policy ({reason}); refusing to reuse the container. "
+                    f"expected network={want_net} workspace={want_ws}; "
+                    f"live network={live_net} workspace={live_ws}. "
+                    "Recreate the container to restore the desired isolation."
+                )
             return "deny", {"error": message, "drift": drift}
         return "reuse", drift
 
