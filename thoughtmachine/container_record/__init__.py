@@ -49,6 +49,16 @@ from .models import (
     RecordLocked,
     RecordNotFound,
 )
+from .lifecycle_policy import (
+    POLICY_BY_CLASS,
+    RESOURCE_IMAGE,
+    RESOURCE_LABEL,
+    RESOURCE_NAME_PREFIX,
+    LifecyclePolicy,
+    UnknownLifecycleClass,
+    is_resource_like,
+    policy_for,
+)
 from .snapshot import (
     HARDENING_KEYS,
     snapshot_from_attrs,
@@ -94,4 +104,13 @@ __all__ = [
     "delete_record",
     # migration (§4)
     "migrate_records",
+    # lifecycle policy
+    "LifecyclePolicy",
+    "POLICY_BY_CLASS",
+    "policy_for",
+    "UnknownLifecycleClass",
+    "is_resource_like",
+    "RESOURCE_LABEL",
+    "RESOURCE_NAME_PREFIX",
+    "RESOURCE_IMAGE",
 ]

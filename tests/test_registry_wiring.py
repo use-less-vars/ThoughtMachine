@@ -261,7 +261,9 @@ def test_container_manager_start_registry_limit_error_is_mapped(monkeypatch):
 
 
 def test_container_manager_stop_destroys_via_registry_by_name(monkeypatch):
-    fake = _FakeDelegateRegistry(handles=[{"id": "c123", "name": "tm-res-abc"}])
+    # NOTE: "my-box" is a non-reserved name; names starting with "tm-res-" are
+    # reserved for resource containers (class_of_handle() -> agent-unreachable).
+    fake = _FakeDelegateRegistry(handles=[{"id": "c123", "name": "my-box"}])
     _activate_registry(monkeypatch, fake)
     cm = _make_container_manager()
     cm._containers["my-box"] = "c123"
@@ -269,14 +271,16 @@ def test_container_manager_stop_destroys_via_registry_by_name(monkeypatch):
     result = cm.stop("c123")
 
     assert result == {
-        "status": "stopped", "container_id": "c123", "name": "tm-res-abc"
+        "status": "stopped", "container_id": "c123", "name": "my-box"
     }
-    assert fake.destroyed == ["tm-res-abc"]
+    assert fake.destroyed == ["my-box"]
     assert cm._containers == {}
 
 
 def test_container_manager_remove_destroys_via_registry_by_name(monkeypatch):
-    fake = _FakeDelegateRegistry(handles=[{"id": "c123", "name": "tm-res-abc"}])
+    # NOTE: "my-box" is a non-reserved name; names starting with "tm-res-" are
+    # reserved for resource containers (class_of_handle() -> agent-unreachable).
+    fake = _FakeDelegateRegistry(handles=[{"id": "c123", "name": "my-box"}])
     _activate_registry(monkeypatch, fake)
     cm = _make_container_manager()
     cm._containers["my-box"] = "c123"
@@ -284,9 +288,9 @@ def test_container_manager_remove_destroys_via_registry_by_name(monkeypatch):
     result = cm.remove("c123")
 
     assert result == {
-        "status": "removed", "container_id": "c123", "name": "tm-res-abc"
+        "status": "removed", "container_id": "c123", "name": "my-box"
     }
-    assert fake.destroyed == ["tm-res-abc"]
+    assert fake.destroyed == ["my-box"]
     assert cm._containers == {}
 
 

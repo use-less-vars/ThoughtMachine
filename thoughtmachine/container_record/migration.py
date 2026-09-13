@@ -25,6 +25,7 @@ from typing import Any
 
 from . import storage
 from .api import RECORD_LABEL_KEY
+from .lifecycle_policy import is_resource_like
 from .models import (
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
@@ -105,12 +106,23 @@ def _extract(payload: dict) -> dict:
     }
 
 
-def _derive_class_owner(labels: dict) -> tuple[str, str, bool]:
-    """Derive ``(lifecycle_class, owner, unknown_type)`` from container labels."""
+def _derive_class_owner(
+    labels: dict,
+    name: object = None,
+    image: object = None,
+) -> tuple[str, str, bool]:
+    """Derive ``(lifecycle_class, owner, unknown_type)`` from a container.
+
+    Resource detection is delegated to the shared
+    :func:`thoughtmachine.container_record.lifecycle_policy.is_resource_like`
+    predicate (label / name / image) so the migration agrees with the live
+    container probe; ``name`` is the docker ``Name`` and ``image`` the image
+    reference from ``Config.Image`` (a bare reference string is accepted).
+    """
     container_type = str(labels.get(CONTAINER_TYPE_LABEL) or "").strip().lower()
-    is_resource = bool(labels.get(RESOURCE_LABEL)) or (
-        container_type == CONTAINER_TYPE_RESOURCE
-    )
+    is_resource = is_resource_like(
+        labels, name=name, image_tags=image
+    ) or container_type == CONTAINER_TYPE_RESOURCE
     if is_resource:
         return LIFECYCLE_RESOURCE, OWNER_WORKSPACE, False
     if container_type == CONTAINER_TYPE_FREE_USE:
@@ -291,7 +303,13 @@ def migrate_records(
             else:
                 record_id = new_record_id()
 
-            lifecycle_class, owner, unknown = _derive_class_owner(labels)
+            config = payload.get("Config")
+            image_ref = config.get("Image") if isinstance(config, dict) else None
+            lifecycle_class, owner, unknown = _derive_class_owner(
+                labels,
+                name=payload.get("Name"),
+                image=image_ref,
+            )
             intent = snapshot_from_attrs(payload)
             note = (
                 "unknown container type; defaulted to persistent/workspace-owned"

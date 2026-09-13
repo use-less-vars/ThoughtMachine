@@ -111,6 +111,12 @@ from thoughtmachine.container_record import (
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     RECORD_LABEL_KEY,
+    RESOURCE_LABEL,
+    RESOURCE_NAME_PREFIX,
+    UnknownLifecycleClass,
+    find_by_docker_label,
+    is_resource_like,
+    policy_for,
 )
 from thoughtmachine.container_record.hook import record_creation
 
@@ -124,6 +130,7 @@ from security.admission_gate import (
     ClientProbes,
     ContainerSpec,
     Deny,
+    REASON_UNKNOWN_LIFECYCLE_CLASS,
     Transform,
     admit,
 )
@@ -132,6 +139,7 @@ from security.admission_gate import (
 from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
     CONTAINER_TYPE_LABEL,
+    CONTAINER_TYPE_RESOURCE,
     DEFAULT_IMAGE,
     DEFAULT_MAX_CONTAINERS,
     EXEC_OUTPUT_LIMIT_BYTES,
@@ -635,7 +643,7 @@ class ContainerManager:
         # Hidden resource containers (tm-res-*) are never addressable through
         # the generic container manager — they are owned by the resource
         # container manager and must stay invisible here.
-        if str(name).startswith("tm-res-"):
+        if str(name).startswith(RESOURCE_NAME_PREFIX):
             return {"error": "Resource container access denied"}
 
         # Phase 3: workspace-scoped reuse + container-limit enforcement BEFORE
@@ -1011,8 +1019,9 @@ class ContainerManager:
     def exec(self, container_id, command, timeout=30, workdir="/workspace", environment=None):
         """Run ``command`` in the container; returns {"stdout","stderr","exit_code"}."""
         container = self.client.containers.get(container_id)
-        if self._is_resource_container(container):
-            raise PermissionError("Resource container access denied")
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            raise PermissionError(_denial)
 
         # ── Exec-path drift admission (fail-safe) ─────────────────────────────────
         # Deny when the LIVE container is more permissive than a RESOLVED session
@@ -1260,9 +1269,10 @@ class ContainerManager:
                 # Resource containers are tracked by the registry too (their
                 # factory registers them with container_type="resource");
                 # refuse to destroy them here just like the legacy path does.
-                if handle.get("container_type") == "resource":
+                _denial = self._agent_access_denial(self.class_of_handle(handle))
+                if _denial is not None:
                     return {"status": "error", "container_id": container_id,
-                            "error": "Resource container access denied"}
+                            "error": _denial}
                 name = handle.get("name")
                 try:
                     self._registry.destroy_container(name)
@@ -1281,9 +1291,10 @@ class ContainerManager:
                     "error": "container not found"}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
-        if self._is_resource_container(container):
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
             return {"status": "error", "container_id": container_id,
-                    "error": "Resource container access denied"}
+                    "error": _denial}
         try:
             container.reload()
         except Exception:
@@ -1318,9 +1329,10 @@ class ContainerManager:
                 # Resource containers are tracked by the registry too (their
                 # factory registers them with container_type="resource");
                 # refuse to destroy them here just like the legacy path does.
-                if handle.get("container_type") == "resource":
+                _denial = self._agent_access_denial(self.class_of_handle(handle))
+                if _denial is not None:
                     return {"status": "error", "container_id": container_id,
-                            "error": "Resource container access denied"}
+                            "error": _denial}
                 name = handle.get("name")
                 try:
                     self._registry.destroy_container(name)
@@ -1359,9 +1371,10 @@ class ContainerManager:
                     "error": "container not found"}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
-        if self._is_resource_container(container):
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
             return {"status": "error", "container_id": container_id,
-                    "error": "Resource container access denied"}
+                    "error": _denial}
         try:
             container.reload()
         except Exception:
@@ -1606,7 +1619,7 @@ class ContainerManager:
             # infra/resource_container_manager.py, label thoughtmachine.resource):
             # they carry the workspace_id label so cleanup_workspace sweeps them,
             # but must stay invisible to agent-facing listings.
-            if (container.labels or {}).get("thoughtmachine.resource"):
+            if self._agent_access_denial(self.class_of(container)) is not None:
                 continue
             # uptime: now - StartedAt (mirrors status()); None when missing/unparseable
             uptime_seconds = None
@@ -1783,8 +1796,9 @@ class ContainerManager:
                 f"Failed to access container {container_id}: {e}"
             ) from e
 
-        if self._is_resource_container(container):
-            raise RuntimeError("Resource container access denied")
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            raise RuntimeError(_denial)
 
         try:
             raw = container.logs(
@@ -1815,41 +1829,96 @@ class ContainerManager:
         )
         return {"stdout": stdout, "stderr": stderr}
 
+    # ── Lifecycle class (single resource/record classifier) ───────────────
+
+    def class_of(self, container) -> str:
+        """Lifecycle class of a live ``container`` object.
+
+        Resource containers are recognised by the shared live probe; every
+        other container is resolved through its container-record (keyed by the
+        ``RECORD_LABEL_KEY`` label) and falls back to ``LIFECYCLE_PERSISTENT``
+        when no record is attached or resolvable.
+
+        The record lookup calls :func:`find_by_docker_label` with the DEFAULT
+        vault resolution (``vault_root=None``), mirroring the writer
+        (``thoughtmachine.container_record.hook.record_creation``), which also
+        writes with the default vault.  Do NOT thread a manager/session
+        ``vault_root`` in here without changing the writer too: a divergent
+        vault makes the lookup silently miss, so the class degrades to
+        ``LIFECYCLE_PERSISTENT`` and the fail-closed denial for the
+        ``service``/unknown classes is LOST.
+        """
+        return _container_lifecycle_class(container)
+
+    def class_of_handle(self, handle) -> str:
+        """Lifecycle class of a registry ``handle`` dict.
+
+        The registry records ``container_type`` for every tracked container, so
+        a ``"resource"`` handle is classified without touching the daemon.  Any
+        other handle is bridged to :meth:`class_of` via the live container (the
+        handle's ``id``/``name``), and finally by the ``tm-res-`` name prefix.
+        """
+        if not isinstance(handle, dict):
+            return LIFECYCLE_PERSISTENT
+        if handle.get("container_type") == CONTAINER_TYPE_RESOURCE:
+            return LIFECYCLE_RESOURCE
+        container = None
+        container_id = handle.get("id") or handle.get("name")
+        if container_id:
+            try:
+                container = self.client.containers.get(container_id)
+            except Exception:
+                container = None
+        if container is not None:
+            return self.class_of(container)
+        name = handle.get("name") or handle.get("id") or ""
+        if isinstance(name, str) and name.lstrip("/").startswith(RESOURCE_NAME_PREFIX):
+            return LIFECYCLE_RESOURCE
+        return LIFECYCLE_PERSISTENT
+
+    def policy_of(self, container):
+        """Lifecycle policy for a live ``container`` object."""
+        return policy_for(self.class_of(container))
+
+    def policy_of_handle(self, handle):
+        """Lifecycle policy for a registry ``handle`` dict."""
+        return policy_for(self.class_of_handle(handle))
+
+    @staticmethod
+    def _agent_access_denial(lifecycle_class):
+        """Denial reason for an agent-facing ACCESS site, or None when allowed.
+
+        Fail-closed: an unknown lifecycle class (no policy) is denied with the
+        ``REASON_UNKNOWN_LIFECYCLE_CLASS`` code; a class whose policy is not
+        ``agent_reachable`` is denied with the standard resource message.
+        """
+        try:
+            policy = policy_for(lifecycle_class)
+        except UnknownLifecycleClass:
+            return REASON_UNKNOWN_LIFECYCLE_CLASS
+        if not policy.agent_reachable:
+            return "Resource container access denied"
+        return None
+
     @staticmethod
     def _is_resource_container(obj):
         """True when ``obj`` is a hidden resource container (tm-res-*).
 
-        Hidden resource containers (managed exclusively by the resource
-        container manager) must never be addressable through the generic
-        container manager. They are recognized by their
-        ``thoughtmachine.resource`` label, their ``tm-res-`` name prefix, or
-        their ``tm-resource-git`` image. Any probe failure is treated as
-        False (a non-resource container).
+        Thin delegation to the shared, pure probe
+        :func:`thoughtmachine.container_record.is_resource_like` — the single
+        source of truth for resource-container identity (``thoughtmachine.resource``
+        label, ``tm-res-`` name prefix, or ``tm-resource-git`` image).  Any probe
+        failure is treated as False (a non-resource container).
         """
         try:
-            labels = getattr(obj, "labels", None) or {}
-            label_val = labels.get("thoughtmachine.resource")
-            if isinstance(label_val, str) and label_val:
-                return True
-        except Exception:
-            pass
-        try:
-            name = str(getattr(obj, "name", "") or "")
-            if name.startswith("tm-res-"):
-                return True
-        except Exception:
-            pass
-        try:
+            labels = getattr(obj, "labels", None)
+            name = getattr(obj, "name", None)
             image = getattr(obj, "image", None)
-            if image is None:
-                return False
-            if isinstance(image, str):
-                return image == "tm-resource-git"
-            tags = getattr(image, "tags", None) or []
-            return any(
-                tag == "tm-resource-git" or tag.startswith("tm-resource-git:")
-                for tag in tags
-            )
+            if image is None or isinstance(image, str):
+                image_tags = image
+            else:
+                image_tags = getattr(image, "tags", None)
+            return is_resource_like(labels, name=name, image_tags=image_tags)
         except Exception:
             return False
 
@@ -1881,7 +1950,7 @@ class ContainerManager:
             if not containers:
                 return None
             first = containers[0]
-            if self._is_resource_container(first):
+            if self._agent_access_denial(self.class_of(first)) is not None:
                 return None
             return first
         except Exception:
@@ -2193,8 +2262,9 @@ def cleanup_stale_worker_containers(docker_client, owner_identity):
                 # Not ours (defensive: the label filter runs server-side, but
                 # fake/mislabeled containers must never be touched).
                 continue
-            if labels.get(_RESOURCE_LABEL):
-                # Resource containers are owned by infra/resource_container_manager.
+            if _gc_should_skip(container):
+                # Resource / lifecycle-owning containers (e.g. the git sandbox from
+                # infra/resource_container_manager) are owned elsewhere — never here.
                 continue
             status = getattr(container, "status", None)
             if status is None:
@@ -2217,8 +2287,61 @@ def cleanup_stale_worker_containers(docker_client, owner_identity):
 
 # ── Idle/TTL + orphan sweep for EXITED workspace containers ─────────────────
 _WORKSPACE_LABEL = "thoughtmachine.workspace_id"
-_RESOURCE_LABEL = "thoughtmachine.resource"
+_RESOURCE_LABEL = RESOURCE_LABEL
 _SWEEP_SKIP_DETAIL_CAP = 8  # keep startup log lines bounded
+
+
+def _container_lifecycle_class(container) -> str:
+    """Best-effort lifecycle class of a live ``container`` object.
+
+    Module-level twin of :meth:`ContainerManager.class_of`, for the sweeps that
+    run without a manager instance: resource containers are recognised by the
+    shared live probe; every other container is resolved through its
+    container-record (``RECORD_LABEL_KEY`` label) and falls back to
+    ``LIFECYCLE_PERSISTENT`` when no record is attached or resolvable.
+
+    The record lookup uses the DEFAULT vault resolution
+    (``find_by_docker_label(record_id)`` with ``vault_root=None``), matching the
+    writer ``record_creation``; a divergent vault makes the lookup silently miss
+    and the class degrade to ``LIFECYCLE_PERSISTENT`` (losing the fail-closed
+    denial for the ``service``/unknown classes).  See :meth:`class_of`.
+    """
+    try:
+        if ContainerManager._is_resource_container(container):
+            return LIFECYCLE_RESOURCE
+    except Exception:
+        pass
+    record_id = None
+    try:
+        labels = getattr(container, "labels", None)
+        if isinstance(labels, dict):
+            record_id = labels.get(RECORD_LABEL_KEY)
+    except Exception:
+        record_id = None
+    if record_id:
+        try:
+            record = find_by_docker_label(record_id)
+        except Exception:
+            record = None
+        if record is not None:
+            cls = getattr(record, "lifecycle_class", "") or ""
+            if cls:
+                return cls
+    return LIFECYCLE_PERSISTENT
+
+
+def _gc_should_skip(container) -> bool:
+    """True when a destructive workspace GC must NOT touch ``container``.
+
+    Containers whose lifecycle class owns its own lifecycle (resource/service)
+    are skipped, as is any container with an unknown/absent class
+    (fail-closed).
+    """
+    try:
+        policy = policy_for(_container_lifecycle_class(container))
+    except UnknownLifecycleClass:
+        return True
+    return policy.own_lifecycle
 
 
 def _container_name(container):
@@ -2308,9 +2431,9 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
             labels = container.labels or {}
         except Exception:
             labels = {}
-        if labels.get(_RESOURCE_LABEL):
-            # Resource containers (hidden git images etc.) are owned by
-            # infra/resource_container_manager — never touched here.
+        if _gc_should_skip(container):
+            # Resource / lifecycle-owning containers (hidden git images etc.) are
+            # owned by infra/resource_container_manager — never touched here.
             _note_skip("resource")
             continue
 
