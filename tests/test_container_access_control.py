@@ -59,7 +59,12 @@ from infra.resource_container_manager import (  # noqa: E402
     _prepare_resource_build_context,
     _resolve_vault_build_source,
 )
+from security.admission_gate import REASON_UNKNOWN_LIFECYCLE_CLASS  # noqa: E402
 from security.security_gate import check_requires_resource  # noqa: E402
+from thoughtmachine.container_record import (  # noqa: E402
+    LIFECYCLE_SERVICE,
+    RECORD_LABEL_KEY,
+)
 from tools.base import ToolBase  # noqa: E402
 from tools.git_info_tool import GitReadTool  # noqa: E402
 from tools.git_write_tool import GitWriteTool  # noqa: E402
@@ -441,3 +446,92 @@ class TestContainerManagerResourceDenial:
         container.name = "agent-exec-123"
         container.image = "agent-executor"
         assert ContainerManager._is_resource_container(container) is False
+
+
+# ---------------------------------------------------------------------------
+# 6. ContainerManager denies access by RECORD-DRIVEN lifecycle class
+# ---------------------------------------------------------------------------
+
+
+class TestContainerManagerLifecycleClassDenial:
+    """A container whose container-record classifies it as ``service`` (or an
+    unknown class) is refused by every agent access site and hidden from
+    ``list_containers`` — the fail-closed posture the resource probe enforces,
+    now driven by the container record rather than a Docker label.
+    """
+
+    def _mgr(self, container):
+        mgr = object.__new__(ContainerManager)
+        mgr.client = mock.Mock()
+        mgr.client.containers.get.return_value = container
+        return mgr
+
+    @staticmethod
+    def _rec_container():
+        container = mock.Mock()
+        container.labels = {RECORD_LABEL_KEY: "rec-1"}
+        container.name = "agent-exec-1"
+        container.image = "agent-executor"
+        return container
+
+    def _patch(self, monkeypatch, lifecycle_class):
+        monkeypatch.setattr(
+            cm_mod,
+            "find_by_docker_label",
+            lambda label, vault_root=None: mock.Mock(lifecycle_class=lifecycle_class),
+        )
+
+    def test_exec_denied_for_unknown_lifecycle_class(self, monkeypatch):
+        self._patch(monkeypatch, "bogus")
+        mgr = self._mgr(self._rec_container())
+        with pytest.raises(PermissionError, match=REASON_UNKNOWN_LIFECYCLE_CLASS):
+            mgr.exec("rec-1", ["git", "status"])
+
+    def test_exec_denied_for_service_container(self, monkeypatch):
+        self._patch(monkeypatch, LIFECYCLE_SERVICE)
+        mgr = self._mgr(self._rec_container())
+        with pytest.raises(PermissionError, match="Resource container access denied"):
+            mgr.exec("rec-1", ["git", "status"])
+
+    def test_stop_denied_for_service_container(self, monkeypatch):
+        self._patch(monkeypatch, LIFECYCLE_SERVICE)
+        mgr = self._mgr(self._rec_container())
+        result = mgr.stop("rec-1")
+        assert result["status"] == "error"
+        assert result["error"] == "Resource container access denied"
+
+    def test_status_denied_for_service_container(self, monkeypatch):
+        self._patch(monkeypatch, LIFECYCLE_SERVICE)
+        mgr = self._mgr(self._rec_container())
+        result = mgr.status("rec-1")
+        assert result["status"] == "error"
+        assert result["error"] == "Resource container access denied"
+
+    def test_remove_denied_for_service_container(self, monkeypatch):
+        self._patch(monkeypatch, LIFECYCLE_SERVICE)
+        mgr = self._mgr(self._rec_container())
+        result = mgr.remove("rec-1")
+        assert result["status"] == "error"
+        assert result["error"] == "Resource container access denied"
+
+    def test_stop_denied_for_unknown_lifecycle_class(self, monkeypatch):
+        self._patch(monkeypatch, "bogus")
+        mgr = self._mgr(self._rec_container())
+        result = mgr.stop("rec-1")
+        assert result["status"] == "error"
+        assert result["error"] == REASON_UNKNOWN_LIFECYCLE_CLASS
+
+    def test_get_logs_denied_for_service_container(self, monkeypatch):
+        self._patch(monkeypatch, LIFECYCLE_SERVICE)
+        mgr = self._mgr(self._rec_container())
+        with mock.patch("infra.container_manager.DOCKER_AVAILABLE", True):
+            with pytest.raises(RuntimeError, match="Resource container access denied"):
+                mgr.get_logs("rec-1")
+
+    def test_list_containers_hides_service_container(self, monkeypatch):
+        self._patch(monkeypatch, LIFECYCLE_SERVICE)
+        mgr = object.__new__(ContainerManager)
+        mgr.client = mock.Mock()
+        mgr.client.containers.list.return_value = [self._rec_container()]
+        mgr.workspace_id = "ws1"
+        assert mgr.list_containers() == []
