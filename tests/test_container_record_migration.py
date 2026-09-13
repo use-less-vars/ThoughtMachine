@@ -301,3 +301,44 @@ def test_workspace_mount_derives_workspace_mode(vault, rw, expected):
     assert rec["schema_version"] == SCHEMA_VERSION_LEGACY
     assert rec["inferred"] is True
 
+
+# ── Resource detection from name / image (§4) ───────────────────────────────
+
+
+def test_resource_container_detected_by_name_only(vault):
+    """A ``tm-res-``-named container is a resource even without the legacy
+    ``container_type`` / resource labels (shared predicate)."""
+    payload = make_payload("d-name", {"thoughtmachine.workspace_id": WS})
+    payload["Name"] = "/tm-res-deadbeef-git"
+    summary = migration.migrate_records(
+        WS, docker_source=FakeDockerClient([payload]), vault_root=vault
+    )
+    assert summary["created"] == 1
+    rec = _records(WS, vault)[0]
+    assert rec["lifecycle_class"] == "resource"
+    assert rec["owner"] == "workspace-owned"
+
+
+def test_resource_container_detected_by_image_only(vault):
+    """A resource image reference (``Config.Image``) marks the container."""
+    payload = make_payload("d-img", {"thoughtmachine.workspace_id": WS})
+    payload["Config"]["Image"] = "tm-resource-git:latest"
+    summary = migration.migrate_records(
+        WS, docker_source=FakeDockerClient([payload]), vault_root=vault
+    )
+    assert summary["created"] == 1
+    rec = _records(WS, vault)[0]
+    assert rec["lifecycle_class"] == "resource"
+    assert rec["owner"] == "workspace-owned"
+
+
+def test_agent_exec_name_is_not_resource(vault):
+    """A normal ``agent-exec-`` container is unaffected by the name heuristic."""
+    payload = make_payload("d-plain", ws_labels(WS, "free_use"))
+    payload["Name"] = "/agent-exec-1234567890ab"
+    migration.migrate_records(
+        WS, docker_source=FakeDockerClient([payload]), vault_root=vault
+    )
+    rec = _records(WS, vault)[0]
+    assert rec["lifecycle_class"] == "ephemeral"
+
