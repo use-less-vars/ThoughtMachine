@@ -336,3 +336,158 @@ def test_registered_workspace_reap_forgets_name_index_entry():
     # Only the reaped record's entry is dropped: the bystander survives.
     assert container_manager._NAME_INDEX[bystander_key] == "rec-2"
 
+
+
+# ---------------------------------------------------------------------------
+# (m) the sweeper emits EXACTLY ONE summary (WARNING + RECORD_SWEEP) per run,
+#     on every exit path, and never emits a container *record* event
+#     (regression guard for the ``_emit_summary`` boot-visibility change).
+# ---------------------------------------------------------------------------
+
+
+def _collect(monkeypatch):
+    """Install list collectors for the sweeper's audit + log side effects."""
+    audits, logs, events = [], [], []
+    monkeypatch.setattr(container_manager, "_audit",
+                        lambda event, data: audits.append((event, data)))
+    monkeypatch.setattr(container_manager, "log",
+                        lambda *a, **k: logs.append(a))
+    monkeypatch.setattr(container_manager, "log_container_event",
+                        lambda *a, **k: events.append(a))
+    return audits, logs, events
+
+
+def test_clean_sweep_emits_one_summary_audit_and_warning(monkeypatch):
+    audits, logs, events = _collect(monkeypatch)
+
+    result = _sweep(registered_workspace_ids=[_REG_WS],
+                    docker_client=_FakeDocker([]))
+
+    assert result["removed"] == 0
+    sweeps = [e for e, _ in audits if e == "RECORD_SWEEP"]
+    assert len(sweeps) == 1
+    warnings = [a for a in logs if a and a[0] == "WARNING"]
+    assert len(warnings) == 1
+    assert "orphan record sweep" in warnings[0][2]
+    assert "reason=clean" in warnings[0][2]
+    # The sweeper never emits a container record event.
+    assert events == []
+
+
+def test_docker_unavailable_emits_one_summary(monkeypatch):
+    audits, logs, events = _collect(monkeypatch)
+
+    class _Boom:
+        class containers:  # noqa: N801 - attribute namespace
+            @staticmethod
+            def list(all=True):  # noqa: A002
+                raise RuntimeError("daemon down")
+
+    result = sweep_orphan_container_records(
+        registered_workspace_ids=[_REG_WS], docker_client=_Boom(),
+    )
+
+    assert result["detail"].startswith("docker unavailable:")
+    # EXACTLY ONE summary audit + EXACTLY ONE summary WARNING, tagged with the
+    # exact docker-unavailable detail (not merely its prefix).
+    assert len([e for e, _ in audits if e == "RECORD_SWEEP"]) == 1
+    warnings = [a for a in logs if a and a[0] == "WARNING"]
+    assert len(warnings) == 1
+    assert "orphan record sweep" in warnings[0][2]
+    assert f"reason={result['detail']}" in warnings[0][2]
+    assert events == []
+
+
+def test_registry_empty_variant_emits_one_summary(monkeypatch):
+    audits, logs, _ = _collect(monkeypatch)
+
+    result = sweep_orphan_container_records(
+        registered_workspace_ids=[], docker_client=_FakeDocker([]),
+    )
+
+    assert result["detail"] == "registry empty; record GC skipped"
+    assert len([e for e, _ in audits if e == "RECORD_SWEEP"]) == 1
+    warnings = [a for a in logs if a and a[0] == "WARNING"]
+    assert len(warnings) == 1
+    assert "reason=registry empty; record GC skipped" in warnings[0][2]
+
+
+def test_real_reap_still_emits_record_reap_and_one_summary(monkeypatch):
+    _mint(_REG_WS, "rec-1", docker_id="d" * 16, age_days=10)
+    audits, logs, events = _collect(monkeypatch)
+
+    result = _sweep(registered_workspace_ids=[_REG_WS])
+
+    assert result["removed"] == 1
+    assert any(e == "RECORD_REAP" for e, _ in audits)
+    reaped_warnings = [
+        a for a in logs
+        if a and a[0] == "WARNING" and "reaped orphan container record" in str(a)
+    ]
+    assert len(reaped_warnings) == 1
+    assert len([e for e, _ in audits if e == "RECORD_SWEEP"]) == 1
+    assert events == []
+
+
+# ---------------------------------------------------------------------------
+# (n) the summary fires EXACTLY ONCE on EVERY return path of the sweeper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path, expected_detail",
+    [
+        ("registry_empty", "registry empty; record GC skipped"),
+        ("no_sdk", "docker SDK not installed"),
+        ("from_env_fail", "docker unavailable: boom"),
+        ("list_fail", "docker unavailable: daemon down"),
+        ("clean", ""),
+    ],
+)
+def test_summary_emitted_exactly_once_on_every_return_path(
+        path, expected_detail, monkeypatch):
+    audits, logs, events = _collect(monkeypatch)
+
+    # No records are minted: every path below returns before (or without) a
+    # reap, so the *only* emitted WARNING must be the one summary line.
+    kwargs = {"registered_workspace_ids": [_REG_WS]}
+
+    if path == "registry_empty":
+        kwargs["registered_workspace_ids"] = []
+        kwargs["docker_client"] = _FakeDocker([])
+    elif path == "no_sdk":
+        monkeypatch.setattr(container_manager, "DOCKER_AVAILABLE", False)
+        kwargs["docker_client"] = None
+    elif path == "from_env_fail":
+        monkeypatch.setattr(container_manager, "DOCKER_AVAILABLE", True)
+
+        class _NoDaemon:
+            @staticmethod
+            def from_env():
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(container_manager, "docker", _NoDaemon())
+        kwargs["docker_client"] = None
+    elif path == "list_fail":
+        class _Boom:
+            class containers:  # noqa: N801 - attribute namespace
+                @staticmethod
+                def list(all=True):  # noqa: A002
+                    raise RuntimeError("daemon down")
+
+        kwargs["docker_client"] = _Boom()
+    elif path == "clean":
+        kwargs["docker_client"] = _FakeDocker([])
+
+    result = sweep_orphan_container_records(**kwargs)
+
+    assert result["detail"] == expected_detail
+    # EXACTLY ONE summary audit + EXACTLY ONE summary WARNING ...
+    assert len([e for e, _ in audits if e == "RECORD_SWEEP"]) == 1
+    warnings = [a for a in logs if a and a[0] == "WARNING"]
+    assert len(warnings) == 1
+    assert "orphan record sweep" in warnings[0][2]
+    assert f"reason={result['detail'] or 'clean'}" in warnings[0][2]
+    # ... and never a container *record* event.
+    assert events == []
+
