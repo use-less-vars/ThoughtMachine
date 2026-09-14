@@ -3320,18 +3320,21 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
 def sweep_orphan_container_records(*, registered_workspace_ids=None,
                                    default_max_age_s=86400, dry_run=False,
                                    docker_client=None) -> dict:
-    """Sweep orphaned container RECORDS whose workspace is unregistered.
+    """Sweep orphaned container RECORDS whose bound container is gone.
 
     A record is reaped when ALL of the following hold:
-    - its workspace is NOT in ``registered_workspace_ids`` (orphan);
     - its lifecycle class policy does NOT own its lifecycle (resource /
       service containers manage themselves and are exempt);
     - its ``docker_id`` is empty or names no LIVE container;
     - its age (from ``updated_at`` else ``created_at``) is past its retention
       window (``retention_days`` when set, else ``default_max_age_s``).
 
-    ``registered_workspace_ids=None`` or ``[]`` -> conservative NO-OP: with no
-    registry every workspace would look like an orphan, so nothing is removed.
+    The record's workspace registration is NOT a reap condition: a record
+    whose bound container is gone is reaped whether or not its workspace is
+    registered.
+
+    ``registered_workspace_ids=None`` or ``[]`` -> conservative NO-OP: an
+    absent registry is treated as an unconfigured caller, so nothing is removed.
 
     ``dry_run=True`` counts would-be removals but never calls ``delete_record``.
     Never raises: a missing/broken docker daemon soft-fails into a result.
@@ -3375,7 +3378,6 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
         result["detail"] = f"docker unavailable: {exc}"
         return result
 
-    registered = {str(ws) for ws in registered_workspace_ids}
     skip_counts = {}
     now = time.time()
 
@@ -3389,8 +3391,6 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
         workspace_ids = []
 
     for ws in workspace_ids:
-        if ws in registered:
-            continue
         try:
             records = list_records(ws)
         except Exception:
