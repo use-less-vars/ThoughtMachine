@@ -394,18 +394,26 @@ def append_event(
 def delete_record(
     workspace_id: str, id: str, vault_root: str | os.PathLike | None = None
 ) -> None:
-    """Delete a record (and its event sidecar).
+    """Delete a record (and its event sidecar and lock file).
 
     Raises :class:`RecordNotFound` when the record does not exist.
     """
     path = storage.record_path(workspace_id, id, vault_root)
-    with storage.record_lock(storage.lock_path(workspace_id, id, vault_root)):
+    lock = storage.lock_path(workspace_id, id, vault_root)
+    with storage.record_lock(lock):
         if not path.is_file():
             raise RecordNotFound(f"record not found: {workspace_id}/{id}")
         os.unlink(path)
         sidecar = storage.events_path(workspace_id, id, vault_root)
         if sidecar.is_file():
             os.unlink(sidecar)
+    # ``record_lock`` released the flock and closed its fd on exit; drop the
+    # now-unused sibling ``<id>.json.lock`` so a deleted record leaves no
+    # 0-byte lock file behind.  Tolerant of an already-missing file.
+    try:
+        os.unlink(lock)
+    except FileNotFoundError:
+        pass
 
 
 __all__ = [

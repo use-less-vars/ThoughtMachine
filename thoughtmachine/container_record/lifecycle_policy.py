@@ -139,6 +139,14 @@ class LifecyclePolicy:
 #:
 #: ``workspace_gc_max_age_s = 86400`` mirrors the garbage collector's
 #: ``TM_GC_ORPHAN_RESOURCE_CONTAINER_HOURS`` default of 24 h (``vault_gc``).
+#:
+#: ``workspace_gc_max_age_s = None`` is OVERLOADED and means two different
+#: things depending on the class:
+#:   * EPHEMERAL — exempt from workspace GC: the workspace garbage collector
+#:     must NOT reap the container (``None`` = never ages out).
+#:   * RESOURCE / SERVICE — not applicable, because ``own_lifecycle=True``:
+#:     these classes manage their own lifecycle, so workspace GC never
+#:     considers their age.
 POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
     LIFECYCLE_PERSISTENT: LifecyclePolicy(
         class_name=LIFECYCLE_PERSISTENT,
