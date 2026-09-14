@@ -1,10 +1,10 @@
 """Hermetic tests for the orphan container-RECORD garbage collector.
 
 Exercises ``infra.container_manager.sweep_orphan_container_records`` — the
-module-level sweeper that reaps records whose workspace is *unregistered* and
-whose bound container is gone, honouring lifecycle policy (``own_lifecycle``),
-liveness (``docker_id`` in the live set), age (``updated_at`` / ``created_at``)
-and the per-record ``retention_days`` window.
+module-level sweeper that reaps records whose bound container is gone,
+honouring lifecycle policy (``own_lifecycle``), liveness (``docker_id`` in the
+live set), age (``updated_at`` / ``created_at``) and the per-record
+``retention_days`` window.
 
 The Docker client is a fake (never a live daemon); the vault is a tmp dir via
 ``THOUGHTMACHINE_VAULT_ROOT`` so records are minted into an isolated store.
@@ -137,16 +137,18 @@ def test_orphan_old_record_is_reaped():
 
 
 # ---------------------------------------------------------------------------
-# (c) registered workspace -> untouched
+# (c) registered workspace -> its gone-container record is STILL reaped
 # ---------------------------------------------------------------------------
 
 
-def test_registered_workspace_is_skipped():
+def test_registered_workspace_record_is_also_reaped():
+    # Workspace registration is not a reap condition: a record whose bound
+    # container is gone is reaped from a registered workspace too.
     path = _mint(_KEPT_WS, "rec-1", age_days=10)
     result = _sweep(registered_workspace_ids=[_KEPT_WS])
-    assert result["removed"] == 0
-    assert result["removed_records"] == []
-    assert path.is_file()
+    assert result["removed"] == 1
+    assert result["removed_records"] == ["rec-1"]
+    assert not path.is_file()
 
 
 # ---------------------------------------------------------------------------
