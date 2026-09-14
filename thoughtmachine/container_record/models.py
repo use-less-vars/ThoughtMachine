@@ -45,7 +45,8 @@ SCHEMA_VERSION_LEGACY = 0
 #: ``schema_version`` for records authored natively (never synthesised).
 #: v2 adds the ``restart_policy`` intent field (absent in v1 records).
 #: v3 adds the ``name`` identity field (absent in v1/v2 records).
-SCHEMA_VERSION_CURRENT = 3
+#: v4 adds the ``retention_days`` lifecycle field (absent in v1-v3 records).
+SCHEMA_VERSION_CURRENT = 4
 
 LIFECYCLE_EPHEMERAL = "ephemeral"
 LIFECYCLE_PERSISTENT = "persistent"
@@ -89,6 +90,11 @@ SCHEMA_FIELD_NAMES: tuple[str, ...] = (
     # predates the field, i.e. unset). Appended last to keep the on-disk key
     # order of v1/v2 records stable.
     "name",
+    # ``retention_days`` is the record's lifecycle retention window in *days*
+    # (``None`` = the record predates the field, i.e. unset -> the sweeper
+    # falls back to its own default). Appended last to keep the on-disk key
+    # order of v1-v3 records stable.
+    "retention_days",
 )
 
 #: Nested ``intent_snapshot`` field order (§1.1).
@@ -177,6 +183,8 @@ class Record:
     restart_policy: str | None = None
     #: Workspace-scoped container identity ("" = unset).
     name: str = ""
+    #: Lifecycle retention window in days (``None`` = unset).
+    retention_days: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the record as a plain dict in §1 field order."""
@@ -196,6 +204,7 @@ class Record:
             "updated_at": self.updated_at,
             "restart_policy": self.restart_policy,
             "name": self.name,
+            "retention_days": self.retention_days,
         }
 
     @classmethod
@@ -217,6 +226,24 @@ class Record:
         if not isinstance(restart_policy, str) or not restart_policy:
             restart_policy = None
 
+        # ``retention_days`` is lenient: absent / blank / non-numeric /
+        # non-integer values fall back to ``None`` and never raise.
+        retention_days = data.get("retention_days")
+        if isinstance(retention_days, bool) or retention_days is None:
+            retention_days = None
+        elif isinstance(retention_days, int):
+            pass
+        elif isinstance(retention_days, float):
+            retention_days = int(retention_days) if retention_days.is_integer() else None
+        elif isinstance(retention_days, str):
+            text = retention_days.strip()
+            try:
+                retention_days = int(text) if text else None
+            except ValueError:
+                retention_days = None
+        else:
+            retention_days = None
+
         return cls(
             id=str(data.get("id", "")),
             lifecycle_class=str(data.get("lifecycle_class", "")),
@@ -233,4 +260,5 @@ class Record:
             updated_at=str(data.get("updated_at", "") or ""),
             restart_policy=restart_policy,
             name=str(data.get("name", "") or ""),
+            retention_days=retention_days,
         )

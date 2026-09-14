@@ -120,6 +120,7 @@ from thoughtmachine.container_record import (
     RecordLocked,
     RecordNotFound,
     UnknownLifecycleClass,
+    delete_record,
     docker_restart_policy,
     find_by_docker_label,
     is_resource_like,
@@ -129,6 +130,8 @@ from thoughtmachine.container_record import (
     policy_for,
     update_record,
 )
+from thoughtmachine.container_record import drift
+from thoughtmachine.container_record import storage
 from thoughtmachine.container_record.hook import record_creation
 
 # Admission control (phase 2): the legacy (registry-inactive) fresh create is a
@@ -247,6 +250,20 @@ _NAME_INDEX = {}
 _NAME_INDEX_COLLISIONS = set()
 _NAME_INDEX_BUILT = set()
 _NAME_MIGRATED = set()
+
+
+def _name_index_forget(record_id):
+    """Drop every ``(workspace, name)`` index entry pointing at *record_id*.
+
+    Module-scope so callers without a ``ContainerManager`` instance (the
+    orphan-record sweeper) can keep the in-memory name index consistent after
+    deleting a record.  Never raises.
+    """
+    if not record_id:
+        return
+    with _NAME_INDEX_LOCK:
+        for key in [k for k, v in _NAME_INDEX.items() if v == record_id]:
+            _NAME_INDEX.pop(key, None)
 
 # Isolation ranks: higher == more permissive.  Network "default" is normalized
 # to "bridge" upstream (see ContainerManager._normalize_network_mode); any other
@@ -907,10 +924,8 @@ class ContainerManager:
                 _NAME_INDEX_COLLISIONS.add(key)
 
     def _name_index_forget(self, record_id):
-        """Drop every index entry pointing at *record_id*."""
-        with _NAME_INDEX_LOCK:
-            for key in [k for k, v in _NAME_INDEX.items() if v == record_id]:
-                _NAME_INDEX.pop(key, None)
+        """Drop every index entry pointing at *record_id* (module helper)."""
+        _name_index_forget(record_id)
 
     def _record_for_name(self, name):
         """Return the record id indexed for *name* in this workspace, or None.
@@ -1110,6 +1125,8 @@ class ContainerManager:
             # (a) Record + docker_id: reuse via the record's docker id.
             container = self._reuse_container(docker_id)
             if container is None:
+                self._emit_stale_docker_id_drift_once(
+                    name, record_id, docker_id, "record")
                 return {"error": (f"Container {name!r} record {record_id} names "
                                   f"docker_id {docker_id!r} but no such container "
                                   f"exists."),
@@ -1264,46 +1281,6 @@ class ContainerManager:
                 f"(workspace_id={self.workspace_id}) "
                 f"— fail-closed; workspace capabilities restrict this session "
                 f"or the security gate errored (see docker.security_gate).")
-
-        # 1) Registry hit
-        container_id = self._containers.get(name)
-        if container_id:
-            container = self._reuse_container(container_id)
-            if container is not None:
-                # Image honesty (see workspace-label path): reject reuse when an
-                # explicitly-requested image differs from the container's image.
-                if (explicit_image is not None
-                        and not self._image_matches(container, explicit_image)):
-                    actual = self._image_ref(container)
-                    msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
-                           f"with image {explicit_image}. Remove it first or use a different name.")
-                    log("WARNING", "docker.container_manager", msg)
-                    _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
-                           f"name={name} id={container.id} actual={actual} "
-                           f"requested={explicit_image} source=registry")
-                    return {"error": msg}
-                _action, _payload = self._start_drift_decision(
-                    container, network_mode, workspace_mode, "registry",
-                    lifecycle_class=lifecycle_class,
-                )
-                if _action == "deny":
-                    return _payload
-                if note is not None:
-                    self._write_note(self._record_id_for(container), note)
-                note_value = (note if note is not None
-                              else self._read_note(container))
-                _audit("CONTAINER_REUSE_OK",
-                       f"source=registry name={name} id={container.id} session={self.session_id}")
-                log_container_event("started", container_id=container.id,
-                                    session_id=self.session_id or "",
-                                    data={"image": self._image_ref(container),
-                                          "name": name, "status": "reused"})
-                _reuse_resp = {"id": container.id, "name": name, "status": "reused",
-                               "note": note_value}
-                if _payload is not None:
-                    _reuse_resp["drift"] = _payload
-                return _reuse_resp
-            self._containers.pop(name, None)  # stale entry
 
         # 2) Label lookup (survives manager restarts)
         container = self._find_by_labels(name)
@@ -1730,7 +1707,7 @@ class ContainerManager:
             pass
 
         try:
-            self._audit(_EXEC_DRIFT_AUDIT, summary)
+            _audit(_EXEC_DRIFT_AUDIT, summary)
         except Exception:
             pass
 
@@ -1827,7 +1804,7 @@ class ContainerManager:
             pass
 
         try:
-            self._audit(_START_DRIFT_RESTART_AUDIT, summary)
+            _audit(_START_DRIFT_RESTART_AUDIT, summary)
         except Exception:
             pass
 
@@ -1845,6 +1822,59 @@ class ContainerManager:
                     decision=decision,
                     expected={"restart_policy": expected},
                     actual={"restart_policy": actual},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+
+    def _emit_stale_docker_id_drift_once(self, name, record_id, stale_docker_id,
+                                         source):
+        """Emit stale-docker-id drift EVENT + WARNING + audit ONCE per signature.
+
+        Fired on the start path when a record names a ``docker_id`` that has no
+        live container.  Same module-scope memo/lock discipline as
+        :meth:`_emit_restart_drift_once` (separate signature namespace via the
+        ``stale-docker-id`` tag).  Best-effort: every sub-step is individually
+        guarded.  The record's ``docker_id`` is NEVER rewritten here.
+        """
+        docker_id = ""  # the container the record names is ABSENT
+        signature = hashlib.sha256(
+            f"{source}|{stale_docker_id}|{record_id}|{docker_id}".encode()
+        ).hexdigest()
+        key = (stale_docker_id, signature)
+        with _START_DRIFT_LOCK:
+            if key in _START_DRIFT_SEEN:
+                return
+            _START_DRIFT_SEEN[key] = True
+            while len(_START_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _START_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"name={name} record_id={record_id} source={source} "
+            f"expected_docker_id={stale_docker_id} actual_docker_id=None"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"start on stale-docker-id record: {summary}")
+        except Exception:
+            pass
+
+        try:
+            _audit("CONTAINER_START_STALE_DOCKER_ID", summary)
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    drift.EVENT_CONTAINER_ABSENT,
+                    _START_DRIFT_ACTOR,
+                    source=source,
+                    expected={"docker_id": stale_docker_id},
+                    actual={"docker_id": None},
                     detected_at=datetime.now(timezone.utc).isoformat(),
                 )
         except Exception:
@@ -1994,7 +2024,7 @@ class ContainerManager:
             pass
 
         try:
-            self._audit(_START_DRIFT_AUDIT, summary)
+            _audit(_START_DRIFT_AUDIT, summary)
         except Exception:
             pass
 
@@ -3284,4 +3314,161 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
     _audit("CONTAINER_SWEEP",
            f"removed={result['removed']} skipped={result['skipped']} "
            f"dry_run={dry_run}")
+    return result
+
+
+def sweep_orphan_container_records(*, registered_workspace_ids=None,
+                                   default_max_age_s=86400, dry_run=False,
+                                   docker_client=None) -> dict:
+    """Sweep orphaned container RECORDS whose workspace is unregistered.
+
+    A record is reaped when ALL of the following hold:
+    - its workspace is NOT in ``registered_workspace_ids`` (orphan);
+    - its lifecycle class policy does NOT own its lifecycle (resource /
+      service containers manage themselves and are exempt);
+    - its ``docker_id`` is empty or names no LIVE container;
+    - its age (from ``updated_at`` else ``created_at``) is past its retention
+      window (``retention_days`` when set, else ``default_max_age_s``).
+
+    ``registered_workspace_ids=None`` or ``[]`` -> conservative NO-OP: with no
+    registry every workspace would look like an orphan, so nothing is removed.
+
+    ``dry_run=True`` counts would-be removals but never calls ``delete_record``.
+    Never raises: a missing/broken docker daemon soft-fails into a result.
+    Returns::
+
+        {"removed": int, "skipped": int, "detail": str, "dry_run": bool,
+         "removed_records": [record id, ...], "removed_orphan": int}
+    """
+    result = {
+        "removed": 0,
+        "skipped": 0,
+        "detail": "",
+        "dry_run": bool(dry_run),
+        "removed_records": [],
+        "removed_orphan": 0,
+    }
+
+    if registered_workspace_ids is None or len(registered_workspace_ids) == 0:
+        # Empty/absent registry -> every workspace would classify as orphan;
+        # wiping every record on a bad registry read is a data-loss surprise.
+        result["detail"] = "registry empty; record GC skipped"
+        return result
+
+    if docker_client is None:
+        if not DOCKER_AVAILABLE:
+            result["detail"] = "docker SDK not installed"
+            return result
+        try:
+            docker_client = docker.from_env()
+        except Exception as exc:
+            result["detail"] = f"docker unavailable: {exc}"
+            return result
+
+    try:
+        live_ids = set()
+        for container in docker_client.containers.list(all=True):
+            cid = getattr(container, "id", None)
+            if cid:
+                live_ids.add(str(cid))
+    except Exception as exc:
+        result["detail"] = f"docker unavailable: {exc}"
+        return result
+
+    registered = {str(ws) for ws in registered_workspace_ids}
+    skip_counts = {}
+    now = time.time()
+
+    def _note_skip(category):
+        skip_counts[category] = skip_counts.get(category, 0) + 1
+        result["skipped"] += 1
+
+    try:
+        workspace_ids = storage.iter_workspace_ids()
+    except Exception:
+        workspace_ids = []
+
+    for ws in workspace_ids:
+        if ws in registered:
+            continue
+        try:
+            records = list_records(ws)
+        except Exception:
+            records = []
+        for record in records or []:
+            try:
+                policy = policy_for(record.lifecycle_class)
+            except UnknownLifecycleClass:
+                _note_skip("unknown_class")
+                continue
+            if policy.own_lifecycle:
+                _note_skip("lifecycle_own")
+                continue
+
+            docker_id = str(getattr(record, "docker_id", "") or "")
+            if docker_id and docker_id in live_ids:
+                _note_skip("container_live")
+                continue
+
+            timestamp_text = (
+                getattr(record, "updated_at", "")
+                or getattr(record, "created_at", "")
+                or ""
+            )
+            try:
+                ts = datetime.fromisoformat(
+                    str(timestamp_text).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = None
+            if ts is None:
+                _note_skip("no_timestamp")
+                continue
+            if ts > now:
+                _note_skip("timestamp_in_future")
+                continue
+
+            retention = getattr(record, "retention_days", None)
+            if isinstance(retention, int) and not isinstance(retention, bool) \
+                    and retention > 0:
+                max_age_s = retention * 86400
+            else:
+                max_age_s = default_max_age_s
+            if now - ts < max_age_s:
+                _note_skip("too young")
+                continue
+
+            if dry_run:
+                result["removed"] += 1
+                result["removed_orphan"] += 1
+                result["removed_records"].append(record.id)
+                continue
+
+            try:
+                delete_record(ws, record.id)
+            except Exception as exc:
+                _note_skip(f"delete failed: {exc}")
+                continue
+            _name_index_forget(record.id)
+            result["removed"] += 1
+            result["removed_orphan"] += 1
+            result["removed_records"].append(record.id)
+            try:
+                log("WARNING", "docker.container_manager",
+                    f"reaped orphan container record: workspace_id={ws} "
+                    f"record_id={record.id} docker_id={docker_id!r}")
+            except Exception:
+                pass
+            try:
+                _audit("RECORD_REAP",
+                       f"workspace_id={ws} record_id={record.id} "
+                       f"docker_id={docker_id!r} dry_run={dry_run}")
+            except Exception:
+                pass
+
+    if skip_counts:
+        parts = ", ".join(f"{cat}: {cnt}" for cat, cnt in sorted(skip_counts.items()))
+        if len(parts) > _SWEEP_SKIP_DETAIL_CAP * 40:
+            parts = parts[:_SWEEP_SKIP_DETAIL_CAP * 40] + "\u2026"
+        result["detail"] = f"skipped ({parts})"
+
     return result
