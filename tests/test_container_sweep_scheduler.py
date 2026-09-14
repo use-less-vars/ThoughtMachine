@@ -23,7 +23,7 @@ def test_periodic_sweep_loop_runs_both_sweeps_and_cancels(monkeypatch):
     server = _load_server()
 
     lock = threading.Lock()
-    counts = {"exited": 0, "orphan": 0}
+    counts = {"exited": 0, "orphan": 0, "records": 0}
 
     def fake_exited():
         with lock:
@@ -33,10 +33,16 @@ def test_periodic_sweep_loop_runs_both_sweeps_and_cancels(monkeypatch):
         with lock:
             counts["orphan"] += 1
 
+    def fake_records():
+        with lock:
+            counts["records"] += 1
+
     monkeypatch.setattr(
         server, "_sweep_exited_workspace_containers", fake_exited)
     monkeypatch.setattr(
         server, "_sweep_orphan_resource_containers", fake_orphan)
+    monkeypatch.setattr(
+        server, "_sweep_orphan_container_records", fake_records)
 
     async def scenario():
         task = asyncio.create_task(
@@ -54,8 +60,9 @@ def test_periodic_sweep_loop_runs_both_sweeps_and_cancels(monkeypatch):
     assert task.cancelled()
     assert counts["exited"] >= 2, counts
     assert counts["orphan"] >= 2, counts
-    # Both sweeps must be invoked equally often (one full pass per iteration).
-    assert counts["exited"] == counts["orphan"], counts
+    assert counts["records"] >= 2, counts
+    # All sweeps must be invoked equally often (one full pass per iteration).
+    assert counts["exited"] == counts["orphan"] == counts["records"], counts
 
 
 def test_periodic_sweep_loop_swallows_sweep_errors(monkeypatch):
@@ -63,7 +70,7 @@ def test_periodic_sweep_loop_swallows_sweep_errors(monkeypatch):
     server = _load_server()
 
     lock = threading.Lock()
-    counts = {"exited": 0, "orphan": 0}
+    counts = {"exited": 0, "orphan": 0, "records": 0}
 
     def boom_exited():
         with lock:
@@ -74,10 +81,16 @@ def test_periodic_sweep_loop_swallows_sweep_errors(monkeypatch):
         with lock:
             counts["orphan"] += 1
 
+    def ok_records():
+        with lock:
+            counts["records"] += 1
+
     monkeypatch.setattr(
         server, "_sweep_exited_workspace_containers", boom_exited)
     monkeypatch.setattr(
         server, "_sweep_orphan_resource_containers", ok_orphan)
+    monkeypatch.setattr(
+        server, "_sweep_orphan_container_records", ok_records)
 
     async def scenario():
         task = asyncio.create_task(
@@ -91,8 +104,9 @@ def test_periodic_sweep_loop_swallows_sweep_errors(monkeypatch):
 
     asyncio.run(scenario())
 
-    # The sibling sweep still ran despite the other raising.
+    # The sibling sweeps still ran despite the other raising.
     assert counts["orphan"] >= 2, counts
+    assert counts["records"] >= 2, counts
 
 
 def test_lifespan_creates_and_cancels_sweep_task(monkeypatch):
@@ -104,6 +118,8 @@ def test_lifespan_creates_and_cancels_sweep_task(monkeypatch):
         server, "_sweep_exited_workspace_containers", lambda: None)
     monkeypatch.setattr(
         server, "_sweep_orphan_resource_containers", lambda: None)
+    monkeypatch.setattr(
+        server, "_sweep_orphan_container_records", lambda: None)
 
     captured = {}
 

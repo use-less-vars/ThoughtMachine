@@ -88,6 +88,7 @@ def _load_server():
 def _neutralise_sweeps(monkeypatch, server):
     monkeypatch.setattr(server, "_sweep_exited_workspace_containers", lambda: None)
     monkeypatch.setattr(server, "_sweep_orphan_resource_containers", lambda: None)
+    monkeypatch.setattr(server, "_sweep_orphan_container_records", lambda: None)
 
 
 def _record_log(monkeypatch, server):

@@ -376,6 +376,13 @@ _EXITED_CONTAINER_SWEEP_MAX_AGE_S = int(
     os.environ.get('THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S', '86400')
 )
 
+# Default retention (seconds) applied to an orphaned container RECORD whose own
+# ``retention_days`` is unset when the record sweeper considers reaping it.
+# Tune via env override if needed.
+_ORPHAN_RECORD_SWEEP_MAX_AGE_S = int(
+    os.environ.get('THOUGHTMACHINE_ORPHAN_RECORD_MAX_AGE_S', '86400')
+)
+
 
 def _sweep_exited_workspace_containers():
     """Startup sweep: remove EXITED generic workspace containers.
@@ -429,6 +436,39 @@ def _sweep_exited_workspace_containers():
         log('WARNING', 'server', f'Startup workspace sweep skipped: {exc}')
 
 
+def _sweep_orphan_container_records():
+    """Startup/periodic sweep: reap orphaned container RECORDS.
+
+    A container record whose workspace is no longer registered and whose
+    Docker container is gone is reaped once past its retention window.
+    Best-effort and NEVER raising.  If the workspace registry cannot be read
+    the sweep degrades to a NO-OP (``ids=None``) so a failing/empty registry
+    can never trigger a record wipe.
+    """
+    try:
+        from infra.container_manager import sweep_orphan_container_records
+
+        try:
+            registry = WorkspaceRegistry.get_default()
+            ids = [e.id for e in registry.list_workspaces()]
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Startup record sweep: could not list registered workspaces: {exc}')
+            ids = None  # registry failure -> no-op; never wipe on a bad read
+
+        result = sweep_orphan_container_records(
+            registered_workspace_ids=ids,
+            default_max_age_s=_ORPHAN_RECORD_SWEEP_MAX_AGE_S,
+        )
+        detail = result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup record sweep: reaped {result.get("removed", 0)} orphan '
+            f'record(s), skipped {result.get("skipped", 0)}'
+            + (f' — {detail}' if detail else ''))
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup record sweep skipped: {exc}')
+
+
 # ── Periodic container sweep (Phase 1.1) ───────────────────────────────
 # Startup runs both sweeps once; a background task then re-runs them on a
 # fixed interval so idle/orphan containers are reclaimed during long-lived
@@ -443,6 +483,7 @@ def _run_container_sweeps():
     for _label, _fn in (
         ('exited-workspace', _sweep_exited_workspace_containers),
         ('orphan-resource', _sweep_orphan_resource_containers),
+        ('orphan-records', _sweep_orphan_container_records),
     ):
         try:
             _fn()
@@ -686,6 +727,12 @@ async def lifespan(app: FastAPI):
     # treated as orphans and removed too. Resource containers are excluded.
     # Best-effort: a failing sweep must never break startup.
     _sweep_exited_workspace_containers()
+
+    # ── Startup orphan container-RECORD sweep ───────────────────────────
+    # Reap records whose workspace is no longer registered and whose Docker
+    # container is gone, once past their retention window.  Best-effort: a
+    # failing sweep must never break startup.
+    _sweep_orphan_container_records()
 
     # ── Background periodic container sweep (Phase 1.1) ─────────────────────
     # Re-run both sweeps on an interval so idle/orphan containers are

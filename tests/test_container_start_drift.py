@@ -250,6 +250,26 @@ def events(monkeypatch):
     return recorded
 
 
+@pytest.fixture
+def audits(monkeypatch):
+    """Capture container-manager audits via a patched ``audit_event``.
+
+    ``container_manager._audit`` is ``lambda event, data: audit_event(...)``,
+    so patching the module global intercepts every audit call.  This proves the
+    stale-docker-id audit actually FIRES (rather than being a swallowed
+    ``AttributeError``).
+    """
+    import infra.container_manager as cm
+
+    captured = []
+
+    def _fake_audit(event, data):
+        captured.append({"event": event, "data": data})
+
+    monkeypatch.setattr(cm, "audit_event", _fake_audit, raising=True)
+    return captured
+
+
 # ---------------------------------------------------------------------------
 # (a) clean match -> reuse exactly as today, NO drift key, NO event
 # ---------------------------------------------------------------------------
@@ -406,3 +426,83 @@ def test_unreadable_attrs_reuse_without_drift(site, events):
     assert "drift" not in result
     assert cm._remove_container.called is False
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# (h) record names a STALE docker_id -> REFUSE + one container_absent drift
+# ---------------------------------------------------------------------------
+
+
+_ABSENT_EVENT = "drift.container_absent"
+
+
+def test_stale_docker_id_refused_and_emits_absent_drift_once(events, audits):
+    stale = "d" * 16
+    cm = _make_cm(None, want=("none", "ro"))
+    cm.client = _FakeDockerClient([])  # no live containers -> docker_id is stale
+    _mint_record("w1", "agent-x", stale)
+
+    r1 = cm.start(name="agent-x")
+    assert "error" in r1
+    assert r1["code"] == "container_record_container_missing"
+
+    absent = [e for e in events if e["event_type"] == _ABSENT_EVENT]
+    assert len(absent) == 1
+    ev = absent[0]
+    assert ev["actor"] == _ACTOR
+    assert ev["record_id"] == "rec-1"
+    assert ev["workspace_id"] == "w1"
+    assert ev["payload"]["source"] == "record"
+    assert ev["payload"]["expected"] == {"docker_id": stale}
+    assert ev["payload"]["actual"] == {"docker_id": None}
+    assert "detected_at" in ev["payload"]
+
+    # Memoised: the SECOND call still refuses but emits NO further event.
+    r2 = cm.start(name="agent-x")
+    assert "error" in r2
+    assert r2["code"] == "container_record_container_missing"
+    assert [e for e in events if e["event_type"] == _ABSENT_EVENT] == absent
+
+    # A1: the stale path fires the module-level audit ONCE (it is NOT a
+    # swallowed ``self._audit`` AttributeError).
+    audited = [a for a in audits if a["event"] == "CONTAINER_START_STALE_DOCKER_ID"]
+    assert len(audited) == 1
+    assert f"expected_docker_id={stale}" in audited[0]["data"]
+    assert "actual_docker_id=None" in audited[0]["data"]
+
+
+def test_stale_docker_id_emits_audit_once(monkeypatch, events):
+    """The stale-docker-id refusal raises a CONTAINER_START_STALE_DOCKER_ID audit.
+
+    The audit is the operator-visible trace that a record names a ``docker_id``
+    with no live container.  It is emitted from the MODULE-level ``_audit``
+    (``ContainerManager`` has no ``self._audit`` attribute), so it is captured by
+    patching ``infra.container_manager._audit`` directly, and it is memoised with
+    the drift event (same ``_START_DRIFT_SEEN`` signature).
+    """
+    audits = []
+    monkeypatch.setattr(
+        container_manager, "_audit",
+        lambda event, data: audits.append((event, data)),
+    )
+    stale = "d" * 16
+    cm = _make_cm(None, want=("none", "ro"))
+    cm.client = _FakeDockerClient([])  # no live containers -> docker_id is stale
+    _mint_record("w1", "agent-x", stale)
+
+    r1 = cm.start(name="agent-x")
+    assert r1["code"] == "container_record_container_missing"
+
+    fired = [a for a in audits if a[0] == "CONTAINER_START_STALE_DOCKER_ID"]
+    assert len(fired) == 1, audits
+    _event, data = fired[0]
+    assert "name=agent-x" in data
+    assert "record_id=rec-1" in data
+    assert "source=record" in data
+    assert f"expected_docker_id={stale}" in data
+    assert "actual_docker_id=None" in data
+
+    # Memoised: a second refused call adds NO further audit.
+    cm.start(name="agent-x")
+    assert [a for a in audits if a[0] == "CONTAINER_START_STALE_DOCKER_ID"] == fired
+

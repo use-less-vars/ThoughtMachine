@@ -4,7 +4,8 @@ Pins the ``feat/registry-transition`` behaviour of ``infra/container_manager``
 and the record schema:
 
   1. Schema v3 adds ``name`` (workspace-scoped container identity) to the record
-     field set; ``SCHEMA_VERSION_CURRENT == 3``; a native record round-trips the
+     field set; v4 appends ``retention_days``; ``SCHEMA_VERSION_CURRENT == 4``;
+     a native record round-trips the
      name (present -> kept, absent -> ``""``), and the legacy migration
      ``_materialise`` NEVER synthesises one.
   2. The record-first identity ladder: the module-scoped ``(workspace, name) ->
@@ -179,13 +180,13 @@ def _no_registry(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_current_is_3():
-    assert SCHEMA_VERSION_CURRENT == 3
+def test_schema_version_current_is_4():
+    assert SCHEMA_VERSION_CURRENT == 4
 
 
-def test_name_is_a_schema_field_and_is_last():
+def test_name_is_a_schema_field_and_retention_days_is_last():
     assert "name" in SCHEMA_FIELD_NAMES
-    assert SCHEMA_FIELD_NAMES[-1] == "name"
+    assert SCHEMA_FIELD_NAMES[-1] == "retention_days"
 
 
 def test_record_round_trip_name_present(tmp_path):
