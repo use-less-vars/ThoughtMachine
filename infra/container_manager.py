@@ -3352,20 +3352,48 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
         "removed_orphan": 0,
     }
 
+    def _emit_summary():
+        """Emit the once-per-invocation sweep summary (WARNING + audit).
+
+        WARNING is used deliberately: at boot no agent logger is attached
+        (``server.py`` never calls ``set_logger``), so an INFO line would be
+        dropped by the console gate (``msg_priority >= WARNING`` when
+        ``TM_LOG_TAGS`` is empty) and no agent sink would receive it.  WARNING
+        reaches stderr, which ``start_thoughtmachine.sh`` tees into
+        ``logs/backend_startup.log``.  Each emit is independently best-effort
+        and never raises.
+        """
+        try:
+            log("WARNING", "docker.container_manager",
+                f"orphan record sweep: reaped={result['removed']} "
+                f"skipped={result['skipped']} "
+                f"reason={result['detail'] or 'clean'}")
+        except Exception:
+            pass
+        try:
+            _audit("RECORD_SWEEP",
+                   f"reaped={result['removed']} skipped={result['skipped']} "
+                   f"dry_run={dry_run} reason={result['detail']!r}")
+        except Exception:
+            pass
+
     if registered_workspace_ids is None or len(registered_workspace_ids) == 0:
         # Empty/absent registry -> every workspace would classify as orphan;
         # wiping every record on a bad registry read is a data-loss surprise.
         result["detail"] = "registry empty; record GC skipped"
+        _emit_summary()
         return result
 
     if docker_client is None:
         if not DOCKER_AVAILABLE:
             result["detail"] = "docker SDK not installed"
+            _emit_summary()
             return result
         try:
             docker_client = docker.from_env()
         except Exception as exc:
             result["detail"] = f"docker unavailable: {exc}"
+            _emit_summary()
             return result
 
     try:
@@ -3376,6 +3404,7 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
                 live_ids.add(str(cid))
     except Exception as exc:
         result["detail"] = f"docker unavailable: {exc}"
+        _emit_summary()
         return result
 
     skip_counts = {}
@@ -3470,5 +3499,168 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
         if len(parts) > _SWEEP_SKIP_DETAIL_CAP * 40:
             parts = parts[:_SWEEP_SKIP_DETAIL_CAP * 40] + "\u2026"
         result["detail"] = f"skipped ({parts})"
+
+    _emit_summary()
+    return result
+
+
+def reap_container_record(workspace_id, record_id, *, apply=False,
+                          docker_client=None, actor=None, reason=None) -> dict:
+    """Force-reap ONE orphan container record, bypassing the AGE gate ONLY.
+
+    Primitive behind ``scripts/reap_container_record.py``.  It reaps a single
+    record identified by ``record_id`` in ``workspace_id`` without waiting for
+    its retention window to elapse -- the operator's explicit escape hatch for
+    a record whose bound container is long gone but which the age-gated sweeper
+    (:func:`sweep_orphan_container_records`) still considers "too young".
+
+    Every OTHER safety gate the sweeper enforces stays in force, fail-closed:
+
+    - **own-lifecycle** -- ``resource`` / ``service`` classes manage their own
+      lifecycle and are never reaped here (``reason="lifecycle_own"``); an
+      unknown class is refused (``reason="unknown_class"``).
+    - **liveness** -- a record whose ``docker_id`` still names a LIVE container
+      is NEVER reaped, even with ``apply=True`` (``reason="container_live"``).
+      This is the whole point of "orphan".
+    - **docker** -- a missing/unreachable docker daemon soft-fails
+      (``reason="docker_unavailable"``) and never deletes.
+
+    Only the age/retention gate is bypassed.
+
+    ``apply=False`` (default) is a dry run: it reports ``reaped=True`` but
+    writes nothing and emits no audit.  ``apply=True`` deletes the record,
+    forgets its ``(workspace, name)`` index entry, logs a WARNING and emits
+    ``RECORD_REAP`` + ``RECORD_FORCE_REAP`` audit events.
+
+    ``actor`` / ``reason`` are free-form attribution recorded on the
+    ``RECORD_FORCE_REAP`` audit line (e.g. the CLI's ``--actor`` / ``--reason``).
+
+    Never raises: every failure soft-fails into ``result["reason"]``.
+    Returns::
+
+        {"workspace_id": str, "record_id": str, "docker_id": str,
+         "found": bool, "reaped": bool, "applied": bool,
+         "detail": str, "reason": str}
+    """
+    workspace_id = str(workspace_id) if workspace_id is not None else ""
+    record_id = str(record_id) if record_id is not None else ""
+    result = {
+        "workspace_id": workspace_id,
+        "record_id": record_id,
+        "docker_id": "",
+        "found": False,
+        "reaped": False,
+        "applied": False,
+        "detail": "",
+        "reason": "",
+    }
+
+    try:
+        record = load_record(workspace_id, record_id)
+    except Exception:
+        record = None
+    if record is None:
+        result["reason"] = "record_not_found"
+        result["detail"] = (
+            f"no record {record_id!r} in workspace {workspace_id!r}")
+        return result
+
+    result["found"] = True
+    docker_id = str(getattr(record, "docker_id", "") or "")
+    result["docker_id"] = docker_id
+
+    # Own-lifecycle gate (fail closed): resource/service containers manage
+    # their own lifecycle; an unknown class is never reaped.  ``apply`` does NOT
+    # bypass this -- it bypasses the AGE gate only.
+    try:
+        policy = policy_for(record.lifecycle_class)
+    except UnknownLifecycleClass:
+        result["reason"] = "unknown_class"
+        result["detail"] = (
+            f"unknown lifecycle class {record.lifecycle_class!r}; refusing")
+        return result
+    if policy.own_lifecycle:
+        result["reason"] = "lifecycle_own"
+        result["detail"] = (
+            f"lifecycle class {record.lifecycle_class!r} owns its lifecycle; "
+            f"refusing to reap")
+        return result
+
+    # Docker liveness (NEVER bypassed).  Mirror the sweeper's soft-fail.
+    if docker_client is None:
+        if not DOCKER_AVAILABLE:
+            result["reason"] = "docker_unavailable"
+            result["detail"] = "docker SDK not installed"
+            return result
+        try:
+            docker_client = docker.from_env()
+        except Exception as exc:
+            result["reason"] = "docker_unavailable"
+            result["detail"] = f"docker unavailable: {exc}"
+            return result
+
+    try:
+        live_ids = set()
+        for container in docker_client.containers.list(all=True):
+            cid = getattr(container, "id", None)
+            if cid:
+                live_ids.add(str(cid))
+    except Exception as exc:
+        result["reason"] = "docker_unavailable"
+        result["detail"] = f"docker unavailable: {exc}"
+        return result
+
+    if docker_id and docker_id in live_ids:
+        result["reason"] = "container_live"
+        result["detail"] = (
+            f"container {docker_id!r} still exists; refusing to force-reap "
+            f"(liveness gate never bypassed)")
+        return result
+
+    # AGE GATE BYPASSED: reap regardless of age / retention below this point.
+
+    if not apply:
+        result["reaped"] = True
+        result["applied"] = False
+        result["reason"] = "dry_run"
+        result["detail"] = (
+            f"would force-reap record {record.id!r} (docker_id={docker_id!r}); "
+            f"dry run, nothing written")
+        return result
+
+    try:
+        delete_record(workspace_id, record.id)
+    except Exception as exc:
+        result["reason"] = "delete_failed"
+        result["detail"] = f"delete failed: {exc}"
+        return result
+
+    _name_index_forget(record.id)
+    result["reaped"] = True
+    result["applied"] = True
+    result["reason"] = "ok"
+    result["detail"] = (
+        f"force-reaped record {record.id!r} (docker_id={docker_id!r})")
+
+    try:
+        log("WARNING", "docker.container_manager",
+            f"force-reaped orphan container record: "
+            f"workspace_id={workspace_id} record_id={record.id} "
+            f"docker_id={docker_id!r}")
+    except Exception:
+        pass
+    try:
+        _audit("RECORD_REAP",
+               f"workspace_id={workspace_id} record_id={record.id} "
+               f"docker_id={docker_id!r} dry_run=False")
+    except Exception:
+        pass
+    try:
+        _audit("RECORD_FORCE_REAP",
+               f"workspace_id={workspace_id} record_id={record.id} "
+               f"docker_id={docker_id!r} actor={actor!r} reason={reason!r} "
+               f"created_at={str(getattr(record, 'created_at', '') or '')}")
+    except Exception:
+        pass
 
     return result
