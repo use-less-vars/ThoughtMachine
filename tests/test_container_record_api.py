@@ -127,6 +127,17 @@ def test_delete_record_removes_file_and_sidecar(vault):
     assert not sidecar.exists()
 
 
+def test_delete_record_removes_lock_file(vault):
+    rec = api.create_record(WS, "ephemeral", "workspace-owned", vault_root=vault)
+
+    api.delete_record(WS, rec.id, vault)
+
+    assert not storage.record_path(WS, rec.id, vault).exists()
+    assert not storage.lock_path(WS, rec.id, vault).exists(), (
+        "delete_record must not leave a 0-byte <id>.json.lock behind"
+    )
+
+
 def test_list_records_quarantines_and_raises_on_corrupt(vault):
     good = api.create_record(WS, "ephemeral", "workspace-owned", vault_root=vault)
     bad = storage.record_path(WS, "bad", vault)
