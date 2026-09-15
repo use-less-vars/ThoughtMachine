@@ -144,13 +144,10 @@ class GitReadTool(ToolBase):
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
         """Return dynamic permission categories based on the git operation.
 
-        This tool is read-only: every operation requires ``git:read``;
-        ``remote`` additionally needs network egress to query remotes.
+        This tool is read-only: every operation, including ``remote``, requires
+        only ``git:read``. ``remote`` runs ``git remote -v`` and never contacts
+        a remote, so it needs no network egress.
         """
-        if params:
-            op = params.get("operation", "")
-            if op == "remote":
-                return ["git:read", "network:outbound"]
         return ["git:read"]
 
     tool: Literal["GitInfoTool"] = "GitInfoTool"
@@ -298,25 +295,6 @@ class GitReadTool(ToolBase):
         self._last_execution_mode = None
         self._last_failure_reason = None
         self._last_fallback_used = False
-
-        # Atomic permission re-check for network operations. An 'ask' level
-        # is NOT re-checked here: it defers to the ToolExecutor's outer gate,
-        # which already prompted the user and approved this call, so effective
-        # permissions still read 'ask'. Missing/banned/False stay fail-closed
-        # (the atomic check runs and denies).
-        operation = self.operation
-        network_ops = {"remote"}
-        if operation in network_ops:
-            effective = self.effective_permissions or {}
-            if effective.get("network") != "ask":
-                from security.security_gate import check_atomic_operation
-                if not check_atomic_operation(
-                    "network:outbound",
-                    effective,
-                    "GitReadTool",
-                    f"{operation} on remote"
-                ):
-                    return json.dumps({"error": f"Atomic permission check failed: network:outbound required for {operation}"})
 
         try:
             # Determine working directory
@@ -623,9 +601,21 @@ class GitReadTool(ToolBase):
         # treats 'ASK' as denied, so the category must be left unset here
         # or the host path would hard-deny before the user is ever asked.
         required_category = None
-        if self.session_permissions is not None:
-            if (self.effective_permissions or {}).get("git") != "ask":
-                required_category = f"git:{self._get_operation_level(args)}"
+        if self.session_permissions is None:
+            # Fail closed: an unresolved (None) session must never reach the
+            # host sandbox. Authorising on an unknown session is a bypass, and
+            # no git subprocess may be spawned for such a call.
+            logger.warning(
+                "GitReadTool host-side git execution refused: "
+                "session_permissions_unresolved (operation=%s)",
+                self.operation,
+            )
+            raise RuntimeError(
+                "GitReadTool: session_permissions_unresolved - refusing "
+                "host-side git execution without resolved session permissions"
+            )
+        if (self.effective_permissions or {}).get("git") != "ask":
+            required_category = f"git:{self._get_operation_level(args)}"
 
         result = executor.run(
             ["git"] + hardened_args + args,
@@ -684,26 +674,37 @@ class GitReadTool(ToolBase):
         # callers without effective_permissions). An 'ask' level is NOT
         # denied here: it defers to the ToolExecutor's outer gate, which owns
         # the interactive user-prompt flow.
-        if self.session_permissions is not None:
-            level = self._get_operation_level(args)
-            effective = self.effective_permissions or {}
-            if effective.get("git") != "ask":
-                from security.security_gate import (
-                    _ceiling_denial_note,
-                    check_atomic_operation,
-                )
+        if self.session_permissions is None:
+            # Fail closed: an unresolved (None) session must never reach the
+            # resource container. Authorising on an unknown session is a bypass.
+            logger.warning(
+                "GitReadTool containerized git execution refused: "
+                "session_permissions_unresolved (operation=%s)",
+                self.operation,
+            )
+            raise PermissionError(
+                "GitReadTool: session_permissions_unresolved - refusing "
+                "containerized git execution without resolved session permissions"
+            )
+        level = self._get_operation_level(args)
+        effective = self.effective_permissions or {}
+        if effective.get("git") != "ask":
+            from security.security_gate import (
+                _ceiling_denial_note,
+                check_atomic_operation,
+            )
 
-                if not check_atomic_operation(
-                    f"git:{level}",
-                    effective,
-                    "GitReadTool",
-                    f"git {' '.join(args)}",
-                ):
-                    note = _ceiling_denial_note("git", level, effective)
-                    raise PermissionError(
-                        f"Permission denied: git:{level} required for this operation"
-                        + (f" (workspace ceiling: {note})" if note else "")
-                    )
+            if not check_atomic_operation(
+                f"git:{level}",
+                effective,
+                "GitReadTool",
+                f"git {' '.join(args)}",
+            ):
+                note = _ceiling_denial_note("git", level, effective)
+                raise PermissionError(
+                    f"Permission denied: git:{level} required for this operation"
+                    + (f" (workspace ceiling: {note})" if note else "")
+                )
 
         # NOTE: no --no-verify here. The resource container IS the security
         # boundary; hooks are restricted to the workspace .githooks dir via

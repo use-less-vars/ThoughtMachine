@@ -321,7 +321,12 @@ def test_container_commit_does_not_skip_hooks(tmp_path):
     is injected instead.
     """
     manager = _FakeManager()
-    tool = GitWriteTool(operation="commit", message="x")
+    tool = GitWriteTool(
+        operation="commit",
+        message="x",
+        session_permissions=FULL_PERMISSIONS,
+        effective_permissions=FULL_PERMISSIONS,
+    )
     object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
     object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
     object.__setattr__(tool, "_ensure_resource_container", lambda: manager)

@@ -594,7 +594,7 @@ class TestContainerNoteFileStore:
         manager._containers = {}
         manager.workspace_config = {}
         manager.max_containers = 4
-        manager.client = SimpleNamespace(containers=fake_containers)
+        manager.client = SimpleNamespace(containers=fake_containers, ping=lambda: True)
         manager._compute_config = lambda ws, wid, sp, lc=None: ("none", "rw")
         return manager
 
@@ -750,7 +750,7 @@ class TestContainerWorkerLabel:
         manager._containers = {}
         manager.workspace_config = {}
         manager.max_containers = 4
-        manager.client = SimpleNamespace(containers=fake_containers)
+        manager.client = SimpleNamespace(containers=fake_containers, ping=lambda: True)
         manager._compute_config = lambda ws, wid, sp, lc=None: ("none", "rw")
         return manager
 

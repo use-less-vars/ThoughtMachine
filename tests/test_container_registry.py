@@ -92,6 +92,10 @@ class FakeClient:
             side_effect=lambda image, command=None, **kwargs: FakeContainer(kwargs["name"])
         )
         self.containers.get = mock.Mock(side_effect=self._get)
+        self.containers.list = mock.Mock(return_value=[])
+
+    def ping(self):
+        return True
 
     def _get(self, name):
         container = FakeContainer(name)

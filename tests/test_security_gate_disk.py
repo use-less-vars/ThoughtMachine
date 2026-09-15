@@ -255,3 +255,47 @@ def test_explicit_workspace_permissions_win_over_disk_ids(hermetic_vault):
         workspace_id=ws_id,
     )
     assert disk["filesystem"] == "write"
+
+
+def test_disk_mode_schema_invalid_ceiling_fails_closed(hermetic_vault, monkeypatch):
+    """A schema-invalid capped profile must fail CLOSED, not keep the grant.
+
+    R2/S4: when applying the workspace ceiling yields a dict that is not a
+    schema-valid ``SessionPermissions`` profile, the session collapses to the
+    deny-all ``_DISK_FAIL_CLOSED_SESSION``.  The resulting effective profile
+    is all-banned AND carries NO ceiling annotation (the annotation is
+    suppressed for the fail-closed session).
+    """
+    ws_id, sid = "ws-s4", "sess-1"
+    write_session_permissions(
+        hermetic_vault, ws_id, sid,
+        {"filesystem": "write", "git": "write"},
+    )
+    _write_config(hermetic_vault, ws_id, {"filesystem": "write", "git": "write"})
+
+    # Force the ceiling pass to produce a schema-INVALID profile.
+    monkeypatch.setattr(
+        "security.security_gate.apply_workspace_ceiling",
+        lambda workspace_permissions, raw: {
+            "filesystem": "not-a-level",
+            "git": 123,
+            "network": object(),
+            "mcp": ["nope"],
+            "container": "maybe",
+            "host_bash": None,
+        },
+    )
+
+    eff = get_effective_permissions(
+        SessionPermissions(),  # ignored in disk mode
+        _FULL_CAPS,
+        session_id=sid,
+        workspace_id=ws_id,
+    )
+
+    assert eff == ALL_BANNED  # (a) deny-all session
+    # (b) NO ceiling annotation attached: the fail-closed deny-all was caused
+    # by an unusable ceiling, not a legitimate reduction, so the result must
+    # NOT carry the _ceiling_annotations provenance attribute.
+    assert getattr(eff, "_ceiling_annotations", None) in (None, {})
+

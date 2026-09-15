@@ -101,7 +101,12 @@ class _FakeManager:
 
 class TestContainerCommitArgs:
     def _tool(self, tmp_path):
-        tool = GitWriteTool(operation="commit", message="x")
+        tool = GitWriteTool(
+            operation="commit",
+            message="x",
+            session_permissions={"git": "write"},
+            effective_permissions={"git": "write"},
+        )
         object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
         object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
         return tool
@@ -151,7 +156,12 @@ class TestHostCommitArgs:
     def test_host_commit_keeps_no_verify_and_hooks_neutralized(self, tmp_path, monkeypatch):
         _FakeSandbox.instances.clear()
         monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _FakeSandbox)
-        tool = GitWriteTool(operation="commit", message="x")
+        tool = GitWriteTool(
+            operation="commit",
+            message="x",
+            session_permissions={"git": "write"},
+            effective_permissions={"git": "write"},
+        )
 
         tool._exec_host_raw(tmp_path, ["commit", "-m", "x"])
 
@@ -206,7 +216,12 @@ class TestSelfHealingModeRouting:
             in ("commit", "init", "clone", "branch_create", "checkout", "stage", "unstage")
             else GitInfoTool
         )
-        tool = tool_cls(operation=operation, message="x")
+        tool = tool_cls(
+            operation=operation,
+            message="x",
+            session_permissions={"git": "write"},
+            effective_permissions={"git": "write"},
+        )
         object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
         object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
         return tool

@@ -887,7 +887,24 @@ def get_effective_permissions(
         try:
             session = SessionPermissions(**capped)
         except Exception:
-            pass  # keep the original session if the capped profile is not schema-valid
+            # The ceiling produced a profile SessionPermissions rejects.
+            # Retry ONCE through the resource catalog -- the SAME boundary
+            # coercion/validation idiom used for the disk-grant read above
+            # (``SessionPermissions(**coerce_resource_permissions(...))``).
+            # coerce_resource_permissions drops any entry that is not a valid
+            # catalog level, so a clamp that CHANGES the mapping proves the
+            # ceiling emitted data the schema cannot represent: the ceiling is
+            # unusable, so fail CLOSED to the deny-all session rather than
+            # silently keeping the un-capped, fail-open session.
+            try:
+                coerced = coerce_resource_permissions(capped)
+                if coerced != capped:
+                    raise ValueError(
+                        "workspace ceiling produced non-catalog session entries"
+                    )
+                session = SessionPermissions(**coerced)
+            except Exception:
+                session = _DISK_FAIL_CLOSED_SESSION
 
     # ── Capability merge over the (possibly ceiling-capped) session ───────
     effective = _merge_with_capabilities(session, workspace)
@@ -900,8 +917,17 @@ def get_effective_permissions(
     # The annotated result is a plain-dict subclass whose content is
     # identical; when nothing changed (or there is no ceiling) the plain
     # dict is returned, so the common path is byte-for-byte unchanged.
+    # A deny-all session produced by an UNUSABLE ceiling (or an unreadable
+    # grant store) carries no ceiling-change annotation: the all-banned
+    # profile was not caused by a legitimate ceiling reduction, so attributing
+    # categories to the workspace ceiling would be misleading.  Suppress the
+    # annotation whenever the effective session is the fail-closed sentinel.
     result: Dict[str, Any] = effective
-    if workspace_permissions and session is not base_session:
+    if (
+        workspace_permissions
+        and session is not base_session
+        and session is not _DISK_FAIL_CLOSED_SESSION
+    ):
         base_eff = _merge_with_capabilities(base_session, workspace)
         annotated = _annotate_ceiling_changes(
             base_eff, effective, workspace_permissions

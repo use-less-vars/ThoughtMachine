@@ -198,7 +198,10 @@ class _FakeContainers:
 class _FakeClient:
     def __init__(self, images=None, containers=None):
         self.images = images
-        self.containers = containers
+        self.containers = containers if containers is not None else _FakeContainers()
+
+    def ping(self):
+        return True
 
 
 class _FakeDockerModule:
@@ -535,7 +538,12 @@ def test_git_info_tool_resolves_overlay_image(monkeypatch, tmp_path):
     # is sufficient.
     monkeypatch.setattr(rcm, "ResourceContainerManager", _FakeResourceManager)
 
-    tool = GitInfoTool(operation="status", message="x")
+    tool = GitInfoTool(
+        operation="status",
+        message="x",
+        session_permissions={"git": "write"},
+        effective_permissions={"git": "write"},
+    )
     object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
     object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
 

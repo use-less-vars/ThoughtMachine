@@ -104,6 +104,10 @@ class FakeClient:
         self.containers.get = mock.Mock(
             side_effect=lambda name: FakeContainer(name)
         )
+        self.containers.list = mock.Mock(return_value=[])
+
+    def ping(self):
+        return True
 
 
 @pytest.fixture

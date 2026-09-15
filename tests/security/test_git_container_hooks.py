@@ -1,6 +1,6 @@
 """Docker-gated integration tests: commit hook policy in container vs host mode.
 
-These tests prove the GitInfoTool commit-hook contract against a REAL Docker
+These tests prove the git commit-hook contract against a REAL Docker
 daemon (mirroring the gating in ``test_git_container_sandbox.py``):
 
 1. Containerized commits run hooks ONLY from the workspace-owned ``.githooks``
@@ -29,7 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.git_info_tool import GitInfoTool
+from tools.git_write_tool import GitWriteTool
 
 
 def _docker_security_tests_enabled():
@@ -94,8 +94,13 @@ def resource_manager(tmp_path):
 
 
 def _container_tool(ws_dir):
-    """GitInfoTool wired for container mode against a registry workspace."""
-    tool = GitInfoTool(operation="commit", message="x")
+    """GitWriteTool wired for container mode against a registry workspace."""
+    tool = GitWriteTool(
+        operation="commit",
+        message="x",
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+        effective_permissions={"git": "write"},  # container path enforces the atomic git:write category
+    )
     object.__setattr__(tool, "_resolved_workspace_path", str(ws_dir))
     object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
     return tool
@@ -190,7 +195,11 @@ def test_host_commit_hooks_fully_neutralized(tmp_path, monkeypatch):
     ws_dir.mkdir(exist_ok=True)
     (ws_dir / ".githooks").mkdir(exist_ok=True)  # must be ignored on host path
 
-    tool = GitInfoTool(operation="commit", message="x")
+    tool = GitWriteTool(
+        operation="commit",
+        message="x",
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+    )
     exit_code, stdout, stderr = tool._exec_host_raw(ws_dir, ["commit", "-m", "x"])
     assert (exit_code, stdout, stderr) == (0, "ok", "")
 

@@ -197,6 +197,7 @@ def _client(containers=None):
 
     c = _Client()
     c.containers = _FakeContainers(containers)
+    c.ping = lambda: True
     return c
 
 

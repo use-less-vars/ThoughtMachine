@@ -200,7 +200,7 @@ class Probes(Protocol):
 
     def disk_usage(self, path: Any) -> Any: ...
     def docker_reachable(self) -> bool: ...
-    def workspace_container_count(self, workspace_id: str) -> int: ...
+    def workspace_container_count(self, workspace_id: str) -> Optional[int]: ...
     def now(self) -> float: ...
 
 
@@ -218,7 +218,7 @@ class _RealProbes:
         except Exception:
             return False
 
-    def workspace_container_count(self, workspace_id: str) -> int:
+    def workspace_container_count(self, workspace_id: str) -> Optional[int]:
         try:
             import docker  # lazy: only needed at runtime
 
@@ -229,7 +229,9 @@ class _RealProbes:
             )
             return len(containers)
         except Exception:
-            return 0
+            # Fail CLOSED: an unresolvable count is unknown, not zero (a
+            # zero would silently admit over the per-workspace limit).
+            return None
 
     def now(self) -> float:
         return time.time()
@@ -241,8 +243,9 @@ class ClientProbes:
     Unlike :class:`_RealProbes` (which opens its own daemon connection), this
     probe uses the caller's already-resolved ``client`` so admission observes
     the *same* daemon the create path will talk to.  It is deliberately
-    tolerant of test doubles: a client without ``ping`` is presumed live, and
-    a listing failure is reported as zero containers (never trips the limit).
+    fail-CLOSED on unresolvable observations: a client without ``ping`` is
+    treated as unreachable, and a listing failure resolves the count to
+    ``None`` (unknown), which denies rather than silently admitting.
     """
 
     def __init__(self, client: Any) -> None:
@@ -269,14 +272,15 @@ class ClientProbes:
     def docker_reachable(self) -> bool:
         ping = getattr(self._client, "ping", None)
         if not callable(ping):
-            # Injected client (fake/test double) is presumed live.
-            return True
+            # A client with no ``ping`` capability is NOT presumed reachable:
+            # with no way to observe the daemon, admission must fail CLOSED.
+            return False
         try:
             return bool(ping())
         except Exception:
             return False
 
-    def workspace_container_count(self, workspace_id: str) -> int:
+    def workspace_container_count(self, workspace_id: str) -> Optional[int]:
         try:
             return len(
                 self._client.containers.list(
@@ -285,7 +289,9 @@ class ClientProbes:
                 )
             )
         except Exception:
-            return 0
+            # Fail CLOSED: an unresolvable count is unknown, not zero (a
+            # zero would silently admit over the per-workspace limit).
+            return None
 
     def now(self) -> float:
         return time.time()
@@ -412,6 +418,13 @@ def _admit(request: Any, probes: Optional[Any]) -> Decision:
     # ── step 6: per-workspace container limit ──────────────────────────────
     limit = _container_limit(getattr(request, "session_config", None))
     count = probes.workspace_container_count(workspace_id)
+    if count is None:
+        # Fail CLOSED: the count could not be observed, so we cannot prove we
+        # are under the limit. Deny with an honest, non-numeric reason.
+        return Deny(
+            REASON_CONTAINER_LIMIT_EXCEEDED,
+            f"container count unavailable (limit {limit}); failing closed",
+        )
     if count >= limit:
         return Deny(
             REASON_CONTAINER_LIMIT_EXCEEDED,

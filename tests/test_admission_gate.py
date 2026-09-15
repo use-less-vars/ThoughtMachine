@@ -433,3 +433,57 @@ def test_fuzz_admit_never_raises():
             )
         decision = admit(request, probes=FakeProbes())
         assert isinstance(decision, (Allow, Deny, Transform))
+
+
+# ─═ ClientProbes: fail-CLOSED probe contract ══════════════════════════════
+class _FakeContainers:
+    """Minimal ``client.containers`` double; ``list`` optionally raises."""
+
+    def __init__(self, raises):
+        self._raises = raises
+
+    def list(self, *args, **kwargs):
+        if self._raises:
+            raise RuntimeError("docker listing failed")
+        return []
+
+
+class FakeDockerClient:
+    """Minimal docker-client double accepted by :class:`ClientProbes`.
+
+    ``ping`` is only attached when supplied: a client without a callable
+    ``ping`` (a bare test double) must NOT be presumed reachable.
+    """
+
+    def __init__(self, *, list_raises=False, ping=None):
+        self.containers = _FakeContainers(list_raises)
+        if ping is not None:
+            self.ping = ping
+
+
+def test_client_probes_container_count_none_on_listing_failure():
+    """A listing failure resolves the count to ``None`` (unknown), never 0."""
+    probes = ag.ClientProbes(FakeDockerClient(list_raises=True, ping=lambda: True))
+    assert probes.workspace_container_count("ws1") is None
+
+
+def test_client_probes_listing_failure_denies_admission():
+    """An unknown container count fails CLOSED (limit exceeded), not open."""
+    probes = ag.ClientProbes(FakeDockerClient(list_raises=True, ping=lambda: True))
+    decision = admit(make_request(), probes=probes)
+    assert isinstance(decision, Deny)
+    assert decision.code == REASON_CONTAINER_LIMIT_EXCEEDED
+
+
+def test_client_probes_docker_reachable_false_without_ping():
+    """A client with no ping is NOT presumed reachable: it is unreachable."""
+    probes = ag.ClientProbes(FakeDockerClient())
+    assert probes.docker_reachable() is False
+
+
+def test_client_probes_no_ping_denies_admission():
+    probes = ag.ClientProbes(FakeDockerClient())
+    decision = admit(make_request(), probes=probes)
+    assert isinstance(decision, Deny)
+    assert decision.code == REASON_DAEMON_UNREACHABLE
+
