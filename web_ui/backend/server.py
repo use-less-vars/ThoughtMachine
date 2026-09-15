@@ -107,6 +107,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -119,7 +120,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
-from fastapi import Body, FastAPI, Form, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
@@ -3324,6 +3325,307 @@ def workspace_container_delete(workspace_id: str, container_name: str,
         log("ERROR", "server.workspace_container_delete",
             f"Remove failed: {exc}")
         return _json_error(str(exc), status_code=503)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Container-record user actions (RECORD-keyed): kill / restart / recreate
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These routes act on a durable container *record* keyed by its stable
+# ``record_id`` within a workspace -- NOT on a container *name*. They are
+# purely additive: the name-keyed start/stop/delete routes above are untouched.
+#
+# Every action is attributed (``X-Actor`` header; a body ``actor`` wins),
+# gated by the workspace permission ceiling (fail-closed) and audited as
+# ``RECORD_USER_ACTION`` on both the container-manager audit channel and the
+# record's own event log. All guards run BEFORE any Docker call.
+
+#: Request header carrying the acting principal; a body ``actor`` overrides it.
+USER_ACTION_ACTOR_HEADER = "X-Actor"
+
+#: Actor token grammar. ``actor`` is attribution, not authentication -- it
+#: names the caller for the audit trail and never authorises anything.
+_USER_ACTION_ACTOR_RE = re.compile(r"^[A-Za-z0-9._@:-]+$")
+_USER_ACTION_ACTOR_MAX = 64
+
+
+def _resolve_actor(request: Request, body: Optional[dict]):
+    """Resolve the acting principal (fail-closed): attribution, not authentication.
+
+    A non-empty body ``actor`` OVERRIDES the ``X-Actor`` header. Returns
+    ``(actor, None)`` or ``(None, <JSONResponse>)`` on a missing (401) /
+    malformed (400) token.
+    """
+    raw = None
+    if isinstance(body, dict):
+        candidate = body.get("actor")
+        if isinstance(candidate, str) and candidate.strip():
+            raw = candidate.strip()
+    if raw is None:
+        header = request.headers.get(USER_ACTION_ACTOR_HEADER)
+        if header and header.strip():
+            raw = header.strip()
+    if raw is None:
+        return None, _json_error(
+            f"actor required (body 'actor' or '{USER_ACTION_ACTOR_HEADER}' header)",
+            status_code=401)
+    if len(raw) > _USER_ACTION_ACTOR_MAX or not _USER_ACTION_ACTOR_RE.match(raw):
+        return None, _json_error(
+            "actor malformed (allowed [A-Za-z0-9._@:-], max 64 chars)",
+            status_code=400)
+    return raw, None
+
+
+def _container_write_allowed(workspace_id: str):
+    """Return ``(allowed, reason)`` for a container write in *workspace_id*.
+
+    HTTP carries no session object, so the workspace permission ceiling
+    (``config.json['permissions']['container']``, purpose preset as fallback)
+    is the sole positive authority and the session profile is the SAFE default
+    (``container=False``). An unset/malformed ceiling therefore DENIES, and any
+    error resolving it also denies (fail-closed).
+    """
+    try:
+        from security.security_gate import check_atomic_operation
+        from web_ui.backend.config_manager import _load_workspace_permission_ceiling
+
+        ceiling = _load_workspace_permission_ceiling(workspace_id) or {}
+        effective = {"container": ceiling.get("container", False)}
+        if check_atomic_operation(
+            "container:write", effective, "container_records_user_action"
+        ):
+            return True, "allowed"
+        return False, "workspace does not grant the container category"
+    except Exception as exc:
+        return False, f"permission check failed: {exc}"
+
+
+#: The closed vocabulary of ``decision`` values the record-user-action handler
+#: may emit (on BOTH audit channels). Single source of truth so a stray literal
+#: is a review-time/typo signal rather than silent drift.
+VALID_DECISIONS = frozenset({"applied", "denied", "conflict", "error"})
+
+
+def _audit_record_user_action(workspace_id, record_id, actor, action, decision,
+                              reason, previous_docker_id, new_docker_id):
+    """Emit ``RECORD_USER_ACTION`` on BOTH audit channels for one attempt.
+
+    (i) the container-manager audit channel, best-effort (a failure here never
+    fails the request); (ii) the record's own event log via
+    ``container_record.api.append_event`` -- MANDATORY, so a failure raises to
+    the caller, which turns a persistent-store failure into a 500.
+    """
+    if decision not in VALID_DECISIONS:
+        raise ValueError(
+            f"invalid record-user-action decision {decision!r}; expected one "
+            f"of {sorted(VALID_DECISIONS)}")
+    detail = (f"actor={actor} action={action} decision={decision} "
+              f"workspace_id={workspace_id} record_id={record_id} "
+              f"previous_docker_id={previous_docker_id!r} "
+              f"new_docker_id={new_docker_id!r} reason={reason!r}")
+    try:
+        from infra import container_manager as _container_manager_module
+
+        _container_manager_module._audit("RECORD_USER_ACTION", detail)
+    except Exception:
+        pass
+
+    from thoughtmachine.container_record import api as _cr_api
+    from thoughtmachine.container_record.models import iso_now
+
+    return _cr_api.append_event(
+        workspace_id, record_id, "RECORD_USER_ACTION", actor,
+        action=action, decision=decision, reason=reason,
+        previous_docker_id=previous_docker_id, new_docker_id=new_docker_id,
+        at=iso_now(),
+    )
+
+
+def _record_user_action(record_id: str, action: str, request: Request,
+                        workspace_id: Optional[str], body: Optional[dict]):
+    """Shared handler for the record-keyed kill/restart/recreate endpoints."""
+    # Guard 1 -- workspace_id is required.
+    if not workspace_id or not workspace_id.strip():
+        return _json_error("workspace_id query parameter is required",
+                           status_code=400)
+
+    # Guard 2 -- attribution (fail-closed).
+    actor, actor_error = _resolve_actor(request, body)
+    if actor_error is not None:
+        return actor_error
+    reason = ""
+    if isinstance(body, dict) and isinstance(body.get("reason"), str):
+        reason = body["reason"]
+
+    from thoughtmachine.container_record import api as _cr_api
+
+    # Guard 3 -- resolve the record. Wrong workspace -> 403, unknown -> 404.
+    try:
+        record = _cr_api.load_record(workspace_id, record_id)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action", f"record load failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if record is None:
+        try:
+            elsewhere = _cr_api.find_by_docker_label(record_id)
+        except Exception:
+            elsewhere = None
+        if elsewhere is not None:
+            return _json_error(
+                f"record '{record_id}' does not belong to workspace "
+                f"'{workspace_id}'", status_code=403)
+        return _json_error(f"record '{record_id}' not found", status_code=404)
+
+    # Guard 4 -- permission gate (fail-closed). Denied attempts are audited.
+    allowed, deny_reason = _container_write_allowed(workspace_id)
+    if not allowed:
+        try:
+            _audit_record_user_action(workspace_id, record_id, actor, action,
+                                      "denied", deny_reason, record.docker_id,
+                                      record.docker_id)
+        except Exception as exc:
+            log("ERROR", "server.record_user_action",
+                f"denied-attempt audit failed: {exc}")
+            return _json_error(f"audit write failed: {exc}", status_code=500)
+        return JSONResponse({"error": deny_reason, "code": "permission_denied"},
+                            status_code=403)
+
+    # Guard 5 -- build the container manager.
+    try:
+        manager = _make_container_manager(workspace_id)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+
+    # Guard 6 -- resolve the container handle + record identity (state conflict).
+    if not record.name:
+        return _json_error("record has no container name", status_code=409)
+    try:
+        container_id = _find_container_id(manager, record.name)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action",
+            f"container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    container_id = container_id or record.docker_id or None
+    if not container_id:
+        return _json_error("record has no bound container", status_code=409)
+
+    previous_docker_id = container_id
+
+    def _audit(decision, new_id):
+        return _audit_record_user_action(workspace_id, record_id, actor, action,
+                                         decision, reason, previous_docker_id,
+                                         new_id)
+
+    def _fail(result, default_msg):
+        """Map a manager 'error' result to a 503 (audited); else ``None``."""
+        if isinstance(result, dict) and result.get("status") == "error":
+            try:
+                _audit("error", previous_docker_id)
+            except Exception as exc:
+                return _json_error(f"audit write failed: {exc}", status_code=500)
+            return _json_error(result.get("error", default_msg), status_code=503)
+        return None
+
+    # Guard 7 -- Docker action (all guards complete).
+    try:
+        if action == "kill":
+            # kill = stop with kill fallback (ContainerManager.stop escalates
+            # to container.kill() when a graceful stop does not take).
+            stop_result = manager.stop(container_id)
+            conflict = _fail(stop_result, "kill failed")
+            if conflict is not None:
+                return conflict
+            if isinstance(stop_result, dict) and stop_result.get("status") == "missing":
+                return _json_error(stop_result.get("error", "container not found"),
+                                   status_code=409)
+            new_docker_id = previous_docker_id
+        else:
+            if action == "restart":
+                pre_result = manager.stop(container_id)
+            else:  # recreate
+                pre_result = manager.remove(container_id)
+            conflict = _fail(pre_result, f"{action} failed")
+            if conflict is not None:
+                return conflict
+            # restart/recreate start through the REAL name-index path; the
+            # record_id stays stable across the whole operation.
+            start_result = manager.start(name=record.name, note=record.notes,
+                                         allow_fresh=(action == "recreate"))
+            if isinstance(start_result, dict) and start_result.get("error"):
+                try:
+                    _audit("conflict", None)
+                except Exception as exc:
+                    return _json_error(f"audit write failed: {exc}",
+                                       status_code=500)
+                return _json_error(start_result["error"], status_code=409)
+            new_docker_id = (start_result or {}).get("id") or previous_docker_id
+            # Rebind the record's container handle + observed state.
+            try:
+                _cr_api.update_record(workspace_id, record_id,
+                                      docker_id=new_docker_id, state="running")
+            except Exception as exc:
+                log("ERROR", "server.record_user_action",
+                    f"record rebind failed: {exc}")
+                return _json_error(str(exc), status_code=503)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action", f"{action} failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+    # MANDATORY audit on the record's event log (raises -> 500).
+    try:
+        _audit("applied", new_docker_id)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action",
+            f"applied-attempt audit failed: {exc}")
+        return _json_error(f"audit write failed: {exc}", status_code=500)
+
+    # Read-back: same shape as GET /api/container-records/{record_id}.
+    from thoughtmachine.container_record import api as _cr_api
+
+    record_after = _cr_api.load_record(workspace_id, record_id)
+    if record_after is None:
+        return _json_error("record disappeared during action", status_code=500)
+    try:
+        _cr_api.read_event_log(workspace_id, record_id)
+    except Exception:
+        pass
+    from web_ui.backend.container_record_routes import _serialise
+
+    return JSONResponse(_serialise(record_after, workspace_id))
+
+
+@app.post("/api/container-records/{record_id}/kill")
+def container_record_kill(record_id: str, request: Request,
+                          workspace_id: Optional[str] = None,
+                          body: Optional[dict] = Body(default=None)):
+    """Kill the record's container (stop; escalates to Docker kill)."""
+    return _record_user_action(record_id, "kill", request, workspace_id, body)
+
+
+@app.post("/api/container-records/{record_id}/restart")
+def container_record_restart(record_id: str, request: Request,
+                             workspace_id: Optional[str] = None,
+                             body: Optional[dict] = Body(default=None)):
+    """Restart the record's container (stop then start via the name index)."""
+    return _record_user_action(record_id, "restart", request, workspace_id, body)
+
+
+@app.post("/api/container-records/{record_id}/recreate")
+def container_record_recreate(record_id: str, request: Request,
+                              workspace_id: Optional[str] = None,
+                              body: Optional[dict] = Body(default=None)):
+    """Recreate the record's container (remove then start via the name index)."""
+    return _record_user_action(record_id, "recreate", request, workspace_id, body)
 
 
 # Container logs: upper bound on ``tail`` accepted by the REST route. The

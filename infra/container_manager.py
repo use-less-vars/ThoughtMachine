@@ -110,6 +110,7 @@ except ImportError:  # pragma: no cover - defensive
 
 from infra.container_env import merge_container_identity_env
 from thoughtmachine.container_record import (
+    attach_container,
     ContainerRecordError,
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
@@ -128,6 +129,7 @@ from thoughtmachine.container_record import (
     load_record,
     normalise_restart_policy,
     policy_for,
+    record_label,
     update_record,
 )
 from thoughtmachine.container_record import drift
@@ -1016,7 +1018,8 @@ class ContainerManager:
         return None
 
     def start(self, image=None, name=None, note=None, worker_name=None, *,
-              lifecycle_class: str = LIFECYCLE_PERSISTENT):
+              lifecycle_class: str = LIFECYCLE_PERSISTENT,
+              allow_fresh: bool = False):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
@@ -1111,6 +1114,15 @@ class ContainerManager:
                 record = None
             docker_id = str(getattr(record, "docker_id", "") or "") if record else ""
             if not docker_id:
+                # allow_fresh is operator-only (recreate path). Do not set in
+                # worker/agent code paths - the refusal is the fail-closed
+                # default.
+                if allow_fresh:
+                    return self._fresh_start(
+                        image=image, name=name, note=note, worker_name=None,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=want_network, workspace_mode=want_workspace,
+                        reuse_record_id=record_id)
                 # (b) Record exists but names no container yet -> REFUSE.
                 self._warn_note_once(
                     ("name.record_without_container", self.workspace_id, name),
@@ -1125,6 +1137,12 @@ class ContainerManager:
             # (a) Record + docker_id: reuse via the record's docker id.
             container = self._reuse_container(docker_id)
             if container is None:
+                if allow_fresh:
+                    return self._fresh_start(
+                        image=image, name=name, note=note, worker_name=None,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=want_network, workspace_mode=want_workspace,
+                        reuse_record_id=record_id)
                 self._emit_stale_docker_id_drift_once(
                     name, record_id, docker_id, "record")
                 return {"error": (f"Container {name!r} record {record_id} names "
@@ -1320,7 +1338,67 @@ class ContainerManager:
                 _reuse_resp["drift"] = _payload
             return _reuse_resp
 
-        # 3) Fresh create
+        # 3) Fresh create: one shared creation path.
+        return self._fresh_start(
+            image=image, name=name, note=note, worker_name=worker_name,
+            lifecycle_class=lifecycle_class,
+            network_mode=network_mode, workspace_mode=workspace_mode,
+        )
+
+    def _run_container(self, *, image, name, labels, mounts, tmpfs,
+                       network_mode, lifecycle_class):
+        """Create one container via the daemon (the single ``run`` call site).
+
+        ``labels`` must already carry any record-owned label; the caller binds
+        the record to the returned container.  Returns the created container.
+        """
+        return self.client.containers.run(
+            image=image,
+            name=name,
+            volumes=None,
+            mounts=mounts,
+            tmpfs=tmpfs,
+            network=network_mode,
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            oom_score_adj=1000,  # user containers are the first OOM-kill victims
+            read_only=True,
+            user="1000:1000",
+            detach=True,
+            tty=True,
+            stdin_open=True,
+            command=["tail", "-f", "/dev/null"],
+            mem_limit=self.mem_limit,
+            cpu_quota=self.cpu_quota,
+            environment=merge_container_identity_env(
+                {"PYTHONUSERBASE": "/home/agent/.local"},
+                session_id=self.session_id,
+                workspace_id=self.workspace_id,
+            ),
+            restart_policy=docker_restart_policy(lifecycle_class),
+            labels=labels,
+        )
+
+    def _cache_container(self, name, container):
+        """Reload a freshly created container and warm the read-through cache."""
+        try:
+            container.reload()
+        except Exception:
+            pass
+        self._containers[name] = container.id
+        return container
+
+    def _fresh_start(self, *, image, name, note, worker_name, lifecycle_class,
+                     network_mode, workspace_mode, reuse_record_id=None):
+        """Create exactly one container (the single fresh-create path).
+
+        With ``reuse_record_id`` unset a NEW record is minted alongside the
+        container (the legacy fresh create).  With ``reuse_record_id`` set the
+        container is created for, and bound to, that EXISTING record instead -
+        the operator-only recreate path: no new record is minted, the record's
+        docker_id/state are rebound, and the name index keeps pointing at the
+        same record id.
+        """
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
@@ -1328,7 +1406,6 @@ class ContainerManager:
         if os.path.isdir(os.path.join(self.workspace_path, ".git")):
             tmpfs["/workspace/.git"] = ""
 
-        volumes = None
         mounts = [
             Mount(
                 target="/workspace", source=self.workspace_path, type="bind",
@@ -1372,7 +1449,8 @@ class ContainerManager:
         # creation path.  The registry generates the docker name; the facade
         # keeps its own ``name`` as the label ``thoughtmachine.container_name``
         # so label-based reuse still works on later start() calls.
-        if is_registry_active(getattr(self, "_session_config", None)):
+        if (reuse_record_id is None
+                and is_registry_active(getattr(self, "_session_config", None))):
             registry = self._registry
             try:
                 handle = registry.request_container(
@@ -1457,47 +1535,45 @@ class ContainerManager:
         if isinstance(_decision, Transform):
             network_mode = _decision.spec.network_mode
 
+        if reuse_record_id is not None:
+            # Operator-only recreate: bind the fresh container to the EXISTING
+            # record (no new record, no delete; the name index is untouched).
+            labels.update(record_label(reuse_record_id))
+            container = self._run_container(
+                image=image, name=name, labels=labels, mounts=mounts,
+                tmpfs=tmpfs, network_mode=network_mode,
+                lifecycle_class=lifecycle_class)
+            attach_container(self.workspace_id, reuse_record_id, container.id,
+                             state="running")
+            container = self._cache_container(name, container)
+            if note is not None:
+                self._write_note(reuse_record_id, note)
+            _audit("CONTAINER_CREATE",
+                   f"source=recreate image={image} name={name} "
+                   f"record_id={reuse_record_id} session={self.session_id} "
+                   f"workspace_id={self.workspace_id}")
+            log_container_event("started", container_id=container.id,
+                                session_id=self.session_id or "",
+                                data={"image": image, "name": name,
+                                      "status": "created"})
+            return {"id": container.id, "name": name, "status": "created",
+                    "note": note or ""}
+
         with record_creation(
             workspace_id=self.workspace_id,
             lifecycle_class=lifecycle_class,
             labels=labels,
             name=name,
         ) as record:
-            container = self.client.containers.run(
-                image=image,
-                name=name,
-                volumes=volumes,
-                mounts=mounts,
-                tmpfs=tmpfs,
-                network=network_mode,
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                oom_score_adj=1000,  # user containers are the first OOM-kill victims
-                read_only=True,
-                user="1000:1000",
-                detach=True,
-                tty=True,
-                stdin_open=True,
-                command=["tail", "-f", "/dev/null"],
-                mem_limit=self.mem_limit,
-                cpu_quota=self.cpu_quota,
-                environment=merge_container_identity_env(
-                    {"PYTHONUSERBASE": "/home/agent/.local"},
-                    session_id=self.session_id,
-                    workspace_id=self.workspace_id,
-                ),
-                restart_policy=docker_restart_policy(lifecycle_class),
-                labels=labels,
-            )
+            container = self._run_container(
+                image=image, name=name, labels=labels, mounts=mounts,
+                tmpfs=tmpfs, network_mode=network_mode,
+                lifecycle_class=lifecycle_class)
             record.attach(container)
             # Record-first identity: index the freshly minted record so a
             # subsequent start(name=...) reuses it instead of re-creating.
             self._name_index_register(name, getattr(record, "id", ""))
-        try:
-            container.reload()
-        except Exception:
-            pass
-        self._containers[name] = container.id
+        container = self._cache_container(name, container)
         if note is not None:
             self._write_note(self._record_id_for(container), note)
         log_container_event("started", container_id=container.id,

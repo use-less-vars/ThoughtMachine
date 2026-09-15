@@ -517,3 +517,61 @@ def test_resolve_pre_registered_outside_home_still_resolves(client, clean_home):
         assert resp.json()["workspace_id"] == "ws-pre-registered"
     finally:
         shutil.rmtree(outside, ignore_errors=True)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Fix 5 — record user-action endpoint boundary (kill / restart / recreate)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# The record-keyed user-action routes run every guard BEFORE any Docker call.
+# The workspace-id + actor-attribution guards are pure host-boundary checks:
+# they fire (400 / 401 / 400) without touching the vault or a Docker daemon, so
+# they are pinned here at the HTTP boundary, on all three routes.
+
+_RECORD_ACTIONS = ("kill", "restart", "recreate")
+
+
+def test_record_action_requires_workspace_id_400(client):
+    """No ``workspace_id`` query param → HTTP 400, before attribution."""
+    for action in _RECORD_ACTIONS:
+        resp = client.post(f"/api/container-records/rec-x/{action}",
+                           headers={"X-Actor": "tester"})
+        assert resp.status_code == 400, resp.text
+        assert "workspace_id" in resp.json()["error"]
+
+
+def test_record_action_requires_actor_401(client):
+    """No actor (body or ``X-Actor`` header) → HTTP 401."""
+    for action in _RECORD_ACTIONS:
+        resp = client.post(f"/api/container-records/rec-x/{action}",
+                           params={"workspace_id": "ws-hardening"})
+        assert resp.status_code == 401, resp.text
+
+
+def test_record_action_rejects_malformed_actor_400(client):
+    """An actor outside the allowed alphabet → HTTP 400 (not 401)."""
+    for action in _RECORD_ACTIONS:
+        resp = client.post(f"/api/container-records/rec-x/{action}",
+                           params={"workspace_id": "ws-hardening"},
+                           headers={"X-Actor": "bad actor!"})
+        assert resp.status_code == 400, resp.text
+        assert "malformed" in resp.json()["error"]
+
+
+def test_record_action_rejects_overlong_actor_400(client):
+    """An actor longer than 64 chars → HTTP 400 (bounded token)."""
+    resp = client.post("/api/container-records/rec-x/kill",
+                       params={"workspace_id": "ws-hardening"},
+                       headers={"X-Actor": "a" * 65})
+    assert resp.status_code == 400, resp.text
+
+
+def test_record_action_body_actor_passes_attribution_guard(client):
+    """A body ``actor`` satisfies attribution with no header: the request
+    advances PAST the actor guard (it must not fail 400/401 — it fails later,
+    at record resolution, which needs no Docker daemon)."""
+    resp = client.post("/api/container-records/rec-x/kill",
+                       params={"workspace_id": "ws-hardening"},
+                       json={"actor": "body-user"})
+    assert resp.status_code not in (400, 401), resp.text
+
