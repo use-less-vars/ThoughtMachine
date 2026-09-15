@@ -454,3 +454,407 @@
   color: #11111b;
 }
 
+
+
+/* --- Container records panel (RecordContainerPanel) --- */
+
+.rcp-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.rcp-refresh-btn {
+  flex-shrink: 0;
+}
+
+.rcp-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #6c7086;
+}
+
+.rcp-error {
+  margin: 0;
+}
+
+.rcp-empty {
+  margin: 0;
+}
+
+/* Row list --------------------------------------------------------------- */
+
+.rcp-record-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.rcp-record-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  color: #cdd6f4;
+  cursor: pointer;
+  font-size: 0.83rem;
+}
+
+.rcp-record-row:hover {
+  border-color: #89b4fa;
+}
+
+.rcp-record-row-selected {
+  border-color: #89b4fa;
+  background: #1e1e2e;
+}
+
+.rcp-record-name {
+  font-weight: 600;
+}
+
+.rcp-state {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: #89b4fa;
+  color: #1e1e2e;
+}
+
+.rcp-record-lifecycle {
+  font-size: 0.75rem;
+  color: #a6adc8;
+}
+
+.rcp-record-updated {
+  margin-left: auto;
+  font-size: 0.72rem;
+  color: #6c7086;
+}
+
+.rcp-drift-indicator {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: #313244;
+  color: #a6adc8;
+}
+
+.rcp-drift-indicator.rcp-drift-clean {
+  background: #a6e3a1;
+  color: #1e1e2e;
+}
+
+.rcp-drift-indicator.rcp-drift-drift {
+  background: #f38ba8;
+  color: #1e1e2e;
+}
+
+.rcp-drift-indicator.rcp-drift-unknown {
+  background: #f9e2af;
+  color: #1e1e2e;
+}
+
+/* Detail ----------------------------------------------------------------- */
+
+.rcp-detail {
+  margin-top: 0.4rem;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.rcp-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.rcp-detail-title {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #cdd6f4;
+}
+
+.rcp-fields {
+  display: grid;
+  grid-template-columns: minmax(120px, max-content) 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.rcp-field-label {
+  color: #a6adc8;
+}
+
+.rcp-field-value {
+  margin: 0;
+  color: #cdd6f4;
+  overflow-wrap: anywhere;
+}
+
+.rcp-notes {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #a6adc8;
+}
+
+.rcp-subsection-title {
+  margin: 0.3rem 0 0;
+  font-size: 0.85rem;
+  color: #cdd6f4;
+}
+
+.rcp-intent {
+  margin-top: 0.2rem;
+}
+
+p.rcp-drift-unknown {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #f9e2af;
+}
+
+p.rcp-drift-clean {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #a6e3a1;
+}
+
+p.rcp-drift-detected {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #f38ba8;
+}
+
+/* Drift table ------------------------------------------------------------ */
+
+.rcp-drift-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.76rem;
+}
+
+.rcp-drift-caption {
+  caption-side: top;
+  text-align: left;
+  color: #6c7086;
+  font-size: 0.74rem;
+  padding-bottom: 0.25rem;
+}
+
+.rcp-drift-row td,
+.rcp-drift-table th {
+  border: 1px solid #313244;
+  padding: 0.25rem 0.4rem;
+  text-align: left;
+  color: #cdd6f4;
+  vertical-align: top;
+}
+
+.rcp-drift-table th {
+  color: #a6adc8;
+  font-weight: 600;
+  background: #1e1e2e;
+}
+
+.rcp-drift-class {
+  font-weight: 600;
+}
+
+.rcp-drift-value {
+  color: #a6adc8;
+}
+
+.rcp-drift-signature {
+  font-family: monospace;
+  color: #fab387;
+}
+
+.rcp-drift-toggle {
+  background: #313244;
+  border: 1px solid #45475a;
+  color: #cdd6f4;
+  border-radius: 4px;
+  padding: 0 0.4rem;
+  cursor: pointer;
+  font-size: 0.72rem;
+}
+
+.rcp-drift-toggle:hover {
+  background: #45475a;
+}
+
+.rcp-drift-raw-row td {
+  background: #1e1e2e;
+}
+
+.rcp-drift-raw {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.72rem;
+  color: #a6adc8;
+}
+
+/* Event log -------------------------------------------------------------- */
+
+.rcp-events {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.rcp-event-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.rcp-event-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.75rem;
+  align-items: center;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.76rem;
+  color: #cdd6f4;
+}
+
+.rcp-event-time {
+  color: #6c7086;
+}
+
+.rcp-event-type {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: #313244;
+  color: #a6adc8;
+}
+
+.rcp-event-actor {
+  color: #a6adc8;
+}
+
+.rcp-event-payload {
+  font-family: monospace;
+  font-size: 0.72rem;
+  color: #6c7086;
+  overflow-wrap: anywhere;
+}
+
+/* Pass-2b action context ------------------------------------------------- */
+
+.rcp-action-context {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-top: 0.3rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #313244;
+  font-size: 0.78rem;
+  color: #a6adc8;
+}
+
+.rcp-actor {
+  color: #cdd6f4;
+}
+
+.rcp-reason-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: #a6adc8;
+}
+
+.rcp-reason-input {
+  flex: 1;
+  min-width: 180px;
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #cdd6f4;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.rcp-reason-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Pass-2b action bar (kill / restart / recreate) ------------------------- */
+
+.rcp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.3rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #313244;
+}
+
+/* The actor/reason row lives inside the action bar (full-width, no second
+   divider -- the bar's own top border already separates it from the log). */
+.rcp-actions .rcp-action-context {
+  flex: 1 1 100%;
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.rcp-action-btn {
+  font-weight: 600;
+}
+
+.rcp-action-kill {
+  border-color: #f38ba8;
+  color: #f38ba8;
+  background: transparent;
+}
+
+.rcp-action-kill:hover:not(:disabled) {
+  background: rgba(243, 139, 168, 0.12);
+}
+
+.rcp-action-pending {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #f9e2af;
+}
+
+.rcp-action-notice {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #a6e3a1;
+}
+
