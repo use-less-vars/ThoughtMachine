@@ -1592,8 +1592,8 @@ class ContainerManager:
         # ── Exec-path drift admission (fail-safe) ─────────────────────────────────
         # Deny when the LIVE container is more permissive than a RESOLVED session
         # policy; warn (and continue) when it differs but is not more
-        # permissive.  An UNRESOLVABLE policy proves nothing, so it (like any
-        # other classifier error) degrades to "run as today".
+        # permissive.  An UNRESOLVABLE policy proves nothing, so it FAILS CLOSED
+        # (refused); only an unexpected classifier error degrades to "run as today".
         _drift_action, _drift_payload = self._check_exec_drift(container, container_id)
         if _drift_action == "deny":
             return _drift_payload
@@ -1680,8 +1680,9 @@ class ContainerManager:
 
         The session policy is resolved with ``strict=True``: when the policy
         SSOT is unavailable, an unresolvable policy PROVES NOTHING about the
-        live container, so we have no drift opinion and run as today (a deny
-        requires a genuinely RESOLVED policy proving live is more permissive).
+        live container, so we cannot certify the exec is within policy and
+        FAIL CLOSED --- the command is REFUSED (exit 126, deny payload with no
+        ``drift`` key) with a WARNING, an audit record and a record event.
         Any OTHER unexpected exception likewise degrades to ("run", None) as a
         last-resort so a classifier bug can never block legitimate exec.
         """
@@ -1696,15 +1697,48 @@ class ContainerManager:
                 )
             except Exception as exc:
                 # The policy SSOT could NOT be resolved at all.  This proves
-                # nothing about the live container, so we form no drift opinion
-                # and MUST NOT deny (deny requires a RESOLVED policy).
+                # nothing about the live container, so we CANNOT certify the
+                # exec is within policy -> FAIL CLOSED and refuse the command.
                 try:
                     log("WARNING", "docker.container_manager",
                         "session policy could not be resolved "
-                        f"({exc!r}); proceeding without exec drift opinion")
+                        f"({exc!r}); refusing to run (fail-closed)")
                 except Exception:
                     pass
-                return "run", None
+
+                try:
+                    _audit(_EXEC_DRIFT_AUDIT,
+                           "session policy could not be resolved; refusing exec")
+                except Exception:
+                    pass
+
+                try:
+                    labels = getattr(container, "labels", None) or {}
+                    record_id = labels.get(RECORD_LABEL_KEY)
+                    if record_id is not None and getattr(self, "workspace_id", None):
+                        from thoughtmachine.container_record import append_event
+                        append_event(
+                            self.workspace_id,
+                            str(record_id),
+                            _EXEC_DRIFT_EVENT,
+                            _EXEC_DRIFT_ACTOR,
+                            decision="deny",
+                            reason="policy_unresolved",
+                            detail=(f"session policy could not be resolved "
+                                    f"({exc!r})"),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                except Exception:
+                    pass
+
+                return "deny", {
+                    "stdout": "",
+                    "stderr": (
+                        "refusing to run: session policy could not be resolved "
+                        f"({exc!r})"
+                    ),
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                }
 
             if self._config_matches(container, want_net, want_ws):
                 return "run", None

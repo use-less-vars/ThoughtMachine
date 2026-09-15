@@ -148,6 +148,23 @@ def events(monkeypatch):
     return recorded
 
 
+@pytest.fixture
+def warnings(monkeypatch):
+    """Capture ``log(...)`` calls emitted by ``infra.container_manager``.
+
+    Same idiom as the ``events`` fixture: patch the module-level logging entry
+    point so the emitted (level, component, message) triples are recorded and
+    can be asserted on.
+    """
+    calls = []
+
+    def _fake_log(level, component, message, *args, **kwargs):
+        calls.append((level, component, message))
+
+    monkeypatch.setattr(container_manager, "log", _fake_log, raising=True)
+    return calls
+
+
 # ---------------------------------------------------------------------------
 # (a) clean match -> runs exactly as today, no drift key, no event
 # ---------------------------------------------------------------------------
@@ -287,6 +304,7 @@ def test_attrs_raise_degrades_to_run(events):
     cm = _make_cm(_FakeDockerClient([ctr]))
     result = cm.exec("c1", "echo hi")
 
+    # Site B: intentional, see Main ruling — do not flip absent-mindedly
     assert result["exit_code"] == 0
     assert "drift" not in result
     assert _command_ran(ctr)
@@ -317,16 +335,17 @@ def test_structurally_absent_attrs_run(events):
 
 
 # ---------------------------------------------------------------------------
-# (f) UNRESOLVABLE session policy -> no drift opinion -> RUN (regression pin)
+# (f) UNRESOLVABLE session policy -> REFUSE (fail CLOSED), cmd NOT run, exit 126
 # ---------------------------------------------------------------------------
 
 
-def test_unresolved_policy_degrades_to_run(events, monkeypatch):
-    """The policy SSOT is unavailable -> an unresolvable policy must NOT deny.
+def test_unresolved_policy_refuses(events, warnings, monkeypatch):
+    """The policy SSOT is unavailable -> an unresolvable policy must REFUSE.
 
-    A HEALTHY live container (bridge + /workspace rw) that a genuinely RESOLVED
-    restrictive policy WOULD deny must still RUN when the policy cannot be
-    resolved at all (previously this fail-CLOSED to ("none","ro") and denied).
+    RED-first (R1): production still returns ("run", None) here, so this test
+    currently fails (e.g. expected exit_code 126, got 0).  After the fix the
+    command is NEVER run: refusal payload (exit 126, empty stdout, non-empty
+    "refus*" stderr, NO "drift" key) + a WARNING + an audit event.
     """
     import security.security_gate as sg
 
@@ -341,15 +360,24 @@ def test_unresolved_policy_degrades_to_run(events, monkeypatch):
     del cm._compute_config  # exercise the REAL resolver (strict=True path)
     result = cm.exec("c1", "echo hi")
 
-    assert result["exit_code"] != 126
-    assert result["exit_code"] == 0
+    # Refusal payload shape (deny-style, but with NO drift diff to report).
+    assert result["exit_code"] == 126
+    assert result["stdout"] == ""
+    assert "refus" in result["stderr"].lower()
     assert "drift" not in result
-    assert _command_ran(ctr)
-    assert events == []
+    # Command was NEVER executed.
+    assert not _command_ran(ctr)
+    assert ctr.exec_calls == []
+    # A WARNING was emitted when the policy could not be resolved.
+    assert any(lvl == "WARNING" for lvl, *_ in warnings)
+    # An audit event was recorded for the refusal.
+    assert events != []
+    assert events[0]["workspace_id"] == "w1"
+    assert events[0]["event_type"]
 
 
-def test_unresolved_non_containerconfig_degrades_to_run(events, monkeypatch):
-    """Resolver returns a non-ContainerConfig -> unresolved -> RUN."""
+def test_unresolved_non_containerconfig_refuses(events, warnings, monkeypatch):
+    """Resolver returns a non-ContainerConfig -> unresolved -> REFUSE (exit 126)."""
     import security.security_gate as sg
 
     monkeypatch.setattr(sg, "get_workspace_capabilities",
@@ -357,15 +385,20 @@ def test_unresolved_non_containerconfig_degrades_to_run(events, monkeypatch):
     monkeypatch.setattr(sg, "resolve_container_config",
                         lambda perms, caps, lifecycle: object(), raising=True)
 
-    ctr = _FakeContainer("c1", attrs=_attrs("bridge", True))
+    ctr = _FakeContainer("c1", labels={RECORD_LABEL_KEY: "rec-1"},
+                         attrs=_attrs("bridge", True))
     cm = _make_cm(_FakeDockerClient([ctr]))
     del cm._compute_config
     result = cm.exec("c1", "echo hi")
 
-    assert result["exit_code"] == 0
+    assert result["exit_code"] == 126
+    assert result["stdout"] == ""
+    assert "refus" in result["stderr"].lower()
     assert "drift" not in result
-    assert _command_ran(ctr)
-    assert events == []
+    assert not _command_ran(ctr)
+    assert ctr.exec_calls == []
+    assert any(lvl == "WARNING" for lvl, *_ in warnings)
+    assert events != []
 
 
 # ---------------------------------------------------------------------------

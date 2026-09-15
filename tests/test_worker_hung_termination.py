@@ -124,14 +124,61 @@ class TestExecutionTrackerRegister(unittest.TestCase):
 
 class TestExecutionTrackerTermination(unittest.TestCase):
     def test_terminate_container_exec_minimal_docker_kill(self):
-        cm = FakeContainerManager()
+        # The container must RESOLVE and be WORKER-OWNED (thoughtmachine.worker
+        # label matches the worker) so the minimal kill is admissible.
+        cm = FakeContainerManager(containers=[
+            {"container_id": "c1", "name": "agent-exec-x",
+             "labels": {"thoughtmachine.worker": "w1"}},
+        ])
         tracker = ExecutionTracker()
         tracker.add("e1", {"type": "container_exec", "container_id": "c1", "pid": 4242})
-        tracker.terminate_all("w1", cm, None)
+        tracker.terminate_all("w1", cm, None, session_id="s1")
         # Minimal touch: exec_run kill <pid>, never stop the container.
         self.assertEqual(cm.exec_run_calls, [("c1", ["kill", "4242"])])
         self.assertEqual(cm.stopped, [])
         self.assertEqual(tracker.active_count(), 0)
+
+    def test_container_exec_pid_non_worker_owned_no_kill(self):
+        """Site C: a container_id+pid that is NOT worker-owned must NOT be
+        exec-killed (no ``docker exec ... kill``), and must emit a WARNING.
+
+        RED-first (R1): production currently runs ``docker exec <id> kill
+        <pid>`` for ANY container id (no ownership check), so the
+        ``exec_run_calls == []`` assertion fails today with
+        ``[('c-res', ['kill', '4242'])]``.
+        """
+        import tools.workspace.worker_execution as we
+
+        cases = [
+            # (a) resolves to a shared RESOURCE container (never worker-owned)
+            [{"container_id": "c-res", "name": "tm-res-abc-git",
+              "image": "tm-resource-git",
+              "labels": {"thoughtmachine.resource": "git"}}],
+            # (b) does NOT resolve at all (not listed by the manager)
+            [],
+        ]
+        for containers in cases:
+            cm = FakeContainerManager(containers=containers)
+            tracker = ExecutionTracker()
+            tracker.add("e1", {"type": "container_exec",
+                               "container_id": "c-res", "pid": 4242})
+            logged = []
+
+            def _fake_log(level, component, message, *a, **k):
+                logged.append((level, component, message))
+
+            with mock.patch.object(we, "_log", _fake_log):
+                tracker.terminate_all("w1", cm, None, session_id="s1")
+
+            # No in-container kill for a non-owned / unresolvable container.
+            self.assertEqual(cm.exec_run_calls, [])
+            self.assertEqual(cm.stopped, [])
+            # A WARNING was emitted for the skipped, inadmissible kill.
+            self.assertTrue(
+                any(lvl == "WARNING" for lvl, *_ in logged),
+                f"expected a WARNING for the skipped non-owned kill; got {logged!r}",
+            )
+            self.assertEqual(tracker.active_count(), 0)
 
     def test_terminate_container_exec_subprocess_sigterm(self):
         tracker = ExecutionTracker()

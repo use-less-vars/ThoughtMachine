@@ -304,13 +304,22 @@ class ExecutionTracker:
 
         With ``container_id`` + ``pid`` the minimal action is a
         ``docker exec <container> kill <pid>`` — the container itself keeps
-        running and is never stopped. Without a pid the container is stopped
-        ONLY when it is worker-owned (``thoughtmachine.worker`` label matches
-        the worker); resource/shared containers are never touched.
+        running and is never stopped. This is applied ONLY when the container
+        is worker-owned (``thoughtmachine.worker`` label matches the worker);
+        resource/shared/unresolvable containers are never touched. Without a
+        pid the container is stopped ONLY when it is worker-owned; resource/
+        shared containers are never touched.
         """
         container_id = details.get("container_id")
         pid = details.get("pid")
         if container_id and pid:
+            info = _container_info(container_manager, container_id)
+            if not _is_worker_owned_container(info, worker_id, session_id):
+                _log("WARNING", "workspace.lifecycle",
+                     f"terminate_all: container_exec {execution_id} pid={pid} "
+                     f"container {container_id} is not worker-owned — skipping "
+                     f"(never touch resource/shared containers)")
+                return
             self._docker_exec_kill(execution_id, container_id, int(pid), container_manager)
             return
         if not container_id:
