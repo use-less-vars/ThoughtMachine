@@ -13,6 +13,7 @@ import VaultHealthBanner from './VaultHealthBanner'
 import VaultHealthPanel from './VaultHealthPanel'
 import GlobalSessions from './GlobalSessions'
 import GlobalContainers from './GlobalContainers'
+import RecordContainerPanel from './RecordContainerPanel'
 import GlobalResources from './GlobalResources'
 import GlobalCredentials from './GlobalCredentials'
 import PromptLibrary from './PromptLibrary'
@@ -228,6 +229,10 @@ export default function WorkspaceSelector() {
         <section className="gms-section" aria-label="Active Containers">
           <h3 className="gms-section-title">Active Containers</h3>
           <GlobalContainers containers={containers} />
+        </section>
+
+        <section className="gms-section" aria-label="Container Records">
+          <RecordContainerPanel />
         </section>
 
         <section className="gms-section" aria-label="Global Resources">
