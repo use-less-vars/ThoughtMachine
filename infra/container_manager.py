@@ -297,18 +297,27 @@ def _exec_workspace_rank(workspace_mode):
     return _EXEC_WORKSPACE_RANK.get(workspace_mode, 2)
 
 
-def _exec_live_isolation(container):
+def _exec_live_isolation(container, *, strict=False):
     """Read (live_network_mode, live_workspace_mode) from a container's attrs.
 
-    Returns ``(None, None)`` when attrs is unreadable or not a dict.  A key that
-    is STRUCTURALLY ABSENT (no ``HostConfig`` dict, no ``Mounts`` list) yields
-    ``None`` for that axis — "cannot determine", i.e. no observable drift, so
-    pre-existing callers whose fakes omit these keys are unaffected.  A present
-    ``Mounts`` list without a ``/workspace`` destination yields ``"absent"``.
+    A key that is STRUCTURALLY ABSENT (no ``HostConfig`` dict, no ``Mounts``
+    list) yields ``None`` for that axis — the attrs are LEGIBLE but the field is
+    missing, i.e. no observable drift, so callers whose fakes omit these keys
+    are unaffected.  A present ``Mounts`` list without a ``/workspace``
+    destination yields ``"absent"``.
+
+    RULING: we do not run what we cannot prove is allowed.  With ``strict=True``
+    (the exec gate) an attrs read that RAISES PROPAGATES — "the read failed, so
+    we cannot tell" is NOT the same as "the fields are structurally absent"
+    (a deliberate, non-jurisdiction RUN case).  With ``strict=False`` (default;
+    the start-path caller) a read error keeps the legacy ``(None, None)``
+    "cannot determine" behaviour.
     """
     try:
         attrs = getattr(container, "attrs", None)
     except Exception:
+        if strict:
+            raise
         return None, None
     if not isinstance(attrs, dict):
         return None, None
@@ -1589,11 +1598,13 @@ class ContainerManager:
         if _denial is not None:
             raise PermissionError(_denial)
 
-        # ── Exec-path drift admission (fail-safe) ─────────────────────────────────
+        # ── Exec-path drift admission (fail-closed) ─────────────────────────────────
         # Deny when the LIVE container is more permissive than a RESOLVED session
         # policy; warn (and continue) when it differs but is not more
-        # permissive.  An UNRESOLVABLE policy proves nothing, so it FAILS CLOSED
-        # (refused); only an unexpected classifier error degrades to "run as today".
+        # permissive.  Anything that leaves the policy UNPROVABLE FAILS CLOSED
+        # (refused): an unresolvable policy, an unreadable container isolation,
+        # and any unexpected classifier error.  We do not run what we cannot
+        # prove is allowed.
         _drift_action, _drift_payload = self._check_exec_drift(container, container_id)
         if _drift_action == "deny":
             return _drift_payload
@@ -1683,8 +1694,18 @@ class ContainerManager:
         live container, so we cannot certify the exec is within policy and
         FAIL CLOSED --- the command is REFUSED (exit 126, deny payload with no
         ``drift`` key) with a WARNING, an audit record and a record event.
-        Any OTHER unexpected exception likewise degrades to ("run", None) as a
-        last-resort so a classifier bug can never block legitimate exec.
+
+        The live container's isolation is read with ``strict=True`` too, for the
+        same reason: an attrs read that RAISES means we cannot tell what the
+        container is isolated to, so the command is REFUSED the same way
+        (``reason="attrs_unresolved"``).  Isolation fields that are
+        STRUCTURALLY ABSENT (legible attrs, missing keys) stay a deliberate,
+        non-jurisdiction RUN case — that is NOT a refusal.
+
+        Finally, any OTHER exception raised by the classifier is ALSO
+        fail-closed (``reason="classifier_unresolved"``): the ruling is that we
+        do not run what we cannot prove is allowed, so a classifier error must
+        not be dressed up as an availability trade-off that runs the command.
         """
         try:
             try:
@@ -1743,7 +1764,55 @@ class ContainerManager:
             if self._config_matches(container, want_net, want_ws):
                 return "run", None
 
-            live_net, live_ws = _exec_live_isolation(container)
+            try:
+                live_net, live_ws = _exec_live_isolation(container, strict=True)
+            except Exception as exc:
+                # The container's live isolation could not be READ at all.  That
+                # proves nothing about the container, so we cannot certify the
+                # exec is within policy -> FAIL CLOSED and refuse.  (An attrs
+                # that is LEGIBLE but missing isolation keys is a DIFFERENT case:
+                # it just yields ``None`` and RUNs below.)
+                try:
+                    log("WARNING", "docker.container_manager",
+                        "container isolation could not be read "
+                        f"({exc!r}); refusing to run (fail-closed)")
+                except Exception:
+                    pass
+
+                try:
+                    _audit(_EXEC_DRIFT_AUDIT,
+                           "container isolation could not be read; refusing exec")
+                except Exception:
+                    pass
+
+                try:
+                    labels = getattr(container, "labels", None) or {}
+                    record_id = labels.get(RECORD_LABEL_KEY)
+                    if record_id is not None and getattr(self, "workspace_id", None):
+                        from thoughtmachine.container_record import append_event
+                        append_event(
+                            self.workspace_id,
+                            str(record_id),
+                            _EXEC_DRIFT_EVENT,
+                            _EXEC_DRIFT_ACTOR,
+                            decision="deny",
+                            reason="attrs_unresolved",
+                            detail=(f"container isolation could not be read "
+                                    f"({exc!r})"),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                except Exception:
+                    pass
+
+                return "deny", {
+                    "stdout": "",
+                    "stderr": (
+                        "refusing to run: container isolation could not be "
+                        f"read ({exc!r})"
+                    ),
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                }
+
             decision, reason = _exec_drift_decision(
                 live_net, live_ws, want_net, want_ws
             )
@@ -1780,13 +1849,50 @@ class ContainerManager:
                     "drift": drift,
                 }
             return "warn", drift
-        except Exception as exc:  # fail-safe: never block exec on classifier error
+        except Exception as exc:
+            # The drift classifier itself failed before reaching a decision, so
+            # we cannot certify the exec is within policy.  FAIL CLOSED (ruling:
+            # we do not run what we cannot prove is allowed).  Mirrors the
+            # policy-unresolved refusal above.
             try:
                 log("WARNING", "docker.container_manager",
-                    f"exec drift check failed ({exc!r}); proceeding")
+                    "exec drift check failed "
+                    f"({exc!r}); refusing to run (fail-closed)")
             except Exception:
                 pass
-            return "run", None
+
+            try:
+                _audit(_EXEC_DRIFT_AUDIT,
+                       "exec drift check failed; refusing exec")
+            except Exception:
+                pass
+
+            try:
+                labels = getattr(container, "labels", None) or {}
+                record_id = labels.get(RECORD_LABEL_KEY)
+                if record_id is not None and getattr(self, "workspace_id", None):
+                    from thoughtmachine.container_record import append_event
+                    append_event(
+                        self.workspace_id,
+                        str(record_id),
+                        _EXEC_DRIFT_EVENT,
+                        _EXEC_DRIFT_ACTOR,
+                        decision="deny",
+                        reason="classifier_unresolved",
+                        detail=(f"exec drift check failed ({exc!r})"),
+                        detected_at=datetime.now(timezone.utc).isoformat(),
+                    )
+            except Exception:
+                pass
+
+            return "deny", {
+                "stdout": "",
+                "stderr": (
+                    "refusing to run: exec drift check failed "
+                    f"({exc!r})"
+                ),
+                "exit_code": _EXEC_DRIFT_EXIT_CODE,
+            }
 
     def _emit_exec_drift_once(self, container_id, container, signature, decision,
                               reason, want_net, want_ws, live_net, live_ws):
@@ -3043,6 +3149,11 @@ class ContainerManager:
         try:
             attrs = container.attrs
         except Exception:
+            # Cannot READ attrs -> cannot prove a match, so report "no match".
+            # The exec gate does not lean on this swallow: it re-reads isolation
+            # with ``_exec_live_isolation(strict=True)`` and REFUSES (fail
+            # closed) when that read RAISES.  ``False`` here only routes the
+            # caller to that strict read.
             return False
         actual_network = (attrs.get("HostConfig") or {}).get("NetworkMode")
         workspace_rw = None

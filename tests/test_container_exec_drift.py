@@ -67,7 +67,9 @@ class _RaisingAttrsContainer(_FakeContainer):
         self.name = name or container_id
         self.image = _FakeImageRef()
         self.status = "running"
-        self.labels = {}
+        # Carry a container RECORD label like the other fakes so the refusal
+        # path can record its event against a real record id.
+        self.labels = {RECORD_LABEL_KEY: "rec-1"}
         self.removed = []
         self.exec_calls = []
         self._exec_result = None
@@ -295,20 +297,73 @@ def test_memoised_emission_and_decision_still_applies(events):
 
 
 # ---------------------------------------------------------------------------
-# (e) fail-safe: unreadable attrs -> run as today, never crash
+# (e) fail-CLOSED: an UNREADABLE attrs (the read RAISES -> we cannot tell) is
+#     REFUSED; LEGIBLE attrs with structurally-absent isolation fields stay a
+#     deliberate non-jurisdiction RUN case.
 # ---------------------------------------------------------------------------
 
 
-def test_attrs_raise_degrades_to_run(events):
+def test_unreadable_attrs_refuses(events, warnings):
+    """Unreadable attrs (the attrs read RAISES) -> REFUSE (fail CLOSED).
+
+    The container's isolation cannot be READ at all, so we cannot tell what it
+    is isolated to -> per the ruling we do not run what we cannot prove is
+    allowed.  The command is NEVER run: refusal payload (exit 126, empty stdout,
+    non-empty "refus*" stderr, NO "drift" key) + a WARNING + an audit event.
+    """
     ctr = _RaisingAttrsContainer("c1")
     cm = _make_cm(_FakeDockerClient([ctr]))
     result = cm.exec("c1", "echo hi")
 
-    # Site B: intentional, see Main ruling — do not flip absent-mindedly
-    assert result["exit_code"] == 0
+    # Refusal payload shape (deny-style, but with NO drift diff to report).
+    assert result["exit_code"] == 126
+    assert result["stdout"] == ""
+    assert "refus" in result["stderr"].lower()
     assert "drift" not in result
-    assert _command_ran(ctr)
-    assert events == []
+    # Command was NEVER executed.
+    assert not _command_ran(ctr)
+    assert ctr.exec_calls == []
+    # A WARNING was emitted when the container's isolation could not be read.
+    assert any(lvl == "WARNING" for lvl, *_ in warnings)
+    # An audit event was recorded for the refusal.
+    assert events != []
+    assert events[0]["workspace_id"] == "w1"
+    assert events[0]["event_type"]
+
+
+def test_outer_classifier_error_refuses(events, warnings, monkeypatch):
+    """An error in the OUTER classifier body -> REFUSE (fail CLOSED), exit 126.
+
+    The drift classifier raised before reaching a decision (here the helper the
+    outer body calls, ``_config_matches``, is patched to re-raise).  Per the
+    ruling we do not run what we cannot prove is allowed: the refusal payload
+    (exit 126, empty stdout, non-empty "refus*" stderr, NO "drift" key) is
+    returned with a WARNING + an audit event, and the command is NEVER run.
+    """
+    ctr = _FakeContainer("c1", labels={RECORD_LABEL_KEY: "rec-1"},
+                         attrs=_attrs("none", False))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("classifier exploded")
+
+    cm = _make_cm(_FakeDockerClient([ctr]))
+    monkeypatch.setattr(cm, "_config_matches", _boom, raising=True)
+    result = cm.exec("c1", "echo hi")
+
+    # Refusal payload shape (deny-style, but with NO drift diff to report).
+    assert result["exit_code"] == 126
+    assert result["stdout"] == ""
+    assert "refus" in result["stderr"].lower()
+    assert "drift" not in result
+    # Command was NEVER executed.
+    assert not _command_ran(ctr)
+    assert ctr.exec_calls == []
+    # A WARNING was emitted when the classifier failed.
+    assert any(lvl == "WARNING" for lvl, *_ in warnings)
+    # An audit event was recorded for the refusal.
+    assert events != []
+    assert events[0]["workspace_id"] == "w1"
+    assert events[0]["event_type"]
 
 
 def test_attrs_none_degrades_to_run(events):
