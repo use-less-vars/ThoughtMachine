@@ -42,7 +42,7 @@ from thoughtmachine.container_record.models import (
 #: ``lifecycle_class -> (agent_reachable, own_lifecycle, gc_age_s, drift_axes)``.
 _EXPECTED = {
     LIFECYCLE_PERSISTENT: (True, False, 86400, {"identity", "policy", "runtime", "image", "hardening"}),
-    LIFECYCLE_EPHEMERAL: (True, False, None, {"image"}),
+    LIFECYCLE_EPHEMERAL: (True, False, 86400, {"image"}),
     LIFECYCLE_RESOURCE: (False, True, None, {"image"}),
     LIFECYCLE_SERVICE: (False, True, None, {"image"}),
 }

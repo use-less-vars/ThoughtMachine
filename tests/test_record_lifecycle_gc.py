@@ -19,6 +19,7 @@ import pytest
 import infra.container_manager as container_manager
 from infra.container_manager import sweep_orphan_container_records
 from thoughtmachine.container_record import (
+    LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     LIFECYCLE_SERVICE,
@@ -268,3 +269,53 @@ def test_docker_unavailable_soft_fails():
     assert result["removed"] == 0
     assert result["detail"].startswith("docker unavailable:")
     assert path.is_file()
+
+
+# ---------------------------------------------------------------------------
+# (k) per-CLASS policy TTL governs the age gate (ephemeral is bounded, 24 h)
+#     R3 precedence: per-record retention_days -> per-class
+#     policy.workspace_gc_max_age_s -> global default_max_age_s.
+#     For an ephemeral record the effective TTL is the POLICY value (86400 s),
+#     NOT the run's global default.
+# ---------------------------------------------------------------------------
+
+
+def test_ephemeral_ttl_comes_from_policy_not_global_default():
+    # Two days old: past the 1-day (86400 s) ephemeral policy TTL, but well
+    # inside a 30-day global default.  The policy value wins -> reaped.
+    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_EPHEMERAL,
+                 age_days=2)
+    result = _sweep(default_max_age_s=30 * 86400)
+    assert result["removed"] == 1
+    assert result["removed_records"] == ["rec-1"]
+    assert not path.is_file()
+
+
+def test_ephemeral_young_record_retained_despite_short_global_default():
+    # Two hours old: younger than the 1-day ephemeral policy TTL, but older
+    # than a 1-hour global default.  The policy value wins -> still "too young".
+    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_EPHEMERAL,
+                 age_days=2 / 24)
+    result = _sweep(default_max_age_s=3600)
+    assert result["removed"] == 0
+    assert result["skipped"] == 1
+    assert "too young" in result["detail"]
+    assert path.is_file()
+
+
+# ---------------------------------------------------------------------------
+# (l) per-CLASS policy TTL governs PERSISTENT too (86400 s), regardless of the
+#     run's global default — parity with the ephemeral pair above.
+# ---------------------------------------------------------------------------
+
+
+def test_persistent_ttl_comes_from_policy_not_global_default():
+    # Two days old: past the 1-day (86400 s) persistent policy TTL, but well
+    # inside a 30-day global default.  The policy value wins -> reaped.
+    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_PERSISTENT,
+                 age_days=2)
+    result = _sweep(default_max_age_s=30 * 86400)
+    assert result["removed"] == 1
+    assert result["removed_records"] == ["rec-1"]
+    assert not path.is_file()
+
