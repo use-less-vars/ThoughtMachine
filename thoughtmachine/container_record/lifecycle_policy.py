@@ -120,7 +120,8 @@ class LifecyclePolicy:
         own_lifecycle: whether the container manages its own lifecycle (the
             workspace does not stop/GC it).
         workspace_gc_max_age_s: age, in seconds, after which an unowned
-            workspace container may be garbage-collected (``None`` = exempt).
+            workspace container may be garbage-collected (``None`` = no
+            opinion, fall through to the next tier — never an exemption).
         drift_axes: the drift classes compared for this lifecycle class.
         restart_policy: the Docker restart policy applied when a container of
             this class is created (``None`` = unset, i.e. Docker's default
@@ -137,16 +138,21 @@ class LifecyclePolicy:
 
 #: The policy table, keyed by lifecycle class.
 #:
-#: ``workspace_gc_max_age_s = 86400`` mirrors the garbage collector's
-#: ``TM_GC_ORPHAN_RESOURCE_CONTAINER_HOURS`` default of 24 h (``vault_gc``).
+#: ``workspace_gc_max_age_s`` records the class's OPINION on how old an
+#: orphaned container may grow before the workspace GC reaps it. It is an
+#: OPINION, not an exemption. ``86400`` mirrors the garbage collector's
+#: ``TM_GC_ORPHAN_RESOURCE_CONTAINER_HOURS`` default of 24 h (``vault_gc``);
+#: ``None`` means "no opinion — fall through to the next tier".
 #:
-#: ``workspace_gc_max_age_s = None`` is OVERLOADED and means two different
-#: things depending on the class:
-#:   * EPHEMERAL — exempt from workspace GC: the workspace garbage collector
-#:     must NOT reap the container (``None`` = never ages out).
-#:   * RESOURCE / SERVICE — not applicable, because ``own_lifecycle=True``:
-#:     these classes manage their own lifecycle, so workspace GC never
-#:     considers their age.
+#: Sweeper age precedence (per record):
+#:   1. per-record ``retention_days`` (when a positive int),
+#:   2. else the per-class ``policy.workspace_gc_max_age_s`` (when not ``None``),
+#:   3. else the global ``default_max_age_s``.
+#: ``None`` at any tier falls through to the next — it NEVER means "exempt".
+#:
+#: Exemption from workspace GC is expressed ONLY by ``own_lifecycle=True``
+#: (the class-gate skip): RESOURCE / SERVICE manage their own lifecycle, so
+#: the sweeper skips them outright, regardless of their ``workspace_gc_max_age_s``.
 POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
     LIFECYCLE_PERSISTENT: LifecyclePolicy(
         class_name=LIFECYCLE_PERSISTENT,
@@ -160,7 +166,7 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         class_name=LIFECYCLE_EPHEMERAL,
         agent_reachable=True,
         own_lifecycle=False,
-        workspace_gc_max_age_s=None,
+        workspace_gc_max_age_s=86400,
         drift_axes=_IMAGE_AXIS,
         restart_policy="no",
     ),

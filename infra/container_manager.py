@@ -3538,6 +3538,7 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
     return result
 
 
+# ``default_max_age_s`` is now a DORMANT FALLBACK — every lifecycle class that reaches this age gate carries an explicit ``workspace_gc_max_age_s``, and ``own_lifecycle=True`` classes skip the gate entirely, so per-class policy is authoritative (see the precedence docstring in ``thoughtmachine/container_record/lifecycle_policy.py``).
 def sweep_orphan_container_records(*, registered_workspace_ids=None,
                                    default_max_age_s=86400, dry_run=False,
                                    docker_client=None) -> dict:
@@ -3681,6 +3682,8 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
             if isinstance(retention, int) and not isinstance(retention, bool) \
                     and retention > 0:
                 max_age_s = retention * 86400
+            elif policy.workspace_gc_max_age_s is not None:
+                max_age_s = policy.workspace_gc_max_age_s
             else:
                 max_age_s = default_max_age_s
             if now - ts < max_age_s:

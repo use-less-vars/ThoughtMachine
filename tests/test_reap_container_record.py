@@ -22,7 +22,10 @@ import pytest
 import infra.container_manager as container_manager
 from infra.container_manager import ContainerManager, reap_container_record
 from thoughtmachine.container_record import (
+    LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
+    LIFECYCLE_SERVICE,
     OWNER_WORKSPACE,
     create_record,
     load_record,
@@ -287,3 +290,34 @@ def test_cli_json_apply_shape(cli, monkeypatch, capsys):
     assert payload["applied"] is True
     assert payload["reason"] == "ok"
     assert payload["exit_code"] == 0
+
+
+# ---------------------------------------------------------------------------
+# (7b) class gate: EPHEMERAL records ARE force-reaped (they do not own their
+#      lifecycle); RESOURCE / SERVICE are still refused (lifecycle_own).
+# ---------------------------------------------------------------------------
+
+
+def test_ephemeral_record_is_force_reaped():
+    path = _mint(_WS, "rec-1", lifecycle_class=LIFECYCLE_EPHEMERAL,
+                 docker_id="d" * 16, age_days=0)
+    result = reap_container_record(
+        _WS, "rec-1", apply=True, docker_client=_FakeDocker([]))
+    assert result["found"] is True
+    assert result["reaped"] is True
+    assert result["applied"] is True
+    assert result["reason"] == "ok"
+    assert not path.is_file()
+
+
+@pytest.mark.parametrize("lifecycle_class",
+                         [LIFECYCLE_RESOURCE, LIFECYCLE_SERVICE])
+def test_own_lifecycle_classes_are_refused_by_force_reap(lifecycle_class):
+    path = _mint(_WS, "rec-1", lifecycle_class=lifecycle_class,
+                 docker_id="d" * 16, age_days=10)
+    result = reap_container_record(
+        _WS, "rec-1", apply=True, docker_client=_FakeDocker([]))
+    assert result["reaped"] is False
+    assert result["reason"] == "lifecycle_own"
+    assert path.is_file()
+
