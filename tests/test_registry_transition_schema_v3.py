@@ -92,9 +92,29 @@ class _FakeContainers:
                 return c
         raise LookupError(container_id)
 
+    def list(self, all=False, filters=None):  # noqa: A002 - docker signature
+        label = (filters or {}).get("label")
+        if label is None:
+            return list(self._containers)
+        if isinstance(label, str):
+            label = [label]
+        out = []
+        for c in self._containers:
+            labels = dict(getattr(c, "labels", None) or {})
+            if all(
+                labels.get(spec.partition("=")[0]) == spec.partition("=")[2]
+                for spec in label
+            ):
+                out.append(c)
+        return out
+
 
 def _client(containers=None):
-    return type("_C", (), {"containers": _FakeContainers(containers or [])})()
+    return type(
+        "_C",
+        (),
+        {"containers": _FakeContainers(containers or []), "ping": lambda self: True},
+    )()
 
 
 def _make_manager(workspace_id, vault_root, client, **overrides):
@@ -432,7 +452,7 @@ def test_start_create_indexes_record_then_reuses(tmp_path):
             self.items.append(ctr)
             return ctr
 
-    client = type("_C", (), {"containers": _Containers()})()
+    client = type("_C", (), {"containers": _Containers(), "ping": lambda self: True})()
     cm = _make_manager(
         "ws-create", vault, client,
         _find_by_labels=MagicMock(return_value=None))

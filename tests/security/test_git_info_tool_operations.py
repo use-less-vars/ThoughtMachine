@@ -126,16 +126,28 @@ def _tool(tmp_path, **params):
     """Construct a GitWriteTool wired to the workspace for path validation.
 
     Write operations require the session git permission, so it is set
-    by default unless the caller overrides agent_config explicitly.
+    by default unless the caller overrides agent_config explicitly. The
+    resolved session/effective permission grains are also defaulted to
+    git:"write" (satisfying git:read and git:write) unless the caller
+    supplies them, reproducing the fully-allowed behaviour.
     """
     params.setdefault("agent_config", {"session_permissions": {"git": "write"}})
+    params.setdefault("session_permissions", {"git": "write"})
+    params.setdefault("effective_permissions", {"git": "write"})
     tool = GitWriteTool(**params)
     object.__setattr__(tool, "workspace_path", str(tmp_path))
     return tool
 
 
 def _read_tool(tmp_path, **params):
-    """Construct a GitInfoTool (read operations) wired to the workspace."""
+    """Construct a GitInfoTool (read operations) wired to the workspace.
+
+    Read operations require the session git permission, so the resolved
+    session/effective permission grains are defaulted to git:"write"
+    (satisfying git:read) unless the caller supplies them.
+    """
+    params.setdefault("session_permissions", {"git": "write"})
+    params.setdefault("effective_permissions", {"git": "write"})
     tool = GitInfoTool(**params)
     object.__setattr__(tool, "workspace_path", str(tmp_path))
     return tool
@@ -774,6 +786,11 @@ class TestNoRawFlagsExposed:
         ) == ["git:read"]
         assert GitInfoTool.get_required_categories(
             {"operation": "branch_list"}
+        ) == ["git:read"]
+        # ``remote`` is a pure local read (configured remotes): it must NOT
+        # require network:outbound.
+        assert GitInfoTool.get_required_categories(
+            {"operation": "remote"}
         ) == ["git:read"]
 
 

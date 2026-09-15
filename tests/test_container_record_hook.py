@@ -105,6 +105,9 @@ class _FakeDockerClient:
     def __init__(self, containers=None):
         self.containers = _FakeContainers(containers or [])
 
+    def ping(self):
+        return True
+
 
 class _RaisingCtr:
     """Container whose inspect ``attrs`` access blows up (best-effort capture)."""

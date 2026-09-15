@@ -68,6 +68,9 @@ class _FakeClient:
             payloads, raise_on_list=raise_on_list
         )
 
+    def ping(self):
+        return True
+
 
 def _install_fake_docker(monkeypatch, client):
     """Install a stub ``docker`` module whose ``from_env()`` returns *client*."""
@@ -441,6 +444,9 @@ class _WoCContainers:
 class _WoCClient:
     def __init__(self):
         self.containers = _WoCContainers()
+
+    def ping(self):
+        return True
 
 
 def _woc_manager(ws, client, vault):

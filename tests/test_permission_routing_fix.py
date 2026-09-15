@@ -189,8 +189,37 @@ class TestContainerPath:
         assert manager.calls == []
 
 
+class TestUnresolvedSessionPermissions:
+    """``None`` session_permissions is fail-CLOSED (unresolved), never a bypass.
+
+    A ``None`` session means the permission context could not be resolved at
+    all (it is not a granted profile), so both execution paths must refuse
+    rather than run git with the gate silently skipped.
+    """
+
+    def test_host_none_session_permissions_raises(self, tmp_path, fake_sandbox):
+        tool = _tool("commit", None, None)
+        with pytest.raises(RuntimeError, match="session_permissions_unresolved"):
+            tool._exec_host_raw(tmp_path, ["commit", "-m", "x"])
+
+    def test_container_none_session_permissions_raises(self, tmp_path):
+        manager = FakeManager()
+        tool = _tool("commit", None, None)
+        object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+        object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+        object.__setattr__(tool, "_ensure_resource_container", lambda: manager)
+        with pytest.raises(PermissionError, match="session_permissions_unresolved"):
+            tool._exec_container_raw(tmp_path, ["commit", "-m", "x"])
+        assert manager.calls == []
+
+
 class TestExecuteNetworkGate:
-    """execute(): the network atomic re-check must defer for 'ask'."""
+    """execute(): ``remote`` no longer requires ``network:outbound``.
+
+    A ``remote`` read needs only ``git:read``; the atomic
+    ``network:outbound`` re-check was removed, so a banned/absent network
+    grain must NOT block the operation.
+    """
 
     def test_network_ask_defers_gate(self):
         tool = _tool(
@@ -201,23 +230,20 @@ class TestExecuteNetworkGate:
         result = tool.execute()
         assert "Atomic permission check failed" not in result
 
-    def test_network_banned_denied(self):
+    def test_network_banned_still_served(self):
         tool = _tool(
             "remote",
             {"network": "banned", "git": "read"},
             {"network": "banned", "git": "read"},
         )
         result = tool.execute()
-        assert (
-            "Atomic permission check failed: network:outbound required for remote"
-            in result
-        )
+        assert "Atomic permission check failed" not in result
 
-    def test_network_missing_fail_closed(self):
-        """No effective_permissions: the gate still runs and denies."""
+    def test_network_missing_still_served(self):
+        """No effective_permissions: ``remote`` needs only ``git:read``."""
         tool = _tool("remote", {"git": "read"}, None)
         result = tool.execute()
-        assert "Atomic permission check failed" in result
+        assert "Atomic permission check failed" not in result
 
     def test_clone_ask_network_defers_gate(self):
         """clone is a network op too; 'ask' must defer before URL validation."""

@@ -1021,22 +1021,21 @@ class TestPermissionRouting:
         result = tool.execute()
         assert "Atomic permission check failed" not in result
 
-    def test_network_banned_fail_closed(self):
+    def test_network_banned_still_served(self):
+        # ``remote`` needs only git:read; the network:outbound atomic re-check
+        # was removed, so a banned network grain must NOT block the read.
         tool = _git_tool(
             "remote",
             {"network": "banned", "git": "read"},
             {"network": "banned", "git": "read"},
         )
         result = tool.execute()
-        assert (
-            "Atomic permission check failed: network:outbound required for remote"
-            in result
-        )
+        assert "Atomic permission check failed" not in result
 
-    def test_network_missing_fail_closed(self):
+    def test_network_missing_still_served(self):
         tool = _git_tool("remote", {"git": "read"}, None)
         result = tool.execute()
-        assert "Atomic permission check failed" in result
+        assert "Atomic permission check failed" not in result
 
     def test_clone_ask_network_defers_gate(self):
         tool = _git_tool(

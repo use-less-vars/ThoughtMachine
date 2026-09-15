@@ -188,7 +188,10 @@ class _FakeContainers:
 class _FakeClient:
     def __init__(self, images=None, containers=None):
         self.images = images
-        self.containers = containers
+        self.containers = containers if containers is not None else _FakeContainers()
+
+    def ping(self):
+        return True
 
 
 class _FakeDockerModule:

@@ -122,6 +122,7 @@ def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
         working_dir=str(repo),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
         agent_config={"session_permissions": {"git": "write"}},
     )
 
@@ -162,7 +163,12 @@ def test_container_path_commit_runs_githooks_only(tmp_path):
     --no-verify.
     """
     manager = _FakeManager()
-    tool = GitWriteTool(operation="commit", message="x")
+    tool = GitWriteTool(
+        operation="commit",
+        message="x",
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+        effective_permissions={"git": "write"},  # container path enforces the atomic git:write category
+    )
     object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
     object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
     object.__setattr__(tool, "_ensure_resource_container", lambda: manager)
@@ -209,6 +215,7 @@ def test_repo_root_outside_workspace_rejected(tmp_path):
         working_dir=str(proj),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
     )
     result = tool.execute()
     assert isinstance(result, str)
@@ -225,6 +232,7 @@ def test_status_still_works(hardened_repo):
         working_dir=str(repo),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
     )
     result = tool.execute()
     assert "a.txt" in result
@@ -310,6 +318,7 @@ def test_fsmonitor_config_not_executed(hardened_repo):
         working_dir=str(repo),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
     )
     result = tool.execute()
     assert "a.txt" in result
@@ -451,6 +460,7 @@ def test_normal_git_operations(hardened_repo):
             working_dir=str(repo),
             workspace_path=str(workspace),
             workspace_id=HOST_TEST_WS,
+            session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
             **kwargs,
         )
         result = tool.execute()
@@ -491,6 +501,7 @@ def test_textconv_driver_never_executes_via_show(tmp_path):
         working_dir=str(nested),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
     )
     result = tool.execute()
     assert "Git command failed" not in result
@@ -520,6 +531,7 @@ def test_textconv_disabled_but_builtin_diff_works(tmp_path):
         working_dir=str(repo),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
     )
     result = tool.execute()
     assert "Git command failed" not in result
