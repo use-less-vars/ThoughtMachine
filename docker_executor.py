@@ -25,7 +25,7 @@ integrity checks and container creation/recreation.
 
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 from agent.logging import log
-from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL
+from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL, host_user
 import docker
 import docker.types
 import hashlib
@@ -689,7 +689,7 @@ class DockerExecutor:
         # ── Create new container ──
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
-            "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
+            "/home/agent": f"rw,exec,size=256M,uid={os.getuid()},gid={os.getgid()}",
         }
         git_path = os.path.join(self.workspace_path, ".git")
         if os.path.isdir(git_path):
@@ -771,6 +771,13 @@ class DockerExecutor:
         if isinstance(_admission, Transform):
             network_mode = _admission.spec.network_mode
 
+        if os.getuid() == 0:
+            raise RuntimeError(
+                "root_host_unsupported: refusing to create a container for the "
+                "host root user (uid 0); the container user must match a "
+                "non-root host user"
+            )
+
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
@@ -780,7 +787,7 @@ class DockerExecutor:
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             read_only=True,
-            user="1000:1000",  # must match the user in Dockerfile
+            user=host_user(),  # container user matches the host uid:gid
             detach=True,
             tty=True,
             stdin_open=True,
@@ -809,7 +816,7 @@ class DockerExecutor:
         # Auto-create working directory with correct ownership if needed
         if workdir != "/workspace":
             self.container.exec_run(
-                cmd=["sh", "-c", f"mkdir -p {workdir} && chown agent:agent {workdir}"],
+                cmd=["sh", "-c", f"mkdir -p {workdir} && chown {os.getuid()}:{os.getgid()} {workdir}"],
                 workdir="/workspace"
             )
         try:

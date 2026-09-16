@@ -95,6 +95,10 @@ SCHEMA_FIELD_NAMES: tuple[str, ...] = (
     # falls back to its own default). Appended last to keep the on-disk key
     # order of v1-v3 records stable.
     "retention_days",
+    # ``user`` is the container user (``uid:gid``) recorded at attach time
+    # ("" = the record predates the field). Appended last to keep the on-disk
+    # key order of v1-v4 records stable.
+    "user",
 )
 
 #: Nested ``intent_snapshot`` field order (§1.1).
@@ -113,6 +117,9 @@ INTENT_SNAPSHOT_KEYS: tuple[str, ...] = (
     # ``restart_policy`` records the restart policy observed in the live
     # container's ``HostConfig.RestartPolicy.Name`` (``""`` when unset).
     "restart_policy",
+    # ``user`` records the container user (``uid:gid``) observed in the live
+    # container's ``Config.User`` (``""`` when unset).
+    "user",
 )
 
 #: ``event_log`` entry field order (§1.2).
@@ -185,6 +192,8 @@ class Record:
     name: str = ""
     #: Lifecycle retention window in days (``None`` = unset).
     retention_days: int | None = None
+    #: The container user (``uid:gid``) recorded at attach time ("" = unset).
+    user: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return the record as a plain dict in §1 field order."""
@@ -205,6 +214,7 @@ class Record:
             "restart_policy": self.restart_policy,
             "name": self.name,
             "retention_days": self.retention_days,
+            "user": self.user,
         }
 
     @classmethod
@@ -261,4 +271,5 @@ class Record:
             restart_policy=restart_policy,
             name=str(data.get("name", "") or ""),
             retention_days=retention_days,
+            user=str(data.get("user", "") or ""),
         )

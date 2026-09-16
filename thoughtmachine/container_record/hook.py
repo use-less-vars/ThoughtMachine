@@ -37,6 +37,8 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+from agent.config.defaults import host_user
+
 from .api import (
     attach_container,
     begin_record,
@@ -132,28 +134,33 @@ class _RecordHandle:
             return None
         docker_id = getattr(container, "id", "") or ""
         snapshot: dict | None = None
-        # Capture the intent snapshot at attach time only when the record does
-        # not already carry one (a natively authored snapshot wins).  Deriving
-        # it from the live container's inspect ``attrs`` is best-effort: any
-        # failure is logged and the attach proceeds without a snapshot.
-        if not self.record.intent_snapshot:
-            try:
-                attrs = getattr(container, "attrs", None)
+        user: str | None = None
+        # Capture the intent snapshot and the container user from the live
+        # container's inspect ``attrs``.  Both derivations are best-effort: any
+        # failure is logged and the attach proceeds without a snapshot (and
+        # without a recorded user, leaving the record's ``user`` untouched).
+        # The snapshot is only written when the record does not already carry
+        # one (a natively authored snapshot wins).
+        try:
+            attrs = getattr(container, "attrs", None)
+            if not self.record.intent_snapshot:
                 candidate = snapshot_from_attrs(attrs)
                 if snapshot_has_evidence(candidate):
                     snapshot = candidate
-            except Exception:  # noqa: BLE001 - snapshot capture must never block attach
-                log.warning(
-                    "record attach: failed to derive intent snapshot for %s",
-                    self.record.id,
-                    exc_info=True,
-                )
+            user = (attrs or {}).get("Config", {}).get("User") or host_user()
+        except Exception:  # noqa: BLE001 - snapshot capture must never block attach
+            log.warning(
+                "record attach: failed to derive intent snapshot for %s",
+                self.record.id,
+                exc_info=True,
+            )
         self.record = attach_container(
             self.workspace_id,
             self.record.id,
             docker_id,
             state,
             intent_snapshot=snapshot,
+            user=user,
             vault_root=self.vault_root,
         )
         self._attached = True

@@ -166,6 +166,7 @@ from agent.config.defaults import (
     DEFAULT_IMAGE,
     DEFAULT_MAX_CONTAINERS,
     EXEC_OUTPUT_LIMIT_BYTES,
+    host_user,
 )
 _TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
 
@@ -358,6 +359,44 @@ def _exec_live_isolation(container, *, strict=False):
                 live_ws = "rw" if mount.get("RW") else "ro"
                 break
     return live_net, live_ws
+
+
+def _live_user(container):
+    """Read the container's live ``Config.User``, or ``None`` when undeterminable.
+
+    A STRUCTURALLY ABSENT / blank user reads as ``None`` (no observable drift),
+    mirroring the restart-policy axis, so fakes that predate this axis are
+    unaffected.
+    """
+    try:
+        attrs = getattr(container, "attrs", None)
+    except Exception:
+        return None
+    if not isinstance(attrs, dict):
+        return None
+    cfg = attrs.get("Config")
+    if not isinstance(cfg, dict):
+        return None
+    user = cfg.get("User")
+    if not isinstance(user, str) or not user:
+        return None
+    return user
+
+
+def _user_drift_axis(container, policy_user):
+    """Return ``("deny", reason, detail)`` when live user != policy user.
+
+    An unreadable/absent live user is NOT drift (cannot prove a mismatch); a
+    PRESENT user that differs from ``policy_user`` runs the container as a user
+    the host policy did not intend, so it is treated as MORE permissive and
+    DENIED.
+    """
+    live = _live_user(container)
+    if live is None or policy_user is None:
+        return None
+    if live == policy_user:
+        return None
+    return "deny", "user_mismatch", {"expected": policy_user, "actual": live}
 
 
 def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
@@ -1089,6 +1128,18 @@ class ContainerManager:
         event is emitted.  A failed heal never raises and falls through to the
         ordinary refusal.
         """
+        # Root-host refusal: the container user MUST match the host user so
+        # bind-mounted workspace files are owned correctly. A host running as
+        # root (uid 0) cannot be matched to a non-root in-container user, so we
+        # refuse up front rather than silently falling back to a fixed user.
+        if os.getuid() == 0:
+            return {
+                "error": "Refusing to start a container from the host root "
+                         "user (uid 0); the container user must match a "
+                         "non-root host user.",
+                "code": "root_host_unsupported",
+            }
+
         # Adopt any legacy container_notes.json entries onto records before we
         # read/write notes below (idempotent; a no-op once per workspace).
         self._migrate_legacy_notes_once()
@@ -1415,7 +1466,7 @@ class ContainerManager:
             security_opt=["no-new-privileges:true"],
             oom_score_adj=1000,  # user containers are the first OOM-kill victims
             read_only=True,
-            user="1000:1000",
+            user=host_user(),
             detach=True,
             tty=True,
             stdin_open=True,
@@ -1451,9 +1502,16 @@ class ContainerManager:
         docker_id/state are rebound, and the name index keeps pointing at the
         same record id.
         """
+        if os.getuid() == 0:
+            raise RuntimeError(
+                "root_host_unsupported: refusing to create a container for the "
+                "host root user (uid 0)"
+            )
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
-            "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
+            "/home/agent": (
+                f"rw,exec,size=256M,uid={os.getuid()},gid={os.getgid()}"
+            ),
         }
         if os.path.isdir(os.path.join(self.workspace_path, ".git")):
             tmpfs["/workspace/.git"] = ""
@@ -1617,6 +1675,22 @@ class ContainerManager:
                     _snapshot = _candidate
             except Exception:
                 _snapshot = None
+            if _snapshot is not None:
+                _live_user_attr = None
+                try:
+                    _live_user_attr = (
+                        (getattr(container, "attrs", None) or {})
+                        .get("Config", {})
+                        .get("User")
+                    )
+                except Exception:
+                    _live_user_attr = None
+                # INVARIANT: the snapshot's user is ONLY ever the live container's
+                # OBSERVED user (its inspect Config.User). A policy value must
+                # never be fabricated into the snapshot — an unobserved key stays
+                # "" (mirroring snapshot_from_attrs, which leaves unobserved keys
+                # ""). Never reintroduce an ``or host_user()`` fallback here.
+                _snapshot["user"] = _live_user_attr or ""
             _attach_kwargs = {"state": "running"}
             if _snapshot is not None:
                 _attach_kwargs["intent_snapshot"] = _snapshot
@@ -1690,7 +1764,7 @@ class ContainerManager:
         # Ensure the requested working directory exists (writable by agent)
         if workdir != "/workspace":
             container.exec_run(
-                ["sh", "-c", f"mkdir -p {workdir} && chown agent:agent {workdir}"],
+                ["sh", "-c", f"mkdir -p {workdir} && chown {os.getuid()}:{os.getgid()} {workdir}"],
                 workdir="/workspace",
             )
 
@@ -1776,6 +1850,29 @@ class ContainerManager:
         not be dressed up as an availability trade-off that runs the command.
         """
         try:
+            # User axis (fail-closed): a live container whose user differs from
+            # the host policy user runs as an unintended user -> DENY.
+            _user_axis = _user_drift_axis(container, host_user())
+            if _user_axis is not None:
+                _udec, _ureason, _udetail = _user_axis
+                if _udec == "deny":
+                    message = (
+                        "Container user is MORE PERMISSIVE than the host "
+                        f"policy ({_ureason}: expected {_udetail['expected']} "
+                        f"got {_udetail['actual']}); refusing to run the "
+                        "command."
+                    )
+                    return "deny", {
+                        "stdout": "",
+                        "stderr": f"{message}\nreason={_ureason}",
+                        "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                        "drift": {
+                            "drifted": True,
+                            "decision": _udec,
+                            "reason": _ureason,
+                            "user": _udetail,
+                        },
+                    }
             try:
                 want_net, want_ws = self._compute_config(
                     getattr(self, "workspace_path", None),
@@ -2308,7 +2405,8 @@ class ContainerManager:
         restart_axis = None
         if lifecycle_class is not None:
             restart_axis = self._restart_drift_axis(container, lifecycle_class)
-        if config_ok and restart_axis is None:
+        user_axis = _user_drift_axis(container, host_user())
+        if config_ok and restart_axis is None and user_axis is None:
             return "ok", None
 
         live_net, live_ws = _exec_live_isolation(container)
@@ -2327,14 +2425,24 @@ class ContainerManager:
         if restart_axis is not None:
             restart_decision, restart_reason, restart_detail = restart_axis
 
-        if isolation_decision is None and restart_decision is None:
+        user_decision = None
+        user_reason = None
+        user_detail = None
+        if user_axis is not None:
+            user_decision, user_reason, user_detail = user_axis
+
+        if (isolation_decision is None and restart_decision is None
+                and user_decision is None):
             return "ok", None
 
         decision = (
-            "deny" if "deny" in (isolation_decision, restart_decision) else "warn"
+            "deny" if "deny" in (isolation_decision, restart_decision,
+                                 user_decision) else "warn"
         )
         if reason is None:
             reason = restart_reason
+        if reason is None:
+            reason = user_reason
 
         drift = {
             "drifted": True,
@@ -2346,6 +2454,8 @@ class ContainerManager:
         }
         if restart_detail is not None:
             drift["restart_policy"] = restart_detail
+        if user_detail is not None:
+            drift["user"] = user_detail
         container_id = getattr(container, "id", None)
         if isolation_decision is not None:
             signature = hashlib.sha256(
@@ -2385,6 +2495,14 @@ class ContainerManager:
                     f"{restart_detail['actual']}); refusing to reuse the "
                     "container. Recreate the container to restore the desired "
                     "restart policy."
+                )
+            elif user_decision == "deny":
+                message = (
+                    "Container user is MORE PERMISSIVE than the host policy "
+                    f"({user_reason}: expected {user_detail['expected']} got "
+                    f"{user_detail['actual']}); refusing to reuse the "
+                    "container. Recreate the container to restore the desired "
+                    "user."
                 )
             else:
                 message = (
