@@ -44,7 +44,7 @@ import sys
 
 # Measured on branch feat/ci-platform-matrix: 3555 tests collect in total and
 # `-m "not docker and not e2e"` selects 3552 of them (3 deselected).
-DEFAULT_EXPECTED = 3552
+DEFAULT_EXPECTED = 3559
 DEFAULT_MARKER = "not docker and not e2e"
 
 # "3552/3555 tests collected (3 deselected)" -> 3552 (the selected count).
