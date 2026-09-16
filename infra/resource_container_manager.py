@@ -105,6 +105,7 @@ from agent.config.defaults import (
     CONTAINER_TYPE_RESOURCE,
     RESOURCE_NAME_LABEL,
     host_user,
+    _host_ids,
 )
 
 # Global resource images are lifecycle-protected shared infrastructure:
@@ -1050,7 +1051,11 @@ class ResourceContainerManager:
                 ``_ResourceContainerHandle`` on the registry path, or the
                 docker container object on the legacy path.
         """
-        if os.getuid() == 0:
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept), so there is no root host
+        # to refuse.
+        ids = _host_ids()
+        if ids is not None and ids[0] == 0:
             from security.admission_gate import AdmissionDenied
             raise AdmissionDenied(
                 "root_host_unsupported",
@@ -1093,11 +1098,12 @@ class ResourceContainerManager:
             )
         # tmpfs (same entries as ContainerManager.start / docker_executor,
         # minus the /workspace/.git shadow — we need the real .git).
+        home_tmpfs = "rw,exec,size=256M"
+        if ids is not None:
+            home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
-            "/home/agent": (
-                f"rw,exec,size=256M,uid={os.getuid()},gid={os.getgid()}"
-            ),
+            "/home/agent": home_tmpfs,
         }
         # Admission gate (site 4/4 of the terminal container-create sites):
         # gate the legacy RAW create only.  This block deliberately sits

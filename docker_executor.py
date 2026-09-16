@@ -25,7 +25,7 @@ integrity checks and container creation/recreation.
 
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 from agent.logging import log
-from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL, host_user
+from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL, host_user, _host_ids
 import docker
 import docker.types
 import hashlib
@@ -687,9 +687,15 @@ class DockerExecutor:
             return
 
         # ── Create new container ──
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept); omit the tmpfs uid/gid.
+        ids = _host_ids()
+        _home_tmpfs = "rw,exec,size=256M"
+        if ids is not None:
+            _home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
-            "/home/agent": f"rw,exec,size=256M,uid={os.getuid()},gid={os.getgid()}",
+            "/home/agent": _home_tmpfs,
         }
         git_path = os.path.join(self.workspace_path, ".git")
         if os.path.isdir(git_path):
@@ -771,7 +777,10 @@ class DockerExecutor:
         if isinstance(_admission, Transform):
             network_mode = _admission.spec.network_mode
 
-        if os.getuid() == 0:
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept), so there is no root host
+        # to refuse.
+        if ids is not None and ids[0] == 0:
             raise RuntimeError(
                 "root_host_unsupported: refusing to create a container for the "
                 "host root user (uid 0); the container user must match a "
@@ -815,8 +824,15 @@ class DockerExecutor:
         self.last_used = time.time()
         # Auto-create working directory with correct ownership if needed
         if workdir != "/workspace":
+            # Route through the single host-id source of truth: on Windows
+            # _host_ids() returns None (no uid concept); omit the chown there.
+            ids = _host_ids()
+            if ids is not None:
+                _mkdir = f"mkdir -p {workdir} && chown {ids[0]}:{ids[1]} {workdir}"
+            else:
+                _mkdir = f"mkdir -p {workdir}"
             self.container.exec_run(
-                cmd=["sh", "-c", f"mkdir -p {workdir} && chown {os.getuid()}:{os.getgid()} {workdir}"],
+                cmd=["sh", "-c", _mkdir],
                 workdir="/workspace"
             )
         try:

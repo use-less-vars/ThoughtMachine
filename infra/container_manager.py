@@ -167,6 +167,7 @@ from agent.config.defaults import (
     DEFAULT_MAX_CONTAINERS,
     EXEC_OUTPUT_LIMIT_BYTES,
     host_user,
+    _host_ids,
 )
 _TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
 
@@ -1132,7 +1133,11 @@ class ContainerManager:
         # bind-mounted workspace files are owned correctly. A host running as
         # root (uid 0) cannot be matched to a non-root in-container user, so we
         # refuse up front rather than silently falling back to a fixed user.
-        if os.getuid() == 0:
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept), so there is no root host
+        # to refuse.
+        ids = _host_ids()
+        if ids is not None and ids[0] == 0:
             return {
                 "error": "Refusing to start a container from the host root "
                          "user (uid 0); the container user must match a "
@@ -1502,16 +1507,21 @@ class ContainerManager:
         docker_id/state are rebound, and the name index keeps pointing at the
         same record id.
         """
-        if os.getuid() == 0:
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept), so there is no root host
+        # to refuse.
+        ids = _host_ids()
+        if ids is not None and ids[0] == 0:
             raise RuntimeError(
                 "root_host_unsupported: refusing to create a container for the "
                 "host root user (uid 0)"
             )
+        home_tmpfs = "rw,exec,size=256M"
+        if ids is not None:
+            home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
-            "/home/agent": (
-                f"rw,exec,size=256M,uid={os.getuid()},gid={os.getgid()}"
-            ),
+            "/home/agent": home_tmpfs,
         }
         if os.path.isdir(os.path.join(self.workspace_path, ".git")):
             tmpfs["/workspace/.git"] = ""
@@ -1763,8 +1773,15 @@ class ContainerManager:
 
         # Ensure the requested working directory exists (writable by agent)
         if workdir != "/workspace":
+            # Route through the single host-id source of truth: on Windows
+            # _host_ids() returns None (no uid concept); omit the chown there.
+            ids = _host_ids()
+            if ids is not None:
+                _mkdir = f"mkdir -p {workdir} && chown {ids[0]}:{ids[1]} {workdir}"
+            else:
+                _mkdir = f"mkdir -p {workdir}"
             container.exec_run(
-                ["sh", "-c", f"mkdir -p {workdir} && chown {os.getuid()}:{os.getgid()} {workdir}"],
+                ["sh", "-c", _mkdir],
                 workdir="/workspace",
             )
 

@@ -110,6 +110,7 @@ from agent.config.defaults import (
     DEFAULT_TMPFS,
     host_user,
     host_tmpfs,
+    _host_ids,
     DEFAULT_COMMAND,
     DEFAULT_MEM_LIMIT,
     DEFAULT_CPU_QUOTA,
@@ -181,7 +182,10 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
     container was first created -- so the recreate re-validates POLICY
     (network/permission narrowing) only, with ``image=None`` on the spec.
     """
-    if os.getuid() == 0:
+    # Route through the single host-id source of truth: on Windows _host_ids()
+    # returns None (no uid concept), so there is no root host to refuse.
+    ids = _host_ids()
+    if ids is not None and ids[0] == 0:
         raise AdmissionDenied(
             "root_host_unsupported",
             "Refusing to create a container for the host root user (uid 0); "
