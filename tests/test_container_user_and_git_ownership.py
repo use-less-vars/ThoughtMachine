@@ -22,6 +22,7 @@ Coverage:
 
 import json
 import os
+import sys
 import types
 
 import pytest
@@ -165,6 +166,10 @@ def _evidence_attrs(user=None):
 # ── 1 ────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="pins POSIX uid:gid derivation; host_user() returns None on Windows",
+)
 def test_container_user_matches_host_uid(monkeypatch):
     """_run_container must pass the host ``uid:gid`` as the container user."""
     client = _FakeClient(run_result=_FakeCtr())
@@ -220,6 +225,10 @@ def test_git_status_succeeds_without_safe_directory(monkeypatch):
 # ── 3 ────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only uid:gid mapping; host_tmpfs() omits uid/gid on Windows",
+)
 def test_macos_uid_501_not_1000_maps(monkeypatch):
     """ContainerProfile().tmpfs /home/agent must reflect the live host uid/gid."""
     monkeypatch.setattr(os, "getuid", lambda: 501)
@@ -237,8 +246,14 @@ def test_macos_uid_501_not_1000_maps(monkeypatch):
 
 
 def test_root_host_keeps_nonroot_container_user(monkeypatch):
-    """No create site may run a container from the host root user (uid 0)."""
-    monkeypatch.setattr(os, "getuid", lambda: 0)
+    """No create site may run a container from the host root user (uid 0).
+
+    ``raising=False``: Windows has no ``os.getuid``.  Injecting a ``0`` host
+    uid is still meaningful there -- it drives every create site's real
+    ``os.getuid() == 0`` refusal branch end to end (the container is never
+    created), so the assertions below stay meaningful, not vacuous.
+    """
+    monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
 
     # (a) ContainerManager.start refuses up front.
     client = _FakeClient(run_result=_FakeCtr())
