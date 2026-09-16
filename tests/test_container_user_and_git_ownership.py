@@ -415,3 +415,77 @@ def test_foreign_owner_still_refuses(monkeypatch, tmp_path):
                         headers={"X-Actor": "tester"})
     assert resp2.status_code == 404, resp2.text
 
+
+# ── 8 (Windows guard: host has no uid:gid) ───────────────────────────────────
+# ``os.getuid``/``os.getgid`` do not exist on Windows, so there is no host
+# uid:gid to pin the container to.  The resolver must return ``None`` (never a
+# bogus ``0:0``), and ``create_hardened_container`` must then omit ``--user``
+# (docker-py drops ``User`` for ``None``) so the container runs as the image
+# default instead of being pinned to root.
+
+
+class _NtOSView:
+    """An ``os`` view whose ``name`` is ``"nt"``; everything else delegates.
+
+    Simulates Windows without mutating the process-global ``os.name`` (which
+    would make pytest's failure-repr build a ``WindowsPath`` on POSIX and abort
+    the run).  ``getuid``/``getgid`` stay the live ones, so reverting the guard
+    reddens on an ``assert`` (AssertionError), proving the guard exists.
+    """
+
+    name = "nt"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+def test_host_user_is_none_on_windows(monkeypatch):
+    """``os.name == "nt"``: ``host_user()`` returns ``None`` and the tmpfs
+    recipe omits the uid/gid parameters (assertion-shaped RED: ``getuid`` still
+    resolves, so a reverted guard fails the ``assert`` below)."""
+    monkeypatch.setattr(defaults, "os", _NtOSView())
+
+    assert defaults.host_user() is None
+
+    recipe = defaults.host_tmpfs()
+    assert recipe["/tmp"] == "rw,noexec,nosuid,size=64m"
+    assert "/home/agent" in recipe
+    assert "uid=" not in recipe["/home/agent"]
+    assert "gid=" not in recipe["/home/agent"]
+
+
+def test_host_user_none_on_windows_without_getuid(monkeypatch):
+    """The faithful Windows shape: ``os.name == "nt"`` with NO ``getuid``
+    (it does not exist on Windows).  Pre-fix this raised
+    ``AttributeError: module 'os' has no attribute 'getuid'`` -- the original
+    Windows CI crash; the guard must short-circuit to ``None`` first.
+
+    Reverting the guard makes THIS node fail with AttributeError (the bug),
+    distinct from the AssertionError of the delegating-view node above.
+    """
+    monkeypatch.setattr(defaults, "os", types.SimpleNamespace(name="nt"))
+
+    assert defaults.host_user() is None
+
+    recipe = defaults.host_tmpfs()
+    assert "uid=" not in recipe["/home/agent"]
+    assert "gid=" not in recipe["/home/agent"]
+
+
+def test_container_registry_omits_user_when_host_user_is_none(monkeypatch):
+    """With no host user (Windows), ``create_hardened_container`` runs as the
+    image default: the docker create kwargs carry no ``user``.
+
+    Drives the whole create path against the realistic Windows-shaped ``os``
+    (``name == "nt"`` and no ``getuid``) so a missing guard is exercised end to
+    end, not just in the resolver.
+    """
+    from infra.container_registry import create_hardened_container
+
+    monkeypatch.setattr(defaults, "os", types.SimpleNamespace(name="nt"))
+
+    client = _FakeClient(run_result=_FakeCtr())
+    create_hardened_container(client, ContainerProfile(), "c-win")
+
+    kwargs = client.containers.run_calls[-1]["kwargs"]
+    assert kwargs.get("user") is None

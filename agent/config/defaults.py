@@ -163,32 +163,64 @@ HARDENED_SECURITY_OPT = ["no-new-privileges:true"]
 HARDENED_READ_ONLY = True
 
 
-def host_user() -> str:
-    """Return the host ``uid:gid`` the container user must match.
+def _host_ids() -> tuple[int, int] | None:
+    """Host uid/gid as ``(uid, gid)``, or ``None`` on platforms without one.
+
+    Windows has no host uid:gid concept (``os.getuid`` does not exist), so the
+    container cannot be pinned to the host user there; callers must omit
+    ``--user`` and run as the image default.  Single source of truth for the
+    host ids; resolved at CALL time so tests can monkeypatch
+    ``os.getuid``/``os.getgid`` for determinism.
+    """
+    if os.name == "nt":
+        return None
+    return os.getuid(), os.getgid()
+
+
+def host_user() -> str | None:
+    """Return the host ``uid:gid`` the container user must match, or ``None``.
 
     The container runs as the HOST user so bind-mounted workspace files are
     owned by the in-container process (git ownership checks pass without a
     ``safe.directory`` override).  Resolved at CALL time so tests can
-    monkeypatch ``os.getuid``/``os.getgid`` for determinism.
+    monkeypatch ``os.getuid``/``os.getgid`` for determinism.  Windows has no
+    host uid:gid concept, so this returns ``None`` there and callers omit
+    ``--user`` (docker-py omits ``User`` when the value is ``None``).
     """
-    return f"{os.getuid()}:{os.getgid()}"
+    ids = _host_ids()
+    if ids is None:
+        return None
+    uid, gid = ids
+    return f"{uid}:{gid}"
 
 
 def host_tmpfs() -> dict:
-    """Fresh tmpfs recipe with the live host uid/gid (resolved at call time)."""
+    """Fresh tmpfs recipe with the live host uid/gid (resolved at call time).
+
+    On Windows (no host uid:gid) the ``/home/agent`` entry is kept but the
+    ``uid=``/``gid=`` parameters are omitted.
+    """
+    ids = _host_ids()
+    home = "rw,exec,size=256m"
+    if ids is not None:
+        uid, gid = ids
+        home = f"{home},uid={uid},gid={gid}"
     return {
         "/tmp": "rw,noexec,nosuid,size=64m",
-        "/home/agent": f"rw,exec,size=256m,uid={os.getuid()},gid={os.getgid()}",
+        "/home/agent": home,
     }
 
 
+# Frozen at import-time (per-process, stable): host uid/gid do not change within a process.
 HARDENED_USER = host_user()
 # tmpfs recipe (design doc §1.1; dispatch spelling "256m").
+_TMPFS_HOME = "rw,exec,size=256m"
+_HIDS = _host_ids()
+if _HIDS is not None:
+    _TMPFS_HOME = f"{_TMPFS_HOME},uid={_HIDS[0]},gid={_HIDS[1]}"
 DEFAULT_TMPFS = {
     "/tmp": "rw,noexec,nosuid,size=64m",
-    "/home/agent": (
-        f"rw,exec,size=256m,uid={os.getuid()},gid={os.getgid()}"
-    ),
+    "/home/agent": _TMPFS_HOME,
 }
 DEFAULT_COMMAND = ["tail", "-f", "/dev/null"]
 DEFAULT_MEM_LIMIT = "1g"
