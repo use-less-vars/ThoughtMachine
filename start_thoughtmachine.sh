@@ -63,6 +63,17 @@ if [ "${TM_CHECK_ONLY:-}" = "1" ]; then
     CHECK_ONLY=true
 fi
 
+# TM_REQUIRE_DOCKER: strict opt-in for failing the boot on a Docker problem.
+# Value "1" ONLY (mirrors install.sh's DOCKER_NONFATAL idiom); unset/empty/any
+# other value keeps Docker optional, so a Docker problem degrades the boot
+# (warn + continue) instead of refusing to start.
+TM_REQUIRE_DOCKER="${TM_REQUIRE_DOCKER:-}"
+if [ "$TM_REQUIRE_DOCKER" = "1" ]; then
+    DOCKER_REQUIRED=1
+else
+    DOCKER_REQUIRED=0
+fi
+
 doctor() {
     python3 "$DOCTOR" "$@"
 }
@@ -234,13 +245,19 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             elif $DOCTOR_MODE; then
                 echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --doctor mode."
                 [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
-            else
+            elif [ "$DOCKER_REQUIRED" -eq 1 ]; then
                 echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
                 [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
                 if [ "$DOCKER_REASON" = "daemon_down" ]; then
                     echo "      Start it with:  sudo systemctl enable --now docker"
                 fi
                 exit 1
+            else
+                echo "      WARNING: Docker is not usable (reason: ${DOCKER_REASON:-unknown}) - the boot continues degraded without Docker."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                if [ "$DOCKER_REASON" = "daemon_down" ]; then
+                    echo "      Start Docker and re-run to enable container features (sudo systemctl enable --now docker)."
+                fi
             fi
             ;;
         *)
@@ -250,10 +267,13 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             elif $DOCTOR_MODE; then
                 echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --doctor mode."
                 [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
-            else
+            elif [ "$DOCKER_REQUIRED" -eq 1 ]; then
                 echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
                 [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
                 exit 1
+            else
+                echo "      WARNING: Docker is not usable (reason: ${DOCKER_REASON:-unknown}) - the boot continues degraded without Docker."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
             fi
             ;;
     esac

@@ -27,7 +27,7 @@ actually do, what they check, and what they will not do for you.
 | --- | --- | --- | --- |
 | Python | >= 3.11 (`install.sh` check `[1/5]`, critical) | 3.11 – 3.13 (checked via `py` launcher, then `python`, then `python3`) | The Windows installer refuses Python outside 3.11–3.13. |
 | Node.js | >= 18 (`install.sh` check `[5/5]`, critical) | >= 18 | **Not vendored.** Must be installed manually on both platforms. |
-| Docker | Recommended (daemon must be running; group membership optional) | Docker Desktop recommended; warning-only | Docker is optional for `--check-only`/`--doctor` and for the Windows dev launcher; many features are disabled without it. |
+| Docker | Recommended; the launcher boots degraded (warn + continue) without it | Docker Desktop recommended; warning-only | Docker is optional for `--check-only`/`--doctor`, for the Windows dev launcher, and for a normal boot (which degrades); many features are disabled without it. Set `TM_REQUIRE_DOCKER=1` to make it mandatory (fail-fast). |
 | curl | Required | — | Used by `install.sh`. |
 | Network | Required | Required | `pip install -r requirements.txt` and `npm install` download dependencies. |
 
@@ -59,8 +59,11 @@ The five checks, in order:
 
 1. **[1/5] Python >= 3.11** — critical. Installs `python3-venv` (needs `sudo`)
    if missing.
-2. **[2/5] Docker daemon** — critical. May offer to install `docker.io` via
-   `sudo apt` and/or start it with `sudo systemctl enable --now docker`.
+2. **[2/5] Docker daemon** — degraded by default. If Docker is missing or the
+   daemon is not running, the step prints a warning, is recorded as skipped
+   (`[--]`) and the installer continues. Set `TM_REQUIRE_DOCKER=1` to make it
+   critical again — Docker then aborts the install on failure, and the
+   installer may offer to install `docker.io` via `sudo apt`.
 3. **[3/5] Docker group** — non-critical. If your user is not in the `docker`
    group, it prints: `Re-login or run: newgrp docker`.
 4. **[4/5] venv** — critical. Runs `doctor --ensure-venv`, which creates
@@ -102,8 +105,9 @@ Next step: ./start_thoughtmachine.sh
 - `--doctor` is check-only plus starting the backend and verifying
   `/api/health`; it prints `BACKEND-HEALTHY` and keeps running. Use it when
   reporting problems.
-- The 8 preflight checks: required tools, venv (critical), Docker (critical
-  outside check-only/doctor), stale containers (reported, not removed), ports
+- The 8 preflight checks: required tools, venv (critical), Docker (degraded by
+  default outside check-only/doctor: warn + continue, fail-fast only with
+  `TM_REQUIRE_DOCKER=1`), stale containers (reported, not removed), ports
   8000/5173 free (fatal if busy), Node >= 18, `~/.thoughtmachine` writable
   (`Vault not writable. Fix with: sudo chown -R $USER ~/.thoughtmachine`), and
   locale (`LANG set to C.UTF-8`).
@@ -258,9 +262,11 @@ User data (config, workspaces, session state) lives in `~/.thoughtmachine` /
 - Ports 8000/5173 busy → the launcher refuses to start. Kill the stale
   processes (`kill_thoughtmachine.bat` on Windows) and retry.
 - Vault not writable → `sudo chown -R $USER ~/.thoughtmachine` (Linux).
-- Docker not usable in normal mode → the launcher fails with
-  `Start it with:  sudo systemctl enable --now docker` (Linux); on Windows,
-  start Docker Desktop and retry.
+- Docker not usable in normal mode → the launcher warns and continues in
+  degraded mode (container features disabled); it no longer refuses to start.
+  Docker problems are fatal only when `TM_REQUIRE_DOCKER=1` is set, in which
+  case the launcher fails with `Start it with:  sudo systemctl enable --now
+  docker` (Linux); on Windows, start Docker Desktop and retry.
 - Locale warnings → set `LANG` to a UTF-8 locale such as `C.UTF-8`.
 
 For the Windows-specific debugging history, see
