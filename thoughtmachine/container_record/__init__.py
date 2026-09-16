@@ -65,6 +65,7 @@ from .snapshot import (
     HARDENING_KEYS,
     snapshot_from_attrs,
 )
+from .hook import snapshot_has_evidence
 
 __all__ = [
     # exceptions (§3.1)
@@ -90,6 +91,7 @@ __all__ = [
     "STATE_CREATING",
     # snapshot extraction (§1.1 / §4)
     "snapshot_from_attrs",
+    "snapshot_has_evidence",
     "HARDENING_KEYS",
     # api (§3 / §7)
     "RECORD_LABEL_KEY",

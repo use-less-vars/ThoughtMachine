@@ -66,7 +66,7 @@ _EVIDENCE_KEYS: tuple[str, ...] = (
 )
 
 
-def _snapshot_has_evidence(snapshot: Any) -> bool:
+def snapshot_has_evidence(snapshot: Any) -> bool:
     """Return True when *snapshot* carries any recoverable intent evidence.
 
     A snapshot is evidence-bearing when any scalar key in
@@ -140,7 +140,7 @@ class _RecordHandle:
             try:
                 attrs = getattr(container, "attrs", None)
                 candidate = snapshot_from_attrs(attrs)
-                if _snapshot_has_evidence(candidate):
+                if snapshot_has_evidence(candidate):
                     snapshot = candidate
             except Exception:  # noqa: BLE001 - snapshot capture must never block attach
                 log.warning(

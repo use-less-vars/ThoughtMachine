@@ -114,6 +114,10 @@ The move from today's state to the model is additive and idempotent, never a des
 
 Reconciliation between these synthesised records and observed reality — deciding which inferred fields to trust and correcting them — is a **separate, future decision** and is explicitly out of scope for this workstream.
 
+The one *active* counterpart — rebuilding a container whose record names a `docker_id` with no live
+container — is a **manager** move (`infra.container_manager.start`), not the record layer's; see the
+ownership doctrine in `docs/container_record_design.md` §6: `record = passive; manager = active; heal lives in manager.`
+
 ---
 
 ## 6. Restart policy and boot drift
@@ -157,7 +161,7 @@ Scope is as load-bearing as scope-creep avoidance. Explicitly out of scope — e
 - **No database.** The Container Record is vault JSON files, not a database.
 - **No ORM.** Records are read and written directly; there is no object-relational layer.
 - **No event-bus library.** The append-only event log is a file, not a message bus.
-- **No K8s-style scheduler.** No pod model, no reconciliation loop, no declarative control plane.
+- **No K8s-style scheduler.** No pod model, no reconciliation loop, no declarative control plane. The only rebuild-on-missing behaviour is the manager-side heal (`infra.container_manager.start`) — the record layer only reports drift and never acts (doctrine: `record = passive; manager = active; heal lives in manager.`, `docs/container_record_design.md` §6).
 - **No auto-scaling.** Container counts change on explicit decisions, not on load.
 - **No cross-host container orchestration.** This is a single-host model.
 - **No plugin system for the Container Record.** The record schema is fixed; behaviour is not pluggable.

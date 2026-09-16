@@ -33,15 +33,20 @@ def test_start_error_dict_surfaces_limit_message(tmp_path, monkeypatch):
     """start() returning {"error": "container limit ..."} must surface that
     message in the response error and never reach exec/stop."""
 
+    calls = {"heal_missing": []}
+
     class FakeManager:
         """ContainerManager stand-in whose start() hits the limit branch."""
 
         def __init__(self, **kwargs):
             pass
 
-        def start(self, image=None, worker_name=None, *, lifecycle_class=None):
+        def start(self, image=None, worker_name=None, *, lifecycle_class=None,
+                  heal_missing=False):
             # Real ContainerManager.start() signature: accepts worker_name
-            # (thoughtmachine.worker ownership label on fresh creates).
+            # (thoughtmachine.worker ownership label on fresh creates) and
+            # heal_missing (recorded so the runner is asserted to pass True).
+            calls["heal_missing"].append(heal_missing)
             return {
                 "error": "Workspace container limit (4) reached "
                          "(4 active container(s)). "
@@ -64,13 +69,15 @@ def test_start_error_dict_surfaces_limit_message(tmp_path, monkeypatch):
     assert "container limit" in result["error"]
     assert result["error"] != "'id'"
     assert "Unexpected error" not in result["error"]
+    # The runner must pass heal_missing=True so the limit path can auto-heal.
+    assert calls["heal_missing"] == [True]
 
 
 def test_drift_deny_removes_and_restarts_exactly_once(tmp_path, monkeypatch):
     """A drift DENY must remove the drifted container EXACTLY once and re-start
     EXACTLY once (a single recovery attempt, never a retry loop)."""
 
-    calls = {"start": 0, "removed": []}
+    calls = {"start": 0, "removed": [], "heal_missing": []}
 
     class FakeManager:
         """First start() denies on drift; second (post-remove) create succeeds."""
@@ -78,8 +85,10 @@ def test_drift_deny_removes_and_restarts_exactly_once(tmp_path, monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def start(self, image=None, worker_name=None, *, lifecycle_class=None):
+        def start(self, image=None, worker_name=None, *, lifecycle_class=None,
+                  heal_missing=False):
             calls["start"] += 1
+            calls["heal_missing"].append(heal_missing)
             if calls["start"] == 1:
                 return {
                     "error": "Container isolation is MORE PERMISSIVE than the "
@@ -118,20 +127,24 @@ def test_drift_deny_removes_and_restarts_exactly_once(tmp_path, monkeypatch):
     # (b) start() called EXACTLY twice: the original + one recovery re-start.
     assert calls["start"] == 2
     assert result["success"] is True
+    # Both start calls (original + recovery) must pass heal_missing=True.
+    assert calls["heal_missing"] == [True, True]
 
 
 def test_drift_deny_without_container_id_raises(tmp_path, monkeypatch):
     """A drift DENY whose drift dict LACKS ``container_id`` must RAISE rather
     than silently proceeding: remove() and a second start() must NOT run."""
 
-    calls = {"start": 0, "removed": 0}
+    calls = {"start": 0, "removed": 0, "heal_missing": []}
 
     class FakeManager:
         def __init__(self, **kwargs):
             pass
 
-        def start(self, image=None, worker_name=None, *, lifecycle_class=None):
+        def start(self, image=None, worker_name=None, *, lifecycle_class=None,
+                  heal_missing=False):
             calls["start"] += 1
+            calls["heal_missing"].append(heal_missing)
             return {
                 "error": "Container isolation is MORE PERMISSIVE than the "
                          "session policy (network_more_permissive).",
@@ -167,3 +180,5 @@ def test_drift_deny_without_container_id_raises(tmp_path, monkeypatch):
     # The absent-id case must NOT remove, and must NOT attempt a second start.
     assert calls["removed"] == 0
     assert calls["start"] == 1
+    # The single start call must pass heal_missing=True.
+    assert calls["heal_missing"] == [True]

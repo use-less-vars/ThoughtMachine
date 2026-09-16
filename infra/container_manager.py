@@ -130,9 +130,15 @@ from thoughtmachine.container_record import (
     normalise_restart_policy,
     policy_for,
     record_label,
+    snapshot_from_attrs,
+    snapshot_has_evidence,
     update_record,
 )
 from thoughtmachine.container_record import drift
+from thoughtmachine.container_record.drift import (
+    EVENT_CONTAINER_RECORD_AUTO_RECREATED,
+    EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED,
+)
 from thoughtmachine.container_record import storage
 from thoughtmachine.container_record.hook import record_creation
 
@@ -229,6 +235,20 @@ _START_DRIFT_AUDIT = "CONTAINER_START_DRIFT"
 _START_DRIFT_RESTART_EVENT = "drift.restart_policy_mismatch"
 _START_DRIFT_RESTART_ACTOR = "infra.container_manager.start"
 _START_DRIFT_RESTART_AUDIT = "CONTAINER_RESTART_DRIFT"
+
+# Missing-container auto-heal (agent-facing counterpart to the operator-only
+# ``allow_fresh`` recreate).  A record that names a ``docker_id`` with no live
+# container is rebuilt ONCE for the agent path; the attempt is memoised per
+# ``(record_id, stale_docker_id)`` so a persistently failing heal refuses
+# thereafter instead of looping.  MODULE scope (like the drift memos above) so
+# the memo holds across the fresh ContainerManager built for every tool call.
+_HEAL_MEMO_MAX = 256
+_HEAL_ATTEMPTED = OrderedDict()  # (record_id, stale_docker_id) -> True, oldest evicted
+_HEAL_LOCK = threading.Lock()
+_HEAL_ACTOR = "infra.container_manager.start"
+_HEAL_REASON = "container_missing"
+_HEAL_AUDIT_RECREATED = "CONTAINER_START_MISSING_HEAL"
+_HEAL_AUDIT_REFUSED = "CONTAINER_START_MISSING_HEAL_FAILED"
 
 # Sticky-note migration/warning memos (module scope so dedup holds across the
 # fresh ContainerManager instances built for every tool call). ``_NOTES_WARNED``
@@ -1028,7 +1048,8 @@ class ContainerManager:
 
     def start(self, image=None, name=None, note=None, worker_name=None, *,
               lifecycle_class: str = LIFECYCLE_PERSISTENT,
-              allow_fresh: bool = False):
+              allow_fresh: bool = False,
+              heal_missing: bool = False):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
@@ -1057,6 +1078,16 @@ class ContainerManager:
         attached to the response; when it is MORE permissive than the resolved
         policy the container is REFUSED (``{"error": ..., "drift": ...}``) so
         the caller can act, instead of being silently reused or removed.
+
+        ``allow_fresh`` (operator-only) recreates a record's container when the
+        record names one that no longer exists.  ``heal_missing`` (agent-only,
+        default False) is its auto-heal counterpart: when a record names a
+        ``docker_id`` with no live container AND the record's lifecycle class
+        does not own its own container lifecycle, ONE policy-current rebuild is
+        attempted, the attempt is memoised (so a persistently failing heal
+        refuses thereafter), and on success a ``container_record_auto_recreated``
+        event is emitted.  A failed heal never raises and falls through to the
+        ordinary refusal.
         """
         # Adopt any legacy container_notes.json entries onto records before we
         # read/write notes below (idempotent; a no-op once per workspace).
@@ -1152,6 +1183,18 @@ class ContainerManager:
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
                         reuse_record_id=record_id)
+                # Guardrail 5: auto-heal is reachable ONLY from this
+                # container_missing path (never on drift).  It is the agent
+                # counterpart to the operator-only allow_fresh recreate above
+                # (which, when set, wins).  On success _heal_missing returns the
+                # created-container payload; on any refusal/failure it returns
+                # None and we fall through to the byte-identical refusal below.
+                if heal_missing and self._heal_eligible(record, docker_id):
+                    healed = self._heal_missing(
+                        name=name, record_id=record_id, stale_docker_id=docker_id,
+                        image=image, note=note, lifecycle_class=lifecycle_class)
+                    if healed is not None:
+                        return healed
                 self._emit_stale_docker_id_drift_once(
                     name, record_id, docker_id, "record")
                 return {"error": (f"Container {name!r} record {record_id} names "
@@ -1552,8 +1595,33 @@ class ContainerManager:
                 image=image, name=name, labels=labels, mounts=mounts,
                 tmpfs=tmpfs, network_mode=network_mode,
                 lifecycle_class=lifecycle_class)
+            # Guardrail 7: bind the fresh container's intent snapshot to the
+            # record in the SAME attach call — but only when the live inspect
+            # payload carries real evidence.  The gate is the shared, public
+            # ``snapshot_has_evidence`` helper (imported from the container_record
+            # package) — it is the single definition of the evidence rule.
+            # attach_container writes the snapshot whenever the kwarg is not
+            # None, so an all-empty snapshot would clobber the record's good
+            # snapshot with ``{}``; omit the kwarg otherwise, leaving the
+            # record's existing (good) snapshot untouched.
+            #
+            # INTENTIONAL DIVERGENCE from hook.record_creation().attach(): that
+            # path applies a "a natively-authored snapshot wins" rule (it only
+            # fills a record that has no snapshot yet), whereas guardrail 7
+            # requires a FRESH snapshot on rebuild — so here we always recompute
+            # from the live container and overwrite.
+            _snapshot = None
+            try:
+                _candidate = snapshot_from_attrs(getattr(container, "attrs", None))
+                if snapshot_has_evidence(_candidate):
+                    _snapshot = _candidate
+            except Exception:
+                _snapshot = None
+            _attach_kwargs = {"state": "running"}
+            if _snapshot is not None:
+                _attach_kwargs["intent_snapshot"] = _snapshot
             attach_container(self.workspace_id, reuse_record_id, container.id,
-                             state="running")
+                             **_attach_kwargs)
             container = self._cache_container(name, container)
             if note is not None:
                 self._write_note(reuse_record_id, note)
@@ -2042,6 +2110,125 @@ class ContainerManager:
                 )
         except Exception:
             pass
+
+    def _heal_eligible(self, record, stale_docker_id):
+        """Return True when ``start()`` may auto-heal this missing container.
+
+        Pure: consults the attempt memo and the class policy, mutating nothing.
+        Fail-closed — an unknown lifecycle class, or a class that OWNS its
+        container lifecycle (``own_lifecycle is True``; the orphan sweeps apply
+        the same rule), is never auto-healed.
+        """
+        # Already guaranteed on the calling path (the heal hook sits inside the
+        # record+docker_id branch ~:1146), but kept as an honest guard.
+        if record is None or not stale_docker_id:
+            return False
+        key = (str(getattr(record, "id", "") or ""), str(stale_docker_id))
+        with _HEAL_LOCK:
+            if key in _HEAL_ATTEMPTED:
+                return False
+        try:
+            policy = policy_for(record.lifecycle_class)
+        except UnknownLifecycleClass:
+            # Fail closed, mirroring the orphan sweeps (:3373-3384).
+            return False
+        if getattr(policy, "own_lifecycle", False) is True:
+            return False
+        return True
+
+    def _heal_missing(self, *, name, record_id, stale_docker_id, image, note,
+                      lifecycle_class):
+        """Attempt ONE policy-current rebuild of a record whose container is gone.
+
+        Agent-facing counterpart to the operator-only ``allow_fresh`` recreate:
+        the record names a ``docker_id`` that has no live container, so the
+        container is rebuilt for the EXISTING record (``reuse_record_id``) — the
+        same argument-for-argument call the operator path makes.
+
+        DOCUMENTED DEVIATION: the rebuild is computed from the CURRENT policy
+        (``_compute_config``); the record's stored ``intent_snapshot`` is NOT
+        read as a rebuild source (it is a recovery artefact, not authoritative).
+
+        Memo semantics (load-bearing): the ``(record_id, stale_docker_id)``
+        signature is recorded as ATTEMPTED here — at the moment of the attempt,
+        NOT on success — so a failed heal is terminal and later calls fall
+        through to the ordinary refusal.  Best-effort and total: never raises;
+        returns the created-container payload on success, else ``None``.
+        """
+        key = (str(record_id), str(stale_docker_id))
+        with _HEAL_LOCK:
+            _HEAL_ATTEMPTED[key] = True
+            while len(_HEAL_ATTEMPTED) > _HEAL_MEMO_MAX:
+                _HEAL_ATTEMPTED.popitem(last=False)
+
+        try:
+            network_mode, workspace_mode = self._compute_config(
+                self.workspace_path, self.workspace_id,
+                self.session_permissions, lifecycle_class)
+        except Exception:
+            # Config uncomputable -> invent nothing; refuse via the heal signal
+            # (start() then produces the ordinary refusal payload).
+            try:
+                _audit(_HEAL_AUDIT_REFUSED,
+                       f"name={name} record_id={record_id} "
+                       f"stale_docker_id={stale_docker_id} "
+                       f"detail=config_uncomputable workspace_id={self.workspace_id}")
+            except Exception:
+                pass
+            try:
+                if getattr(self, "workspace_id", None):
+                    from thoughtmachine.container_record import append_event
+                    append_event(
+                        self.workspace_id, str(record_id),
+                        EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED,
+                        _HEAL_ACTOR,
+                        reason=_HEAL_REASON,
+                        old_docker_id=stale_docker_id,
+                        detail="config_uncomputable",
+                        detected_at=datetime.now(timezone.utc).isoformat(),
+                    )
+            except Exception:
+                pass
+            return None
+
+        try:
+            result = self._fresh_start(
+                image=image, name=name, note=note, worker_name=None,
+                lifecycle_class=lifecycle_class, network_mode=network_mode,
+                workspace_mode=workspace_mode, reuse_record_id=record_id)
+        except Exception:
+            return None
+
+        if not (isinstance(result, dict) and result.get("id")
+                and "error" not in result):
+            # _fresh_start refused (e.g. admission Deny): treat as a failure and
+            # fall through to the byte-identical ordinary refusal.
+            return None
+
+        try:
+            _audit(_HEAL_AUDIT_RECREATED,
+                   f"name={name} record_id={record_id} "
+                   f"old_docker_id={stale_docker_id} "
+                   f"new_docker_id={result.get('id')} "
+                   f"reason={_HEAL_REASON} workspace_id={self.workspace_id}")
+        except Exception:
+            pass
+        try:
+            if getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id, str(record_id),
+                    EVENT_CONTAINER_RECORD_AUTO_RECREATED,
+                    _HEAL_ACTOR,
+                    reason=_HEAL_REASON,
+                    old_docker_id=stale_docker_id,
+                    new_docker_id=result.get("id"),
+                    caller=_HEAL_ACTOR,
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+        return result
 
     def _emit_stale_docker_id_drift_once(self, name, record_id, stale_docker_id,
                                          source):

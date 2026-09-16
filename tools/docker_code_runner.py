@@ -410,6 +410,7 @@ chmod +x "{script_path}"
                 image=self.image,
                 worker_name=getattr(self, "worker_name", None) or current_worker_name(),
                 lifecycle_class=LIFECYCLE_EPHEMERAL,
+                heal_missing=True,
             )
             # start() returns {"error": ...} (no "id") when the per-workspace
             # container limit is reached or any pre-create check fails -
@@ -439,6 +440,7 @@ chmod +x "{script_path}"
                     image=self.image,
                     worker_name=getattr(self, "worker_name", None) or current_worker_name(),
                     lifecycle_class=LIFECYCLE_EPHEMERAL,
+                    heal_missing=True,
                 )
             if "error" in info:
                 raise RuntimeError(info["error"])

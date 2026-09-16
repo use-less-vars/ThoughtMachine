@@ -87,6 +87,14 @@ EVENT_IMAGE_CHANGED = "drift.image_changed"
 EVENT_HARDENING_LOST = "drift.hardening_lost"
 EVENT_RESTART_POLICY_MISMATCH = "drift.restart_policy_mismatch"
 
+#: Auto-heal lifecycle events.  Deliberate DEVIATION from the ``drift.*``
+#: convention above: these are emitted by the container MANAGER
+#: (``infra.container_manager.start``), not by drift detection, so a ``drift.``
+#: prefix would be a lie.  The block above is a convention, not a contract; the
+#: ``EVENT_*`` naming still holds.
+EVENT_CONTAINER_RECORD_AUTO_RECREATED = "container_record_auto_recreated"
+EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED = "container_record_auto_recreated_refused"
+
 #: Axis sets, in the order axes within a class are compared.
 _POLICY_AXES = ("network_mode", "workspace_mode")
 _RUNTIME_AXES = ("network_mode", "workspace_mode", "mem_limit", "cpu_quota", "oom_score_adj")

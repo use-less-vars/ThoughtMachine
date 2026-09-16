@@ -335,6 +335,16 @@ the thing that acts on containers.
   auto-GC, live sync) means the wrong problem is being solved — those are separate moves, not
   the record.
 
+**Ownership: the record reports, the manager acts.** The guardrails above are an ownership split,
+not merely a fence. A record that names a `docker_id` with no live container is **reported** by the
+record layer as drift — a finding, never a fix; the record layer never starts, stops or recreates
+anything. The *decision and the action* to rebuild belong to the container manager
+(`infra.container_manager.start`), reachable only on the missing-container path, gated by the class
+policy `own_lifecycle`, and memoised per `(record_id, stale_docker_id)` so a persistently failing
+rebuild refuses rather than loops.
+
+record = passive; manager = active; heal lives in manager.
+
 ---
 
 ## 7. Docker Label Contract
@@ -383,6 +393,9 @@ Consistent with the target arch §8 fence, the Container Record subsystem does *
 - Reconcile inferred fields against intent (target arch §5 — an explicit **out-of-scope**
   future decision).
 - Retire the legacy registry/manager (target arch §7 — a separate later decision).
+
+The missing-container heal is **not** a record behaviour: the record only *reports* the drift, and
+the rebuild is the manager-side move (`infra.container_manager.start`) described in §6.
 
 ---
 
