@@ -28,9 +28,12 @@ from infra.container_manager import ContainerManager
 from thoughtmachine.container_record import (
     LIFECYCLE_CLASSES,
     LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
     OWNER_WORKSPACE,
     RECORD_LABEL_KEY,
     create_record,
+    load_record,
+    snapshot_from_attrs,
     update_record,
 )
 
@@ -192,6 +195,21 @@ def _clear_memo():
     yield
     container_manager._EXEC_DRIFT_SEEN.clear()
     container_manager._START_DRIFT_SEEN.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_heal_memo():
+    """Isolate the module-scope auto-heal attempt memo between tests.
+
+    ``_HEAL_ATTEMPTED`` is MODULE scope (it must survive the fresh
+    ``ContainerManager`` built per tool call), so it MUST be cleared per test or
+    a ``(record_id, stale_docker_id)`` key memoised in one test would suppress
+    the heal in the next.  The related drift dedup state (``_EXEC_DRIFT_SEEN`` /
+    ``_START_DRIFT_SEEN``) is already reset by ``_clear_memo``.
+    """
+    container_manager._HEAL_ATTEMPTED.clear()
+    yield
+    container_manager._HEAL_ATTEMPTED.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -506,3 +524,365 @@ def test_stale_docker_id_emits_audit_once(monkeypatch, events):
     cm.start(name="agent-x")
     assert [a for a in audits if a[0] == "CONTAINER_START_STALE_DOCKER_ID"] == fired
 
+
+
+# ---------------------------------------------------------------------------
+# (i) missing-container AUTO-HEAL (agent path, ``heal_missing=True``)
+# ---------------------------------------------------------------------------
+#
+# A record whose ``docker_id`` has NO live container is, when the caller opts in
+# with ``heal_missing=True``, rebuilt ONCE for the SAME record (the agent-facing
+# counterpart to the operator-only ``allow_fresh`` recreate).  The attempt is
+# memoised per ``(record_id, stale_docker_id)`` and is fail-closed: an
+# own-lifecycle class, an uncomputable policy, or a refused rebuild all fall
+# through to the byte-identical ordinary refusal.  Every refusal assertion
+# carries a non-vacuous signal (the recreate/refused event, the heal audit, or
+# the ordinary stale-docker-id drift + audit) so a silently-swallowed failure
+# can never pass.
+
+_HEAL_EVENT = container_manager.EVENT_CONTAINER_RECORD_AUTO_RECREATED
+_HEAL_REFUSED_EVENT = container_manager.EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED
+_HEAL_AUDIT_OK = container_manager._HEAL_AUDIT_RECREATED
+_HEAL_AUDIT_FAIL = container_manager._HEAL_AUDIT_REFUSED
+_HEAL_NEW_ID = "e" * 16
+_HEAL_STALE = "d" * 16
+
+
+def _missing_cm(workspace_id="w1"):
+    """Manager whose record-backed name names a docker_id with NO live container."""
+    cm = _make_cm(None, want=("none", "ro"), workspace_id=workspace_id)
+    cm.client = _FakeDockerClient([])  # no live containers -> the docker_id is stale
+    cm._fresh_start = MagicMock(
+        return_value={"id": _HEAL_NEW_ID, "name": "agent-x",
+                      "status": "created", "note": ""})
+    return cm
+
+
+def test_missing_heal_recreates_for_existing_record(events, audits):
+    """heal_missing=True: a stale docker_id is rebuilt ONCE for the SAME record."""
+    cm = _missing_cm()
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result.get("error") is None
+    assert result["id"] == _HEAL_NEW_ID
+    assert result["status"] == "created"
+    # Exactly ONE rebuild, bound to the EXISTING record, from the CURRENT policy.
+    assert cm._fresh_start.call_count == 1
+    _args, kwargs = cm._fresh_start.call_args
+    assert kwargs["reuse_record_id"] == "rec-1"
+    assert kwargs["network_mode"] == "none"
+    assert kwargs["workspace_mode"] == "ro"
+    # Non-vacuous: the recreate is signal-visible (event + audit).
+    recreated = [e for e in events if e["event_type"] == _HEAL_EVENT]
+    assert len(recreated) == 1
+    ev = recreated[0]
+    assert ev["workspace_id"] == "w1"
+    assert ev["record_id"] == "rec-1"
+    assert ev["actor"] == container_manager._HEAL_ACTOR
+    assert ev["payload"]["reason"] == "container_missing"
+    assert ev["payload"]["old_docker_id"] == _HEAL_STALE
+    assert ev["payload"]["new_docker_id"] == _HEAL_NEW_ID
+    heals = [a for a in audits if a["event"] == _HEAL_AUDIT_OK]
+    assert len(heals) == 1
+    assert f"old_docker_id={_HEAL_STALE}" in heals[0]["data"]
+    assert f"new_docker_id={_HEAL_NEW_ID}" in heals[0]["data"]
+
+
+def test_missing_without_heal_flag_refuses(events, audits):
+    """heal_missing defaults False: the ordinary refusal stands, no rebuild."""
+    cm = _missing_cm()
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    result = cm.start(name="agent-x")
+
+    assert result["code"] == "container_record_container_missing"
+    assert cm._fresh_start.call_count == 0
+    assert [e for e in events if e["event_type"] == _HEAL_EVENT] == []
+    assert [a for a in audits if a["event"] == _HEAL_AUDIT_OK] == []
+    # Non-vacuous: the ordinary stale-docker-id drift signal DID fire.
+    assert len([e for e in events if e["event_type"] == _ABSENT_EVENT]) == 1
+
+
+def test_missing_heal_is_attempted_once_only_when_it_fails(events, audits):
+    """A REFUSED rebuild is terminal: the memo stops a second attempt."""
+    cm = _missing_cm()
+    cm._fresh_start = MagicMock(return_value={"error": "admission denied"})
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    r1 = cm.start(name="agent-x", heal_missing=True)
+    r2 = cm.start(name="agent-x", heal_missing=True)
+
+    assert r1["code"] == "container_record_container_missing"
+    assert r2["code"] == "container_record_container_missing"
+    # Exactly ONE attempt across BOTH calls: the failed heal is memoised at
+    # ATTEMPT time, so a later call never retries.
+    assert cm._fresh_start.call_count == 1
+    assert [e for e in events if e["event_type"] == _HEAL_EVENT] == []
+    # Non-vacuous: the ordinary refusal signal fired (once, memoised).
+    assert len([a for a in audits
+                if a["event"] == "CONTAINER_START_STALE_DOCKER_ID"]) == 1
+
+
+def test_missing_heal_refuses_when_policy_uncomputable(events, audits):
+    """An uncomputable policy invents nothing: refuse via the heal signal."""
+    cm = _missing_cm()
+    calls = {"n": 0}
+
+    def _boom(*a, **k):
+        calls["n"] += 1
+        if calls["n"] > 1:  # start()'s own compute succeeds; the HEAL recompute fails
+            raise RuntimeError("no policy")
+        return ("none", "ro")
+
+    cm._compute_config = _boom
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result["code"] == "container_record_container_missing"
+    assert cm._fresh_start.call_count == 0  # never built an un-policied container
+    refused = [e for e in events if e["event_type"] == _HEAL_REFUSED_EVENT]
+    assert len(refused) == 1
+    assert refused[0]["payload"]["reason"] == "container_missing"
+    assert refused[0]["payload"]["detail"] == "config_uncomputable"
+    assert refused[0]["payload"]["old_docker_id"] == _HEAL_STALE
+    failed = [a for a in audits if a["event"] == _HEAL_AUDIT_FAIL]
+    assert len(failed) == 1
+    assert "detail=config_uncomputable" in failed[0]["data"]
+
+
+def test_missing_heal_refused_for_own_lifecycle_class(events, audits):
+    """Classes that OWN their lifecycle (RESOURCE/SERVICE) are never auto-healed."""
+    cm = _missing_cm()
+    create_record("w1", LIFECYCLE_RESOURCE, OWNER_WORKSPACE, id="rec-1",
+                  name="agent-x", vault_root=_VAULT["root"])
+    update_record("w1", "rec-1", vault_root=_VAULT["root"], docker_id=_HEAL_STALE)
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result["code"] == "container_record_container_missing"
+    assert cm._fresh_start.call_count == 0  # the class gate blocks the rebuild
+    assert [e for e in events if e["event_type"] == _HEAL_EVENT] == []
+    # Non-vacuous: the ordinary stale-docker-id drift signal still fires.
+    assert len([e for e in events if e["event_type"] == _ABSENT_EVENT]) == 1
+
+
+def test_drift_still_refuses_even_with_heal_flag(events, audits):
+    """Regression pin: auto-heal is reachable ONLY on container_missing, never drift."""
+    ctr = _FakeContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                         attrs=_attrs("bridge", True))  # MORE permissive than policy
+    cm = _make_cm(ctr, want=("none", "ro"))
+    cm._fresh_start = MagicMock()
+    _arrange(cm, ctr, "agent-x", "record")
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert "error" in result
+    assert result["drift"]["decision"] == "deny"
+    assert cm._fresh_start.called is False
+    assert [e for e in events if e["event_type"] == _HEAL_EVENT] == []
+
+
+def test_missing_heal_rebuilds_from_current_policy_then_reuses_clean(events):
+    """The rebuild uses the CURRENT policy; the rebound container then reuses clean."""
+    cm = _missing_cm()
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    def _fake_fresh(**kwargs):
+        # Mirror _fresh_start's real side effect: rebind the EXISTING record to the
+        # fresh container, and publish it live with CURRENT-policy isolation.
+        update_record("w1", "rec-1", vault_root=_VAULT["root"],
+                      docker_id=_HEAL_NEW_ID)
+        cm.client.containers.containers = [
+            _FakeContainer(_HEAL_NEW_ID, name="agent-x",
+                           labels={RECORD_LABEL_KEY: "rec-1"},
+                           attrs=_attrs("none", False))]
+        return {"id": _HEAL_NEW_ID, "name": "agent-x", "status": "created",
+                "note": ""}
+
+    cm._fresh_start = MagicMock(side_effect=_fake_fresh)
+
+    r1 = cm.start(name="agent-x", heal_missing=True)
+    assert r1["id"] == _HEAL_NEW_ID
+    _args, kwargs = cm._fresh_start.call_args
+    assert (kwargs["network_mode"], kwargs["workspace_mode"]) == ("none", "ro")
+
+    # A SECOND start resolves the (now live) rebuilt container -> CLEAN reuse.
+    r2 = cm.start(name="agent-x", heal_missing=True)
+    assert r2["status"] == "reused"
+    assert "drift" not in r2
+    assert [e for e in events if e["event_type"] == _ABSENT_EVENT] == []
+
+
+def test_missing_heal_memo_prevents_second_heal(events, audits):
+    """After ONE heal the ``(record_id, stale_docker_id)`` memo is spent."""
+    cm = _missing_cm()
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    r1 = cm.start(name="agent-x", heal_missing=True)
+    assert r1["id"] == _HEAL_NEW_ID
+    assert cm._fresh_start.call_count == 1
+
+    # The record STILL names the original stale docker_id (no rebind here): a
+    # second start must NOT heal again.
+    r2 = cm.start(name="agent-x", heal_missing=True)
+    assert r2["code"] == "container_record_container_missing"
+    assert cm._fresh_start.call_count == 1
+
+
+def test_missing_heal_fires_even_when_record_state_is_creating(events):
+    """Negative pin: the heal gate does NOT consult the record's ``state`` field."""
+    cm = _missing_cm()
+    create_record("w1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, id="rec-1",
+                  name="agent-x", vault_root=_VAULT["root"])
+    update_record("w1", "rec-1", vault_root=_VAULT["root"],
+                  docker_id=_HEAL_STALE, state="creating")
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result["id"] == _HEAL_NEW_ID
+    assert cm._fresh_start.call_count == 1
+    assert len([e for e in events if e["event_type"] == _HEAL_EVENT]) == 1
+
+
+
+# ---------------------------------------------------------------------------
+# Guardrail 7 (chunk 4.1): the attach-time intent-snapshot refresh on rebuild.
+#
+# n7 above STUBS ``_fresh_start`` (deliberately, for ITS assertion), so the REAL
+# guardrail-7 block inside ``_fresh_start``'s ``reuse_record_id`` branch is never
+# entered by any earlier test.  n10/n11 close that gap: they drive the REAL
+# ``_fresh_start`` through the heal path and fake ONLY the daemon create seam
+# (``client.containers.run``) -- the SUBJECT (``_fresh_start``) is NEVER stubbed.
+# ---------------------------------------------------------------------------
+
+
+class _RunContainers:
+    """Fake ``client.containers``: the read-through ``get``/``list`` the admission
+    probes need, plus ``run`` (the single daemon create seam) returning a
+    pre-baked container whose ``.attrs`` carry the inspect payload under test."""
+
+    def __init__(self, items, run_result):
+        self._items = list(items)
+        self.run_result = run_result
+
+    def get(self, container_id):
+        for c in self._items:
+            if c.id == container_id or c.name == container_id:
+                return c
+        raise LookupError(container_id)
+
+    def list(self, all=False, filters=None):
+        return list(self._items)
+
+    def run(self, **kwargs):
+        return self.run_result
+
+
+class _RunFakeDockerClient:
+    """Fake docker client rich enough for the admission gate to ALLOW: ``ping``
+    succeeds and ``containers.list`` resolves the workspace count to a small,
+    under-limit number.  Distinct from ``_FakeDockerClient`` (which is the
+    intentionally-minimal read-only double the reuse tests use)."""
+
+    def __init__(self, created, live=()):
+        self.containers = _RunContainers(live, created)
+
+    def ping(self):  # admission: a client without ping is treated unreachable
+        return True
+
+
+def _real_heal_cm(created_attrs, *, workspace_id="w1"):
+    """A manager that drives the REAL ``_fresh_start`` via ``heal_missing``.
+
+    Only the daemon create seam (``client.containers.run``) is faked; the guard
+    block under test runs for real.  ``_fresh_start`` is DELIBERATELY left as the
+    real bound method (n7 stubs it; n10/n11 must NOT)."""
+    created = _FakeContainer(_HEAL_NEW_ID, name="agent-x", attrs=created_attrs)
+    cm = _make_cm(None, want=("none", "ro"), workspace_id=workspace_id)
+    cm.client = _RunFakeDockerClient(created)
+    cm.mem_limit = "1g"
+    cm.cpu_quota = 100000
+    return cm
+
+
+_EMPTY_EVIDENCE_ATTRS = {
+    "State": {"Status": "running"},
+    "HostConfig": {},          # no NetworkMode -> snapshot network_mode ""
+    "Mounts": [],              # no /workspace mount -> snapshot workspace_mode ""
+}
+
+
+def test_missing_heal_refresh_snapshot_on_rebuild(monkeypatch):
+    """Guardrail 7: a healed rebuild attaches the FRESH snapshot derived from the
+    live container's attrs (evidence-bearing) and it round-trips into the record.
+
+    Drives the REAL ``_fresh_start`` reuse branch -- ``_fresh_start`` is NOT
+    stubbed; only the daemon create seam is faked.
+    """
+    attrs = _attrs("none", False)  # network_mode/workspace_mode -> real evidence
+    cm = _real_heal_cm(attrs)
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    spy = MagicMock(wraps=container_manager.attach_container)
+    monkeypatch.setattr(container_manager, "attach_container", spy)
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result.get("error") is None
+    assert result["id"] == _HEAL_NEW_ID
+    assert spy.call_count == 1
+    expected = snapshot_from_attrs(attrs)
+    _args, kwargs = spy.call_args
+    assert kwargs.get("intent_snapshot") == expected
+    # Round-trip: the same snapshot is persisted on the record (default vault).
+    rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
+    assert rec.intent_snapshot == expected
+
+
+def test_missing_heal_omits_empty_snapshot_on_rebuild(monkeypatch):
+    """ITEM-0 mitigation: when the live attrs carry NO evidence the heal OMITS the
+    ``intent_snapshot`` kwarg, so the record's PRE-EXISTING good snapshot survives.
+
+    Real ``_fresh_start`` path; only the daemon create seam is faked.
+    """
+    cm = _real_heal_cm(_EMPTY_EVIDENCE_ATTRS)
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+    seed = {"network_mode": "bridge", "workspace_mode": "rw",
+            "hardening": {"cap_drop": ["ALL"]}}
+    update_record("w1", "rec-1", vault_root=_VAULT["root"],
+                  intent_snapshot=dict(seed))
+
+    spy = MagicMock(wraps=container_manager.attach_container)
+    monkeypatch.setattr(container_manager, "attach_container", spy)
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result.get("error") is None
+    assert result["id"] == _HEAL_NEW_ID
+    assert spy.call_count == 1
+    _args, kwargs = spy.call_args
+    assert "intent_snapshot" not in kwargs  # explicit kwarg-absence (not truthiness)
+    rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
+    assert rec.intent_snapshot == seed      # the good snapshot is byte-identical
+
+
+
+def test_start_refusal_message_unchanged_for_stale_docker_id():
+    """The missing-container refusal MESSAGE is pinned byte-for-byte (F4).
+
+    The refusal text is asserted as a fully LITERAL string built from this
+    test's own known inputs, so an incidental edit to the source f-string
+    (e.g. ``names`` -> ``references``) turns this assertion RED.
+    """
+    cm = _missing_cm()
+    _mint_record("w1", "agent-x", _HEAL_STALE)
+
+    result = cm.start(name="agent-x")
+
+    assert result["error"] == (
+        "Container 'agent-x' record rec-1 names docker_id "
+        "'dddddddddddddddd' but no such container exists."
+    )

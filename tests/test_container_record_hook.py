@@ -469,7 +469,7 @@ def test_attach_snapshot_failure_logs_and_still_binds(caplog):
 
 def test_snapshot_has_evidence_truth_table():
     """(e) The evidence rule: any truthy scalar / non-empty hardening counts."""
-    has_evidence = hook_mod._snapshot_has_evidence
+    has_evidence = hook_mod.snapshot_has_evidence
     assert has_evidence(None) is False
     assert has_evidence("nope") is False
     assert has_evidence({}) is False
