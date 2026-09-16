@@ -175,10 +175,14 @@ def test_install_sh_is_idempotent(exec_tmp):
     assert second.stdout.count("[ok]") >= min_ok, second.stdout
 
 
-def test_install_sh_rejects_macos(exec_tmp):
+def test_install_sh_accepts_macos(exec_tmp):
+    # install.sh supports macOS (Darwin): it runs the cross-platform checks and
+    # points at the launcher, emitting no refusal / unsupported message.
     result = _run_installer_platform(exec_tmp, "Darwin", "x86_64", None)
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "macOS is not supported" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Next step: ./start_thoughtmachine.sh" in result.stdout
+    assert "not supported" not in result.stdout.lower()
+    assert "unsupported" not in result.stdout.lower()
 
 
 def test_install_sh_rejects_windows(exec_tmp):

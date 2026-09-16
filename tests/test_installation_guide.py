@@ -1,5 +1,6 @@
 """Checks that docs/installation_guide.md exists and covers the documented
-platform surface (Linux x86_64, Windows x64, macOS unsupported), the
+platform surface (Linux x86_64, Windows x64, macOS supported via Docker
+Desktop), the
 one-command Linux installer, the --check-only flag, the onboarding wizard,
 and links to at least one of the Windows-specific docs.
 
@@ -26,9 +27,12 @@ def test_platform_surface_covered():
     text = GUIDE.read_text(encoding="utf-8")
     assert "Linux x86_64" in text
     assert "Windows x64" in text
-    # macOS must be explicitly declared unsupported, not silently omitted.
+    # macOS must be explicitly declared supported, not silently omitted.
     assert "macOS" in text
-    assert "Not supported" in text or "not supported" in text
+    assert (
+        "| macOS (Docker Desktop) | `./install.sh` | `./start_thoughtmachine.sh` | Supported |"
+        in text
+    )
 
 
 def test_linux_installer_and_check_only_mentioned():

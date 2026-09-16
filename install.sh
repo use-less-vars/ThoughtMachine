@@ -2,9 +2,10 @@
 #===============================================================================
 # install.sh - one-command installer for ThoughtMachine (Linux / x86_64)
 #
-# Supported platforms: Debian/Ubuntu on x86_64 (amd64). Other OSes/arches
-# exit early with a pointer to the right installer (install_thoughtmachine.bat
-# on Windows; manual setup on macOS).
+# Supported platforms: Debian/Ubuntu on x86_64 (amd64) and macOS (Docker
+# Desktop). Windows exits early with a pointer to install_thoughtmachine.bat.
+# On macOS the Linux-only steps (apt-get install, the docker group membership
+# check) are skipped and Docker Desktop's CLI directories are added to PATH.
 #
 # Runs the doctor checks and fixes what it can:
 #   [1/5] Python >= 3.11  (CRITICAL: abort with exit 1 on failure)
@@ -54,44 +55,58 @@ echo "============================================"
 echo ""
 
 # ---------------------------------------------------------------- platform gate
-# The Linux installer targets Debian/Ubuntu on x86_64. Anything else exits
-# early with a pointer to the right path.
+# Supports Debian/Ubuntu on x86_64 and macOS (Docker Desktop). The Windows
+# cases exit early with a pointer to the right installer.
 UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
+IS_DARWIN=0
 case "$UNAME_S" in
-    Darwin)
-        echo "ERROR: macOS is not supported by this installer."
-        echo "       Install Docker Desktop, Python >= 3.11 and Node.js >= 18,"
-        echo "       then run ./start_thoughtmachine.sh directly."
-        exit 1
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        echo "ERROR: this is the Linux installer; on Windows use install_thoughtmachine.bat."
-        exit 1
-        ;;
+    Darwin) IS_DARWIN=1 ;;
     Linux) ;;
+    MINGW*|MSYS*|CYGWIN*)
+        echo "ERROR: this is the Linux/macOS installer; on Windows use install_thoughtmachine.bat."
+        exit 1
+        ;;
     *)
-        echo "ERROR: unsupported operating system: $UNAME_S (expected Linux)."
+        echo "ERROR: unsupported operating system: $UNAME_S (expected Linux or Darwin)."
         exit 1
         ;;
 esac
 
-UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
-case "$UNAME_M" in
-    x86_64|amd64) ;;
-    *)
-        echo "ERROR: unsupported architecture: $UNAME_M (expected x86_64/amd64)."
-        exit 1
-        ;;
-esac
+# Docker Desktop on macOS installs its CLI outside the default PATH; add the
+# two known locations when present so `docker` (and the doctor checks) resolve.
+if [ "$IS_DARWIN" -eq 1 ]; then
+    for _dd in "$HOME/.docker/bin" "/Applications/Docker.app/Contents/Resources/bin"; do
+        if [ -d "$_dd" ]; then
+            case ":$PATH:" in
+                *":$_dd:"*) ;;
+                *) export PATH="$_dd:$PATH" ;;
+            esac
+        fi
+    done
+    unset _dd
+fi
 
-DISTRO_ID="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n1)"
-case "$DISTRO_ID" in
-    debian|ubuntu) ;;
-    *)
-        echo "ERROR: unsupported distribution: ${DISTRO_ID:-unknown} (expected debian or ubuntu)."
-        exit 1
-        ;;
-esac
+# The architecture and distribution gates are Linux-only; macOS is accepted
+# as-is (Apple Silicon arm64 included).
+if [ "$IS_DARWIN" -eq 0 ]; then
+    UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
+    case "$UNAME_M" in
+        x86_64|amd64) ;;
+        *)
+            echo "ERROR: unsupported architecture: $UNAME_M (expected x86_64/amd64)."
+            exit 1
+            ;;
+    esac
+
+    DISTRO_ID="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n1)"
+    case "$DISTRO_ID" in
+        debian|ubuntu) ;;
+        *)
+            echo "ERROR: unsupported distribution: ${DISTRO_ID:-unknown} (expected debian or ubuntu)."
+            exit 1
+            ;;
+    esac
+fi
 
 # ------------------------------------------------------------------ [1/5] Python (critical)
 echo "[1/5] Python >= 3.11 ..."
@@ -125,6 +140,14 @@ if [ "$DOCKER_RC" -ne 0 ]; then
     DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
     case "$DOCKER_REASON" in
         lib_missing)
+            if [ "$IS_DARWIN" -eq 1 ]; then
+                echo "      FAILED: Docker CLI not found on PATH."
+                echo "      Install and launch Docker Desktop, then re-run ./install.sh:"
+                echo "      https://docs.docker.com/desktop/install/mac-install/"
+                echo ""
+                echo "  Installation aborted."
+                exit 1
+            fi
             if sudo -n true 2>/dev/null; then
                 echo "      docker CLI not found - installing docker.io via apt-get (may take a moment)..."
                 sudo apt-get update && sudo apt-get install -y docker.io 2>&1 | sed 's/^/      /' || true
@@ -149,10 +172,22 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             fi
             ;;
         daemon_down)
-            echo "      daemon not running - trying to start it (may prompt for sudo password)..."
-            doctor --ensure-docker-daemon 2>&1 | sed 's/^/      /' || true
-            DOCKER_OUT="$(doctor --check-docker 2>&1)"
-            DOCKER_RC=$?
+            if [ "$IS_DARWIN" -eq 1 ]; then
+                echo "      daemon not running - launching Docker Desktop..."
+                open -a Docker 2>/dev/null || echo "      (could not run 'open -a Docker'; start Docker Desktop manually)"
+                for _wait in $(seq 1 30); do
+                    DOCKER_OUT="$(doctor --check-docker 2>&1)"
+                    DOCKER_RC=$?
+                    [ "$DOCKER_RC" -eq 0 ] && break
+                    sleep 2
+                done
+                unset _wait
+            else
+                echo "      daemon not running - trying to start it (may prompt for sudo password)..."
+                doctor --ensure-docker-daemon 2>&1 | sed 's/^/      /' || true
+                DOCKER_OUT="$(doctor --check-docker 2>&1)"
+                DOCKER_RC=$?
+            fi
             if [ "$DOCKER_RC" -ne 0 ]; then
                 DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
                 echo "      FAILED: Docker daemon could not be started."
@@ -185,6 +220,12 @@ fi
 echo ""
 
 # ------------------------------------------------------------------ [3/5] Docker group
+# macOS has no 'docker' group (Docker Desktop grants socket access without it),
+# so this Linux-only membership step is skipped on Darwin.
+if [ "$IS_DARWIN" -eq 1 ]; then
+echo "[3/5] Docker group ... skipped (not applicable on macOS)."
+echo ""
+else
 echo "[3/5] Docker group ..."
 GROUP_OUT="$(doctor --check-docker-group 2>&1)"
 GROUP_RC=$?
@@ -198,6 +239,7 @@ else
     DONE_OK+=("Docker group")
 fi
 echo ""
+fi
 fi
 
 # ------------------------------------------------------------------ [4/5] venv (critical)

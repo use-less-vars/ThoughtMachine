@@ -22,6 +22,7 @@ Coverage:
 
 import json
 import os
+import sys
 import types
 
 import pytest
@@ -165,6 +166,10 @@ def _evidence_attrs(user=None):
 # ── 1 ────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="pins POSIX uid:gid derivation; host_user() returns None on Windows",
+)
 def test_container_user_matches_host_uid(monkeypatch):
     """_run_container must pass the host ``uid:gid`` as the container user."""
     client = _FakeClient(run_result=_FakeCtr())
@@ -220,6 +225,10 @@ def test_git_status_succeeds_without_safe_directory(monkeypatch):
 # ── 3 ────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only uid:gid mapping; host_tmpfs() omits uid/gid on Windows",
+)
 def test_macos_uid_501_not_1000_maps(monkeypatch):
     """ContainerProfile().tmpfs /home/agent must reflect the live host uid/gid."""
     monkeypatch.setattr(os, "getuid", lambda: 501)
@@ -236,9 +245,24 @@ def test_macos_uid_501_not_1000_maps(monkeypatch):
 # ── 4 ────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "root-host refusal is POSIX-only: _host_ids() returns None on Windows "
+        "(no uid concept), so there is no root host to refuse"
+    ),
+)
 def test_root_host_keeps_nonroot_container_user(monkeypatch):
-    """No create site may run a container from the host root user (uid 0)."""
-    monkeypatch.setattr(os, "getuid", lambda: 0)
+    """No create site may run a container from the host root user (uid 0).
+
+    POSIX-only: the refusal keys off ``_host_ids()``, which returns ``None`` on
+    Windows (no uid concept) -- there is no root host to refuse there, so this
+    test is skipped.  On POSIX the ``raising=False`` injection of host uid
+    ``0`` drives every create site's real ``_host_ids()[0] == 0`` refusal branch
+    end to end (the container is never created), keeping the assertions below
+    meaningful rather than vacuous.
+    """
+    monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
 
     # (a) ContainerManager.start refuses up front.
     client = _FakeClient(run_result=_FakeCtr())
@@ -328,8 +352,10 @@ def test_intent_snapshot_carries_user(monkeypatch, tmp_path):
     record = load_record("ws-5", rid)
     assert record is not None
     # Both fields read the OBSERVED user (host path takes Config.User first).
-    assert record.user == observed
-    assert record.intent_snapshot["user"] == observed
+    # Windows: host_user() is None and the store coerces an absent user to "".
+    expected = observed if observed is not None else ""
+    assert record.user == expected
+    assert record.intent_snapshot["user"] == expected
     assert record.user == record.intent_snapshot["user"]
 
 

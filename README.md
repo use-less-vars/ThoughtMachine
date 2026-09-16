@@ -1,206 +1,139 @@
-
-
-
 # ThoughtMachine
 
-An AI agent framework that executes code securely inside Docker containers.
-Runs everywhere — **Linux**, **macOS**, and **Windows** (no WSL required).
+An AI agent framework that executes the code it writes inside isolated Docker
+containers. Runs natively on **Linux**, **macOS**, and **Windows** — no WSL,
+Git Bash, or Cygwin required.
 
----
+- **Isolated execution.** Agent-generated code runs in a Docker container that has
+  no network and a read-only root filesystem by default; relax the policy when a
+  task needs it.
+- **No model lock-in.** OpenAI, Anthropic, DeepSeek, Ollama, OpenRouter, or any
+  OpenAI-compatible endpoint — change the config, not the code.
+- **Lean by design.** Summarisation plus a persistent Knowledge Base keep long
+  agentic sessions inside a ~75k-token working budget.
+- **Persistent workspaces.** Point it at any folder; it keeps architecture notes,
+  bug logs, and task tracking that survive across sessions.
+- **Agent & Engineer modes.** Engineer mode orchestrates worker sub-agents, each
+  in its own thread/context, returning a structured status/confidence envelope.
 
-## Why ThoughtMachine?
+## Platform support
 
-This project started from a simple frustration: most AI agent frameworks lock you
-into specific models, cost a fortune at scale, or compromise on security.
+| Capability | Linux | macOS | Windows |
+|---|---|---|---|
+| Web UI (React + FastAPI + WebSocket) | ✅ | ✅ | ✅ |
+| CLI / programmatic API | ✅ | ✅ | ✅ |
+| Docker code sandbox | ✅ | ✅ | ❌ fails gracefully |
 
-ThoughtMachine is built different.
-
-**Secure by design.** Every piece of code the agent writes runs inside an isolated
-Docker container. No sandbox escapes, no accidental host modification. The
-container has no network and a read-only filesystem by default. You can relax the
-rules when you need to, but the safe defaults keep you out of trouble.
-
-**No lock-in.** Use OpenAI, Anthropic, DeepSeek, Ollama, OpenRouter, or any
-OpenAI-compatible endpoint. Swap models with a config change. Your workspace,
-your choice.
-
-**Efficient by default.** Larger context windows mean more tokens processed on
-every call, and those add up fast over many agentic rounds — even with cached
-tokens. ThoughtMachine is designed to do real work inside a **75k token** budget.
-Smart summarization and a persistent Knowledge Base handle project memory, so you
-don't need a million-token window to keep context. Run it on DeepSeek-v4-flash and
-a full day of coding costs under $0.50. Or use a heavy model — either way, you
-keep your token burn lean.
-
-**Workspaces remember.** Point ThoughtMachine at any folder and it becomes a
-workspace with a persistent Knowledge Base — architecture notes, bug logs,
-lessons learned, task tracking, all surviving across sessions. The agent builds
-real understanding of your project over time.
-
----
-
-### What's new in V2.0
-
-V2.0 introduces a multi-agent architecture with a dedicated Engineer mode.
-
-- **Agent & Engineer modes.** Agent mode gives you a general-purpose assistant with 22 tools. Engineer mode gives you a focused orchestrator that delegates all implementation to a powerful default worker sub-agent.
-- **Workers.** Each workspace hosts its own worker — a fully capable sub-agent that runs in an isolated thread with its own context window. The worker returns a structured envelope with status, confidence, metadata, and telemetry (elapsed time, tool call count, token usage).
-- **WorkingDocument.** A structured collaborative document tool for sharing task specs, progress, and results between the main agent and workers.
-- **Protocol fields.** Workers accept `purpose` and `style` hints; they respond with `status`, `confidence`, and `meta` (struggles, blockers, remaining work). The main agent is prompted to read these signals and adjust its delegation.
-- **Integration tests.** 26 hermetic tests verify session lifecycle, config serialization, preset enforcement, and vault bootstrap — all in under a second.
-- **Pre-commit safety net.** A pre-commit hook checks syntax, critical imports, and unit tests before every commit.
-
----
-
-### Getting started
-
-You're about three commands away from running your first session.
-Download the repo, run the install script, set up Docker, drop your API keys in
-one place, and you're riding ThoughtMachine.
-
-Let us know how it goes. We'd love to see it tested against Claude Code, Cursor,
-and the rest. Kick the tires.
-
----
-
-## Quick Start — Windows
-
-**You need to install these manually first:**
-
-| Dependency | Where to get it |
-|-----------|-----------------|
-| **Python 3.12** | https://www.python.org/downloads/release/python-3125/ — click the big **Download Python 3.12.5** button. During install, check **"Add Python to PATH"**. |
-| **Node.js** | https://nodejs.org/ — click the **LTS** button (left side, says e.g. "22 LTS"), not "Current". |
-
-Then double-click (or run from cmd):
-
-```batch
-install_thoughtmachine.bat
-```
-
-This will:
-1. Detect that Python and Node.js are installed
-2. Create a virtual environment (`.venv`) and install Python dependencies
-3. Install npm packages and build the React frontend
-
-(A config file is created automatically on the first server start.)
-
-When it finishes:
-
-```batch
-start_thoughtmachine.bat
-```
-
-Point your browser to **http://127.0.0.1:8000**.
-
-> **Optional RAG support:** `install_thoughtmachine.bat --with-rag`
-
----
+The web UI is the supported frontend on every platform. On Windows the Docker
+sandbox is unavailable by design — the tool reports this and the rest of the
+agent keeps working; see
+[docs/windows_stability_contract.md](docs/windows_stability_contract.md).
 
 ## Quick Start — Linux / macOS
 
 ```bash
-# 1. Install dependencies
-./install_thoughtmachine.sh
+# 1. Prerequisite checks + venv + Python deps (Python >= 3.11, Docker, Node >= 18)
+./install.sh
 
-# 2. Start the Web UI
+# 2. Web UI dependencies (install.sh does NOT run npm install)
+cd web_ui/frontend && npm install && cd ../..
+
+# 3. Launch: backend on :8000 + Vite dev server on :5173
 ./start_thoughtmachine.sh
 ```
 
-Prerequisites: **Python 3.11–3.13**, **Node.js 18+**, **Docker** (for sandboxed execution).
+Open **http://127.0.0.1:5173** (Vite proxies `/api` and `/ws` to the backend on
+:8000). For a single-process production run, where the backend serves the built
+frontend directly:
 
----
+```bash
+./start_thoughtmachine.sh --prod   # http://127.0.0.1:8000
+```
+
+What each script does (and does not do) is spelled out in
+[docs/installation_guide.md](docs/installation_guide.md).
+
+## Quick Start — Windows
+
+Install these manually first:
+
+| Dependency | Source |
+|---|---|
+| **Python 3.11+** (3.14 supported) | https://www.python.org/downloads/ — tick "Add Python to PATH" |
+| **Node.js 18+** (LTS) | https://nodejs.org/ |
+
+Then, from a `cmd` prompt:
+
+```batch
+install_thoughtmachine.bat    REM venv + Python deps + npm install + frontend build
+start_thoughtmachine.bat      REM open http://127.0.0.1:8000
+```
+
+The installer refuses to continue if Python is older than 3.11 or Node.js older
+than 18. Docker Desktop is optional on Windows — the sandbox is unavailable
+there, so those tools fail gracefully.
 
 ## What's Included
 
 | Component | Description | Access |
-|-----------|-------------|--------|
-| Web UI | Full-featured browser interface (React + FastAPI + WebSocket) | `start_thoughtmachine.bat` / `.sh` → `http://127.0.0.1:8000` |
-| Qt GUI | Native desktop interface (PyQt6) | `python run_gui.py` |
-| CLI / API | Programmatic access via FastAPI server | Server at port 8000 |
-| Docker sandbox | Secure code execution in isolated containers | Auto-configured |
-| **V2.0 Engineer mode** | Multi-agent orchestrator with worker sub-agents, structured protocol, WorkingDocument | Create an Engineer session in the Web UI |
-| PyInstaller bundle | Standalone .exe / binary (no Python needed) | See `PACKAGING.md` |
-
----
-
-## Packaging — Standalone Executable
-
-Build a self-contained binary with PyInstaller:
-
-**Linux / macOS:**
-```bash
-./build_thoughtmachine_exe.sh
-```
-
-**Windows:**
-```batch
-build_thoughtmachine_exe.bat
-```
-
-See [PACKAGING.md](PACKAGING.md) for detailed instructions, spec-file
-reference, and troubleshooting.
-
----
+|---|---|---|
+| Web UI | React + FastAPI + WebSocket browser interface | `start_thoughtmachine.{sh,bat}` → :8000 (:5173 in dev) |
+| CLI / API | Programmatic access to the agent | FastAPI server, port 8000 |
+| Docker sandbox | Isolated code execution | Auto-configured (Linux/macOS) |
+| Engineer mode | Orchestrator + worker sub-agents, structured protocol, WorkingDocument | Create an Engineer session in the Web UI |
+| Standalone binary | PyInstaller bundle (`.exe` / ELF) | See [PACKAGING.md](PACKAGING.md) |
 
 ## Configuration
 
-On first run, ThoughtMachine creates a config file at:
-
-- **Linux/macOS:** `~/.thoughtmachine/agent_config.json`
-- **Windows:** `%USERPROFILE%\.thoughtmachine\agent_config.json`
-
-Set your API key(s) in the Web UI's **Model** panel, or edit the file
-directly:
+On first start ThoughtMachine creates `~/.thoughtmachine/agent_config.json`
+(`%USERPROFILE%\.thoughtmachine\agent_config.json` on Windows). Set API keys in
+the Web UI's **Model** panel, or edit the file:
 
 ```json
-{
-  "provider_type": "openai",
-  "model": "gpt-4o",
-  "api_key": "sk-..."
-}
+{ "provider_type": "openai", "model": "gpt-4o", "api_key": "sk-..." }
 ```
 
-Supported providers: OpenAI, Anthropic, and any OpenAI-compatible endpoint
-(e.g. OpenRouter, DeepSeek, Ollama).
-
----
+Keep keys out of the repository — see [SECURITY.md](SECURITY.md).
 
 ## Requirements
 
 | Dependency | Minimum | Notes |
-|-----------|---------|-------|
-| Python | 3.11 | 3.12 and 3.13 also supported |
-| Node.js | Any recent version | Required for Web UI frontend build |
-| Docker | 24+ | Required for sandboxed execution (optional without) |
-| RAM | 4 GB | 8 GB recommended for local LLMs |
+|---|---|---|
+| Python | 3.11 | `requires-python = ">=3.11"`; tested on 3.14 |
+| Node.js | 18 | Required for the Web UI frontend |
+| Docker | a recent engine | Required for the sandbox; optional on Windows |
 
-> **Windows users:** Install Python and Node.js manually first (links above).
-No WSL, no Git Bash, no Cygwin needed — native `.bat` scripts.
+## Development & Testing
 
----
+```bash
+python -m pytest -m "not docker and not e2e"   # the selection CI runs
+python -m pytest -m docker                     # requires a real Docker daemon
+```
+
+Markers: `slow`, `integration`, `docker`, `e2e` (Playwright, `--run-e2e`); tests
+live under `tests/`. Push the branch before merging, and merge only after CI is
+green.
 
 ## Project Structure
 
 ```
-.
-├── install_thoughtmachine.bat   # Windows installer (double-click)
-├── install_thoughtmachine.sh    # Linux/macOS installer
-├── start_thoughtmachine.bat     # Windows launcher
-├── start_thoughtmachine.sh      # Linux/macOS launcher
-├── build_thoughtmachine_exe.bat # Windows PyInstaller build
-├── build_thoughtmachine_exe.sh  # Linux/macOS PyInstaller build
+├── install.sh                     # Linux/macOS installer — canonical path (used by CI)
+├── install_thoughtmachine.sh      # legacy all-in-one installer (also builds frontend, bootstraps vault)
+├── start_thoughtmachine.sh        # Linux/macOS launcher (dev / --prod / --check-only / --doctor)
+├── install_thoughtmachine.bat     # Windows installer
+├── start_thoughtmachine.bat       # Windows launcher
+├── start_windows.py               # portable Windows launcher (absolute paths)
+├── kill_thoughtmachine.sh/.bat    # force-stop :8000 and :5173-5177
+├── build_thoughtmachine_exe.sh/.bat   # PyInstaller builds
 ├── web_ui/
-│   ├── backend/                 # FastAPI + WebSocket server
-│   └── frontend/                # React + Vite
-├── agent/                       # Core agent framework
-├── tools/                       # Tool implementations
-├── qt_gui/                      # Native PyQt6 desktop GUI
-├── docker/                      # Docker executor config
-└── PACKAGING.md                 # PyInstaller packaging guide
+│   ├── backend/                   # FastAPI + WebSocket server
+│   └── frontend/                  # React + Vite
+├── agent/                         # core agent framework
+├── tools/                         # tool implementations
+├── tests/                         # pytest suite
+├── docs/                          # guides + architecture notes
+└── PACKAGING.md                   # PyInstaller packaging guide
 ```
-
----
 
 ## License
 

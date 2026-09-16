@@ -15,6 +15,7 @@ See ``docs/architecture/config_ownership.md`` for the ownership model.
 """
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def _vault_file_snapshot(vault: Path) -> dict:
     snapshot = {}
     for p in sorted(vault.rglob("*")):
         if p.is_file():
-            snapshot[str(p.relative_to(vault))] = p.read_bytes()
+            snapshot[str(p.relative_to(vault)).replace(os.sep, "/")] = p.read_bytes()
     return snapshot
 
 

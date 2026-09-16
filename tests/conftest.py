@@ -136,16 +136,79 @@ atexit.register(shutil.rmtree, HERMETIC_BASE_DIR, ignore_errors=True)
 _SAVED_HOME = os.environ.get("HOME")
 _SAVED_VAULT_ROOT = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
 _SAVED_PATH_HOME = pathlib.Path.home
+_SAVED_USERPROFILE = os.environ.get("USERPROFILE")
+_SAVED_HOMEDRIVE = os.environ.get("HOMEDRIVE")
+_SAVED_HOMEPATH = os.environ.get("HOMEPATH")
 
 # Tracked at session start by hermetic_vault_env; used by the exit-time
 # cleanup helper (kept named for symmetry; see _cleanup_hermetic_base).
 _HERMETIC_BASE_DIR = None
 
 os.environ["HOME"] = HERMETIC_BASE_DIR
+# On Windows, ``os.path.expanduser`` is ``ntpath.expanduser``: it resolves a
+# leading ``~`` from ``USERPROFILE`` (or ``HOMEDRIVE`` + ``HOMEPATH``) and
+# IGNORES ``HOME`` -- the HOME redirect above therefore does not reach it. Set
+# the Windows variables too (HOMEDRIVE/HOMEPATH reconstructed from the base dir
+# for completeness) so any ``os.path.expanduser`` caller is redirected.
+os.environ["USERPROFILE"] = HERMETIC_BASE_DIR
+_HOMEDRIVE, _HOMEPATH = os.path.splitdrive(HERMETIC_BASE_DIR)
+os.environ["HOMEDRIVE"] = _HOMEDRIVE or ""
+os.environ["HOMEPATH"] = _HOMEPATH or HERMETIC_BASE_DIR
 os.environ.pop("THOUGHTMACHINE_VAULT_ROOT", None)
 pathlib.Path.home = staticmethod(
     lambda: pathlib.Path(os.environ.get("HOME", HERMETIC_BASE_DIR))
 )
+
+# ``os.path.expanduser`` is the second "~"-resolving seam: POSIX-path code
+# reaches the vault via ``os.path.expanduser("~/.thoughtmachine")`` without
+# going through ``pathlib.Path.home`` (patched above). Wrap it so the two
+# unambiguous "~" forms always resolve to the hermetic base on every platform,
+# recognising BOTH separators (so the rewrite is correct under posixpath and
+# ntpath alike). Everything else (``~otheruser``, absolute paths, ...) falls
+# through to the captured original unchanged, preserving its edge behaviour.
+# For realistic POSIX inputs (``~``, ``~/...``) the original already returned
+# the hermetic base via the redirected HOME, so this is a behavioural NO-OP on
+# Linux/macOS. Re-import safe: the wrapper carries a marker and is never
+# stacked (a double conftest import reuses the first captured original).
+if getattr(os.path.expanduser, "_hermetic_expanduser", False):
+    _SAVED_EXPANDUSER = os.path.expanduser._hermetic_original
+else:
+    _SAVED_EXPANDUSER = os.path.expanduser
+
+    @functools.wraps(_SAVED_EXPANDUSER)
+    def _hermetic_expanduser(path):
+        """Resolve a leading ``~`` from ``$HOME`` (both separators).
+
+        conftest redirects ``HOME`` to the hermetic base dir at import time,
+        but on Windows ``ntpath.expanduser`` IGNORES ``HOME`` and reads
+        ``USERPROFILE``/``HOMEDRIVE``+``HOMEPATH`` instead -- so wrap the seam
+        and resolve from ``HOME`` explicitly on every platform.  Because the
+        rewrite still goes through ``HOME``, tests that monkeypatch ``HOME``
+        (e.g. to a tmp dir) keep seeing their value, exactly as the unwrapped
+        ``posixpath.expanduser`` would.
+        """
+        if path == "~":
+            rest = None
+        elif path.startswith("~/") or path.startswith("~\\"):
+            rest = path[2:]
+        else:
+            return _SAVED_EXPANDUSER(path)
+        home = os.environ.get("HOME")
+        if not home:
+            return _SAVED_EXPANDUSER(path)
+        return home if rest is None else os.path.join(home, rest)
+
+    _hermetic_expanduser._hermetic_expanduser = True
+    _hermetic_expanduser._hermetic_original = _SAVED_EXPANDUSER
+    os.path.expanduser = _hermetic_expanduser
+
+
+def _restore_env_var(name, saved):
+    """Restore env var *name* to *saved* (delete it when it was originally unset)."""
+    if saved is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = saved
 
 
 def _restore_hermetic_env():
@@ -160,6 +223,7 @@ def _restore_hermetic_env():
     dir instead of the real user vault. Idempotent; safe to call twice.
     """
     pathlib.Path.home = _SAVED_PATH_HOME
+    os.path.expanduser = _SAVED_EXPANDUSER
     if _SAVED_HOME is None:
         os.environ.pop("HOME", None)
     else:
@@ -168,6 +232,9 @@ def _restore_hermetic_env():
         os.environ.pop("THOUGHTMACHINE_VAULT_ROOT", None)
     else:
         os.environ["THOUGHTMACHINE_VAULT_ROOT"] = _SAVED_VAULT_ROOT
+    _restore_env_var("USERPROFILE", _SAVED_USERPROFILE)
+    _restore_env_var("HOMEDRIVE", _SAVED_HOMEDRIVE)
+    _restore_env_var("HOMEPATH", _SAVED_HOMEPATH)
 
 
 def _cleanup_hermetic_base():
