@@ -1,24 +1,25 @@
 # ThoughtMachine Installation Guide
 
 This guide covers installing and running ThoughtMachine from a source checkout on
-Linux and Windows. It is written for engineers: it tells you what the scripts
+Linux, Windows and macOS. It is written for engineers: it tells you what the scripts
 actually do, what they check, and what they will not do for you.
 
 ## Scope
 
-- **Supported:** Linux (Debian/Ubuntu, x86_64) and Windows (x64).
-- **Not supported:** macOS. The Linux installer refuses to run on macOS; the
-  recommended path is a Linux VM/container or manual setup of the components
-  (Python, Node, Docker Desktop) followed by `./start_thoughtmachine.sh`.
+- **Supported:** Linux (Debian/Ubuntu, x86_64), Windows (x64), and macOS
+  (Docker Desktop).
+- **macOS support.** `install.sh` detects Darwin and runs the same checks as on
+  Linux, skipping the Linux-only steps (`apt-get`, the `docker` group
+  membership check) and adding the Docker Desktop CLI to `PATH`.
 - **Platform gaps are explicit.** The Windows launcher does **not** support the
   Docker executor (see `docs/windows_stability_contract.md`), and the Linux
-  installer does **not** cover macOS or non-Debian distros.
+  installer does **not** cover non-Debian distros.
 
 | Platform | Installer | Launcher | Status |
 | --- | --- | --- | --- |
 | Linux x86_64 (Debian/Ubuntu) | `./install.sh` | `./start_thoughtmachine.sh` | Supported |
 | Windows x64 | `install_thoughtmachine.bat` | `python start_windows.py` | Supported |
-| macOS | — | `./start_thoughtmachine.sh` (manual setup) | **Not supported** |
+| macOS (Docker Desktop) | `./install.sh` | `./start_thoughtmachine.sh` | Supported |
 
 ## Prerequisites
 
@@ -47,13 +48,7 @@ reported, and a summary is printed at the end. It refuses to run on the wrong
 platform before doing anything:
 
 ```
-ERROR: macOS is not supported by this installer.
-       Install Docker Desktop, Python >= 3.11 and Node.js >= 18,
-       then run ./start_thoughtmachine.sh directly.
-```
-
-```
-ERROR: this is the Linux installer; on Windows use install_thoughtmachine.bat.
+ERROR: this is the Linux/macOS installer; on Windows use install_thoughtmachine.bat.
 ```
 
 It also gates on architecture (`ERROR: unsupported architecture: $UNAME_M

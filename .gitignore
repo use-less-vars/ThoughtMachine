@@ -163,3 +163,8 @@ line_number_report.md
 # huge WIP test-run log (removed from tracking)
 docs/testing/test_run_on_host.txt
 !docs/container_subsystem_target_architecture.md
+
+# Allowlisted build docs (platform-matrix deliverables, 2026)
+!docs/CAPABILITIES.md
+!docs/testing/
+!docs/testing/ci_process.md

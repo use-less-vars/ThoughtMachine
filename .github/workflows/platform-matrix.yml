@@ -1,0 +1,375 @@
+# Platform Matrix CI (additive)
+# ---------------------------------------------------------------------------
+# Runs the project's test suite, an import smoke, a thin cross-platform test
+# slice and macOS-specific probes across Linux / Windows / macOS.
+#
+# The repository is PUBLIC, so GitHub-hosted runners consume free minutes for
+# all three operating systems; every job therefore runs on every push and
+# pull_request (no path/label gating, no manual dispatch).
+#
+# This file is intentionally additive: it has its own concurrency group and
+# does not modify or replace python-version-matrix.yml or cross-platform-
+# smoke.yml.
+#
+# Anti-vacuity: every job that runs pytest first runs
+# scripts/ci_assert_collected.py, which fails the job when the number of
+# *collected* tests is lower than expected (a suite that silently collects
+# zero tests must not be able to report green).
+#
+# Measured collection counts (branch feat/ci-platform-matrix):
+#   * total                                      = 3555
+#   * -m "not docker and not e2e"                 = 3552 (3 deselected)
+#   * thin node set (3 files below)              = 69
+#
+# macOS install note: install.sh supports Darwin (it runs the same prerequisite
+# and venv checks as on Linux, minus the Linux-only apt / docker-group steps),
+# and no macOS-specific installer exists in the repo, so the macOS install smoke
+# job reports the selected installer, runs it best-effort, then falls back to a
+# manual venv + pip install if the installer left no usable .venv, so the backend
+# can still be started and probed.
+# All macOS jobs are advisory (continue-on-error: true).
+# ---------------------------------------------------------------------------
+name: Platform Matrix
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: platform-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Ubuntu / Linux: the authoritative full suite on the primary platform.
+  # -------------------------------------------------------------------------
+  ubuntu-suite:
+    name: Ubuntu - full test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 3552
+          --marker "not docker and not e2e"
+
+      - name: Run test suite
+        run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
+  # Windows: import smoke. Proves the application package imports cleanly on
+  # Windows even though the platform-specific code paths are exercised fully
+  # only by the thin pytest slice below.
+  # -------------------------------------------------------------------------
+  windows-import-smoke:
+    name: Windows - import smoke
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install runtime dependencies
+        run: |
+          source .venv/Scripts/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Verify critical imports
+        run: |
+          source .venv/Scripts/activate
+          python -c "import web_ui.backend.server; print('IMPORTS_OK')"
+
+  # -------------------------------------------------------------------------
+  # Windows: thin, self-contained pytest slice. These three modules were
+  # selected because they exercise container registry / ownership / global
+  # default logic without requiring Docker, so they are safe to run on a
+  # Windows runner. 69 tests are expected.
+  # -------------------------------------------------------------------------
+  windows-thin-pytest:
+    name: Windows - thin pytest slice
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install dependencies
+        run: |
+          source .venv/Scripts/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: |
+          source .venv/Scripts/activate
+          python scripts/ci_assert_collected.py \
+            --expected 69 \
+            tests/test_container_registry.py \
+            tests/test_container_user_and_git_ownership.py \
+            tests/test_global_defaults.py
+
+      - name: Run thin pytest slice
+        run: |
+          source .venv/Scripts/activate
+          python -m pytest \
+            tests/test_container_registry.py \
+            tests/test_container_user_and_git_ownership.py \
+            tests/test_global_defaults.py \
+            --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
+  # macOS: full suite (advisory).
+  # -------------------------------------------------------------------------
+  macos-suite:
+    name: macOS - full test suite (advisory)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 3552
+          --marker "not docker and not e2e"
+
+      - name: Run test suite
+        run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
+  # macOS: install + startup smoke (advisory).
+  #
+  # Reports the host facts (uname -m / sw_vers / id -u / id -g), selects the
+  # best available installer (prefer a macOS-specific script if one is added,
+  # otherwise `bash install.sh`, which installs on Darwin too), then starts the
+  # backend and probes the health endpoints. If the installer left no usable
+  # .venv, the job falls back to a manual venv so the probes still run.
+  # -------------------------------------------------------------------------
+  macos-install-smoke:
+    name: macOS - install/startup smoke (advisory)
+    runs-on: macos-latest
+    continue-on-error: true
+    env:
+      PORT: "8000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Report host facts
+        run: |
+          echo "uname -m : $(uname -m)"
+          echo "uname -s : $(uname -s)"
+          echo "sw_vers  : $(sw_vers -productVersion 2>/dev/null || echo n/a)"
+          echo "id -u    : $(id -u)"
+          echo "id -g    : $(id -g)"
+
+      - name: Select and run installer (best effort)
+        run: |
+          set -x
+          if [ -f install_macos.sh ]; then
+            INSTALLER="bash install_macos.sh"
+          elif [ -f scripts/install_macos.sh ]; then
+            INSTALLER="bash scripts/install_macos.sh"
+          elif [ -f scripts/install_macos.command ]; then
+            INSTALLER="bash scripts/install_macos.command"
+          else
+            # No macOS-specific installer exists; install.sh is the only path.
+            INSTALLER="bash install.sh"
+          fi
+          echo "SELECTED_INSTALLER: ${INSTALLER}"
+          ${INSTALLER} || echo "INSTALLER_EXIT=$? (non-fatal: advisory job)"
+
+      - name: Fallback - ensure a usable environment
+        run: |
+          if [ ! -x .venv/bin/python ]; then
+            echo "No .venv from installer; creating one manually (macOS fallback)."
+            python -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip
+            .venv/bin/python -m pip install -r requirements.txt
+            .venv/bin/python -m pip install -e .
+          else
+            echo "Using .venv created by the installer."
+          fi
+
+      - name: Start backend and probe health endpoints
+        run: |
+          set -x
+          .venv/bin/python -m uvicorn web_ui.backend.server:app --host 127.0.0.1 --port "${PORT}" &
+          SERVER_PID=$!
+          echo "SERVER_PID=${SERVER_PID}"
+
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/health" -o /tmp/health.json; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${ok}" -eq 1 ]; then
+            echo "HEALTH_OK: $(cat /tmp/health.json)"
+          else
+            echo "HEALTH_UNREACHABLE after 60s"
+          fi
+
+          if curl -fsS "http://127.0.0.1:${PORT}/api/health/containers" -o /tmp/health_containers.json; then
+            echo "HEALTH_CONTAINERS: $(cat /tmp/health_containers.json)"
+          else
+            echo "HEALTH_CONTAINERS_UNREACHABLE"
+          fi
+
+          kill "${SERVER_PID}" 2>/dev/null || true
+
+      - name: Containerized git_read status probe (only if Docker present)
+        run: |
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            echo "Docker daemon reachable; exercising GitReadTool containerized status."
+            python - <<'PY'
+          import os
+          try:
+              from tools.git_info_tool import GitReadTool
+              tool = GitReadTool(
+                  operation="status",
+                  session_id="ci-macos-smoke",
+                  workspace_id=os.environ.get("GITHUB_WORKSPACE", "ws"),
+                  session_permissions={},
+              )
+              text = tool.execute()
+              print(text)
+              print("execution_mode:", getattr(tool, "_last_execution_mode", "?"))
+              print("failure_reason:", getattr(tool, "_last_failure_reason", "?"))
+              print("fallback_used:", getattr(tool, "_last_fallback_used", "?"))
+          except Exception as exc:  # noqa: BLE001 - advisory probe
+              print("GIT_READ_PROBE_ERROR:", repr(exc))
+          PY
+          else
+            echo "Docker not available on this runner; skipping git_read probe."
+          fi
+
+      - name: Shutdown / cleanup
+        if: always()
+        run: pkill -f "uvicorn web_ui.backend.server:app" 2>/dev/null || true
+
+  # -------------------------------------------------------------------------
+  # macOS: Docker Desktop availability probe (advisory).
+  #
+  # WHAT THIS PROVES (when Docker Desktop is present and the daemon is up):
+  #   * the Docker CLI + daemon are reachable from the macOS runner,
+  #   * `docker run --user` reports the in-container uid, and
+  #   * `git status` works *inside a container against the bind-mounted
+  #     workspace* (i.e. the mount is readable/writable in-container).
+  #
+  # WHAT THIS DOES NOT PROVE:
+  #   * It does NOT prove Linux bind-mount host-ownership semantics: on macOS,
+  #     Docker Desktop runs containers inside a Linux VM using a file-sharing
+  #     layer (VirtioFS/gRPC-FUSE), so uid/gid mapping between the macOS host
+  #     and the container is NOT the same as on a native Linux host. The
+  #     in-container uid shown here is the container's uid, not the macOS
+  #     host user's uid.
+  # -------------------------------------------------------------------------
+  macos-docker-probe:
+    name: macOS - Docker availability probe (advisory)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Probe Docker CLI and daemon
+        run: |
+          set -x
+          if command -v docker >/dev/null 2>&1; then
+            echo "DOCKER_CLI: present ($(command -v docker))"
+            docker --version || true
+          else
+            echo "DOCKER_CLI: absent"
+          fi
+
+          if ls -d /Applications/Docker.app* >/dev/null 2>&1; then
+            echo "DOCKER_DESKTOP_APP: present"
+          else
+            echo "DOCKER_DESKTOP_APP: absent"
+          fi
+
+          if command -v docker >/dev/null 2>&1; then
+            if docker info >/dev/null 2>&1; then
+              echo "DOCKER_DAEMON: reachable"
+              echo "--- branch: present + startable ---"
+              docker run --rm --user "$(id -u):$(id -g)" alpine:3 sh -c 'echo in-container-id=$(id -u):$(id -g)'
+            else
+              echo "DOCKER_DAEMON: not reachable (branch: needs-install / not-running)"
+            fi
+          else
+            echo "DOCKER_DAEMON: unavailable (branch: unavailable)"
+          fi
+
+      - name: git status inside container against bind-mounted workspace
+        run: |
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -v "${GITHUB_WORKSPACE}:/workspace" -w /workspace \
+              alpine:3 sh -c 'command -v git >/dev/null 2>&1 && git status --porcelain=v1 | head -n 5 || echo "git not present in probe image"'
+          else
+            echo "Skipping in-container git status: Docker unavailable."
+          fi
