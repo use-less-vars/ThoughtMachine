@@ -209,6 +209,7 @@ def attach_container(
     state: str | None = None,
     *,
     intent_snapshot: Mapping[str, Any] | None = None,
+    user: str | None = None,
     vault_root: str | os.PathLike | None = None,
 ) -> Record:
     """Complete a pre-run record once Docker has assigned a container id.
@@ -219,12 +220,17 @@ def attach_container(
     ``intent_snapshot`` (when supplied) is written into the record's
     ``intent_snapshot`` field in the *same* ``update_record`` call; when
     ``None`` the existing snapshot is left untouched (no-op).
+
+    ``user`` (when supplied) overwrites the record's ``user`` field with the
+    container user ``uid:gid``; when ``None`` the existing value is kept.
     """
     changes: dict[str, Any] = {"docker_id": docker_id}
     if state is not None:
         changes["state"] = state
     if intent_snapshot is not None:
         changes["intent_snapshot"] = intent_snapshot
+    if user is not None:
+        changes["user"] = user
     return update_record(workspace_id, id, vault_root=vault_root, **changes)
 
 

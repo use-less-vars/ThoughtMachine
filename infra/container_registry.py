@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 import time
 import uuid
@@ -107,6 +108,8 @@ from agent.config.defaults import (
     HARDENED_READ_ONLY,
     HARDENED_USER,
     DEFAULT_TMPFS,
+    host_user,
+    host_tmpfs,
     DEFAULT_COMMAND,
     DEFAULT_MEM_LIMIT,
     DEFAULT_CPU_QUOTA,
@@ -133,7 +136,7 @@ class ContainerProfile:
     labels: dict = field(default_factory=dict)
     environment: dict = field(default_factory=dict)
     mounts: list = field(default_factory=list)
-    tmpfs: dict = field(default_factory=lambda: dict(DEFAULT_TMPFS))
+    tmpfs: dict = field(default_factory=host_tmpfs)
     extra_hosts: dict = field(default_factory=dict)
     volumes: list = field(default_factory=list)
 
@@ -178,6 +181,12 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
     container was first created -- so the recreate re-validates POLICY
     (network/permission narrowing) only, with ``image=None`` on the spec.
     """
+    if os.getuid() == 0:
+        raise AdmissionDenied(
+            "root_host_unsupported",
+            "Refusing to create a container for the host root user (uid 0); "
+            "the container user must match a non-root host user.",
+        )
     lifecycle = lifecycle_class or (
         LIFECYCLE_RESOURCE
         if profile.container_type == "resource"
@@ -233,7 +242,7 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
         cap_drop=list(HARDENED_CAP_DROP),
         security_opt=list(HARDENED_SECURITY_OPT),
         read_only=HARDENED_READ_ONLY,
-        user=HARDENED_USER,
+        user=host_user(),
         oom_score_adj=profile.oom_score_adj,
         network_mode=profile.network_mode,
         mem_limit=profile.mem_limit,

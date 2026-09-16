@@ -16,6 +16,8 @@ None placeholders, derived aliases (e.g. STALE_AFTER_S,
 GLOBAL_RESOURCE_IMAGES, *_BUILD_CMD) and private/underscored constants.
 """
 
+import os
+
 # ── thoughtmachine/timeout_constants.py (re-exported) ────────────────────────
 # Unified idle/cleanup + soft-budget timeouts. The canonical definitions live
 # in the dependency-free thoughtmachine.timeout_constants leaf; they are
@@ -159,11 +161,34 @@ ADMISSION_IMAGE_ALLOWLIST = (DEFAULT_IMAGE, RESOURCE_IMAGE_TAG)
 HARDENED_CAP_DROP = ["ALL"]
 HARDENED_SECURITY_OPT = ["no-new-privileges:true"]
 HARDENED_READ_ONLY = True
-HARDENED_USER = "1000:1000"
+
+
+def host_user() -> str:
+    """Return the host ``uid:gid`` the container user must match.
+
+    The container runs as the HOST user so bind-mounted workspace files are
+    owned by the in-container process (git ownership checks pass without a
+    ``safe.directory`` override).  Resolved at CALL time so tests can
+    monkeypatch ``os.getuid``/``os.getgid`` for determinism.
+    """
+    return f"{os.getuid()}:{os.getgid()}"
+
+
+def host_tmpfs() -> dict:
+    """Fresh tmpfs recipe with the live host uid/gid (resolved at call time)."""
+    return {
+        "/tmp": "rw,noexec,nosuid,size=64m",
+        "/home/agent": f"rw,exec,size=256m,uid={os.getuid()},gid={os.getgid()}",
+    }
+
+
+HARDENED_USER = host_user()
 # tmpfs recipe (design doc §1.1; dispatch spelling "256m").
 DEFAULT_TMPFS = {
     "/tmp": "rw,noexec,nosuid,size=64m",
-    "/home/agent": "rw,exec,size=256m,uid=1000,gid=1000",
+    "/home/agent": (
+        f"rw,exec,size=256m,uid={os.getuid()},gid={os.getgid()}"
+    ),
 }
 DEFAULT_COMMAND = ["tail", "-f", "/dev/null"]
 DEFAULT_MEM_LIMIT = "1g"

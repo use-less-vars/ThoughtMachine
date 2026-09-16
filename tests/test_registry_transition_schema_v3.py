@@ -204,9 +204,10 @@ def test_schema_version_current_is_4():
     assert SCHEMA_VERSION_CURRENT == 4
 
 
-def test_name_is_a_schema_field_and_retention_days_is_last():
+def test_name_is_a_schema_field_and_user_is_last():
     assert "name" in SCHEMA_FIELD_NAMES
-    assert SCHEMA_FIELD_NAMES[-1] == "retention_days"
+    assert "user" in SCHEMA_FIELD_NAMES
+    assert SCHEMA_FIELD_NAMES[-1] == "user"
 
 
 def test_record_round_trip_name_present(tmp_path):

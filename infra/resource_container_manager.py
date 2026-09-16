@@ -104,6 +104,7 @@ from agent.config.defaults import (
     CONTAINER_TYPE_LABEL,
     CONTAINER_TYPE_RESOURCE,
     RESOURCE_NAME_LABEL,
+    host_user,
 )
 
 # Global resource images are lifecycle-protected shared infrastructure:
@@ -1049,6 +1050,14 @@ class ResourceContainerManager:
                 ``_ResourceContainerHandle`` on the registry path, or the
                 docker container object on the legacy path.
         """
+        if os.getuid() == 0:
+            from security.admission_gate import AdmissionDenied
+            raise AdmissionDenied(
+                "root_host_unsupported",
+                "Refusing to create a resource container from the host root "
+                "user (uid 0); the container user must match a non-root host "
+                "user.",
+            )
         name = name or self.container_name
         # Workspace bind mount, READ-WRITE: git writes .git + index on the
         # REAL workspace. Documented divergence from the executor's ro/.git-
@@ -1086,7 +1095,9 @@ class ResourceContainerManager:
         # minus the /workspace/.git shadow — we need the real .git).
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
-            "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
+            "/home/agent": (
+                f"rw,exec,size=256M,uid={os.getuid()},gid={os.getgid()}"
+            ),
         }
         # Admission gate (site 4/4 of the terminal container-create sites):
         # gate the legacy RAW create only.  This block deliberately sits
@@ -1203,7 +1214,7 @@ class ResourceContainerManager:
                     security_opt=["no-new-privileges:true"],
                     oom_score_adj=500,  # resource (git) containers get a moderate OOM score
                     read_only=True,
-                    user="1000:1000",  # must match the agent user in the Dockerfile
+                    user=host_user(),  # must match the host user
                     detach=True,
                     tty=True,
                     stdin_open=True,
