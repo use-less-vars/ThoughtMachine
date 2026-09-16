@@ -48,6 +48,11 @@ if args and args[0].endswith("doctor_checks.py"):
     if flag == "--check-python":
         _emit({"ok": True, "reason": "", "detail": "python3 3.11.9 meets the >= 3.11 requirement", "version": "3.11.9"})
     elif flag == "--check-docker":
+        # TM_TEST_INSTALL_DOCKER_DOWN is TEST-ONLY and DEFAULT-OFF: the shim
+        # reports Docker UP unless it is set (only the idempotency test sets it,
+        # to force the degraded path). Unset => Docker UP, as before.
+        if os.environ.get("TM_TEST_INSTALL_DOCKER_DOWN"):
+            _emit({"ok": False, "reason": "lib_missing", "detail": "docker CLI not found on PATH"})
         _emit({"ok": True, "reason": "", "detail": "docker info succeeded"})
     elif flag == "--ensure-docker-daemon":
         _emit({"ok": True, "changed": False, "detail": "docker daemon is already running"})
@@ -156,23 +161,34 @@ def _run_installer_platform(base, kernel, machine, distro_id):
     )
 
 
-def test_install_sh_is_idempotent(exec_tmp):
-    # Under CI, install.sh skips the Docker steps (CI="${CI:-}" + [ -n "$CI" ]),
-    # so fewer [ok] banners are emitted than on a normal machine; GitHub
-    # Actions exports CI=true, so accept the CI count when it is set.
-    min_ok = 3 if os.environ.get("CI") else 4
+def test_install_sh_is_idempotent(exec_tmp, monkeypatch):
+    # NEW CONTRACT (fix/startup-docker-optional): in NORMAL mode (CI unset/empty)
+    # WITHOUT Docker, install.sh no longer aborts. The Docker step is recorded as
+    # a DONE_SKIP and the run still completes (rc 0) and stays idempotent.
+    #
+    # The shim is told Docker is down for this test (TM_TEST_INSTALL_DOCKER_DOWN)
+    # so the degraded path is actually exercised - the previous shim reported
+    # Docker UP, under which a naive floor relaxation is not RED at all.
+    monkeypatch.setenv("TM_TEST_INSTALL_DOCKER_DOWN", "1")
+    monkeypatch.delenv("CI", raising=False)
+
     first = _run_installer(exec_tmp)
     assert first.returncode == 0, first.stdout + first.stderr
     assert "Next step: ./start_thoughtmachine.sh" in first.stdout
     assert "created and populated" in first.stdout
-    assert first.stdout.count("[ok]") >= min_ok, first.stdout
+    assert "Installation aborted" not in first.stdout
+    assert "[--]" in first.stdout  # Docker step recorded as skipped
+    # Python + venv + Node still counted; the Docker step degraded
+    assert first.stdout.count("[ok]") >= 3, first.stdout
 
     second = _run_installer(exec_tmp)
     assert second.returncode == 0, second.stdout + second.stderr
     assert "Next step: ./start_thoughtmachine.sh" in second.stdout
     assert "up to date" in second.stdout
     assert "created and populated" not in second.stdout
-    assert second.stdout.count("[ok]") >= min_ok, second.stdout
+    assert "Installation aborted" not in second.stdout
+    assert "[--]" in second.stdout
+    assert second.stdout.count("[ok]") >= 3, second.stdout
 
 
 def test_install_sh_accepts_macos(exec_tmp):

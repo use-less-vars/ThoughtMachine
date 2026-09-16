@@ -37,6 +37,14 @@ print(d.get(sys.argv[1], "") if isinstance(d, dict) else "")' "$1" 2>/dev/null |
 DONE_OK=()
 DONE_SKIP=()
 
+# Record the Docker step as skipped ("[--]" summary line) for a degraded
+# install: Docker is optional, so a Docker problem warns instead of refusing.
+docker_degraded_skip() {
+    echo "      WARNING: Docker is not usable (reason: ${DOCKER_REASON:-unknown}) - continuing without Docker."
+    [ -n "${DOCKER_DETAIL:-}" ] && echo "      $DOCKER_DETAIL"
+    DONE_SKIP+=("Docker daemon (not usable - continuing without Docker)")
+}
+
 # ---------------------------------------------------------------- CI handling
 # GitHub Actions runners have no usable Docker daemon and no passwordless
 # sudo, so on CI the Docker steps must be optional. When CI is set, the
@@ -47,6 +55,16 @@ if [ -n "$CI" ]; then
     DOCKER_NONFATAL=1
 else
     DOCKER_NONFATAL=0
+fi
+
+# TM_REQUIRE_DOCKER: strict opt-in. Value "1" ONLY (mirrors DOCKER_NONFATAL);
+# unset/empty/any other value keeps Docker optional, so a Docker problem is
+# recorded as a skip ("[--]") and the installer continues in degraded mode.
+TM_REQUIRE_DOCKER="${TM_REQUIRE_DOCKER:-}"
+if [ "$TM_REQUIRE_DOCKER" = "1" ]; then
+    DOCKER_REQUIRED=1
+else
+    DOCKER_REQUIRED=0
 fi
 
 echo "============================================"
@@ -140,32 +158,33 @@ if [ "$DOCKER_RC" -ne 0 ]; then
     DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
     case "$DOCKER_REASON" in
         lib_missing)
-            if [ "$IS_DARWIN" -eq 1 ]; then
+            if [ "$DOCKER_REQUIRED" -eq 0 ]; then
+                docker_degraded_skip
+            elif [ "$IS_DARWIN" -eq 1 ]; then
                 echo "      FAILED: Docker CLI not found on PATH."
                 echo "      Install and launch Docker Desktop, then re-run ./install.sh:"
                 echo "      https://docs.docker.com/desktop/install/mac-install/"
                 echo ""
                 echo "  Installation aborted."
                 exit 1
-            fi
-            if sudo -n true 2>/dev/null; then
+            elif sudo -n true 2>/dev/null; then
                 echo "      docker CLI not found - installing docker.io via apt-get (may take a moment)..."
                 sudo apt-get update && sudo apt-get install -y docker.io 2>&1 | sed 's/^/      /' || true
+                DOCKER_OUT="$(doctor --check-docker 2>&1)"
+                DOCKER_RC=$?
+                if [ "$DOCKER_RC" -ne 0 ]; then
+                    DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
+                    echo "      FAILED: Docker still not usable after installation."
+                    [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                    echo "      Start it with:  sudo systemctl enable --now docker"
+                    echo ""
+                    echo "  Installation aborted."
+                    exit 1
+                fi
             else
                 echo "      FAILED: Docker is not installed and this installer needs sudo to install it."
                 echo "      Run this yourself, then re-run ./install.sh:"
                 echo "      sudo apt-get update && sudo apt-get install -y docker.io"
-                echo ""
-                echo "  Installation aborted."
-                exit 1
-            fi
-            DOCKER_OUT="$(doctor --check-docker 2>&1)"
-            DOCKER_RC=$?
-            if [ "$DOCKER_RC" -ne 0 ]; then
-                DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
-                echo "      FAILED: Docker still not usable after installation."
-                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
-                echo "      Start it with:  sudo systemctl enable --now docker"
                 echo ""
                 echo "  Installation aborted."
                 exit 1
@@ -190,12 +209,15 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             fi
             if [ "$DOCKER_RC" -ne 0 ]; then
                 DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
-                echo "      FAILED: Docker daemon could not be started."
-                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
-                echo "      Start it with:  sudo systemctl enable --now docker"
-                echo ""
-                echo "  Installation aborted."
-                exit 1
+                if [ "$DOCKER_REQUIRED" -eq 1 ]; then
+                    echo "      FAILED: Docker daemon could not be started."
+                    [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                    echo "      Start it with:  sudo systemctl enable --now docker"
+                    echo ""
+                    echo "  Installation aborted."
+                    exit 1
+                fi
+                docker_degraded_skip
             fi
             ;;
         permission_denied)
@@ -205,11 +227,14 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             DONE_SKIP+=("Docker daemon (permission problem - fixed by the group step)")
             ;;
         *)
-            echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
-            [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
-            echo ""
-            echo "  Installation aborted."
-            exit 1
+            if [ "$DOCKER_REQUIRED" -eq 1 ]; then
+                echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                echo ""
+                echo "  Installation aborted."
+                exit 1
+            fi
+            docker_degraded_skip
             ;;
     esac
 fi

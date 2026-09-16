@@ -250,11 +250,32 @@ def test_check_only_doctor_table_still_reports_docker_fail(exec_tmp):
     assert "FAIL" in result.stdout
 
 
-def test_normal_mode_still_fails_without_docker(exec_tmp):
-    repo = _make_repo(exec_tmp)
-    result = _run_script(repo, exec_tmp, "lib_missing", extra_args=())
-    assert result.returncode == 1
-    assert "FAILED" in result.stdout
+def test_normal_mode_boots_degraded_without_docker(exec_tmp):
+    # NEW CONTRACT (fix/startup-docker-optional): a default, non-check-only,
+    # non-doctor boot WITHOUT Docker now DEGRADES instead of refusing - a
+    # WARNING is printed and execution CONTINUES through the remaining preflight
+    # steps and into the dev launch (parity with start_windows.py, which warns
+    # and still starts the backend + Vite). The old rc==1 + "FAILED" refusal is
+    # now only reachable when TM_REQUIRE_DOCKER=1, so it is no longer the
+    # default behaviour.
+    #
+    # NB: the final rc is deliberately NOT asserted. This hermetic repo contains
+    # only start_thoughtmachine.sh (no .venv / web_ui), so the dev launch cannot
+    # succeed here and rc reflects that, not the Docker contract. The contract
+    # under test is "did not refuse and kept going", asserted below.
+    # Every Docker failure reason - including the "other" catch-all, the only
+    # unhandled value scripts/doctor_checks.py can emit - must degrade the same
+    # way (each iteration needs its own fresh scratch base: the helpers mkdir()
+    # their subdirs without exist_ok).
+    for idx, reason in enumerate(("lib_missing", "daemon_down", "other")):
+        sub = exec_tmp / f"reason_{idx}"
+        sub.mkdir()
+        repo = _make_repo(sub)
+        result = _run_script(repo, sub, reason, extra_args=())
+        assert "WARNING: Docker is not usable" in result.stdout, (reason, result.stdout)
+        assert "FAILED: Docker is not usable" not in result.stdout, reason
+        # degradation is not a silent refusal: the next mandatory step still runs
+        assert "[3/8]" in result.stdout, reason
 
 
 def test_script_prepends_system_paths_for_docker_detection():
@@ -320,19 +341,68 @@ def test_install_ci_mode_skips_docker_checks(exec_tmp):
     assert "Next step: ./start_thoughtmachine.sh" in result.stdout
 
 
-def test_install_normal_mode_still_aborts_without_docker(exec_tmp):
-    repo = _make_install_repo(exec_tmp)
+def test_install_normal_mode_degrades_without_docker(exec_tmp):
+    # NEW CONTRACT (fix/startup-docker-optional): in NORMAL mode (CI unset/empty)
+    # WITHOUT Docker, install.sh no longer aborts - it records the Docker step as
+    # a DONE_SKIP ("[--]" summary line) and falls through to the remaining steps
+    # (rc 0, no "Installation aborted"). The old rc==1 abort path is now only
+    # reachable when TM_REQUIRE_DOCKER=1.
+    #
     # Pin CI="" rather than unsetting it: GitHub Actions exports CI=true for
     # every step, which would flip install.sh into CI mode (docker checks
     # skipped, rc 0) and make this test pass vacuously there. install.sh's
     # `CI="${CI:-}"; [ -n "$CI" ]` treats the empty string as "not CI", so
-    # the real normal-machine abort path is exercised everywhere.
+    # the normal-machine path is exercised everywhere.
+    # Every Docker failure reason - including the "other" catch-all, the only
+    # unhandled value scripts/doctor_checks.py can emit - must degrade the same
+    # way in normal mode.
+    for idx, reason in enumerate(("lib_missing", "daemon_down", "other")):
+        sub = exec_tmp / f"reason_{idx}"
+        sub.mkdir()
+        repo = _make_install_repo(sub)
+        result = _run_install_script(
+            repo, sub, reason, fake_sudo=True, extra_env={"CI": ""}
+        )
+        assert result.returncode == 0, (reason, result.stdout + result.stderr)
+        assert "NOTE: CI environment detected" not in result.stdout, reason
+        assert "Installation aborted" not in result.stdout, reason
+        # the Docker step is recorded as skipped, not as a fatal error
+        assert "[--]" in result.stdout, reason
+        # and the run still reaches the end (degraded, not refused)
+        assert "Next step: ./start_thoughtmachine.sh" in result.stdout, reason
+
+
+def test_install_require_docker_opt_in_still_aborts(exec_tmp):
+    # TM_REQUIRE_DOCKER=1 is the strict opt-in: it restores the old fail-fast
+    # contract, so a Docker problem still ABORTS the install even in normal mode
+    # (CI unset/empty). This is the only path that keeps the pre-branch
+    # "FAILED ... Installation aborted" behaviour.
+    repo = _make_install_repo(exec_tmp)
     result = _run_install_script(
-        repo, exec_tmp, "lib_missing", fake_sudo=True, extra_env={"CI": ""}
+        repo,
+        exec_tmp,
+        "lib_missing",
+        fake_sudo=True,
+        extra_env={"CI": "", "TM_REQUIRE_DOCKER": "1"},
     )
-    assert result.returncode == 1
-    assert "NOTE: CI environment detected" not in result.stdout
-    assert "FAILED: Docker is not installed and this installer needs sudo to install it." in result.stdout
-    assert "sudo apt-get update && sudo apt-get install -y docker.io" in result.stdout
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "FAILED" in result.stdout
     assert "Installation aborted" in result.stdout
+    # Only the literal "1" opts in: every other value (the default "" plus
+    # "0"/"true"/"yes"/"on") keeps Docker optional, so the SAME Docker problem
+    # is recorded as a "[--]" skip with rc 0 instead of aborting.
+    for idx, value in enumerate(("", "0", "true", "yes", "on")):
+        o_base = exec_tmp / f"optin_{idx}"
+        o_base.mkdir()
+        o_repo = _make_install_repo(o_base)
+        r = _run_install_script(
+            o_repo,
+            o_base,
+            "lib_missing",
+            fake_sudo=True,
+            extra_env={"CI": "", "TM_REQUIRE_DOCKER": value},
+        )
+        assert r.returncode == 0, (value, r.stdout + r.stderr)
+        assert "Installation aborted" not in r.stdout, value
+        assert "[--]" in r.stdout, value
 
