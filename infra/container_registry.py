@@ -246,7 +246,9 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
         cap_drop=list(HARDENED_CAP_DROP),
         security_opt=list(HARDENED_SECURITY_OPT),
         read_only=HARDENED_READ_ONLY,
-        user=host_user(),
+        # Windows: Docker Desktop presents bind mounts as root:root; match the mount owner.
+        # Retired when fix/uid-probe-universal lands.
+        user=(host_user() or "0:0"),
         oom_score_adj=profile.oom_score_adj,
         network_mode=profile.network_mode,
         mem_limit=profile.mem_limit,
