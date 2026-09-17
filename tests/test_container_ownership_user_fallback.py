@@ -201,3 +201,141 @@ def test_registry_none_host_user_falls_back_to_root_owner(monkeypatch):
     """
     kwargs = _registry_create_run_kwargs(monkeypatch, None)
     assert kwargs["user"] == "0:0"
+
+
+# ── Site 2: ContainerManager._run_container (legacy direct create) ─────────
+
+
+def _container_manager_run_kwargs(monkeypatch, host_user_value):
+    """Drive ``ContainerManager._run_container``; return the run kwargs.
+
+    ``_run_container`` is ContainerManager's single ``client.containers.run``
+    create site.  The manager is built without ``__init__`` (no daemon); only
+    the ``host_user`` seam is stubbed, so the ``user=`` argument under test is
+    the real production object.
+    """
+    import infra.container_manager as container_manager
+    from infra.container_manager import ContainerManager
+    from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+
+    client = _FakeClient(run_result=_FakeCtr())
+    mgr = ContainerManager.__new__(ContainerManager)
+    mgr.client = client
+    mgr.mem_limit = "512m"
+    mgr.cpu_quota = 50000
+    mgr.session_id = "s-fallback-test"
+    mgr.workspace_id = "ws-fallback-test"
+
+    # The seam under test.
+    monkeypatch.setattr(container_manager, "host_user", lambda: host_user_value)
+
+    mgr._run_container(
+        image="tm-resource-git",
+        name="tm-res-c",
+        labels={"thoughtmachine.workspace_id": "ws-fallback-test"},
+        mounts=[],
+        tmpfs={"/tmp": "rw,size=8m"},
+        network_mode="none",
+        lifecycle_class=LIFECYCLE_PERSISTENT,
+    )
+
+    assert client.containers.run_calls, "containers.run was never called"
+    return client.containers.run_calls[-1]["kwargs"]
+
+
+def test_container_manager_none_host_user_falls_back_to_root_owner(monkeypatch):
+    """CASE D: ``ContainerManager._run_container`` applies the ``"0:0"`` fallback.
+
+    ``infra/container_manager.py`` carries its OWN ``user=host_user()``; with
+    ``host_user() -> None`` it must create with ``user == "0:0"`` so the Windows
+    bind-mount ownership fix is not limited to the other two create sites.
+    """
+    kwargs = _container_manager_run_kwargs(monkeypatch, None)
+    assert kwargs["user"] == "0:0"
+
+
+def test_container_manager_posix_host_user_passed_through_unchanged(monkeypatch):
+    """CASE E: the fallback must not alter the real POSIX host ``uid:gid``."""
+    kwargs = _container_manager_run_kwargs(monkeypatch, "1000:1000")
+    assert kwargs["user"] == "1000:1000"
+
+
+# ── Site 3: DockerExecutor._ensure_container (the executor create) ────────
+
+
+def _executor_run_kwargs(monkeypatch, host_user_value):
+    """Drive ``DockerExecutor._ensure_container``; return the run kwargs.
+
+    Mirrors the hermetic harness in
+    ``tests/integration/test_admission_wiring.py`` (site 1): the image probe,
+    container-config resolution, admission gate and host-id probe are stubbed,
+    so the single ``client.containers.run`` call -- and its ``user=`` argument
+    -- is the production object under test.  No docker daemon is used.
+    """
+    import hashlib
+    from unittest.mock import MagicMock
+
+    import docker_executor
+    from docker_executor import DockerExecutor
+    import security.admission_gate as admission_gate
+    from security.admission_gate import Allow
+
+    try:
+        from docker.errors import NotFound
+    except Exception:  # pragma: no cover - docker SDK absent
+        NotFound = Exception
+
+    workspace_path = "/tmp/tm-fallback-ws"
+    container_name = "agent-exec-" + hashlib.sha256(
+        workspace_path.encode()).hexdigest()[:12]
+
+    client = MagicMock()
+    client.containers.list.return_value = []
+    client.containers.get.side_effect = NotFound(container_name)
+    client.containers.run.return_value = _FakeCtr(name=container_name)
+    client.volumes.get_or_create.return_value = MagicMock()
+
+    ex = DockerExecutor.__new__(DockerExecutor)
+    ex.workspace_path = workspace_path
+    ex.image = "agent-executor-test"
+    ex.network = "none"
+    ex.mem_limit = "128m"
+    ex.cpu_quota = 50000
+    ex.force_rebuild = False
+    ex.idle_timeout = 600
+    ex.session_permissions = {"container": True}
+    ex.workspace_id = "ws-fallback-test"
+    ex.client = client
+    ex.container = None
+    ex.last_used = 0.0
+    ex._timeout_warning_printed = False
+
+    monkeypatch.setattr(DockerExecutor, "_ensure_image", lambda self, *a, **k: None)
+    monkeypatch.setattr(
+        DockerExecutor, "_compute_container_config", lambda self: ("none", "ro")
+    )
+    # Pass the root-host guard (non-root host id).
+    monkeypatch.setattr(docker_executor, "_host_ids", lambda: (1000, 1000))
+    # The seam under test.
+    monkeypatch.setattr(docker_executor, "host_user", lambda: host_user_value)
+    # Admission allow: the create must reach ``containers.run``.
+    monkeypatch.setattr(
+        admission_gate, "admit", lambda request, **k: Allow(spec=request.spec)
+    )
+
+    ex._ensure_container()
+
+    assert client.containers.run.called, "containers.run was never called"
+    return client.containers.run.call_args.kwargs
+
+
+def test_executor_none_host_user_falls_back_to_root_owner(monkeypatch):
+    """CASE F: ``DockerExecutor._ensure_container`` applies the ``"0:0"`` fallback."""
+    kwargs = _executor_run_kwargs(monkeypatch, None)
+    assert kwargs["user"] == "0:0"
+
+
+def test_executor_posix_host_user_passed_through_unchanged(monkeypatch):
+    """CASE G: the fallback must not alter the real POSIX host ``uid:gid``."""
+    kwargs = _executor_run_kwargs(monkeypatch, "1000:1000")
+    assert kwargs["user"] == "1000:1000"
