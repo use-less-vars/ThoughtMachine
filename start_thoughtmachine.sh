@@ -74,6 +74,17 @@ else
     DOCKER_REQUIRED=0
 fi
 
+# TM_REQUIRE_FRONTEND: strict opt-in for failing the boot on a frontend problem.
+# Value "1" ONLY (mirrors TM_REQUIRE_DOCKER above); unset/empty/any other value
+# keeps the frontend optional, so a frontend dev-server failure degrades the
+# boot (warn + continue with the backend only) instead of refusing to start.
+TM_REQUIRE_FRONTEND="${TM_REQUIRE_FRONTEND:-}"
+if [ "$TM_REQUIRE_FRONTEND" = "1" ]; then
+    FRONTEND_REQUIRED=1
+else
+    FRONTEND_REQUIRED=0
+fi
+
 # TM_BACKEND_PORT / TM_FRONTEND_PORT: ports the launcher binds and probes.
 # Defaults preserve the historical values exactly (backend 8000, frontend 5173)
 # so an unset environment behaves the same as before.
@@ -444,11 +455,24 @@ else
 fi
 
 # Wait briefly (max ~10s) until the frontend answers on its port.
+FRONTEND_DIED=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if ! kill -0 "$VITE_PID" 2>/dev/null; then
-        echo "  FAILED: the frontend dev server exited during startup."
-        cleanup
-        exit 1
+        if [ "$FRONTEND_REQUIRED" = "1" ]; then
+            echo "  FAILED: the frontend dev server exited during startup."
+            cleanup
+            exit 1
+        fi
+        echo ""
+        echo "  WARNING: the frontend dev server exited during startup."
+        echo "    The web UI at http://localhost:$TM_FRONTEND_PORT will NOT be available."
+        echo "    The backend API/WebSocket server is unaffected: http://localhost:$TM_BACKEND_PORT"
+        echo "    To fix, re-run ./install.sh to install the frontend dependencies."
+        echo "    To restore strict behaviour (fail the boot instead): TM_REQUIRE_FRONTEND=1 ./start_thoughtmachine.sh"
+        echo ""
+        VITE_PID=""
+        FRONTEND_DIED=1
+        break
     fi
     if (command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ":$TM_FRONTEND_PORT ") || \
        (command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$TM_FRONTEND_PORT" -sTCP:LISTEN >/dev/null 2>&1); then
@@ -458,8 +482,13 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 echo ""
-echo "  Backend is running (PID $BACKEND_PID) with the frontend dev server on http://localhost:$TM_FRONTEND_PORT."
-echo "  Stop it with Ctrl-C; the frontend dev server is stopped automatically."
+if [ "$FRONTEND_DIED" = "1" ]; then
+    echo "  Backend is running (PID $BACKEND_PID) at http://localhost:$TM_BACKEND_PORT; the frontend dev server is NOT running."
+    echo "  Stop it with Ctrl-C."
+else
+    echo "  Backend is running (PID $BACKEND_PID) with the frontend dev server on http://localhost:$TM_FRONTEND_PORT."
+    echo "  Stop it with Ctrl-C; the frontend dev server is stopped automatically."
+fi
 echo ""
 wait "$BACKEND_PID"
 BACKEND_RC=$?
