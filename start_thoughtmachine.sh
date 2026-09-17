@@ -4,7 +4,7 @@
 #
 #  Preflight doctor + launcher for ThoughtMachine.
 #  Runs all checks first; when they pass it starts the app:
-#    * default (dev):  vite on 127.0.0.1:5173 in the background, plus the
+#    * default (dev):  vite on the frontend port (default 5173) in the background, plus the
 #                      backend (.venv/bin/python -m web_ui.backend.server).
 #                      The backend is health-checked (GET /api/health) BEFORE
 #                      the frontend is started; when the backend exits, vite
@@ -19,7 +19,7 @@
 #
 #  The backend is always started in the background; its stdout+stderr are
 #  mirrored to the console AND to logs/backend_startup.log (via tee). The
-#  script polls http://127.0.0.1:8000/api/health for up to 30 s before
+#  script polls http://127.0.0.1:<TM_BACKEND_PORT>/api/health for up to 30 s before
 #  considering the backend up. The frontend is only started after the
 #  backend is healthy.
 #===============================================================================
@@ -74,6 +74,12 @@ else
     DOCKER_REQUIRED=0
 fi
 
+# TM_BACKEND_PORT / TM_FRONTEND_PORT: ports the launcher binds and probes.
+# Defaults preserve the historical values exactly (backend 8000, frontend 5173)
+# so an unset environment behaves the same as before.
+TM_BACKEND_PORT="${TM_BACKEND_PORT:-8000}"
+TM_FRONTEND_PORT="${TM_FRONTEND_PORT:-5173}"
+
 doctor() {
     python3 "$DOCTOR" "$@"
 }
@@ -101,12 +107,13 @@ cleanup() {
 }
 trap 'cleanup; exit 130' INT TERM
 
-# Poll GET http://127.0.0.1:8000/api/health for up to 30 s (30 x 1 s).
+# Poll GET http://127.0.0.1:<TM_BACKEND_PORT>/api/health for up to 30 s (30 x 1 s).
 # Returns 0 when the backend answers 200; 1 on timeout or early exit.
 # Fallback: when /api/health returns 404 (route not registered in this build),
 # probe /api/health/containers (the real readiness endpoint) instead.
 wait_for_backend() {
-    python3 - "$1" <<'PY'
+    # $1 = backend PID; $2 = backend port to probe.
+    python3 - "$1" "$2" <<'PY'
 import os
 import sys
 import time
@@ -114,19 +121,20 @@ import urllib.error
 import urllib.request
 
 pid = sys.argv[1]
+port = sys.argv[2]
 have_proc = os.path.isdir("/proc")
 deadline = time.time() + 30
 while time.time() < deadline:
     if have_proc and not os.path.isdir("/proc/%s" % pid):
         break
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2) as resp:
+        with urllib.request.urlopen("http://127.0.0.1:%s/api/health" % port, timeout=2) as resp:
             if resp.status == 200:
                 sys.exit(0)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             try:
-                with urllib.request.urlopen("http://127.0.0.1:8000/api/health/containers", timeout=2) as resp2:
+                with urllib.request.urlopen("http://127.0.0.1:%s/api/health/containers" % port, timeout=2) as resp2:
                     if resp2.status == 200:
                         sys.exit(0)
             except Exception:
@@ -152,7 +160,7 @@ start_backend() {
     ( exec $1 ) > >(tee "$BACKEND_LOG") 2>&1 &
     BACKEND_PID=$!
     echo "  Backend PID: $BACKEND_PID"
-    if ! wait_for_backend "$BACKEND_PID"; then
+    if ! wait_for_backend "$BACKEND_PID" "$TM_BACKEND_PORT"; then
         kill "$BACKEND_PID" 2>/dev/null || true
         wait "$BACKEND_PID" 2>/dev/null || true
         echo ""
@@ -308,9 +316,9 @@ else
 fi
 echo ""
 
-# ------------------------------------------------ [4/8] Ports 8000 (API) / 5173 (Vite)
-echo "[4/8] Ports 8000 (backend) and 5173 (frontend) ..."
-for port in 8000 5173; do
+# ---------------------------------------------- [4/8] Ports (backend API) / (Vite frontend)
+echo "[4/8] Ports $TM_BACKEND_PORT (backend) and $TM_FRONTEND_PORT (frontend) ..."
+for port in "$TM_BACKEND_PORT" "$TM_FRONTEND_PORT"; do
     PORT_OUT="$(doctor --check-port "$port" 2>&1)"
     PORT_RC=$?
     if [ "$PORT_RC" -ne 0 ]; then
@@ -382,7 +390,7 @@ if $DOCTOR_MODE; then
     echo "  ThoughtMachine - doctor mode"
     echo "============================================"
     echo ""
-    start_backend ".venv/bin/python -m web_ui.backend.server"
+    start_backend ".venv/bin/python -m web_ui.backend.server --port $TM_BACKEND_PORT"
     echo ""
     echo "BACKEND-HEALTHY"
     echo "  (--doctor: backend verified healthy; press Ctrl-C to stop)"
@@ -395,13 +403,13 @@ fi
 if $PROD_MODE; then
     echo "============================================"
     echo "  ThoughtMachine - production mode"
-    echo "  http://localhost:8000  (backend serves the built frontend)"
+    echo "  http://localhost:$TM_BACKEND_PORT  (backend serves the built frontend)"
     echo "============================================"
     echo ""
     export TM_NPM_CMD="$(command -v npm 2>/dev/null || true)"
-    start_backend ".venv/bin/python -m web_ui.backend.server --serve-frontend"
+    start_backend ".venv/bin/python -m web_ui.backend.server --serve-frontend --port $TM_BACKEND_PORT"
     echo ""
-    echo "  Backend is running (PID $BACKEND_PID); serving the frontend on http://localhost:8000."
+    echo "  Backend is running (PID $BACKEND_PID); serving the frontend on http://localhost:$TM_BACKEND_PORT."
     echo "  Stop it with Ctrl-C."
     wait "$BACKEND_PID"
     BACKEND_RC=$?
@@ -410,18 +418,23 @@ fi
 
 echo "============================================"
 echo "  ThoughtMachine - starting (dev mode)"
-echo "  Backend:   http://localhost:8000"
-echo "  Frontend:  http://localhost:5173"
+echo "  Backend:   http://localhost:$TM_BACKEND_PORT"
+echo "  Frontend:  http://localhost:$TM_FRONTEND_PORT"
 echo "============================================"
 echo ""
 
-start_backend ".venv/bin/python -m web_ui.backend.server"
+start_backend ".venv/bin/python -m web_ui.backend.server --port $TM_BACKEND_PORT"
 
 FRONTEND_DIR="$SCRIPT_DIR/web_ui/frontend"
 VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
 
+# vite.config.js reads VITE_PORT (dev-server bind port) and VITE_BACKEND_PORT
+# (API/WS proxy target); export both so the dev server follows TM_*_PORT.
+export VITE_PORT="$TM_FRONTEND_PORT"
+export VITE_BACKEND_PORT="$TM_BACKEND_PORT"
+
 if [ -x "$VITE_BIN" ]; then
-    echo "  Starting vite ($VITE_BIN --host 127.0.0.1) ..."
+    echo "  Starting vite ($VITE_BIN --host 127.0.0.1, port $TM_FRONTEND_PORT) ..."
     (cd "$FRONTEND_DIR" && "$VITE_BIN" --host 127.0.0.1) &
     VITE_PID=$!
 else
@@ -430,22 +443,22 @@ else
     VITE_PID=$!
 fi
 
-# Wait briefly (max ~10s) until the frontend answers on port 5173.
+# Wait briefly (max ~10s) until the frontend answers on its port.
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if ! kill -0 "$VITE_PID" 2>/dev/null; then
         echo "  FAILED: the frontend dev server exited during startup."
         cleanup
         exit 1
     fi
-    if (command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':5173 ') || \
-       (command -v lsof >/dev/null 2>&1 && lsof -iTCP:5173 -sTCP:LISTEN >/dev/null 2>&1); then
+    if (command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ":$TM_FRONTEND_PORT ") || \
+       (command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$TM_FRONTEND_PORT" -sTCP:LISTEN >/dev/null 2>&1); then
         break
     fi
     sleep 1
 done
 
 echo ""
-echo "  Backend is running (PID $BACKEND_PID) with the frontend dev server on http://localhost:5173."
+echo "  Backend is running (PID $BACKEND_PID) with the frontend dev server on http://localhost:$TM_FRONTEND_PORT."
 echo "  Stop it with Ctrl-C; the frontend dev server is stopped automatically."
 echo ""
 wait "$BACKEND_PID"
