@@ -212,7 +212,9 @@ def host_tmpfs() -> dict:
 
 
 # Frozen at import-time (per-process, stable): host uid/gid do not change within a process.
-HARDENED_USER = host_user()
+# Windows: host_user() returns None. Fall back to "0:0" to match Docker
+# Desktop's root:root bind mounts; on POSIX the real uid:gid is used.
+HARDENED_USER = host_user() or "0:0"
 # tmpfs recipe (design doc §1.1; dispatch spelling "256m").
 _TMPFS_HOME = "rw,exec,size=256m"
 _HIDS = _host_ids()
