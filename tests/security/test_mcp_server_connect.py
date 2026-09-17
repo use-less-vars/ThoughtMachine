@@ -155,6 +155,6 @@ def test_registry_outside_workspace():
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in (".git", ".venv", "node_modules", "__pycache__", ".pytest_cache")
+            if d not in (".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".tmp-test")
         ]
         assert "mcp_servers.json" not in filenames
