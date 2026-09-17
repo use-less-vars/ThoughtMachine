@@ -118,6 +118,9 @@ _START_LOG_TIMEOUT_S = 20.0
 _TOOL_NAME = "DateTimeTool"
 _CONTAINER_MARKERS = ("container", "docker")
 
+# test-only fault-injection hook; unset in normal runs (sentinel "1" only)
+_INDUCE_SIGTERM = os.environ.get("TM_SMOKE_INDUCE_SIGTERM_AFTER_S") == "1"
+
 
 # ---------------------------------------------------------------------------
 # scratch helpers
@@ -372,7 +375,17 @@ def _http_post_json(url: str, payload: dict, timeout: float = 30.0):
 
 
 def _collect_events(ws, seconds: float) -> list:
-    """Read WS messages for up to ``seconds`` and return the parsed dicts."""
+    """Read WS messages for up to ``seconds`` and return the parsed dicts.
+
+    A closed WebSocket is **not** silently swallowed: the old blanket
+    ``except Exception: break`` hid an aborted turn as "no events".  Only a
+    ``TimeoutError`` (the read window elapsed) is retried; a
+    ``ConnectionClosed`` is surfaced as an ``AssertionError`` so the caller's
+    diagnostics can dump the observed wire shape, and every other exception
+    propagates untouched.
+    """
+    from websockets.exceptions import ConnectionClosed  # noqa: PLC0415 - optional dep, lazy import
+
     events = []
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -380,8 +393,8 @@ def _collect_events(ws, seconds: float) -> list:
             raw = ws.recv(timeout=1.0)
         except TimeoutError:
             continue
-        except Exception:  # noqa: BLE001 - connection closed / protocol end
-            break
+        except ConnectionClosed as exc:
+            raise AssertionError(f"WebSocket closed during event collection: {exc}") from exc
         try:
             message = json.loads(raw)
         except (TypeError, ValueError):
@@ -389,6 +402,47 @@ def _collect_events(ws, seconds: float) -> list:
         if isinstance(message, dict):
             events.append(message)
     return events
+
+
+def _wait_for_session_loaded(ws, seconds: float = 30.0, interval: float = 0.25) -> list:
+    """Drain WS frames until the ``session_loaded`` frame arrives (bounded).
+
+    ``new_session`` is asynchronous: the backend replies with a
+    ``session_loaded`` frame carrying the **WS-minted** session id only once the
+    session is fully built, and the frames before it are neither fixed in count
+    nor guaranteed to arrive within a fixed window.  A fixed-time drain (the
+    previous ``_collect_events(ws, seconds=5.0)``) therefore either races a
+    half-built session or wastes wall-clock.  This helper blocks on the single
+    frame that actually signals readiness, **returns every frame it drained**
+    (so the caller's ``events`` stays complete) and fails loudly -- with the
+    last five frame types -- if the frame never arrives.  The ``session_id`` it
+    matches is the *WS* one, not the REST ``/api/session/create`` id.
+    """
+    from websockets.exceptions import ConnectionClosed  # noqa: PLC0415 - optional dep, lazy import
+
+    events = []
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            raw = ws.recv(timeout=interval)
+        except TimeoutError:
+            continue
+        except ConnectionClosed as exc:
+            raise AssertionError(f"WebSocket closed before session_loaded: {exc}") from exc
+        try:
+            frame = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(frame, dict):
+            continue
+        events.append(frame)
+        if frame.get("type") == "session_loaded" and "session_id" in frame:
+            return events
+    tail = [f"{e.get('type')!r} keys={sorted(e.keys())}" for e in events[-5:]]
+    pytest.fail(
+        f"session_loaded frame never arrived within {seconds:.0f}s "
+        f"(drained {len(events)} frame(s)); last 5: " + "; ".join(tail)
+    )
 
 
 # Raw events from the most recent tool turn, captured by _run_single_tool_turn
@@ -519,7 +573,9 @@ def _extract_tool_results(events: list) -> list:
     return best or typed
 
 
-def _run_single_tool_turn(backend_port: int, vault: Path) -> list:
+def _run_single_tool_turn(
+    backend_port: int, vault: Path, launcher_proc: "subprocess.Popen | None" = None
+) -> list:
     """Create a session, send one query, and return the observed tool results."""
     import websockets.sync.client as ws_client  # noqa: PLC0415 - optional dep, lazy import
 
@@ -532,7 +588,28 @@ def _run_single_tool_turn(backend_port: int, vault: Path) -> list:
     events = []
     with ws_client.connect(f"ws://127.0.0.1:{backend_port}/ws", open_timeout=15, close_timeout=5) as ws:
         ws.send(json.dumps({"command": "new_session"}))
-        events += _collect_events(ws, seconds=5.0)
+        events += _wait_for_session_loaded(ws)
+        # test-only fault-injection hook; see _INDUCE_SIGTERM; unset in normal runs
+        if _INDUCE_SIGTERM and launcher_proc is not None:
+            print(
+                f"TM_SMOKE_INDUCE_SIGTERM_AFTER_S=1: SIGTERM to launcher pgid "
+                f"(pid={launcher_proc.pid}) before continue_session send",
+                flush=True,
+            )
+            try:
+                _launcher_pgid = os.getpgid(launcher_proc.pid)
+            except ProcessLookupError:
+                _launcher_pgid = None
+            if _launcher_pgid is not None:
+                try:
+                    os.killpg(_launcher_pgid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            # Drain whatever the dying launcher flushes (the close frame in
+            # particular) before the send below, so the send races the real
+            # close and reproduces the CI condition. The drained frames are
+            # discarded; a missed close falls through to the send.
+            _collect_events(ws, seconds=5.0)
         ws.send(json.dumps({"command": "continue_session", "query": "What is the current date and time?"}))
         # Collect until the stub's final message arrives (or a bounded timeout).
         deadline = time.monotonic() + 60.0
@@ -574,6 +651,7 @@ def test_install_and_start_smoke(monkeypatch):
     proc = None
     log_handle = None
     body_error = None
+    completed_ok = False
 
     scratch_home.mkdir(parents=True, exist_ok=True)
     (vault / "user").mkdir(parents=True, exist_ok=True)
@@ -643,23 +721,42 @@ def test_install_and_start_smoke(monkeypatch):
             )
 
         # ---- 4. non-container tool call(s) ran and succeeded ----------------
-        tool_results = _run_single_tool_turn(backend_port, vault)
-        diagnostic = _events_diagnostic(_LAST_TURN_EVENTS)
-        container = [r for r in tool_results if any(m in r["name"].lower() for m in _CONTAINER_MARKERS)]
-        non_container = [r for r in tool_results if r not in container]
-        assert non_container, (
-            f"expected at least one non-container tool result, got: {tool_results}\n{diagnostic}"
-        )
-        assert not container, f"expected no container tool results, got: {container}\n{diagnostic}"
-        assert any(r["success"] is True for r in non_container), (
-            f"expected a successful non-container tool call, got: {non_container}\n{diagnostic}"
-        )
-        failed = [r for r in non_container if r["success"] is False and r["error"] is not None]
-        assert not failed, f"non-container tool call(s) failed with an error: {failed}\n{diagnostic}"
-        names = [r["name"] for r in non_container]
-        assert _TOOL_NAME in names, (
-            f"expected {_TOOL_NAME!r} among the executed tools, got: {names}\n{diagnostic}"
-        )
+        # Everything from here on runs *after* the health check, so these two
+        # tails are the only backend/launcher evidence a failure in this region
+        # would otherwise lack. The wrap re-raises, so nothing is swallowed.
+        try:
+            tool_results = _run_single_tool_turn(backend_port, vault, proc)
+            diagnostic = _events_diagnostic(_LAST_TURN_EVENTS)
+            container = [r for r in tool_results if any(m in r["name"].lower() for m in _CONTAINER_MARKERS)]
+            non_container = [r for r in tool_results if r not in container]
+            assert non_container, (
+                f"expected at least one non-container tool result, got: {tool_results}\n{diagnostic}"
+            )
+            assert not container, f"expected no container tool results, got: {container}\n{diagnostic}"
+            assert any(r["success"] is True for r in non_container), (
+                f"expected a successful non-container tool call, got: {non_container}\n{diagnostic}"
+            )
+            failed = [r for r in non_container if r["success"] is False and r["error"] is not None]
+            assert not failed, f"non-container tool call(s) failed with an error: {failed}\n{diagnostic}"
+            names = [r["name"] for r in non_container]
+            assert _TOOL_NAME in names, (
+                f"expected {_TOOL_NAME!r} among the executed tools, got: {names}\n{diagnostic}"
+            )
+        except BaseException:
+            # Post-health failure (barrier timeout, WS-closed AssertionError, or
+            # an assertion mismatch): dump both tails to stdout, then re-raise
+            # the original exception unchanged.
+            print("--- BEGIN post-health diagnostics ---", flush=True)
+            print("--- backend_startup.log (last 100 lines) ---", flush=True)
+            print(_read_tail(backend_log, 100), flush=True)
+            print("--- start_thoughtmachine.sh output (last 100 lines) ---", flush=True)
+            print(_read_tail(start_log, 100), flush=True)
+            print("--- END post-health diagnostics ---", flush=True)
+            raise
+
+        # Reached only after every post-health assertion passed; on any failure
+        # above the flag stays False so the scratch is preserved in `finally`.
+        completed_ok = True
 
     except BaseException as exc:  # noqa: BLE001 - re-raised after cleanup
         body_error = exc
@@ -681,7 +778,15 @@ def test_install_and_start_smoke(monkeypatch):
             log_handle.close()
         if stub is not None:
             stub.stop()
-        shutil.rmtree(scratch, ignore_errors=True)
+        if completed_ok:
+            shutil.rmtree(scratch, ignore_errors=True)
+        else:
+            # On failure the scratch holds the only backend/launcher evidence, so
+            # it is deliberately left in place for CI artifact collection; on
+            # success it is removed exactly as before.
+            print(f"preserving scratch for diagnostics: {scratch}", flush=True)
+            print(f"  launcher log: {start_log}", flush=True)
+            print(f"  backend log:  {backend_log}", flush=True)
 
         after = _snapshot_tree(real_vault)
         if after != before:
