@@ -120,6 +120,15 @@ jobs:
           # --run-e2e is required; tests/e2e/conftest.py:49-55 skips e2e-keyworded items without it. Missing this flag means the job runs zero tests and passes.
           python -m pytest tests/e2e/test_install_and_start_smoke.py --run-e2e -v -rA --timeout 900
 
+      - name: Upload install-smoke logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-install-smoke-logs
+          path: |
+            .tmp-test/**
+          if-no-files-found: ignore
+
   # -------------------------------------------------------------------------
   # Windows: import smoke. Proves the application package imports cleanly on
   # Windows even though the platform-specific code paths are exercised fully
