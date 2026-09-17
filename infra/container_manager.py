@@ -1471,7 +1471,7 @@ class ContainerManager:
             security_opt=["no-new-privileges:true"],
             oom_score_adj=1000,  # user containers are the first OOM-kill victims
             read_only=True,
-            user=host_user(),
+            user=(host_user() or "0:0"),
             detach=True,
             tty=True,
             stdin_open=True,
