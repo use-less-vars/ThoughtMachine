@@ -1220,7 +1220,9 @@ class ResourceContainerManager:
                     security_opt=["no-new-privileges:true"],
                     oom_score_adj=500,  # resource (git) containers get a moderate OOM score
                     read_only=True,
-                    user=host_user(),  # must match the host user
+                    # Windows: Docker Desktop presents bind mounts as root:root; match the mount owner.
+                    # Retired when fix/uid-probe-universal lands.
+                    user=(host_user() or "0:0"),  # must match the host user
                     detach=True,
                     tty=True,
                     stdin_open=True,
