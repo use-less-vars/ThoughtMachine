@@ -167,6 +167,25 @@ def _mirror_repo_into(scratch_repo: Path) -> None:
     for entry in sorted(REPO_ROOT.iterdir()):
         if entry.name in _SCRATCH_SKIP:
             continue
+        if entry.name == "web_ui":
+            # web_ui must be a REAL directory (not a symlink to REPO_ROOT) so the
+            # frontend dependencies installed by install.sh land inside the
+            # scratch repo instead of mutating the real tree.
+            web_ui_dest = scratch_repo / "web_ui"
+            web_ui_dest.mkdir(parents=True, exist_ok=True)
+            for child in sorted(entry.iterdir()):
+                if child.name == "frontend":
+                    continue
+                (web_ui_dest / child.name).symlink_to(child, target_is_directory=child.is_dir())
+            frontend_src = entry / "frontend"
+            if frontend_src.is_dir():
+                shutil.copytree(
+                    frontend_src,
+                    web_ui_dest / "frontend",
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns("node_modules", ".vite", "dist"),
+                )
+            continue
         (scratch_repo / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
 
     (scratch_repo / "scripts").mkdir(parents=True, exist_ok=True)
@@ -679,6 +698,25 @@ def test_install_and_start_smoke(monkeypatch):
         )
         for banner in _INSTALL_BANNERS:
             assert banner in combined, f"install.sh banner missing: {banner!r}\n--- output ---\n{combined}"
+
+        # ---- 1b. frontend deps: install.sh must be load-bearing ------------
+        frontend_dir = scratch_repo / "web_ui" / "frontend"
+        vite_bin = frontend_dir / "node_modules" / ".bin" / "vite"
+        assert vite_bin.exists(), (
+            "install.sh is expected to be load-bearing for frontend deps, but "
+            f"{vite_bin} does not exist after install.sh ran"
+        )
+        # Hazard regression guard: the frontend tree must be a REAL directory
+        # inside the scratch repo, never a symlink back into the real repo
+        # (otherwise install.sh would mutate REPO_ROOT/web_ui/frontend).
+        assert not frontend_dir.is_symlink(), (
+            f"{frontend_dir} must be a real directory, not a symlink"
+        )
+        resolved_node_modules = (frontend_dir / "node_modules").resolve()
+        assert scratch_repo.resolve() in resolved_node_modules.parents, (
+            f"{resolved_node_modules} must resolve inside {scratch_repo}, "
+            "not back into the real repository"
+        )
 
         # ---- 2. provider recipe + local deterministic stub ------------------
         stub = _StubLLM()

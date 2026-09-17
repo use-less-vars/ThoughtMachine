@@ -307,6 +307,29 @@ echo "      ok (node ${NODE_VERSION:-version unknown})."
 DONE_OK+=("Node.js")
 echo ""
 
+# ------------------------------------------------------------------ frontend deps
+if [ -f "${SCRIPT_DIR}/web_ui/frontend/package.json" ]; then
+    echo "      Installing frontend dependencies (web_ui/frontend) ..."
+    if [ -f "${SCRIPT_DIR}/web_ui/frontend/package-lock.json" ]; then
+        (cd "${SCRIPT_DIR}/web_ui/frontend" && npm ci)
+        FRONTEND_DEPS_RC=$?
+    else
+        (cd "${SCRIPT_DIR}/web_ui/frontend" && npm install)
+        FRONTEND_DEPS_RC=$?
+    fi
+    if [ "$FRONTEND_DEPS_RC" -ne 0 ]; then
+        echo "      FAILED: frontend dependency install failed (npm exit code ${FRONTEND_DEPS_RC})."
+        echo "      Fix the error above, then re-run ./install.sh"
+        echo ""
+        echo "  Installation aborted."
+        exit 1
+    fi
+    echo "      ok (frontend dependencies installed)."
+else
+    echo "      Frontend dependencies skipped (no web_ui/frontend tree present)."
+fi
+echo ""
+
 # ------------------------------------------------------------------ summary
 echo "============================================"
 echo "  Summary"
