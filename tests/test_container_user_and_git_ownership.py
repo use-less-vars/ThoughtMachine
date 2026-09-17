@@ -445,9 +445,9 @@ def test_foreign_owner_still_refuses(monkeypatch, tmp_path):
 # ── 8 (Windows guard: host has no uid:gid) ───────────────────────────────────
 # ``os.getuid``/``os.getgid`` do not exist on Windows, so there is no host
 # uid:gid to pin the container to.  The resolver must return ``None`` (never a
-# bogus ``0:0``), and ``create_hardened_container`` must then omit ``--user``
-# (docker-py drops ``User`` for ``None``) so the container runs as the image
-# default instead of being pinned to root.
+# bogus ``0:0``); the create site then supplies ``"0:0"`` so the create user
+# matches Docker Desktop's root:root bind mounts.  The image default
+# (``agent``/uid 1000) does not match and must not be relied on.
 
 
 class _NtOSView:
@@ -498,12 +498,19 @@ def test_host_user_none_on_windows_without_getuid(monkeypatch):
     assert "gid=" not in recipe["/home/agent"]
 
 
-def test_container_registry_omits_user_when_host_user_is_none(monkeypatch):
-    """With no host user (Windows), ``create_hardened_container`` runs as the
-    image default: the docker create kwargs carry no ``user``.
+def test_container_registry_passes_root_when_host_user_is_none(monkeypatch):
+    """With no host user (Windows), ``create_hardened_container`` pins the
+    create user to ``"0:0"`` — RATIFIED contract.
+
+    Docker Desktop presents Windows bind mounts as ``root:root``, so the
+    container's create user must match that mount owner.  The image default
+    (``agent``/uid 1000) does not match and produced host permission failures;
+    pinning ``"0:0"`` is what the live Windows verification established (commit
+    ``6bb3bea``, merge ``fea95dd``).  ``host_user()`` still returns ``None`` on
+    Windows (the resolver is unchanged); the create site supplies the fallback.
 
     Drives the whole create path against the realistic Windows-shaped ``os``
-    (``name == "nt"`` and no ``getuid``) so a missing guard is exercised end to
+    (``name == "nt"`` and no ``getuid``) so the fallback is exercised end to
     end, not just in the resolver.
     """
     from infra.container_registry import create_hardened_container
@@ -514,4 +521,4 @@ def test_container_registry_omits_user_when_host_user_is_none(monkeypatch):
     create_hardened_container(client, ContainerProfile(), "c-win")
 
     kwargs = client.containers.run_calls[-1]["kwargs"]
-    assert kwargs.get("user") is None
+    assert kwargs.get("user") == "0:0"
