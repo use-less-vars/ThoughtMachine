@@ -4,6 +4,7 @@ from typing import Any, ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import logging
 import subprocess
+import unicodedata
 from pathlib import Path
 from .base import ToolBase
 from security.sandboxed_execution import SandboxedExecution
@@ -41,6 +42,59 @@ def resolve_git_execution_mode(
     if effective_mode == "host" or not resolved_workspace_id:
         return "host_fallback"
     return "containerized"
+
+
+def _decode_status_path(token: str) -> bytes:
+    """Decode a porcelain-v1 path token (C-quoted OR raw UTF-8) to bytes."""
+    if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+        try:
+            return token[1:-1].encode("latin-1").decode("unicode_escape").encode("latin-1")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+    return token.encode("utf-8")
+
+
+def _nfc_key(path_bytes: bytes) -> bytes:
+    """NFC-normalize a path; BOTH comparison sides use this (symmetric)."""
+    try:
+        return unicodedata.normalize("NFC", path_bytes.decode("utf-8")).encode("utf-8")
+    except UnicodeDecodeError:
+        return path_bytes
+
+
+def _reconcile_status_paths(output: str) -> str:
+    """Collapse Unicode-equivalent delete/untracked pairs in porcelain v1.
+
+    When ONE logical path is spelled Unicode-equivalently but byte-distinct in
+    the index and the worktree, git reports it twice (a `` D`` for the index
+    spelling plus a ``??`` for the worktree spelling); the two rows are dropped
+    together. Pairing is keyed on git's own index-derived deletion report, never
+    a platform setting, so an unpaired ``??`` always survives.
+    """
+    parsed, deletions, untracked = [], set(), set()
+    for line in output.splitlines():
+        if len(line) < 4 or line[2] != " ":
+            parsed.append(("", b"", line))
+            continue
+        status = line[:2]
+        path_bytes = _decode_status_path(line[3:])
+        if status == "??":
+            key = _nfc_key(path_bytes)
+            untracked.add(key)
+        elif status.strip() == "D":
+            key = _nfc_key(path_bytes)
+            deletions.add(key)
+        else:
+            key = b""
+        parsed.append((status, key, line))
+    paired = deletions & untracked
+    if not paired:
+        return output
+    return "\n".join(
+        line
+        for status, key, line in parsed
+        if not (key in paired and (status == "??" or status.strip() == "D"))
+    )
 
 
 class GitReadTool(ToolBase):
@@ -980,11 +1034,16 @@ class GitReadTool(ToolBase):
         return "read"
 
     def _git_status(self, repo_root: Path) -> str:
-        """Run git status."""
-        output = self._run_git(repo_root, ["status", "--porcelain=v1"])
+        """Run git status, reconciling Unicode-equivalent path spellings."""
+        output = self._run_git(
+            repo_root,
+            ["status", "--porcelain=v1"],
+        )
         if output.startswith("Git command failed"):
             # Try human-readable status
             output = self._run_git(repo_root, ["status"])
+        else:
+            output = _reconcile_status_paths(output)
         return self._with_mode(self._truncate_output(output))
     
     def _git_diff(self, repo_root: Path) -> str:
