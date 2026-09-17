@@ -17,8 +17,8 @@
 # zero tests must not be able to report green).
 #
 # Measured collection counts (branch feat/ci-platform-matrix):
-#   * total                                      = 3567
-#   * -m "not docker and not e2e"                 = 3564 (3 deselected)
+#   * total                                      = 3568
+#   * -m "not docker and not e2e"                 = 3564 (4 deselected)
 #   * thin node set (3 files below)              = 69
 #
 # macOS install note: install.sh supports Darwin (it runs the same prerequisite
@@ -78,6 +78,47 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
+  # Linux: install + startup smoke (BLOCKING).
+  #
+  # Runs the real end-to-end smoke: it drives the real install.sh and the real
+  # start_thoughtmachine.sh (on free TM_BACKEND_PORT / TM_FRONTEND_PORT
+  # values), then makes one live turn through the running backend. Unlike the
+  # macOS install-smoke job this one is NOT advisory: a failure fails the
+  # workflow (no continue-on-error).
+  # -------------------------------------------------------------------------
+  linux-install-smoke:
+    name: Linux - install/startup smoke (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 1
+          tests/e2e/test_install_and_start_smoke.py
+
+      - name: Run install + startup smoke test
+        run: |
+          # --run-e2e is required; tests/e2e/conftest.py:49-55 skips e2e-keyworded items without it. Missing this flag means the job runs zero tests and passes.
+          python -m pytest tests/e2e/test_install_and_start_smoke.py --run-e2e -v -rA --timeout 900
 
   # -------------------------------------------------------------------------
   # Windows: import smoke. Proves the application package imports cleanly on
