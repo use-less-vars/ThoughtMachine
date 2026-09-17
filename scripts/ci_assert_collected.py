@@ -42,9 +42,9 @@ import re
 import subprocess
 import sys
 
-# Measured on branch feat/ci-platform-matrix: 3568 tests collect in total and
-# `-m "not docker and not e2e"` selects 3564 of them (4 deselected).
-DEFAULT_EXPECTED = 3564
+# Measured on branch feat/ci-platform-matrix: 3571 tests collect in total and
+# `-m "not docker and not e2e"` selects 3567 of them (4 deselected).
+DEFAULT_EXPECTED = 3567
 DEFAULT_MARKER = "not docker and not e2e"
 
 # "3552/3555 tests collected (3 deselected)" -> 3552 (the selected count).
