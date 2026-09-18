@@ -796,7 +796,7 @@ class DockerExecutor:
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             read_only=True,
-            user=host_user(),  # container user matches the host uid:gid
+            user=(host_user() or "0:0"),  # container user matches the host uid:gid
             detach=True,
             tty=True,
             stdin_open=True,

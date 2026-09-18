@@ -207,7 +207,7 @@ def test_git_status_succeeds_without_safe_directory(monkeypatch):
     )
 
     kwargs = client.containers.run_calls[-1]["kwargs"]
-    assert kwargs["user"] == host_user()
+    assert kwargs["user"] == (host_user() or "0:0")
     blob = json.dumps(
         {
             "user": kwargs["user"],
