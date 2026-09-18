@@ -1069,10 +1069,12 @@ def test_pause_all_during_async_job_terminalizes_job(tmp_path, monkeypatch):
     thread.pause()  # Pause All while the job is mid-flight
     release.set()
     assert _wait_until(lambda: thread.status == "paused"), thread.status
+    assert _wait_until(lambda: reg.job(job_id)["status"] == "paused")
     assert reg.job(job_id)["status"] == "paused"
 
     thread.resume()
     assert _wait_until(lambda: thread.status == "ready"), thread.status
+    assert _wait_until(lambda: reg.job(job_id)["status"] == "paused")
     assert reg.job(job_id)["status"] == "paused"  # terminal, unchanged
 
     # A later completion of the SAME job id must not clobber the terminal state.
@@ -1080,6 +1082,7 @@ def test_pause_all_during_async_job_terminalizes_job(tmp_path, monkeypatch):
     thread._input_queue.put((job_id, "again", reply_q2))
     envelope2 = json.loads(reply_q2.get(timeout=10))
     assert json.loads(envelope2["content"])["response"] == "done"
+    assert _wait_until(lambda: reg.job(job_id)["status"] == "paused")
     assert reg.job(job_id)["status"] == "paused"
 
 
