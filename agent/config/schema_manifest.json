@@ -204,7 +204,7 @@
         "mode": {
           "type": "string",
           "required": false,
-          "description": "Agent mode (e.g. agent, architect, engineer). Consumed by web_ui/backend/session_manager.py:67 and config_manager.py:91,277-278."
+          "description": "Agent mode (e.g. agent, architect, engineer). Defaulted and normalised in web_ui/backend/config_manager.py (the 'mode' key); referenced in web_ui/backend/session_manager.py (extract_session_config)."
         },
         "workspace_path": {
           "type": "string",
