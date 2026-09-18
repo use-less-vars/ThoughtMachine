@@ -166,11 +166,8 @@ HARDENED_READ_ONLY = True
 def _host_ids() -> tuple[int, int] | None:
     """Host uid/gid as ``(uid, gid)``, or ``None`` on platforms without one.
 
-    Windows has no host uid:gid concept (``os.getuid`` does not exist), so the
-    container cannot be pinned to the host user there; callers must omit
-    ``--user`` and run as the image default.  Single source of truth for the
-    host ids; resolved at CALL time so tests can monkeypatch
-    ``os.getuid``/``os.getgid`` for determinism.
+    Single source of truth for the host ids; resolved at CALL time so tests
+    can monkeypatch ``os.getuid``/``os.getgid`` for determinism.
     """
     if os.name == "nt":
         return None
@@ -183,9 +180,7 @@ def host_user() -> str | None:
     The container runs as the HOST user so bind-mounted workspace files are
     owned by the in-container process (git ownership checks pass without a
     ``safe.directory`` override).  Resolved at CALL time so tests can
-    monkeypatch ``os.getuid``/``os.getgid`` for determinism.  Windows has no
-    host uid:gid concept, so this returns ``None`` there and callers omit
-    ``--user`` (docker-py omits ``User`` when the value is ``None``).
+    monkeypatch ``os.getuid``/``os.getgid`` for determinism.
     """
     ids = _host_ids()
     if ids is None:
