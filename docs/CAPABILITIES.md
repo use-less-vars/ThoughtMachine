@@ -80,7 +80,7 @@ enters with fail-closed defaults — `network_mode="none"`, `workspace_mode="ro"
 - a keep-alive command (`["tail", "-f", "/dev/null"]`).
 
 `infra/container_registry.py` uses the same hardened kwargs (`cap_drop=HARDENED`,
-`security_opt`, `read_only=HARDENED_READ_ONLY`, `user=host_user()`) and **requires** a
+`security_opt`, `read_only=HARDENED_READ_ONLY`, `user=(host_user() or "0:0")`) and **requires** a
 `workspace_id` (fail-closed). `infra/container_manager.py` additionally pins
 `oom_score_adj=1000`, observes the *live* container user, and with `strict=True`
 refuses to proceed if the observed process would exit `126` (i.e. a broken user
@@ -104,9 +104,13 @@ and `DEFAULT_MAX_CONTAINERS`.
 superuser.
 
 **Host-user ownership.** `agent/config/defaults.py::host_user()` returns the host
-user's `"uid:gid"` (or `None` on Windows, `os.name == "nt"`). Because the container runs
-as the **host** user, bind-mounted files retain correct ownership — Git ownership checks
-pass without needing `safe.directory` — on native Linux hosts.
+user's `"uid:gid"` (or `None` on Windows, `os.name == "nt"`). On **native Linux** the
+container runs as the **host** user, so bind-mounted files retain correct ownership and
+Git ownership checks pass without needing `safe.directory`. On **Windows** the resolver
+returns `None` and the create sites (`infra/container_registry.py`,
+`infra/resource_container_manager.py`) supply `user="0:0"` instead — matching Docker
+Desktop, which presents bind mounts as `root:root`, so the container user matches the
+mount owner.
 
 For the Windows boundary and the banned-pattern rules (`shell=True`/`os.system`
 prohibited, `pathlib`/`os.path` required, explicit UTF-8), see
