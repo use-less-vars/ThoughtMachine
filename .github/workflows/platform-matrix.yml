@@ -164,10 +164,10 @@ jobs:
           python -c "import web_ui.backend.server; print('IMPORTS_OK')"
 
   # -------------------------------------------------------------------------
-  # Windows: thin, self-contained pytest slice. These three modules were
+  # Windows: thin, self-contained pytest slice. These four modules were
   # selected because they exercise container registry / ownership / global
   # default logic without requiring Docker, so they are safe to run on a
-  # Windows runner. 69 tests are expected.
+  # Windows runner. 76 tests are expected.
   # -------------------------------------------------------------------------
   windows-thin-pytest:
     name: Windows - thin pytest slice
@@ -199,10 +199,11 @@ jobs:
         run: |
           source .venv/Scripts/activate
           python scripts/ci_assert_collected.py \
-            --expected 69 \
+            --expected 76 \
             tests/test_container_registry.py \
             tests/test_container_user_and_git_ownership.py \
-            tests/test_global_defaults.py
+            tests/test_global_defaults.py \
+            tests/test_container_ownership_user_fallback.py
 
       - name: Run thin pytest slice
         run: |
@@ -211,6 +212,7 @@ jobs:
             tests/test_container_registry.py \
             tests/test_container_user_and_git_ownership.py \
             tests/test_global_defaults.py \
+            tests/test_container_ownership_user_fallback.py \
             --timeout 600 -ra
 
   # -------------------------------------------------------------------------
