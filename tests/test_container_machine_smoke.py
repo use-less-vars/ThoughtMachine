@@ -588,6 +588,10 @@ def test_g9_real_container_hardening(require_docker, smoke_env):
             assert opt in (host_cfg.get("SecurityOpt") or [])
         # It never runs as root.
         user = attrs["Config"].get("User") or ""
+        # POSIX-only assertion. On Windows host_user() is None, so the
+        # hardened container falls back to "0:0" — a value forbidden here.
+        # The G9 skip above (host is None) keeps that path unreachable, so
+        # this check is deliberately never reached, and never weakened, on Windows.
         assert user not in ("", "0", "0:0", "root")
         assert user == host
     finally:
