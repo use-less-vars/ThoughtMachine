@@ -133,14 +133,14 @@ RESOURCE_MEM_LIMIT = "512m"
 RESOURCE_CPU_QUOTA = 50000
 # Default image used by container_manager.
 DEFAULT_IMAGE = "agent-executor"
-# Workspace config.json default max_containers (container_manager L228/243).
+# Workspace config.json default max_containers (infra/container_manager.py: ContainerManager.max_containers).
 DEFAULT_MAX_CONTAINERS = 6
 # Valid container_type values ("git" is represented as "resource"; mcp/proxy
 # are future types reserved by the registry).
 CONTAINER_TYPES = ("user", "resource", "mcp", "proxy")
 # OOM score defaults by container type (None sentinel in ContainerProfile):
-#   user     -> 1000  first OOM-kill victims (container_manager L523)
-#   resource ->  500  moderate score (resource_container_manager L536)
+#   user     -> 1000  first OOM-kill victims (infra/container_manager.py: oom_score_adj).
+#   resource ->  500  moderate score (infra/resource_container_manager.py: oom_score_adj).
 DEFAULT_USER_OOM_SCORE_ADJ = 1000
 DEFAULT_RESOURCE_OOM_SCORE_ADJ = 500
 
