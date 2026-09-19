@@ -420,18 +420,39 @@ def _mount_specs_from_docker_mounts(mounts):
     ``Type``/``ReadOnly`` and exposes NO matching attribute accessors, whereas
     ``ContainerCreateSpec`` reads ``MountSpec`` by ATTRIBUTE.  An empty or
     ``None`` ``mounts`` yields an empty tuple (the create then attaches none).
+
+    Accepted entry shapes: a ``docker.types.Mount`` (or any mapping) carrying
+    ``Source`` and ``Target`` keys (``Type``/``ReadOnly`` optional).  Shorthand
+    strings such as ``"src:tgt:ro"`` are NOT accepted here: the ``mounts=``
+    boundary the docker SDK exposes performs NO per-entry parsing, so shorthand
+    is only valid on the separate ``volumes=``/binds path.  Any entry that is
+    not such a mapping (a ``str``, an ``int``, a non-mapping object, or a
+    mapping missing the required keys) raises a self-describing ``TypeError``
+    naming the offending object instead of leaking a low-level ``string indices
+    must be integers`` error.
     """
     if not mounts:
         return ()
-    return tuple(
-        MountSpec(
-            source=m["Source"],
-            target=m["Target"],
-            type=m.get("Type") or "bind",
-            read_only=bool(m.get("ReadOnly")),
+    specs = []
+    for m in mounts:
+        try:
+            source = m["Source"]
+            target = m["Target"]
+        except (TypeError, KeyError) as exc:
+            raise TypeError(
+                "mounts entries must be docker.types.Mount mappings with "
+                "Source/Target keys; got "
+                f"{type(m).__name__}: {m!r}"
+            ) from exc
+        specs.append(
+            MountSpec(
+                source=source,
+                target=target,
+                type=m.get("Type") or "bind",
+                read_only=bool(m.get("ReadOnly")),
+            )
         )
-        for m in mounts
-    )
+    return tuple(specs)
 
 
 

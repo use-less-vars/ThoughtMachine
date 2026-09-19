@@ -24,6 +24,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from docker.types import Mount
+
 _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
@@ -156,7 +158,7 @@ class StaleWorkerContainerCleanupTest(unittest.TestCase):
             client = mock.Mock()
             created = SimpleNamespace(id="new1", reload=lambda: None)
             client.containers.run.side_effect = \
-                lambda **kw: (events.append("create"), created)[1]
+                lambda *args, **kw: (events.append("create"), created)[1]
             client.containers.list.return_value = []
             manager.client = client
 
@@ -176,7 +178,10 @@ class StaleWorkerContainerCleanupTest(unittest.TestCase):
                     mock.patch.object(self.container_manager, "_audit"), \
                     mock.patch.object(self.container_manager, "log_container_event"), \
                     mock.patch.object(self.container_manager, "Mount",
-                                      return_value="mount"):
+                                      return_value=Mount(
+                                          target="/workspace",
+                                          source="/tmp/ws",
+                                          type="bind")):
                 result = manager.start(worker_name="sess-1:w1")
 
             cleanup_mock.assert_called_once_with(client, "sess-1:w1")
@@ -232,7 +237,7 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
 
         client = mock.Mock()
         created = SimpleNamespace(id="new1", reload=lambda: None)
-        client.containers.run.side_effect = lambda **kw: created
+        client.containers.run.side_effect = lambda *args, **kw: created
         client.containers.list.return_value = []
         manager.client = client
 
@@ -255,7 +260,10 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
                 mock.patch.object(self.container_manager, "_audit"), \
                 mock.patch.object(self.container_manager, "log_container_event"), \
                 mock.patch.object(self.container_manager, "Mount",
-                                  return_value="mount"):
+                                  return_value=Mount(
+                                      target="/workspace",
+                                      source="/tmp/ws",
+                                      type="bind")):
             return manager.start(worker_name=worker_name)
 
     # ── helper unit tests ───────────────────────────────────────────────
