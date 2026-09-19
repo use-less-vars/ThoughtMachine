@@ -13,9 +13,9 @@ where the docker SDK is absent.
 
 The hardening recipe (:func:`_expected_hardening_recipe`) and the conformance
 predicate (:func:`_hardening_conformance`) are defined here as the canonical
-homes; :mod:`infra.container_manager` still holds a duplicate copy of the recipe
-and the conformance check, and the canonical move (deleting those copies in
-favour of a re-export shim) happens at step 1, not now.
+homes.  :mod:`infra.container_manager` imports them (see its module-top
+``from infra.container_create import (...)`` block) and no longer keeps a
+duplicate copy of either.
 """
 
 from __future__ import annotations

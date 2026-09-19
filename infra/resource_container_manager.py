@@ -186,6 +186,13 @@ except Exception:  # pragma: no cover - registry not wired
     is_registry_active = lambda session_config: False  # noqa: E731
 
 from infra.container_env import merge_container_identity_env
+from infra.container_create import (
+    ContainerCreateSpec,
+    HardeningRecipe as _HardeningRecipe,
+    MountSpec,
+    _expected_hardening_recipe,
+    create_hardened_container,
+)
 from thoughtmachine.container_record import (
     LIFECYCLE_RESOURCE,
     RESOURCE_NAME_PREFIX,
@@ -1205,34 +1212,55 @@ class ResourceContainerManager:
                 )
                 return _ResourceContainerHandle(handle["id"])
             ctr_labels = self._labels(name)
+            # Site-3 migration: the hardened ``containers.run`` now flows through
+            # the shared primitive (``infra.container_create``), matching the
+            # registry path (site 4) and ``ContainerManager._run_container``
+            # (site 2).  Called with ``admission=None`` (this wrapper applied the
+            # gate above) and ``record=False`` (the record is owned by the
+            # ``record_creation`` block below, so recording inside the primitive
+            # would double-record).  ``user`` is re-resolved from THIS module's
+            # ``host_user`` seam so the Windows "0:0" fallback and the POSIX
+            # pass-through are preserved unchanged (mirrors site 2).
+            _recipe = _expected_hardening_recipe()
+            create_spec = ContainerCreateSpec(
+                image=self.image,
+                command=["tail", "-f", "/dev/null"],
+                name=name,
+                container_type="resource",
+                lifecycle_class=LIFECYCLE_RESOURCE,
+                hardening=_HardeningRecipe(
+                    cap_drop=_recipe.cap_drop,
+                    security_opt=_recipe.security_opt,
+                    read_only=_recipe.read_only,
+                    user=(host_user() or "0:0"),
+                ),
+                workspace_id=self.workspace_id,
+                session_id=self.session_id,
+                labels=ctr_labels,
+                environment=identity_env,
+                mounts=tuple(
+                    MountSpec(
+                        source=m["Source"],
+                        target=m["Target"],
+                        type=m.get("Type") or "bind",
+                        read_only=bool(m.get("ReadOnly")),
+                    )
+                    for m in mounts
+                ),
+                tmpfs=tmpfs,
+                network_mode=network_mode,
+                mem_limit=self.mem_limit,
+                cpu_quota=self.cpu_quota,
+                oom_score_adj=500,  # resource (git) containers get a moderate OOM score
+            )
             with record_creation(
                 workspace_id=self.workspace_id,
                 lifecycle_class=LIFECYCLE_RESOURCE,
                 labels=ctr_labels,
             ) as record:
-                container = self.client.containers.run(
-                    image=self.image,
-                    name=name,
-                    mounts=mounts,
-                    tmpfs=tmpfs,
-                    network_mode=network_mode,
-                    cap_drop=["ALL"],
-                    security_opt=["no-new-privileges:true"],
-                    oom_score_adj=500,  # resource (git) containers get a moderate OOM score
-                    read_only=True,
-                    # Windows: Docker Desktop presents bind mounts as root:root; match the mount owner.
-                    # Retired when fix/uid-probe-universal lands.
-                    user=(host_user() or "0:0"),  # must match the host user
-                    detach=True,
-                    tty=True,
-                    stdin_open=True,
-                    command=["tail", "-f", "/dev/null"],
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    environment=identity_env,
-                    labels=ctr_labels,
-                    restart_policy=docker_restart_policy(LIFECYCLE_RESOURCE),
-                )
+                container = create_hardened_container(
+                    self.client, create_spec, admission=None, record=False
+                ).container
                 record.attach(container)
         except Exception as e:
             # Wrap image-missing with actionable build instructions.

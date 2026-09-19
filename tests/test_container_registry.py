@@ -321,6 +321,21 @@ class TestCreateHardenedContainer:
             source = str(entry).split(":")[0]
             assert repr(source) in str(exc.value)
 
+    def test_drive_letter_volume_source_raises(self, fake_client):
+        # A Windows drive-letter volume source ("C:\\data:/ctr") splits on ":"
+        # into a single-letter ``source``; it must be rejected as path-like
+        # rather than silently accepted as a bogus named volume.
+        path_like = [
+            "C:\\data:/ctr",
+            "D:\\work:/ctr",
+        ]
+        for entry in path_like:
+            profile = ContainerProfile(image="i", volumes=[entry])
+            with pytest.raises(ValueError, match="named-volume shorthands") as exc:
+                create_hardened_container(fake_client, profile, "n-drive")
+            source = str(entry).split(":")[0]
+            assert repr(source) in str(exc.value)
+
     def test_docker_exception_propagates(self, fake_client):
         fake_client.containers.run.side_effect = docker.errors.DockerException("boom")
         with pytest.raises(docker.errors.DockerException):

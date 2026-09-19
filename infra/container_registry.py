@@ -201,6 +201,12 @@ def _mount_specs_from_profile(profile: ContainerProfile) -> tuple:
             or source.startswith("./")
             or source.startswith("~")
             or "\\" in source
+            # Windows drive-letter sources ("C:\\data:/ctr") split on ":" into
+            # a single-letter ``source``.  A backslash-bearing entry like that
+            # is a path, not a named volume, so reject it with the same
+            # actionable error; a bare single-letter named volume (e.g.
+            # "v:/d") carries no backslash and is still accepted.
+            or (len(source) == 1 and source.isalpha() and "\\" in str(entry))
         ):
             raise ValueError(
                 "profile.volumes entries must be named-volume shorthands "
