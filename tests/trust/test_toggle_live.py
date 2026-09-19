@@ -239,8 +239,8 @@ class TestAskPermissionRestrictive:
             executor._ensure_container()
 
         _, kwargs = mock_docker.containers.run.call_args
-        assert kwargs.get("network") == "none", (
-            f"network='ask' → expected network='none', got {kwargs.get('network')!r}"
+        assert kwargs["network_mode"] == "none", (
+            f"network='ask' → expected network='none', got {kwargs.get('network_mode')!r}"
         )
 
     def test_ask_filesystem_creates_ro_mode(
@@ -359,7 +359,7 @@ class TestAskPermissionRestrictive:
         assert mock_container.stop.called
         assert mock_container.remove.called
         _, kwargs = mock_docker.containers.run.call_args
-        assert kwargs.get("network") == "bridge"
+        assert kwargs["network_mode"] == "bridge"
         mounts = kwargs.get("mounts") or []
         ws_mounts = [m for m in mounts
                      if m.get("Target") == "/workspace" and m.get("Type") == "bind"]
@@ -393,7 +393,7 @@ class TestAskPermissionRestrictive:
         assert mock_container.stop.called
         assert mock_container.remove.called
         _, kwargs = mock_docker.containers.run.call_args
-        assert kwargs.get("network") == "none"
+        assert kwargs["network_mode"] == "none"
         mounts = kwargs.get("mounts") or []
         ws_mounts = [m for m in mounts
                      if m.get("Target") == "/workspace" and m.get("Type") == "bind"]
