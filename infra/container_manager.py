@@ -75,7 +75,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -398,6 +398,97 @@ def _user_drift_axis(container, policy_user):
     if live == policy_user:
         return None
     return "deny", "user_mismatch", {"expected": policy_user, "actual": live}
+
+
+# ── Docker HARDENING: single source of truth + conformance predicate ────────
+# The four hardening values a hardened create applies live in ONE place
+# (``_expected_hardening_recipe``) and are both CONSUMED by ``_run_container``
+# and CHECKED against live containers by ``_hardening_conformance``.
+_HardeningRecipe = namedtuple(
+    "_HardeningRecipe", ["cap_drop", "security_opt", "read_only", "user"]
+)
+
+
+def _expected_hardening_recipe():
+    """Single source of truth for the docker HARDENING a create must apply.
+
+    Returns a frozen (namedtuple) value object carrying the four hardening
+    values a hardened create passes to ``containers.run``:
+
+      * ``cap_drop``     -> ``["ALL"]``
+      * ``security_opt`` -> ``["no-new-privileges:true"]``
+      * ``read_only``    -> ``True``
+      * ``user``         -> ``host_user() or "0:0"``
+
+    ``user`` is resolved at CALL time (never frozen into an import-time
+    constant) so a monkeypatched ``host_user`` -- or a host whose ids change
+    between import and use -- is honoured, exactly like the live expression it
+    replaced in ``_run_container``.
+    """
+    return _HardeningRecipe(
+        cap_drop=["ALL"],
+        security_opt=["no-new-privileges:true"],
+        read_only=True,
+        user=(host_user() or "0:0"),
+    )
+
+
+def _hardening_conformance(container, recipe):
+    """Return the docker HARDENING axes on which *container* is too weak.
+
+    ABSENT vs PRESENT rule (in words):
+
+      * an ABSENT backing key means the daemon exposes no surface on that axis,
+        so the axis is SKIPPED (never drift); this keeps fakes/daemons that
+        predate an axis from ever drifting on it;
+      * a PRESENT-but-WRONG value is a MISMATCH, and the axis name is returned.
+
+    PURE predicate over ``container.attrs`` (no Manager dependency).  The four
+    axes, each read from the docker section that owns it:
+
+      * ``HostConfig.CapDrop``        present => ``"ALL"`` must be among the
+                                      dropped caps (a SUPERSET is accepted);
+      * ``HostConfig.SecurityOpt``    present => ``"no-new-privileges:true"``
+                                      must be among the options;
+      * ``HostConfig.ReadonlyRootfs`` present => must be exactly ``True``;
+      * ``Config.User``               present => must EQUAL ``recipe.user``.
+
+    Returns the list of failing axis names (``[]`` == fully conformant).
+
+    DELIBERATE DIVERGENCE from :func:`_user_drift_axis`: that axis treats a
+    BLANK live user as "no user" and NOT drift, whereas here a PRESENT
+    empty-string ``Config.User`` is a MISMATCH -- a container that requested no
+    user did not request the hardened user we mandate.
+    """
+    try:
+        attrs = getattr(container, "attrs", None)
+    except Exception:
+        return []
+    if not isinstance(attrs, dict):
+        return []
+    host = attrs.get("HostConfig") or {}
+    cfg = attrs.get("Config") or {}
+    if not isinstance(host, dict):
+        host = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    failures = []
+    if "CapDrop" in host:
+        cap_drop = host.get("CapDrop")
+        if not (isinstance(cap_drop, (list, tuple)) and "ALL" in cap_drop):
+            failures.append("cap_drop")
+    if "SecurityOpt" in host:
+        security_opt = host.get("SecurityOpt")
+        if not (isinstance(security_opt, (list, tuple))
+                and "no-new-privileges:true" in security_opt):
+            failures.append("security_opt")
+    if "ReadonlyRootfs" in host:
+        if host.get("ReadonlyRootfs") is not True:
+            failures.append("read_only")
+    if "User" in cfg:
+        if cfg.get("User") != recipe.user:
+            failures.append("user")
+    return failures
 
 
 def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
@@ -1274,6 +1365,24 @@ class ContainerManager:
             )
             if _action == "deny":
                 return _payload
+            if _action == "recreate":
+                _removed_id = getattr(container, "id", None)
+                try:
+                    container.remove(force=True)
+                except Exception as exc:
+                    log("WARNING", "docker.container_manager",
+                        f"Recreate: failed to remove weak container "
+                        f"{_removed_id!r} for {name!r}: {exc}")
+                _audit("CONTAINER_CREATE",
+                       f"source=recreate+remove name={name} "
+                       f"removed_id={_removed_id} session={self.session_id} "
+                       f"workspace_id={self.workspace_id}")
+                return self._fresh_start(
+                    image=image, name=name, note=note, worker_name=worker_name,
+                    lifecycle_class=lifecycle_class,
+                    network_mode=want_network, workspace_mode=want_workspace,
+                    reuse_record_id=record_id,
+                )
             if note is not None:
                 self._write_note(self._record_id_for(container), note)
             note_value = (note if note is not None else self._read_note(container))
@@ -1344,6 +1453,27 @@ class ContainerManager:
                     )
                     if _action == "deny":
                         return _payload
+                    if _action == "recreate":
+                        _removed_id = getattr(container, "id", None)
+                        try:
+                            container.remove(force=True)
+                        except Exception as exc:
+                            log("WARNING", "docker.container_manager",
+                                f"Recreate: failed to remove weak container "
+                                f"{_removed_id!r} for {name!r}: {exc}")
+                        _audit("CONTAINER_CREATE",
+                               f"source=recreate+remove name={name} "
+                               f"removed_id={_removed_id} "
+                               f"session={self.session_id} "
+                               f"workspace_id={self.workspace_id}")
+                        return self._fresh_start(
+                            image=image, name=name, note=note,
+                            worker_name=worker_name,
+                            lifecycle_class=lifecycle_class,
+                            network_mode=want_network,
+                            workspace_mode=want_workspace,
+                            reuse_record_id=None,
+                        )
                     if _action == "reuse":
                         _start_drift = _payload
                     try:
@@ -1428,6 +1558,24 @@ class ContainerManager:
             )
             if _action == "deny":
                 return _payload
+            if _action == "recreate":
+                _removed_id = getattr(container, "id", None)
+                try:
+                    container.remove(force=True)
+                except Exception as exc:
+                    log("WARNING", "docker.container_manager",
+                        f"Recreate: failed to remove weak container "
+                        f"{_removed_id!r} for {name!r}: {exc}")
+                _audit("CONTAINER_CREATE",
+                       f"source=recreate+remove name={name} "
+                       f"removed_id={_removed_id} session={self.session_id} "
+                       f"workspace_id={self.workspace_id}")
+                return self._fresh_start(
+                    image=image, name=name, note=note, worker_name=worker_name,
+                    lifecycle_class=lifecycle_class,
+                    network_mode=network_mode, workspace_mode=workspace_mode,
+                    reuse_record_id=None,
+                )
             self._ensure_running(container)
             self._containers[name] = container.id
             if note is not None:
@@ -1460,6 +1608,7 @@ class ContainerManager:
         ``labels`` must already carry any record-owned label; the caller binds
         the record to the returned container.  Returns the created container.
         """
+        _hardening = _expected_hardening_recipe()
         return self.client.containers.run(
             image=image,
             name=name,
@@ -1467,11 +1616,11 @@ class ContainerManager:
             mounts=mounts,
             tmpfs=tmpfs,
             network=network_mode,
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges:true"],
+            cap_drop=_hardening.cap_drop,
+            security_opt=_hardening.security_opt,
             oom_score_adj=1000,  # user containers are the first OOM-kill victims
-            read_only=True,
-            user=(host_user() or "0:0"),
+            read_only=_hardening.read_only,
+            user=_hardening.user,
             detach=True,
             tty=True,
             stdin_open=True,
@@ -2423,7 +2572,11 @@ class ContainerManager:
         if lifecycle_class is not None:
             restart_axis = self._restart_drift_axis(container, lifecycle_class)
         user_axis = _user_drift_axis(container, host_user())
-        if config_ok and restart_axis is None and user_axis is None:
+        hardening_failures = _hardening_conformance(
+            container, _expected_hardening_recipe()
+        )
+        if (config_ok and restart_axis is None and user_axis is None
+                and not hardening_failures):
             return "ok", None
 
         live_net, live_ws = _exec_live_isolation(container)
@@ -2449,7 +2602,7 @@ class ContainerManager:
             user_decision, user_reason, user_detail = user_axis
 
         if (isolation_decision is None and restart_decision is None
-                and user_decision is None):
+                and user_decision is None and not hardening_failures):
             return "ok", None
 
         decision = (
@@ -2473,6 +2626,8 @@ class ContainerManager:
             drift["restart_policy"] = restart_detail
         if user_detail is not None:
             drift["user"] = user_detail
+        if hardening_failures:
+            drift["hardening"] = {"failed": list(hardening_failures)}
         container_id = getattr(container, "id", None)
         if isolation_decision is not None:
             signature = hashlib.sha256(
@@ -2530,6 +2685,12 @@ class ContainerManager:
                     "Recreate the container to restore the desired isolation."
                 )
             return "deny", {"error": message, "drift": drift}
+        if hardening_failures:
+            # FOURTH axis: docker HARDENING (cap_drop / security_opt / read-only
+            # rootfs / user) is weaker than a fresh create would be.  A deny
+            # still wins above; otherwise the caller must REMOVE this container
+            # and recreate it rather than hand back the weak one.
+            return "recreate", drift
         return "reuse", drift
 
     def _emit_start_drift_once(self, container_id, container, signature, decision,
