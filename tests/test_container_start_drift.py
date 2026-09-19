@@ -777,7 +777,7 @@ class _RunContainers:
     def list(self, all=False, filters=None):
         return list(self._items)
 
-    def run(self, **kwargs):
+    def run(self, *args, **kwargs):
         return self.run_result
 
 

@@ -558,7 +558,7 @@ class FakeContainers:
                 return c
         raise docker.errors.NotFound("container not found")
 
-    def run(self, **kwargs):
+    def run(self, *args, **kwargs):
         labels = dict(kwargs.get("labels") or {})
         name = kwargs.get("name") or "fake-" + uuid.uuid4().hex[:8]
         c = FakeContainer("fake-" + uuid.uuid4().hex[:16], name, labels=labels)

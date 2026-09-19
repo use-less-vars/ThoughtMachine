@@ -109,6 +109,14 @@ except ImportError:  # pragma: no cover - defensive
 
 
 from infra.container_env import merge_container_identity_env
+from infra.container_create import (
+    ContainerCreateSpec,
+    HardeningRecipe as _HardeningRecipe,
+    MountSpec,
+    _expected_hardening_recipe,
+    _hardening_conformance,
+    create_hardened_container,
+)
 from thoughtmachine.container_record import (
     attach_container,
     ContainerRecordError,
@@ -400,95 +408,31 @@ def _user_drift_axis(container, policy_user):
     return "deny", "user_mismatch", {"expected": policy_user, "actual": live}
 
 
-# ── Docker HARDENING: single source of truth + conformance predicate ────────
-# The four hardening values a hardened create applies live in ONE place
-# (``_expected_hardening_recipe``) and are both CONSUMED by ``_run_container``
-# and CHECKED against live containers by ``_hardening_conformance``.
-_HardeningRecipe = namedtuple(
-    "_HardeningRecipe", ["cap_drop", "security_opt", "read_only", "user"]
-)
+# ── Mount conversion for the spec-based create primitive ────────────────────
+# The canonical docker-HARDENING recipe (``_expected_hardening_recipe``) and the
+# conformance predicate (``_hardening_conformance``) now live in
+# ``infra.container_create`` and are imported at module top; this module no
+# longer keeps a duplicate copy.
+def _mount_specs_from_docker_mounts(mounts):
+    """Convert docker ``Mount`` objects into a tuple of ``MountSpec``.
 
-
-def _expected_hardening_recipe():
-    """Single source of truth for the docker HARDENING a create must apply.
-
-    Returns a frozen (namedtuple) value object carrying the four hardening
-    values a hardened create passes to ``containers.run``:
-
-      * ``cap_drop``     -> ``["ALL"]``
-      * ``security_opt`` -> ``["no-new-privileges:true"]``
-      * ``read_only``    -> ``True``
-      * ``user``         -> ``host_user() or "0:0"``
-
-    ``user`` is resolved at CALL time (never frozen into an import-time
-    constant) so a monkeypatched ``host_user`` -- or a host whose ids change
-    between import and use -- is honoured, exactly like the live expression it
-    replaced in ``_run_container``.
+    ``docker.types.Mount`` is a ``dict`` subclass keyed ``Target``/``Source``/
+    ``Type``/``ReadOnly`` and exposes NO matching attribute accessors, whereas
+    ``ContainerCreateSpec`` reads ``MountSpec`` by ATTRIBUTE.  An empty or
+    ``None`` ``mounts`` yields an empty tuple (the create then attaches none).
     """
-    return _HardeningRecipe(
-        cap_drop=["ALL"],
-        security_opt=["no-new-privileges:true"],
-        read_only=True,
-        user=(host_user() or "0:0"),
+    if not mounts:
+        return ()
+    return tuple(
+        MountSpec(
+            source=m["Source"],
+            target=m["Target"],
+            type=m.get("Type") or "bind",
+            read_only=bool(m.get("ReadOnly")),
+        )
+        for m in mounts
     )
 
-
-def _hardening_conformance(container, recipe):
-    """Return the docker HARDENING axes on which *container* is too weak.
-
-    ABSENT vs PRESENT rule (in words):
-
-      * an ABSENT backing key means the daemon exposes no surface on that axis,
-        so the axis is SKIPPED (never drift); this keeps fakes/daemons that
-        predate an axis from ever drifting on it;
-      * a PRESENT-but-WRONG value is a MISMATCH, and the axis name is returned.
-
-    PURE predicate over ``container.attrs`` (no Manager dependency).  The four
-    axes, each read from the docker section that owns it:
-
-      * ``HostConfig.CapDrop``        present => ``"ALL"`` must be among the
-                                      dropped caps (a SUPERSET is accepted);
-      * ``HostConfig.SecurityOpt``    present => ``"no-new-privileges:true"``
-                                      must be among the options;
-      * ``HostConfig.ReadonlyRootfs`` present => must be exactly ``True``;
-      * ``Config.User``               present => must EQUAL ``recipe.user``.
-
-    Returns the list of failing axis names (``[]`` == fully conformant).
-
-    DELIBERATE DIVERGENCE from :func:`_user_drift_axis`: that axis treats a
-    BLANK live user as "no user" and NOT drift, whereas here a PRESENT
-    empty-string ``Config.User`` is a MISMATCH -- a container that requested no
-    user did not request the hardened user we mandate.
-    """
-    try:
-        attrs = getattr(container, "attrs", None)
-    except Exception:
-        return []
-    if not isinstance(attrs, dict):
-        return []
-    host = attrs.get("HostConfig") or {}
-    cfg = attrs.get("Config") or {}
-    if not isinstance(host, dict):
-        host = {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-    failures = []
-    if "CapDrop" in host:
-        cap_drop = host.get("CapDrop")
-        if not (isinstance(cap_drop, (list, tuple)) and "ALL" in cap_drop):
-            failures.append("cap_drop")
-    if "SecurityOpt" in host:
-        security_opt = host.get("SecurityOpt")
-        if not (isinstance(security_opt, (list, tuple))
-                and "no-new-privileges:true" in security_opt):
-            failures.append("security_opt")
-    if "ReadonlyRootfs" in host:
-        if host.get("ReadonlyRootfs") is not True:
-            failures.append("read_only")
-    if "User" in cfg:
-        if cfg.get("User") != recipe.user:
-            failures.append("user")
-    return failures
 
 
 def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
@@ -1608,33 +1552,39 @@ class ContainerManager:
         ``labels`` must already carry any record-owned label; the caller binds
         the record to the returned container.  Returns the created container.
         """
-        _hardening = _expected_hardening_recipe()
-        return self.client.containers.run(
+        # The hardening values come from the canonical recipe in
+        # ``infra.container_create``; ``user`` is re-resolved from THIS module's
+        # ``host_user`` seam (the legacy, monkeypatchable seam the ownership
+        # tests pin) so the Windows ``"0:0"`` fallback and the POSIX
+        # pass-through are preserved unchanged.
+        _recipe = _expected_hardening_recipe()
+        hardening = _HardeningRecipe(
+            cap_drop=_recipe.cap_drop,
+            security_opt=_recipe.security_opt,
+            read_only=_recipe.read_only,
+            user=(host_user() or "0:0"),
+        )
+        spec = ContainerCreateSpec(
             image=image,
-            name=name,
-            volumes=None,
-            mounts=mounts,
-            tmpfs=tmpfs,
-            network=network_mode,
-            cap_drop=_hardening.cap_drop,
-            security_opt=_hardening.security_opt,
-            oom_score_adj=1000,  # user containers are the first OOM-kill victims
-            read_only=_hardening.read_only,
-            user=_hardening.user,
-            detach=True,
-            tty=True,
-            stdin_open=True,
             command=["tail", "-f", "/dev/null"],
+            name=name,
+            container_type="user",
+            lifecycle_class=lifecycle_class,
+            hardening=hardening,
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+            labels=labels,
+            environment={"PYTHONUSERBASE": "/home/agent/.local"},
+            mounts=_mount_specs_from_docker_mounts(mounts),
+            tmpfs=tmpfs,
+            network_mode=network_mode,
             mem_limit=self.mem_limit,
             cpu_quota=self.cpu_quota,
-            environment=merge_container_identity_env(
-                {"PYTHONUSERBASE": "/home/agent/.local"},
-                session_id=self.session_id,
-                workspace_id=self.workspace_id,
-            ),
-            restart_policy=docker_restart_policy(lifecycle_class),
-            labels=labels,
+            oom_score_adj=1000,  # user containers are the first OOM-kill victims
         )
+        return create_hardened_container(
+            self.client, spec, admission=None, record=False
+        ).container
 
     def _cache_container(self, name, container):
         """Reload a freshly created container and warm the read-through cache."""
