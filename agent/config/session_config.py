@@ -53,6 +53,19 @@ def normalize_system_prompt(value: Any) -> str:
     return ''
 
 
+def _drop_legacy_use_container_registry(model_fields, values):
+    """Legacy-data shim for the retired ``use_container_registry`` flag.
+
+    While the field is still declared the caller's value is honoured untouched (no-op);
+    once the declaration is removed (M1 step 5b) the raw key would trip ``extra="forbid"``,
+    so the pop becomes load-bearing. Keeping the shim inert until then means step 5b can be
+    reverted on its own without silently discarding a restored field's value.
+    """
+    if isinstance(values, dict) and 'use_container_registry' not in model_fields:
+        values.pop('use_container_registry', None)
+    return values
+
+
 class SessionConfig(BaseModel):
     """Session-level configuration model.
 
@@ -107,6 +120,11 @@ class SessionConfig(BaseModel):
         if isinstance(values, dict):
             values.pop('allow_host_resources', None)
         return values
+
+    @model_validator(mode='before')
+    def drop_legacy_use_container_registry(cls, values):
+        """Retire-tolerant load of legacy session JSON; see _drop_legacy_use_container_registry."""
+        return _drop_legacy_use_container_registry(cls.model_fields, values)
 
     # ── Fields ──────────────────────────────────────────────────────────
 

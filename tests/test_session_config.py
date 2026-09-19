@@ -97,3 +97,22 @@ class TestLegacyAllowHostResourcesDropped:
         ac = cfg.to_agent_config()
         assert "allow_host_resources" not in ac.model_dump()
 
+
+class TestLegacyUseContainerRegistryDropped:
+    """The retired SessionConfig use_container_registry key is tolerated on load."""
+
+    def test_legacy_key_is_honoured_while_declared_and_shim_gated_after(self):
+        # While the field is still declared the caller's value is honoured.
+        cfg = SessionConfig.model_validate({"use_container_registry": True})
+        assert cfg.use_container_registry is True
+
+        # The module-level shim only drops the key once the field is retired:
+        # a declared field keeps the value, a missing declaration pops it.
+        from agent.config.session_config import _drop_legacy_use_container_registry
+
+        assert _drop_legacy_use_container_registry(
+            {}, {"use_container_registry": True}
+        ) == {}
+        assert _drop_legacy_use_container_registry(
+            {"use_container_registry": object()}, {"use_container_registry": True}
+        ) == {"use_container_registry": True}
