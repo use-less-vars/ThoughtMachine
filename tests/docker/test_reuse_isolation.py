@@ -1,4 +1,4 @@
-"""RED-first regression test: start() must REFUSE a weak container and RECREATE.
+"""Regression test: start() REFUSES a non-conforming container and recreates it.
 
 Scenario
 --------
@@ -6,45 +6,51 @@ A container with the SAME name already exists with WEAK docker hardening (no
 ``cap_drop=ALL``, no ``no-new-privileges``, writable rootfs) and no other
 binding container record.  ``ContainerManager.start()`` finds it via the label
 path and runs the drift admission
-(``ContainerManager._start_drift_decision``).  That decision only inspects the
-network mode, the ``/workspace`` mount mode, the container ``user`` and the
-restart policy - it NEVER inspects the docker HARDENING axes (``cap_drop`` /
-``security_opt`` / ``read_only`` rootfs).  A container whose network
-and ``/workspace`` mount already match the resolved policy (and that carries a
-blank ``user``, which the user axis ignores) therefore passes the drift
-admission even though it is far weaker than a fresh create would be.
+(``ContainerManager._start_drift_decision``).  In addition to the network mode,
+the ``/workspace`` mount mode, the container ``user`` and the restart policy,
+that decision now inspects the docker HARDENING axes (``cap_drop`` /
+``security_opt`` / ``read_only`` rootfs) via
+``infra/container_manager.py::_expected_hardening_recipe()`` and
+``infra/container_manager.py::_hardening_conformance()``.  A container whose
+network and ``/workspace`` mount match the resolved policy (and that carries a
+blank ``user``, which the user axis ignores) is still flagged as non-conforming
+because it is far weaker on the hardening axes than a fresh create would be.
 
-Refuse-and-recreate (the semantics this test pins)
---------------------------------------------------
-When the requested isolation does not match an existing container, ``start()``
-must REFUSE to reuse it and must CREATE a NEW hardened container - it must NOT
-silently hand back the weak one.  Because a fresh create reuses the SAME
-container name, the weak container cannot survive that recreate.
+Refuse-and-recreate (the contract this test pins)
+-------------------------------------------------
+When an existing container is non-conforming on the hardening axes, ``start()``
+REFUSES to reuse it and CREATES a new, fully hardened container - it never
+silently hands back the weak one.  ``_start_drift_decision`` signals this with
+``("recreate", drift)``; ``start()`` then removes the weak container
+(``container.remove(force=True)``) and calls ``self._fresh_start(...)`` for the
+SAME name, so the weak container cannot survive the recreate.
 
 This test therefore:
 
 1. creates "config A" - a deliberately WEAK container whose ``network=none`` and
-   read-only ``/workspace`` bind mount already match the resolved policy, so the
-   drift admission passes;
+   read-only ``/workspace`` bind mount match the resolved policy but that omits
+   the hardening axes;
 2. calls ``start(name=...)`` ("config B" - the full hardened isolation a FRESH
    create would produce under the same default policy: network none, workspace
    ro, ``cap_drop=ALL``, ``no-new-privileges:true``, read-only rootfs and the
    host ``user``);
 3. FIRST builds an ``attribute | expected | actual`` table of the RETURNED
-   container's live docker config and fails on it - so an unfixed reuse
-   implementation fails with the full table, not merely with a guard message;
+   container's live docker config and asserts it is fully conformant - so if
+   refuse-and-recreate regresses (the weak container is handed back) the test
+   fails with the full table;
 4. then (structural guard) asserts the returned id is NOT the weak container's
    id, and (secondary) that the fresh create reported ``status == "created"``.
 
-RED-first expectation
----------------------
-On current code the table in step 3 FAILS: the reuse path hands back the weak
-container, so its ``CapDrop`` / ``SecurityOpt`` / ``ReadonlyRootfs`` / ``User``
-do not match "config B".  The assertions below are therefore
-expected to FAIL until ``start()`` refuses the weak container and recreates it.
+Post-fix contract
+-----------------
+The assertions PASS on fixed code: ``start()`` refuses the weak container and
+replaces it with a freshly created, fully hardened one under the SAME name.
+They FAIL if refuse-and-recreate regresses (the weak container is reused), so
+the test protects the hardening-admission behaviour rather than documenting its
+absence.
 
-Self-skips cleanly when no Docker daemon is available (module-level
-``needs_docker`` marker, mirroring tests/docker/test_persistence.py).
+Self-skips cleanly when no Docker daemon is available (class-level
+``@needs_docker`` skipif gate, mirroring tests/docker/test_persistence.py).
 """
 
 from __future__ import annotations
@@ -143,7 +149,7 @@ class TestReuseRefusesNonConforming:
             pass
 
     def _create_weak_container(self):
-        """Config A: weak hardening; matches every axis the drift check reads."""
+        """Config A: weak hardening; network + /workspace match, hardening axes omitted."""
         return self.client.containers.run(
             image=IMAGE,
             name=NAME,
@@ -168,16 +174,16 @@ class TestReuseRefusesNonConforming:
 
         Each row is ``(attribute, expected, actual, ok)``.  Actual values are
         read from the live docker attrs of the RETURNED container, using the
-        correct section per attribute (``Config`` vs ``HostConfig``):
+        correct section per attribute (``Config`` vs ``HostConfig``).  The four
+        expected values are defined by
+        ``infra/container_manager.py::_expected_hardening_recipe()`` and checked
+        against the live container by
+        ``infra/container_manager.py::_hardening_conformance()``:
 
         * ``HostConfig.CapDrop``          -> must contain ``"ALL"``
-          (infra/container_manager.py:1470)
         * ``HostConfig.SecurityOpt``      -> must contain ``"no-new-privileges:true"``
-          (infra/container_manager.py:1471)
         * ``HostConfig.ReadonlyRootfs``   -> must be ``True``
-          (infra/container_manager.py:1473)
         * ``Config.User``                 -> the host user (``host_user() or "0:0"``)
-          (infra/container_manager.py:1474)
         """
         host = attrs.get("HostConfig") or {}
         cfg = attrs.get("Config") or {}
