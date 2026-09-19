@@ -199,7 +199,7 @@ jobs:
         run: |
           source .venv/Scripts/activate
           python scripts/ci_assert_collected.py \
-            --expected 76 \
+            --expected 77 \
             tests/test_container_registry.py \
             tests/test_container_user_and_git_ownership.py \
             tests/test_global_defaults.py \
