@@ -125,45 +125,6 @@ class _FakeDockerModule:
         return self._client
 
 
-class _FakeDelegateRegistry:
-    """Records request_container / destroy_container like the registry wiring."""
-
-    def __init__(self, request_result=None, handles=None):
-        self.requested = []
-        self.destroyed = []
-        self.handles = list(handles or [])
-        self.request_result = request_result or {
-            "id": "c123",
-            "name": "tm-res-abc",
-            "status": "running",
-            "container_type": "resource",
-        }
-
-    def request_container(self, *args, **kwargs):
-        self.requested.append((args, kwargs))
-        return dict(self.request_result)
-
-    def destroy_container(self, *args, **kwargs):
-        self.destroyed.append((args, kwargs))
-
-    def list_all(self, *args, **kwargs):
-        return copy.copy(self.handles)
-
-
-class _RegistryRecorder:
-    """Records create_resource_container kwargs (resource-container registry path)."""
-
-    def __init__(self, result=None):
-        self.calls = []
-        self.result = result or {
-            "id": "c-r-1",
-            "name": "tm-res-x",
-            "status": "running",
-        }
-
-    def create_resource_container(self, **kwargs):
-        self.calls.append(kwargs)
-        return dict(self.result)
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +177,7 @@ def _make_container_manager(
     cm.session_id = session_id
     cm.workspace_id = workspace_id
     cm.session_permissions = {}
-    cm._session_config = session_config or {"use_container_registry": True}
+    cm._session_config = session_config or {}
     cm.image = "agent-executor"
     cm.mem_limit = "1g"
     cm.cpu_quota = 100000
@@ -229,21 +190,6 @@ def _make_container_manager(
     cm.workspace_config = {"max_containers": 4}
     cm.dockerfile_path = None
     return cm
-
-
-def _activate_registry(monkeypatch, fake):
-    monkeypatch.setattr(
-        container_manager, "is_registry_active", lambda cfg: True
-    )
-    monkeypatch.setattr(
-        container_manager, "get_active_registry", lambda cfg: fake
-    )
-
-
-def _deactivate_registry(monkeypatch):
-    monkeypatch.setattr(
-        container_manager, "is_registry_active", lambda cfg: False
-    )
 
 
 def _make_resource_manager(
@@ -360,40 +306,9 @@ class TestMergeHelperPure:
 
 
 class TestContainerManagerStart:
-    def test_registry_path_injects_identity_env(self, monkeypatch):
-        fake_reg = _FakeDelegateRegistry()
-        _activate_registry(monkeypatch, fake_reg)
-        cm = _make_container_manager(
-            session_id="s1", workspace_id="w1",
-            session_config={"use_container_registry": True},
-        )
-        result = cm.start(name="my-box")
-        assert result["id"] == fake_reg.request_result["id"]
-        assert len(fake_reg.requested) == 1
-        args, kwargs = fake_reg.requested[0]
-        assert kwargs["environment"] == {
-            "PYTHONUSERBASE": "/home/agent/.local",
-            SESSION_ID_ENV: "s1",
-            WORKSPACE_ID_ENV: "w1",
-        }
 
-    def test_registry_path_no_session(self, monkeypatch):
-        fake_reg = _FakeDelegateRegistry()
-        _activate_registry(monkeypatch, fake_reg)
-        cm = _make_container_manager(
-            session_id=None, workspace_id="w1",
-            session_config={"use_container_registry": True},
-        )
-        cm.start(name="my-box")
-        args, kwargs = fake_reg.requested[0]
-        assert kwargs["environment"] == {
-            "PYTHONUSERBASE": "/home/agent/.local",
-            WORKSPACE_ID_ENV: "w1",
-        }
-        assert SESSION_ID_ENV not in kwargs["environment"]
 
     def test_direct_path_injects_identity_env(self, monkeypatch):
-        _deactivate_registry(monkeypatch)
         client = _FakeDockerClient()
         cm = _make_container_manager(client, session_id="s1", workspace_id="w1")
         result = cm.start(name="my-box")
@@ -407,7 +322,6 @@ class TestContainerManagerStart:
         }
 
     def test_direct_path_no_session_id(self, monkeypatch):
-        _deactivate_registry(monkeypatch)
         client = _FakeDockerClient()
         cm = _make_container_manager(client, session_id=None, workspace_id="w1")
         cm.start(name="my-box")
@@ -504,7 +418,6 @@ class TestResourceContainerManagerCreate:
     def test_direct_create_workspace_only_when_session_none(self, monkeypatch):
         fake_docker = _FakeDockerModule()
         mgr = _make_resource_manager(monkeypatch, fake_docker, session_id=None)
-        monkeypatch.setattr(rcm, "is_registry_active", lambda cfg: False)
         cid = mgr.ensure_container()
         assert cid
         assert len(fake_docker._client.containers.run_calls) == 1
@@ -514,32 +427,10 @@ class TestResourceContainerManagerCreate:
     def test_direct_create_with_session_injects_both(self, monkeypatch):
         fake_docker = _FakeDockerModule()
         mgr = _make_resource_manager(monkeypatch, fake_docker, session_id="s-r")
-        monkeypatch.setattr(rcm, "is_registry_active", lambda cfg: False)
         mgr.ensure_container()
         assert len(fake_docker._client.containers.run_calls) == 1
         env = fake_docker._client.containers.run_calls[0]["kwargs"]["environment"]
         assert env == {SESSION_ID_ENV: "s-r", WORKSPACE_ID_ENV: "ws-r"}
-
-    def test_registry_path_injects_identity_env(self, monkeypatch):
-        fake_docker = _FakeDockerModule()
-        recorder = _RegistryRecorder()
-        mgr = _make_resource_manager(
-            monkeypatch,
-            fake_docker,
-            session_id="s-r",
-            session_config={"use_container_registry": True},
-        )
-        monkeypatch.setattr(rcm, "is_registry_active", lambda cfg: True)
-        monkeypatch.setattr(rcm, "get_active_registry", lambda cfg: recorder)
-        cid = mgr.ensure_container()
-        assert cid == "c-r-1"
-        assert len(recorder.calls) == 1
-        env = recorder.calls[0]["environment"]
-        assert env == {SESSION_ID_ENV: "s-r", WORKSPACE_ID_ENV: "ws-r"}
-        assert recorder.calls[0]["session_id"] == "s-r"
-        assert recorder.calls[0]["workspace_id"] == "ws-r"
-        # direct docker run must NOT be used on registry path
-        assert fake_docker._client.containers.run_calls == []
 
 
 # ===========================================================================

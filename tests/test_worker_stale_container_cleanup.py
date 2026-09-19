@@ -173,8 +173,6 @@ class StaleWorkerContainerCleanupTest(unittest.TestCase):
             with mock.patch.object(
                     self.container_manager, "cleanup_stale_worker_containers",
                     side_effect=lambda *a, **k: events.append("cleanup")) as cleanup_mock, \
-                    mock.patch.object(self.container_manager, "is_registry_active",
-                                      return_value=False), \
                     mock.patch.object(self.container_manager, "_audit"), \
                     mock.patch.object(self.container_manager, "log_container_event"), \
                     mock.patch.object(self.container_manager, "Mount",
@@ -255,8 +253,6 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
         with mock.patch.object(self.container_manager,
                                "cleanup_stale_worker_containers",
                                return_value=[]), \
-                mock.patch.object(self.container_manager, "is_registry_active",
-                                  return_value=False), \
                 mock.patch.object(self.container_manager, "_audit"), \
                 mock.patch.object(self.container_manager, "log_container_event"), \
                 mock.patch.object(self.container_manager, "Mount",

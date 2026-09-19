@@ -45,7 +45,6 @@ from infra.container_registry import (  # noqa: E402
     ContainerRegistry,
     create_hardened_container,
     get_container_registry,
-    is_container_registry_enabled,
     _resolve_network_mode_via_gate,
 )
 
@@ -805,25 +804,18 @@ class TestDriftEventBindingConstraint:
 
 
 class TestFeatureFlagAndHelpers:
-    def test_is_container_registry_enabled(self):
-        assert is_container_registry_enabled(None) is False
-        assert is_container_registry_enabled({}) is False
-        assert is_container_registry_enabled({"use_container_registry": False}) is False
-        assert is_container_registry_enabled({"use_container_registry": True}) is True
-
-    def test_get_container_registry_disabled_config_never_touches_docker(self):
-        with mock.patch("docker.from_env") as from_env:
+    def test_get_container_registry_ignores_retired_flag(self):
+        # ``is_container_registry_enabled`` is deleted: the retained factory no
+        # longer gates on the retired ``use_container_registry`` key -- it always
+        # returns an enabled registry that connects to the daemon.
+        with mock.patch("docker.from_env", return_value=FakeClient()) as from_env:
             reg = get_container_registry(session_config={"use_container_registry": False})
-            from_env.assert_not_called()
-        assert reg.is_enabled() is False
-        assert reg._docker_client is None
-        with pytest.raises(RuntimeError, match="ContainerRegistry is disabled"):
-            reg.request_container("w", "s", {}, workspace_id="ws")
+            from_env.assert_called_once()
+        assert reg.is_enabled() is True
+        assert reg._docker_client is not None
 
     def test_get_container_registry_enabled_config(self, fake_client):
-        reg = get_container_registry(
-            docker_client=fake_client, session_config={"use_container_registry": True}
-        )
+        reg = get_container_registry(docker_client=fake_client, session_config={})
         assert reg.is_enabled() is True
         handle = reg.request_container("w", "s", {}, workspace_id="ws")
         assert handle["status"] == "running"

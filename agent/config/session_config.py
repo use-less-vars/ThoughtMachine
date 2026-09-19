@@ -205,10 +205,6 @@ class SessionConfig(BaseModel):
         default=False,
         description='Enable the Workspace Lifecycle Manager for worker queries in this session (feature flag).',
     )
-    use_container_registry: bool = Field(
-        default=False,
-        description='Enable the ContainerRegistry delegation for container lifecycle in this session (feature flag).',
-    )
     worker_timeout_seconds: Optional[int] = Field(
         default=None,
         ge=1,
@@ -341,7 +337,6 @@ class SessionConfig(BaseModel):
             kwargs['provider_config'] = dict(self.provider_config)
 
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
-        kwargs['use_container_registry'] = bool(self.use_container_registry)
         if self.max_workers_per_session is not None:
             kwargs['max_workers_per_session'] = self.max_workers_per_session
         if self.worker_timeout_seconds is not None:

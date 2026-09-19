@@ -101,7 +101,6 @@ def _drive_start(fake_container, monkeypatch):
     # NOT from the workspace container-limit guard.
     mgr._get_max_containers = lambda: 100
     mgr._active_containers = lambda cs: []
-    monkeypatch.setattr(cm, "is_registry_active", lambda *a, **k: False)
     return mgr, mgr.start(name="agent-x")
 
 

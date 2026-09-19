@@ -98,16 +98,6 @@ from thoughtmachine.audit_logger import audit_event
 
 _audit = lambda event, data: audit_event(event, data)
 
-try:
-    from infra.registry_wiring import get_active_registry, is_registry_active
-except ImportError:  # pragma: no cover - defensive
-    def get_active_registry(session_config=None):
-        return None
-
-    def is_registry_active(session_config=None):
-        return False
-
-
 from infra.container_env import merge_container_identity_env
 from infra.container_create import (
     ContainerCreateSpec,
@@ -1118,30 +1108,6 @@ class ContainerManager:
             self._name_index_add(updated)
 
     # ── Public API ─────────────────────────────────────────────────────────
-    @property
-    def _registry(self):
-        """Lazily-resolved ContainerRegistry facade (wired per session config)."""
-        return get_active_registry(getattr(self, "_session_config", None))
-
-    def _resolve_registry_handle(self, container_id):
-        """Map a container id (or name) to the registry's tracked handle.
-
-        Returns None when the container is not tracked by the registry (e.g.
-        a legacy container created before the flag was enabled) — callers
-        then fall back to the legacy docker path.  The handle carries the
-        registry's ``container_type`` bookkeeping ("resource" for hidden
-        resource containers), which the stop/remove registry branches use to
-        refuse destroying them.
-        """
-        try:
-            handles = self._registry.list_all()
-        except Exception:
-            return None
-        for handle in handles or []:
-            if handle.get("id") == container_id or handle.get("name") == container_id:
-                return handle
-        return None
-
     def start(self, image=None, name=None, note=None, worker_name=None, *,
               lifecycle_class: str = LIFECYCLE_PERSISTENT,
               allow_fresh: bool = False,
@@ -1463,11 +1429,8 @@ class ContainerManager:
                     _reuse_resp["drift"] = _start_drift
                 return _reuse_resp
         limit = self._get_max_containers()
-        # When the registry is active it owns the per-session limit; the
-        # legacy workspace-scoped check is skipped so the registry is the
-        # single source of truth for container counts.
         active_containers = self._active_containers(containers)
-        if len(active_containers) >= limit and not is_registry_active(getattr(self, "_session_config", None)):
+        if len(active_containers) >= limit:
             log("WARNING", "docker.container_manager",
                 f"Workspace container limit reached: active={len(active_containers)} "
                 f"exited={len(containers) - len(active_containers)} limit={limit} "
@@ -1684,69 +1647,10 @@ class ContainerManager:
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")
 
-        # Phase 3 facade: with the registry active, the fresh create (and the
-        # per-session limit) is delegated to the registry's single hardened
-        # creation path.  The registry generates the docker name; the facade
-        # keeps its own ``name`` as the label ``thoughtmachine.container_name``
-        # so label-based reuse still works on later start() calls.
-        if (reuse_record_id is None
-                and is_registry_active(getattr(self, "_session_config", None))):
-            registry = self._registry
-            try:
-                handle = registry.request_container(
-                    self.session_id or "unknown",
-                    self.session_id or "default",
-                    self.session_permissions or {},
-                    image=image,
-                    workspace_id=self.workspace_id,
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    oom_score_adj=1000,
-                    labels=labels,
-                    environment=merge_container_identity_env(
-                        {"PYTHONUSERBASE": "/home/agent/.local"},
-                        session_id=self.session_id,
-                        workspace_id=self.workspace_id,
-                    ),
-                    mounts=[{
-                        "source": self.workspace_path,
-                        "target": "/workspace",
-                        "mode": "ro" if workspace_mode != "rw" else "rw",
-                    }],
-                    volumes=[f"tm-packages-{self.workspace_id}:/home/agent/.local"],
-                    tmpfs=tmpfs,
-                    lifecycle_class=lifecycle_class,
-                    name=name,
-                )
-            except RuntimeError as exc:
-                if "Container limit reached" in str(exc):
-                    return {"error": f"Workspace container limit reached: {exc}"}
-                raise
-            container_id = handle["id"]
-            container_name = handle["name"]
-            # Record-first identity: the registry minted the record on its own
-            # create path; index it here so a subsequent start(name=...) reuses
-            # it.  Resolve the record id from the live container label.
-            self._name_index_register(
-                name, self._record_id_for_name(container_name))
-            self._containers[name] = container_id
-            if note is not None:
-                self._write_note(self._record_id_for_name(container_id), note)
-            _audit("CONTAINER_CREATE",
-                   f"source=registry image={image} name={container_name} "
-                   f"session={self.session_id} workspace_id={self.workspace_id}")
-            log_container_event("started", container_id=container_id,
-                                session_id=self.session_id or "",
-                                data={"image": image, "name": name, "status": "created"})
-            return {"id": container_id, "name": name, "status": "created",
-                    "note": note or ""}
-
-        # Admission control (phase 2): the legacy (registry-inactive) create is a
-        # terminal container-create site, so gate it through the pure admission
-        # gate before touching the daemon.  Fail closed: a ``Deny`` returns an
+        # Admission control (phase 2): the create is a terminal
+        # container-create site, so gate it through the pure admission gate
+        # before touching the daemon.  Fail closed: a ``Deny`` returns an
         # error dict; a ``Transform`` may only narrow the network mode.
-        # (When the registry is active this code is unreachable - the registry
-        # already applied admission on its own create path.)
         _admission_spec = ContainerSpec(
             container_type="user",
             lifecycle_class=lifecycle_class,
@@ -1754,7 +1658,7 @@ class ContainerManager:
             session_id=self.session_id,
             # The image is operator-configured (``self.image``, defaulting to
             # ``DEFAULT_IMAGE``), so gating it against the user-image allowlist is
-            # a tautology; image enforcement lives on the registry path/upstream.
+            # a tautology; image enforcement lives upstream.
             image=None,
             name=name,
             mem_limit=self.mem_limit,
@@ -2741,27 +2645,6 @@ class ContainerManager:
 
     def stop(self, container_id):
         """Stop the container. Idempotent; NEVER raises."""
-        if is_registry_active(getattr(self, "_session_config", None)):
-            handle = self._resolve_registry_handle(container_id)
-            if handle is not None:
-                # Resource containers are tracked by the registry too (their
-                # factory registers them with container_type="resource");
-                # refuse to destroy them here just like the legacy path does.
-                _denial = self._agent_access_denial(self.class_of_handle(handle))
-                if _denial is not None:
-                    return {"status": "error", "container_id": container_id,
-                            "error": _denial}
-                name = handle.get("name")
-                try:
-                    self._registry.destroy_container(name)
-                except Exception as e:
-                    return {"status": "error", "container_id": container_id,
-                            "error": str(e)}
-                self._drop_container(container_id)
-                log_container_event("stopped", container_id=container_id,
-                                    session_id=self.session_id or "")
-                return {"status": "stopped", "container_id": container_id,
-                        "name": name}
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
@@ -2801,27 +2684,6 @@ class ContainerManager:
             {"status": "removed", "container_id": ...}
             {"status": "error", "container_id": ..., "error": ...}
         """
-        if is_registry_active(getattr(self, "_session_config", None)):
-            handle = self._resolve_registry_handle(container_id)
-            if handle is not None:
-                # Resource containers are tracked by the registry too (their
-                # factory registers them with container_type="resource");
-                # refuse to destroy them here just like the legacy path does.
-                _denial = self._agent_access_denial(self.class_of_handle(handle))
-                if _denial is not None:
-                    return {"status": "error", "container_id": container_id,
-                            "error": _denial}
-                name = handle.get("name")
-                try:
-                    self._registry.destroy_container(name)
-                except Exception as e:
-                    return {"status": "error", "container_id": container_id,
-                            "error": str(e)}
-                self._drop_container(container_id)
-                log_container_event("removed", container_id=container_id,
-                                    session_id=self.session_id or "")
-                return {"status": "removed", "container_id": container_id,
-                        "name": name}
         stopped = self.stop(container_id)
         if stopped.get("status") not in ("stopped", "missing"):
             return stopped

@@ -66,7 +66,6 @@ class AgentConfig(BaseModel):
         'worker_timeout_seconds': HOT_SWAPPABLE,
         'worker_max_retries': HOT_SWAPPABLE,
         'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
-        'use_container_registry': HOT_SWAPPABLE,
         'mode': RESTART_REQUIRED,
     }
 
@@ -137,10 +136,6 @@ class AgentConfig(BaseModel):
     use_workspace_lifecycle_manager: bool = Field(
         default=False,
         description='Enable the Workspace Lifecycle Manager for worker queries (feature flag).',
-    )
-    use_container_registry: bool = Field(
-        default=False,
-        description='Enable ContainerRegistry delegation for container lifecycle in worker queries (feature flag).',
     )
     @field_validator('system_prompt')
     def load_default_system_prompt(cls, v):

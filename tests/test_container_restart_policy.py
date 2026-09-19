@@ -195,14 +195,6 @@ def _tmp_vault(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_registry(monkeypatch):
-    """Never let the registry facade intercept the stubbed start() paths."""
-    monkeypatch.setattr(
-        container_manager, "is_registry_active", lambda *a, **k: False
-    )
-
-
-@pytest.fixture(autouse=True)
 def events(monkeypatch):
     """Capture record events so drift emission never writes to a real vault."""
     recorded = []
@@ -318,7 +310,6 @@ def test_site3_resource_container_manager_legacy_create(monkeypatch):
     client = _FakeDockerClient()
     monkeypatch.setattr(rcm, "docker", _FakeDockerModule(client))
     monkeypatch.setattr(rcm, "_ensure_resource_image", lambda: True)
-    monkeypatch.setattr(rcm, "is_registry_active", lambda cfg: False)
 
     mgr = rcm.ResourceContainerManager(
         workspace_id="ws-rp",

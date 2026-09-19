@@ -324,9 +324,6 @@ def test_record_store_failure_propagates_fail_closed(monkeypatch):
 
 
 def test_container_manager_start_injects_label_and_records(monkeypatch):
-    monkeypatch.setattr(
-        container_manager, "is_registry_active", lambda cfg: False
-    )
     client = _FakeDockerClient()
     cm = _make_container_manager(client, workspace_id="ws-cm")
     result = cm.start(image="agent-executor", name="agent-exec-integration")
@@ -373,9 +370,6 @@ def test_container_manager_start_explicit_ephemeral(monkeypatch):
     The start() default is persistent (non-destructive); only a caller that
     KNOWS the container is ephemeral passes ``lifecycle_class`` explicitly.
     """
-    monkeypatch.setattr(
-        container_manager, "is_registry_active", lambda cfg: False
-    )
     client = _FakeDockerClient()
     cm = _make_container_manager(client, workspace_id="ws-cm-eph")
     result = cm.start(
@@ -484,9 +478,6 @@ def test_snapshot_has_evidence_truth_table():
 
 def test_container_manager_start_persists_snapshot(monkeypatch):
     """(f) End-to-end: ContainerManager.start records the derived snapshot."""
-    monkeypatch.setattr(
-        container_manager, "is_registry_active", lambda cfg: False
-    )
     client = _FakeDockerClient()
     client.containers.run_attrs = _realistic_attrs()
     cm = _make_container_manager(client, workspace_id="ws-cm-snap")

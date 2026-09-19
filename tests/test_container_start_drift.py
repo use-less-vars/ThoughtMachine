@@ -239,14 +239,6 @@ def _tmp_vault(tmp_path, monkeypatch):
     _reset()
 
 
-@pytest.fixture(autouse=True)
-def _no_registry(monkeypatch):
-    """Never let the registry facade intercept the (stubbed) reuse paths."""
-    monkeypatch.setattr(
-        container_manager, "is_registry_active", lambda *a, **k: False
-    )
-
-
 @pytest.fixture
 def events(monkeypatch):
     """Capture record events via a patched thoughtmachine.container_record."""

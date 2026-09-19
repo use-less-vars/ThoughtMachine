@@ -417,22 +417,6 @@ def _sweep_exited_workspace_containers():
             f'workspace container(s), skipped {result.get("skipped", 0)}'
             + (f' — {detail}' if detail else ''))
 
-        # Registry companion: drop swept names so the in-memory container
-        # registry does not retain entries for removed containers. The
-        # disabled registry no-ops here, so this is safe on every start.
-        removed = result.get("removed_containers") or []
-        if removed:
-            try:
-                from infra.registry_wiring import get_active_registry
-                registry = get_active_registry(None)
-                for name in removed:
-                    try:
-                        registry.unregister(name)
-                    except Exception:
-                        pass
-            except Exception as exc:
-                log('WARNING', 'server',
-                    f'Startup sweep: registry companion unregister failed: {exc}')
     except Exception as exc:
         log('WARNING', 'server', f'Startup workspace sweep skipped: {exc}')
 

@@ -3589,15 +3589,6 @@ class Worker(ToolBase):
                 nested_cfg.get("use_workspace_lifecycle_manager")
             )
 
-        # Propagate the container-registry feature flag the same way.
-        # The ToolExecutor normally injects it already; the nested fallback
-        # covers direct callers that pass the legacy ``session_config`` shape.
-        if "use_container_registry" not in result:
-            nested_cfg = cfg.get("session_config") or {}
-            result["use_container_registry"] = bool(
-                nested_cfg.get("use_container_registry")
-            )
-
         return result
 
     def _resolve_tool_class(self, tool_name: str) -> Optional[type[ToolBase]]:

@@ -134,7 +134,6 @@ def _create_run_kwargs(monkeypatch, tmp_path, host_user_value):
     monkeypatch.setattr(rc_mgr, "_host_ids", lambda: (1000, 1000))
     # Gate 2 - registry facade OFF, so the LEGACY ``containers.run`` path
     # (the one carrying ``user=host_user()``) is exercised.
-    monkeypatch.setattr(rc_mgr, "is_registry_active", lambda _cfg: False)
     # The seam under test.
     monkeypatch.setattr(rc_mgr, "host_user", lambda: host_user_value)
     # Hermetic seams: no vault/record/disk side effects.

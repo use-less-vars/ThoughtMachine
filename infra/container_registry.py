@@ -48,7 +48,6 @@ __all__ = [
     "STOP_TIMEOUT",
     "create_hardened_container",
     "get_container_registry",
-    "is_container_registry_enabled",
 ]
 
 log = logging.getLogger("infra.container_registry")
@@ -1042,20 +1041,10 @@ def _emit_policy_drift_event(
         )
 
 
-def is_container_registry_enabled(session_config) -> bool:
-    """Session config flag (default False); mirrors the
-    ``use_workspace_lifecycle_manager`` pattern (workspace_lifecycle_manager.py
-    L97-101)."""
-    return bool((session_config or {}).get("use_container_registry", False))
-
-
 def get_container_registry(docker_client=None, session_config=None) -> ContainerRegistry:
     """Factory helper.
 
-    Disabled config -> a docker-less registry whose feature flag is always
-    False (docker.from_env is never called).  Enabled config -> a live
-    registry (connect to the host daemon when no client is injected).
+    Returns a live registry (connect to the host daemon when no client is
+    injected).
     """
-    if not is_container_registry_enabled(session_config):
-        return ContainerRegistry(docker_client=None, feature_flag_check=lambda: False)
     return ContainerRegistry(docker_client=docker_client, feature_flag_check=None)

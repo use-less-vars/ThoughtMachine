@@ -52,15 +52,6 @@ except ImportError:  # pragma: no cover - defensive
     RESOURCE_IMAGE_TAG = "tm-resource-git"
 
 try:
-    from infra.registry_wiring import get_active_registry, is_registry_active
-except ImportError:  # pragma: no cover - defensive
-    def get_active_registry(session_config=None):  # type: ignore[misc]
-        return None
-
-    def is_registry_active(session_config=None) -> bool:  # type: ignore[misc]
-        return False
-
-try:
     from infra.container_registry import DEFAULT_MAX_CONTAINERS
 except ImportError:  # pragma: no cover - defensive
     DEFAULT_MAX_CONTAINERS = 6
@@ -617,20 +608,7 @@ class WorkerSupervisor:
                 raise RuntimeError(
                     f"Worker container limit reached ({self._max_container_count})"
                 )
-        # Phase 3: with the registry active the registry owns creation and the
-        # container limit; the legacy ContainerManager.start() path runs only
-        # when the registry is inactive.
-        if is_registry_active(_get_session_config(cm)):
-            registry = get_active_registry(_get_session_config(cm))
-            result = registry.request_container(
-                worker_id or self.worker_id,
-                session_id or self.worker_id,
-                permissions if isinstance(permissions, dict) else {},
-                image=image,
-                workspace_id=getattr(cm, "workspace_id", None),
-            )
-        else:
-            result = cm.start(image=image, name=name, note=note)
+        result = cm.start(image=image, name=name, note=note)
         # Track the created container (by id, else by name) so release can
         # account for it. Handles exposing no id/name are not tracked — the
         # limit still applies to subsequent requests.
@@ -653,20 +631,6 @@ class WorkerSupervisor:
                 f"WorkerSupervisor({self.worker_id}) has no container_manager — "
                 f"release_container unavailable"
             )
-        # Phase 3: with the registry active, release goes through the registry
-        # (name-keyed destroy); containers not tracked by the registry fall
-        # back to the legacy stop path.
-        if is_registry_active(_get_session_config(cm)):
-            registry = get_active_registry(_get_session_config(cm))
-            name = None
-            for handle in registry.list_all() or []:
-                if handle.get("id") == container_id or handle.get("name") == container_id:
-                    name = handle.get("name")
-                    break
-            if name is not None:
-                registry.destroy_container(name)
-                return {"status": "stopped", "container_id": container_id,
-                        "name": name}
         return cm.stop(container_id)
 
     def _is_resource_container_request(self, permissions_or_image: Any) -> bool:

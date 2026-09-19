@@ -763,11 +763,6 @@
           "required": false,
           "description": "Enable Workspace Lifecycle Manager for worker queries (feature flag)."
         },
-        "use_container_registry": {
-          "type": "bool",
-          "required": false,
-          "description": "Enable ContainerRegistry delegation for container lifecycle (feature flag)."
-        },
         "allow_host_resources": {
           "type": "bool",
           "required": false,
