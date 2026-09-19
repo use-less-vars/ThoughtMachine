@@ -183,6 +183,11 @@ def _registry_create_run_kwargs(monkeypatch, host_user_value):
     monkeypatch.setattr(container_registry, "_host_ids", lambda: (1000, 1000))
     # The seam under test.
     monkeypatch.setattr(container_registry, "host_user", lambda: host_user_value)
+    # registry delegates user resolution to the primitive; patch both to
+    # preserve intent if the seam moves again.
+    monkeypatch.setattr(
+        "infra.container_create.host_user", lambda: host_user_value
+    )
 
     profile = container_registry.ContainerProfile()
     container_registry.create_hardened_container(client, profile, "tm-res-c")

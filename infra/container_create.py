@@ -186,6 +186,7 @@ class ContainerCreateSpec:
         mem_limit: memory limit.
         cpu_quota: CPU quota.
         oom_score_adj: OOM score adjustment; ``None`` selects the per-type default.
+        extra_hosts: extra ``/etc/hosts`` entries (``hostname -> IP``).
     """
 
     image: str
@@ -204,6 +205,7 @@ class ContainerCreateSpec:
     mem_limit: str = DEFAULT_MEM_LIMIT
     cpu_quota: int = DEFAULT_CPU_QUOTA
     oom_score_adj: int | None = None
+    extra_hosts: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.container_type not in CONTAINER_TYPES:
@@ -358,6 +360,7 @@ def create_hardened_container(
             tmpfs=dict(spec.tmpfs),
             labels=run_labels,
             environment=env,
+            extra_hosts=dict(spec.extra_hosts),
             mounts=mounts,
             restart_policy=docker_restart_policy(spec.lifecycle_class),
         )
