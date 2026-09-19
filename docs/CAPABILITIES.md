@@ -143,8 +143,8 @@ Effective permissions are computed **monotonically** via
 session)`. The gate is applied fail-closed at tool entry
 (`agent/core/tool_executor.py:67`–`:77`).
 
-Two optional session feature flags exist and both **default to `False`**:
-`use_workspace_lifecycle_manager`, `use_container_registry`.
+One optional session feature flag exists and it **defaults to `False`**:
+`use_workspace_lifecycle_manager`.
 
 > Note: `kill_thoughtmachine.sh` / `kill_thoughtmachine.bat` are **process-kill**
 > scripts (they force-stop the services on ports 8000/5173). They are *not* a security
@@ -160,7 +160,7 @@ The container subsystem has two layers:
 1. **`DockerExecutor`** (`tools/docker_executor.py`) — per-invocation code execution, the
    `DockerCodeRunner` path.
 2. **Lifecycle layer** — `infra/container_registry.py` (durable, `workspace_id`-keyed
-   records, gated behind `use_container_registry`) and `infra/container_manager.py`
+   records) and `infra/container_manager.py`
    (live container management).
 
 ### DEGRADED MODE

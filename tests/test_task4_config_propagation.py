@@ -148,13 +148,15 @@ class TestOperatorFlagPropagation:
         acfg = SessionConfig(
             git_allow_worktree_commits=True,
             use_workspace_lifecycle_manager=True,
-            use_container_registry=True,
+            use_container_registry=True,  # retired: silently dropped by the shim
         ).to_agent_config()
         assert acfg.session_permissions.git == 'write'
         assert 'git_write' not in acfg.session_permissions.model_dump()
         assert 'allow_host_resources' not in acfg.model_dump()
         assert acfg.use_workspace_lifecycle_manager is True
-        assert acfg.use_container_registry is True
+        # use_container_registry is retired: not an AgentConfig field, not forwarded.
+        assert not hasattr(acfg, 'use_container_registry')
+        assert 'use_container_registry' not in acfg.model_dump()
 
     def test_flags_default_to_false(self):
         acfg = SessionConfig().to_agent_config()
@@ -189,7 +191,6 @@ class TestToolExecutorFlagInjection:
             model='m1',
             git_allow_worktree_commits=True,
             use_workspace_lifecycle_manager=True,
-            use_container_registry=True,
         )
         executor = ToolExecutor(
             tool_classes=[FlagCaptureTool],
@@ -208,7 +209,7 @@ class TestToolExecutorFlagInjection:
         assert 'git_allow_worktree_commits' not in injected
         assert 'allow_host_resources' not in injected
         assert injected['use_workspace_lifecycle_manager'] is True
-        assert injected['use_container_registry'] is True
+        assert 'use_container_registry' not in injected
 
 
 class TestWorkerFlagForwarding:

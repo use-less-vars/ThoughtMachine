@@ -53,6 +53,19 @@ def normalize_system_prompt(value: Any) -> str:
     return ''
 
 
+def _drop_legacy_use_container_registry(model_fields, values):
+    """Legacy-data shim for the retired ``use_container_registry`` flag.
+
+    While the field is still declared the caller's value is honoured untouched (no-op);
+    once the declaration is removed (M1 step 5b) the raw key would trip ``extra="forbid"``,
+    so the pop becomes load-bearing. Keeping the shim inert until then means step 5b can be
+    reverted on its own without silently discarding a restored field's value.
+    """
+    if isinstance(values, dict) and 'use_container_registry' not in model_fields:
+        values.pop('use_container_registry', None)
+    return values
+
+
 class SessionConfig(BaseModel):
     """Session-level configuration model.
 
@@ -107,6 +120,11 @@ class SessionConfig(BaseModel):
         if isinstance(values, dict):
             values.pop('allow_host_resources', None)
         return values
+
+    @model_validator(mode='before')
+    def drop_legacy_use_container_registry(cls, values):
+        """Retire-tolerant load of legacy session JSON; see _drop_legacy_use_container_registry."""
+        return _drop_legacy_use_container_registry(cls.model_fields, values)
 
     # ── Fields ──────────────────────────────────────────────────────────
 
@@ -186,10 +204,6 @@ class SessionConfig(BaseModel):
     use_workspace_lifecycle_manager: bool = Field(
         default=False,
         description='Enable the Workspace Lifecycle Manager for worker queries in this session (feature flag).',
-    )
-    use_container_registry: bool = Field(
-        default=False,
-        description='Enable the ContainerRegistry delegation for container lifecycle in this session (feature flag).',
     )
     worker_timeout_seconds: Optional[int] = Field(
         default=None,
@@ -323,7 +337,6 @@ class SessionConfig(BaseModel):
             kwargs['provider_config'] = dict(self.provider_config)
 
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
-        kwargs['use_container_registry'] = bool(self.use_container_registry)
         if self.max_workers_per_session is not None:
             kwargs['max_workers_per_session'] = self.max_workers_per_session
         if self.worker_timeout_seconds is not None:

@@ -227,7 +227,7 @@ def _make_container_manager(client, vault, ws="ws-cm", session_id="sess-cm"):
     cm.session_id = session_id
     cm.workspace_id = ws
     cm.session_permissions = {"container": True}
-    cm._session_config = {"use_container_registry": False}
+    cm._session_config = {}
     cm.image = "agent-executor"
     cm.mem_limit = "1g"
     cm.cpu_quota = 100000
@@ -242,26 +242,10 @@ def _make_container_manager(client, vault, ws="ws-cm", session_id="sess-cm"):
     return cm
 
 
-class _FakeRegistryFacade:
-    """Records ``request_container`` (registry-active ContainerManager path)."""
-
-    def __init__(self):
-        self.requested = []
-
-    def request_container(self, *args, **kwargs):
-        self.requested.append((args, kwargs))
-        return {
-            "id": "reg-cm-1",
-            "name": kwargs.get("name") or "agent-exec-reg",
-            "status": "running",
-            "note": "",
-        }
-
 
 def test_site2_legacy_start_admits_once_before_run(monkeypatch, vault):
     recorder = Recorder()
     _patch_admit(monkeypatch, recorder)
-    monkeypatch.setattr(container_manager, "is_registry_active", lambda cfg: False)
     client = _FakeClient(recorder)
     cm = _make_container_manager(client, vault)
 
@@ -271,24 +255,6 @@ def test_site2_legacy_start_admits_once_before_run(monkeypatch, vault):
     assert recorder.kinds == ["admit", "run"]
     assert recorder.events[0] == ("admit", "user")
 
-
-def test_site2_facade_skips_direct_admit(monkeypatch, vault):
-    recorder = Recorder()
-    _patch_admit(monkeypatch, recorder)
-    monkeypatch.setattr(container_manager, "is_registry_active", lambda cfg: True)
-    facade = _FakeRegistryFacade()
-    monkeypatch.setattr(
-        container_manager, "get_active_registry", lambda cfg: facade
-    )
-    client = _FakeClient(recorder)
-    cm = _make_container_manager(client, vault)
-
-    result = cm.start(image="agent-executor", name="agent-exec-adm")
-
-    assert result["status"] == "created"
-    assert facade.requested, "create must be delegated to the registry facade"
-    # No direct admit AND no direct run at site 2 (the registry owns both).
-    assert recorder.kinds == []
 
 
 # ── Site 3: container_registry.create_hardened_container ─────────────────────
@@ -331,25 +297,10 @@ def _make_resource_manager(monkeypatch, client, vault, session_config=None):
     )
 
 
-class _FakeResourceRegistry:
-    """Records ``create_resource_container`` (registry-active resource path)."""
-
-    def __init__(self):
-        self.created = []
-
-    def create_resource_container(self, **kwargs):
-        self.created.append(kwargs)
-        return {
-            "id": "reg-res-1",
-            "name": kwargs.get("name") or "tm-res-reg-git",
-            "status": "running",
-        }
-
 
 def test_site4_legacy_create_admits_once_before_run(monkeypatch, vault):
     recorder = Recorder()
     _patch_admit(monkeypatch, recorder)
-    monkeypatch.setattr(rcm, "is_registry_active", lambda cfg: False)
     client = _FakeClient(recorder)
     mgr = _make_resource_manager(monkeypatch, client, vault)
 
@@ -362,7 +313,6 @@ def test_site4_legacy_create_admits_once_before_run(monkeypatch, vault):
 def test_site4_legacy_create_deny_short_circuits_before_run(monkeypatch, vault):
     recorder = Recorder(deny=Deny("policy_denied", "nope"))
     _patch_admit(monkeypatch, recorder)
-    monkeypatch.setattr(rcm, "is_registry_active", lambda cfg: False)
     client = _FakeClient(recorder)
     mgr = _make_resource_manager(monkeypatch, client, vault)
 
@@ -372,19 +322,3 @@ def test_site4_legacy_create_deny_short_circuits_before_run(monkeypatch, vault):
     assert recorder.kinds == ["admit"]
 
 
-def test_site4_facade_skips_direct_admit(monkeypatch, vault):
-    recorder = Recorder()
-    _patch_admit(monkeypatch, recorder)
-    monkeypatch.setattr(rcm, "is_registry_active", lambda cfg: True)
-    facade = _FakeResourceRegistry()
-    monkeypatch.setattr(rcm, "get_active_registry", lambda cfg: facade)
-    client = _FakeClient(recorder)
-    mgr = _make_resource_manager(
-        monkeypatch, client, vault, session_config={"use_container_registry": True}
-    )
-
-    mgr._create_resource_container(name="tm-res-adm-git")
-
-    assert facade.created, "create must be delegated to the registry facade"
-    # No direct admit AND no direct run at site 4.
-    assert recorder.kinds == []

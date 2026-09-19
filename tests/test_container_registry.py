@@ -45,7 +45,6 @@ from infra.container_registry import (  # noqa: E402
     ContainerRegistry,
     create_hardened_container,
     get_container_registry,
-    is_container_registry_enabled,
     _resolve_network_mode_via_gate,
 )
 
@@ -264,9 +263,14 @@ class TestCreateHardenedContainer:
         assert kwargs["environment"] == {"FOO": "bar"}
         assert kwargs["tmpfs"] == {"/tmp": "rw,size=8m"}
         assert kwargs["extra_hosts"] == {"host.docker.internal": "1.2.3.4"}
-        assert kwargs["volumes"] == ["vol1:/data"]
-        assert kwargs["mounts"] == [
-            {"source": "/host", "target": "/guest", "type": "bind", "read_only": False}
+        # No raw ``volumes=`` kwarg: volume shorthands are folded into the
+        # ``mounts`` list as real ``docker.types.Mount`` objects.
+        assert "volumes" not in kwargs
+        mounts = kwargs["mounts"]
+        assert all(isinstance(m, docker.types.Mount) for m in mounts)
+        assert [(m["Source"], m["Target"], m["Type"], m["ReadOnly"]) for m in mounts] == [
+            ("/host", "/guest", "bind", False),
+            ("vol1", "/data", "volume", False),
         ]
 
     def test_default_profile_hardening(self, fake_client):
@@ -279,7 +283,7 @@ class TestCreateHardenedContainer:
         assert kwargs["cpu_quota"] == DEFAULT_CPU_QUOTA
         assert kwargs["tmpfs"] == DEFAULT_TMPFS
         assert kwargs["mounts"] == []
-        assert kwargs["volumes"] == []
+        assert "volumes" not in kwargs
         assert kwargs["labels"] == {}
         assert kwargs["environment"] == {}
         assert kwargs["extra_hosts"] == {}
@@ -294,11 +298,42 @@ class TestCreateHardenedContainer:
             ],
         )
         create_hardened_container(fake_client, profile, "n2")
-        assert _run_kwargs(fake_client)["mounts"] == [
-            {"source": "/a", "target": "/b", "type": "bind", "read_only": True},
-            {"source": "/c", "target": "/d", "type": "bind", "read_only": False},
-            {"source": "/e", "target": "/f", "type": "bind", "read_only": False},
+        mounts = _run_kwargs(fake_client)["mounts"]
+        assert all(isinstance(m, docker.types.Mount) for m in mounts)
+        assert [(m["Source"], m["Target"], m["Type"], m["ReadOnly"]) for m in mounts] == [
+            ("/a", "/b", "bind", True),
+            ("/c", "/d", "bind", False),
+            ("/e", "/f", "bind", False),
         ]
+
+    def test_path_like_volume_source_raises(self, fake_client):
+        path_like = [
+            "/host/path:/ctr",         # absolute host path
+            "./data:/ctr",             # relative host path
+            "~/data:/ctr",             # home-relative host path
+            "\\\\server\\share:/ctr",  # UNC path (backslash)
+        ]
+        for entry in path_like:
+            profile = ContainerProfile(image="i", volumes=[entry])
+            with pytest.raises(ValueError, match="named-volume shorthands") as exc:
+                create_hardened_container(fake_client, profile, "n-path")
+            source = str(entry).split(":")[0]
+            assert repr(source) in str(exc.value)
+
+    def test_drive_letter_volume_source_raises(self, fake_client):
+        # A Windows drive-letter volume source ("C:\\data:/ctr") splits on ":"
+        # into a single-letter ``source``; it must be rejected as path-like
+        # rather than silently accepted as a bogus named volume.
+        path_like = [
+            "C:\\data:/ctr",
+            "D:\\work:/ctr",
+        ]
+        for entry in path_like:
+            profile = ContainerProfile(image="i", volumes=[entry])
+            with pytest.raises(ValueError, match="named-volume shorthands") as exc:
+                create_hardened_container(fake_client, profile, "n-drive")
+            source = str(entry).split(":")[0]
+            assert repr(source) in str(exc.value)
 
     def test_docker_exception_propagates(self, fake_client):
         fake_client.containers.run.side_effect = docker.errors.DockerException("boom")
@@ -453,12 +488,22 @@ class TestRequestContainer:
         record = load_record("ws9", record_id)
         assert record is not None
         assert record.docker_id == handle["id"]
-        assert kwargs["environment"] == {"X": "1"}
+        # The identity env is merged unconditionally by the create primitive:
+        # the caller's env vars survive, plus the workspace/session identity.
+        assert kwargs["environment"] == {
+            "X": "1",
+            "THOUGHTMACHINE_SESSION_ID": "s",
+            "THOUGHTMACHINE_WORKSPACE_ID": "ws9",
+        }
         assert kwargs["tmpfs"] == {"/tmp": "rw,size=4m"}
         assert kwargs["extra_hosts"] == {"h": "1.2.3.4"}
-        assert kwargs["volumes"] == ["v:/d"]
-        assert kwargs["mounts"] == [
-            {"source": "/s", "target": "/t", "type": "bind", "read_only": True}
+        # ``volumes=`` is gone; the ``"v:/d"`` shorthand is a volume mount.
+        assert "volumes" not in kwargs
+        mounts = kwargs["mounts"]
+        assert all(isinstance(m, docker.types.Mount) for m in mounts)
+        assert [(m["Source"], m["Target"], m["Type"], m["ReadOnly"]) for m in mounts] == [
+            ("/s", "/t", "bind", True),
+            ("v", "/d", "volume", False),
         ]
 
     def test_request_network_mode_kwarg_overridden_by_permissions(self, registry, fake_client):
@@ -759,25 +804,18 @@ class TestDriftEventBindingConstraint:
 
 
 class TestFeatureFlagAndHelpers:
-    def test_is_container_registry_enabled(self):
-        assert is_container_registry_enabled(None) is False
-        assert is_container_registry_enabled({}) is False
-        assert is_container_registry_enabled({"use_container_registry": False}) is False
-        assert is_container_registry_enabled({"use_container_registry": True}) is True
-
-    def test_get_container_registry_disabled_config_never_touches_docker(self):
-        with mock.patch("docker.from_env") as from_env:
+    def test_get_container_registry_ignores_retired_flag(self):
+        # ``is_container_registry_enabled`` is deleted: the retained factory no
+        # longer gates on the retired ``use_container_registry`` key -- it always
+        # returns an enabled registry that connects to the daemon.
+        with mock.patch("docker.from_env", return_value=FakeClient()) as from_env:
             reg = get_container_registry(session_config={"use_container_registry": False})
-            from_env.assert_not_called()
-        assert reg.is_enabled() is False
-        assert reg._docker_client is None
-        with pytest.raises(RuntimeError, match="ContainerRegistry is disabled"):
-            reg.request_container("w", "s", {}, workspace_id="ws")
+            from_env.assert_called_once()
+        assert reg.is_enabled() is True
+        assert reg._docker_client is not None
 
     def test_get_container_registry_enabled_config(self, fake_client):
-        reg = get_container_registry(
-            docker_client=fake_client, session_config={"use_container_registry": True}
-        )
+        reg = get_container_registry(docker_client=fake_client, session_config={})
         assert reg.is_enabled() is True
         handle = reg.request_container("w", "s", {}, workspace_id="ws")
         assert handle["status"] == "running"

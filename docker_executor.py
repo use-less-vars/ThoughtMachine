@@ -26,6 +26,12 @@ integrity checks and container creation/recreation.
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 from agent.logging import log
 from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL, host_user, _host_ids
+from infra.container_create import (
+    ContainerCreateSpec,
+    HardeningRecipe,
+    MountSpec,
+    create_hardened_container,
+)
 import docker
 import docker.types
 import hashlib
@@ -731,7 +737,7 @@ class DockerExecutor:
         mounts = [workspace_mount]
         if pkg_mount is not None:
             mounts.append(pkg_mount)
-        container_env = ["PYTHONUSERBASE=/home/agent/.local"]
+        container_env = {"PYTHONUSERBASE": "/home/agent/.local"}
 
         # ── Admission control (phase 2 gate) ─────────────────────────────
         # Route this terminal create through the pure admission gate so the
@@ -787,31 +793,45 @@ class DockerExecutor:
                 "non-root host user"
             )
 
-        self.container = self.client.containers.run(
+        spec = ContainerCreateSpec(
             image=self.image,
-            name=container_name,
-            mounts=mounts,
-            tmpfs=tmpfs,
-            network=network_mode,
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges:true"],
-            read_only=True,
-            user=(host_user() or "0:0"),  # container user matches the host uid:gid
-            detach=True,
-            tty=True,
-            stdin_open=True,
             command=["tail", "-f", "/dev/null"],
-            mem_limit=self.mem_limit,
-            cpu_quota=self.cpu_quota,
-            environment=container_env,
+            name=container_name,
+            container_type="user",
+            lifecycle_class=LIFECYCLE_PERSISTENT,
+            hardening=HardeningRecipe(
+                cap_drop=("ALL",),
+                security_opt=("no-new-privileges:true",),
+                read_only=True,
+                user=(host_user() or "0:0"),  # container user matches the host uid:gid
+            ),
+            workspace_id=self.workspace_id,
             labels={
                 "thoughtmachine.workspace_id": str(self.workspace_id)
                 if self.workspace_id is not None else "default",
                 "thoughtmachine.note": "",
                 CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
             },
-            restart_policy=docker_restart_policy(LIFECYCLE_PERSISTENT),
+            environment=container_env,
+            mounts=[
+                MountSpec(
+                    source=m["Source"],
+                    target=m["Target"],
+                    type=m["Type"],
+                    read_only=m["ReadOnly"],
+                )
+                for m in mounts
+            ],
+            tmpfs=tmpfs,
+            network_mode=network_mode,
+            mem_limit=self.mem_limit,
+            cpu_quota=self.cpu_quota,
+            oom_score_adj=1000,
         )
+        created = create_hardened_container(
+            self.client, spec, admission=None, record=False,
+        )
+        self.container = created.container
         # Workspace bind mount already has correct UID (matches host)
         self.last_used = time.time()
 

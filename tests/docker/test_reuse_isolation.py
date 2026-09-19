@@ -10,8 +10,8 @@ path and runs the drift admission
 the ``/workspace`` mount mode, the container ``user`` and the restart policy,
 that decision now inspects the docker HARDENING axes (``cap_drop`` /
 ``security_opt`` / ``read_only`` rootfs) via
-``infra/container_manager.py::_expected_hardening_recipe()`` and
-``infra/container_manager.py::_hardening_conformance()``.  A container whose
+``infra/container_create.py::_expected_hardening_recipe()`` and
+``infra/container_create.py::_hardening_conformance()``.  A container whose
 network and ``/workspace`` mount match the resolved policy (and that carries a
 blank ``user``, which the user axis ignores) is still flagged as non-conforming
 because it is far weaker on the hardening axes than a fresh create would be.
@@ -176,9 +176,9 @@ class TestReuseRefusesNonConforming:
         read from the live docker attrs of the RETURNED container, using the
         correct section per attribute (``Config`` vs ``HostConfig``).  The four
         expected values are defined by
-        ``infra/container_manager.py::_expected_hardening_recipe()`` and checked
+        ``infra/container_create.py::_expected_hardening_recipe()`` and checked
         against the live container by
-        ``infra/container_manager.py::_hardening_conformance()``:
+        ``infra/container_create.py::_hardening_conformance()``:
 
         * ``HostConfig.CapDrop``          -> must contain ``"ALL"``
         * ``HostConfig.SecurityOpt``      -> must contain ``"no-new-privileges:true"``

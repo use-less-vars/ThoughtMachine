@@ -810,28 +810,3 @@ def test_plumbing_wlm_flag_off_end_to_end(tmp_path):
         timeout_seconds=60,
     )
     assert thread._wlm_flag_enabled() is False
-
-
-def test_plumbing_container_registry_flag_forwarding(tmp_path):
-    """use_container_registry forwards through the same chain (default False)."""
-    from agent.config.session_config import SessionConfig
-    from agent.config.models import AgentConfig
-
-    session = SessionConfig(mode="custom", use_container_registry=True)
-    acfg = session.to_agent_config(workspace_path=str(tmp_path))
-    assert isinstance(acfg, AgentConfig)
-    assert acfg.use_container_registry is True
-
-    injected = _run_probe(_make_probe_executor(acfg))
-    assert injected["use_container_registry"] is True
-
-    built = _build_via_worker_tool(injected)
-    assert built.get("use_container_registry") is True
-
-    off = SessionConfig(mode="custom").to_agent_config()
-    assert off.use_container_registry is False
-    off_injected = _run_probe(_make_probe_executor(off))
-    assert off_injected["use_container_registry"] is False
-    off_built = _build_via_worker_tool(off_injected)
-    assert off_built.get("use_container_registry") is False
-

@@ -98,17 +98,15 @@ from thoughtmachine.audit_logger import audit_event
 
 _audit = lambda event, data: audit_event(event, data)
 
-try:
-    from infra.registry_wiring import get_active_registry, is_registry_active
-except ImportError:  # pragma: no cover - defensive
-    def get_active_registry(session_config=None):
-        return None
-
-    def is_registry_active(session_config=None):
-        return False
-
-
 from infra.container_env import merge_container_identity_env
+from infra.container_create import (
+    ContainerCreateSpec,
+    HardeningRecipe as _HardeningRecipe,
+    MountSpec,
+    _expected_hardening_recipe,
+    _hardening_conformance,
+    create_hardened_container,
+)
 from thoughtmachine.container_record import (
     attach_container,
     ContainerRecordError,
@@ -400,95 +398,52 @@ def _user_drift_axis(container, policy_user):
     return "deny", "user_mismatch", {"expected": policy_user, "actual": live}
 
 
-# ── Docker HARDENING: single source of truth + conformance predicate ────────
-# The four hardening values a hardened create applies live in ONE place
-# (``_expected_hardening_recipe``) and are both CONSUMED by ``_run_container``
-# and CHECKED against live containers by ``_hardening_conformance``.
-_HardeningRecipe = namedtuple(
-    "_HardeningRecipe", ["cap_drop", "security_opt", "read_only", "user"]
-)
+# ── Mount conversion for the spec-based create primitive ────────────────────
+# The canonical docker-HARDENING recipe (``_expected_hardening_recipe``) and the
+# conformance predicate (``_hardening_conformance``) now live in
+# ``infra.container_create`` and are imported at module top; this module no
+# longer keeps a duplicate copy.
+def _mount_specs_from_docker_mounts(mounts):
+    """Convert docker ``Mount`` objects into a tuple of ``MountSpec``.
 
+    ``docker.types.Mount`` is a ``dict`` subclass keyed ``Target``/``Source``/
+    ``Type``/``ReadOnly`` and exposes NO matching attribute accessors, whereas
+    ``ContainerCreateSpec`` reads ``MountSpec`` by ATTRIBUTE.  An empty or
+    ``None`` ``mounts`` yields an empty tuple (the create then attaches none).
 
-def _expected_hardening_recipe():
-    """Single source of truth for the docker HARDENING a create must apply.
-
-    Returns a frozen (namedtuple) value object carrying the four hardening
-    values a hardened create passes to ``containers.run``:
-
-      * ``cap_drop``     -> ``["ALL"]``
-      * ``security_opt`` -> ``["no-new-privileges:true"]``
-      * ``read_only``    -> ``True``
-      * ``user``         -> ``host_user() or "0:0"``
-
-    ``user`` is resolved at CALL time (never frozen into an import-time
-    constant) so a monkeypatched ``host_user`` -- or a host whose ids change
-    between import and use -- is honoured, exactly like the live expression it
-    replaced in ``_run_container``.
+    Accepted entry shapes: a ``docker.types.Mount`` (or any mapping) carrying
+    ``Source`` and ``Target`` keys (``Type``/``ReadOnly`` optional).  Shorthand
+    strings such as ``"src:tgt:ro"`` are NOT accepted here: the ``mounts=``
+    boundary the docker SDK exposes performs NO per-entry parsing, so shorthand
+    is only valid on the separate ``volumes=``/binds path.  Any entry that is
+    not such a mapping (a ``str``, an ``int``, a non-mapping object, or a
+    mapping missing the required keys) raises a self-describing ``TypeError``
+    naming the offending object instead of leaking a low-level ``string indices
+    must be integers`` error.
     """
-    return _HardeningRecipe(
-        cap_drop=["ALL"],
-        security_opt=["no-new-privileges:true"],
-        read_only=True,
-        user=(host_user() or "0:0"),
-    )
+    if not mounts:
+        return ()
+    specs = []
+    for m in mounts:
+        try:
+            source = m["Source"]
+            target = m["Target"]
+        except (TypeError, KeyError) as exc:
+            raise TypeError(
+                "mounts entries must be docker.types.Mount mappings with "
+                "Source/Target keys; got "
+                f"{type(m).__name__}: {m!r}"
+            ) from exc
+        specs.append(
+            MountSpec(
+                source=source,
+                target=target,
+                type=m.get("Type") or "bind",
+                read_only=bool(m.get("ReadOnly")),
+            )
+        )
+    return tuple(specs)
 
-
-def _hardening_conformance(container, recipe):
-    """Return the docker HARDENING axes on which *container* is too weak.
-
-    ABSENT vs PRESENT rule (in words):
-
-      * an ABSENT backing key means the daemon exposes no surface on that axis,
-        so the axis is SKIPPED (never drift); this keeps fakes/daemons that
-        predate an axis from ever drifting on it;
-      * a PRESENT-but-WRONG value is a MISMATCH, and the axis name is returned.
-
-    PURE predicate over ``container.attrs`` (no Manager dependency).  The four
-    axes, each read from the docker section that owns it:
-
-      * ``HostConfig.CapDrop``        present => ``"ALL"`` must be among the
-                                      dropped caps (a SUPERSET is accepted);
-      * ``HostConfig.SecurityOpt``    present => ``"no-new-privileges:true"``
-                                      must be among the options;
-      * ``HostConfig.ReadonlyRootfs`` present => must be exactly ``True``;
-      * ``Config.User``               present => must EQUAL ``recipe.user``.
-
-    Returns the list of failing axis names (``[]`` == fully conformant).
-
-    DELIBERATE DIVERGENCE from :func:`_user_drift_axis`: that axis treats a
-    BLANK live user as "no user" and NOT drift, whereas here a PRESENT
-    empty-string ``Config.User`` is a MISMATCH -- a container that requested no
-    user did not request the hardened user we mandate.
-    """
-    try:
-        attrs = getattr(container, "attrs", None)
-    except Exception:
-        return []
-    if not isinstance(attrs, dict):
-        return []
-    host = attrs.get("HostConfig") or {}
-    cfg = attrs.get("Config") or {}
-    if not isinstance(host, dict):
-        host = {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-    failures = []
-    if "CapDrop" in host:
-        cap_drop = host.get("CapDrop")
-        if not (isinstance(cap_drop, (list, tuple)) and "ALL" in cap_drop):
-            failures.append("cap_drop")
-    if "SecurityOpt" in host:
-        security_opt = host.get("SecurityOpt")
-        if not (isinstance(security_opt, (list, tuple))
-                and "no-new-privileges:true" in security_opt):
-            failures.append("security_opt")
-    if "ReadonlyRootfs" in host:
-        if host.get("ReadonlyRootfs") is not True:
-            failures.append("read_only")
-    if "User" in cfg:
-        if cfg.get("User") != recipe.user:
-            failures.append("user")
-    return failures
 
 
 def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
@@ -1153,30 +1108,6 @@ class ContainerManager:
             self._name_index_add(updated)
 
     # ── Public API ─────────────────────────────────────────────────────────
-    @property
-    def _registry(self):
-        """Lazily-resolved ContainerRegistry facade (wired per session config)."""
-        return get_active_registry(getattr(self, "_session_config", None))
-
-    def _resolve_registry_handle(self, container_id):
-        """Map a container id (or name) to the registry's tracked handle.
-
-        Returns None when the container is not tracked by the registry (e.g.
-        a legacy container created before the flag was enabled) — callers
-        then fall back to the legacy docker path.  The handle carries the
-        registry's ``container_type`` bookkeeping ("resource" for hidden
-        resource containers), which the stop/remove registry branches use to
-        refuse destroying them.
-        """
-        try:
-            handles = self._registry.list_all()
-        except Exception:
-            return None
-        for handle in handles or []:
-            if handle.get("id") == container_id or handle.get("name") == container_id:
-                return handle
-        return None
-
     def start(self, image=None, name=None, note=None, worker_name=None, *,
               lifecycle_class: str = LIFECYCLE_PERSISTENT,
               allow_fresh: bool = False,
@@ -1498,11 +1429,8 @@ class ContainerManager:
                     _reuse_resp["drift"] = _start_drift
                 return _reuse_resp
         limit = self._get_max_containers()
-        # When the registry is active it owns the per-session limit; the
-        # legacy workspace-scoped check is skipped so the registry is the
-        # single source of truth for container counts.
         active_containers = self._active_containers(containers)
-        if len(active_containers) >= limit and not is_registry_active(getattr(self, "_session_config", None)):
+        if len(active_containers) >= limit:
             log("WARNING", "docker.container_manager",
                 f"Workspace container limit reached: active={len(active_containers)} "
                 f"exited={len(containers) - len(active_containers)} limit={limit} "
@@ -1608,33 +1536,39 @@ class ContainerManager:
         ``labels`` must already carry any record-owned label; the caller binds
         the record to the returned container.  Returns the created container.
         """
-        _hardening = _expected_hardening_recipe()
-        return self.client.containers.run(
+        # The hardening values come from the canonical recipe in
+        # ``infra.container_create``; ``user`` is re-resolved from THIS module's
+        # ``host_user`` seam (the legacy, monkeypatchable seam the ownership
+        # tests pin) so the Windows ``"0:0"`` fallback and the POSIX
+        # pass-through are preserved unchanged.
+        _recipe = _expected_hardening_recipe()
+        hardening = _HardeningRecipe(
+            cap_drop=_recipe.cap_drop,
+            security_opt=_recipe.security_opt,
+            read_only=_recipe.read_only,
+            user=(host_user() or "0:0"),
+        )
+        spec = ContainerCreateSpec(
             image=image,
-            name=name,
-            volumes=None,
-            mounts=mounts,
-            tmpfs=tmpfs,
-            network=network_mode,
-            cap_drop=_hardening.cap_drop,
-            security_opt=_hardening.security_opt,
-            oom_score_adj=1000,  # user containers are the first OOM-kill victims
-            read_only=_hardening.read_only,
-            user=_hardening.user,
-            detach=True,
-            tty=True,
-            stdin_open=True,
             command=["tail", "-f", "/dev/null"],
+            name=name,
+            container_type="user",
+            lifecycle_class=lifecycle_class,
+            hardening=hardening,
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+            labels=labels,
+            environment={"PYTHONUSERBASE": "/home/agent/.local"},
+            mounts=_mount_specs_from_docker_mounts(mounts),
+            tmpfs=tmpfs,
+            network_mode=network_mode,
             mem_limit=self.mem_limit,
             cpu_quota=self.cpu_quota,
-            environment=merge_container_identity_env(
-                {"PYTHONUSERBASE": "/home/agent/.local"},
-                session_id=self.session_id,
-                workspace_id=self.workspace_id,
-            ),
-            restart_policy=docker_restart_policy(lifecycle_class),
-            labels=labels,
+            oom_score_adj=1000,  # user containers are the first OOM-kill victims
         )
+        return create_hardened_container(
+            self.client, spec, admission=None, record=False
+        ).container
 
     def _cache_container(self, name, container):
         """Reload a freshly created container and warm the read-through cache."""
@@ -1713,69 +1647,10 @@ class ContainerManager:
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")
 
-        # Phase 3 facade: with the registry active, the fresh create (and the
-        # per-session limit) is delegated to the registry's single hardened
-        # creation path.  The registry generates the docker name; the facade
-        # keeps its own ``name`` as the label ``thoughtmachine.container_name``
-        # so label-based reuse still works on later start() calls.
-        if (reuse_record_id is None
-                and is_registry_active(getattr(self, "_session_config", None))):
-            registry = self._registry
-            try:
-                handle = registry.request_container(
-                    self.session_id or "unknown",
-                    self.session_id or "default",
-                    self.session_permissions or {},
-                    image=image,
-                    workspace_id=self.workspace_id,
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    oom_score_adj=1000,
-                    labels=labels,
-                    environment=merge_container_identity_env(
-                        {"PYTHONUSERBASE": "/home/agent/.local"},
-                        session_id=self.session_id,
-                        workspace_id=self.workspace_id,
-                    ),
-                    mounts=[{
-                        "source": self.workspace_path,
-                        "target": "/workspace",
-                        "mode": "ro" if workspace_mode != "rw" else "rw",
-                    }],
-                    volumes=[f"tm-packages-{self.workspace_id}:/home/agent/.local"],
-                    tmpfs=tmpfs,
-                    lifecycle_class=lifecycle_class,
-                    name=name,
-                )
-            except RuntimeError as exc:
-                if "Container limit reached" in str(exc):
-                    return {"error": f"Workspace container limit reached: {exc}"}
-                raise
-            container_id = handle["id"]
-            container_name = handle["name"]
-            # Record-first identity: the registry minted the record on its own
-            # create path; index it here so a subsequent start(name=...) reuses
-            # it.  Resolve the record id from the live container label.
-            self._name_index_register(
-                name, self._record_id_for_name(container_name))
-            self._containers[name] = container_id
-            if note is not None:
-                self._write_note(self._record_id_for_name(container_id), note)
-            _audit("CONTAINER_CREATE",
-                   f"source=registry image={image} name={container_name} "
-                   f"session={self.session_id} workspace_id={self.workspace_id}")
-            log_container_event("started", container_id=container_id,
-                                session_id=self.session_id or "",
-                                data={"image": image, "name": name, "status": "created"})
-            return {"id": container_id, "name": name, "status": "created",
-                    "note": note or ""}
-
-        # Admission control (phase 2): the legacy (registry-inactive) create is a
-        # terminal container-create site, so gate it through the pure admission
-        # gate before touching the daemon.  Fail closed: a ``Deny`` returns an
+        # Admission control (phase 2): the create is a terminal
+        # container-create site, so gate it through the pure admission gate
+        # before touching the daemon.  Fail closed: a ``Deny`` returns an
         # error dict; a ``Transform`` may only narrow the network mode.
-        # (When the registry is active this code is unreachable - the registry
-        # already applied admission on its own create path.)
         _admission_spec = ContainerSpec(
             container_type="user",
             lifecycle_class=lifecycle_class,
@@ -1783,7 +1658,7 @@ class ContainerManager:
             session_id=self.session_id,
             # The image is operator-configured (``self.image``, defaulting to
             # ``DEFAULT_IMAGE``), so gating it against the user-image allowlist is
-            # a tautology; image enforcement lives on the registry path/upstream.
+            # a tautology; image enforcement lives upstream.
             image=None,
             name=name,
             mem_limit=self.mem_limit,
@@ -2770,27 +2645,6 @@ class ContainerManager:
 
     def stop(self, container_id):
         """Stop the container. Idempotent; NEVER raises."""
-        if is_registry_active(getattr(self, "_session_config", None)):
-            handle = self._resolve_registry_handle(container_id)
-            if handle is not None:
-                # Resource containers are tracked by the registry too (their
-                # factory registers them with container_type="resource");
-                # refuse to destroy them here just like the legacy path does.
-                _denial = self._agent_access_denial(self.class_of_handle(handle))
-                if _denial is not None:
-                    return {"status": "error", "container_id": container_id,
-                            "error": _denial}
-                name = handle.get("name")
-                try:
-                    self._registry.destroy_container(name)
-                except Exception as e:
-                    return {"status": "error", "container_id": container_id,
-                            "error": str(e)}
-                self._drop_container(container_id)
-                log_container_event("stopped", container_id=container_id,
-                                    session_id=self.session_id or "")
-                return {"status": "stopped", "container_id": container_id,
-                        "name": name}
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
@@ -2830,27 +2684,6 @@ class ContainerManager:
             {"status": "removed", "container_id": ...}
             {"status": "error", "container_id": ..., "error": ...}
         """
-        if is_registry_active(getattr(self, "_session_config", None)):
-            handle = self._resolve_registry_handle(container_id)
-            if handle is not None:
-                # Resource containers are tracked by the registry too (their
-                # factory registers them with container_type="resource");
-                # refuse to destroy them here just like the legacy path does.
-                _denial = self._agent_access_denial(self.class_of_handle(handle))
-                if _denial is not None:
-                    return {"status": "error", "container_id": container_id,
-                            "error": _denial}
-                name = handle.get("name")
-                try:
-                    self._registry.destroy_container(name)
-                except Exception as e:
-                    return {"status": "error", "container_id": container_id,
-                            "error": str(e)}
-                self._drop_container(container_id)
-                log_container_event("removed", container_id=container_id,
-                                    session_id=self.session_id or "")
-                return {"status": "removed", "container_id": container_id,
-                        "name": name}
         stopped = self.stop(container_id)
         if stopped.get("status") not in ("stopped", "missing"):
             return stopped

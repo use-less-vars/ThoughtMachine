@@ -69,7 +69,6 @@ def _drive(fake_container, monkeypatch, image=None):
     mgr._active_containers = lambda cs: []
     # Deterministic desired config so the fake container's none/rw matches.
     mgr._compute_config = lambda *a, **k: ("none", "rw")
-    monkeypatch.setattr(cm, "is_registry_active", lambda *a, **k: False)
     return mgr, mgr.start(name="agent-x", image=image)
 
 

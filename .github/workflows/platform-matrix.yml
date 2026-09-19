@@ -17,8 +17,8 @@
 # zero tests must not be able to report green).
 #
 # Measured collection counts (branch feat/ci-platform-matrix):
-#   * total                                      = 3585
-#   * -m "not docker and not e2e"                 = 3581 (4 deselected)
+#   * total                                      = 3608
+#   * -m "not docker and not e2e"                 = 3604 (4 deselected)
 #   * thin node set (4 files below)              = 76
 #
 # macOS install note: install.sh supports Darwin (it runs the same prerequisite
@@ -73,7 +73,7 @@ jobs:
       - name: Assert collected test count (anti-vacuity)
         run: >
           python scripts/ci_assert_collected.py
-          --expected 3581
+          --expected 3588
           --marker "not docker and not e2e"
 
       - name: Run test suite
@@ -199,7 +199,7 @@ jobs:
         run: |
           source .venv/Scripts/activate
           python scripts/ci_assert_collected.py \
-            --expected 76 \
+            --expected 77 \
             tests/test_container_registry.py \
             tests/test_container_user_and_git_ownership.py \
             tests/test_global_defaults.py \
@@ -243,7 +243,7 @@ jobs:
       - name: Assert collected test count (anti-vacuity)
         run: >
           python scripts/ci_assert_collected.py
-          --expected 3581
+          --expected 3588
           --marker "not docker and not e2e"
 
       - name: Run test suite

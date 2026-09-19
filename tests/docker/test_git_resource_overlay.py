@@ -178,7 +178,15 @@ class _FakeContainers:
             raise self.list_error
         return list(self.containers)
 
-    def run(self, **kwargs):
+    def run(self, *args, **kwargs):
+        # The shared create primitive (``infra.container_create``) calls
+        # ``containers.run(image, command, ...)`` with those two positionally;
+        # fold them back into the recorded kwargs so the call still exposes
+        # ``image``/``command`` under their historical kwarg names.
+        if args:
+            kwargs.setdefault("image", args[0])
+        if len(args) > 1:
+            kwargs.setdefault("command", args[1])
         self.run_calls.append(kwargs)
         if self.run_error is not None:
             raise self.run_error

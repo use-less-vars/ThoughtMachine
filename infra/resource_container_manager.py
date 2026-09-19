@@ -176,16 +176,14 @@ GIT_OVERLAY_BUILD_CMD = (
 )
 RESOURCE_IMAGE_BUILD_CMD = GIT_OVERLAY_BUILD_CMD
 
-# Phase 3: optional ContainerRegistry delegation behind the session-config
-# `use_container_registry` flag. Defensive import — the registry must never
-# break the legacy path when it is unavailable.
-try:
-    from infra.registry_wiring import get_active_registry, is_registry_active
-except Exception:  # pragma: no cover - registry not wired
-    get_active_registry = None
-    is_registry_active = lambda session_config: False  # noqa: E731
-
 from infra.container_env import merge_container_identity_env
+from infra.container_create import (
+    ContainerCreateSpec,
+    HardeningRecipe as _HardeningRecipe,
+    MountSpec,
+    _expected_hardening_recipe,
+    create_hardened_container,
+)
 from thoughtmachine.container_record import (
     LIFECYCLE_RESOURCE,
     RESOURCE_NAME_PREFIX,
@@ -871,11 +869,7 @@ class ResourceContainerManager:
                 docker build -t tm-resource-git -f ~/.thoughtmachine/docker/resource/git_overlay.Dockerfile --build-arg BASE_IMAGE=tm-workspace-runtime:latest ~/.thoughtmachine/docker/resource
         vault_root: Reserved for future audit/config use; NEVER mounted into
             the container.
-        session_config: Optional session config dict; the registry feature
-            flag ``use_container_registry`` is read from it. When set and
-            the registry is active, ``ensure_container`` delegates the fresh
-            create to ``ContainerRegistry.create_resource_container``
-            (design doc docs/container_registry_design.md §6).
+        session_config: Optional session config dict.
         session_id: Optional session id the resource container is registered
             under (registry bookkeeping only).
         session_permissions: Optional session/workspace permissions dict.
@@ -923,26 +917,6 @@ class ResourceContainerManager:
         self.mem_limit = "512m"
         self.cpu_quota = 50000
         self.client = docker.from_env()
-
-    # -------------------------------------------------- registry facade
-    @property
-    def _registry_active(self) -> bool:
-        """True when the registry feature flag is on AND usable.
-
-        Falls back to the legacy create path when the registry is disabled
-        or has no usable docker client.
-        """
-        try:
-            return bool(is_registry_active(self.session_config))
-        except Exception:
-            return False
-
-    @property
-    def _registry(self):
-        """Lazily-resolved registry facade for this manager's session config."""
-        if get_active_registry is None:
-            return None
-        return get_active_registry(self.session_config)
 
     # ------------------------------------------------------------------ names
     @property
@@ -1039,17 +1013,15 @@ class ResourceContainerManager:
 
         Builds the workspace bind mount (rw) plus the optional
         linked-worktree main-repo mount, then creates
-        the container via the registry facade (when active) or
-        ``client.containers.run`` with the full hardening set.
+        the container via ``client.containers.run`` with the full
+        hardening set.
 
         Raises:
             RuntimeError: when creation fails (with the manual build command
                 for actionable image-missing diagnostics).
 
         Returns:
-            object: the created container (``.id`` usable) — a
-                ``_ResourceContainerHandle`` on the registry path, or the
-                docker container object on the legacy path.
+            object: the created container (``.id`` usable).
         """
         # Route through the single host-id source of truth: on Windows
         # _host_ids() returns None (no uid concept), so there is no root host
@@ -1106,19 +1078,15 @@ class ResourceContainerManager:
             "/home/agent": home_tmpfs,
         }
         # Admission gate (site 4/4 of the terminal container-create sites):
-        # gate the legacy RAW create only.  This block deliberately sits
-        # BEFORE the try/except below because that handler re-wraps every
-        # exception as a RuntimeError -- an AdmissionDenied must propagate
-        # unchanged.  When the registry facade is active its own create path
-        # (site 3) already applies admission, so skip here to avoid a
-        # double-admit.  Fail closed: a Deny raises AdmissionDenied; a
-        # Transform may only narrow, so we adopt the gate's network mode for
-        # the run below.
+        # gate the RAW create.  This block deliberately sits BEFORE the
+        # try/except below because that handler re-wraps every exception as a
+        # RuntimeError -- an AdmissionDenied must propagate unchanged.  Fail
+        # closed: a Deny raises AdmissionDenied; a Transform may only narrow,
+        # so we adopt the gate's network mode for the run below.
         #
         # Permissions: pass an EMPTY Mapping, not self.session_permissions.
-        # Mirroring the registry's own resource-container factory (site 3,
-        # container_registry.create_resource_container), the resource
-        # container does NOT feed the session permission blob to admission:
+        # The resource container does NOT feed the session permission blob to
+        # admission:
         # the per-resource grant was already enforced upstream
         # (ensure_resource -> _resource_policy_denied, and
         # provision_workspace_resource -> resolve_container_config for the
@@ -1129,110 +1097,105 @@ class ResourceContainerManager:
         # Empty Mapping (not None): resolve_container_config rejects a None
         # permissions value with ContainerConfigError; {} admits.
         network_mode = self.network_mode
-        if not self._registry_active:
-            from security.admission_gate import (
-                AdmissionDenied,
-                AdmissionRequest,
-                ClientProbes,
-                ContainerSpec,
-                Deny,
-                Transform,
-                admit,
-            )
+        from security.admission_gate import (
+            AdmissionDenied,
+            AdmissionRequest,
+            ClientProbes,
+            ContainerSpec,
+            Deny,
+            Transform,
+            admit,
+        )
 
-            _admission_wsid = (
-                str(self.workspace_id)
-                if self.workspace_id is not None
-                else "default"
-            )
-            _admission = admit(
-                AdmissionRequest(
-                    spec=ContainerSpec(
-                        container_type="resource",
-                        lifecycle_class=LIFECYCLE_RESOURCE,
-                        workspace_id=_admission_wsid,
-                        session_id=self.session_id,
-                        image=self.image,
-                        name=name,
-                        mem_limit=self.mem_limit,
-                        cpu_quota=self.cpu_quota,
-                        oom_score_adj=500,
-                        network_mode=network_mode,
-                        read_only=True,
-                    ),
-                    permissions={},
-                    capabilities=_load_capabilities(_admission_wsid),
-                    session_config=self.session_config,
+        _admission_wsid = (
+            str(self.workspace_id)
+            if self.workspace_id is not None
+            else "default"
+        )
+        _admission = admit(
+            AdmissionRequest(
+                spec=ContainerSpec(
+                    container_type="resource",
+                    lifecycle_class=LIFECYCLE_RESOURCE,
+                    workspace_id=_admission_wsid,
+                    session_id=self.session_id,
+                    image=self.image,
+                    name=name,
+                    mem_limit=self.mem_limit,
+                    cpu_quota=self.cpu_quota,
+                    oom_score_adj=500,
+                    network_mode=network_mode,
+                    read_only=True,
                 ),
-                probes=ClientProbes(self.client),
-            )
-            if isinstance(_admission, Deny):
-                raise AdmissionDenied(_admission.code, _admission.message)
-            if isinstance(_admission, Transform):
-                network_mode = _admission.spec.network_mode
+                permissions={},
+                capabilities=_load_capabilities(_admission_wsid),
+                session_config=self.session_config,
+            ),
+            probes=ClientProbes(self.client),
+        )
+        if isinstance(_admission, Deny):
+            raise AdmissionDenied(_admission.code, _admission.message)
+        if isinstance(_admission, Transform):
+            network_mode = _admission.spec.network_mode
         try:
             # Phase 2 identity env: session/workspace ids are injected into
-            # the resource container at create time on BOTH paths (registry
-            # facade and legacy direct create) so in-container git tooling
-            # can attribute its work to the owning session/workspace.
+            # the resource container at create time so in-container git
+            # tooling can attribute its work to the owning session/workspace.
             identity_env = merge_container_identity_env(
                 None,
                 session_id=self.session_id,
                 workspace_id=self.workspace_id,
             )
-            if self._registry_active:
-                # Phase 3: the registry facade owns the hardened create
-                # (design doc §6.2). The /workspace bind is always added by
-                # the registry from workspace_path (rw); the linked-worktree
-                # main-repo mount computed above is passed as an extra. The
-                # registry returns the same shape of handle; its
-                # create failure is wrapped identically below.
-                handle = self._registry.create_resource_container(
-                    session_id=self.session_id or "resource",
-                    workspace_id=self.workspace_id,
-                    network_mode=self.network_mode,
-                    workspace_path=self.workspace_path,
-                    name=name,
-                    mounts=[
-                        {
-                            "source": m["source"],
-                            "target": m["target"],
-                            "mode": "ro" if m["read_only"] else "rw",
-                        }
-                        for m in mounts[1:]
-                    ],
-                    environment=identity_env,
-                )
-                return _ResourceContainerHandle(handle["id"])
             ctr_labels = self._labels(name)
+            # Site-3 migration: the hardened ``containers.run`` now flows through
+            # the shared primitive (``infra.container_create``), matching the
+            # registry path (site 4) and ``ContainerManager._run_container``
+            # (site 2).  Called with ``admission=None`` (this wrapper applied the
+            # gate above) and ``record=False`` (the record is owned by the
+            # ``record_creation`` block below, so recording inside the primitive
+            # would double-record).  ``user`` is re-resolved from THIS module's
+            # ``host_user`` seam so the Windows "0:0" fallback and the POSIX
+            # pass-through are preserved unchanged (mirrors site 2).
+            _recipe = _expected_hardening_recipe()
+            create_spec = ContainerCreateSpec(
+                image=self.image,
+                command=["tail", "-f", "/dev/null"],
+                name=name,
+                container_type="resource",
+                lifecycle_class=LIFECYCLE_RESOURCE,
+                hardening=_HardeningRecipe(
+                    cap_drop=_recipe.cap_drop,
+                    security_opt=_recipe.security_opt,
+                    read_only=_recipe.read_only,
+                    user=(host_user() or "0:0"),
+                ),
+                workspace_id=self.workspace_id,
+                session_id=self.session_id,
+                labels=ctr_labels,
+                environment=identity_env,
+                mounts=tuple(
+                    MountSpec(
+                        source=m["Source"],
+                        target=m["Target"],
+                        type=m.get("Type") or "bind",
+                        read_only=bool(m.get("ReadOnly")),
+                    )
+                    for m in mounts
+                ),
+                tmpfs=tmpfs,
+                network_mode=network_mode,
+                mem_limit=self.mem_limit,
+                cpu_quota=self.cpu_quota,
+                oom_score_adj=500,  # resource (git) containers get a moderate OOM score
+            )
             with record_creation(
                 workspace_id=self.workspace_id,
                 lifecycle_class=LIFECYCLE_RESOURCE,
                 labels=ctr_labels,
             ) as record:
-                container = self.client.containers.run(
-                    image=self.image,
-                    name=name,
-                    mounts=mounts,
-                    tmpfs=tmpfs,
-                    network_mode=network_mode,
-                    cap_drop=["ALL"],
-                    security_opt=["no-new-privileges:true"],
-                    oom_score_adj=500,  # resource (git) containers get a moderate OOM score
-                    read_only=True,
-                    # Windows: Docker Desktop presents bind mounts as root:root; match the mount owner.
-                    # Retired when fix/uid-probe-universal lands.
-                    user=(host_user() or "0:0"),  # must match the host user
-                    detach=True,
-                    tty=True,
-                    stdin_open=True,
-                    command=["tail", "-f", "/dev/null"],
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    environment=identity_env,
-                    labels=ctr_labels,
-                    restart_policy=docker_restart_policy(LIFECYCLE_RESOURCE),
-                )
+                container = create_hardened_container(
+                    self.client, create_spec, admission=None, record=False
+                ).container
                 record.attach(container)
         except Exception as e:
             # Wrap image-missing with actionable build instructions.

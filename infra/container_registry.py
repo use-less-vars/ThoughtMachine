@@ -48,7 +48,6 @@ __all__ = [
     "STOP_TIMEOUT",
     "create_hardened_container",
     "get_container_registry",
-    "is_container_registry_enabled",
 ]
 
 log = logging.getLogger("infra.container_registry")
@@ -73,6 +72,16 @@ from security.admission_gate import (
     Deny,
     Transform,
     admit,
+)
+
+# The shared container-creation primitive.  The registry keeps OWNING the
+# admission gate + profile->spec conversion, but delegates the actual hardened
+# ``containers.run`` to the primitive (aliased to avoid shadowing this module's
+# own ``create_hardened_container`` name).
+from infra.container_create import (
+    ContainerCreateSpec,
+    MountSpec,
+    create_hardened_container as _create_hardened_container,
 )
 
 # Drift event emitted when a permission change reconciles a live container's
@@ -153,16 +162,84 @@ class ContainerProfile:
                 self.oom_score_adj = DEFAULT_RESOURCE_OOM_SCORE_ADJ
 
 
+def _mount_specs_from_profile(profile: ContainerProfile) -> tuple:
+    """Convert *profile* mounts + volumes to primitive :class:`MountSpec`-s.
+
+    ``profile.mounts`` entries are ``{"source", "target", "mode"}`` dicts
+    (``mode`` ``"rw"``/``"ro"``); each becomes a BIND :class:`MountSpec` whose
+    ``read_only`` is ``mode == "ro"``.  ``profile.volumes`` entries are docker
+    volume shorthands -- ``"name:/target"`` or ``"name:/target:ro"`` -- each
+    becoming a VOLUME :class:`MountSpec` (``read_only`` from the optional
+    trailing mode).  Only these named-volume shorthands are accepted: a
+    path-like source (absolute ``/``, relative ``./``, home-relative ``~`` or a
+    backslash-bearing source) is fail-closed with :class:`ValueError`, because a
+    ``volumes=`` shorthand can only name a managed docker volume.
+
+    The primitive turns every :class:`MountSpec` into a real
+    ``docker.types.Mount`` for the ``containers.run`` call, so the registry no
+    longer emits the old lowercase ``{"source", "target", "type",
+    "read_only"}`` dicts (or a raw ``volumes=`` kwarg) itself.
+    """
+    specs = []
+    for m in profile.mounts:
+        specs.append(
+            MountSpec(
+                type="bind",
+                source=m["source"],
+                target=m["target"],
+                read_only=str(m.get("mode", "rw")).lower() == "ro",
+            )
+        )
+    for entry in profile.volumes:
+        parts = str(entry).split(":")
+        source = parts[0]
+        target = parts[1] if len(parts) > 1 else ""
+        mode = parts[2] if len(parts) > 2 else "rw"
+        if (
+            source.startswith("/")
+            or source.startswith("./")
+            or source.startswith("~")
+            or "\\" in source
+            # Windows drive-letter sources ("C:\\data:/ctr") split on ":" into
+            # a single-letter ``source``.  A backslash-bearing entry like that
+            # is a path, not a named volume, so reject it with the same
+            # actionable error; a bare single-letter named volume (e.g.
+            # "v:/d") carries no backslash and is still accepted.
+            or (len(source) == 1 and source.isalpha() and "\\" in str(entry))
+        ):
+            raise ValueError(
+                "profile.volumes entries must be named-volume shorthands "
+                "('name:/target[:ro]'); got path-like source "
+                f"{source!r} in {entry!r}"
+            )
+        specs.append(
+            MountSpec(
+                type="volume",
+                source=source,
+                target=target,
+                read_only=mode.lower() == "ro",
+            )
+        )
+    return tuple(specs)
+
+
 def create_hardened_container(client, profile: ContainerProfile, container_name: str, *,
                               workspace_id=None, lifecycle_class=None, session_id=None,
                               permissions=None, capabilities=None, session_config=None,
                               probes=None, revalidate_image=True):
     """THE single hardened create path (design doc §2.3, dispatch form).
 
-    Runs ``client.containers.run`` with EVERY profile field plus the full
-    hardening recipe.  ``profile.mounts`` entries (``{"source", "target",
-    "mode": "rw"|"ro"}`` dicts) are converted to docker bind-mount dicts
-    ``{"source", "target", "type": "bind", "read_only": bool}``.
+    Builds a :class:`~infra.container_create.ContainerCreateSpec` and delegates
+    the hardened ``containers.run`` to
+    :func:`infra.container_create.create_hardened_container` (invoked with
+    ``admission=None`` and ``record=False``).  This wrapper keeps OWNERSHIP of
+    the admission gate, the root-host ``uid 0`` guard, the ``revalidate_image``
+    axis and the ``probes`` override.  ``profile.mounts`` entries
+    (``{"source", "target", "mode": "rw"|"ro"}`` dicts) and ``profile.volumes``
+    shorthands are both normalised to real ``docker.types.Mount`` objects by the
+    primitive; the old ``volumes=`` kwarg is no longer passed (volume shorthands
+    are folded into ``mounts`` as ``type="volume"``).  The hardening envelope is
+    the primitive's default recipe (:func:`_expected_hardening_recipe`).
 
     Admission hook (phase 2): when ``workspace_id`` is supplied the call is
     first gated through :func:`security.admission_gate.admit` -- a ``Deny``
@@ -227,40 +304,35 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
             # narrowest value), so it never needs applying to the profile.
             profile = replace(profile, network_mode=decision.spec.network_mode)
 
-    mounts = [
-        {
-            "source": m["source"],
-            "target": m["target"],
-            "type": "bind",
-            "read_only": str(m.get("mode", "rw")).lower() == "ro",
-        }
-        for m in profile.mounts
-    ]
-    return client.containers.run(
-        profile.image,
-        profile.command,
-        detach=True,
-        tty=True,
-        stdin_open=True,
+    # Everything the old inline ``containers.run`` passed is now expressed on
+    # the primitive's spec.  ``hardening`` keeps the primitive's default recipe
+    # (cap_drop=ALL, no-new-privileges:true, read_only=True, host user), which
+    # is exactly the HARDENED_* envelope the registry mandates.  Profiles'
+    # bind mounts and volume shorthands are folded into ``mounts`` (the
+    # primitive emits real ``docker.types.Mount`` objects).
+    create_spec = ContainerCreateSpec(
+        image=profile.image,
+        command=tuple(profile.command),
         name=container_name,
-        cap_drop=list(HARDENED_CAP_DROP),
-        security_opt=list(HARDENED_SECURITY_OPT),
-        read_only=HARDENED_READ_ONLY,
-        # Windows: Docker Desktop presents bind mounts as root:root; match the mount owner.
-        # Retired when fix/uid-probe-universal lands.
-        user=(host_user() or "0:0"),
-        oom_score_adj=profile.oom_score_adj,
+        container_type=profile.container_type,
+        lifecycle_class=lifecycle,
+        workspace_id=workspace_id,
+        session_id=session_id,
+        labels=dict(profile.labels),
+        environment=dict(profile.environment),
+        mounts=_mount_specs_from_profile(profile),
+        tmpfs=dict(profile.tmpfs),
         network_mode=profile.network_mode,
         mem_limit=profile.mem_limit,
         cpu_quota=profile.cpu_quota,
-        tmpfs=dict(profile.tmpfs),
-        labels=dict(profile.labels),
-        environment=dict(profile.environment),
+        oom_score_adj=profile.oom_score_adj,
         extra_hosts=dict(profile.extra_hosts),
-        volumes=list(profile.volumes),
-        mounts=mounts,
-        restart_policy=docker_restart_policy(lifecycle),
     )
+    # Admission stays in this wrapper (the primitive is called with no
+    # admission context).  ``record=False``: the callers here own the record
+    # attach, so recording inside the primitive would double-record.
+    created = _create_hardened_container(client, create_spec, admission=None, record=False)
+    return created.container
 
 
 class ContainerRegistry:
@@ -969,20 +1041,10 @@ def _emit_policy_drift_event(
         )
 
 
-def is_container_registry_enabled(session_config) -> bool:
-    """Session config flag (default False); mirrors the
-    ``use_workspace_lifecycle_manager`` pattern (workspace_lifecycle_manager.py
-    L97-101)."""
-    return bool((session_config or {}).get("use_container_registry", False))
-
-
 def get_container_registry(docker_client=None, session_config=None) -> ContainerRegistry:
     """Factory helper.
 
-    Disabled config -> a docker-less registry whose feature flag is always
-    False (docker.from_env is never called).  Enabled config -> a live
-    registry (connect to the host daemon when no client is injected).
+    Returns a live registry (connect to the host daemon when no client is
+    injected).
     """
-    if not is_container_registry_enabled(session_config):
-        return ContainerRegistry(docker_client=None, feature_flag_check=lambda: False)
     return ContainerRegistry(docker_client=docker_client, feature_flag_check=None)

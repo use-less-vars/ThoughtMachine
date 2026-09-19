@@ -476,7 +476,6 @@ def _woc_manager(ws, client, vault):
 
 def test_migration_does_not_duplicate_write_on_create_record(monkeypatch, vault):
     """A write-on-create record survives a later migration pass un-duplicated."""
-    monkeypatch.setattr(container_manager, "is_registry_active", lambda cfg: False)
     ws = "ws-woc"
     client = _WoCClient()
     cm = _woc_manager(ws, client, vault)
@@ -500,7 +499,6 @@ def test_migration_rematerialises_write_on_create_record_after_crash(
     monkeypatch, vault
 ):
     """If a write-on-create record file is lost, migration rebuilds the SAME id."""
-    monkeypatch.setattr(container_manager, "is_registry_active", lambda cfg: False)
     ws = "ws-woc-crash"
     client = _WoCClient()
     cm = _woc_manager(ws, client, vault)

@@ -189,12 +189,6 @@ def _reset_module_memos():
     _cm._NOTES_WARNED.clear()
 
 
-@pytest.fixture(autouse=True)
-def _no_registry(monkeypatch):
-    """Default: the registry facade is inactive (stubbed reuse paths stand)."""
-    monkeypatch.setattr(_cm, "is_registry_active", lambda *a, **k: False)
-
-
 # ---------------------------------------------------------------------------
 # 1. Schema v3 -- model + round-trip
 # ---------------------------------------------------------------------------
@@ -376,32 +370,6 @@ def test_start_refuses_ambiguous_name_and_warns(tmp_path):
     assert ("ws-dup", "dup") in _cm._NAME_INDEX_COLLISIONS
     assert cm._find_by_labels.called is False
 
-
-def test_start_fresh_name_creates_normally(tmp_path, monkeypatch):
-    """No record for the name -> normal (registry) create; name is labelled."""
-    vault = tmp_path / "vault"
-    calls = []
-
-    class _FakeRegistry:
-        def request_container(self, *args, **kwargs):
-            calls.append(kwargs)
-            return {"id": "cid-fresh", "name": kwargs.get("name")}
-
-    monkeypatch.setattr(_cm, "is_registry_active", lambda *a, **k: True)
-    monkeypatch.setattr(_cm, "get_active_registry", lambda *a, **k: _FakeRegistry())
-
-    cm = _make_manager(
-        "ws-fresh", vault, _client(),
-        _session_config={}, _find_by_labels=lambda n: None,
-    )
-    result = cm.start(name="fresh-x")
-
-    assert result["status"] == "created"
-    assert result["id"] == "cid-fresh"
-    assert cm._containers["fresh-x"] == "cid-fresh"
-    assert len(calls) == 1
-    assert calls[0]["name"] == "fresh-x"
-    assert calls[0]["labels"][CONTAINER_NAME_LABEL] == "fresh-x"
 
 
 def test_start_create_indexes_record_then_reuses(tmp_path):

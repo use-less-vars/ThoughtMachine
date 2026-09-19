@@ -331,7 +331,6 @@ _SESSION_CONFIG = {
     "token_monitor_enabled": True,
     "token_monitor_warning_threshold": 1200,
     "token_monitor_critical_threshold": 1800,
-    "use_container_registry": True,
     "use_workspace_lifecycle_manager": True,
     "workspace_id": "ws1",
     "workspace_path": "/some/ws",
