@@ -297,6 +297,56 @@ function PermissionsResourcesTab({
 function ContainersTab({ summary }) {
   const dockerfile = summary.dockerfile || null
   const containers = Array.isArray(summary.active_containers) ? summary.active_containers : []
+  const workspaceId = summary.workspace_id
+  // Read-only: the tab reflects the summary's live container state and can
+  // lazily fetch logs. Nothing here starts, stops or otherwise mutates a
+  // container.
+  const [selectedKey, setSelectedKey] = useState(null)
+  const [logs, setLogs] = useState({})
+
+  const keyFor = (container, index) => container.id || container.name || `container-${index}`
+  const selected =
+    containers.find((container, index) => keyFor(container, index) === selectedKey) || null
+
+  function toggleLogs(key, container) {
+    const current = logs[key] || {}
+    if (current.open) {
+      setLogs((prev) => ({ ...prev, [key]: { ...current, open: false } }))
+      return
+    }
+    if (current.loaded) {
+      setLogs((prev) => ({ ...prev, [key]: { ...current, open: true } }))
+      return
+    }
+    setLogs((prev) => ({
+      ...prev,
+      [key]: { open: true, loaded: false, status: 'loading', error: null, text: null },
+    }))
+    const name = container.name || ''
+    fetch(`/api/workspace/${workspaceId}/containers/${name}/logs?tail=200`)
+      .then((response) => {
+        if (!response.ok) throw new Error(`Failed to load logs (${response.status})`)
+        return response.text()
+      })
+      .then((text) => {
+        setLogs((prev) => ({
+          ...prev,
+          [key]: { open: true, loaded: true, status: 'done', error: null, text },
+        }))
+      })
+      .catch((error) => {
+        setLogs((prev) => ({
+          ...prev,
+          [key]: {
+            open: true,
+            loaded: true,
+            status: 'error',
+            error: (error && error.message) || 'Failed to load logs',
+            text: null,
+          },
+        }))
+      })
+  }
 
   return (
     <div className="wdp-tab-content">
@@ -317,27 +367,88 @@ function ContainersTab({ summary }) {
         {containers.length === 0 ? (
           <div className="wdp-empty">No active containers.</div>
         ) : (
-          <div className="wdp-container-list">
-            {containers.map((container) => (
-              <div className="wdp-container-row" key={container.id || container.name}>
-                <div className="wdp-container-main">
-                  <span className="wdp-container-name">{container.name || 'unnamed'}</span>
-                  <span className="wdp-badge wdp-context-badge">
-                    {container.type || 'unknown type'}
-                  </span>
-                </div>
-                <div className="wdp-container-meta">
-                  <span className="wdp-container-status">{container.status || 'unknown'}</span>
-                  {container.id && <span className="wdp-container-id">{container.id}</span>}
-                  {container.workspace_id && (
-                    <span className="wdp-container-ws">{container.workspace_id}</span>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
+          <table className="wdp-container-table">
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">State</th>
+                <th scope="col">Type</th>
+                <th scope="col">ID</th>
+                <th scope="col">Workspace</th>
+                <th scope="col">Logs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {containers.map((container, index) => {
+                const key = keyFor(container, index)
+                const isSelected = key === selectedKey
+                const log = logs[key] || {}
+                return (
+                  <React.Fragment key={key}>
+                    <tr
+                      className={`wdp-container-row${isSelected ? ' wdp-container-row-selected' : ''}`}
+                      onClick={() => setSelectedKey(isSelected ? null : key)}
+                    >
+                      <td className="wdp-container-name">{container.name || 'unnamed'}</td>
+                      <td className="wdp-container-status">{container.status || 'unknown'}</td>
+                      <td className="wdp-container-type">{container.type || 'unknown type'}</td>
+                      <td className="wdp-container-id">{container.id || '—'}</td>
+                      <td className="wdp-container-ws">
+                        {container.workspace_id || workspaceId || '—'}
+                      </td>
+                      <td className="wdp-container-logs-cell">
+                        <button
+                          type="button"
+                          className="wdp-logs-toggle"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            toggleLogs(key, container)
+                          }}
+                        >
+                          {log.open ? 'Hide logs' : 'Logs'}
+                        </button>
+                      </td>
+                    </tr>
+                    {log.open && (
+                      <tr className="wdp-container-logs-row">
+                        <td colSpan={6}>
+                          {log.status === 'loading' && (
+                            <div className="wdp-container-logs-loading">Loading logs…</div>
+                          )}
+                          {log.status === 'error' && (
+                            <div className="wdp-container-logs-error">{log.error}</div>
+                          )}
+                          {log.status === 'done' && (
+                            <pre className="wdp-container-logs">{log.text}</pre>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                )
+              })}
+            </tbody>
+          </table>
         )}
       </div>
+
+      {selected && (
+        <div className="wdp-card wdp-container-detail">
+          <div className="wdp-card-label">Container detail</div>
+          <div className="wdp-container-detail-grid">
+            <span className="wdp-detail-key">Container ID</span>
+            <span className="wdp-detail-value">{selected.id || '—'}</span>
+            <span className="wdp-detail-key">Name</span>
+            <span className="wdp-detail-value">{selected.name || 'unnamed'}</span>
+            <span className="wdp-detail-key">State</span>
+            <span className="wdp-detail-value">{selected.status || 'unknown'}</span>
+            <span className="wdp-detail-key">Type</span>
+            <span className="wdp-detail-value">{selected.type || 'unknown type'}</span>
+            <span className="wdp-detail-key">Workspace ID</span>
+            <span className="wdp-detail-value">{selected.workspace_id || workspaceId || '—'}</span>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -624,4 +624,88 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.queryByRole('dialog', { name: /^New session$/ })).toBeNull()
     expect(createBodies.length).toBe(0)
   })
+
+  // --- Containers tab: live read-only status view -------------------------
+  // The tab must present the summary's live container state as a read-only
+  // table, reveal a detail region on row selection, and lazily fetch
+  // container logs from the read-only logs route. No lifecycle controls.
+
+  it('renders a read-only container status table with column headers', async () => {
+    stubFetchByUrl(routesFor(makeSummary()))
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    expect(screen.getByRole('columnheader', { name: 'Name' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'State' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'Type' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'ID' })).toBeInTheDocument()
+  })
+
+  it('reveals a container detail region when a row is selected', async () => {
+    stubFetchByUrl(routesFor(makeSummary()))
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    expect(screen.queryByText('Container detail')).toBeNull()
+    fireEvent.click(screen.getByText('research-runner'))
+    expect(screen.getByText('Container detail')).toBeInTheDocument()
+    expect(screen.getByText('Workspace ID')).toBeInTheDocument()
+  })
+
+  it('loads container logs on demand into a pre element with the read-only route', async () => {
+    const logText = 'boot\nlistening on :8080\n'
+    const fetchMock = stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          text: async () => logText,
+        },
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logs' }))
+
+    const pre = await screen.findByText(/listening on :8080/)
+    expect(pre.tagName).toBe('PRE')
+    const urls = fetchMock.mock.calls.map(([u]) => String(u))
+    expect(
+      urls.some((u) =>
+        u.includes('/api/workspace/ws-1/containers/research-runner/logs?tail=200')
+      )
+    ).toBe(true)
+  })
+
+  it('shows an inline error when container logs fail to load', async () => {
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': jsonErr('no such container', 404),
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logs' }))
+    expect(await screen.findByText(/Failed to load logs/)).toBeInTheDocument()
+  })
+
+  it('exposes no container lifecycle controls in the read-only tab', async () => {
+    stubFetchByUrl(routesFor(makeSummary()))
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    expect(
+      screen.queryByRole('button', { name: /start|stop|remove|restart|delete|kill|recreate/i })
+    ).toBeNull()
+    // The only control in the tab is the read-only logs viewer toggle.
+    expect(screen.getByRole('button', { name: 'Logs' })).toBeInTheDocument()
+  })
 })
