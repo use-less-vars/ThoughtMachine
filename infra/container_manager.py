@@ -831,6 +831,9 @@ class ContainerManager:
             try:
                 attrs = getattr(container, "attrs", None) or {}
                 labels = (attrs.get("Config") or {}).get("Labels")
+            # R18: deliberately NOT narrowed. `_record_id_for` is a best-effort
+            # identity probe whose contract is "never raises; any lookup failure
+            # yields None" (see docstring + tests/test_container_start_drift.py (g)).
             except Exception:
                 labels = None
         return self._record_id_from_labels(labels)
@@ -845,7 +848,8 @@ class ContainerManager:
             return None
         try:
             container = self.client.containers.get(name)
-        except Exception:
+        # A missing name is the docker SDK's NotFound; anything else must surface.
+        except NotFound:
             return None
         return self._record_id_for(container)
 
@@ -3677,7 +3681,8 @@ def _container_lifecycle_class(container) -> str:
     if record_id:
         try:
             record = find_by_docker_label(record_id)
-        except Exception:
+        # The record store raises ContainerRecordError; unexpected errors surface.
+        except ContainerRecordError:
             record = None
         if record is not None:
             cls = getattr(record, "lifecycle_class", "") or ""
