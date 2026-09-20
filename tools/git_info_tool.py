@@ -194,6 +194,14 @@ class GitReadTool(ToolBase):
             f"(workspaces/{ws_id}/config.json)"
         )
 
+    def _kill_switch_state(self) -> str:
+        """Return the workspace host-resource kill-switch state ("on"/"off").
+
+        "on"  -> the workspace ceiling allows host-side git execution.
+        "off" -> host execution is denied (fail-closed) for this workspace.
+        """
+        return "off" if self._host_execution_denied_reason() else "on"
+
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
         """Return dynamic permission categories based on the git operation.
@@ -556,6 +564,15 @@ class GitReadTool(ToolBase):
             self._last_execution_mode = "host_fallback"
             self._last_failure_reason = None
             self._last_fallback_used = False
+            logger.warning(
+                "GitReadTool host fallback: reason=%s command=%s "
+                "workspace_id=%s kill_switch_state=%s (operation=%s)",
+                "container_unavailable",
+                " ".join(args),
+                self._resolved_workspace_id or "none",
+                self._kill_switch_state(),
+                self.operation,
+            )
             return self._exec_host_raw(repo_root, args, timeout=timeout)
 
         mode, manager = self._resolve_resource_execution()
@@ -608,7 +625,12 @@ class GitReadTool(ToolBase):
             raise RuntimeError(denied)
         logger.warning(
             "GitReadTool degraded containerized git execution to hardened "
-            "host git: %s (operation=%s)",
+            "host git: reason=%s command=%s workspace_id=%s "
+            "kill_switch_state=%s detail=%s (operation=%s)",
+            "container_unavailable",
+            " ".join(args),
+            self._resolved_workspace_id or "none",
+            self._kill_switch_state(),
             detail,
             self.operation,
         )
