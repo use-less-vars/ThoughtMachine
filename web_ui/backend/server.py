@@ -3123,6 +3123,42 @@ def _json_error(message: str, status_code: int = 500):
     return JSONResponse({"error": message}, status_code=status_code)
 
 
+def _hardening_json(container) -> dict:
+    """Three-state hardening-conformance verdict for a status response.
+
+    Mirrors ``infra.container_create._hardening_conformance`` -- a pure
+    predicate over ``container.attrs`` -- onto the workspace
+    container-status route.  Returns:
+
+    * ``{"status": "conformant", "failed": []}`` when every present
+      hardening axis is satisfied;
+    * ``{"status": "drifted", "failed": [<axes>]}`` when one or more REAL
+      axes are weak (the failing-axis names from the predicate);
+    * ``{"status": "unverified", "failed": []}`` when the container object
+      could not be obtained (``None``), its ``attrs`` could not be read (the
+      ``"attrs_unreadable"`` sentinel), or any other error occurred.
+
+    Fail-closed: the unverifiable case is NEVER reported as ``conformant``.
+    Infra is imported lazily -- matching the module's function-local
+    infra-import convention -- and the whole computation is wrapped so this
+    helper can never raise (it must not turn a working status into a 5xx).
+    """
+    try:
+        if container is None:
+            return {"status": "unverified", "failed": []}
+        from infra.container_create import (
+            _hardening_conformance, _expected_hardening_recipe)
+        failures = _hardening_conformance(
+            container, _expected_hardening_recipe())
+    except Exception:
+        return {"status": "unverified", "failed": []}
+    if failures == ["attrs_unreadable"]:
+        return {"status": "unverified", "failed": []}
+    if failures:
+        return {"status": "drifted", "failed": list(failures)}
+    return {"status": "conformant", "failed": []}
+
+
 @app.get("/api/workspace/{workspace_id}/containers")
 def workspace_containers(workspace_id: str, workspace_path: str = ""):
     """List containers for the workspace."""
@@ -3189,11 +3225,20 @@ def workspace_container_status(workspace_id: str, container_name: str,
         return _json_error(f"container '{container_name}' not found",
                            status_code=404)
     try:
-        return manager.status(container_id)
+        data = manager.status(container_id)
     except Exception as exc:
         log("ERROR", "server.workspace_container_status",
             f"Status failed: {exc}")
         return _json_error(str(exc), status_code=503)
+    # Three-state hardening-conformance verdict (read-only).  If the container
+    # object cannot be obtained the verdict is "unverified" -- fail-closed,
+    # never "conformant" -- and the status response is never turned into 5xx.
+    try:
+        container = manager.client.containers.get(container_id)
+    except Exception:
+        container = None
+    data["hardening"] = _hardening_json(container)
+    return data
 
 
 @app.post("/api/workspace/{workspace_id}/containers/{container_name}/start")
