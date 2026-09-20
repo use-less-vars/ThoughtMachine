@@ -1920,6 +1920,74 @@ class ContainerManager:
                             "user": _udetail,
                         },
                     }
+            # Hardening-recipe drift admission (fail-closed): a container whose
+            # docker HARDENING axes (cap_drop / security_opt / read_only rootfs /
+            # user) are weaker than the frozen recipe is strictly MORE PERMISSIVE
+            # than a fresh create would be, so REFUSE the command.  The
+            # network/workspace isolation can MATCH while hardening has drifted,
+            # so this gate runs BEFORE the ``_config_matches`` early-return below.
+            hardening_failures = _hardening_conformance(
+                container, _expected_hardening_recipe()
+            )
+            # ``_hardening_conformance`` reports UNREADABLE attrs as the distinct
+            # sentinel ``["attrs_unreadable"]``.  That condition is already refused
+            # by the pre-existing ``attrs_unresolved`` branch below, so strip the
+            # sentinel here to REUSE that branch -- never duplicate it.  Only REAL
+            # failing axes are acted on by this gate.
+            real_hardening_failures = [
+                f for f in hardening_failures if f != "attrs_unreadable"
+            ]
+            if real_hardening_failures:
+                failed_axes = ", ".join(real_hardening_failures)
+                hmessage = (
+                    "Container hardening is MORE PERMISSIVE than the host "
+                    f"recipe (failing axes: {failed_axes}); refusing to run the "
+                    "command."
+                )
+                try:
+                    log("WARNING", "docker.container_manager",
+                        "container hardening drifted "
+                        f"({failed_axes}); refusing to run (fail-closed)")
+                except Exception:
+                    pass
+
+                try:
+                    _audit(_EXEC_DRIFT_AUDIT,
+                           "container hardening drifted; refusing exec")
+                except Exception:
+                    pass
+
+                try:
+                    labels = getattr(container, "labels", None) or {}
+                    record_id = labels.get(RECORD_LABEL_KEY)
+                    if record_id is not None and getattr(self, "workspace_id", None):
+                        from thoughtmachine.container_record import append_event
+                        append_event(
+                            self.workspace_id,
+                            str(record_id),
+                            _EXEC_DRIFT_EVENT,
+                            _EXEC_DRIFT_ACTOR,
+                            decision="deny",
+                            reason="hardening_drift",
+                            detail=("failing hardening axes: "
+                                    + failed_axes),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                except Exception:
+                    pass
+
+                return "deny", {
+                    "stdout": "",
+                    "stderr": f"{hmessage}\nreason=hardening_drift",
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                    "drift": {
+                        "drifted": True,
+                        "decision": "deny",
+                        "reason": "hardening_drift",
+                        "hardening": {"failed": list(real_hardening_failures)},
+                    },
+                }
+
             try:
                 want_net, want_ws = self._compute_config(
                     getattr(self, "workspace_path", None),
