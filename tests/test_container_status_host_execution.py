@@ -12,7 +12,7 @@ LAST host-git fallback event recorded for the workspace:
 Contract (read-only, fail-closed):
 
 * when the workspace vault JSONL
-  ``<vault>/workspaces/<ws>/resources/git.host.execution.jsonl`` holds at
+  ``<vault>/workspaces/<ws>/resources/git.host_execution.jsonl`` holds at
   least one recorded event, the key is present and mirrors the last event;
 * when NO event is recorded -- or the store is missing / empty / malformed --
   the key is OMITTED entirely (absence != a fabricated ``{"fallback": false}``);
@@ -78,7 +78,7 @@ def _write_event(vault, at="2026-01-02T03:04:05Z", raw=None, append=False):
     When ``raw`` is given it is written verbatim (used to inject malformed
     content).  ``append=True`` adds a further line instead of truncating.
     """
-    path = vault / "workspaces" / WS / "resources" / "git.host.execution.jsonl"
+    path = vault / "workspaces" / WS / "resources" / "git.host_execution.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     if raw is not None:
         text = raw

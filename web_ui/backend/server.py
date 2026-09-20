@@ -3127,7 +3127,7 @@ def _host_execution_json(workspace_id: str) -> dict:
     """Latest host-fallback projection for ``workspace_id`` (read-only).
 
     Reads the append-only workspace vault JSONL
-    ``<vault>/workspaces/<ws>/resources/git.host.execution.jsonl`` (written by
+    ``<vault>/workspaces/<ws>/resources/git.host_execution.jsonl`` (written by
     ``GitReadTool._record_host_fallback_event``) and returns the projection of
     the LAST recorded event::
 
@@ -3148,7 +3148,7 @@ def _host_execution_json(workspace_id: str) -> dict:
             / "workspaces"
             / workspace_id
             / "resources"
-            / "git.host.execution.jsonl"
+            / "git.host_execution.jsonl"
         )
         if not path.is_file():
             return {}

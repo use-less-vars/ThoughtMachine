@@ -17,7 +17,7 @@ Usage
 
 Defaults target the primary Linux/macOS gate::
 
-    --expected 3603   # `-m "not docker and not e2e"` selection
+    --expected 3644   # `-m "not docker and not e2e"` selection
     --marker   "not docker and not e2e"
 
 Passing one or more positional ``TARGET`` paths (files or directories) runs
@@ -27,8 +27,8 @@ small, self-contained node set.
 
 Recognised pytest summaries (checked in this order)::
 
-    3603/3607 tests collected (4 deselected) in 10.61s   -> 3603
-    3607 tests collected in 10.49s                        -> 3607
+    3644/3649 tests collected (5 deselected) in 10.61s   -> 3644
+    3649 tests collected in 10.49s                        -> 3649
     no tests collected in 0.10s                           -> 0
 
 Exit status is 0 on an exact match and 1 on mismatch *or* when no collection
@@ -42,14 +42,14 @@ import re
 import subprocess
 import sys
 
-# Measured on branch feat/ci-platform-matrix: 3607 tests collect in total and
-# `-m "not docker and not e2e"` selects 3603 of them (4 deselected).
-DEFAULT_EXPECTED = 3632
+# Measured on branch fix/git-host-fallback-closure: 3649 tests collect in total
+# and `-m "not docker and not e2e"` selects 3644 of them (5 deselected).
+DEFAULT_EXPECTED = 3644
 DEFAULT_MARKER = "not docker and not e2e"
 
-# "3603/3607 tests collected (4 deselected)" -> 3603 (the selected count).
+# "3644/3649 tests collected (5 deselected)" -> 3644 (the selected count).
 _DESELECTED_RE = re.compile(r"(\d+)/\d+\s+tests?\s+collected")
-# "3607 tests collected" -> 3607.
+# "3649 tests collected" -> 3649.
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 # "no tests collected" -> 0.
 _NONE_RE = re.compile(r"no\s+tests?\s+collected")
