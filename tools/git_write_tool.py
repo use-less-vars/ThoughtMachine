@@ -487,7 +487,7 @@ class GitWriteTool(GitReadTool):
         """True when a _run_git/_git_add result string signals failure.
 
         _run_git returns error-shaped strings on failure: "Git command
-        failed ...", "Git command timed out", "Git command not found ..."
+        failed ...", "Git command not found ..."
         or "Error running git command: ..."; _git_add prepends "Error: ..."
         for argument-validation failures. On success git add emits no
         stdout, so prefixing on "Git command" / "Error" is unambiguous.

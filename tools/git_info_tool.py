@@ -590,9 +590,14 @@ class GitReadTool(ToolBase):
                 return f"Git command failed (exit code {exit_code}):\n{stderr}"
             return stdout
         except subprocess.TimeoutExpired:
-            return "Git command timed out"
+            # Fail closed: a timeout must surface as an exception, never as a
+            # returned string. Callers parse return values as branch names or
+            # refs; a returned "timed out" string would be treated as a valid
+            # branch and open a security gate. Raising escapes both gates.
+            raise
         except TimeoutError:
-            return "Git command timed out"
+            # Fail closed, same reason as TimeoutExpired above.
+            raise
         except FileNotFoundError:
             return "Git command not found (git may not be installed)"
         except PermissionError:
