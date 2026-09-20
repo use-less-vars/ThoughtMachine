@@ -1578,8 +1578,10 @@ class ContainerManager:
         """Reload a freshly created container and warm the read-through cache."""
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_cache_container: container.reload() failed for {name!r} "
+                f"(id={getattr(container, 'id', '?')}): {type(e).__name__}: {e}")
         self._containers[name] = container.id
         return container
 
@@ -2445,6 +2447,13 @@ class ContainerManager:
         The container is NEVER removed or recreated here: start() no longer
         MUTATES on drift.  A caller that must replace a more-permissive drifted
         container (e.g. the ephemeral runner) acts on the refusal itself.
+
+        A container whose HARDENING attrs cannot be READ is UNVERIFIABLE, not
+        weak: ``_hardening_conformance`` reports that case as the distinct
+        sentinel ``["attrs_unreadable"]``, which this method maps EXPLICITLY to
+        the zero-failure/reuse outcome (fail-soft: never recreate a container
+        merely because we could not read it).  Only REAL failing hardening axes
+        trigger the recreate branch.
         """
         config_ok = self._config_matches(container, want_net, want_ws)
         restart_axis = None
@@ -2454,8 +2463,19 @@ class ContainerManager:
         hardening_failures = _hardening_conformance(
             container, _expected_hardening_recipe()
         )
+        # ``_hardening_conformance`` returns the DISTINCT sentinel
+        # ``["attrs_unreadable"]`` when the container's attrs cannot be read at
+        # all.  That verdict means "cannot tell", NOT "too weak": the fail-soft
+        # contract is to REUSE an unverifiable container (no remove/recreate),
+        # exactly as before, so the sentinel is stripped out here before every
+        # downstream gate.  Only REAL failing axes (cap_drop / security_opt /
+        # read_only / user) may drive a recreate.  The sentinel and a real axis
+        # are mutually exclusive, so this filter can never mask genuine drift.
+        real_hardening_failures = [
+            f for f in hardening_failures if f != "attrs_unreadable"
+        ]
         if (config_ok and restart_axis is None and user_axis is None
-                and not hardening_failures):
+                and not real_hardening_failures):
             return "ok", None
 
         live_net, live_ws = _exec_live_isolation(container)
@@ -2481,7 +2501,7 @@ class ContainerManager:
             user_decision, user_reason, user_detail = user_axis
 
         if (isolation_decision is None and restart_decision is None
-                and user_decision is None and not hardening_failures):
+                and user_decision is None and not real_hardening_failures):
             return "ok", None
 
         decision = (
@@ -2505,8 +2525,8 @@ class ContainerManager:
             drift["restart_policy"] = restart_detail
         if user_detail is not None:
             drift["user"] = user_detail
-        if hardening_failures:
-            drift["hardening"] = {"failed": list(hardening_failures)}
+        if real_hardening_failures:
+            drift["hardening"] = {"failed": list(real_hardening_failures)}
         container_id = getattr(container, "id", None)
         if isolation_decision is not None:
             signature = hashlib.sha256(
@@ -2564,11 +2584,14 @@ class ContainerManager:
                     "Recreate the container to restore the desired isolation."
                 )
             return "deny", {"error": message, "drift": drift}
-        if hardening_failures:
+        if real_hardening_failures:
             # FOURTH axis: docker HARDENING (cap_drop / security_opt / read-only
             # rootfs / user) is weaker than a fresh create would be.  A deny
             # still wins above; otherwise the caller must REMOVE this container
-            # and recreate it rather than hand back the weak one.
+            # and recreate it rather than hand back the weak one.  The
+            # "attrs_unreadable" sentinel is NOT in ``real_hardening_failures``
+            # (stripped above), so an unverifiable container falls through to
+            # REUSE below instead of being recreated.
             return "recreate", drift
         return "reuse", drift
 
@@ -2662,8 +2685,10 @@ class ContainerManager:
                     "error": _denial}
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"stop: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
         try:
             if container.status == "running":
                 _audit("CONTAINER_STOP",
@@ -2721,8 +2746,10 @@ class ContainerManager:
                     "error": _denial}
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"status: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
 
         uptime_seconds = None
         started_at = (container.attrs.get("State") or {}).get("StartedAt")
@@ -3302,14 +3329,18 @@ class ContainerManager:
     def _ensure_running(self, container):
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: initial container.reload() failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
         try:
             if container.status != "running":
                 container.start()
                 container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: container.start()/reload() failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
 
     def set_note(self, container_id, note):
         """Set the container's sticky note on its RECORD; NEVER raises.
@@ -3339,8 +3370,10 @@ class ContainerManager:
             return {"success": False, "container_id": container_id, "error": str(e)}
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"set_note: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
         record_id = self._record_id_for(container)
         if not record_id:
             self._warn_note_once(

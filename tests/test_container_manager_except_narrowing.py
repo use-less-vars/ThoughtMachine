@@ -30,12 +30,21 @@ Each narrowed clause's contract is two-sided:
 
 No Docker daemon, network or ``sleep`` is involved: managers are built with
 ``ContainerManager.__new__`` and collaborators are monkeypatched.
+
+ADDED PINS (hardening-conformance verdict consumed by ``_start_drift_decision``):
+``_hardening_conformance`` reports a container whose attrs cannot be READ as the
+DISTINCT sentinel ``["attrs_unreadable"]`` (never ``[]``);
+``_start_drift_decision`` maps that sentinel EXPLICITLY to the zero-failure
+REUSE outcome, while a container with REAL failing hardening axes still routes
+to ``"recreate"``.  These extend the file's focus (swallowing-``except``
+contracts) to the swallow in ``_hardening_conformance`` that this change fixed.
 """
 
 from types import SimpleNamespace
 
 import pytest
 
+import infra.container_create as cc
 import infra.container_manager as cm_mod
 from infra.container_manager import ContainerManager
 from thoughtmachine.container_record import (
@@ -151,3 +160,71 @@ def test_lifecycle_class_unexpected_lookup_error_propagates(monkeypatch):
     monkeypatch.setattr(cm_mod, "find_by_docker_label", _boom)
     with pytest.raises(RuntimeError):
         cm_mod._container_lifecycle_class(_ctr_with_record_label())
+
+
+# ---------------------------------------------------------------------------
+# Hardening-conformance verdicts consumed by _start_drift_decision
+#   ``_hardening_conformance`` returns the DISTINCT sentinel
+#   ``["attrs_unreadable"]`` when a container's attrs cannot be read at all;
+#   ``_start_drift_decision`` maps that sentinel EXPLICITLY to the
+#   zero-failure/reuse outcome (fail-soft), while REAL failing hardening axes
+#   still route to ``"recreate"``.
+# ---------------------------------------------------------------------------
+
+
+class _RaisingAttrsContainer:
+    """A container stand-in whose ``attrs`` property always raises."""
+
+    id = "c" * 16
+    name = "agent-x"
+
+    @property
+    def attrs(self):
+        raise RuntimeError("attrs unavailable")
+
+
+# Isolation on both axes MATCHES want=("none", "ro"); only the hardening axes
+# are wrong, so a recreate can only be driven by the hardening verdict.
+_REAL_HARDENING_DRIFT_ATTRS = {
+    "State": {"Status": "running"},
+    "HostConfig": {
+        "NetworkMode": "none",
+        "CapDrop": [],
+        "SecurityOpt": [],
+        "ReadonlyRootfs": False,
+    },
+    "Config": {"User": ""},
+    "Mounts": [{"Destination": "/workspace", "RW": False}],
+}
+
+
+def test_hardening_conformance_unreadable_attrs_is_distinct_sentinel():
+    """(a) An unreadable-attrs container yields the sentinel, NEVER ``[]``."""
+    failures = cc._hardening_conformance(
+        _RaisingAttrsContainer(), cc._expected_hardening_recipe()
+    )
+    assert failures == ["attrs_unreadable"]
+    assert failures != []
+
+
+def test_start_drift_decision_unverifiable_hardening_maps_to_reuse():
+    """(b) The sentinel maps to the zero-failure/reuse outcome, not recreate."""
+    mgr = _manager()
+    decision, drift = mgr._start_drift_decision(
+        _RaisingAttrsContainer(), "none", "ro", "record"
+    )
+    assert decision == "ok"
+    assert drift is None
+
+
+def test_start_drift_decision_real_hardening_drift_still_recreates():
+    """A REAL weak-hardening container must still be recreated, not reused."""
+    mgr = _manager()
+    ctr = SimpleNamespace(
+        id="c" * 16, name="agent-x", attrs=_REAL_HARDENING_DRIFT_ATTRS
+    )
+    decision, drift = mgr._start_drift_decision(ctr, "none", "ro", "record")
+    assert decision == "recreate"
+    assert set(drift["hardening"]["failed"]) == {
+        "cap_drop", "security_opt", "read_only", "user"
+    }
