@@ -202,6 +202,86 @@ class GitReadTool(ToolBase):
         """
         return "off" if self._host_execution_denied_reason() else "on"
 
+    def _host_fallback_event_path(self) -> Optional[Path]:
+        """Vault JSONL path for this workspace's host-fallback event log.
+
+        Mirrors the ``thoughtmachine.container_record.storage`` vault layout
+        (``<vault>/workspaces/<ws>/...``) and is keyed by workspace id; returns
+        ``None`` when no workspace id is resolvable (nothing to key on).
+        """
+        ws_id = self._resolved_workspace_id or getattr(self, "workspace_id", None)
+        if not ws_id:
+            return None
+        try:
+            from thoughtmachine.vault import vault_root
+
+            return (
+                Path(vault_root())
+                / "workspaces"
+                / ws_id
+                / "resources"
+                / "git.host_execution.jsonl"
+            )
+        except Exception:
+            return None
+
+    def _record_host_fallback_event(self, detail: Optional[str] = None) -> None:
+        """Append one host-fallback event to the workspace vault JSONL log.
+
+        Append-only, one JSON object per line, mirroring
+        ``container_record.storage._append_line`` (``O_APPEND``, mode ``0o600``,
+        ``fsync``, parents created on demand).  Best-effort: this observability
+        side-channel can NEVER raise -- any failure (no vault, unwritable path,
+        serialization error) is swallowed AND logged at WARNING so a working git
+        call is never turned into an error by logging, while a lost event is
+        never silent.
+        """
+        path = None
+        ws_id = self._resolved_workspace_id or getattr(self, "workspace_id", None)
+        try:
+            path = self._host_fallback_event_path()
+            if path is None:
+                return
+            import os
+            from datetime import datetime, timezone
+
+            entry = {
+                "timestamp": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "event_type": "host_execution",
+                "actor": "git_read",
+                "payload": {
+                    "fallback": True,
+                    "reason": "container_unavailable",
+                    "workspace_id": ws_id,
+                    "operation": self.operation,
+                    "kill_switch_state": self._kill_switch_state(),
+                    "detail": detail,
+                },
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except Exception as exc:  # R3: swallow, but never silent
+            try:
+                logger.warning(
+                    "GitReadTool host_execution event write failed: "
+                    "reason=event_write_failed path=%s workspace_id=%s "
+                    "operation=%s exc_class=%s",
+                    path if path is not None else "<unresolved>",
+                    ws_id if ws_id else "<unresolved>",
+                    getattr(self, "operation", None),
+                    type(exc).__name__,
+                )
+            except Exception:
+                pass
+            return
+
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
         """Return dynamic permission categories based on the git operation.
@@ -564,6 +644,8 @@ class GitReadTool(ToolBase):
             self._last_execution_mode = "host_fallback"
             self._last_failure_reason = None
             self._last_fallback_used = False
+            # Persist the fallback event (observability; never raises).
+            self._record_host_fallback_event()
             logger.warning(
                 "GitReadTool host fallback: reason=%s command=%s "
                 "workspace_id=%s kill_switch_state=%s (operation=%s)",
@@ -637,6 +719,8 @@ class GitReadTool(ToolBase):
         self._last_execution_mode = "host_fallback"
         self._last_failure_reason = failure_reason
         self._last_fallback_used = fallback_used
+        # Persist the fallback event with the resolver's degradation detail.
+        self._record_host_fallback_event(detail=detail)
         return self._exec_host_raw(repo_root, args, timeout=timeout)
 
     def _exec_host_raw(

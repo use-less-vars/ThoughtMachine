@@ -3123,6 +3123,56 @@ def _json_error(message: str, status_code: int = 500):
     return JSONResponse({"error": message}, status_code=status_code)
 
 
+def _host_execution_json(workspace_id: str) -> dict:
+    """Latest host-fallback projection for ``workspace_id`` (read-only).
+
+    Reads the append-only workspace vault JSONL
+    ``<vault>/workspaces/<ws>/resources/git.host.execution.jsonl`` (written by
+    ``GitReadTool._record_host_fallback_event``) and returns the projection of
+    the LAST recorded event::
+
+        {"fallback": True, "reason": <reason>, "at": <iso8601 UTC>}
+
+    Returns ``{}`` when NO event is recorded or when the store is
+    missing / empty / unreadable / fully-malformed -- the empty dict lets the
+    caller OMIT the ``host_execution`` key.  The store is an append-only EVENT
+    log, so absence means "no fallback event recorded" and must stay
+    distinguishable from a fabricated ``{"fallback": false}``.  Fail-closed:
+    a broken read never fabricates an event and never turns a working status
+    into a 5xx.  Blank/unparseable lines are SKIPPED (mirroring
+    ``container_record.storage.read_events_sidecar``), not fatal.
+    """
+    try:
+        path = (
+            Path(_vault.vault_root())
+            / "workspaces"
+            / workspace_id
+            / "resources"
+            / "git.host.execution.jsonl"
+        )
+        if not path.is_file():
+            return {}
+        entry = None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(entry, dict):
+            return {}
+        payload = entry.get("payload") or {}
+        reason = payload.get("reason")
+        at = entry.get("timestamp")
+        if reason is None or at is None:
+            return {}
+        return {"fallback": True, "reason": reason, "at": at}
+    except Exception:
+        return {}
+
+
 def _hardening_json(container) -> dict:
     """Three-state hardening-conformance verdict for a status response.
 
@@ -3238,6 +3288,12 @@ def workspace_container_status(workspace_id: str, container_name: str,
     except Exception:
         container = None
     data["hardening"] = _hardening_json(container)
+    # Host-fallback observability (read-only): surface the latest recorded
+    # host-git fallback event for this workspace, if any.  Absent -> OMIT the
+    # key entirely (absence != "no fallback capability").
+    host_execution = _host_execution_json(workspace_id)
+    if host_execution:
+        data["host_execution"] = host_execution
     return data
 
 
