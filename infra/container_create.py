@@ -129,6 +129,17 @@ def _hardening_conformance(container: Any, recipe: HardeningRecipe) -> list:
     * ``Config.User`` present => must EQUAL ``recipe.user``.
 
     Returns the list of failing axis names (``[]`` == fully conformant).
+
+    UNREADABLE-ATTRS rule: when ``container.attrs`` cannot be read at all (the
+    attribute access raises), the predicate MUST NOT report the container as
+    fully conformant -- the safe, honest verdict is that conformance is
+    UNVERIFIABLE, not that it passed.  In that case the DISTINCT sentinel value
+    ``["attrs_unreadable"]`` is returned.  It never collides with a real failing
+    axis name (the axis vocabulary is ``cap_drop``/``security_opt``/
+    ``read_only``/``user`` only), so callers can tell "could not tell" apart from
+    "nothing wrong" and from "these axes are weak".  Callers that follow the
+    fail-soft contract treat the sentinel as "cannot verify -> do not act"
+    (reuse), NOT as drift.
     DELIBERATE DIVERGENCE from ``_user_drift_axis``: that axis treats a BLANK
     live user as "no user" and NOT drift, whereas here a PRESENT empty-string
     ``Config.User`` is a MISMATCH -- a container that requested no user did not
@@ -137,7 +148,10 @@ def _hardening_conformance(container: Any, recipe: HardeningRecipe) -> list:
     try:
         attrs = getattr(container, "attrs", None)
     except Exception:
-        return []
+        # attrs could not be read at all: conformance is UNVERIFIABLE, which is
+        # NOT the same as conformant.  Return the distinct sentinel so callers
+        # never mistake "cannot tell" for "fully conformant" (``[]``).
+        return ["attrs_unreadable"]
     if not isinstance(attrs, dict):
         return []
     host = attrs.get("HostConfig") or {}

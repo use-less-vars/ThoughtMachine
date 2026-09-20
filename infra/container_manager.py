@@ -831,6 +831,9 @@ class ContainerManager:
             try:
                 attrs = getattr(container, "attrs", None) or {}
                 labels = (attrs.get("Config") or {}).get("Labels")
+            # R18: deliberately NOT narrowed. `_record_id_for` is a best-effort
+            # identity probe whose contract is "never raises; any lookup failure
+            # yields None" (see docstring + tests/test_container_start_drift.py (g)).
             except Exception:
                 labels = None
         return self._record_id_from_labels(labels)
@@ -845,7 +848,8 @@ class ContainerManager:
             return None
         try:
             container = self.client.containers.get(name)
-        except Exception:
+        # A missing name is the docker SDK's NotFound; anything else must surface.
+        except NotFound:
             return None
         return self._record_id_for(container)
 
@@ -1574,8 +1578,10 @@ class ContainerManager:
         """Reload a freshly created container and warm the read-through cache."""
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_cache_container: container.reload() failed for {name!r} "
+                f"(id={getattr(container, 'id', '?')}): {type(e).__name__}: {e}")
         self._containers[name] = container.id
         return container
 
@@ -1914,6 +1920,74 @@ class ContainerManager:
                             "user": _udetail,
                         },
                     }
+            # Hardening-recipe drift admission (fail-closed): a container whose
+            # docker HARDENING axes (cap_drop / security_opt / read_only rootfs /
+            # user) are weaker than the frozen recipe is strictly MORE PERMISSIVE
+            # than a fresh create would be, so REFUSE the command.  The
+            # network/workspace isolation can MATCH while hardening has drifted,
+            # so this gate runs BEFORE the ``_config_matches`` early-return below.
+            hardening_failures = _hardening_conformance(
+                container, _expected_hardening_recipe()
+            )
+            # ``_hardening_conformance`` reports UNREADABLE attrs as the distinct
+            # sentinel ``["attrs_unreadable"]``.  That condition is already refused
+            # by the pre-existing ``attrs_unresolved`` branch below, so strip the
+            # sentinel here to REUSE that branch -- never duplicate it.  Only REAL
+            # failing axes are acted on by this gate.
+            real_hardening_failures = [
+                f for f in hardening_failures if f != "attrs_unreadable"
+            ]
+            if real_hardening_failures:
+                failed_axes = ", ".join(real_hardening_failures)
+                hmessage = (
+                    "Container hardening is MORE PERMISSIVE than the host "
+                    f"recipe (failing axes: {failed_axes}); refusing to run the "
+                    "command."
+                )
+                try:
+                    log("WARNING", "docker.container_manager",
+                        "container hardening drifted "
+                        f"({failed_axes}); refusing to run (fail-closed)")
+                except Exception:
+                    pass
+
+                try:
+                    _audit(_EXEC_DRIFT_AUDIT,
+                           "container hardening drifted; refusing exec")
+                except Exception:
+                    pass
+
+                try:
+                    labels = getattr(container, "labels", None) or {}
+                    record_id = labels.get(RECORD_LABEL_KEY)
+                    if record_id is not None and getattr(self, "workspace_id", None):
+                        from thoughtmachine.container_record import append_event
+                        append_event(
+                            self.workspace_id,
+                            str(record_id),
+                            _EXEC_DRIFT_EVENT,
+                            _EXEC_DRIFT_ACTOR,
+                            decision="deny",
+                            reason="hardening_drift",
+                            detail=("failing hardening axes: "
+                                    + failed_axes),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                except Exception:
+                    pass
+
+                return "deny", {
+                    "stdout": "",
+                    "stderr": f"{hmessage}\nreason=hardening_drift",
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                    "drift": {
+                        "drifted": True,
+                        "decision": "deny",
+                        "reason": "hardening_drift",
+                        "hardening": {"failed": list(real_hardening_failures)},
+                    },
+                }
+
             try:
                 want_net, want_ws = self._compute_config(
                     getattr(self, "workspace_path", None),
@@ -2441,6 +2515,13 @@ class ContainerManager:
         The container is NEVER removed or recreated here: start() no longer
         MUTATES on drift.  A caller that must replace a more-permissive drifted
         container (e.g. the ephemeral runner) acts on the refusal itself.
+
+        A container whose HARDENING attrs cannot be READ is UNVERIFIABLE, not
+        weak: ``_hardening_conformance`` reports that case as the distinct
+        sentinel ``["attrs_unreadable"]``, which this method maps EXPLICITLY to
+        the zero-failure/reuse outcome (fail-soft: never recreate a container
+        merely because we could not read it).  Only REAL failing hardening axes
+        trigger the recreate branch.
         """
         config_ok = self._config_matches(container, want_net, want_ws)
         restart_axis = None
@@ -2450,8 +2531,19 @@ class ContainerManager:
         hardening_failures = _hardening_conformance(
             container, _expected_hardening_recipe()
         )
+        # ``_hardening_conformance`` returns the DISTINCT sentinel
+        # ``["attrs_unreadable"]`` when the container's attrs cannot be read at
+        # all.  That verdict means "cannot tell", NOT "too weak": the fail-soft
+        # contract is to REUSE an unverifiable container (no remove/recreate),
+        # exactly as before, so the sentinel is stripped out here before every
+        # downstream gate.  Only REAL failing axes (cap_drop / security_opt /
+        # read_only / user) may drive a recreate.  The sentinel and a real axis
+        # are mutually exclusive, so this filter can never mask genuine drift.
+        real_hardening_failures = [
+            f for f in hardening_failures if f != "attrs_unreadable"
+        ]
         if (config_ok and restart_axis is None and user_axis is None
-                and not hardening_failures):
+                and not real_hardening_failures):
             return "ok", None
 
         live_net, live_ws = _exec_live_isolation(container)
@@ -2477,7 +2569,7 @@ class ContainerManager:
             user_decision, user_reason, user_detail = user_axis
 
         if (isolation_decision is None and restart_decision is None
-                and user_decision is None and not hardening_failures):
+                and user_decision is None and not real_hardening_failures):
             return "ok", None
 
         decision = (
@@ -2501,8 +2593,8 @@ class ContainerManager:
             drift["restart_policy"] = restart_detail
         if user_detail is not None:
             drift["user"] = user_detail
-        if hardening_failures:
-            drift["hardening"] = {"failed": list(hardening_failures)}
+        if real_hardening_failures:
+            drift["hardening"] = {"failed": list(real_hardening_failures)}
         container_id = getattr(container, "id", None)
         if isolation_decision is not None:
             signature = hashlib.sha256(
@@ -2560,11 +2652,14 @@ class ContainerManager:
                     "Recreate the container to restore the desired isolation."
                 )
             return "deny", {"error": message, "drift": drift}
-        if hardening_failures:
+        if real_hardening_failures:
             # FOURTH axis: docker HARDENING (cap_drop / security_opt / read-only
             # rootfs / user) is weaker than a fresh create would be.  A deny
             # still wins above; otherwise the caller must REMOVE this container
-            # and recreate it rather than hand back the weak one.
+            # and recreate it rather than hand back the weak one.  The
+            # "attrs_unreadable" sentinel is NOT in ``real_hardening_failures``
+            # (stripped above), so an unverifiable container falls through to
+            # REUSE below instead of being recreated.
             return "recreate", drift
         return "reuse", drift
 
@@ -2658,8 +2753,10 @@ class ContainerManager:
                     "error": _denial}
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"stop: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
         try:
             if container.status == "running":
                 _audit("CONTAINER_STOP",
@@ -2717,8 +2814,10 @@ class ContainerManager:
                     "error": _denial}
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"status: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
 
         uptime_seconds = None
         started_at = (container.attrs.get("State") or {}).get("StartedAt")
@@ -3298,14 +3397,18 @@ class ContainerManager:
     def _ensure_running(self, container):
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: initial container.reload() failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
         try:
             if container.status != "running":
                 container.start()
                 container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: container.start()/reload() failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
 
     def set_note(self, container_id, note):
         """Set the container's sticky note on its RECORD; NEVER raises.
@@ -3335,8 +3438,10 @@ class ContainerManager:
             return {"success": False, "container_id": container_id, "error": str(e)}
         try:
             container.reload()
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"set_note: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
         record_id = self._record_id_for(container)
         if not record_id:
             self._warn_note_once(
@@ -3677,7 +3782,8 @@ def _container_lifecycle_class(container) -> str:
     if record_id:
         try:
             record = find_by_docker_label(record_id)
-        except Exception:
+        # The record store raises ContainerRecordError; unexpected errors surface.
+        except ContainerRecordError:
             record = None
         if record is not None:
             cls = getattr(record, "lifecycle_class", "") or ""

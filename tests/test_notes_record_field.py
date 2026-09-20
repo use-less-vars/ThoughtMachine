@@ -59,7 +59,8 @@ class _FakeContainers:
 
     def get(self, name):
         if name not in self._name_to_rid:
-            raise LookupError(name)
+            # Fidelity bug: a real docker SDK containers.get raises NotFound here.
+            raise _cm.NotFound(name)
         rid = self._name_to_rid[name]
         labels = {} if rid is None else {RECORD_LABEL_KEY: str(rid)}
         ctr = SimpleNamespace(name=name, labels=labels)
