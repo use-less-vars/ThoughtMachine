@@ -12,12 +12,14 @@ import { fetchTools, updateWorkspacePermissions } from './workspaceApi'
 import VaultHealthBanner from '../VaultHealthBanner'
 import NewSessionModal from './modals/NewSessionModal'
 import ContainerLogsViewer from './ContainerLogsViewer'
+import RecordContainerPanel from '../RecordContainerPanel'
 import './WorkspaceDetailPage.css'
 
 const TABS = [
   'Overview',
   'Permissions & Resources',
   'Containers',
+  'Records',
   'Workers',
   'Session Defaults',
   'Tools',
@@ -831,6 +833,8 @@ export default function WorkspaceDetailPage({ workspaceId }) {
           />
         ) : activeTab === 'Containers' ? (
           <ContainersTab summary={summary} />
+        ) : activeTab === 'Records' ? (
+          <RecordContainerPanel workspaceId={summary.workspace_id} />
         ) : activeTab === 'Workers' ? (
           <WorkersTab summary={summary} />
         ) : activeTab === 'Tools' ? (
