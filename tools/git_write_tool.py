@@ -320,9 +320,13 @@ class GitWriteTool(GitReadTool):
             # Container-mandatory branch resolution failed (container
             # unavailable, policy denial): fail closed, never degrade.
             return False
-        branch = (output or "").strip().splitlines()[0].strip() if (output or "").strip() else ""
-        if not branch:
-            # Fail closed on empty/blank branch output.
+        branch = (output or "").strip()
+        if not self._is_valid_branch_ref(branch):
+            # Invalid branch output (empty / multi-line / error-shaped /
+            # over-long): fail closed.  Closes the fail-open where a swallowed
+            # FileNotFoundError / OSError return string ("Git command not
+            # found ...", "Error running git command: ...") was parsed as a
+            # branch name and permitted the commit.
             return False
         return branch not in self._PROTECTED_BRANCHES
 
@@ -487,7 +491,7 @@ class GitWriteTool(GitReadTool):
         """True when a _run_git/_git_add result string signals failure.
 
         _run_git returns error-shaped strings on failure: "Git command
-        failed ...", "Git command timed out", "Git command not found ..."
+        failed ...", "Git command not found ..."
         or "Error running git command: ..."; _git_add prepends "Error: ..."
         for argument-validation failures. On success git add emits no
         stdout, so prefixing on "Git command" / "Error" is unambiguous.
@@ -496,6 +500,35 @@ class GitWriteTool(GitReadTool):
         confusing "pathspec did not match" error).
         """
         return output.startswith("Git command") or output.startswith("Error")
+
+    @staticmethod
+    def _is_valid_branch_ref(output: str) -> bool:
+        """True only when ``output`` is a plausible single git branch name.
+
+        Fail-closed validator for the branch-resolution result of
+        ``git rev-parse --abbrev-ref HEAD``.  ``_run_git`` returns error-shaped
+        STRINGS -- not exceptions -- for some failures: ``"Git command not
+        found (git may not be installed)"`` (FileNotFoundError) and
+        ``"Error running git command: ..."`` (generic OSError).  Both commit
+        gates otherwise parse ANY non-empty string as a branch name, so a
+        string that is not in ``_PROTECTED_BRANCHES`` would open the gate
+        (fail-OPEN).  Rejecting every error shape closes that hole.
+
+        A valid ref is: non-empty, single line (no embedded newline), free of
+        any whitespace, not error-prefixed (``Git command`` / ``Error`` /
+        ``fatal:``) and length-bounded (<= 255).
+        """
+        if not output:
+            return False
+        if "\n" in output or "\r" in output:
+            return False
+        if any(c.isspace() for c in output):
+            return False
+        if output.startswith("Git command") or output.startswith("Error"):
+            return False
+        if output.startswith("fatal:"):
+            return False
+        return len(output) <= 255
 
     def _git_add(
         self, repo_root: Path, allow_host_fallback: bool = True
@@ -565,12 +598,8 @@ class GitWriteTool(GitReadTool):
                 )
             except (RuntimeError, PermissionError):
                 branch_output = ""
-            branch = (
-                branch_output.strip().splitlines()[0].strip()
-                if (branch_output or "").strip()
-                else ""
-            )
-            if not branch or branch in self._PROTECTED_BRANCHES:
+            branch = (branch_output or "").strip()
+            if not self._is_valid_branch_ref(branch) or branch in self._PROTECTED_BRANCHES:
                 branch_label = branch or "unknown"
                 return self._truncate_output(
                     "Error: git:write denied: write_on_feature_branch "

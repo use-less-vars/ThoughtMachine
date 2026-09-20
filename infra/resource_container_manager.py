@@ -52,8 +52,9 @@ Exec semantics
 --------------
 ``exec()`` runs the command as a raw argv list via ``container.exec_run``
 (``cmd=...``, NO ``/bin/sh -c`` wrapper) with a thread+queue timeout guard
-mirroring ``ContainerManager.exec``: on timeout the container is killed,
-removed, and ``TimeoutError`` is raised. ``NotFound``/``APIError`` from the
+mirroring ``ContainerManager.exec``: on timeout the container is killed but
+NOT removed (so it can be reused/restarted), and ``TimeoutError`` is raised.
+``NotFound``/``APIError`` from the
 daemon are converted to clear structured results or raised as ``RuntimeError``
 with actionable messages (see per-method docstrings).
 """
@@ -1444,8 +1445,8 @@ class ResourceContainerManager:
         cannot smuggle shell metacharacters through an extra shell layer.
 
         Timeout guard mirrors ``ContainerManager.exec`` (thread + queue):
-        on timeout the container is killed and removed, then ``TimeoutError``
-        is raised.
+        on timeout the container is killed but NOT removed, so a later
+        ``ensure_container()`` can restart it; then ``TimeoutError`` is raised.
 
         Raises:
             RuntimeError: if the container does not exist (call
@@ -1495,7 +1496,6 @@ class ResourceContainerManager:
                 container.kill()
             except Exception:
                 pass
-            self.remove()
             raise TimeoutError(
                 f"Git resource command timed out after {timeout} seconds"
             )

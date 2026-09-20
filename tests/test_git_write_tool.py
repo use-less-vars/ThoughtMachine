@@ -20,6 +20,10 @@ These tests exercise ``GitWriteTool._git_commit`` directly (bypassing the
 ``execute()`` validation layer) to lock down the internal policy gates.
 """
 
+import subprocess
+
+import pytest
+
 from tools.git_write_tool import GitWriteTool
 
 FLAG_ERROR = 'Error: git:write denied: session git_write permission is not "write"'
@@ -382,3 +386,117 @@ def test_feature_branch_commit_stages_only_named_path(tmp_path):
     ]
     assert all("-A" not in c[0] for c in calls)
     _assert_no_commit_subprocess(exec_container, exec_host)
+
+
+# --- Timeout fail-open defect (RED stage) -----------------------------------
+#
+# ``GitReadTool._run_git`` swallows ``subprocess.TimeoutExpired`` and
+# ``TimeoutError`` into the literal string ``"Git command timed out"``. Both
+# commit gates parse that string as a *branch name*: it is non-empty and not
+# in ``_PROTECTED_BRANCHES``, so a branch probe that times out is read as an
+# unprotected branch and the commit is PERMITTED (fail open). The tests below
+# pin the fail-closed contract: a timed-out branch probe must never result in
+# a permitted commit.
+
+
+class _TimeoutOnBranchProbe:
+    """Fake ``_run_git_raw`` that times out on the branch probe only.
+
+    ``rev-parse --abbrev-ref HEAD`` (the branch resolution) raises the supplied
+    timeout exception; every other git command reports the ``COMMIT_OK``
+    sentinel. The argv of every call is recorded so a test can assert whether
+    the ``git commit`` subprocess was ever reached.
+    """
+
+    def __init__(self, timeout_exc):
+        self.timeout_exc = timeout_exc
+        self.calls = []
+
+    def __call__(self, repo_root, args, timeout=30, allow_host_fallback=True):
+        self.calls.append(list(args))
+        if list(args)[:2] == ["rev-parse", "--abbrev-ref"]:
+            raise self.timeout_exc
+        return (0, "COMMIT_OK\n", "")
+
+    @property
+    def commit_ran(self):
+        return any(args[:1] == ["commit"] for args in self.calls)
+
+
+def _commit_permitted(tool, repo_root):
+    """True iff ``_git_commit`` permitted the commit to run.
+
+    A timeout that propagates (``subprocess.TimeoutExpired`` /
+    ``TimeoutError``) is the fail-closed signal -- the error surfaces as a hard
+    failure instead of being swallowed into a string -- so nothing is permitted.
+    """
+    try:
+        result = tool._git_commit(repo_root)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        return False
+    return "COMMIT_OK" in result
+
+
+def _timeout_expired():
+    return subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+
+@pytest.mark.parametrize(
+    "timeout_exc_factory",
+    [_timeout_expired, lambda: TimeoutError("git timed out")],
+    ids=["TimeoutExpired", "TimeoutError"],
+)
+def test_unprotected_branch_agent_commit_fails_closed_on_branch_timeout(
+    timeout_exc_factory,
+):
+    """The worktree agent-commit gate must fail CLOSED on a branch timeout.
+
+    ``_unprotected_branch_agent_commit_allowed`` reads the "Git command timed
+    out" string as a valid, unprotected branch and returns True, so the commit
+    runs. That container-mandatory branch check is the only guard against an
+    agent commit in an operator-managed worktree; a timeout there must deny the
+    commit instead of permitting it.
+    """
+    tool = _tool(
+        file_path="agent_change.py",
+        agent_config={"session_permissions": {"git": "write"}},
+    )
+    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
+    tool._use_container_mode = lambda: True  # noqa: SLF001
+    tool._validated_rel_paths = lambda root, paths: [  # noqa: SLF001
+        "agent_change.py"
+    ]
+    raw = _TimeoutOnBranchProbe(timeout_exc_factory())
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    assert _commit_permitted(tool, "/tmp/repo") is False
+    assert raw.commit_ran is False
+
+
+@pytest.mark.parametrize(
+    "timeout_exc_factory",
+    [_timeout_expired, lambda: TimeoutError("git timed out")],
+    ids=["TimeoutExpired", "TimeoutError"],
+)
+def test_wofb_feature_branch_gate_fails_closed_on_branch_timeout(
+    timeout_exc_factory,
+):
+    """The write_on_feature_branch commit gate must fail CLOSED on a timeout.
+
+    Same defect, second gate (``_git_commit``): the branch probe returns "Git
+    command timed out", the gate reads it as an unprotected branch and lets the
+    commit through -- so a wofb session can commit on a protected branch
+    whenever the branch probe times out.
+    """
+    tool = _tool(
+        file_path=["note.txt"],
+        agent_config={"session_permissions": {"git": "write_on_feature_branch"}},
+    )
+    tool._is_operator_managed_worktree = lambda root: False  # noqa: SLF001
+    tool._validated_rel_paths = lambda root, paths: ["note.txt"]  # noqa: SLF001
+    raw = _TimeoutOnBranchProbe(timeout_exc_factory())
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    assert _commit_permitted(tool, "/tmp/repo") is False
+    assert raw.commit_ran is False
+
