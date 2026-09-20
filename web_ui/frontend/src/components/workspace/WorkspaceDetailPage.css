@@ -620,6 +620,36 @@
   color: #f38ba8;
 }
 
+.wdp-container-logs-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.wdp-container-logs-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.wdp-logs-tail-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  color: #a6adc8;
+}
+
+.wdp-logs-tail-select {
+  background: #313244;
+  color: #cdd6f4;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
 .wdp-container-detail-grid {
   display: grid;
   grid-template-columns: max-content 1fr;

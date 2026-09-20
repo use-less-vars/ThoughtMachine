@@ -709,3 +709,73 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getByRole('button', { name: 'Logs' })).toBeInTheDocument()
   })
 })
+
+// --- Container logs viewer extraction (integration) -------------------------
+// The inline logs viewer was extracted into ContainerLogsViewer; the tab now
+// delegates to it. These tests pin the accessible contract the tab exposes:
+// a labelled logs region, the single long-log affordance (a tail-size select),
+// a logs toggle whose accessible name still contains "Logs", and the exact
+// backend error string.
+
+describe('WorkspaceDetailPage \u2014 container logs viewer', () => {
+  it('exposes an accessible logs region and a tail-size select after opening logs', async () => {
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          text: async () => 'boot\nlistening on :8080\n',
+        },
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    // The logs toggle's accessible name still contains "Logs".
+    fireEvent.click(screen.getByRole('button', { name: /Logs/ }))
+
+    // A labelled region wraps the log output.
+    const region = await screen.findByRole('region', { name: 'Container logs' })
+    expect(region).toBeInTheDocument()
+    const pre = screen.getByText(/listening on :8080/)
+    expect(pre.tagName).toBe('PRE')
+
+    // The single long-log affordance is the tail-size select.
+    const select = screen.getByRole('combobox', { name: 'Log tail size' })
+    expect(Array.from(select.options).map((o) => Number(o.value))).toEqual([
+      200, 500, 1000, 2000,
+    ])
+  })
+
+  it('refetches container logs with the newly chosen tail', async () => {
+    const fetchMock = stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          text: async () => 'boot\nlistening on :8080\n',
+        },
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+    fireEvent.click(screen.getByRole('button', { name: /Logs/ }))
+
+    const select = await screen.findByRole('combobox', { name: 'Log tail size' })
+    fireEvent.change(select, { target: { value: '500' } })
+
+    await waitFor(() => {
+      const urls = fetchMock.mock.calls.map(([u]) => String(u))
+      expect(
+        urls.some((u) =>
+          u.includes('/api/workspace/ws-1/containers/research-runner/logs?tail=500')
+        )
+      ).toBe(true)
+    })
+  })
+})
+

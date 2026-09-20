@@ -11,6 +11,7 @@ import useWorkspaceSummary from './useWorkspaceSummary'
 import { fetchTools, updateWorkspacePermissions } from './workspaceApi'
 import VaultHealthBanner from '../VaultHealthBanner'
 import NewSessionModal from './modals/NewSessionModal'
+import ContainerLogsViewer from './ContainerLogsViewer'
 import './WorkspaceDetailPage.css'
 
 const TABS = [
@@ -302,51 +303,11 @@ function ContainersTab({ summary }) {
   // lazily fetch logs. Nothing here starts, stops or otherwise mutates a
   // container.
   const [selectedKey, setSelectedKey] = useState(null)
-  const [logs, setLogs] = useState({})
+  const [logsOpenKey, setLogsOpenKey] = useState(null)
 
   const keyFor = (container, index) => container.id || container.name || `container-${index}`
   const selected =
     containers.find((container, index) => keyFor(container, index) === selectedKey) || null
-
-  function toggleLogs(key, container) {
-    const current = logs[key] || {}
-    if (current.open) {
-      setLogs((prev) => ({ ...prev, [key]: { ...current, open: false } }))
-      return
-    }
-    if (current.loaded) {
-      setLogs((prev) => ({ ...prev, [key]: { ...current, open: true } }))
-      return
-    }
-    setLogs((prev) => ({
-      ...prev,
-      [key]: { open: true, loaded: false, status: 'loading', error: null, text: null },
-    }))
-    const name = container.name || ''
-    fetch(`/api/workspace/${workspaceId}/containers/${name}/logs?tail=200`)
-      .then((response) => {
-        if (!response.ok) throw new Error(`Failed to load logs (${response.status})`)
-        return response.text()
-      })
-      .then((text) => {
-        setLogs((prev) => ({
-          ...prev,
-          [key]: { open: true, loaded: true, status: 'done', error: null, text },
-        }))
-      })
-      .catch((error) => {
-        setLogs((prev) => ({
-          ...prev,
-          [key]: {
-            open: true,
-            loaded: true,
-            status: 'error',
-            error: (error && error.message) || 'Failed to load logs',
-            text: null,
-          },
-        }))
-      })
-  }
 
   return (
     <div className="wdp-tab-content">
@@ -382,7 +343,7 @@ function ContainersTab({ summary }) {
               {containers.map((container, index) => {
                 const key = keyFor(container, index)
                 const isSelected = key === selectedKey
-                const log = logs[key] || {}
+                const isLogsOpen = key === logsOpenKey
                 return (
                   <React.Fragment key={key}>
                     <tr
@@ -402,25 +363,20 @@ function ContainersTab({ summary }) {
                           className="wdp-logs-toggle"
                           onClick={(event) => {
                             event.stopPropagation()
-                            toggleLogs(key, container)
+                            setLogsOpenKey((current) => (current === key ? null : key))
                           }}
                         >
-                          {log.open ? 'Hide logs' : 'Logs'}
+                          {isLogsOpen ? 'Hide logs' : 'Logs'}
                         </button>
                       </td>
                     </tr>
-                    {log.open && (
+                    {isLogsOpen && (
                       <tr className="wdp-container-logs-row">
                         <td colSpan={6}>
-                          {log.status === 'loading' && (
-                            <div className="wdp-container-logs-loading">Loading logs…</div>
-                          )}
-                          {log.status === 'error' && (
-                            <div className="wdp-container-logs-error">{log.error}</div>
-                          )}
-                          {log.status === 'done' && (
-                            <pre className="wdp-container-logs">{log.text}</pre>
-                          )}
+                          <ContainerLogsViewer
+                            workspaceId={workspaceId}
+                            containerName={container.name || ''}
+                          />
                         </td>
                       </tr>
                     )}
