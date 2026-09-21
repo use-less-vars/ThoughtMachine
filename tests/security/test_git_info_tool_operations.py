@@ -24,11 +24,12 @@ Security properties asserted per operation:
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tools.git_info_tool import GitInfoTool
+from tools.git_info_tool import GitInfoTool, GitUnavailableError
 from tools.git_write_tool import GitWriteTool
 
 FLAG_ERROR = 'Error: git:write denied: session git_write permission is not "write"'
@@ -936,4 +937,67 @@ class TestHostFallbackNoWorkspaceIdGate:
             tool._git_status(tmp_path)
         assert tool._last_execution_mode == "unavailable"
         assert not _FakeSandbox.instances
+
+
+
+# ---------------------------------------------------------------------------
+# _git_repo_root: a missing git binary must NEVER read as "not a repository"
+# ---------------------------------------------------------------------------
+class TestGitRepoRootAvailability:
+    """Defect A5: git-unavailable and not-a-repo were conflated."""
+
+    @staticmethod
+    def _spawn_failure(repo_root, args, timeout=30):
+        raise FileNotFoundError("git")
+
+    def test_t1_spawn_failure_reports_unavailable(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        monkeypatch.setattr(tool, "_run_git_raw", self._spawn_failure)
+        with pytest.raises(GitUnavailableError):
+            tool._git_repo_root(tmp_path)
+        result = tool.execute()
+        assert "git executable not available" in result
+        assert "Not a git repository" not in result
+
+    def test_t1b_exit_127_reports_unavailable(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        monkeypatch.setattr(
+            tool, "_run_git_raw",
+            lambda repo_root, args, timeout=30: (127, "", "git: not found"),
+        )
+        result = tool.execute()
+        assert "git executable not available" in result
+        assert "Not a git repository" not in result
+
+    def test_t2_not_a_repo_message(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        monkeypatch.setattr(
+            tool, "_run_git_raw",
+            lambda repo_root, args, timeout=30: (
+                128, "",
+                "fatal: not a git repository (or any of the parent directories): .git",
+            ),
+        )
+        result = tool.execute()
+        assert "Not a git repository" in result
+        assert "not available" not in result
+
+    def test_t3_happy_path_still_resolves_root(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            tool, "_run_git_raw",
+            lambda repo_root, args, timeout=30: (0, str(repo), ""),
+        )
+        assert tool._git_repo_root(tmp_path) == repo
+        result = tool.execute()
+        assert "not available" not in result
+        assert "Not a git repository" not in result
+
+    def test_t4_conflated_string_absent_from_sources(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for rel in ("tools/git_info_tool.py", "tools/git_write_tool.py"):
+            src = (repo_root / rel).read_text(encoding="utf-8")
+            assert "not available or not a git repository" not in src, rel
 

@@ -14,6 +14,33 @@ from agent.config.resource_catalog import catalog_entry
 logger = logging.getLogger(__name__)
 
 
+class GitUnavailableError(FileNotFoundError):
+    """The git executable could not be run (missing binary / unspawnable).
+
+    Raised by ``GitReadTool._git_repo_root`` so that "git is unavailable" is
+    never reported as "not a git repository".
+
+    Subclasses ``FileNotFoundError`` deliberately: ``GitWriteTool`` (which
+    shares ``_git_repo_root``) only catches
+    ``(subprocess.TimeoutExpired, TimeoutError, FileNotFoundError)`` around its
+    call, so this keeps that call site fail-closed without modification.
+    """
+
+
+def _git_run_indicates_missing_git(exit_code: int, stderr: Optional[str]) -> bool:
+    """True when a failed ``git`` run looks like a missing git executable.
+
+    Distinguishes "git could not be found" (a POSIX shell exits 127, or the
+    runtime prints a "command not found"-style message) from "git ran and this
+    is not a repository" (e.g. exit 128 with "fatal: not a git repository"), so
+    the two failure modes are never reported with the same message.
+    """
+    if exit_code == 127:
+        return True
+    text = (stderr or "").strip().lower()
+    return "command not found" in text or "not found" in text
+
+
 def _migrate_legacy_git_execution_mode(agent_config: Optional[dict]) -> None:
     """Pop the retired ``git_execution_mode`` session/agent-config key.
 
@@ -436,8 +463,24 @@ class GitReadTool(ToolBase):
             # path before re-validation.
             try:
                 resolved_root = self._git_repo_root(repo_root)
-            except (subprocess.TimeoutExpired, TimeoutError, FileNotFoundError):
-                return self._truncate_output(f"Git not available or not a git repository: {repo_root}")
+            except GitUnavailableError as e:
+                # The git binary is missing / could not be spawned: an
+                # availability failure, NOT a "not a repository" condition.
+                return self._truncate_output(
+                    f"git executable not available: {e}"
+                )
+            except (subprocess.TimeoutExpired, TimeoutError) as e:
+                # A hung git binary is also an availability failure; never
+                # report it as "not a git repository".
+                return self._truncate_output(
+                    f"git executable not available (timed out): {e}"
+                )
+            except FileNotFoundError as e:
+                # Defensive parity with the previous spawn-error handling: an
+                # unwrapped "git not found" is still an availability failure.
+                return self._truncate_output(
+                    f"git executable not available: {e}"
+                )
             if resolved_root is None:
                 return self._truncate_output(f"Not a git repository: {repo_root}")
             repo_root = resolved_root
@@ -805,15 +848,34 @@ class GitReadTool(ToolBase):
         Fast path: ``<repo_root>/.git`` exists as a directory. Otherwise
         consult ``git rev-parse --show-toplevel``; in container mode the
         returned ``/workspace`` path is reverse-mapped to the host path.
+
+        Returns ``None`` ONLY when git ran and reported that ``repo_root`` is
+        not inside a repository. When the git executable itself cannot be run
+        (missing binary, exit 127, or an unspawnable process) this raises
+        ``GitUnavailableError`` instead, so an unavailable git is never
+        conflated with a genuine "not a git repository" result.
         """
         dot_git = repo_root / ".git"
         if dot_git.exists() and dot_git.is_dir():
             return repo_root
 
-        exit_code, stdout, _stderr = self._run_git_raw(
-            repo_root, ["rev-parse", "--show-toplevel"], timeout=10
-        )
+        try:
+            exit_code, stdout, stderr = self._run_git_raw(
+                repo_root, ["rev-parse", "--show-toplevel"], timeout=10
+            )
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            # The git binary could not be spawned at all -- not a repository
+            # problem. Surface it as unavailability so the caller never emits
+            # the misleading "Not a git repository" message.
+            raise GitUnavailableError(
+                f"git command could not be executed: {e}"
+            ) from e
         if exit_code != 0 or not stdout.strip():
+            if _git_run_indicates_missing_git(exit_code, stderr):
+                raise GitUnavailableError(
+                    f"git command failed (exit code {exit_code}): "
+                    f"{(stderr or '').strip() or 'no output'}"
+                )
             return None
         if self._use_container_mode():
             return self._from_container_path(stdout.strip())

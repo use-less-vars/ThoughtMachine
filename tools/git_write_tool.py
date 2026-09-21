@@ -246,8 +246,16 @@ class GitWriteTool(GitReadTool):
             # path before re-validation.
             try:
                 resolved_root = self._git_repo_root(repo_root)
-            except (subprocess.TimeoutExpired, TimeoutError, FileNotFoundError):
-                return self._truncate_output(f"Git not available or not a git repository: {repo_root}")
+            except (subprocess.TimeoutExpired, TimeoutError) as e:
+                # A hung git binary is an availability failure, not a
+                # "not a repository" condition.
+                return self._truncate_output(f"git executable not available (timed out): {e}")
+            except FileNotFoundError as e:
+                # GitUnavailableError (raised by _git_repo_root when the git
+                # binary is missing or unspawnable) subclasses
+                # FileNotFoundError, so it lands here and is reported as an
+                # availability failure rather than as "not a git repository".
+                return self._truncate_output(f"git executable not available: {e}")
             if resolved_root is None:
                 return self._truncate_output(f"Not a git repository: {repo_root}")
             repo_root = resolved_root
