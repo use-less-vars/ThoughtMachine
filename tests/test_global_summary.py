@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 import web_ui.backend.global_routes as global_routes
+from agent.config.provider_profile import ProviderProfile
 
 
 @pytest.fixture
@@ -76,6 +77,14 @@ class _FakeSessions:
 class _FakeWorkerManager:
     def list_workers(self, session_id):
         return ["worker-1"]
+
+
+class _FakeProviderManager:
+    def __init__(self, profiles=()):
+        self._profiles = list(profiles)
+
+    def list_profiles(self):
+        return self._profiles
 
 
 def _patch_summary_deps(
@@ -164,7 +173,7 @@ def test_global_summary_working_and_idle_statuses(
 
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body.keys()) == {"workspaces", "active_sessions", "active_containers"}
+    assert set(body.keys()) == {"workspaces", "active_sessions", "active_containers", "providers"}
     assert "warning" not in body
 
     by_id = {w["id"]: w for w in body["workspaces"]}
@@ -222,7 +231,75 @@ def test_global_summary_build_summary_never_raises(monkeypatch, tmp_path):
 
     body = global_routes._build_summary()
 
-    assert set(body.keys()) == {"workspaces", "active_sessions", "active_containers"}
+    assert set(body.keys()) == {"workspaces", "active_sessions", "active_containers", "providers"}
     assert body["workspaces"][0]["status"] == "idle"
     assert body["active_sessions"] == []
     assert body["active_containers"] == []
+
+
+def test_build_summary_includes_providers(monkeypatch, tmp_path):
+    """_build_summary() exposes provider profiles projected to the WS shape."""
+    _patch_summary_deps(
+        monkeypatch,
+        tmp_path,
+        workspace_entries=[],
+        sessions={},
+        worker_manager=_FakeWorkerManager(),
+    )
+    profiles = [
+        ProviderProfile(
+            id="p1",
+            label="Local",
+            provider_type="openai_compatible",
+            base_url="http://localhost:1234/v1",
+            api_key="sk-test",
+            default_model="m1",
+            models=["m1", "m2"],
+            timeout=42,
+        ),
+        ProviderProfile(
+            id="p2",
+            label="Cloud",
+            provider_type="anthropic",
+            base_url="https://api.example/v1",
+            api_key="",
+            default_model="claude",
+            models=[],
+            timeout=120,
+        ),
+    ]
+    # Patch the module-level import site so the projection is deterministic.
+    monkeypatch.setattr(
+        global_routes,
+        "ProviderManager",
+        lambda: _FakeProviderManager(profiles),
+        raising=False,
+    )
+
+    body = global_routes._build_summary()
+
+    providers = body["providers"]
+    assert isinstance(providers, list)
+    assert providers == [
+        {
+            "id": "p1",
+            "label": "Local",
+            "provider_type": "openai_compatible",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "sk-test",
+            "default_model": "m1",
+            "models": ["m1", "m2"],
+            "timeout": 42,
+        },
+        {
+            "id": "p2",
+            "label": "Cloud",
+            "provider_type": "anthropic",
+            "base_url": "https://api.example/v1",
+            "api_key": "",
+            "default_model": "claude",
+            "models": [],
+            "timeout": 120,
+        },
+    ]
+
