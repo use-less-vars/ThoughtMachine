@@ -173,6 +173,9 @@ class StateBridge:
         """
         # Remove custom system prompt so validator falls through to file default
         custom_path = Path(config_loader.CUSTOM_SYSTEM_PROMPT_PATH)
+        # Back it up first (parity with the agent_config.json back-up made by
+        # save_config below); _backup_config is a silent no-op if it is absent.
+        config_loader._backup_config(str(custom_path))
         try:
             custom_path.unlink(missing_ok=True)
             log('DEBUG', 'presenter.state_bridge',
