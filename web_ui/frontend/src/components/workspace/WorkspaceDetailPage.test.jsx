@@ -115,7 +115,7 @@ function makeSummary(overrides = {}) {
         display_name: 'Git',
         description: 'Version control access to repositories.',
         permission_grain_set: ['banned', 'read', 'ask', 'write'],
-        default_execution_context: 'containerized',
+        execution_mode: 'container',
         container_image: null,
         dockerfile_reference: null,
         tools: ['git_read', 'git_write'],
@@ -125,7 +125,7 @@ function makeSummary(overrides = {}) {
         display_name: 'Filesystem',
         description: 'Read and write access to workspace files.',
         permission_grain_set: ['banned', 'read', 'ask', 'write'],
-        default_execution_context: 'containerized',
+        execution_mode: 'container',
         container_image: null,
         dockerfile_reference: null,
         tools: ['read_file', 'file_editor', 'apply_edits'],
@@ -135,7 +135,7 @@ function makeSummary(overrides = {}) {
         display_name: 'Host shell',
         description: 'Execute commands directly on the host machine.',
         permission_grain_set: ['banned', 'read', 'ask', 'write'],
-        default_execution_context: 'containerized',
+        execution_mode: 'host',
         container_image: null,
         dockerfile_reference: null,
         tools: ['host_bash'],
@@ -340,7 +340,7 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getByText('Container')).toBeInTheDocument()
     expect(document.querySelectorAll('.wdp-resource-card').length).toBe(6)
     // Execution-context badges exist only on catalog rows (here: 3).
-    expect(screen.getAllByText('containerized')).toHaveLength(3)
+    expect(screen.getAllByText('container')).toHaveLength(2)
     // Tools render as individual chips (not a comma-joined string).
     expect(screen.getByText('git_read')).toBeInTheDocument()
     expect(screen.getByText('git_write')).toBeInTheDocument()

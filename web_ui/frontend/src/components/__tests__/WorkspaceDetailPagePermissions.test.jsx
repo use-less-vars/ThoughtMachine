@@ -40,7 +40,7 @@ const CATALOG = [
     display_name: 'Git',
     description: 'Version control access',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
-    default_execution_context: 'containerized',
+    execution_mode: 'container',
     container_image: null,
     dockerfile_reference: null,
     tools: ['git_read', 'git_write'],
@@ -50,7 +50,7 @@ const CATALOG = [
     display_name: 'Filesystem',
     description: 'Filesystem access',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
-    default_execution_context: 'containerized',
+    execution_mode: 'container',
     container_image: null,
     dockerfile_reference: null,
     tools: ['read_file', 'file_editor', 'apply_edits', 'file_search', 'glob'],
@@ -60,7 +60,7 @@ const CATALOG = [
     display_name: 'Container',
     description: 'Container sandboxed code execution (Docker runtime)',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
-    default_execution_context: 'containerized',
+    execution_mode: 'container',
     container_image: null,
     dockerfile_reference: null,
     tools: ['docker_code_runner', 'container_control'],
@@ -70,7 +70,7 @@ const CATALOG = [
     display_name: 'Host bash',
     description: 'Host shell execution',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
-    default_execution_context: 'containerized',
+    execution_mode: 'host',
     container_image: null,
     dockerfile_reference: null,
     tools: ['host_bash'],
@@ -80,7 +80,7 @@ const CATALOG = [
     display_name: 'TTY',
     description: 'Terminal device access',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
-    default_execution_context: 'containerized',
+    execution_mode: 'host',
     container_image: null,
     dockerfile_reference: null,
     tools: [],
@@ -90,7 +90,7 @@ const CATALOG = [
     display_name: 'JTAG',
     description: 'Hardware debug access',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
-    default_execution_context: 'containerized',
+    execution_mode: 'host',
     container_image: null,
     dockerfile_reference: null,
     tools: [],
@@ -215,9 +215,9 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     expect(cardFor('Git').getByText('Enabled')).toBeInTheDocument()
     expect(screen.getAllByText('Enabled')).toHaveLength(3)
     expect(screen.getAllByText('Disabled')).toHaveLength(3)
-    // git/filesystem/container/host_bash catalog rows + tty/jtag all carry the
-    // 'containerized' execution-context badge.
-    expect(screen.getAllByText('containerized')).toHaveLength(6)
+    // git/filesystem/container catalog rows carry the 'container'
+    // execution-context badge; host_bash/tty/jtag carry 'host'.
+    expect(screen.getAllByText('container')).toHaveLength(3)
   })
 
   it('applies a network ceiling change through its fallback card', async () => {

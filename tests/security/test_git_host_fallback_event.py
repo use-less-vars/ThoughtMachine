@@ -90,8 +90,16 @@ def _events(vault):
     ]
 
 
-def _host_mode_tool(tmp_path):
-    """Branch 1: ``git_execution_mode='host'`` -> ``_use_container_mode()`` False."""
+def _host_mode_tool(tmp_path, monkeypatch):
+    """Branch 1: catalog selects host mode -> ``_use_container_mode()`` False.
+
+    The legacy ``git_execution_mode`` agent-config key is still supplied, to
+    prove it is ignored (popped) rather than honoured.
+    """
+    monkeypatch.setattr(
+        "tools.git_info_tool.catalog_entry",
+        lambda name: {"execution_mode": "host"} if name == "git" else {},
+    )
     tool = GitInfoTool(
         operation="status",
         session_permissions={"git": "write"},
@@ -130,8 +138,8 @@ def _host_fallback_manager(detail="resource image unavailable"):
 # ---------------------------------------------------------------------------
 # Branch 1: config selects host mode
 # ---------------------------------------------------------------------------
-def test_branch1_appends_host_execution_event(tmp_path):
-    tool = _host_mode_tool(tmp_path)
+def test_branch1_appends_host_execution_event(tmp_path, monkeypatch):
+    tool = _host_mode_tool(tmp_path, monkeypatch)
     tool._run_git_raw(tmp_path, ["status"])
 
     events = _events(tmp_path / "vault")
@@ -147,8 +155,8 @@ def test_branch1_appends_host_execution_event(tmp_path):
     assert payload["kill_switch_state"] == "on"
 
 
-def test_branch1_event_shape(tmp_path):
-    tool = _host_mode_tool(tmp_path)
+def test_branch1_event_shape(tmp_path, monkeypatch):
+    tool = _host_mode_tool(tmp_path, monkeypatch)
     tool._run_git_raw(tmp_path, ["status"])
 
     ev = _events(tmp_path / "vault")[0]
@@ -195,7 +203,7 @@ def test_branch2_appends_host_execution_event_with_detail(tmp_path):
 def test_no_event_when_host_denied(tmp_path, monkeypatch):
     # A vault with NO allow_host_resources config -> fail-closed deny.
     monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "empty-vault"))
-    tool = _host_mode_tool(tmp_path)
+    tool = _host_mode_tool(tmp_path, monkeypatch)
 
     with pytest.raises(RuntimeError):
         tool._run_git_raw(tmp_path, ["status"])
@@ -206,8 +214,8 @@ def test_no_event_when_host_denied(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Append-only: N fallbacks -> N events
 # ---------------------------------------------------------------------------
-def test_events_are_append_only(tmp_path):
-    tool = _host_mode_tool(tmp_path)
+def test_events_are_append_only(tmp_path, monkeypatch):
+    tool = _host_mode_tool(tmp_path, monkeypatch)
     tool._run_git_raw(tmp_path, ["status"])
     tool._run_git_raw(tmp_path, ["status"])
 
@@ -219,8 +227,8 @@ def test_events_are_append_only(tmp_path):
 # ---------------------------------------------------------------------------
 # Unresolvable workspace id -> no-op (never raises)
 # ---------------------------------------------------------------------------
-def test_missing_workspace_id_writes_nothing(tmp_path):
-    tool = _host_mode_tool(tmp_path)
+def test_missing_workspace_id_writes_nothing(tmp_path, monkeypatch):
+    tool = _host_mode_tool(tmp_path, monkeypatch)
     object.__setattr__(tool, "_resolved_workspace_id", None)
 
     tool._record_host_fallback_event()  # must not raise
@@ -232,7 +240,7 @@ def test_missing_workspace_id_writes_nothing(tmp_path):
 # R3: a write failure is swallowed (and logged), never raised
 # ---------------------------------------------------------------------------
 def test_write_failure_never_raises(tmp_path, caplog, monkeypatch):
-    tool = _host_mode_tool(tmp_path)
+    tool = _host_mode_tool(tmp_path, monkeypatch)
 
     # (a) vault root unresolvable -> path resolution fails -> silent no-op.
     def _boom():

@@ -2,8 +2,8 @@
 
 Covers:
 1. ``resolve_git_execution_mode`` — containerized / host_fallback / unavailable,
-   mirroring GitInfoTool's execution-mode decision (agent config → workspace
-   metadata → default container).
+   mirroring GitInfoTool's execution-mode decision, which is driven by the
+   resource catalog's ``execution_mode`` field for the ``git`` resource.
 2. ``validate_path`` allows workspace-local ``.githooks`` scripts while still
    blocking ``.git/config``: the hook security boundary is the policy-owned
    ``.githooks`` directory plus the resource container.
@@ -36,24 +36,28 @@ class TestResolveGitExecutionMode:
     def test_defaults_to_containerized(self):
         assert resolve_git_execution_mode({}, {}, "/ws", "ws-1") == "containerized"
 
-    def test_agent_config_host_wins(self):
-        assert (
-            resolve_git_execution_mode({"git_execution_mode": "host"}, {}, "/ws", "ws-1")
-            == "host_fallback"
+    def test_catalog_host_mode_wins(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.git_info_tool.catalog_entry",
+            lambda name: {"execution_mode": "host"} if name == "git" else {},
         )
+        assert resolve_git_execution_mode({}, {}, "/ws", "ws-1") == "host_fallback"
 
-    def test_agent_config_container(self):
-        assert (
-            resolve_git_execution_mode(
-                {"git_execution_mode": "container"}, {}, "/ws", "ws-1"
+    def test_legacy_agent_config_keys_ignored(self):
+        for legacy_value in ("host", "container"):
+            agent_config = {"git_execution_mode": legacy_value}
+            assert (
+                resolve_git_execution_mode(agent_config, {}, "/ws", "ws-1")
+                == "containerized"
             )
-            == "containerized"
-        )
+            assert "git_execution_mode" not in agent_config
 
-    def test_workspace_metadata_fallback(self):
+    def test_workspace_metadata_ignored(self):
+        # The legacy workspace-metadata key is no longer consulted: the
+        # resource catalog is the single source of truth.
         assert (
             resolve_git_execution_mode({}, {"git_execution_mode": "host"}, "/ws", "ws-1")
-            == "host_fallback"
+            == "containerized"
         )
 
     def test_missing_workspace_id_falls_back_to_host(self):
@@ -528,12 +532,10 @@ class TestCheckSystemGitMode:
 
     def test_probe_exception_keeps_resolver_value(self, tmp_path, monkeypatch):
         self._probe(monkeypatch, RuntimeError("probe exploded"))
-        result = self._make(
-            {"git_execution_mode": "host"}, str(tmp_path)
-        )._query_capabilities("ws-1", str(tmp_path))
-        assert result["git"]["mode"] == "host_fallback"
+        result = self._make({}, str(tmp_path))._query_capabilities("ws-1", str(tmp_path))
+        assert result["git"]["mode"] == "containerized"
         assert result["resources"]["git"] == {
-            "mode": "host_fallback",
+            "mode": "containerized",
             "detail": "probe unavailable",
         }
 

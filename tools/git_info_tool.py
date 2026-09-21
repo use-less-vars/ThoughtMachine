@@ -9,9 +9,32 @@ from pathlib import Path
 from .base import ToolBase
 from security.sandboxed_execution import SandboxedExecution
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
+from agent.config.resource_catalog import catalog_entry
 
 
 logger = logging.getLogger(__name__)
+
+
+def _migrate_legacy_git_execution_mode(agent_config: Optional[dict]) -> None:
+    """Pop the retired ``git_execution_mode`` session/agent-config key.
+
+    The git execution mode is now taken from the resource catalog's ``git``
+    entry (``execution_mode``); the legacy ``git_execution_mode`` config key can
+    no longer influence resolution, so a stale persisted value is popped on
+    read.  A legacy ``"host"`` value used to force a host fallback, so it is
+    surfaced with a WARNING that names it rather than being silently lost --
+    the same retire-tolerant-on-read pattern used for ``use_container_registry``.
+    """
+    if not isinstance(agent_config, dict):
+        return
+    stale = agent_config.pop("git_execution_mode", None)
+    if stale == "host":
+        logger.warning(
+            "Ignoring legacy git_execution_mode=%r; the git execution mode is "
+            "now taken from the resource catalog 'git' entry's execution_mode "
+            "field.",
+            stale,
+        )
 
 
 def resolve_git_execution_mode(
@@ -25,17 +48,22 @@ def resolve_git_execution_mode(
     Mirrors ``GitReadTool._git_execution_mode`` / ``_use_container_mode`` so
     the decision is observable outside the tool (e.g. CheckSystem).
 
+    The mode is the ``execution_mode`` of the resource catalog's ``git`` entry
+    (``"container"`` | ``"host"``).  The retired session/agent-config key
+    ``git_execution_mode`` (and the workspace-metadata key of the same name)
+    no longer influence resolution -- a stale config value is popped on read by
+    ``_migrate_legacy_git_execution_mode`` (logged when it was ``"host"``).
+
     Returns:
         "containerized": git runs inside the workspace resource container.
         "host_fallback": git runs on the host inside the hermetic sandbox.
         "unavailable": no resolvable workspace to run against.
     """
-    config = agent_config or {}
-    mode = config.get("git_execution_mode")
-    if mode not in ("host", "container"):
-        metadata = workspace_metadata or {}
-        mode = metadata.get("git_execution_mode")
-    effective_mode = mode if mode in ("host", "container") else "container"
+    _migrate_legacy_git_execution_mode(agent_config)
+
+    entry = catalog_entry("git") or {}
+    mode = entry.get("execution_mode")
+    effective_mode = mode if mode in ("container", "host") else "container"
 
     if not resolved_workspace_path:
         return "unavailable"
@@ -917,15 +945,18 @@ class GitReadTool(ToolBase):
     def _git_execution_mode(self) -> str:
         """Return 'host' or 'container' for git execution.
 
-        Precedence: ``agent_config['git_execution_mode']`` (per-session),
-        then workspace metadata ``git_execution_mode``, then the default
-        ``'container'``. Container mode additionally requires a
-        registry-derived workspace (enforced by ``_use_container_mode()``).
+        The mode is the ``execution_mode`` of the resource catalog's ``git``
+        entry.  The retired session/agent-config key ``git_execution_mode`` and
+        the workspace-metadata key of the same name no longer influence
+        resolution (any stale config value is popped on read by
+        ``_migrate_legacy_git_execution_mode``). Container mode additionally
+        requires a registry-derived workspace (enforced by
+        ``_use_container_mode()``).
         """
-        config = getattr(self, "agent_config", None) or {}
-        mode = config.get("git_execution_mode")
-        if mode not in ("host", "container"):
-            mode = self._workspace_metadata().get("git_execution_mode")
+        _migrate_legacy_git_execution_mode(getattr(self, "agent_config", None))
+
+        entry = catalog_entry("git") or {}
+        mode = entry.get("execution_mode")
         return mode if mode in ("host", "container") else "container"
 
     def _workspace_metadata(self) -> dict:
@@ -956,14 +987,14 @@ class GitReadTool(ToolBase):
     def _use_container_mode(self) -> bool:
         """True when git must run inside the resource container.
 
-        Container mode requires (a) an explicit execution mode other than
-        'host' AND (b) a registry-derived workspace (id + path). The
-        registry requirement keeps deprecated ``workspace_path`` callers and
-        direct test invocations on the host path, so tests without a docker
-        daemon never enter container mode.
+        Container mode requires (a) the resource catalog ``git`` entry's
+        ``execution_mode`` to be ``"container"`` AND (b) a registry-derived
+        workspace (id + path). The registry requirement keeps deprecated
+        ``workspace_path`` callers and direct test invocations on the host
+        path, so tests without a docker daemon never enter container mode.
         """
         return (
-            self._git_execution_mode() != "host"
+            self._git_execution_mode() == "container"
             and bool(self._resolved_workspace_path)
             and bool(self._resolved_workspace_id)
         )

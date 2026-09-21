@@ -244,7 +244,7 @@ function PermissionsResourcesTab({
     return renderResourceCard({
       name,
       label: (entry && entry.display_name) || (fallback && fallback.display_name) || name,
-      context: entry ? entry.default_execution_context || 'unknown context' : null,
+      context: entry ? entry.execution_mode || 'unknown context' : null,
       description:
         (entry && entry.description) ||
         (fallback && fallback.description) ||
@@ -263,7 +263,7 @@ function PermissionsResourcesTab({
       renderResourceCard({
         name: entry.name,
         label: entry.display_name || entry.name,
-        context: entry.default_execution_context || 'unknown context',
+        context: entry.execution_mode || 'unknown context',
         description: entry.description || 'No description provided.',
         options: undefined,
         tools: entry.tools,

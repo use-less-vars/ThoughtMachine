@@ -43,6 +43,7 @@ _LEGACY_RESOURCES = {
         "name": "Git",
         "description": "Git repository operations (read, write and branch-aware write).",
         "default_permission": "read",
+        "execution_mode": "container",
         "required_workspace_switch": None,
         "risk_level": "low",
         "ui_category": "git",
@@ -51,6 +52,7 @@ _LEGACY_RESOURCES = {
         "name": "Filesystem",
         "description": "File read/write access to the workspace tree.",
         "default_permission": "read",
+        "execution_mode": "container",
         "required_workspace_switch": None,
         "risk_level": "low",
         "ui_category": "filesystem",
@@ -59,10 +61,13 @@ _LEGACY_RESOURCES = {
         "name": "Container",
         "description": "Docker container lifecycle and code execution in sandboxes.",
         "default_permission": False,
+        "execution_mode": "container",
         "required_workspace_switch": "allow_docker",
         "risk_level": "medium",
         "ui_category": "sandbox",
     },
+    # ``network`` / ``mcp`` have no array-catalog counterpart (permission-only
+    # grains), so they carry no ``execution_mode`` field.
     "network": {
         "name": "Network",
         "description": "Outbound network access (HTTP requests, downloads, API calls).",
@@ -83,6 +88,7 @@ _LEGACY_RESOURCES = {
         "name": "Host Bash",
         "description": "Supervised shell command execution on the host machine.",
         "default_permission": "banned",
+        "execution_mode": "host",
         "required_workspace_switch": "allow_host_resources",
         "risk_level": "high",
         "ui_category": "host",
@@ -129,6 +135,32 @@ _REMOVED_LEGACY_RESOURCES: Tuple[str, ...] = (
     "execution",
 )
 
+#: Valid per-resource ``execution_mode`` vocabulary (renamed from the retired
+#: ``default_execution_context``).  ``"container"`` runs a resource's work
+#: inside its resource container; ``"host"`` runs it on the host.
+_EXECUTION_MODES: Tuple[str, ...] = ("container", "host")
+
+
+def _validate_execution_mode(entries: Any) -> None:
+    """Reject any array-catalog entry whose ``execution_mode`` is invalid.
+
+    Raises ``ValueError`` naming the offending entry and value so a malformed
+    catalog fails loudly at load time instead of silently defaulting.  Non-list
+    inputs are ignored (the legacy dict shape carries no ``execution_mode``).
+    """
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        mode = entry.get("execution_mode")
+        if mode not in _EXECUTION_MODES:
+            raise ValueError(
+                "resource catalog entry "
+                f"{entry.get('name', '<unnamed>')!r} has invalid "
+                f"execution_mode {mode!r}; expected one of {list(_EXECUTION_MODES)}"
+            )
+
 
 def load_resource_catalog() -> Dict[str, Any]:
     """Load the resource catalog JSON (uncached, always re-read).
@@ -138,11 +170,16 @@ def load_resource_catalog() -> Dict[str, Any]:
     ``{"schema_version": 1, "permission_levels": ["banned", "ask", "read",
     "write"], "resources": _LEGACY_RESOURCES}`` is returned so the permission
     machinery keeps its legacy tool-level semantics.
+
+    Every array entry's ``execution_mode`` is validated against
+    ``_EXECUTION_MODES`` (``container`` | ``host``); an invalid value raises
+    ``ValueError`` rather than being silently defaulted.
     """
     with open(_CATALOG_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict):
         return data
+    _validate_execution_mode(data)
     return {
         "schema_version": 1,
         "permission_levels": ["banned", "ask", "read", "write"],
