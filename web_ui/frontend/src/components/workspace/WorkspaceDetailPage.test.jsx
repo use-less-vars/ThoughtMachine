@@ -44,6 +44,21 @@ const DEFAULT_FALLBACK = {
   text: async () => '',
 }
 
+// Faithful logs-route stub: GET .../containers/{name}/logs returns a JSON body
+// only ({container, success, stdout, stderr, duration}). A real HTTP Response
+// exposes that payload through .text() as its serialized form, so .text()
+// yields the JSON string, NOT the bare log text. A viewer that reverts to
+// response.text() renders the envelope blob and the marker assertions fail.
+function logsOk(stdout, container = 'research-runner') {
+  const envelope = { container, success: true, stdout, stderr: '', duration: 0.01 }
+  return {
+    ok: true,
+    status: 200,
+    json: async () => envelope,
+    text: async () => JSON.stringify(envelope),
+  }
+}
+
 function stubFetchByUrl(routes, defaultResponse = DEFAULT_FALLBACK) {
   const fetchMock = vi.fn(async (url, init) => {
     const key = Object.keys(routes)
@@ -624,4 +639,146 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.queryByRole('dialog', { name: /^New session$/ })).toBeNull()
     expect(createBodies.length).toBe(0)
   })
+
+  // --- Containers tab: live read-only status view -------------------------
+  // The tab must present the summary's live container state as a read-only
+  // table, reveal a detail region on row selection, and lazily fetch
+  // container logs from the read-only logs route. No lifecycle controls.
+
+  it('renders a read-only container status table with column headers', async () => {
+    stubFetchByUrl(routesFor(makeSummary()))
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    expect(screen.getByRole('columnheader', { name: 'Name' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'State' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'Type' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'ID' })).toBeInTheDocument()
+  })
+
+  it('reveals a container detail region when a row is selected', async () => {
+    stubFetchByUrl(routesFor(makeSummary()))
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    expect(screen.queryByText('Container detail')).toBeNull()
+    fireEvent.click(screen.getByText('research-runner'))
+    expect(screen.getByText('Container detail')).toBeInTheDocument()
+    expect(screen.getByText('Workspace ID')).toBeInTheDocument()
+  })
+
+  it('loads container logs on demand into a pre element with the read-only route', async () => {
+    const logText = 'boot\nlistening on :8080\n'
+    const fetchMock = stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': logsOk(logText),
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logs' }))
+
+    const pre = await screen.findByText(/listening on :8080/)
+    expect(pre.tagName).toBe('PRE')
+    // Rendered output is the decoded stdout, not the JSON envelope blob.
+    expect(pre.textContent).toMatch(/listening on :8080/)
+    expect(pre.textContent).not.toMatch(/"container"|"success"|"duration"/)
+    const urls = fetchMock.mock.calls.map(([u]) => String(u))
+    expect(
+      urls.some((u) =>
+        u.includes('/api/workspace/ws-1/containers/research-runner/logs?tail=200')
+      )
+    ).toBe(true)
+  })
+
+  it('shows an inline error when container logs fail to load', async () => {
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': jsonErr('no such container', 404),
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logs' }))
+    expect(await screen.findByText(/Failed to load logs/)).toBeInTheDocument()
+  })
+
+  it('exposes no container lifecycle controls in the read-only tab', async () => {
+    stubFetchByUrl(routesFor(makeSummary()))
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    expect(
+      screen.queryByRole('button', { name: /start|stop|remove|restart|delete|kill|recreate/i })
+    ).toBeNull()
+    // The only control in the tab is the read-only logs viewer toggle.
+    expect(screen.getByRole('button', { name: 'Logs' })).toBeInTheDocument()
+  })
 })
+
+// --- Container logs viewer extraction (integration) -------------------------
+// The inline logs viewer was extracted into ContainerLogsViewer; the tab now
+// delegates to it. These tests pin the accessible contract the tab exposes:
+// a labelled logs region, the single long-log affordance (a tail-size select),
+// a logs toggle whose accessible name still contains "Logs", and the exact
+// backend error string.
+
+describe('WorkspaceDetailPage \u2014 container logs viewer', () => {
+  it('exposes an accessible logs region and a tail-size select after opening logs', async () => {
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': logsOk('boot\nlistening on :8080\n'),
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+
+    // The logs toggle's accessible name still contains "Logs".
+    fireEvent.click(screen.getByRole('button', { name: /Logs/ }))
+
+    // A labelled region wraps the log output.
+    const region = await screen.findByRole('region', { name: 'Container logs' })
+    expect(region).toBeInTheDocument()
+    const pre = screen.getByText(/listening on :8080/)
+    expect(pre.tagName).toBe('PRE')
+
+    // The single long-log affordance is the tail-size select.
+    const select = screen.getByRole('combobox', { name: 'Log tail size' })
+    expect(Array.from(select.options).map((o) => Number(o.value))).toEqual([
+      200, 500, 1000, 2000,
+    ])
+  })
+
+  it('refetches container logs with the newly chosen tail', async () => {
+    const fetchMock = stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers/research-runner/logs': logsOk('boot\nlistening on :8080\n'),
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+    fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
+    fireEvent.click(screen.getByRole('button', { name: /Logs/ }))
+
+    const select = await screen.findByRole('combobox', { name: 'Log tail size' })
+    fireEvent.change(select, { target: { value: '500' } })
+
+    await waitFor(() => {
+      const urls = fetchMock.mock.calls.map(([u]) => String(u))
+      expect(
+        urls.some((u) =>
+          u.includes('/api/workspace/ws-1/containers/research-runner/logs?tail=500')
+        )
+      ).toBe(true)
+    })
+  })
+})
+

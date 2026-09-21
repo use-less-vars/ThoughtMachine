@@ -5,7 +5,7 @@
  *
  * Architecture (workspace panel shell, Phase 4 + R7):
  *   ┌──────────────────────────────────────────────────────────────────────┐
- *   │  [WorkspacePanel | WorkspaceSelector]   route                        │
+ *   │  [WorkspaceDetailPage | WorkspaceSelector]   route                   │
  *   │  [TabBar strip]  — per-workspace session tabs (frontend-only state)  │
  *   │  ┌─ SessionTab ─┐ (tabs visited on the session layer stay mounted   │
  *   │  │ (own WS)     │  as a hidden deck, so tab switches preserve state  │
@@ -27,7 +27,7 @@
  *
  * Routing (see src/router.js):
  *   #/workspaces          → WorkspaceSelector (no strip)
- *   #/workspace/:id       → WorkspacePanel + strip + active session tab
+ *   #/workspace/:id       → WorkspaceDetailPage (+ session tab strip)
  *   #/session/:sessionId  → tabbed session view (tab ensured + activated)
  */
 

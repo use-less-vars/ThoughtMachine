@@ -858,3 +858,72 @@ p.rcp-drift-detected {
   color: #a6e3a1;
 }
 
+
+/* Hardening verdict + freshness (B4-UI) ----------------------------------- */
+
+.rcp-hardening {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.2rem;
+}
+
+.rcp-hardening-verdict {
+  display: inline-block;
+  align-self: flex-start;
+  margin: 0;
+  padding: 0.15rem 0.55rem;
+  border-radius: 10px;
+  font-size: 0.82rem;
+}
+
+.rcp-hardening-conformant {
+  background: #a6e3a1;
+  color: #1e1e2e;
+}
+
+.rcp-hardening-drifted {
+  background: #f38ba8;
+  color: #1e1e2e;
+}
+
+.rcp-hardening-unknown {
+  background: #f9e2af;
+  color: #1e1e2e;
+}
+
+.rcp-hardening-failed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 0.6rem;
+}
+
+.rcp-hardening-failed-axis {
+  font-family: monospace;
+  font-size: 0.76rem;
+  color: #f38ba8;
+}
+
+.rcp-freshness {
+  margin-top: 0.2rem;
+}
+
+.rcp-freshness-status {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.rcp-freshness-matches {
+  color: #a6e3a1;
+}
+
+.rcp-freshness-differs {
+  color: #f38ba8;
+}
+
+.rcp-freshness-unknown {
+  color: #f9e2af;
+}

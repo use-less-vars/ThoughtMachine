@@ -11,12 +11,15 @@ import useWorkspaceSummary from './useWorkspaceSummary'
 import { fetchTools, updateWorkspacePermissions } from './workspaceApi'
 import VaultHealthBanner from '../VaultHealthBanner'
 import NewSessionModal from './modals/NewSessionModal'
+import ContainerLogsViewer from './ContainerLogsViewer'
+import RecordContainerPanel from '../RecordContainerPanel'
 import './WorkspaceDetailPage.css'
 
 const TABS = [
   'Overview',
   'Permissions & Resources',
   'Containers',
+  'Records',
   'Workers',
   'Session Defaults',
   'Tools',
@@ -297,6 +300,16 @@ function PermissionsResourcesTab({
 function ContainersTab({ summary }) {
   const dockerfile = summary.dockerfile || null
   const containers = Array.isArray(summary.active_containers) ? summary.active_containers : []
+  const workspaceId = summary.workspace_id
+  // Read-only: the tab reflects the summary's live container state and can
+  // lazily fetch logs. Nothing here starts, stops or otherwise mutates a
+  // container.
+  const [selectedKey, setSelectedKey] = useState(null)
+  const [logsOpenKey, setLogsOpenKey] = useState(null)
+
+  const keyFor = (container, index) => container.id || container.name || `container-${index}`
+  const selected =
+    containers.find((container, index) => keyFor(container, index) === selectedKey) || null
 
   return (
     <div className="wdp-tab-content">
@@ -317,27 +330,83 @@ function ContainersTab({ summary }) {
         {containers.length === 0 ? (
           <div className="wdp-empty">No active containers.</div>
         ) : (
-          <div className="wdp-container-list">
-            {containers.map((container) => (
-              <div className="wdp-container-row" key={container.id || container.name}>
-                <div className="wdp-container-main">
-                  <span className="wdp-container-name">{container.name || 'unnamed'}</span>
-                  <span className="wdp-badge wdp-context-badge">
-                    {container.type || 'unknown type'}
-                  </span>
-                </div>
-                <div className="wdp-container-meta">
-                  <span className="wdp-container-status">{container.status || 'unknown'}</span>
-                  {container.id && <span className="wdp-container-id">{container.id}</span>}
-                  {container.workspace_id && (
-                    <span className="wdp-container-ws">{container.workspace_id}</span>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
+          <table className="wdp-container-table">
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">State</th>
+                <th scope="col">Type</th>
+                <th scope="col">ID</th>
+                <th scope="col">Workspace</th>
+                <th scope="col">Logs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {containers.map((container, index) => {
+                const key = keyFor(container, index)
+                const isSelected = key === selectedKey
+                const isLogsOpen = key === logsOpenKey
+                return (
+                  <React.Fragment key={key}>
+                    <tr
+                      className={`wdp-container-row${isSelected ? ' wdp-container-row-selected' : ''}`}
+                      onClick={() => setSelectedKey(isSelected ? null : key)}
+                    >
+                      <td className="wdp-container-name">{container.name || 'unnamed'}</td>
+                      <td className="wdp-container-status">{container.status || 'unknown'}</td>
+                      <td className="wdp-container-type">{container.type || 'unknown type'}</td>
+                      <td className="wdp-container-id">{container.id || '—'}</td>
+                      <td className="wdp-container-ws">
+                        {container.workspace_id || workspaceId || '—'}
+                      </td>
+                      <td className="wdp-container-logs-cell">
+                        <button
+                          type="button"
+                          className="wdp-logs-toggle"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            setLogsOpenKey((current) => (current === key ? null : key))
+                          }}
+                        >
+                          {isLogsOpen ? 'Hide logs' : 'Logs'}
+                        </button>
+                      </td>
+                    </tr>
+                    {isLogsOpen && (
+                      <tr className="wdp-container-logs-row">
+                        <td colSpan={6}>
+                          <ContainerLogsViewer
+                            workspaceId={workspaceId}
+                            containerName={container.name || ''}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                )
+              })}
+            </tbody>
+          </table>
         )}
       </div>
+
+      {selected && (
+        <div className="wdp-card wdp-container-detail">
+          <div className="wdp-card-label">Container detail</div>
+          <div className="wdp-container-detail-grid">
+            <span className="wdp-detail-key">Container ID</span>
+            <span className="wdp-detail-value">{selected.id || '—'}</span>
+            <span className="wdp-detail-key">Name</span>
+            <span className="wdp-detail-value">{selected.name || 'unnamed'}</span>
+            <span className="wdp-detail-key">State</span>
+            <span className="wdp-detail-value">{selected.status || 'unknown'}</span>
+            <span className="wdp-detail-key">Type</span>
+            <span className="wdp-detail-value">{selected.type || 'unknown type'}</span>
+            <span className="wdp-detail-key">Workspace ID</span>
+            <span className="wdp-detail-value">{selected.workspace_id || workspaceId || '—'}</span>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -764,6 +833,8 @@ export default function WorkspaceDetailPage({ workspaceId }) {
           />
         ) : activeTab === 'Containers' ? (
           <ContainersTab summary={summary} />
+        ) : activeTab === 'Records' ? (
+          <RecordContainerPanel workspaceId={summary.workspace_id} />
         ) : activeTab === 'Workers' ? (
           <WorkersTab summary={summary} />
         ) : activeTab === 'Tools' ? (

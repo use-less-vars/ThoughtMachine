@@ -12,6 +12,7 @@
 //   GET /api/container-records
 //   GET /api/container-records/{record_id}?workspace_id=<ws>
 //   GET /api/container-records/{record_id}/events?workspace_id=<ws>
+//   GET /api/workspace/{ws}/containers/{container_name}/status   (live hardening)
 //
 // Write surface (record-keyed only; confirmed against server.py):
 //   POST /api/container-records/{record_id}/kill?workspace_id=<ws>
@@ -22,6 +23,14 @@
 // Drift shape (per finding): {drift_class, event_type, expected, actual,
 // signature}. `drift === null` means the live state could NOT be inspected
 // (Docker unreachable) -- distinct from `[]`, which means "no drift".
+//
+// Hardening shape: the workspace container-status route returns
+//   {hardening: {status: 'conformant'|'drifted'|'unverified', failed: [<axis>]}}
+// rendered as a three-state verdict (conformant / drifted / unknown); every
+// unreadable or unverifiable outcome collapses to "unknown" (never
+// "conformant" -- fail-closed). Freshness compares that LIVE verdict against
+// the record's RECORDED posture (`intent_snapshot.hardening`): the live
+// hardening either matches, differs from, or cannot be compared to it.
 
 import React, { useCallback, useEffect, useState } from 'react'
 
@@ -72,6 +81,54 @@ function driftLabel(drift) {
   if (status === 'unknown') return 'drift: unknown'
   if (status === 'clean') return 'drift: clean'
   return `drift: ${drift.length}`
+}
+
+//: Live hardening-conformance verdict, read from the workspace container-status
+//: route. Shape: {status: 'conformant'|'drifted'|'unverified', failed: [<axis>]}.
+//: Fail-closed: anything that is not an explicit 'conformant'/'drifted' status
+//: (a failed read, an absent/non-object payload, or the server's own
+//: 'unverified') collapses to 'unknown' -- never 'conformant'.
+function hardeningVerdict(hardening) {
+  const status = hardening && typeof hardening === 'object' ? hardening.status : null
+  if (status === 'conformant') return 'conformant'
+  if (status === 'drifted') return 'drifted'
+  return 'unknown'
+}
+
+//: The failing hardening axes reported by the live verdict, in server order.
+function hardeningFailedAxes(hardening) {
+  if (!hardening || typeof hardening !== 'object') return []
+  return Array.isArray(hardening.failed) ? hardening.failed : []
+}
+
+//: Does the record carry a recorded (expected) hardening posture? Only a
+//: non-empty `intent_snapshot.hardening` object counts.
+function hasRecordedHardening(intentSnapshot) {
+  const hardening = intentSnapshot && intentSnapshot.hardening
+  return Boolean(
+    hardening &&
+      typeof hardening === 'object' &&
+      Object.keys(hardening).length > 0
+  )
+}
+
+//: Freshness = the LIVE verdict checked against the RECORDED posture. 'matches'
+//: / 'differs' only when both sides are available; a live 'unknown' verdict or
+//: an absent recorded posture makes the comparison impossible.
+function freshnessState(recordedPresent, verdict) {
+  if (verdict === 'conformant') return recordedPresent ? 'matches' : 'unknown'
+  if (verdict === 'drifted') return recordedPresent ? 'differs' : 'unknown'
+  return 'unknown'
+}
+
+function freshnessLabel(state) {
+  if (state === 'matches') {
+    return 'Freshness: the live hardening matches the recorded posture.'
+  }
+  if (state === 'differs') {
+    return 'Freshness: the live hardening differs from the recorded posture.'
+  }
+  return 'Freshness: cannot compare \u2014 the live hardening verdict is unavailable or no posture was recorded.'
 }
 
 async function readBody(response) {
@@ -284,7 +341,7 @@ function DriftTable({ findings, expandedKey, onToggle }) {
 
 // ── Panel ───────────────────────────────────────────────────────────────────
 
-export default function RecordContainerPanel() {
+export default function RecordContainerPanel({ workspaceId = null }) {
   const [records, setRecords] = useState(null)
   const [listLoading, setListLoading] = useState(true)
   const [listError, setListError] = useState(null)
@@ -296,6 +353,9 @@ export default function RecordContainerPanel() {
   const [events, setEvents] = useState(null)
   const [eventsError, setEventsError] = useState(null)
   const [expandedDriftKey, setExpandedDriftKey] = useState(null)
+  //: Live three-state hardening verdict, fetched from the container-status
+  //: route for the selected record (null until it resolves / on any failure).
+  const [liveHardening, setLiveHardening] = useState(null)
 
   // Pass-2b write-action state: a fixed actor plus an optional free-text reason,
   // plus bookkeeping for the in-flight request and its success/failure feedback.
@@ -368,6 +428,23 @@ export default function RecordContainerPanel() {
     }
   }, [])
 
+  //: Fetch the live hardening verdict (read-only) for the selected record's
+  //: container. Fail-closed: every failure/missing payload -> null -> "unknown".
+  const loadHardening = useCallback(async (name, workspaceId) => {
+    setLiveHardening(null)
+    if (!name || !workspaceId) return
+    try {
+      const response = await fetch(
+        `/api/workspace/${encodeURIComponent(workspaceId)}/containers/${encodeURIComponent(name)}/status`
+      )
+      const body = await readBody(response)
+      if (!response || !response.ok) return
+      setLiveHardening(body && typeof body === 'object' ? body.hardening : null)
+    } catch (err) {
+      setLiveHardening(null)
+    }
+  }, [])
+
   useEffect(() => {
     loadList()
   }, [loadList])
@@ -380,23 +457,40 @@ export default function RecordContainerPanel() {
     return () => clearInterval(timer)
   }, [loadList])
 
-  const list = Array.isArray(records) ? records : []
+  const allRecords = Array.isArray(records) ? records : []
+  //: Optional workspace scope. When a `workspaceId` prop is supplied (the
+  //: workspace-context mount) only records whose own `workspace_id` field
+  //: matches are listed; omitted (the Global mount) => every workspace.
+  const list = workspaceId
+    ? allRecords.filter((record) => record && record.workspace_id === workspaceId)
+    : allRecords
   const selectedRecord =
     list.find((record, index) => recordKey(record, index) === selectedId) || null
   const selectedWorkspaceId =
     selectedRecord && selectedRecord.workspace_id ? selectedRecord.workspace_id : ''
+  const selectedName =
+    selectedRecord && selectedRecord.name ? selectedRecord.name : ''
 
   useEffect(() => {
     if (!selectedId) return
     loadDetail(selectedId, selectedWorkspaceId)
     loadEvents(selectedId, selectedWorkspaceId)
-  }, [selectedId, selectedWorkspaceId, loadDetail, loadEvents])
+    loadHardening(selectedName, selectedWorkspaceId)
+  }, [
+    selectedId,
+    selectedName,
+    selectedWorkspaceId,
+    loadDetail,
+    loadEvents,
+    loadHardening,
+  ])
 
   const handleRefresh = () => {
     loadList()
     if (selectedId) {
       loadDetail(selectedId, selectedWorkspaceId)
       loadEvents(selectedId, selectedWorkspaceId)
+      loadHardening(selectedName, selectedWorkspaceId)
     }
   }
 
@@ -438,6 +532,7 @@ export default function RecordContainerPanel() {
         await loadList()
         loadDetail(selectedId, selectedWorkspaceId)
         loadEvents(selectedId, selectedWorkspaceId)
+        loadHardening(selectedName, selectedWorkspaceId)
         setActionNotice(`${actionLabel(action)} applied to ${selectedId}.`)
       } catch (err) {
         setActionError(networkFailure(err))
@@ -449,10 +544,12 @@ export default function RecordContainerPanel() {
       actor,
       reason,
       selectedId,
+      selectedName,
       selectedWorkspaceId,
       loadList,
       loadDetail,
       loadEvents,
+      loadHardening,
     ]
   )
 
@@ -464,6 +561,12 @@ export default function RecordContainerPanel() {
       ? detail.intent_snapshot
       : {}
   const intentKeys = Object.keys(intentSnapshot)
+  const verdict = hardeningVerdict(liveHardening)
+  const failedAxes = hardeningFailedAxes(liveHardening)
+  const freshness = freshnessState(
+    hasRecordedHardening(intentSnapshot),
+    verdict
+  )
   //: Which write actions the selected record currently permits (see helpers).
   const enablement = actionEnablement(detail || selectedRecord)
 
@@ -607,6 +710,55 @@ export default function RecordContainerPanel() {
                   ))}
                 </dl>
               )}
+
+              <h5 className="rcp-subsection-title">Hardening</h5>
+              <section className="rcp-hardening" aria-label="Hardening verdict">
+                {verdict === 'conformant' && (
+                  <p
+                    className="rcp-hardening-verdict rcp-hardening-conformant"
+                    role="status"
+                  >
+                    Hardening: conformant — every present hardening axis is
+                    satisfied.
+                  </p>
+                )}
+                {verdict === 'drifted' && (
+                  <>
+                    <p
+                      className="rcp-hardening-verdict rcp-hardening-drifted"
+                      role="status"
+                    >
+                      Hardening: drifted — {failedAxes.length} failing axis
+                      {failedAxes.length === 1 ? '' : 'es'}.
+                    </p>
+                    <ul className="rcp-hardening-failed">
+                      {failedAxes.map((axis) => (
+                        <li className="rcp-hardening-failed-axis" key={axis}>
+                          {axis}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                {verdict === 'unknown' && (
+                  <p
+                    className="rcp-hardening-verdict rcp-hardening-unknown"
+                    role="status"
+                  >
+                    Hardening: unknown — the live hardening verdict could not
+                    be verified.
+                  </p>
+                )}
+              </section>
+
+              <section className="rcp-freshness" aria-label="Freshness">
+                <p
+                  className={`rcp-freshness-status rcp-freshness-${freshness}`}
+                  role="status"
+                >
+                  {freshnessLabel(freshness)}
+                </p>
+              </section>
 
               <h5 className="rcp-subsection-title">Drift</h5>
               {driftStatus(detailDrift) === 'unknown' && (
