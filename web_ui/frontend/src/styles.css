@@ -131,6 +131,12 @@ body {
   background: rgba(243, 139, 168, 0.25);
 }
 
+/* Fix 3C: brief pulse on the recovery banner when a stale-session send is
+   blocked (reuses the existing worker-glow-pulse keyframe). */
+.session-error-banner--pulse {
+  animation: worker-glow-pulse 0.4s ease-in-out 1;
+}
+
 /* ── Docker health banner (top-level; shown when the backend is unreachable
       or the Docker daemon is unavailable) ── */
 .docker-health-banner {

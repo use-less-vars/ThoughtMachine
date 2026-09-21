@@ -97,6 +97,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [staleSession, setStaleSession] = useState(false)
   const staleSessionRef = useRef(false)
   const pendingAdoptRef = useRef(null)
+  // Fix 3C: brief pulse on the existing recovery banner when a send is blocked
+  // by the stale-session gate, so a dead click gives visible feedback.
+  const [staleClickPulse, setStaleClickPulse] = useState(false)
+  const staleClickPulseTimerRef = useRef(null)
+  useEffect(() => () => clearTimeout(staleClickPulseTimerRef.current), [])
   // Fix 4d: set while awaiting the reply to a recovery new_session (load_error
   // path). The reply carries a DIFFERENT id than the dead one this tab was
   // waiting for — the flag makes the handler accept it via the normal path
@@ -249,6 +254,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     // user starts a new session.
     if (staleSessionRef.current) {
       console.warn('[SessionTab] Stale session — command blocked:', command)
+      // Fix 3C: pulse the existing recovery banner so the blocked click is visible.
+      setStaleClickPulse(true)
+      if (staleClickPulseTimerRef.current) clearTimeout(staleClickPulseTimerRef.current)
+      staleClickPulseTimerRef.current = setTimeout(() => setStaleClickPulse(false), 400)
       return
     }
     const ws = wsRef.current
@@ -1179,7 +1188,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         ) : null}
       </div>
       {sessionError ? (
-        <div className="session-error-banner" role="alert">
+        <div
+          className={`session-error-banner${staleClickPulse ? ' session-error-banner--pulse' : ''}`}
+          role="alert"
+        >
           <span className="session-error-banner-text">⚠ {sessionError}</span>
           {staleSession ? (
             <button
