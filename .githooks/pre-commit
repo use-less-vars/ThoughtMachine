@@ -262,10 +262,10 @@ S3_END="$(now_ns)"
 STEPS123_MS="$(elapsed_ms "$OVERALL_START" "$S3_END")"
 CONTRACT_TEST="tests/integration/test_session_creation_contract.py"
 
-echo "[pre-commit] 4/4 conditional contract test"
+echo "[pre-commit] 4/4 conditional contract test (auto-skips on slow machines)"
 S4_START="$(now_ns)"
 if [ "$STEPS123_MS" -ge 3000 ]; then
-    echo "  SKIP — steps 1-3 took ${STEPS123_MS} ms (>= 3000 ms); pytest would exceed the 10 s budget"
+    echo "  ⚠ SKIPPED — steps 1-3 took ${STEPS123_MS} ms (>= 3000 ms); pytest budget would exceed the 10 s limit"
 else
     # Enforced: the session-creation contract test went green once
     # create_session began resolving a non-empty provider_id/model.
