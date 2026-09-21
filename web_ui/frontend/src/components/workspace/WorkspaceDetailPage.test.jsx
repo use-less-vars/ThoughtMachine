@@ -538,8 +538,9 @@ describe('WorkspaceDetailPage', () => {
 
     expect(screen.queryByText(/risk score/i)).toBeNull()
     expect(screen.queryByText(/critical/i)).toBeNull()
-    // The detail page now carries its own back-to-workspaces nav link.
-    expect(screen.getByRole('link', { name: '← Back to workspaces' })).toHaveAttribute('href', '#/workspaces')
+    // The page no longer carries its own back link; that affordance now lives
+    // in the shared App-level <LayerNav> (not mounted in this standalone render).
+    expect(screen.queryByRole('link', { name: /back to workspaces/i })).toBeNull()
   })
 
   it('shows the exact placeholder strings in the Session Defaults and Credentials tabs', async () => {
@@ -565,9 +566,9 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getAllByText('Host execution').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByText('Active sessions')).toBeInTheDocument()
     expect(screen.getByText('Active containers')).toBeInTheDocument()
-    // ...and the legacy panel's error chrome is not; the new page's own back
-    // link IS present (three-layer nav: workspaces → workspace → session).
-    expect(screen.getByRole('link', { name: '← Back to workspaces' })).toHaveAttribute('href', '#/workspaces')
+    // ...and the legacy panel's error chrome is not; the page no longer carries
+    // its own back link — the shared App-level <LayerNav> owns the breadcrumb.
+    expect(screen.queryByRole('link', { name: /back to workspaces/i })).toBeNull()
     expect(screen.queryByText('Workspace not found.')).toBeNull()
   })
 

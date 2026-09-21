@@ -8,9 +8,9 @@
  *
  *   workspaces (selector)  →  workspace (WorkspaceDetailPage)  →  session (SessionTab)
  *
- *   - the workspace level carries its own back affordance: the detail page's
- *     '← Back to workspaces' link (#/workspaces);
- *   - the session level's '← Back to Workspace' button goes to the OWNING
+ *   - the shared App-level <LayerNav> breadcrumb carries the back affordances:
+ *     a 'Workspaces' crumb links to the selector (#/workspaces);
+ *   - the workspace crumb links to the OWNING
  *     workspace — the nested session URL (#/workspace/:wsId/session/:sid)
  *     carries the owning workspaceId explicitly (route.workspaceId), so the
  *     back button reaches the workspace level immediately, even before any
@@ -29,6 +29,7 @@ import {
   waitFor,
   act,
   fireEvent,
+  within,
 } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import App from '../../App'
@@ -179,7 +180,7 @@ describe('Three-layer navigation: workspaces → workspace → session', () => {
     seedWorkspaceSessions(hub)
     await screen.findByRole('tab', { name: 'Permissions & Resources' })
     expect(await screen.findByText('Code Development')).toBeInTheDocument()
-    const backLink = screen.getByRole('link', { name: '← Back to workspaces' })
+    const backLink = within(screen.getByTestId('layer-nav')).getByRole('link', { name: 'Workspaces' })
     expect(backLink).toHaveAttribute('href', '#/workspaces')
     fireEvent.click(backLink)
     await waitFor(() => expect(window.location.hash).toBe('#/workspaces'))
@@ -198,14 +199,18 @@ describe('Three-layer navigation: workspaces → workspace → session', () => {
     expect(tabWs).not.toBe(hub)
     await act(async () => tabWs.open())
     act(() => tabWs.receive({ type: 'session_loaded', session_id: 'sess-1', workspace_id: ENTRY.id, session_name: 'S1' }))
-    const backBtn = await screen.findByTitle('Back to workspace')
-    expect(backBtn).toBeInTheDocument()
-    expect(backBtn.textContent).toContain('← Back to Workspace')
+    const nav = await screen.findByTestId('layer-nav')
+    const backBtn = within(nav)
+      .getAllByRole('link')
+      .find((a) => a.getAttribute('href') === `#/workspace/${ENTRY.id}`)
+    expect(backBtn).toBeTruthy()
     fireEvent.click(backBtn)
     await waitFor(() => expect(window.location.hash).toBe(`#/workspace/${ENTRY.id}`))
     expect(await screen.findByRole('tab', { name: 'Permissions & Resources' })).toBeInTheDocument()
     expect(document.querySelector('.tab-wrapper')).toBeNull()
-    expect(screen.queryByTitle('Back to workspace')).toBeNull()
+    const navWs = screen.getByTestId('layer-nav')
+    expect(within(navWs).queryByRole('link', { name: 'Workspace' })).toBeNull()
+    expect(within(navWs).getByRole('link', { name: 'Workspaces' })).toBeInTheDocument()
   })
 
   it('browser back/forward retraces session → workspace → selector and forward again', async () => {
@@ -226,7 +231,12 @@ describe('Three-layer navigation: workspaces → workspace → session', () => {
     expect(tabWs).not.toBe(hub)
     await act(async () => tabWs.open())
     act(() => tabWs.receive({ type: 'session_loaded', session_id: 'sess-1', workspace_id: ENTRY.id, session_name: 'S1' }))
-    expect(await screen.findByTitle('Back to workspace')).toBeInTheDocument()
+    const navBf = await screen.findByTestId('layer-nav')
+    expect(
+      within(navBf)
+        .getAllByRole('link')
+        .some((a) => a.getAttribute('href') === `#/workspace/${ENTRY.id}`)
+    ).toBe(true)
     // Browser back: session → workspace.
     await act(async () => { window.history.back(); await new Promise((r) => setTimeout(r, 30)) })
     await waitFor(() => expect(window.location.hash).toBe(`#/workspace/${ENTRY.id}`))
