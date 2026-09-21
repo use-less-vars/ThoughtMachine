@@ -1552,3 +1552,290 @@ class TestCatFile:
         assert out.startswith("Git command failed")
         assert "Not a valid object name" in out
 
+
+# ---------------------------------------------------------------------------
+# merge_base / stash_list / reflog / show_file (B2)
+# ---------------------------------------------------------------------------
+class TestNewOperationNamesAcceptedB2:
+    @pytest.mark.parametrize(
+        "name", ["merge_base", "stash_list", "reflog", "show_file"]
+    )
+    def test_literal_accepts_new_operation(self, tmp_path, name):
+        tool = _read_host_tool(tmp_path, operation=name)
+        assert tool.operation == name
+
+
+class TestLogRevisionHonoured:
+    BASE = [
+        "log", "--no-ext-diff", "--no-textconv", "--max-count=50", "--oneline"
+    ]
+
+    def test_no_branch_argv_unchanged(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls == [list(self.BASE)]
+
+    def test_branch_inserted_as_revision(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", branch="main")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls == [self.BASE + ["main"]]
+
+    def test_branch_precedes_path_separator(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="log", branch="main", file_path="a.txt"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls == [self.BASE + ["main", "--", "a.txt"]]
+
+    def test_unknown_revision_surfaced_as_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", branch="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128, stderr="fatal: bad revision 'nope'"
+        )
+        out = tool._git_log(tmp_path)
+        assert calls == [self.BASE + ["nope"]]
+        assert out.startswith("Git command failed")
+        assert "bad revision" in out
+
+    @pytest.mark.parametrize("bad", ["-x", "a b", "\tx", "x\ny"])
+    def test_invalid_branch_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="log", branch=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_log(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_max_count_clamped_high(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", max_count=99999)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls[0][3] == "--max-count=1000"
+
+    def test_max_count_clamped_low(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", max_count=0)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls[0][3] == "--max-count=1"
+
+    def test_since_until_still_honoured(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="log", since="2020-01-01", until="2021-01-01"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert "--since=2020-01-01" in calls[0]
+        assert "--until=2021-01-01" in calls[0]
+
+
+class TestMergeBase:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a="main", b="dev")
+        calls = _shadow_run_git_raw(tool, stdout="abc123\n")
+        out = tool._git_merge_base(tmp_path)
+        assert calls == [["merge-base", "main", "dev"]]
+        assert "abc123" in out
+
+    def test_is_ancestor_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="merge_base", a="main", b="dev", is_ancestor=True
+        )
+        calls = _shadow_run_git_raw(tool, stdout="")
+        tool._git_merge_base(tmp_path)
+        assert calls == [["merge-base", "--is-ancestor", "main", "dev"]]
+
+    def test_no_common_ancestor_exit1_meaningful(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a="main", b="dev")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=1)
+        out = tool._git_merge_base(tmp_path)
+        assert calls == [["merge-base", "main", "dev"]]
+        assert "No common ancestor (no merge base)." in out
+        assert out.strip() != ""
+
+    def test_is_ancestor_true_exit0_positive(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="merge_base", a="main", b="dev", is_ancestor=True
+        )
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_merge_base(tmp_path)
+        assert "is an ancestor of" in out
+
+    def test_is_ancestor_false_exit1_negative(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="merge_base", a="main", b="dev", is_ancestor=True
+        )
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=1)
+        out = tool._git_merge_base(tmp_path)
+        assert "is not an ancestor of" in out
+        assert out.strip() != ""
+
+    def test_other_nonzero_exit_is_standard_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a="main", b="dev")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Not a valid object name main",
+        )
+        out = tool._git_merge_base(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "Not a valid object name" in out
+
+    @pytest.mark.parametrize(
+        "a,b",
+        [(None, "dev"), ("main", None), ("", "dev"), ("main", "")],
+    )
+    def test_missing_refs_error_before_git(self, tmp_path, a, b):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a=a, b=b)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_merge_base(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    @pytest.mark.parametrize("bad", ["-x", "a b", "x\ny"])
+    def test_invalid_ref_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a=bad, b="dev")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_merge_base(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+class TestStashList:
+    def test_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="stash_list")
+        calls = _shadow_run_git_raw(tool, stdout="stash@{0}: WIP\n")
+        out = tool._git_stash_list(tmp_path)
+        assert calls == [["stash", "list"]]
+        assert "WIP" in out
+
+    def test_empty_is_benign(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="stash_list")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_stash_list(tmp_path)
+        assert calls == [["stash", "list"]]
+        assert "No stashes." in out
+        assert not out.startswith("Git command failed")
+
+    def test_nonzero_is_standard_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="stash_list")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128, stderr="fatal: not a git repository"
+        )
+        out = tool._git_stash_list(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "not a git repository" in out
+
+
+class TestReflog:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog")
+        calls = _shadow_run_git_raw(tool, stdout="abc HEAD@{0}: commit\n")
+        out = tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n20", "HEAD"]]
+        assert "HEAD@{0}" in out
+
+    def test_custom_ref_and_limit(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", ref="main", limit=5)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n5", "main"]]
+
+    def test_limit_clamped_high(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", limit=5000)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n1000", "HEAD"]]
+
+    def test_limit_clamped_low(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", limit=0)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n1", "HEAD"]]
+
+    def test_empty_is_benign(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_reflog(tmp_path)
+        assert "No reflog entries." in out
+        assert not out.startswith("Git command failed")
+
+    def test_bad_ref_nonzero_is_standard_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", ref="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: ambiguous argument 'nope'",
+        )
+        out = tool._git_reflog(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "ambiguous argument" in out
+
+    @pytest.mark.parametrize("bad", ["-x", "a b", "x\ny"])
+    def test_invalid_ref_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="reflog", ref=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_reflog(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+class TestShowFile:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        calls = _shadow_run_git_raw(tool, stdout="hello\n")
+        out = tool._git_show_file(tmp_path)
+        assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]
+        assert "hello" in out
+
+    def test_custom_ref(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", ref="main", path="a.txt"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="x\n")
+        tool._git_show_file(tmp_path)
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "main:a.txt"]
+        ]
+
+    def test_missing_ref_error_before_git(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", ref=None, path="a.txt")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_missing_path_error_before_git(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_path_escaping_workspace_rejected(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", path="../outside.txt"
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_not_tracked_at_ref_is_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: path 'a.txt' does not exist in 'HEAD'",
+        )
+        out = tool._git_show_file(tmp_path)
+        assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]
+        assert out.startswith("Git command failed")
+        assert "does not exist" in out
+
+    def test_empty_file_is_not_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_show_file(tmp_path)
+        assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]
+        assert not out.startswith("Git command failed")
+        assert not out.startswith("Error:")
+

@@ -282,10 +282,12 @@ class GitReadTool(ToolBase):
         "status", "diff", "diff_cached", "log", "branch", "branch_list",
         "show", "remote", "blame", "config",
         "rev_parse", "show_ref", "for_each_ref", "ls_tree", "cat_file",
+        "merge_base", "stash_list", "reflog", "show_file",
     ] = Field(
         description="Git read operation to perform: status, diff, diff_cached, log, "
         "branch, branch_list, show, remote, blame, config, rev_parse, "
-        "show_ref, for_each_ref, ls_tree, cat_file"
+        "show_ref, for_each_ref, ls_tree, cat_file, merge_base, stash_list, "
+        "reflog, show_file"
     )
     
     # Common parameters
@@ -436,6 +438,27 @@ class GitReadTool(ToolBase):
         default=None,
         description="Object type for cat_file: blob|tree|commit|tag "
         "(default pretty-print -p)."
+    )
+
+    # merge_base parameters
+    a: Optional[str] = Field(
+        default=None,
+        description="First ref for merge_base operation."
+    )
+    b: Optional[str] = Field(
+        default=None,
+        description="Second ref for merge_base operation."
+    )
+    is_ancestor: bool = Field(
+        default=False,
+        description="Use --is-ancestor for merge_base (exit 1 = not an "
+        "ancestor)."
+    )
+
+    # reflog parameters (reuses the ``ref`` field)
+    limit: Optional[int] = Field(
+        default=20,
+        description="Maximum number of reflog entries (clamped to 1..1000)."
     )
 
     def _validate_repo_root(self, repo_root: Path) -> Path:
@@ -650,6 +673,14 @@ class GitReadTool(ToolBase):
                 return self._git_ls_tree(repo_root)
             elif self.operation == "cat_file":
                 return self._git_cat_file(repo_root)
+            elif self.operation == "merge_base":
+                return self._git_merge_base(repo_root)
+            elif self.operation == "stash_list":
+                return self._git_stash_list(repo_root)
+            elif self.operation == "reflog":
+                return self._git_reflog(repo_root)
+            elif self.operation == "show_file":
+                return self._git_show_file(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         
@@ -1290,7 +1321,12 @@ class GitReadTool(ToolBase):
     
     def _git_log(self, repo_root: Path) -> str:
         """Run git log."""
-        args = ["log", "--no-ext-diff", "--no-textconv", f"--max-count={self.max_count}", "--oneline"]
+        try:
+            raw_max = self.max_count if self.max_count is not None else 50
+            max_count = max(1, min(1000, int(raw_max)))
+        except (TypeError, ValueError):
+            return self._truncate_output("Error: max_count must be an integer")
+        args = ["log", "--no-ext-diff", "--no-textconv", f"--max-count={max_count}", "--oneline"]
         if self.since:
             args.append(f"--since={self.since}")
         if self.until:
@@ -1299,6 +1335,15 @@ class GitReadTool(ToolBase):
             args.append(f"--author={self.author}")
         if self.grep:
             args.append(f"--grep={self.grep}")
+        if self.branch:
+            # The revision is now HONORED: a single validated argv element
+            # AFTER the option flags and BEFORE the '--' path separator. An
+            # unknown revision yields a non-zero exit surfaced as the standard
+            # error form, never silently ignored.
+            try:
+                args.append(self._validate_git_ref(self.branch, field="branch"))
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
         if self.file_path:
             # Validate file paths are within workspace (list-safe)
             try:
@@ -1697,6 +1742,121 @@ class GitReadTool(ToolBase):
                 args.extend(rels)
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
+
+    def _git_merge_base(self, repo_root: Path) -> str:
+        """Run git merge-base on two validated refs.
+
+        Exit code 1 is MEANINGFUL and is never mapped to empty/None: for the
+        plain form it means no common ancestor; for ``--is-ancestor`` it means
+        the first ref is NOT an ancestor of the second. Any other non-zero
+        exit is the standard error form.
+        """
+        if not self.a or not self.b:
+            return self._truncate_output(
+                "Error: a and b are required for merge_base operation"
+            )
+        try:
+            a = self._validate_git_ref(self.a, field="a")
+            b = self._validate_git_ref(self.b, field="b")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        args = ["merge-base"] + (
+            ["--is-ancestor"] if self.is_ancestor else []
+        ) + [a, b]
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args)
+        if self.is_ancestor:
+            if exit_code == 0:
+                return self._with_mode(
+                    self._truncate_output(f"{a!r} is an ancestor of {b!r}.")
+                )
+            if exit_code == 1:
+                return self._with_mode(
+                    self._truncate_output(f"{a!r} is not an ancestor of {b!r}.")
+                )
+        else:
+            if exit_code == 1:
+                return self._with_mode(
+                    self._truncate_output("No common ancestor (no merge base).")
+                )
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_stash_list(self, repo_root: Path) -> str:
+        """Run git stash list; empty output is benign, non-zero is an error."""
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, ["stash", "list"])
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        if not stdout.strip():
+            return self._with_mode(self._truncate_output("No stashes."))
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_reflog(self, repo_root: Path) -> str:
+        """Run git reflog on a validated ref with a clamped entry limit."""
+        try:
+            ref = self._validate_git_ref(self.ref or "HEAD", field="ref")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        try:
+            limit = int(self.limit) if self.limit is not None else 20
+        except (TypeError, ValueError):
+            return self._truncate_output("Error: limit must be an integer")
+        limit = max(1, min(1000, limit))
+        args = ["reflog", f"-n{limit}", ref]
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args)
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        if not stdout.strip():
+            return self._with_mode(self._truncate_output("No reflog entries."))
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_show_file(self, repo_root: Path) -> str:
+        """Show a single tracked file at a ref (``git show <ref>:<path>``).
+
+        A non-zero exit is the explicit "path not tracked at ref" signal and is
+        surfaced as the standard error form; exit 0 with empty stdout is a
+        legitimately empty file and is returned as empty content, not an error.
+        """
+        if not self.ref:
+            return self._truncate_output(
+                "Error: ref is required for show_file operation"
+            )
+        if not self.path:
+            return self._truncate_output(
+                "Error: path is required for show_file operation"
+            )
+        try:
+            ref = self._validate_git_ref(self.ref, field="ref")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        try:
+            rels = self._validated_rel_paths(repo_root, self.path)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        rel = rels[0]
+        exit_code, stdout, stderr = self._run_git_raw(
+            repo_root,
+            ["show", "--no-ext-diff", "--no-textconv", f"{ref}:{rel}"],
+        )
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        return self._with_mode(self._truncate_output(stdout))
 
     def _git_cat_file(self, repo_root: Path) -> str:
         """Run git cat-file (-p by default, or a validated object type)."""
