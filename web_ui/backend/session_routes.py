@@ -6,7 +6,6 @@ Provides:
 - GET    /api/session/list            — list all sessions
 - GET    /api/session/{session_id}    — get session details
 - DELETE /api/session/{session_id}    — delete a session
-- POST   /api/session/{session_id}/rename — rename a session
 - GET    /api/session/{session_id}/permissions  — stored raw + computed effective session permissions
 - PUT    /api/session/{session_id}/permissions  — atomically replace the stored raw session permissions
 """
@@ -68,10 +67,6 @@ class CreateSessionResponse(BaseModel):
     updated_at: str
     workspace_id: str = ""
     mode: str = "agent"
-
-
-class RenameSessionBody(BaseModel):
-    name: str
 
 
 class SessionListItem(BaseModel):
@@ -275,54 +270,6 @@ async def get_session(session_id: str) -> Dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get session: {exc}",
-        )
-
-
-@router.post("/{session_id}/rename", response_model=CreateSessionResponse)
-async def rename_session(
-    session_id: str,
-    body: RenameSessionBody,
-) -> Dict[str, Any]:
-    """Rename a session.
-
-    Accepts a new name. The session is loaded, renamed, and persisted.
-    Returns the updated session metadata.
-    """
-    try:
-        store = _get_store()
-        session = store.load_session(session_id, workspace_id=None)
-        if session is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Session not found: {session_id}",
-            )
-
-        session.metadata['name'] = body.name
-        store.save_session(session, workspace_id=session.workspace_id)
-
-        # Update name in global session registry
-        registry = SessionRegistry.get_default()
-        registry.register(
-            session_id=session.session_id,
-            workspace_id=session.workspace_id or "",
-            name=body.name,
-            mode=session.mode,
-        )
-
-        return {
-            "session_id": session.session_id,
-            "name": session.metadata.get('name', 'Untitled Session'),
-            "created_at": session.created_at.isoformat() if hasattr(session.created_at, 'isoformat') else str(session.created_at),
-            "updated_at": session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else str(session.updated_at),
-            "workspace_id": session.workspace_id or "",
-            "mode": session.mode,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to rename session: {exc}",
         )
 
 
