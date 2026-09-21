@@ -17,9 +17,9 @@
 # zero tests must not be able to report green).
 #
 # Measured collection counts (branch fix/git-host-fallback-closure):
-#   * total                                      = 3649
-#   * -m "not docker and not e2e"                 = 3644 (5 deselected)
-#   * thin node set (4 files below)              = 76
+#   * total (gate floor) = 3827
+#   * -m "not docker and not e2e"                 = 3836 (5 deselected)
+#   * thin node set (4 files below)              = 77
 #
 # macOS install note: install.sh supports Darwin (it runs the same prerequisite
 # and venv checks as on Linux, minus the Linux-only apt / docker-group steps),

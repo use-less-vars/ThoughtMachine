@@ -137,9 +137,9 @@ const DEFAULT_ROUTES = {
     },
   }),
   '/api/health/containers': jsonOk({ docker: 'reachable' }),
-  '/api/workspace/ws-1/workers': jsonOk([
-    { name: 'w1', runtime_status: 'ready' },
-    { name: 'w2', runtime_status: 'busy' },
+  '/api/workspace/ws-1/workers/active': jsonOk([
+    { worker_name: 'w1', instance_id: 1, status: 'ready' },
+    { worker_name: 'w2', instance_id: 1, status: 'busy' },
   ]),
   '/api/workspace/ws-1/containers': jsonOk({ containers: [] }),
   '/api/session/list': jsonOk([]),
@@ -264,13 +264,13 @@ describe('SessionSidebar — structure', () => {
     stubBackend({
       '/api/workspace/list': jsonOk([{ id: 'ws-1', label: 'Blank Workspace', root: '/root' }]),
       '/api/workspace/ws-1/effective_permissions': jsonErr('no perms'),
-      '/api/workspace/ws-1/workers': jsonErr('no workers'),
+      '/api/workspace/ws-1/workers/active': jsonOk([]),
     })
     renderSidebar({ tools: [] })
     await act(async () => {})
     expect(screen.getByText('No permission data for this workspace.')).toBeInTheDocument()
     expect(screen.getByText('No tools enabled for this session.')).toBeInTheDocument()
-    expect(screen.getByText('No workers configured for this workspace.')).toBeInTheDocument()
+    expect(screen.getByText('No active workers in this workspace.')).toBeInTheDocument()
     expect(screen.getByText('No containers for this workspace.')).toBeInTheDocument()
   })
 
@@ -383,6 +383,50 @@ describe('SessionSidebar — workers', () => {
     await act(async () => {})
     fireEvent.click(screen.getAllByRole('button', { name: 'Stop' })[0]) // w1
     expect(await screen.findByText('worker busy')).toBeInTheDocument()
+  })
+
+  it('scopes the stop request to the worker instance via ?instance_id=', async () => {
+    // The active-workers payload carries the instance id; the Stop action must
+    // forward it as the instance query.
+    const fetchMock = stubBackend({
+      '/api/workspace/ws-1/workers/active': jsonOk([
+        { worker_name: 'w1', instance_id: 4242, status: 'ready' },
+      ]),
+    })
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' })) // w1#4242
+    await act(async () => {})
+    const calls = fetchMock.mock.calls.map(([url, opts]) => [String(url), opts])
+    expect(
+      calls.some(
+        ([url, opts]) =>
+          url.includes('/api/workspace/ws-1/workers/w1/stop?instance_id=4242') &&
+          opts.method === 'POST'
+      )
+    ).toBe(true)
+  })
+
+  it('does not show a configured-but-not-running worker', async () => {
+    // The workspace config still lists a worker, but it is not running, so the
+    // active-workers endpoint returns nothing and the sidebar must not show it.
+    stubBackend({
+      '/api/workspace/ws-1/workers': jsonOk([{ name: 'configured-but-idle' }]),
+      '/api/workspace/ws-1/workers/active': jsonOk([]),
+    })
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    expect(screen.getByText('No active workers in this workspace.')).toBeInTheDocument()
+    expect(screen.queryByText('configured-but-idle')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+  })
+
+  it('surfaces an active-workers fetch error under the Workers section', async () => {
+    stubBackend({
+      '/api/workspace/ws-1/workers/active': jsonErr({ error: 'boom' }, 503),
+    })
+    renderSidebar({ tools: [] })
+    expect(await screen.findByText('HTTP 503')).toBeInTheDocument()
   })
 })
 

@@ -220,6 +220,34 @@ function DeleteConfirm({ name, onConfirm, onCancel }) {
   );
 }
 
+// ── Stop all workers confirmation dialog ───────────────────────────────────
+function StopAllConfirm({ onConfirm, onCancel }) {
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        className="stop-all-confirm-dialog"
+        style={modalBox}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 0.5rem', fontSize: '1rem', color: '#f38ba8' }}>
+          Stop All Workers
+        </h3>
+        <p style={{ fontSize: '0.85rem', color: '#a6adc8', margin: '0 0 1rem' }}>
+          Stop every running worker instance in this workspace? This cannot be undone.
+        </p>
+        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+          <button style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }} onClick={onCancel}>
+            Cancel
+          </button>
+          <button style={btnDanger} onClick={onConfirm}>
+            Stop All
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Template picker ────────────────────────────────────────────────────────
 function TemplatePicker({ templates, onSelect, onCancel }) {
   return (
@@ -529,6 +557,8 @@ export default function WorkerManagementPanel({
   const [showTemplatePicker, setShowTemplatePicker] = useState(false);
   const [templates, setTemplates] = useState([]);
   const [isCreateFromTemplate, setIsCreateFromTemplate] = useState(false);
+  const [showStopAllConfirm, setShowStopAllConfirm] = useState(false);
+  const [stopAllError, setStopAllError] = useState('');
 
   // ── Auto-open logic (from old WorkersSection) ────────────────────────────
   const prevStatusMapRef = useRef(new Map());
@@ -669,6 +699,32 @@ export default function WorkerManagementPanel({
     },
     [workspaceId]
   );
+
+  // ── Stop all workers ─────────────────────────────────────────────────────
+  const handleStopAll = useCallback(async () => {
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/stop_all`,
+        sessionId
+          ? {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: sessionId }),
+            }
+          : { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || body?.detail || `HTTP ${res.status}`);
+      }
+      setStopAllError('');
+      setWorkers((prev) => prev.map((w) => ({ ...w, runtime_status: 'stopped' })));
+    } catch (err) {
+      setStopAllError(err.message);
+    } finally {
+      setShowStopAllConfirm(false);
+    }
+  }, [workspaceId, sessionId]);
 
   const handlePause = useCallback(async (name, instanceId) => {
     const key = workerInstanceKey({ name, instance_id: instanceId });
@@ -858,6 +914,9 @@ export default function WorkerManagementPanel({
           }}
         >
           From Template
+        </button>
+        <button style={btnDanger} onClick={() => setShowStopAllConfirm(true)}>
+          Stop All Workers
         </button>
       </div>
 
@@ -1252,6 +1311,7 @@ export default function WorkerManagementPanel({
       {/* ── Inline stop errors ────────────────────────────────────────── */}
       {Object.entries(stopErrors).map(([name, err]) => (
         <div
+          role="alert"
           key={`err-${name}`}
           style={{
             marginTop: '0.3rem',
@@ -1262,6 +1322,20 @@ export default function WorkerManagementPanel({
           ✗ {name}: {err}
         </div>
       ))}
+
+      {/* ── Stop-all error ────────────────────────────────────────────── */}
+      {stopAllError && (
+        <div
+          role="alert"
+          style={{
+            marginTop: '0.3rem',
+            fontSize: '0.75rem',
+            color: '#f38ba8',
+          }}
+        >
+          ✗ {stopAllError}
+        </div>
+      )}
 
       {/* ── Permission pills for running worker ───────────────────────── */}
       {workers
@@ -1313,6 +1387,14 @@ export default function WorkerManagementPanel({
           name={showDeleteConfirm}
           onConfirm={handleDeleteWorker}
           onCancel={() => setShowDeleteConfirm(null)}
+        />
+      )}
+
+      {/* Stop all workers confirmation */}
+      {showStopAllConfirm && (
+        <StopAllConfirm
+          onConfirm={handleStopAll}
+          onCancel={() => setShowStopAllConfirm(false)}
         />
       )}
 

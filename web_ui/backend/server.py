@@ -1483,6 +1483,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     that file is now read-compat only.
                     """
                     try:
+                        saved_keys = []
+                        dropped_keys = []
+                        session_id = None
                         config_dict = msg.get("config")
                         if config_dict:
                             # Frontend sent the draft — translate to backend format
@@ -1506,8 +1509,23 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "type": "default_config_saved",
                                 "status": "error",
                                 "message": "No config provided and no active session",
+                                "saved_keys": [],
+                                "dropped_keys": [],
+                                "session_id": None,
                             })
                             continue
+
+                        saved_keys = sorted(
+                            k for k in cfg_dict if k in GLOBAL_DEFAULT_KEYS
+                        )
+                        dropped_keys = sorted(
+                            k for k in cfg_dict if k not in GLOBAL_DEFAULT_KEYS
+                        )
+                        if bridge is not None:
+                            session_id = bridge._session_id or (
+                                bridge._loaded_session.session_id
+                                if bridge._loaded_session else None
+                            )
 
                         saved_path = save_global_defaults(cfg_dict)
 
@@ -1517,6 +1535,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "type": "default_config_saved",
                             "status": "ok",
                             "message": "Default config saved successfully",
+                            "saved_keys": saved_keys,
+                            "dropped_keys": dropped_keys,
+                            "session_id": session_id,
                         })
                     except Exception as exc:
                         log('ERROR', 'server.config', f"set_default_config failed: {exc}")
@@ -1524,6 +1545,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "type": "default_config_saved",
                             "status": "error",
                             "message": f"Failed to save default config: {exc}",
+                            "saved_keys": saved_keys,
+                            "dropped_keys": dropped_keys,
+                            "session_id": session_id,
                         })
 
                 elif command == "get_providers":

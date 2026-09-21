@@ -131,6 +131,12 @@ body {
   background: rgba(243, 139, 168, 0.25);
 }
 
+/* Fix 3C: brief pulse on the recovery banner when a send is blocked (uses the
+   recoloured session-error-banner-pulse keyframe — pink alert accent, same shape/timing as worker-glow-pulse). */
+.session-error-banner--pulse {
+  animation: session-error-banner-pulse 0.4s ease-in-out 1;
+}
+
 /* ── Docker health banner (top-level; shown when the backend is unreachable
       or the Docker daemon is unavailable) ── */
 .docker-health-banner {
@@ -1157,6 +1163,17 @@ body {
   }
   50% {
     box-shadow: 0 0 8px 3px rgba(166, 227, 161, 0.6);
+  }
+}
+
+/* Fix 3C: pink glow pulse for the session-error recovery banner (same shape as
+   worker-glow-pulse, recoloured to the banner's pink alert accent). */
+@keyframes session-error-banner-pulse {
+  0%, 100% {
+    box-shadow: 0 0 4px 0 rgba(243, 139, 168, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 8px 3px rgba(243, 139, 168, 0.6);
   }
 }
 .worker-status-dot-busy {

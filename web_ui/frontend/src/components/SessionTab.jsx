@@ -27,15 +27,11 @@ import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
 import SecurityDialog from './SecurityDialog'
 import SessionSidebar from './SessionSidebar'
-import { useNavigate } from '../router'
-import useWorkspaceStore from '../store/workspaceStore'
+import { wsUrl } from '../apiBase'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
 const CONFIG_PANEL_DEFAULT_WIDTH = 280
-
-const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
-const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 
 // ── Fix 3a: stable empty array + memoized equality for sessionMessages ──
 // SessionTab re-renders on ANY store slice change (status, tokens, etc.);
@@ -97,6 +93,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [staleSession, setStaleSession] = useState(false)
   const staleSessionRef = useRef(false)
   const pendingAdoptRef = useRef(null)
+  // Fix 3C: brief pulse on the existing recovery banner when a send is blocked
+  // by the stale-session gate, so a dead click gives visible feedback.
+  const [staleClickPulse, setStaleClickPulse] = useState(false)
+  const staleClickPulseTimerRef = useRef(null)
+  useEffect(() => () => clearTimeout(staleClickPulseTimerRef.current), [])
   // Fix 4d: set while awaiting the reply to a recovery new_session (load_error
   // path). The reply carries a DIFFERENT id than the dead one this tab was
   // waiting for — the flag makes the handler accept it via the normal path
@@ -125,20 +126,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const sessionState = useStore((s) => s.sessionStates[storeKey])
   const sessionError = useStore((s) => (storeKey ? (s.sessionErrors[storeKey] || '') : ''))
   const config = sessionConfig?.config ?? null
-  const navigate = useNavigate()
-  const workspaceList = useWorkspaceStore((s) => s.workspaceList)
-  // Workspace for the 'Back to Workspace' button: prefer the owning workspaceId
-  // carried by the nested session URL (#/workspace/:wsId/session/:sid) — it
-  // reaches the workspace level immediately, even before session_loaded; next
-  // prefer the workspace_id the backend reported in session_loaded; fall back
-  // to matching the session config's workspace_path against known workspaces;
-  // final fallback null → navigate to the workspace selector ('/workspaces').
-  const backWorkspaceId = routeWorkspaceId || workspaceId || (() => {
-    const wsPath = config?.workspace_path
-    if (!wsPath) return null
-    const match = workspaceList.find((w) => w.root === wsPath || w.path === wsPath)
-    return match ? match.id : null
-  })()
   const providers = sessionConfig?.providers ?? []
   const availableTools = sessionConfig?.tools ?? []
   const history = sessionMessages ?? EMPTY_MESSAGES
@@ -249,6 +236,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     // user starts a new session.
     if (staleSessionRef.current) {
       console.warn('[SessionTab] Stale session — command blocked:', command)
+      // Fix 3C: pulse the existing recovery banner so the blocked click is visible.
+      setStaleClickPulse(true)
+      if (staleClickPulseTimerRef.current) clearTimeout(staleClickPulseTimerRef.current)
+      staleClickPulseTimerRef.current = setTimeout(() => setStaleClickPulse(false), 400)
       return
     }
     const ws = wsRef.current
@@ -311,7 +302,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
     if (closedRef.current) return  // component unmounted (may be set during clearTimeout)
 
-    const ws = new WebSocket(WS_URL)
+    const ws = new WebSocket(wsUrl())
     wsRef.current = ws
 
     // Listener-ordering fix: register message/close/error listeners BEFORE
@@ -839,7 +830,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           console.warn('[SessionTab] default_config_saved for different session, ignoring:', msg.session_id)
           break
         }
-        setDefaultConfigSaveStatus(msg.status)
+        setDefaultConfigSaveStatus({
+          status: msg.status,
+          saved_keys: msg.saved_keys ?? [],
+          dropped_keys: msg.dropped_keys ?? [],
+          session_id: msg.session_id ?? null,
+          message: msg.message ?? null,
+        })
         break
 
       case 'session_saved':
@@ -1120,15 +1117,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               </button>
               <div className="session-header-spacer" />
               <button
-                className="session-header-btn session-header-back-btn"
-                onClick={() =>
-                  navigate(backWorkspaceId ? `/workspace/${encodeURIComponent(backWorkspaceId)}` : '/workspaces')
-                }
-                title="Back to workspace"
-              >
-                ← Back to Workspace
-              </button>
-              <button
                 className="session-header-btn session-header-details-btn"
                 onClick={() => setSidebarOpen((v) => !v)}
                 title="Toggle session details panel"
@@ -1173,7 +1161,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         ) : null}
       </div>
       {sessionError ? (
-        <div className="session-error-banner" role="alert">
+        <div
+          className={`session-error-banner${staleClickPulse ? ' session-error-banner--pulse' : ''}`}
+          role="alert"
+        >
           <span className="session-error-banner-text">⚠ {sessionError}</span>
           {staleSession ? (
             <button

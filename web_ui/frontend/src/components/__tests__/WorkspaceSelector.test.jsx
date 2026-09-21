@@ -6,7 +6,7 @@
 
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import WorkspaceSelector from '../WorkspaceSelector'
 import useWorkspaceStore from '../../store/workspaceStore'
@@ -303,5 +303,160 @@ describe('WorkspaceSelector', () => {
     render(<WorkspaceSelector />)
     await screen.findByText('No workspaces yet. Create one to get started.')
     expect(screen.queryByRole('button', { name: '+ New Session' })).toBeNull()
+  })
+
+  it('surfaces a notice when a prompt is selected from the library', async () => {
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/prompts'
+          ? { match: r.match, value: jsonOk([{ name: 'summarize', content: 'Summarize the text.' }]) }
+          : r
+      )
+    )
+    render(<WorkspaceSelector />)
+    await screen.findByText('summarize')
+    fireEvent.click(screen.getByText('summarize'))
+    expect(screen.getByText('Prompt selected - open a session to apply it')).toBeInTheDocument()
+  })
+
+  it('saves a new provider through the REST provider API', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers') && (init?.method || 'GET').toUpperCase() === 'POST',
+        value: jsonOk({ created: true, provider: { id: 'test-provider-1' } }),
+      },
+    ]
+    const { fetchMock } = stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    // Open the modal: this button label cannot collide with the modal's own
+    // 'Manage Providers' header (that is a <strong>, not a button).
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+
+    // List view -> '+ Add Provider' opens the create form.
+    fireEvent.click(await screen.findByRole('button', { name: /Add Provider/i }))
+
+    fireEvent.change(screen.getByPlaceholderText('e.g., openai, my-custom-vllm'), {
+      target: { value: 'test-provider-1' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('e.g., OpenAI GPT-4, My Local vLLM'), {
+      target: { value: 'Test Provider' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('https://api.openai.com/v1'), {
+      target: { value: 'https://example.test/v1' },
+    })
+
+    // The create form replaces the list, so the footer '+ Add Provider' is gone;
+    // the only remaining 'Add Provider' button is the form's submit.
+    fireEvent.click(screen.getByRole('button', { name: /^Add Provider$/ }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const postCalls = fetchMock.mock.calls
+      .map(([input, init]) => ({
+        url: typeof input === 'string' ? input : String(input),
+        method: (init?.method || 'GET').toUpperCase(),
+        body: init?.body,
+      }))
+      .filter((c) => c.method === 'POST' && c.url.endsWith('/api/providers'))
+
+    expect(postCalls.length).toBe(1)
+    const sent = JSON.parse(postCalls[0].body)
+    expect(sent.id ?? sent.provider?.id).toBe('test-provider-1')
+  })
+
+  it('deletes a provider through the REST provider API', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([{ id: 'x', label: 'X' }]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers/') && (init?.method || 'GET').toUpperCase() === 'DELETE',
+        value: jsonOk({ deleted: true }),
+      },
+    ]
+    const { fetchMock } = stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+
+    // Row 'Delete' (scoped by its title) swaps the list for the confirm overlay;
+    // the overlay's own 'Delete' lives in the 'Delete Provider' panel.
+    fireEvent.click(await screen.findByTitle('Delete provider'))
+    const confirmPanel = screen.getByText('Delete Provider').parentElement
+    fireEvent.click(within(confirmPanel).getByRole('button', { name: 'Delete' }))
+
+    await waitFor(() => {
+      const delCalls = fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          (init?.method || 'GET').toUpperCase() === 'DELETE' &&
+          (typeof input === 'string' ? input : String(input)).endsWith('/api/providers/x')
+      )
+      expect(delCalls.length).toBe(1)
+    })
+  })
+
+  it('alerts when the REST provider API rejects a save', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers') && (init?.method || 'GET').toUpperCase() === 'POST',
+        value: { ok: false, status: 500, json: async () => ({}), text: async () => '' },
+      },
+    ]
+    stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /Add Provider/i }))
+
+    fireEvent.change(screen.getByPlaceholderText('e.g., openai, my-custom-vllm'), {
+      target: { value: 'test-provider-1' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('e.g., OpenAI GPT-4, My Local vLLM'), {
+      target: { value: 'Test Provider' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('https://api.openai.com/v1'), {
+      target: { value: 'https://example.test/v1' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /^Add Provider$/ }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('Could not save provider.')
+  })
+
+  it('alerts when the REST provider API rejects a delete', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([{ id: 'x', label: 'X' }]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers/') && (init?.method || 'GET').toUpperCase() === 'DELETE',
+        value: { ok: false, status: 500, json: async () => ({}), text: async () => '' },
+      },
+    ]
+    stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+    fireEvent.click(await screen.findByTitle('Delete provider'))
+    const confirmPanel = screen.getByText('Delete Provider').parentElement
+    fireEvent.click(within(confirmPanel).getByRole('button', { name: 'Delete' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('Could not delete provider.')
   })
 })

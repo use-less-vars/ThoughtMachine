@@ -82,3 +82,35 @@ export async function fetchVaultRepairApply(payload) {
     return null
   }
 }
+
+export async function fetchProviders() {
+  const data = await safeGet('/api/providers')
+  return Array.isArray(data) ? data : null
+}
+
+export async function saveProvider(provider) {
+  try {
+    const res = await fetch(API_BASE + '/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: provider || {} }),
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+export async function deleteProvider(id) {
+  try {
+    const res = await fetch(API_BASE + '/api/providers/' + encodeURIComponent(id), {
+      method: 'DELETE',
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+

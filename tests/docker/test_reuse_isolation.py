@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 
 import pytest
 
@@ -96,7 +97,7 @@ needs_docker = pytest.mark.skipif(
 
 IMAGE = os.environ.get("TM_REUSE_TEST_IMAGE", "alpine:3.19")
 WS_ID = "ws-reuse-isolation-test"
-NAME = "reuse-iso-test"
+NAME = f"reuse-iso-test-{uuid.uuid4().hex[:8]}"
 
 
 @needs_docker
@@ -141,10 +142,31 @@ class TestReuseRefusesNonConforming:
             session_config={},
         )
         self.weak = None
+        self._created_ids = []
         yield
+        # Best-effort teardown: nothing the test created may leak, even on
+        # failure. Track every container (the weak one plus the hardened one
+        # returned by self.manager.start()).
+        for cid in list(self._created_ids):
+            try:
+                self.client.containers.get(cid).remove(force=True)
+            except Exception:
+                pass
         try:
             if self.weak is not None:
                 self.weak.remove(force=True)
+        except Exception:
+            pass
+        # Belt-and-suspenders: sweep anything left under this workspace label.
+        try:
+            for leaked in self.client.containers.list(
+                all=True,
+                filters={"label": f"thoughtmachine.workspace_id={WS_ID}"},
+            ):
+                try:
+                    leaked.remove(force=True)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -246,6 +268,7 @@ class TestReuseRefusesNonConforming:
 
         self.weak = self._create_weak_container()
         weak_id = self.weak.id
+        self._created_ids.append(weak_id)
 
         # "Config B": the default resolution is network=none / workspace=ro, so
         # the drift admission passes; the correct implementation MUST refuse the
@@ -257,6 +280,8 @@ class TestReuseRefusesNonConforming:
         # table, so an unfixed (reuse) implementation fails HERE with the full
         # table rather than with a bare guard message further down.
         returned_id = res.get("id")
+        if returned_id:
+            self._created_ids.append(returned_id)
         returned = (
             self.client.containers.get(returned_id) if returned_id else None
         )

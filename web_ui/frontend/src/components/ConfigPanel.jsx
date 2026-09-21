@@ -4,6 +4,7 @@ import ContainerPanelContent from './ContainerPanel';
 import WorkspacePanel from './WorkspacePanel';
 import PromptLibrary from './PromptLibrary';
 import useStore from '../store/useStore';
+import { apiUrl } from '../apiBase';
 
 // Canonical-only option lists, permissive-first; no rank map needed — some
 // canonical levels share a rank (write_on_feature_branch is a write-tier grant).
@@ -44,11 +45,50 @@ const isEqualRaw = (a, b) => {
   return keysA.every((k) => a[k] === b[k]);
 }
 
-const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
-const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
+// Backend-canonical key → human label for the "Not global defaults" notice.
+// translate_frontend_config renames provider→provider_type and tools→enabled_tools
+// BEFORE the allowlist split, so dropped_keys carries the BACKEND names.
+const DEFAULT_KEY_LABELS = {
+  provider: 'Provider',
+  provider_type: 'Provider',
+  tools: 'Tools',
+  enabled_tools: 'Tools',
+  mode: 'Mode',
+  workspace_path: 'Workspace path',
+  token_monitor_warning_threshold: 'Token warning threshold',
+  token_monitor_critical_threshold: 'Token critical threshold',
+  tool_output_token_limit: 'Tool output limit',
+};
+
+function humanizeDefaultKey(key) {
+  if (DEFAULT_KEY_LABELS[key]) return DEFAULT_KEY_LABELS[key];
+  return String(key)
+    .split('_')
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(' ');
+}
+
+// Keys in dropped_keys ARE saved (as session-level config) — just not as global
+// defaults — so the copy must never say "not saved".
+function buildDefaultSaveNotice(savedKeys, droppedKeys) {
+  const saved = savedKeys ?? [];
+  const dropped = droppedKeys ?? [];
+  let text =
+    saved.length === 0
+      ? 'No settings saved as global defaults.'
+      : `Saved ${saved.length} settings as global defaults.`;
+  if (dropped.length > 0) {
+    text += ` Not global defaults: ${dropped.map(humanizeDefaultKey).join(', ')}.`;
+  }
+  return text;
+}
+
+const DEFAULT_SAVE_TIMEOUT_MS = 5000;
 
 function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, configQueued = false, applyFailed = null }) {
-  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
+  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error' | 'timeout'
+  const [notice, setNotice] = useState(null);  // null | { kind: 'status' | 'alert', text }
+  const [confirmReset, setConfirmReset] = useState(false);
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
   const [allTools, setAllTools] = useState([]);
@@ -107,23 +147,52 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [applyError, setApplyError] = useState(null);
 
   // ── Sync defaultConfigSaveStatus from backend into local UI state ────
+  // Accepts the new object payload { status, saved_keys, dropped_keys, session_id,
+  // message } OR the legacy bare string ('ok' | 'error') for backward compat.
   useEffect(() => {
-    if (defaultConfigSaveStatus === 'ok') {
+    const incoming = defaultConfigSaveStatus;
+    if (!incoming) return;
+    const isObject = typeof incoming === 'object';
+    const status = isObject ? incoming.status : incoming;
+
+    if (status === 'ok') {
       setDefaultSaved(true);
+      // Only the structured payload can describe which keys were global vs local.
+      if (isObject) {
+        setNotice({ kind: 'status', text: buildDefaultSaveNotice(incoming.saved_keys, incoming.dropped_keys) });
+      }
       const t = setTimeout(() => {
         setDefaultSaved(false);
+        setNotice(null);
         onClearDefaultSaveStatus?.();
-      }, 2500);
+      }, DEFAULT_SAVE_TIMEOUT_MS);
       return () => clearTimeout(t);
-    } else if (defaultConfigSaveStatus === 'error') {
+    } else if (status === 'error') {
       setDefaultSaved('error');
+      if (isObject && incoming.message) {
+        setNotice({ kind: 'alert', text: incoming.message });
+      }
       const t = setTimeout(() => {
         setDefaultSaved(false);
+        setNotice(null);
         onClearDefaultSaveStatus?.();
       }, 4000);
       return () => clearTimeout(t);
     }
   }, [defaultConfigSaveStatus, onClearDefaultSaveStatus]);
+
+  // ── Stuck-pending guard: if the backend never confirms (e.g. the session went
+  // stale and SessionTab dropped the message), surface an honest timeout instead
+  // of leaving the button on 'Saving…' forever. Cleanup is keyed on defaultSaved,
+  // so a pending → ok/error transition clears the timer.
+  useEffect(() => {
+    if (defaultSaved !== 'pending') return;
+    const t = setTimeout(() => {
+      setDefaultSaved('timeout');
+      setNotice({ kind: 'alert', text: 'Not saved — session may be stale. Try Start New Session.' });
+    }, DEFAULT_SAVE_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [defaultSaved]);
 
   useEffect(() => {
     const seeded = getSafeDraft(config)
@@ -179,7 +248,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
   // Fetch the complete list of all available tools from the backend
   useEffect(() => {
-    fetch(`${API_BASE}/api/tools`)
+    fetch(apiUrl('/api/tools'))
       .then(res => res.json())
       .then(data => {
         if (data.tools) setAllTools(data.tools);
@@ -206,7 +275,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       setLastAppliedRaw(null);
       return () => { cancelled = true; };
     }
-    fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/permissions`)
+    fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`))
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -313,7 +382,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         const payload = Object.fromEntries(
           CANONICAL_SESSION_PERMISSION_KEYS.filter((k) => k in rawPerms).map((k) => [k, rawPerms[k]])
         );
-        const res = await fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/permissions`, {
+        const res = await fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -366,7 +435,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const handleLoadPromptFromLibrary = useCallback(async (promptName) => {
     if (!promptName) return;
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/${promptName}`);
+      const res = await fetch(apiUrl(`/api/prompts/${promptName}`));
       if (!res.ok) return;
       const text = await res.text();
       const base = useStore.getState().sessionDrafts[sessionId] ?? getSafeDraft(config);
@@ -448,19 +517,81 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       )}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
         <h3 style={{ margin: 0 }}>Config</h3>
-        <button
-          className="btn btn-accent"
-          style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
-          onClick={() => {
-            // Save-as-Default never carries session_permissions (disk-pure split).
-            const { session_permissions, ...defaultsPayload } = draft;
-            sendCommand('set_default_config', { config: defaultsPayload });
-            setDefaultSaved('pending');
-          }}
-        >
-          {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
-        </button>
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            className="btn btn-accent"
+            style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+            onClick={() => {
+              // Save-as-Default never carries session_permissions (disk-pure split).
+              const { session_permissions, ...defaultsPayload } = draft;
+              sendCommand('set_default_config', { config: defaultsPayload });
+              setDefaultSaved('pending');
+            }}
+          >
+            {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
+          </button>
+          <button
+            className="btn"
+            style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+            onClick={() => setConfirmReset(true)}
+          >
+            Reset
+          </button>
+        </div>
       </div>
+      {notice && (
+        <p
+          role={notice.kind === 'alert' ? 'alert' : 'status'}
+          style={{ margin: '0.5rem 0 0 0', fontSize: '0.85rem', color: notice.kind === 'alert' ? '#f38ba8' : '#a6e3a1' }}
+        >
+          {notice.text}
+        </p>
+      )}
+      {confirmReset && (
+        <div
+          role="alertdialog"
+          aria-label="Confirm config reset"
+          style={{ margin: '0.5rem 0 0 0', padding: '0.6rem 0.75rem', border: '1px solid #f38ba8', borderRadius: '4px', background: '#f38ba811' }}
+        >
+          <p style={{ margin: '0 0 0.5rem 0', fontSize: '0.85rem', color: '#f38ba8' }}>
+            Reset config to factory defaults? This deletes your custom system prompt and global config, and cannot be undone.
+          </p>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <button
+              className="btn"
+              style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+              onClick={async () => {
+                // Destructive + global: POST once; only carry session_id when known.
+                setConfirmReset(false);
+                const body = sessionId ? { session_id: sessionId } : {};
+                try {
+                  const res = await fetch(apiUrl('/api/config/reset'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                  });
+                  if (!res.ok) {
+                    setNotice({ kind: 'alert', text: `Reset failed: HTTP ${res.status}` });
+                    return;
+                  }
+                  setNotice({ kind: 'status', text: 'Config reset to factory defaults' });
+                } catch (err) {
+                  setNotice({ kind: 'alert', text: `Reset failed: ${err?.message || err}` });
+                }
+              }}
+            >
+              Confirm reset
+            </button>
+            <button
+              className="btn"
+              style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+              onClick={() => setConfirmReset(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: '0.25rem', marginBottom: '1rem', borderBottom: '1px solid #45475a', paddingBottom: '0.5rem' }}>

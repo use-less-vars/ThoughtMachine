@@ -680,7 +680,6 @@ export default function WorkspaceDetailPage({ workspaceId }) {
   if (!workspaceId) {
     return (
       <div className="wdp-empty-wrap">
-        <a className="wdp-back-link" href="#/workspaces">← Back to workspaces</a>
         <div className="wdp-empty">No workspace selected.</div>
       </div>
     )
@@ -709,7 +708,6 @@ export default function WorkspaceDetailPage({ workspaceId }) {
 
   return (
     <div className="wdp-panel">
-      <a className="wdp-back-link" href="#/workspaces">← Back to workspaces</a>
       <div className="wdp-header">
         <div className="wdp-title-block">
           <div className="wdp-title">{summary.label || summary.workspace_id}</div>

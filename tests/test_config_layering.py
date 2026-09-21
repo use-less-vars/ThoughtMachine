@@ -465,6 +465,56 @@ class TestResetConfigToFactory:
         assert isinstance(result, dict)
         assert "api_key" not in result, "API key should be excluded from return dict"
 
+    def test_reset_backs_up_custom_system_prompt(
+        self, monkeypatch_factory_path, monkeypatch_user_dir, tmp_path, monkeypatch
+    ):
+        """reset backs up custom_system_prompt.txt before removing it.
+
+        Parity with agent_config.json: the pre-reset content must survive in
+        the (vault) config back-up dir as ``<basename>.<ts>.bak``.
+        """
+        overlay_path = tmp_path / "agent_config.json"
+
+        # Redirect the back-up dir into the temp tree for determinism.
+        backup_dir = tmp_path / "config_backups"
+        monkeypatch.setattr(loader_mod, "VAULT_BACKUP_DIR", str(backup_dir))
+
+        # Create a custom prompt with distinctive content.
+        custom_path = Path(loader_mod.CUSTOM_SYSTEM_PROMPT_PATH)
+        custom_path.parent.mkdir(parents=True, exist_ok=True)
+        custom_path.write_text("My custom prompt", encoding="utf-8")
+        assert custom_path.exists()
+
+        bridge = StateBridge(config_path=str(overlay_path))
+        bridge.reset_config_to_factory()
+
+        # Original is removed...
+        assert not custom_path.exists(), "Custom prompt should be removed on reset"
+
+        # ...but its content is preserved in a timestamped back-up.
+        backups = sorted(backup_dir.glob("custom_system_prompt.txt.*.bak"))
+        assert backups, (
+            f"reset must back up custom_system_prompt.txt; found none in {backup_dir}"
+        )
+        assert backups[-1].read_text(encoding="utf-8") == "My custom prompt"
+
+    def test_reset_without_custom_system_prompt_creates_no_backup(
+        self, monkeypatch_factory_path, monkeypatch_user_dir, tmp_path, monkeypatch
+    ):
+        """reset is a silent no-op (no back-up, no error) when no prompt exists."""
+        overlay_path = tmp_path / "agent_config.json"
+        backup_dir = tmp_path / "config_backups"
+        monkeypatch.setattr(loader_mod, "VAULT_BACKUP_DIR", str(backup_dir))
+
+        custom_path = Path(loader_mod.CUSTOM_SYSTEM_PROMPT_PATH)
+        assert not custom_path.exists()
+
+        bridge = StateBridge(config_path=str(overlay_path))
+        bridge.reset_config_to_factory()  # must not raise
+
+        if backup_dir.exists():
+            assert not list(backup_dir.glob("custom_system_prompt.txt.*.bak"))
+
 
 class TestLegacyFullConfigMigration:
     """Tests that legacy full-config files are handled by the overlay model."""

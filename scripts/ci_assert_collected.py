@@ -3,7 +3,8 @@
 
 A test job that "passes" because pytest silently collected *zero* tests proves
 nothing.  This guard runs pytest in collection-only mode, parses the reported
-collection count, and fails (exit 1) when it does not match an expected value.
+collection count, and fails (exit 1) when fewer tests are collected than the
+expected minimum.
 
 It is dependency-free (standard library only) so it can run before the
 project's own dependencies are installed, and it is deliberately named without
@@ -17,7 +18,7 @@ Usage
 
 Defaults target the primary Linux/macOS gate::
 
-    --expected 3644   # `-m "not docker and not e2e"` selection
+    --expected 3827   # `-m "not docker and not e2e"` lower bound
     --marker   "not docker and not e2e"
 
 Passing one or more positional ``TARGET`` paths (files or directories) runs
@@ -27,12 +28,13 @@ small, self-contained node set.
 
 Recognised pytest summaries (checked in this order)::
 
-    3644/3649 tests collected (5 deselected) in 10.61s   -> 3644
-    3649 tests collected in 10.49s                        -> 3649
+    3834/3839 tests collected (5 deselected) in 4.60s    -> 3834
+    3839 tests collected in 4.11s                        -> 3839
     no tests collected in 0.10s                           -> 0
 
-Exit status is 0 on an exact match and 1 on mismatch *or* when no collection
-count can be parsed (e.g. a collection error aborted the run).
+Exit status is 0 when at least the expected number of tests is collected and 1
+when fewer are collected *or* when no collection count can be parsed (e.g. a
+collection error aborted the run).
 """
 
 from __future__ import annotations
@@ -42,14 +44,15 @@ import re
 import subprocess
 import sys
 
-# Measured on branch fix/git-host-fallback-closure: 3649 tests collect in total
-# and `-m "not docker and not e2e"` selects 3644 of them (5 deselected).
+# Lower-bound baseline for the primary Linux/macOS gate: `-m "not docker and
+# not e2e"` must collect at least 3827 tests.  Measured 3834 live (3839 total,
+# 5 deselected); the headroom lets new tests land without editing the CI.
 DEFAULT_EXPECTED = 3827
 DEFAULT_MARKER = "not docker and not e2e"
 
-# "3644/3649 tests collected (5 deselected)" -> 3644 (the selected count).
+# "3834/3839 tests collected (5 deselected)" -> 3834 (the selected count).
 _DESELECTED_RE = re.compile(r"(\d+)/\d+\s+tests?\s+collected")
-# "3649 tests collected" -> 3649.
+# "3839 tests collected" -> 3839.
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 # "no tests collected" -> 0.
 _NONE_RE = re.compile(r"no\s+tests?\s+collected")
@@ -127,10 +130,10 @@ def main(argv=None) -> int:
         return 1
 
     print(f"ci_assert_collected: expected={args.expected} actual={actual}")
-    if actual != args.expected:
+    if actual < args.expected:
         print(
-            f"ci_assert_collected: FAIL - expected {args.expected} collected "
-            f"tests but pytest collected {actual}.",
+            f"ci_assert_collected: FAIL - expected at least {args.expected} "
+            f"collected tests but pytest collected only {actual}.",
             file=sys.stderr,
         )
         return 1

@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-
-const API_BASE = `http://${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT || '8000'}`;
+import { apiUrl } from '../apiBase';
 
 const FACTORY_NAMES = ['agent', 'engineer'];
 
@@ -21,7 +20,7 @@ export default function PromptLibrary({ onSelectPrompt }) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/prompts`);
+      const res = await fetch(apiUrl('/api/prompts'));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setPrompts(Array.isArray(data) ? data : (Array.isArray(data.prompts) ? data.prompts : []));
@@ -45,7 +44,7 @@ export default function PromptLibrary({ onSelectPrompt }) {
     setSaving(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/${encodeURIComponent(name)}`, {
+      const res = await fetch(apiUrl(`/api/prompts/${encodeURIComponent(name)}`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content }),
@@ -74,7 +73,7 @@ export default function PromptLibrary({ onSelectPrompt }) {
     setSaving(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/${encodeURIComponent(editingPrompt.name)}`, {
+      const res = await fetch(apiUrl(`/api/prompts/${encodeURIComponent(editingPrompt.name)}`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content }),
@@ -97,7 +96,7 @@ export default function PromptLibrary({ onSelectPrompt }) {
     setSaving(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/${encodeURIComponent(deleteTarget)}`, {
+      const res = await fetch(apiUrl(`/api/prompts/${encodeURIComponent(deleteTarget)}`), {
         method: 'DELETE',
       });
       if (res.status === 403) {
@@ -120,7 +119,7 @@ export default function PromptLibrary({ onSelectPrompt }) {
   const startEdit = useCallback(async (name) => {
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/${encodeURIComponent(name)}`);
+      const res = await fetch(apiUrl(`/api/prompts/${encodeURIComponent(name)}`));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setEditingPrompt({ name, text: data.content });

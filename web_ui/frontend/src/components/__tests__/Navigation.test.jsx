@@ -8,9 +8,9 @@
  *
  *   workspaces (selector)  →  workspace (WorkspaceDetailPage)  →  session (SessionTab)
  *
- *   - the workspace level carries its own back affordance: the detail page's
- *     '← Back to workspaces' link (#/workspaces);
- *   - the session level's '← Back to Workspace' button goes to the OWNING
+ *   - the shared App-level <LayerNav> breadcrumb carries the back affordances:
+ *     a 'Workspaces' crumb links to the selector (#/workspaces);
+ *   - the workspace crumb links to the OWNING
  *     workspace — the nested session URL (#/workspace/:wsId/session/:sid)
  *     carries the owning workspaceId explicitly (route.workspaceId), so the
  *     back button reaches the workspace level immediately, even before any
@@ -29,6 +29,7 @@ import {
   waitFor,
   act,
   fireEvent,
+  within,
 } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import App from '../../App'
@@ -89,6 +90,14 @@ function stubFetchByUrl(routes, defaultResponse = DEFAULT_FALLBACK) {
 const ENTRY = { id: 'ws-test-1', label: 'Code Development', root: '~/workspaces/ws-test-1' }
 const ENTRY2 = { id: 'ws-2', label: 'Second Workspace', root: '~/workspaces/ws-2' }
 
+// The workspaceStore does NOT expose the raw backend entry. fetchWorkspaces
+// maps `{ id, label, root }` → `{ id, name: label || id, path, root }`
+// (see workspaceStore.js), and App reads `.name` off workspaceList. Seed the
+// store with the REAL mapped shape — seeding only `.label` bypassed the
+// contract and hid a would-be crumb regression.
+const ENTRY_STORE = { id: ENTRY.id, name: ENTRY.label, path: ENTRY.root, root: ENTRY.root }
+const ENTRY2_STORE = { id: ENTRY2.id, name: ENTRY2.label, path: ENTRY2.root, root: ENTRY2.root }
+
 const SUMMARY = {
   workspace_id: ENTRY.id, label: ENTRY.label, root_path: ENTRY.root,
   allow_host_resources: false, permissions: {}, resource_catalog: [],
@@ -146,7 +155,7 @@ beforeEach(() => {
   localStorage.clear()
   useStore.getState().reset()
   useWorkspaceStore.getState().reset()
-  useWorkspaceStore.setState({ workspaceList: [{ ...ENTRY }, { ...ENTRY2 }] })
+  useWorkspaceStore.setState({ workspaceList: [{ ...ENTRY_STORE }, { ...ENTRY2_STORE }] })
   useSessionTabsStore.getState().reset()
   MockWebSocket.instances = []
   vi.stubGlobal('WebSocket', MockWebSocket)
@@ -178,8 +187,14 @@ describe('Three-layer navigation: workspaces → workspace → session', () => {
     const hub = await connectHub()
     seedWorkspaceSessions(hub)
     await screen.findByRole('tab', { name: 'Permissions & Resources' })
-    expect(await screen.findByText('Code Development')).toBeInTheDocument()
-    const backLink = screen.getByRole('link', { name: '← Back to workspaces' })
+    // Detail title comes from the summary payload (`.label`).
+    await waitFor(() => expect(document.querySelector('.wdp-title')).toHaveTextContent('Code Development'))
+    // The breadcrumb workspace crumb must pin the REAL name from the store
+    // (`workspaceList[].name`), never the 'Workspace' fallback literal.
+    const navWsB = within(screen.getByTestId('layer-nav'))
+    expect(navWsB.getByText('Code Development')).toHaveAttribute('aria-current', 'page')
+    expect(navWsB.queryByText('Workspace')).toBeNull()
+    const backLink = within(screen.getByTestId('layer-nav')).getByRole('link', { name: 'Workspaces' })
     expect(backLink).toHaveAttribute('href', '#/workspaces')
     fireEvent.click(backLink)
     await waitFor(() => expect(window.location.hash).toBe('#/workspaces'))
@@ -198,14 +213,22 @@ describe('Three-layer navigation: workspaces → workspace → session', () => {
     expect(tabWs).not.toBe(hub)
     await act(async () => tabWs.open())
     act(() => tabWs.receive({ type: 'session_loaded', session_id: 'sess-1', workspace_id: ENTRY.id, session_name: 'S1' }))
-    const backBtn = await screen.findByTitle('Back to workspace')
-    expect(backBtn).toBeInTheDocument()
-    expect(backBtn.textContent).toContain('← Back to Workspace')
+    const nav = await screen.findByTestId('layer-nav')
+    const backBtn = within(nav)
+      .getAllByRole('link')
+      .find((a) => a.getAttribute('href') === `#/workspace/${ENTRY.id}`)
+    expect(backBtn).toBeTruthy()
+    // The workspace crumb link is labelled by the REAL workspace name.
+    expect(backBtn).toHaveTextContent('Code Development')
     fireEvent.click(backBtn)
     await waitFor(() => expect(window.location.hash).toBe(`#/workspace/${ENTRY.id}`))
     expect(await screen.findByRole('tab', { name: 'Permissions & Resources' })).toBeInTheDocument()
     expect(document.querySelector('.tab-wrapper')).toBeNull()
-    expect(screen.queryByTitle('Back to workspace')).toBeNull()
+    const navWs = screen.getByTestId('layer-nav')
+    // Workspace view: crumb is the CURRENT (non-link) node showing the REAL name.
+    expect(within(navWs).getByText('Code Development')).toHaveAttribute('aria-current', 'page')
+    expect(within(navWs).queryByText('Workspace')).toBeNull()
+    expect(within(navWs).getByRole('link', { name: 'Workspaces' })).toBeInTheDocument()
   })
 
   it('browser back/forward retraces session → workspace → selector and forward again', async () => {
@@ -226,7 +249,12 @@ describe('Three-layer navigation: workspaces → workspace → session', () => {
     expect(tabWs).not.toBe(hub)
     await act(async () => tabWs.open())
     act(() => tabWs.receive({ type: 'session_loaded', session_id: 'sess-1', workspace_id: ENTRY.id, session_name: 'S1' }))
-    expect(await screen.findByTitle('Back to workspace')).toBeInTheDocument()
+    const navBf = await screen.findByTestId('layer-nav')
+    expect(
+      within(navBf)
+        .getAllByRole('link')
+        .some((a) => a.getAttribute('href') === `#/workspace/${ENTRY.id}`)
+    ).toBe(true)
     // Browser back: session → workspace.
     await act(async () => { window.history.back(); await new Promise((r) => setTimeout(r, 30)) })
     await waitFor(() => expect(window.location.hash).toBe(`#/workspace/${ENTRY.id}`))
@@ -268,7 +296,8 @@ describe('Three-layer navigation: workspaces → workspace → session', () => {
     expect(screen.queryByTitle('S3')).toBeNull()
     // Workspace B strip lists only B's tabs.
     await navigateHash(`#/workspace/${ENTRY2.id}`)
-    expect(await screen.findByText('Second Workspace')).toBeInTheDocument()
+    await waitFor(() => expect(document.querySelector('.wdp-title')).toHaveTextContent('Second Workspace'))
+    expect(within(screen.getByTestId('layer-nav')).getByText('Second Workspace')).toHaveAttribute('aria-current', 'page')
     await waitFor(() => expect(screen.getByTitle('S3')).toBeInTheDocument())
     expect(screen.queryByTitle('S1')).toBeNull()
     expect(screen.queryByTitle('S2')).toBeNull()
