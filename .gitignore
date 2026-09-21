@@ -171,3 +171,25 @@ docs/testing/test_run_on_host.txt
 !docs/testing/ci_process.md
 !docs/ui_map.md
 scratch/
+# Hygiene (2026-09-21): local toolchain caches, probes, scratch dirs and KB noise
+.deb-cache/
+.ms-playwright/
+.pip-cache/
+.pip-tmp/
+.tm-node/
+.tm-fix-scratch/
+chrome-libs/
+datetime
+.tm_probe_write_check.txt
+live_fs_probe.txt
+tm_livemount_probe.txt
+tm_permission_probe.txt
+tm_round6_write_probe.txt
+venv*
+.thoughtmachine/knowledge_backups/
+.thoughtmachine/readme_recon.md
+.thoughtmachine/knowledge/manifest.yaml
+.thoughtmachine/knowledge/project/*.md
+
+.thoughtmachine/knowledge/archive/
+.thoughtmachine/gate_log.txt
