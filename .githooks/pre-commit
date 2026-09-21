@@ -274,7 +274,7 @@ else
     else
         rc=$?
         if [ "$rc" -eq 5 ]; then
-            echo "  SKIP — pytest collected nothing (0 tests) ($(elapsed_ms "$S4_START" "$(now_ns)") ms)"
+            echo "  ⚠ SKIPPED — pytest collected nothing (0 tests) ($(elapsed_ms "$S4_START" "$(now_ns)") ms)"
         else
             echo "  FAIL ($(elapsed_ms "$S4_START" "$(now_ns)") ms) — $CONTRACT_TEST failed" >&2
             STEP_FAILURES=$((STEP_FAILURES + 1))
