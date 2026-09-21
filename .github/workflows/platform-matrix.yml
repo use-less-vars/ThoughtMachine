@@ -17,7 +17,7 @@
 # zero tests must not be able to report green).
 #
 # Measured collection counts (branch fix/git-host-fallback-closure):
-#   * total                                      = 3827
+#   * total (gate floor) = 3827
 #   * -m "not docker and not e2e"                 = 3836 (5 deselected)
 #   * thin node set (4 files below)              = 77
 #
