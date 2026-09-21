@@ -211,7 +211,7 @@ def _status_lines(output):
     Trailer lines appended by ``GitInfoTool._with_mode`` are skipped.
     """
     for line in output.splitlines():
-        if line.startswith(("execution_mode:", "failure_reason:", "fallback_used:")):
+        if line.startswith(("execution_mode:", "failure_reason:")):
             continue
         if len(line) < 4 or line[2] != " ":
             continue
