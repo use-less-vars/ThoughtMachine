@@ -31,7 +31,6 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
   const [stopError, setStopError] = useState(null)
   const [containerError, setContainerError] = useState(null)
   const [activeWorkers, setActiveWorkers] = useState([])
-  const [workersLoading, setWorkersLoading] = useState(false)
   const [workersError, setWorkersError] = useState(null)
 
   // Refresh workspace data (permissions/workers/containers) while open.
@@ -67,8 +66,6 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
     } catch (err) {
       setWorkersError(err.message || String(err))
       setActiveWorkers([])
-    } finally {
-      setWorkersLoading(false)
     }
   }, [workspaceId])
 
@@ -194,7 +191,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
         {/* ── 3. Workers ──────────────────────────────────────────────────── */}
         <section className="session-sidebar-section">
           <h4>Workers</h4>
-          {(wsLoading || workersLoading) && wsMatch ? (
+          {wsLoading && wsMatch ? (
             <p className="session-sidebar-empty">Loading workers...</p>
           ) : workers.length === 0 ? (
             <p className="session-sidebar-empty">No active workers in this workspace.</p>

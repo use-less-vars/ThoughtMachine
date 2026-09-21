@@ -1311,6 +1311,7 @@ export default function WorkerManagementPanel({
       {/* ── Inline stop errors ────────────────────────────────────────── */}
       {Object.entries(stopErrors).map(([name, err]) => (
         <div
+          role="alert"
           key={`err-${name}`}
           style={{
             marginTop: '0.3rem',

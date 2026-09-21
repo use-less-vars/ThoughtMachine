@@ -240,3 +240,62 @@ describe('WorkerManagementPanel — Stop All Workers', () => {
     )
   })
 })
+
+
+// ── Per-worker stop error surface ──────────────────────────────────────────
+// The per-worker stop error element must carry role="alert" so assistive tech
+// announces it. After normalising, BOTH the per-worker error and the stop-all
+// error are alerts, so this test disambiguates the per-worker one by its
+// authored content (worker instance key + message) rather than assuming a
+// single alert in the document.
+describe('WorkerManagementPanel — per-worker stop error role', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('surfaces a per-worker stop error via an alert role', async () => {
+    workersPayload = [makeWorker({ runtime_status: 'ready', paused_manually: false })]
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url) => {
+        const u = String(url)
+        if (u.includes('/workers') && u.includes('/stop')) {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({ detail: { error: 'stop failed foo' } }),
+          }
+        }
+        if (u.includes('/workers')) {
+          return { ok: true, status: 200, json: async () => workersPayload }
+        }
+        return { ok: true, status: 200, json: async () => [] }
+      })
+    )
+    render(
+      <WorkerManagementPanel
+        workspaceId="ws-1"
+        sessionId="sess-1"
+        onSelectWorker={vi.fn()}
+        selectedWorker={null}
+        isActive
+      />
+    )
+    await waitForRow()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+
+    const alerts = await screen.findAllByRole('alert')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toHaveTextContent('docgen#2')
+    expect(alerts[0]).toHaveTextContent('stop failed foo')
+  })
+})
+

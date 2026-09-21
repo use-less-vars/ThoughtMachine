@@ -420,6 +420,14 @@ describe('SessionSidebar — workers', () => {
     expect(screen.queryByText('configured-but-idle')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
   })
+
+  it('surfaces an active-workers fetch error under the Workers section', async () => {
+    stubBackend({
+      '/api/workspace/ws-1/workers/active': jsonErr({ error: 'boom' }, 503),
+    })
+    renderSidebar({ tools: [] })
+    expect(await screen.findByText('HTTP 503')).toBeInTheDocument()
+  })
 })
 
 // ===========================================================================
