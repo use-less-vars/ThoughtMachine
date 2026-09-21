@@ -384,6 +384,32 @@ describe('SessionSidebar — workers', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Stop' })[0]) // w1
     expect(await screen.findByText('worker busy')).toBeInTheDocument()
   })
+
+  it('scopes the stop request to the worker instance via ?instance_id=', async () => {
+    const fetchMock = stubBackend()
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    // Seed an instance-scoped worker row (the shape an instance-aware workers
+    // payload surfaces) so the Stop action must carry the instance query.
+    useWorkspaceStore.setState((s) => ({
+      currentWorkspace: {
+        ...(s.currentWorkspace || { id: 'ws-1' }),
+        id: 'ws-1',
+        workers: [{ name: 'w1', instance_id: 4242, runtimeStatus: 'ready' }],
+      },
+    }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' })) // w1#4242
+    await act(async () => {})
+    const calls = fetchMock.mock.calls.map(([url, opts]) => [String(url), opts])
+    expect(
+      calls.some(
+        ([url, opts]) =>
+          url.includes('/api/workspace/ws-1/workers/w1/stop?instance_id=4242') &&
+          opts.method === 'POST'
+      )
+    ).toBe(true)
+  })
 })
 
 // ===========================================================================
