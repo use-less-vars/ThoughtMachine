@@ -137,9 +137,9 @@ const DEFAULT_ROUTES = {
     },
   }),
   '/api/health/containers': jsonOk({ docker: 'reachable' }),
-  '/api/workspace/ws-1/workers': jsonOk([
-    { name: 'w1', runtime_status: 'ready' },
-    { name: 'w2', runtime_status: 'busy' },
+  '/api/workspace/ws-1/workers/active': jsonOk([
+    { worker_name: 'w1', instance_id: 1, status: 'ready' },
+    { worker_name: 'w2', instance_id: 1, status: 'busy' },
   ]),
   '/api/workspace/ws-1/containers': jsonOk({ containers: [] }),
   '/api/session/list': jsonOk([]),
@@ -264,13 +264,13 @@ describe('SessionSidebar — structure', () => {
     stubBackend({
       '/api/workspace/list': jsonOk([{ id: 'ws-1', label: 'Blank Workspace', root: '/root' }]),
       '/api/workspace/ws-1/effective_permissions': jsonErr('no perms'),
-      '/api/workspace/ws-1/workers': jsonErr('no workers'),
+      '/api/workspace/ws-1/workers/active': jsonOk([]),
     })
     renderSidebar({ tools: [] })
     await act(async () => {})
     expect(screen.getByText('No permission data for this workspace.')).toBeInTheDocument()
     expect(screen.getByText('No tools enabled for this session.')).toBeInTheDocument()
-    expect(screen.getByText('No workers configured for this workspace.')).toBeInTheDocument()
+    expect(screen.getByText('No active workers in this workspace.')).toBeInTheDocument()
     expect(screen.getByText('No containers for this workspace.')).toBeInTheDocument()
   })
 
@@ -386,18 +386,14 @@ describe('SessionSidebar — workers', () => {
   })
 
   it('scopes the stop request to the worker instance via ?instance_id=', async () => {
-    const fetchMock = stubBackend()
+    // The active-workers payload carries the instance id; the Stop action must
+    // forward it as the instance query.
+    const fetchMock = stubBackend({
+      '/api/workspace/ws-1/workers/active': jsonOk([
+        { worker_name: 'w1', instance_id: 4242, status: 'ready' },
+      ]),
+    })
     renderSidebar({ tools: [] })
-    await act(async () => {})
-    // Seed an instance-scoped worker row (the shape an instance-aware workers
-    // payload surfaces) so the Stop action must carry the instance query.
-    useWorkspaceStore.setState((s) => ({
-      currentWorkspace: {
-        ...(s.currentWorkspace || { id: 'ws-1' }),
-        id: 'ws-1',
-        workers: [{ name: 'w1', instance_id: 4242, runtimeStatus: 'ready' }],
-      },
-    }))
     await act(async () => {})
     fireEvent.click(screen.getByRole('button', { name: 'Stop' })) // w1#4242
     await act(async () => {})
@@ -409,6 +405,20 @@ describe('SessionSidebar — workers', () => {
           opts.method === 'POST'
       )
     ).toBe(true)
+  })
+
+  it('does not show a configured-but-not-running worker', async () => {
+    // The workspace config still lists a worker, but it is not running, so the
+    // active-workers endpoint returns nothing and the sidebar must not show it.
+    stubBackend({
+      '/api/workspace/ws-1/workers': jsonOk([{ name: 'configured-but-idle' }]),
+      '/api/workspace/ws-1/workers/active': jsonOk([]),
+    })
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    expect(screen.getByText('No active workers in this workspace.')).toBeInTheDocument()
+    expect(screen.queryByText('configured-but-idle')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
   })
 })
 
