@@ -85,6 +85,13 @@ class GitWriteTool(GitReadTool):
 
     tool: Literal["GitWriteTool"] = "GitWriteTool"
 
+    # Deliberately NOT exposed on the WRITE surface (design §C, §E6): push,
+    # fetch, reset, clean, config, cherry-pick, rebase, and any ref/branch
+    # deletion. The READ surface likewise exposes no C-list op, except the
+    # pre-existing READ-ONLY `config` inspection op (git config --list /
+    # --get), which cannot mutate config. Policy for a future delete op (§E4):
+    # it MUST refuse to delete a checked-out or protected branch AND require
+    # explicit confirmation for a non-merged ref.
     operation: Literal[
         "commit", "init", "clone", "branch_create", "checkout", "stage",
         "unstage", "worktree_add", "worktree_remove", "stash_push",

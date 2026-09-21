@@ -720,6 +720,13 @@ class GitReadTool(ToolBase):
             )
             if exit_code != 0:
                 return f"Git command failed (exit code {exit_code}):\n{stderr}"
+            # §E3: git routes hook stdout to its own stderr (run_hook_ve sets
+            # stdout_to_stderr=1), so a successful commit otherwise hides the
+            # pre-commit hook result. Record it instead of discarding stderr.
+            if args and args[0] == "commit" and stderr:
+                if stdout and not stdout.endswith("\n"):
+                    stdout += "\n"
+                return stdout + stderr
             return stdout
         except subprocess.TimeoutExpired:
             # Fail closed: a timeout must surface as an exception, never as a
@@ -827,6 +834,22 @@ class GitReadTool(ToolBase):
         self, repo_root: Path, args: List[str], timeout: int = 30
     ) -> tuple:
         """Run git on the host inside the hermetic sandbox."""
+        # §E3 host-mode parity: host execution neutralizes hooks
+        # (core.hooksPath=/dev/null + --no-verify), silently bypassing
+        # configured repository hooks. Fail closed when hooks are actually
+        # configured (design §E3: fail closed only when hooks are
+        # configured-but-unenforceable).
+        if args and args[0] == "commit":
+            _ws = getattr(self, "_resolved_workspace_path", None)
+            _hook = Path(_ws) / ".githooks" / "pre-commit" if _ws else None
+            if _hook is not None and _hook.is_file():
+                return (1, "", (
+                    "Error: refusing commit: repository hooks are configured "
+                    "(.githooks/pre-commit) but host execution mode neutralizes "
+                    "them (core.hooksPath=/dev/null, --no-verify); hooks cannot "
+                    "be enforced on the host. Use container mode, or remove the "
+                    "configured hooks to accept the bypass."
+                ))
         # Hardened args, applied to EVERY git invocation: hooks are
         # neutralized (core.hooksPath=/dev/null), external diff drivers /
         # textconv filters, fsmonitor helpers and credential helpers are

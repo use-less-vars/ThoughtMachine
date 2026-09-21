@@ -1222,3 +1222,96 @@ def test_stash_pop_denied_without_write_permission(tmp_path):
     assert result == FLAG_ERROR
     assert raw.calls == []
 
+
+
+
+# =========================================================================
+# §E6 operation-Literal guard + §E3 hook-output capture / host-mode parity
+# =========================================================================
+
+import typing  # noqa: E402
+
+from tools.git_info_tool import GitReadTool  # noqa: E402
+
+_C_LIST = {"push", "fetch", "reset", "clean", "config", "cherry-pick", "rebase"}
+
+
+def test_operation_literals_exclude_c_list():
+    """§E6: the C-list ops must never appear in the WRITE Literal; they must
+    also stay out of the READ Literal EXCEPT ``config``, which is a
+    pre-existing READ-ONLY inspection op (``git config --list`` /
+    ``git config --get <key>``). §C prohibits config *mutation*, not
+    inspection, so ``config`` is excluded from the read-side check.
+    """
+    read_ops = set(typing.get_args(GitReadTool.model_fields["operation"].annotation))
+    write_ops = set(typing.get_args(GitWriteTool.model_fields["operation"].annotation))
+    assert _C_LIST.isdisjoint(write_ops)
+    assert (_C_LIST - {"config"}).isdisjoint(read_ops)
+
+
+# --- §E3-A: _run_git records hook output on a successful commit ----------
+
+
+def test_run_git_commit_surfaces_stderr(tmp_path):
+    tool = _write_tool()
+    tool._run_git_raw = _RawRecorder((0, "OUT\n", "[pre-commit] banner"))
+    result = tool._run_git(tmp_path, ["commit", "-m", "x", "--", "f"])
+    assert "OUT" in result
+    assert "[pre-commit] banner" in result
+
+
+def test_run_git_non_commit_discards_stderr(tmp_path):
+    tool = _write_tool()
+    tool._run_git_raw = _RawRecorder((0, "OUT\n", "noise"))
+    result = tool._run_git(tmp_path, ["status"])
+    assert result == "OUT\n"
+
+
+def test_run_git_commit_failure_unchanged(tmp_path):
+    tool = _write_tool()
+    tool._run_git_raw = _RawRecorder((1, "", "boom"))
+    result = tool._run_git(tmp_path, ["commit", "-m", "x", "--", "f"])
+    assert result == "Git command failed (exit code 1):\nboom"
+
+
+# --- §E3-B: host-mode parity fails closed when hooks are configured ------
+
+
+class _FakeExecResult:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _FakeSandboxExecution:
+    def __init__(self, *args, **kwargs):
+        self.calls = []
+
+    def run(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return _FakeExecResult(returncode=0, stdout="HOSTOUT", stderr="")
+
+
+def test_exec_host_raw_refuses_commit_when_hooks_configured(tmp_path):
+    hooks = tmp_path / ".githooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    tool = _write_tool()
+    tool._resolved_workspace_path = str(tmp_path)
+    result = tool._exec_host_raw(tmp_path, ["commit", "-m", "m", "--", "f"])
+    assert result[0] != 0
+    assert "hooks" in result[2]
+    assert "host" in result[2]
+
+
+def test_exec_host_raw_commit_without_hooks_not_short_circuited(tmp_path, monkeypatch):
+    tool = _write_tool()
+    tool.session_permissions = {"git": "write"}
+    tool.effective_permissions = {"git": "write"}
+    tool._resolved_workspace_path = str(tmp_path)
+    monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _FakeSandboxExecution)
+    result = tool._exec_host_raw(tmp_path, ["commit", "-m", "m", "--", "f"])
+    assert result[0] == 0
+    assert result[1] == "HOSTOUT"
+
