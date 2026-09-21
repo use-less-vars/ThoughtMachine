@@ -19,7 +19,7 @@ import GlobalCredentials from './GlobalCredentials'
 import PromptLibrary from './PromptLibrary'
 import ManageProvidersModal from './ManageProvidersModal'
 import NewSessionModal from './workspace/modals/NewSessionModal'
-import { fetchGlobalSummary } from '../globalApi'
+import { fetchGlobalSummary, fetchProviders, saveProvider, deleteProvider } from '../globalApi'
 import './WorkspaceSelector.css'
 
 // Trim trailing separators so '/home/jojo' and '/home/jojo/' compare equal.
@@ -53,6 +53,8 @@ export default function WorkspaceSelector() {
   const [acknowledgedRisk, setAcknowledgedRisk] = useState(false)
 
   const [showProviders, setShowProviders] = useState(false)
+  const [providersState, setProvidersState] = useState(null)
+  const [providersError, setProvidersError] = useState('')
 
   // '+ New Session' flow: sessionTarget opens NewSessionModal directly (one
   // workspace); chooserOpen/chooserWsId pick the target when several exist.
@@ -76,11 +78,50 @@ export default function WorkspaceSelector() {
     setSelectedPrompt(name)
   }, [])
 
+  const loadProviders = useCallback(async () => {
+    const data = await fetchProviders()
+    if (Array.isArray(data)) setProvidersState(data)
+  }, [])
+
+  // Adapter that lets ManageProvidersModal talk to the REST provider routes.
+  // The modal fires these commands fire-and-forget (it never awaits a reply).
+  const providerCommandAdapter = useCallback(
+    async (command, payload = {}) => {
+      if (command === 'save_provider') {
+        const result = await saveProvider(payload.provider)
+        if (!result) {
+          setProvidersError('Could not save provider.')
+          return
+        }
+        setProvidersError('')
+        await loadProviders()
+        return
+      }
+      if (command === 'delete_provider') {
+        const result = await deleteProvider(payload.provider_id)
+        if (!result) {
+          setProvidersError('Could not delete provider.')
+          return
+        }
+        setProvidersError('')
+        await loadProviders()
+        return
+      }
+      if (command === 'get_providers') {
+        await loadProviders()
+      }
+    },
+    [loadProviders]
+  )
+
   const summaryData = summary || {}
   const workspaces = Array.isArray(summaryData.workspaces) ? summaryData.workspaces : []
   const sessions = Array.isArray(summaryData.active_sessions) ? summaryData.active_sessions : []
   const containers = Array.isArray(summaryData.active_containers) ? summaryData.active_containers : []
   const providers = Array.isArray(summaryData.providers) ? summaryData.providers : []
+  // REST-loaded providers win once a request succeeds; otherwise keep the
+  // summary-derived list so behaviour is unchanged before the first call.
+  const shownProviders = Array.isArray(providersState) ? providersState : providers
 
   const openCustomModal = () => {
     setError('')
@@ -262,9 +303,21 @@ export default function WorkspaceSelector() {
 
         <section className="gms-section" aria-label="Providers">
           <h3 className="gms-section-title">Providers</h3>
-          <button className="ws-modal-btn" onClick={() => setShowProviders(true)}>
+          <button
+            className="ws-modal-btn"
+            onClick={() => {
+              setProvidersError('')
+              setShowProviders(true)
+              loadProviders()
+            }}
+          >
             ⚙ Manage Providers
           </button>
+          {providersError && (
+            <p role="alert" style={{ margin: '0.5rem 0 0 0', fontSize: '0.85rem', color: '#f38ba8' }}>
+              {providersError}
+            </p>
+          )}
         </section>
 
         {chooserOpen && (
@@ -310,8 +363,8 @@ export default function WorkspaceSelector() {
 
         {showProviders && (
           <ManageProvidersModal
-            providers={providers}
-            sendCommand={() => {}}
+            providers={shownProviders}
+            sendCommand={providerCommandAdapter}
             onClose={() => setShowProviders(false)}
             onProviderSaved={() => setShowProviders(false)}
           />
