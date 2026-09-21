@@ -6,7 +6,7 @@
 
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import WorkspaceSelector from '../WorkspaceSelector'
 import useWorkspaceStore from '../../store/workspaceStore'
@@ -367,5 +367,96 @@ describe('WorkspaceSelector', () => {
     expect(postCalls.length).toBe(1)
     const sent = JSON.parse(postCalls[0].body)
     expect(sent.id ?? sent.provider?.id).toBe('test-provider-1')
+  })
+
+  it('deletes a provider through the REST provider API', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([{ id: 'x', label: 'X' }]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers/') && (init?.method || 'GET').toUpperCase() === 'DELETE',
+        value: jsonOk({ deleted: true }),
+      },
+    ]
+    const { fetchMock } = stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+
+    // Row 'Delete' (scoped by its title) swaps the list for the confirm overlay;
+    // the overlay's own 'Delete' lives in the 'Delete Provider' panel.
+    fireEvent.click(await screen.findByTitle('Delete provider'))
+    const confirmPanel = screen.getByText('Delete Provider').parentElement
+    fireEvent.click(within(confirmPanel).getByRole('button', { name: 'Delete' }))
+
+    await waitFor(() => {
+      const delCalls = fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          (init?.method || 'GET').toUpperCase() === 'DELETE' &&
+          (typeof input === 'string' ? input : String(input)).endsWith('/api/providers/x')
+      )
+      expect(delCalls.length).toBe(1)
+    })
+  })
+
+  it('alerts when the REST provider API rejects a save', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers') && (init?.method || 'GET').toUpperCase() === 'POST',
+        value: { ok: false, status: 500, json: async () => ({}), text: async () => '' },
+      },
+    ]
+    stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /Add Provider/i }))
+
+    fireEvent.change(screen.getByPlaceholderText('e.g., openai, my-custom-vllm'), {
+      target: { value: 'test-provider-1' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('e.g., OpenAI GPT-4, My Local vLLM'), {
+      target: { value: 'Test Provider' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('https://api.openai.com/v1'), {
+      target: { value: 'https://example.test/v1' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /^Add Provider$/ }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('Could not save provider.')
+  })
+
+  it('alerts when the REST provider API rejects a delete', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([{ id: 'x', label: 'X' }]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers/') && (init?.method || 'GET').toUpperCase() === 'DELETE',
+        value: { ok: false, status: 500, json: async () => ({}), text: async () => '' },
+      },
+    ]
+    stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+    fireEvent.click(await screen.findByTitle('Delete provider'))
+    const confirmPanel = screen.getByText('Delete Provider').parentElement
+    fireEvent.click(within(confirmPanel).getByRole('button', { name: 'Delete' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('Could not delete provider.')
   })
 })
