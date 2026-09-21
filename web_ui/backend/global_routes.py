@@ -37,6 +37,7 @@ from thoughtmachine.vault import vault_root
 from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 from tools.host_resource_policy import workspace_allows_host_resources
+from agent.config.provider_profile import ProviderManager
 
 # Module-level reference for monkeypatchability in tests; the import is
 # guarded so a failing worker module can never break router import.
@@ -193,6 +194,26 @@ def _build_summary() -> Dict[str, Any]:
     if worker_manager is None:
         warnings.append("workers unavailable")
 
+    # ── Providers (ProviderManager profile store) ─────────────────────────
+    try:
+        profiles = ProviderManager().list_profiles()
+        providers_out: List[Dict[str, Any]] = [
+            {
+                "id": p.id,
+                "label": p.label,
+                "provider_type": p.provider_type,
+                "base_url": p.base_url,
+                "api_key": p.api_key,
+                "default_model": p.default_model,
+                "models": list(p.models) if p.models else [],
+                "timeout": p.timeout,
+            }
+            for p in profiles
+        ]
+    except Exception as exc:
+        providers_out = []
+        warnings.append(f"providers unavailable: {exc}")
+
     # ── Assemble ──────────────────────────────────────────────────────────
     workspaces_out: List[Dict[str, Any]] = []
     for entry in workspace_entries:
@@ -235,6 +256,7 @@ def _build_summary() -> Dict[str, Any]:
         "workspaces": workspaces_out,
         "active_sessions": active_sessions_out,
         "active_containers": containers,
+        "providers": providers_out,
     }
     if warnings:
         result["warning"] = ", ".join(warnings)
