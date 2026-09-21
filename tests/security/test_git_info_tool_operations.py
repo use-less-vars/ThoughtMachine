@@ -1839,3 +1839,71 @@ class TestShowFile:
         assert not out.startswith("Git command failed")
         assert not out.startswith("Error:")
 
+
+
+
+# ---------------------------------------------------------------------------
+# containerized commit round-trip: the container's commit stdout AND the
+# git-routed hook stderr (§E3) both surface back through the tool
+# ---------------------------------------------------------------------------
+class _RoundTripManager(_FakeManager):
+    """Container manager returning a commit-style stdout/stderr pair.
+
+    The non-commit invocation (the ``git add`` that precedes the commit)
+    returns empty output; the ``git commit`` invocation returns the recorded
+    pair so the *round-trip* of container output back to the agent can be
+    asserted end-to-end.
+    """
+
+    def __init__(self, commit_stdout, commit_stderr):
+        super().__init__(mode="containerized")
+        self._commit_stdout = commit_stdout
+        self._commit_stderr = commit_stderr
+
+    def exec(self, command, **kwargs):
+        self.calls.append(("exec", command, kwargs))
+        if "commit" in command:
+            return {
+                "exit_code": 0,
+                "stdout": self._commit_stdout,
+                "stderr": self._commit_stderr,
+            }
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+
+class TestCommitContainerRoundTrip:
+    def test_containerized_commit_round_trips_stdout_and_hook_stderr(self, tmp_path):
+        """A commit through the CONTAINER path surfaces the container's commit
+        stdout plus the git-routed hook stderr (§E3 -- git routes hook stdout
+        to its own stderr, so a successful commit would otherwise hide it),
+        followed by the execution-mode trailer.
+        """
+        (tmp_path / ".git").mkdir()  # real repo dir -> not a worktree gitfile
+        (tmp_path / "hello.txt").write_text("hi\n", encoding="utf-8")
+        manager = _RoundTripManager(
+            commit_stdout="[main abc1234] add hello\n",
+            commit_stderr="pre-commit: hook passed\n",
+        )
+        tool = _container_tool(
+            tmp_path, manager, operation="commit",
+            message="add hello", file_path="hello.txt",
+        )
+
+        result = tool._git_commit(tmp_path)
+
+        execs = [c for c in manager.calls if c[0] == "exec"]
+        # 1st exec stages the named path; 2nd is the hooksPath-pinned commit.
+        assert execs[0][1] == ["git", "add", "--", "hello.txt"]
+        assert execs[1][1] == [
+            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "commit", "-m", "add hello", "--", "hello.txt",
+        ]
+        assert "--no-verify" not in execs[1][1]
+        # Round-trip: both the container's commit stdout and the hook stderr
+        # reach the agent (newline-guarded join), then the mode trailer.
+        assert result.startswith(
+            "[main abc1234] add hello\npre-commit: hook passed"
+        )
+        assert "execution_mode: containerized" in result
+        assert "failure_reason: none" in result
+
