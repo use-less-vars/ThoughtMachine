@@ -4,6 +4,7 @@ import ContainerPanelContent from './ContainerPanel';
 import WorkspacePanel from './WorkspacePanel';
 import PromptLibrary from './PromptLibrary';
 import useStore from '../store/useStore';
+import { apiUrl } from '../apiBase';
 
 // Canonical-only option lists, permissive-first; no rank map needed — some
 // canonical levels share a rank (write_on_feature_branch is a write-tier grant).
@@ -43,9 +44,6 @@ const isEqualRaw = (a, b) => {
   if (keysA.length !== keysB.length) return false;
   return keysA.every((k) => a[k] === b[k]);
 }
-
-const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
-const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
 
 // Backend-canonical key → human label for the "Not global defaults" notice.
 // translate_frontend_config renames provider→provider_type and tools→enabled_tools
@@ -249,7 +247,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
   // Fetch the complete list of all available tools from the backend
   useEffect(() => {
-    fetch(`${API_BASE}/api/tools`)
+    fetch(apiUrl('/api/tools'))
       .then(res => res.json())
       .then(data => {
         if (data.tools) setAllTools(data.tools);
@@ -276,7 +274,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       setLastAppliedRaw(null);
       return () => { cancelled = true; };
     }
-    fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/permissions`)
+    fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`))
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -383,7 +381,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         const payload = Object.fromEntries(
           CANONICAL_SESSION_PERMISSION_KEYS.filter((k) => k in rawPerms).map((k) => [k, rawPerms[k]])
         );
-        const res = await fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/permissions`, {
+        const res = await fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -436,7 +434,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const handleLoadPromptFromLibrary = useCallback(async (promptName) => {
     if (!promptName) return;
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/${promptName}`);
+      const res = await fetch(apiUrl(`/api/prompts/${promptName}`));
       if (!res.ok) return;
       const text = await res.text();
       const base = useStore.getState().sessionDrafts[sessionId] ?? getSafeDraft(config);

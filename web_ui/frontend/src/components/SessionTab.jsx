@@ -29,13 +29,11 @@ import SecurityDialog from './SecurityDialog'
 import SessionSidebar from './SessionSidebar'
 import { useNavigate } from '../router'
 import useWorkspaceStore from '../store/workspaceStore'
+import { wsUrl } from '../apiBase'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
 const CONFIG_PANEL_DEFAULT_WIDTH = 280
-
-const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
-const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 
 // ── Fix 3a: stable empty array + memoized equality for sessionMessages ──
 // SessionTab re-renders on ANY store slice change (status, tokens, etc.);
@@ -320,7 +318,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
     if (closedRef.current) return  // component unmounted (may be set during clearTimeout)
 
-    const ws = new WebSocket(WS_URL)
+    const ws = new WebSocket(wsUrl())
     wsRef.current = ws
 
     // Listener-ordering fix: register message/close/error listeners BEFORE

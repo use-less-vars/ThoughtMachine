@@ -45,10 +45,9 @@ import OnboardingWizard from './components/OnboardingWizard'
 import WorkspaceSelector from './components/WorkspaceSelector'
 import WorkspaceDetailPage from './components/workspace/WorkspaceDetailPage'
 import { useRoute, useNavigate } from './router'
+import { apiUrl, wsUrl } from './apiBase'
 import './styles.css'
 
-const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
-const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 const TABS_PREFIX = 'tm.sessionTabs.'
 const WORKER_PANELS_PREFIX = 'tm.workerPanels.'
 const PANEL_SIZE_MIN = 250
@@ -248,7 +247,7 @@ export default function App() {
       reconnectTimeoutRef.current = null
     }
 
-    const ws = new WebSocket(WS_URL)
+    const ws = new WebSocket(wsUrl())
     wsRef.current = ws
 
     ws.onopen = () => {
@@ -1096,10 +1095,8 @@ export default function App() {
 
   // ── Fetch logging config (callable for retry) ─────────────────────────
   const fetchLoggingConfig = useCallback(() => {
-    const hostname = window.location.hostname
-    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
     setLoggingConfigError(null)
-    fetch(`http://${hostname}:${port}/api/logging/config`)
+    fetch(apiUrl('/api/logging/config'))
       .then(res => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         return res.json()
@@ -1126,15 +1123,13 @@ export default function App() {
   const checkBackendHealth = useCallback(async () => {
     if (healthInFlightRef.current) return
     healthInFlightRef.current = true
-    const hostname = window.location.hostname
-    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
     try {
       // Step 1: backend liveness
-      const healthRes = await fetch(`http://${hostname}:${port}/api/health`)
+      const healthRes = await fetch(apiUrl('/api/health'))
       if (!healthRes.ok) throw new Error(`HTTP ${healthRes.status}`)
       try {
         // Step 2: structured Docker availability (only when the backend is up)
-        const res = await fetch(`http://${hostname}:${port}/api/health/containers`)
+        const res = await fetch(apiUrl('/api/health/containers'))
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         setDockerHealth(await res.json())
       } catch (err) {
@@ -1166,9 +1161,7 @@ export default function App() {
   // banner already covers an unreachable backend.
   useEffect(() => {
     let cancelled = false
-    const hostname = window.location.hostname
-    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
-    fetch(`http://${hostname}:${port}/api/onboarding/status`)
+    fetch(apiUrl('/api/onboarding/status'))
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         return res.json()
@@ -1328,9 +1321,7 @@ export default function App() {
             configError={loggingConfigError}
             onRetry={fetchLoggingConfig}
             onSaveConfig={async (configPayload) => {
-              const hostname = window.location.hostname
-              const port = import.meta.env.VITE_BACKEND_PORT || '8000'
-              const res = await fetch(`http://${hostname}:${port}/api/logging/config`, {
+              const res = await fetch(apiUrl('/api/logging/config'), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(configPayload),
