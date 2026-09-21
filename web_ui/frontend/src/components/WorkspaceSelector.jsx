@@ -41,6 +41,7 @@ export default function WorkspaceSelector() {
   const [summary, setSummary] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshError, setRefreshError] = useState('')
+  const [selectedPrompt, setSelectedPrompt] = useState('')
 
   // Custom workspace modal state (Bridge 2).
   const [showCustomModal, setShowCustomModal] = useState(false)
@@ -70,6 +71,10 @@ export default function WorkspaceSelector() {
   useEffect(() => {
     loadSummary()
   }, [loadSummary])
+
+  const handleSelectPrompt = useCallback((name) => {
+    setSelectedPrompt(name)
+  }, [])
 
   const summaryData = summary || {}
   const workspaces = Array.isArray(summaryData.workspaces) ? summaryData.workspaces : []
@@ -247,7 +252,12 @@ export default function WorkspaceSelector() {
 
         <section className="gms-section" aria-label="Global Sysprompts">
           <h3 className="gms-section-title">Global Sysprompts</h3>
-          <PromptLibrary />
+          <PromptLibrary onSelectPrompt={handleSelectPrompt} />
+          {selectedPrompt && (
+            <p role="status" style={{ margin: '0.5rem 0 0 0', fontSize: '0.85rem', color: '#a6e3a1' }}>
+              Prompt selected - open a session to apply it
+            </p>
+          )}
         </section>
 
         <section className="gms-section" aria-label="Providers">
