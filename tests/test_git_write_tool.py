@@ -705,3 +705,520 @@ def test_normal_branch_commit_still_allowed_regression(tmp_path):
     assert [c[0] for c in calls] == ["rev-parse", "add", "commit"]
     _assert_no_commit_subprocess(exec_container, exec_host)
 
+
+# ---------------------------------------------------------------------------
+# worktree_add / worktree_remove / stash_push / stash_pop write operations.
+#
+# Exercised directly (bypassing execute()) to pin down argv assembly, the
+# fail-closed validation surface and the bare-vs-trailer output convention:
+# argument-validation refusals keep the byte-exact bare form (NO execution-mode
+# trailer), while every git result (success AND git-error) is wrapped by
+# _with_mode().
+# ---------------------------------------------------------------------------
+
+_TRAILER = "execution_mode: unavailable\nfailure_reason: none"
+
+
+class _RawRecorder:
+    """Fake _run_git_raw that replays queued (exit, stdout, stderr) tuples."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
+    def __call__(self, repo_root, args, timeout=30):
+        self.calls.append(list(args))
+        if self.results:
+            return self.results.pop(0)
+        return (0, "", "")
+
+
+def _write_tool(**overrides):
+    """GitWriteTool with a write-capable session git permission."""
+    overrides.setdefault("agent_config", {"session_permissions": {"git": "write"}})
+    return _tool(**overrides)
+
+
+def _run_git_outputting(recorder, output):
+    """Fake _run_git that records argv and returns a fixed output string."""
+
+    def fake(repo_root, args, timeout=30):
+        recorder.append(list(args))
+        return output
+
+    return fake
+
+
+# --- worktree_add ---------------------------------------------------------
+
+
+def test_worktree_add_requires_path(tmp_path):
+    tool = _write_tool(operation="worktree_add")
+    raw = _RawRecorder()
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(add_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert result == "Error: path is required for worktree_add operation"
+    assert raw.calls == []
+    assert add_calls == []
+
+
+def test_worktree_add_defaults_base_to_head(tmp_path):
+    tool = _write_tool(operation="worktree_add", path="wt")
+    raw = _RawRecorder((0, "", ""))
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(add_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert raw.calls == [["worktree", "list", "--porcelain"]]
+    assert add_calls == [["worktree", "add", "wt", "HEAD"]]
+    assert result == f"Created worktree at 'wt' (base: HEAD)\n{_TRAILER}"
+
+
+def test_worktree_add_explicit_base(tmp_path):
+    tool = _write_tool(operation="worktree_add", path="wt", base="feat/y")
+    raw = _RawRecorder((0, "", ""))
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(add_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert add_calls == [["worktree", "add", "wt", "feat/y"]]
+    assert result == f"Created worktree at 'wt' (base: feat/y)\n{_TRAILER}"
+
+
+def test_worktree_add_already_registered_refused(tmp_path):
+    target = str((tmp_path / "wt").resolve())
+    tool = _write_tool(operation="worktree_add", path="wt")
+    raw = _RawRecorder((0, f"worktree {target}\n", ""))
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(add_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert result == (
+        "Error: a worktree is already registered at 'wt'; remove it before adding"
+    )
+    assert raw.calls == [["worktree", "list", "--porcelain"]]
+    assert add_calls == []
+
+
+def test_worktree_add_invalid_base_ref_refused(tmp_path):
+    tool = _write_tool(operation="worktree_add", path="wt", base="bad ref")
+    raw = _RawRecorder()
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(add_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert result == "Error: invalid base ref for worktree_add: 'bad ref'"
+    assert raw.calls == []
+    assert add_calls == []
+
+
+def test_worktree_add_outside_workspace_refused(tmp_path):
+    tool = _write_tool(operation="worktree_add", path="../escape")
+    object.__setattr__(tool, "workspace_path", str(tmp_path))
+    raw = _RawRecorder()
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(add_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert result.startswith("Error: ")
+    assert "outside workspace" in result
+    assert "execution_mode" not in result
+    assert raw.calls == []
+    assert add_calls == []
+
+
+def test_worktree_add_git_error_wrapped(tmp_path):
+    tool = _write_tool(operation="worktree_add", path="wt")
+    raw = _RawRecorder((0, "", ""))
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _run_git_outputting(  # noqa: SLF001
+        add_calls, "Git command failed (exit code 128):\nfatal: boom\n"
+    )
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert "Git command failed (exit code 128):" in result
+    assert result.endswith(_TRAILER)
+
+
+# --- worktree_remove ------------------------------------------------------
+
+
+def test_worktree_remove_requires_path(tmp_path):
+    tool = _write_tool(operation="worktree_remove")
+    raw = _RawRecorder()
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(tmp_path)
+
+    assert result == "Error: path is required for worktree_remove operation"
+    assert raw.calls == []
+    assert rm_calls == []
+
+
+def test_worktree_remove_primary_worktree_refused(tmp_path):
+    repo = tmp_path.resolve()
+    tool = _write_tool(operation="worktree_remove", path=".")
+    raw = _RawRecorder()
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(repo)
+
+    assert result == (
+        f"Error: refusing to remove the primary worktree ({repo}); "
+        "worktree_remove only removes linked worktrees"
+    )
+    assert raw.calls == []
+    assert rm_calls == []
+
+
+def test_worktree_remove_locked_refused_without_force(tmp_path):
+    repo = tmp_path.resolve()
+    target = str((repo / "wt").resolve())
+    tool = _write_tool(operation="worktree_remove", path="wt")
+    raw = _RawRecorder((0, f"worktree {target}\nlocked\n", ""))
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(repo)
+
+    assert result == (
+        "Error: refusing to remove worktree 'wt': it is locked; retry with force=true"
+    )
+    assert raw.calls == [["worktree", "list", "--porcelain"]]
+    assert rm_calls == []
+
+
+def test_worktree_remove_dirty_refused_without_force(tmp_path):
+    repo = tmp_path.resolve()
+    target = str((repo / "wt").resolve())
+    tool = _write_tool(operation="worktree_remove", path="wt")
+    raw = _RawRecorder((0, f"worktree {target}\n", ""), (0, " M a.py\n", ""))
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(repo)
+
+    assert result == (
+        "Error: refusing to remove worktree 'wt': it is has local changes; "
+        "retry with force=true"
+    )
+    assert raw.calls == [
+        ["worktree", "list", "--porcelain"],
+        ["-C", "wt", "status", "--porcelain"],
+    ]
+    assert rm_calls == []
+
+
+def test_worktree_remove_registered_clean_removes(tmp_path):
+    repo = tmp_path.resolve()
+    target = str((repo / "wt").resolve())
+    tool = _write_tool(operation="worktree_remove", path="wt")
+    raw = _RawRecorder((0, f"worktree {target}\n", ""), (0, "", ""))
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(repo)
+
+    assert result == f"Removed worktree 'wt'\n{_TRAILER}"
+    assert rm_calls == [["worktree", "remove", "wt"]]
+
+
+def test_worktree_remove_force_flag_appended(tmp_path):
+    repo = tmp_path.resolve()
+    target = str((repo / "wt").resolve())
+    tool = _write_tool(operation="worktree_remove", path="wt", force=True)
+    raw = _RawRecorder((0, f"worktree {target}\nlocked\n", ""))
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(repo)
+
+    assert result == f"Removed worktree 'wt'\n{_TRAILER}"
+    assert rm_calls == [["worktree", "remove", "--force", "wt"]]
+    # force skips the dirty-status probe: only the registration probe ran.
+    assert raw.calls == [["worktree", "list", "--porcelain"]]
+
+
+def test_worktree_remove_unregistered_removes(tmp_path):
+    repo = tmp_path.resolve()
+    tool = _write_tool(operation="worktree_remove", path="wt")
+    raw = _RawRecorder((0, "", ""))
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(repo)
+
+    assert result == f"Removed worktree 'wt'\n{_TRAILER}"
+    assert rm_calls == [["worktree", "remove", "wt"]]
+    assert raw.calls == [["worktree", "list", "--porcelain"]]
+
+
+def test_worktree_remove_git_error_wrapped(tmp_path):
+    repo = tmp_path.resolve()
+    target = str((repo / "wt").resolve())
+    tool = _write_tool(operation="worktree_remove", path="wt")
+    raw = _RawRecorder((0, f"worktree {target}\n", ""), (0, "", ""))
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _run_git_outputting(  # noqa: SLF001
+        rm_calls, "Git command failed (exit code 1):\nnope\n"
+    )
+
+    result = tool._git_worktree_remove(repo)
+
+    assert "Git command failed (exit code 1):" in result
+    assert result.endswith(_TRAILER)
+
+
+def test_worktree_remove_outside_workspace_refused(tmp_path):
+    tool = _write_tool(operation="worktree_remove", path="../escape")
+    object.__setattr__(tool, "workspace_path", str(tmp_path))
+    raw = _RawRecorder()
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(tmp_path)
+
+    assert result.startswith("Error: ")
+    assert "outside workspace" in result
+    assert "execution_mode" not in result
+    assert raw.calls == []
+    assert rm_calls == []
+
+
+# --- stash_push -----------------------------------------------------------
+
+
+def test_stash_push_requires_message(tmp_path):
+    tool = _write_tool(operation="stash_push", message=None)
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_push(tmp_path)
+
+    assert result == "Error: message is required for stash_push operation"
+    assert raw.calls == []
+
+
+def test_stash_push_blank_message_refused(tmp_path):
+    tool = _write_tool(operation="stash_push", message="   ")
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_push(tmp_path)
+
+    assert result == "Error: message is required for stash_push operation"
+    assert raw.calls == []
+
+
+def test_stash_push_basic_argv_never_all_or_untracked(tmp_path):
+    tool = _write_tool(operation="stash_push", message="wip")
+    raw = _RawRecorder((0, "Saved working directory\n", ""))
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_push(tmp_path)
+
+    assert raw.calls == [["stash", "push", "-m", "wip"]]
+    argv = raw.calls[0]
+    assert "-a" not in argv and "-u" not in argv and "--all" not in argv
+    assert result.startswith("Saved working directory")
+    assert result.endswith(_TRAILER)
+
+
+def test_stash_push_with_paths(tmp_path):
+    repo = tmp_path.resolve()
+    tool = _write_tool(
+        operation="stash_push", message="wip", paths=["a.py", "b.py"]
+    )
+    raw = _RawRecorder((0, "", ""))
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    tool._git_stash_push(repo)
+
+    assert raw.calls == [["stash", "push", "-m", "wip", "--", "a.py", "b.py"]]
+
+
+def test_stash_push_rejects_pathspec_wildcard(tmp_path):
+    tool = _write_tool(operation="stash_push", message="wip", paths=["*.py"])
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_push(tmp_path)
+
+    assert result.startswith("Error: ")
+    assert "pathspec wildcards" in result
+    assert "execution_mode" not in result
+    assert raw.calls == []
+
+
+def test_stash_push_no_local_changes(tmp_path):
+    tool = _write_tool(operation="stash_push", message="wip")
+    raw = _RawRecorder((0, "No local changes to save\n", ""))
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_push(tmp_path)
+
+    assert result == f"No local changes to save.\n{_TRAILER}"
+
+
+def test_stash_push_git_error_uses_stderr(tmp_path):
+    tool = _write_tool(operation="stash_push", message="wip")
+    raw = _RawRecorder((1, "ignored stdout\n", "fatal: boom\n"))
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_push(tmp_path)
+
+    assert result.startswith("Git command failed (exit code 1):\nfatal: boom")
+    assert "ignored stdout" not in result
+    assert result.endswith(_TRAILER)
+
+
+# --- stash_pop ------------------------------------------------------------
+
+
+def test_stash_pop_default_index(tmp_path):
+    tool = _write_tool(operation="stash_pop")
+    raw = _RawRecorder((0, "Dropped refs/stash@{0}\n", ""))
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_pop(tmp_path)
+
+    assert raw.calls == [["stash", "pop", "stash@{0}"]]
+    assert result.startswith("Dropped refs/stash@{0}")
+    assert result.endswith(_TRAILER)
+
+
+def test_stash_pop_custom_index(tmp_path):
+    tool = _write_tool(operation="stash_pop", index=3)
+    raw = _RawRecorder((0, "ok\n", ""))
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    tool._git_stash_pop(tmp_path)
+
+    assert raw.calls == [["stash", "pop", "stash@{3}"]]
+
+
+def test_stash_pop_negative_index_rejected(tmp_path):
+    tool = _write_tool(operation="stash_pop", index=-1)
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_pop(tmp_path)
+
+    assert result == "Error: index must be a non-negative integer for stash_pop"
+    assert raw.calls == []
+
+
+def test_stash_pop_bool_index_rejected(tmp_path):
+    tool = _write_tool(operation="stash_pop")
+    object.__setattr__(tool, "index", True)
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_pop(tmp_path)
+
+    assert result == "Error: index must be a non-negative integer for stash_pop"
+    assert raw.calls == []
+
+
+def test_stash_pop_non_int_index_rejected(tmp_path):
+    tool = _write_tool(operation="stash_pop")
+    object.__setattr__(tool, "index", "1")
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_pop(tmp_path)
+
+    assert result == "Error: index must be a non-negative integer for stash_pop"
+    assert raw.calls == []
+
+
+def test_stash_pop_git_error_concatenates_stdout_stderr(tmp_path):
+    tool = _write_tool(operation="stash_pop")
+    raw = _RawRecorder((2, "partial\n", "conflict\n"))
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_pop(tmp_path)
+
+    assert result.startswith("Git command failed (exit code 2):\npartial\nconflict")
+    assert result.endswith(_TRAILER)
+
+
+# --- fail-closed git permission gate (defense-in-depth) -------------------
+
+
+def test_worktree_add_denied_without_write_permission(tmp_path):
+    tool = _tool(operation="worktree_add", path="wt")
+    raw = _RawRecorder()
+    add_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(add_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_add(tmp_path)
+
+    assert result == FLAG_ERROR
+    assert raw.calls == []
+    assert add_calls == []
+
+
+def test_worktree_remove_denied_without_write_permission(tmp_path):
+    tool = _tool(operation="worktree_remove", path="wt")
+    raw = _RawRecorder()
+    rm_calls = []
+    tool._run_git_raw = raw  # noqa: SLF001
+    tool._run_git = _branch_fake(rm_calls, "ok")  # noqa: SLF001
+
+    result = tool._git_worktree_remove(tmp_path)
+
+    assert result == FLAG_ERROR
+    assert raw.calls == []
+    assert rm_calls == []
+
+
+def test_stash_push_denied_without_write_permission(tmp_path):
+    tool = _tool(operation="stash_push", message="wip")
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_push(tmp_path)
+
+    assert result == FLAG_ERROR
+    assert raw.calls == []
+
+
+def test_stash_pop_denied_without_write_permission(tmp_path):
+    tool = _tool(operation="stash_pop")
+    raw = _RawRecorder()
+    tool._run_git_raw = raw  # noqa: SLF001
+
+    result = tool._git_stash_pop(tmp_path)
+
+    assert result == FLAG_ERROR
+    assert raw.calls == []
+

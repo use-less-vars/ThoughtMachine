@@ -87,10 +87,32 @@ class GitWriteTool(GitReadTool):
 
     operation: Literal[
         "commit", "init", "clone", "branch_create", "checkout", "stage",
-        "unstage",
+        "unstage", "worktree_add", "worktree_remove", "stash_push",
+        "stash_pop",
     ] = Field(
         description="Git write operation to perform: commit, init, clone, "
-        "branch_create, checkout, stage, unstage"
+        "branch_create, checkout, stage, unstage, worktree_add, "
+        "worktree_remove, stash_push, stash_pop"
+    )
+
+    force: bool = Field(
+        default=False,
+        description="Force a destructive worktree operation. worktree_remove "
+        "refuses a locked worktree or one with local changes unless this is "
+        "true (maps to git worktree remove --force)."
+    )
+
+    paths: Optional[List[str]] = Field(
+        default=None,
+        description="Optional path list for stash_push: only the named "
+        "pathspecs are stashed (git stash push -m <msg> -- <paths>). When "
+        "omitted, git's default tracked-file stash is used (never -a/-u)."
+    )
+
+    index: int = Field(
+        default=0,
+        description="Stash index for stash_pop (git stash pop stash@{index}). "
+        "Must be a non-negative integer; default 0 is the most recent stash."
     )
 
     base: Optional[str] = Field(
@@ -310,6 +332,14 @@ class GitWriteTool(GitReadTool):
                 return self._git_stage(repo_root)
             elif self.operation == "unstage":
                 return self._git_unstage(repo_root)
+            elif self.operation == "worktree_add":
+                return self._git_worktree_add(repo_root)
+            elif self.operation == "worktree_remove":
+                return self._git_worktree_remove(repo_root)
+            elif self.operation == "stash_push":
+                return self._git_stash_push(repo_root)
+            elif self.operation == "stash_pop":
+                return self._git_stash_pop(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         except Exception as e:
@@ -790,3 +820,186 @@ class GitWriteTool(GitReadTool):
 
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
+
+    @staticmethod
+    def _resolved_worktree_path(path: str) -> str:
+        """Best-effort resolved form of a worktree path, for comparison."""
+        try:
+            return str(Path(path).resolve())
+        except OSError:
+            return str(path)
+
+    def _git_worktree_add(self, repo_root: Path) -> str:
+        """Create a linked git worktree (git worktree add <path> <base>)."""
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if not self.path:
+            return "Error: path is required for worktree_add operation"
+        # Validate the target path BEFORE any git call: a target outside the
+        # workspace (or outside the repo) must never reach git.
+        try:
+            target_abs = self._validate_path(
+                str((repo_root / self.path).resolve())
+            )
+            rel = str(Path(target_abs).relative_to(repo_root))
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        if not rel or rel in (".", ".."):
+            return self._truncate_output(
+                f"Error: invalid worktree path: {self.path!r}"
+            )
+        base = self.base or "HEAD"
+        if not self._is_valid_branch_ref(base):
+            return self._truncate_output(
+                f"Error: invalid base ref for worktree_add: {base!r}"
+            )
+        # Probe the existing registrations ONCE (read-only). If a worktree is
+        # already registered at the target path, refuse without running
+        # `git worktree add` (which would fail or reuse the registration).
+        target_norm = self._resolved_worktree_path(target_abs)
+        probe_exit, probe_out, _probe_err = self._run_git_raw(
+            repo_root, ["worktree", "list", "--porcelain"], timeout=30
+        )
+        if probe_exit == 0:
+            for line in probe_out.splitlines():
+                if line.startswith("worktree "):
+                    existing = line[len("worktree "):].strip()
+                    if self._resolved_worktree_path(existing) == target_norm:
+                        return self._truncate_output(
+                            f"Error: a worktree is already registered at "
+                            f"'{rel}'; remove it before adding"
+                        )
+        output = self._run_git(repo_root, ["worktree", "add", rel, base])
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        return self._with_mode(self._truncate_output(
+            f"Created worktree at '{rel}' (base: {base})"
+        ))
+
+    def _git_worktree_remove(self, repo_root: Path) -> str:
+        """Remove a linked git worktree (git worktree remove [--force] <path>)."""
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if not self.path:
+            return "Error: path is required for worktree_remove operation"
+        try:
+            target_abs = self._validate_path(
+                str((repo_root / self.path).resolve())
+            )
+            rel = str(Path(target_abs).relative_to(repo_root))
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        # Never remove the PRIMARY worktree (the repo root itself): that is a
+        # whole-repo deletion, not a linked-worktree cleanup. Refuse before
+        # any git call.
+        if self._resolved_worktree_path(target_abs) == self._resolved_worktree_path(
+            str(repo_root)
+        ) or rel in (".", "..") or not rel:
+            return self._truncate_output(
+                f"Error: refusing to remove the primary worktree ({repo_root}); "
+                "worktree_remove only removes linked worktrees"
+            )
+        # Probe registrations ONCE (read-only) to detect a registered, locked
+        # or dirty worktree; refuse without `worktree remove` unless forced.
+        registered = False
+        locked = False
+        probe_exit, probe_out, _probe_err = self._run_git_raw(
+            repo_root, ["worktree", "list", "--porcelain"], timeout=30
+        )
+        if probe_exit == 0:
+            entries = {}
+            order = []
+            current = None
+            for line in probe_out.splitlines():
+                if line.startswith("worktree "):
+                    current = line[len("worktree "):].strip()
+                    entries[current] = False
+                    order.append(current)
+                elif current is not None and (
+                    line == "locked" or line.startswith("locked ")
+                ):
+                    entries[current] = True
+            target_norm = self._resolved_worktree_path(target_abs)
+            for candidate in order:
+                if self._resolved_worktree_path(candidate) == target_norm:
+                    registered = True
+                    locked = entries[candidate]
+                    break
+        if registered and not self.force:
+            reason = None
+            if locked:
+                reason = "locked"
+            else:
+                status_exit, status_out, _status_err = self._run_git_raw(
+                    repo_root, ["-C", rel, "status", "--porcelain"], timeout=30
+                )
+                if status_exit == 0 and status_out.strip():
+                    reason = "has local changes"
+            if reason:
+                return self._truncate_output(
+                    f"Error: refusing to remove worktree '{rel}': it is "
+                    f"{reason}; retry with force=true"
+                )
+        args = ["worktree", "remove"]
+        if self.force:
+            args.append("--force")
+        args.append(rel)
+        output = self._run_git(repo_root, args)
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        return self._with_mode(self._truncate_output(
+            f"Removed worktree '{rel}'"
+        ))
+
+    def _git_stash_push(self, repo_root: Path) -> str:
+        """Stash changes (git stash push -m <msg> [-- <paths>]).
+
+        Never uses ``-a``/``-u``: only tracked changes (or the explicitly
+        named pathspecs) are stashed, so untracked/ignored files are left in
+        the worktree.
+        """
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if not self.message or not self.message.strip():
+            return "Error: message is required for stash_push operation"
+        args = ["stash", "push", "-m", self.message]
+        if self.paths:
+            try:
+                rels = self._validated_rel_paths(repo_root, self.paths)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if rels:
+                args.append("--")
+                args.extend(rels)
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args, timeout=30)
+        if exit_code != 0:
+            return self._with_mode(self._truncate_output(
+                f"Git command failed (exit code {exit_code}):\n{stderr}"
+            ))
+        if "No local changes" in stdout:
+            return self._with_mode(self._truncate_output(
+                "No local changes to save."
+            ))
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_stash_pop(self, repo_root: Path) -> str:
+        """Pop a stash (git stash pop stash@{index})."""
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
+            return "Error: index must be a non-negative integer for stash_pop"
+        args = ["stash", "pop", f"stash@{{{self.index}}}"]
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args, timeout=30)
+        if exit_code != 0:
+            return self._with_mode(self._truncate_output(
+                f"Git command failed (exit code {exit_code}):\n{stdout}{stderr}"
+            ))
+        return self._with_mode(self._truncate_output(stdout))
