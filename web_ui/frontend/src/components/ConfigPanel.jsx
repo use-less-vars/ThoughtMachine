@@ -47,8 +47,49 @@ const isEqualRaw = (a, b) => {
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
 
+// Backend-canonical key → human label for the "Not global defaults" notice.
+// translate_frontend_config renames provider→provider_type and tools→enabled_tools
+// BEFORE the allowlist split, so dropped_keys carries the BACKEND names.
+const DEFAULT_KEY_LABELS = {
+  provider: 'Provider',
+  provider_type: 'Provider',
+  tools: 'Tools',
+  enabled_tools: 'Tools',
+  mode: 'Mode',
+  workspace_path: 'Workspace path',
+  token_monitor_warning_threshold: 'Token warning threshold',
+  token_monitor_critical_threshold: 'Token critical threshold',
+  tool_output_token_limit: 'Tool output limit',
+};
+
+function humanizeDefaultKey(key) {
+  if (DEFAULT_KEY_LABELS[key]) return DEFAULT_KEY_LABELS[key];
+  return String(key)
+    .split('_')
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(' ');
+}
+
+// Keys in dropped_keys ARE saved (as session-level config) — just not as global
+// defaults — so the copy must never say "not saved".
+function buildDefaultSaveNotice(savedKeys, droppedKeys) {
+  const saved = savedKeys ?? [];
+  const dropped = droppedKeys ?? [];
+  let text =
+    saved.length === 0
+      ? 'No settings saved as global defaults.'
+      : `Saved ${saved.length} settings as global defaults.`;
+  if (dropped.length > 0) {
+    text += ` Not global defaults: ${dropped.map(humanizeDefaultKey).join(', ')}.`;
+  }
+  return text;
+}
+
+const DEFAULT_SAVE_TIMEOUT_MS = 5000;
+
 function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, configQueued = false, applyFailed = null }) {
-  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
+  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error' | 'timeout'
+  const [notice, setNotice] = useState(null);  // null | { kind: 'status' | 'alert', text }
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
   const [allTools, setAllTools] = useState([]);
@@ -107,23 +148,52 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [applyError, setApplyError] = useState(null);
 
   // ── Sync defaultConfigSaveStatus from backend into local UI state ────
+  // Accepts the new object payload { status, saved_keys, dropped_keys, session_id,
+  // message } OR the legacy bare string ('ok' | 'error') for backward compat.
   useEffect(() => {
-    if (defaultConfigSaveStatus === 'ok') {
+    const incoming = defaultConfigSaveStatus;
+    if (!incoming) return;
+    const isObject = typeof incoming === 'object';
+    const status = isObject ? incoming.status : incoming;
+
+    if (status === 'ok') {
       setDefaultSaved(true);
+      // Only the structured payload can describe which keys were global vs local.
+      if (isObject) {
+        setNotice({ kind: 'status', text: buildDefaultSaveNotice(incoming.saved_keys, incoming.dropped_keys) });
+      }
       const t = setTimeout(() => {
         setDefaultSaved(false);
+        setNotice(null);
         onClearDefaultSaveStatus?.();
-      }, 2500);
+      }, DEFAULT_SAVE_TIMEOUT_MS);
       return () => clearTimeout(t);
-    } else if (defaultConfigSaveStatus === 'error') {
+    } else if (status === 'error') {
       setDefaultSaved('error');
+      if (isObject && incoming.message) {
+        setNotice({ kind: 'alert', text: incoming.message });
+      }
       const t = setTimeout(() => {
         setDefaultSaved(false);
+        setNotice(null);
         onClearDefaultSaveStatus?.();
       }, 4000);
       return () => clearTimeout(t);
     }
   }, [defaultConfigSaveStatus, onClearDefaultSaveStatus]);
+
+  // ── Stuck-pending guard: if the backend never confirms (e.g. the session went
+  // stale and SessionTab dropped the message), surface an honest timeout instead
+  // of leaving the button on 'Saving…' forever. Cleanup is keyed on defaultSaved,
+  // so a pending → ok/error transition clears the timer.
+  useEffect(() => {
+    if (defaultSaved !== 'pending') return;
+    const t = setTimeout(() => {
+      setDefaultSaved('timeout');
+      setNotice({ kind: 'alert', text: 'Not saved — session may be stale. Try Start New Session.' });
+    }, DEFAULT_SAVE_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [defaultSaved]);
 
   useEffect(() => {
     const seeded = getSafeDraft(config)
@@ -461,6 +531,14 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
         </button>
       </div>
+      {notice && (
+        <p
+          role={notice.kind === 'alert' ? 'alert' : 'status'}
+          style={{ margin: '0.5rem 0 0 0', fontSize: '0.85rem', color: notice.kind === 'alert' ? '#f38ba8' : '#a6e3a1' }}
+        >
+          {notice.text}
+        </p>
+      )}
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: '0.25rem', marginBottom: '1rem', borderBottom: '1px solid #45475a', paddingBottom: '0.5rem' }}>
