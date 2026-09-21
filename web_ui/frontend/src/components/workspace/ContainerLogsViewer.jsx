@@ -30,11 +30,16 @@ export default function ContainerLogsViewer({ workspaceId, containerName, tail =
     fetch(`/api/workspace/${workspaceId}/containers/${containerName}/logs?tail=${selectedTail}`)
       .then((response) => {
         if (!response.ok) throw new Error(`Failed to load logs (${response.status})`)
-        return response.text()
+        return response.json()
       })
-      .then((body) => {
+      .then((data) => {
         if (cancelled) return
-        setText(body)
+        if (!data || data.success === false) {
+          throw new Error((data && data.detail) || 'Failed to load logs')
+        }
+        const stdout = (data && data.stdout) || ''
+        const stderr = (data && data.stderr) || ''
+        setText(stderr ? `${stdout}\n[stderr]\n${stderr}` : stdout)
         setStatus('done')
       })
       .catch((err) => {

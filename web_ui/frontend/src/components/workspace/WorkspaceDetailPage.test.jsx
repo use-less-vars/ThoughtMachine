@@ -44,6 +44,21 @@ const DEFAULT_FALLBACK = {
   text: async () => '',
 }
 
+// Faithful logs-route stub: GET .../containers/{name}/logs returns a JSON body
+// only ({container, success, stdout, stderr, duration}). A real HTTP Response
+// exposes that payload through .text() as its serialized form, so .text()
+// yields the JSON string, NOT the bare log text. A viewer that reverts to
+// response.text() renders the envelope blob and the marker assertions fail.
+function logsOk(stdout, container = 'research-runner') {
+  const envelope = { container, success: true, stdout, stderr: '', duration: 0.01 }
+  return {
+    ok: true,
+    status: 200,
+    json: async () => envelope,
+    text: async () => JSON.stringify(envelope),
+  }
+}
+
 function stubFetchByUrl(routes, defaultResponse = DEFAULT_FALLBACK) {
   const fetchMock = vi.fn(async (url, init) => {
     const key = Object.keys(routes)
@@ -658,12 +673,7 @@ describe('WorkspaceDetailPage', () => {
     const logText = 'boot\nlistening on :8080\n'
     const fetchMock = stubFetchByUrl(
       routesFor(makeSummary(), {
-        '/api/workspace/ws-1/containers/research-runner/logs': {
-          ok: true,
-          status: 200,
-          json: async () => ({}),
-          text: async () => logText,
-        },
+        '/api/workspace/ws-1/containers/research-runner/logs': logsOk(logText),
       })
     )
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
@@ -674,6 +684,9 @@ describe('WorkspaceDetailPage', () => {
 
     const pre = await screen.findByText(/listening on :8080/)
     expect(pre.tagName).toBe('PRE')
+    // Rendered output is the decoded stdout, not the JSON envelope blob.
+    expect(pre.textContent).toMatch(/listening on :8080/)
+    expect(pre.textContent).not.toMatch(/"container"|"success"|"duration"/)
     const urls = fetchMock.mock.calls.map(([u]) => String(u))
     expect(
       urls.some((u) =>
@@ -721,12 +734,7 @@ describe('WorkspaceDetailPage \u2014 container logs viewer', () => {
   it('exposes an accessible logs region and a tail-size select after opening logs', async () => {
     stubFetchByUrl(
       routesFor(makeSummary(), {
-        '/api/workspace/ws-1/containers/research-runner/logs': {
-          ok: true,
-          status: 200,
-          json: async () => ({}),
-          text: async () => 'boot\nlistening on :8080\n',
-        },
+        '/api/workspace/ws-1/containers/research-runner/logs': logsOk('boot\nlistening on :8080\n'),
       })
     )
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
@@ -752,12 +760,7 @@ describe('WorkspaceDetailPage \u2014 container logs viewer', () => {
   it('refetches container logs with the newly chosen tail', async () => {
     const fetchMock = stubFetchByUrl(
       routesFor(makeSummary(), {
-        '/api/workspace/ws-1/containers/research-runner/logs': {
-          ok: true,
-          status: 200,
-          json: async () => ({}),
-          text: async () => 'boot\nlistening on :8080\n',
-        },
+        '/api/workspace/ws-1/containers/research-runner/logs': logsOk('boot\nlistening on :8080\n'),
       })
     )
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)

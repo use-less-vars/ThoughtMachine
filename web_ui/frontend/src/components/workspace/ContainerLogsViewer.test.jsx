@@ -21,12 +21,30 @@ function stubFetch(handler) {
   return fetchMock
 }
 
+// Faithful logs-route stub: the backend returns a JSON body only
+// ({container, success, stdout, stderr, duration}). A real HTTP Response
+// exposes that same payload through .text() as its serialized form, so .text()
+// yields the JSON string (NOT the bare log text). A viewer that silently
+// reverts to response.text() therefore renders the JSON envelope blob, which
+// the envelope-marker assertion below catches.
 function textOk(text = 'boot\nlistening on :8080\n') {
-  return { ok: true, status: 200, json: async () => ({}), text: async () => text }
+  const envelope = { container: CONTAINER_NAME, success: true, stdout: text, stderr: '', duration: 0.01 }
+  return {
+    ok: true,
+    status: 200,
+    json: async () => envelope,
+    text: async () => JSON.stringify(envelope),
+  }
 }
 
+// Faithful error stub: non-2xx responses carry a JSON {detail} body.
 function statusErr(status) {
-  return { ok: false, status, json: async () => ({}), text: async () => '' }
+  return {
+    ok: false,
+    status,
+    json: async () => ({ detail: 'no such container' }),
+    text: async () => JSON.stringify({ detail: 'no such container' }),
+  }
 }
 
 afterEach(() => {
@@ -45,6 +63,10 @@ describe('ContainerLogsViewer', () => {
 
     const pre = await screen.findByText(/listening on :8080/)
     expect(pre.tagName).toBe('PRE')
+    // The viewer must render the decoded stdout, NOT the raw JSON envelope:
+    // a response.text() regression would render the blob and leak these keys.
+    expect(pre.textContent).toMatch(/listening on :8080/)
+    expect(pre.textContent).not.toMatch(/"container"|"success"|"duration"/)
 
     const urls = fetchMock.mock.calls.map(([u]) => String(u))
     expect(urls).toEqual([`${LOGS_URL}?tail=200`])
