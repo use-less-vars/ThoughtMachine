@@ -556,7 +556,10 @@ class GitWriteTool(GitReadTool):
         (explicit ``git add -- <paths>`` staging + ``git commit -m <msg> --
         <paths>``). There is no full-worktree mode -- the historical ``git
         add -A`` auto-stage sweep is removed, so unvetted changes cannot be
-        swept into a commit past the review gate. The named paths are staged
+        swept into a commit past the review gate. The ``-- <paths>`` pathspec
+        applies on EVERY code path -- including the operator-managed-worktree
+        path -- so a pre-staged unrelated file can never slip into the commit.
+        The named paths are staged
         explicitly (never ``-A``) before committing: ``git commit -- <paths>``
         only commits files git already knows, so untracked files (e.g. the
         first commit of a fresh repo) would otherwise fail with "pathspec ...
@@ -605,14 +608,12 @@ class GitWriteTool(GitReadTool):
         # _unprotected_branch_agent_commit_allowed). When the exception applies,
         # the add/commit subprocesses themselves run with no silent host
         # fallback (a container outage fails loudly).
-        worktree_commit_allowed = False
         if self._is_operator_managed_worktree(repo_root):
             if not self._unprotected_branch_agent_commit_allowed(repo_root):
                 return self._truncate_output(
                     "Error: commits in this workspace are performed host-side by "
                     "the operator (workspace is an operator-managed git worktree)"
                 )
-            worktree_commit_allowed = True
 
         if not self.message or not self.message.strip():
             return "Error: message is required for commit operation"
@@ -625,15 +626,9 @@ class GitWriteTool(GitReadTool):
                 "Error: file_path is required for commit operation (at least one path)"
             )
 
-        if worktree_commit_allowed:
-            # Policy-allowed agent commit: stage ONLY the named paths
-            # (never ``-A``; _git_add uses self.file_path) and commit.
-            add_output = self._git_add(repo_root)
-            if self._is_git_error_output(add_output):
-                return self._truncate_output(add_output)
-            output = self._run_git(repo_root, ["commit", "-m", self.message])
-            return self._with_mode(self._truncate_output(output))
-
+        # Single path-scoped commit flow for EVERY code path (plain and
+        # operator-managed-worktree alike). Validate the named paths first,
+        # then stage exactly those paths (never ``-A``) and commit only them.
         try:
             rels = self._validated_rel_paths(repo_root, self.file_path)
         except ValueError as e:

@@ -153,7 +153,7 @@ def test_feature_branch_commit_allowed_with_flag_container_mode(tmp_path):
     assert ["rev-parse", "--abbrev-ref", "HEAD"] in container_args
     assert ["add", "--", "agent_change.py"] in container_args
     assert all("-A" not in a for a in container_args)
-    assert ["commit", "-m", "agent commit"] in container_args
+    assert ["commit", "-m", "agent commit", "--", "agent_change.py"] in container_args
     assert all("--no-verify" not in a for a in container_args)
     assert exec_host.calls == []
     assert [cmd[1] for cmd, _kw in manager.calls] == ["rev-parse", "add", "commit"]
@@ -201,7 +201,7 @@ def test_feature_branch_commit_allowed_on_non_protected_branch(tmp_path):
     assert calls == [
         ["rev-parse", "--abbrev-ref", "HEAD"],
         ["add", "--", "agent_change.py"],
-        ["commit", "-m", "agent commit"],
+        ["commit", "-m", "agent commit", "--", "agent_change.py"],
     ]
     assert all("-A" not in c for c in calls)
     _assert_no_commit_subprocess(exec_container, exec_host)
@@ -289,7 +289,7 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
     assert "ok\n" in result
     assert OPERATOR_ERROR not in result
     assert [c[0] for c in calls] == ["rev-parse", "add", "commit"]
-    assert calls[2] == ["commit", "-m", "Merge branch 'main' into feat/x"]
+    assert calls[2] == ["commit", "-m", "Merge branch 'main' into feat/x", "--", "agent_change.py"]
     assert all("--no-verify" not in c for c in calls)
     assert exec_host.calls == []
 
@@ -379,7 +379,7 @@ def test_feature_branch_commit_stages_only_named_path(tmp_path):
     assert calls == [
         ["rev-parse", "--abbrev-ref", "HEAD"],
         ["add", "--", "agent_change.py"],
-        ["commit", "-m", "agent commit"],
+        ["commit", "-m", "agent commit", "--", "agent_change.py"],
     ]
     assert all("-A" not in c for c in calls)
     _assert_no_commit_subprocess(exec_container, exec_host)
@@ -496,4 +496,113 @@ def test_wofb_feature_branch_gate_fails_closed_on_branch_timeout(
 
     assert _commit_permitted(tool, "/tmp/repo") is False
     assert raw.commit_ran is False
+
+
+
+# --- Pathspec-scoped commit defect (C3) --------------------------------------
+#
+# ``_git_commit`` historically had TWO arms: a plain arm that emitted the
+# path-scoped argv ``["commit", "-m", msg, "--", *paths]`` and an
+# operator-managed-worktree arm that emitted the BARE argv
+# ``["commit", "-m", msg]`` -- which commits the WHOLE index, sweeping any
+# pre-staged unrelated file into the commit. The unification collapses both
+# arms into the single path-scoped flow; these tests pin that contract.
+
+
+def test_commit_with_pathspec_ignores_pre_staged_unrelated_file(tmp_path):
+    """A pre-staged unrelated file must not be swept into a selective commit.
+
+    ``pre_staged.py`` is left in the index; the commit names only
+    ``agent_change.py``. The commit argv must therefore carry the pathspec
+    (``-- agent_change.py``) so the unrelated staged file is excluded.
+    """
+    (tmp_path / "agent_change.py").write_text("print('x')\n")
+    (tmp_path / "pre_staged.py").write_text("print('y')\n")
+    tool = _tool(
+        file_path="agent_change.py",
+        agent_config={"session_permissions": {"git": "write"}},
+    )
+    calls = []
+    exec_container = _RecordingExec()
+    exec_host = _RecordingExec()
+    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
+    tool._use_container_mode = lambda: True  # noqa: SLF001
+    tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
+    tool._exec_container_raw = exec_container  # noqa: SLF001
+    tool._exec_host_raw = exec_host  # noqa: SLF001
+
+    result = tool._git_commit(tmp_path)
+
+    assert "ok\n" in result
+    assert OPERATOR_ERROR not in result
+    commit_args = [c for c in calls if c and c[0] == "commit"]
+    assert commit_args == [
+        ["commit", "-m", "agent commit", "--", "agent_change.py"]
+    ]
+    # The unrelated pre-staged file must never appear in any argv.
+    assert all("pre_staged.py" not in c for c in calls)
+    _assert_no_commit_subprocess(exec_container, exec_host)
+
+
+def test_commit_worktree_arm_uses_pathspec(tmp_path):
+    """The operator-managed-worktree path must emit the path-scoped argv.
+
+    The historic worktree arm committed the whole index (bare
+    ``git commit -m``); after unification every code path passes the validated
+    paths through ``-- <paths>``.
+    """
+    (tmp_path / "agent_change.py").write_text("print('x')\n")
+    tool = _tool(
+        file_path="agent_change.py",
+        agent_config={"session_permissions": {"git": "write"}},
+    )
+    calls = []
+    exec_container = _RecordingExec()
+    exec_host = _RecordingExec()
+    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
+    tool._use_container_mode = lambda: True  # noqa: SLF001
+    tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
+    tool._exec_container_raw = exec_container  # noqa: SLF001
+    tool._exec_host_raw = exec_host  # noqa: SLF001
+
+    result = tool._git_commit(tmp_path)
+
+    assert "ok\n" in result
+    assert OPERATOR_ERROR not in result
+    assert calls == [
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["add", "--", "agent_change.py"],
+        ["commit", "-m", "agent commit", "--", "agent_change.py"],
+    ]
+    assert all("-A" not in c for c in calls)
+    _assert_no_commit_subprocess(exec_container, exec_host)
+
+
+@pytest.mark.parametrize(
+    "empty_paths", [None, "", []], ids=["none", "empty_str", "empty_list"]
+)
+def test_commit_empty_paths_errors_no_subprocess(empty_paths):
+    """Empty file_path -> explicit error with NO git subprocess at all.
+
+    The empty-path guard runs before any ``git add``/``git commit``: no write
+    subprocess may ever be issued for a commit that names no paths.
+    """
+    tool = _tool(
+        file_path=empty_paths,
+        agent_config={"session_permissions": {"git": "write"}},
+    )
+    calls = []
+    exec_container = _RecordingExec()
+    exec_host = _RecordingExec()
+    tool._is_operator_managed_worktree = lambda root: False  # noqa: SLF001
+    tool._use_container_mode = lambda: True  # noqa: SLF001
+    tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
+    tool._exec_container_raw = exec_container  # noqa: SLF001
+    tool._exec_host_raw = exec_host  # noqa: SLF001
+
+    result = tool._git_commit("/tmp/repo")
+
+    assert result == "Error: file_path is required for commit operation (at least one path)"
+    assert calls == []
+    _assert_no_commit_subprocess(exec_container, exec_host)
 
