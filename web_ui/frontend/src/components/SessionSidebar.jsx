@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import useWorkspaceStore from '../store/workspaceStore'
 import './SessionSidebar.css'
 
@@ -30,6 +30,9 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
   const [toolsOverride, setToolsOverride] = useState(null)
   const [stopError, setStopError] = useState(null)
   const [containerError, setContainerError] = useState(null)
+  const [activeWorkers, setActiveWorkers] = useState([])
+  const [workersLoading, setWorkersLoading] = useState(false)
+  const [workersError, setWorkersError] = useState(null)
 
   // Refresh workspace data (permissions/workers/containers) while open.
   useEffect(() => {
@@ -43,6 +46,39 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
     return () => clearInterval(interval)
   }, [workspaceId])
 
+  // Fetch the LIVE active workers (running instances) for this workspace.
+  const fetchActiveWorkers = useCallback(async () => {
+    if (!workspaceId) return
+    try {
+      setWorkersError(null)
+      const res = await fetch(
+        `/api/workspace/${encodeURIComponent(workspaceId)}/workers/active`
+      )
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const list = Array.isArray(data) ? data : []
+      setActiveWorkers(
+        list.map((e) => ({
+          name: e.worker_name ?? e.name,
+          instance_id: e.instance_id ?? null,
+          status: e.status ?? 'unknown',
+        }))
+      )
+    } catch (err) {
+      setWorkersError(err.message || String(err))
+      setActiveWorkers([])
+    } finally {
+      setWorkersLoading(false)
+    }
+  }, [workspaceId])
+
+  // Poll the active workers while the panel is open.
+  useEffect(() => {
+    fetchActiveWorkers()
+    const interval = setInterval(fetchActiveWorkers, 3000)
+    return () => clearInterval(interval)
+  }, [fetchActiveWorkers])
+
   // Keep the optimistic tools override in sync once the backend confirms.
   useEffect(() => {
     setToolsOverride(null)
@@ -50,7 +86,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
 
   const wsMatch = currentWorkspace?.id === workspaceId
   const permissions = wsMatch ? (currentWorkspace.permissions || []) : []
-  const workers = wsMatch ? (currentWorkspace.workers || []) : []
+  const workers = wsMatch ? activeWorkers : []
   const containers = (wsMatch ? (currentWorkspace.containers || []) : [])
     .filter((c) => !(c.name || '').startsWith('tm-resource-'))
 
@@ -158,14 +194,14 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
         {/* ── 3. Workers ──────────────────────────────────────────────────── */}
         <section className="session-sidebar-section">
           <h4>Workers</h4>
-          {wsLoading && wsMatch ? (
+          {(wsLoading || workersLoading) && wsMatch ? (
             <p className="session-sidebar-empty">Loading workers...</p>
           ) : workers.length === 0 ? (
-            <p className="session-sidebar-empty">No workers configured for this workspace.</p>
+            <p className="session-sidebar-empty">No active workers in this workspace.</p>
           ) : (
             <ul className="session-sidebar-workers">
               {workers.map((w) => {
-                const status = w.runtimeStatus || w.runtime_status || 'unknown'
+                const status = w.status || 'unknown'
                 const color = WORKER_STATUS_COLORS[status] || '#6c7086'
                 return (
                   <li key={w.name} className="session-sidebar-worker">
@@ -183,6 +219,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
             </ul>
           )}
           {stopError && <p className="session-sidebar-error">{stopError}</p>}
+          {workersError && <p className="session-sidebar-error">{workersError}</p>}
         </section>
 
         {/* ── 4. Containers (tm-resource-* excluded) ──────────────────────── */}
