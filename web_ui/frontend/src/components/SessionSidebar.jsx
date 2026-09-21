@@ -65,12 +65,13 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
     sendCommand('apply_config', { config: { ...config, tools: next } })
   }
 
-  const handleStopWorker = async (name) => {
+  const handleStopWorker = async (name, instanceId) => {
     if (!workspaceId) return
     try {
       setStopError(null)
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : ''
       const res = await fetch(
-        `/api/workspace/${encodeURIComponent(workspaceId)}/workers/${encodeURIComponent(name)}/stop`,
+        `/api/workspace/${encodeURIComponent(workspaceId)}/workers/${encodeURIComponent(name)}/stop${instanceQuery}`,
         { method: 'POST' }
       )
       if (!res.ok) {
@@ -173,7 +174,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
                       <span className="session-sidebar-worker-name">{w.name}</span>
                       <span className="session-sidebar-worker-status">{status}</span>
                     </div>
-                    <button className="session-sidebar-stop-btn" onClick={() => handleStopWorker(w.name)}>
+                    <button className="session-sidebar-stop-btn" onClick={() => handleStopWorker(w.name, w.instance_id)}>
                       Stop
                     </button>
                   </li>
