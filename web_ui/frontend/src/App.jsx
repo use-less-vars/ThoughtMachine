@@ -44,6 +44,7 @@ import LoggingPanel from './components/LoggingPanel'
 import OnboardingWizard from './components/OnboardingWizard'
 import WorkspaceSelector from './components/WorkspaceSelector'
 import WorkspaceDetailPage from './components/workspace/WorkspaceDetailPage'
+import LayerNav from './components/LayerNav'
 import { useRoute, useNavigate } from './router'
 import { apiUrl, wsUrl } from './apiBase'
 import './styles.css'
@@ -208,6 +209,20 @@ export default function App() {
     const s = useStore.getState().sessions.find(x => x.session_id === sessionId)
     return s?.name || ''
   }
+
+  // --- Shared top-left breadcrumb (LayerNav) labels -------------------
+  // Workspace label comes from workspaceStore.workspaceList ({ id, name }).
+  const layerNavWorkspaceLabel =
+    route?.view === 'workspace'
+      ? (workspaceList.find(w => w.id === route.id)?.name ?? null)
+      : route?.view === 'session' && route.workspaceId
+        ? (workspaceList.find(w => w.id === route.workspaceId)?.name ?? null)
+        : null
+  // Session label: current-strip tab title first, else the shared sessions store.
+  const layerNavSessionLabel =
+    route?.view === 'session' && route.id
+      ? (tabs.find(t => t.sessionId === route.id)?.title || nameFromStore(route.id) || null)
+      : null
 
   // Central rename application. Session renames reach this component through
   // two paths — the inline rename UI and WS session_renamed events (the tab
@@ -1245,6 +1260,7 @@ export default function App() {
       )}
       <div className="app-main">
         <div className="app-center tab-content-area">
+          <LayerNav route={route} workspaceLabel={layerNavWorkspaceLabel} sessionLabel={layerNavSessionLabel} />
           {/* Per-workspace session tab strip (frontend-only state).
               Only shown on workspace/session views — never on the selector. */}
           {route?.view !== 'selector' && currentWs && tabs.length > 0 && (

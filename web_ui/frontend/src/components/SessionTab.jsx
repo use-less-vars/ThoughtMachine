@@ -27,8 +27,6 @@ import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
 import SecurityDialog from './SecurityDialog'
 import SessionSidebar from './SessionSidebar'
-import { useNavigate } from '../router'
-import useWorkspaceStore from '../store/workspaceStore'
 import { wsUrl } from '../apiBase'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
@@ -128,20 +126,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const sessionState = useStore((s) => s.sessionStates[storeKey])
   const sessionError = useStore((s) => (storeKey ? (s.sessionErrors[storeKey] || '') : ''))
   const config = sessionConfig?.config ?? null
-  const navigate = useNavigate()
-  const workspaceList = useWorkspaceStore((s) => s.workspaceList)
-  // Workspace for the 'Back to Workspace' button: prefer the owning workspaceId
-  // carried by the nested session URL (#/workspace/:wsId/session/:sid) — it
-  // reaches the workspace level immediately, even before session_loaded; next
-  // prefer the workspace_id the backend reported in session_loaded; fall back
-  // to matching the session config's workspace_path against known workspaces;
-  // final fallback null → navigate to the workspace selector ('/workspaces').
-  const backWorkspaceId = routeWorkspaceId || workspaceId || (() => {
-    const wsPath = config?.workspace_path
-    if (!wsPath) return null
-    const match = workspaceList.find((w) => w.root === wsPath || w.path === wsPath)
-    return match ? match.id : null
-  })()
   const providers = sessionConfig?.providers ?? []
   const availableTools = sessionConfig?.tools ?? []
   const history = sessionMessages ?? EMPTY_MESSAGES
@@ -1132,15 +1116,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
                 Rename
               </button>
               <div className="session-header-spacer" />
-              <button
-                className="session-header-btn session-header-back-btn"
-                onClick={() =>
-                  navigate(backWorkspaceId ? `/workspace/${encodeURIComponent(backWorkspaceId)}` : '/workspaces')
-                }
-                title="Back to workspace"
-              >
-                ← Back to Workspace
-              </button>
               <button
                 className="session-header-btn session-header-details-btn"
                 onClick={() => setSidebarOpen((v) => !v)}
