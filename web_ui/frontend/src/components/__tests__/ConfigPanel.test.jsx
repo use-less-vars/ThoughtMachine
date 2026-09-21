@@ -347,3 +347,75 @@ describe('Tools tab', () => {
     expect(screen.getByText('Loading tool list...')).toBeInTheDocument();
   });
 });
+
+// ==========================================================================
+// Config reset (Wave 4a)
+// POST /api/config/reset — destructive, global. Confirm-gated, one POST.
+// ==========================================================================
+describe('Config reset', () => {
+  function resetPostCalls() {
+    return globalThis.fetch.mock.calls.filter(([, init]) => init && init.method === 'POST');
+  }
+
+  it('renders a Reset button in the header', () => {
+    renderPanel();
+    expect(screen.getByRole('button', { name: 'Reset' })).toBeInTheDocument();
+  });
+
+  it('reveals a confirmation without POSTing when Reset is clicked', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirm reset' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(resetPostCalls()).toHaveLength(0);
+  });
+
+  it('fires exactly one POST to /api/config/reset when confirmed', async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }));
+    await waitFor(() => {
+      expect(resetPostCalls()).toHaveLength(1);
+    });
+    const url = String(resetPostCalls()[0][0]);
+    expect(url).toEqual(expect.stringContaining('/api/config/reset'));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('fires no POST when Cancel is clicked', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(resetPostCalls()).toHaveLength(0);
+  });
+
+  it('surfaces a role="status" notice on success', async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }));
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toMatch(/reset/i);
+  });
+
+  it('surfaces a role="alert" notice on failure', async () => {
+    globalThis.fetch.mockImplementation(async (url, init) => {
+      if (init && init.method === 'POST') {
+        return {
+          ok: false,
+          status: 500,
+          json: async () => ({ detail: 'Failed to reset config' }),
+          text: async () => '',
+        };
+      }
+      return { ok: true, json: async () => ({ tools: [] }), text: async () => '' };
+    });
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Reset failed');
+  });
+});
+
