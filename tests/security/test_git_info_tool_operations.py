@@ -1112,3 +1112,112 @@ class TestContainerWorkingDirAccepted:
         assert tool._normalise_working_dir("/workspaceX") == "/workspaceX"
         assert tool._normalise_working_dir("/workspace/../outside") == "/workspace/../outside"
 
+
+# ---------------------------------------------------------------------------
+# show honours file scope + optional line range (defect A1)
+# ---------------------------------------------------------------------------
+def _shadow_run_git_raw(tool, stdout="ok", exit_code=0, stderr=""):
+    """Shadow the git seam on ``tool``, recording argv per invocation."""
+    calls = []
+
+    def fake(repo_root, args, timeout=30):
+        calls.append(list(args))
+        return (exit_code, stdout, stderr)
+
+    object.__setattr__(tool, "_run_git_raw", fake)
+    return calls
+
+
+class TestShowHonoursScope:
+    """`show` must honour file_path / line range, never silently drop them."""
+
+    UNSCOPED = ["show", "--no-ext-diff", "--no-textconv", "HEAD"]
+
+    def test_file_path_scopes_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD", file_path="a.txt"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show(tmp_path)
+        assert calls == [self.UNSCOPED + ["--", "a.txt"]]
+        assert calls[0] != self.UNSCOPED
+
+    def test_no_scope_argv_unchanged(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show(tmp_path)
+        assert calls == [self.UNSCOPED]
+
+    def test_format_only_argv_unchanged(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show", format="%H %s")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show(tmp_path)
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "--format=%H %s", "HEAD"]
+        ]
+
+    def test_range_reads_scoped_blob_and_slices(self, tmp_path):
+        blob = "L1\nL2\nL3\nL4\nL5\n"
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD",
+            file_path="a.txt", line_start=2, line_end=4,
+        )
+        calls = _shadow_run_git_raw(tool, stdout=blob)
+        out = tool._git_show(tmp_path)
+        # the range is honoured via the scoped blob <commit>:<path>
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]
+        ]
+        assert "L2" in out and "L4" in out
+        assert "L1" not in out and "L5" not in out
+        assert "L1\nL2\nL3\nL4\nL5" not in out  # not the whole blob
+
+    def test_range_without_file_path_errors_before_git(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", line_start=1, line_end=2
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show(tmp_path)
+        assert out.startswith("Error:")
+        assert "line_start" in out or "line_end" in out
+        assert calls == []  # no git run -> not a silent success
+
+    def test_invalid_range_errors_before_git(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", file_path="a.txt",
+            line_start=5, line_end=2,
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_path_matching_nothing_is_scoped_not_full_patch(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD", file_path="nope.txt"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="")
+        tool._git_show(tmp_path)
+        assert calls == [self.UNSCOPED + ["--", "nope.txt"]]
+        assert calls[0] != self.UNSCOPED  # never the full unscoped patch
+
+
+    def test_ranged_show_git_failure_is_error_not_sliced(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD",
+            file_path="a.txt", line_start=2, line_end=4,
+        )
+        calls = _shadow_run_git_raw(
+            tool, stdout="SHOULD-NOT-LEAK", exit_code=128,
+            stderr="fatal: bad object HEAD:a.txt",
+        )
+        out = tool._git_show(tmp_path)
+        # the ranged invocation did run ...
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]
+        ]
+        # ... and its failure surfaced as an error, never sliced as content
+        assert out.startswith("Git command failed")
+        assert "fatal: bad object HEAD:a.txt" in out
+        assert "SHOULD-NOT-LEAK" not in out
+

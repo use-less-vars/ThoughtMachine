@@ -1346,11 +1346,81 @@ class GitReadTool(ToolBase):
         return self._with_mode(self._truncate_output(output))
 
     def _git_show(self, repo_root: Path) -> str:
-        """Run git show."""
+        """Run git show, honouring file scope and an optional line range.
+
+        ``git show`` has no line-range selector, so a requested line range is
+        honoured by reading the file's blob at ``<commit>:<path>`` and slicing
+        the requested lines. Any ``file_path``/``line_start``/``line_end``
+        argument that cannot be honoured is reported as an explicit error --
+        never silently dropped (defect A1).
+        """
+        range_requested = self.line_start is not None or self.line_end is not None
+        file_path = self.file_path
+
+        # Any range/file argument that cannot be honoured must fail loudly
+        # instead of being silently dropped (defect A1).
+        if range_requested:
+            if file_path is None:
+                return self._truncate_output(
+                    "Error: show: line_start/line_end require file_path "
+                    "(a line range is only honoured for a single scoped file)."
+                )
+            if self.line_start is None or self.line_end is None:
+                return self._truncate_output(
+                    "Error: show: both line_start and line_end are required "
+                    "together for a line range."
+                )
+            if (
+                self.line_start < 1
+                or self.line_end < 1
+                or self.line_start > self.line_end
+            ):
+                return self._truncate_output(
+                    "Error: show: invalid line range; require "
+                    "1 <= line_start <= line_end."
+                )
+            if isinstance(file_path, list):
+                return self._truncate_output(
+                    "Error: show: a line range requires a single file_path "
+                    "(got a list)."
+                )
+
+        rel_paths: List[str] = []
+        if file_path is not None:
+            try:
+                rel_paths = self._validated_rel_paths(repo_root, file_path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+
+        if range_requested:
+            # git show cannot select a line range; read the scoped blob at
+            # <commit>:<path> and slice the requested lines.
+            args = ["show", "--no-ext-diff", "--no-textconv"]
+            if self.format:
+                args.append(f"--format={self.format}")
+            args.append(f"{self.commit}:{rel_paths[0]}")
+            exit_code, stdout, stderr = self._run_git_raw(
+                repo_root, args, timeout=30
+            )
+            if exit_code != 0:
+                # Same git-error convention as _run_git / the other handlers;
+                # never slice an error string as if it were file content.
+                return self._with_mode(self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                ))
+            lines = stdout.split("\n")
+            if lines and lines[-1] == "":
+                lines.pop()
+            sliced = "\n".join(lines[self.line_start - 1:self.line_end])
+            return self._with_mode(self._truncate_output(sliced))
+
         args = ["show", "--no-ext-diff", "--no-textconv"]
         if self.format:
             args.append(f"--format={self.format}")
         args.append(self.commit)
+        if rel_paths:
+            args.append("--")
+            args.extend(rel_paths)
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
     
