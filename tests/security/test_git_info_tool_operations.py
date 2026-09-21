@@ -229,10 +229,14 @@ class TestBranchCreate:
         )
         result = tool._git_branch_create(tmp_path)
 
-        _kind, command, kwargs = _last_manager_exec(fake_manager)
-        assert command == ["git", "branch", "feature/x"]
-        assert kwargs["workdir"] == "/workspace"
+        execs = [c for c in fake_manager.calls if c[0] == "exec"]
+        # first exec resolves the base -> immutable SHA; the second pins the
+        # branch to that SHA (never the bare `git branch <name>` form).
+        assert execs[0][1] == ["git", "rev-parse", "--verify", "HEAD^{commit}"]
+        assert execs[1][1] == ["git", "branch", "feature/x", "ok"]
+        assert execs[1][2]["workdir"] == "/workspace"
         assert "execution_mode: containerized" in result
+        assert "Created branch 'feature/x' at ok" in result
 
     def test_host_argv_and_trailer(self, tmp_path, fake_sandbox):
         tool = _host_tool(
@@ -240,9 +244,12 @@ class TestBranchCreate:
         )
         result = tool._git_branch_create(tmp_path)
 
-        command = _last_sandbox_command()
-        assert command[-2:] == ["branch", "feature/x"]
+        # each host git invocation builds its own sandbox instance; flatten
+        calls = [c[0] for inst in _FakeSandbox.instances for c in inst.calls]
+        assert calls[0][-3:] == ["rev-parse", "--verify", "HEAD^{commit}"]
+        assert calls[1][-3:] == ["branch", "feature/x", "ok"]
         assert "execution_mode: host" in result
+        assert "working tree HEAD not moved" in result
 
     @pytest.mark.parametrize(
         "bad", ["-x", ".x", "a..b", "a@{b}", "a b", "a--no-verify"]
@@ -260,6 +267,85 @@ class TestBranchCreate:
 
         assert result == "Error: branch is required for branch_create operation"
         assert not _FakeSandbox.instances
+
+    # --- defect A3: the branch is pinned to an immutable base SHA ---------
+    def test_default_base_resolves_workspace_head(self, tmp_path, fake_sandbox):
+        # base=None -> rev-parse HEAD^{commit}; branch argv pins the resolved SHA
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        calls = _shadow_run_git_raw(tool, stdout="cafe1234\n")
+        result = tool._git_branch_create(tmp_path)
+
+        assert calls[0] == ["rev-parse", "--verify", "HEAD^{commit}"]
+        assert calls[1] == ["branch", "feature/x", "cafe1234"]
+        assert "Created branch 'feature/x' at cafe1234 (base: HEAD)" in result
+        assert "HEAD not moved" in result
+
+    def test_explicit_base_resolved_to_sha(self, tmp_path, fake_sandbox):
+        # explicit base -> rev-parse <base>^{commit}, branch pinned to the SHA
+        tool = _host_tool(
+            tmp_path, operation="branch_create", branch="feature/x",
+            base="origin/main",
+        )
+        calls = _shadow_run_git_raw(tool, stdout="deadbeef\n")
+        result = tool._git_branch_create(tmp_path)
+
+        assert calls[0] == ["rev-parse", "--verify", "origin/main^{commit}"]
+        assert calls[1] == ["branch", "feature/x", "deadbeef"]
+        assert "(base: origin/main)" in result
+
+    @pytest.mark.parametrize(
+        "bad", ["-x", "--force", ".x", "a..b", "a@{b}", "a b"]
+    )
+    def test_unsafe_base_rejected_before_git(self, tmp_path, fake_sandbox, bad):
+        # a caller base starting with '-' (or otherwise unsafe) must error
+        # BEFORE any git call: it can never reach rev-parse as a flag.
+        tool = _host_tool(
+            tmp_path, operation="branch_create", branch="feature/x", base=bad
+        )
+        calls = _shadow_run_git_raw(tool)
+        result = tool._git_branch_create(tmp_path)
+
+        assert result.startswith("Error: Invalid branch name")
+        assert calls == []
+        assert not _FakeSandbox.instances
+
+    def test_unresolvable_base_errors_without_creating_branch(
+        self, tmp_path, fake_sandbox
+    ):
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Needed a single revision",
+        )
+        result = tool._git_branch_create(tmp_path)
+
+        assert result.startswith("Git command failed (exit code 128):")
+        assert "fatal: Needed a single revision" in result
+        # only the rev-parse ran; no branch was created
+        assert calls == [["rev-parse", "--verify", "HEAD^{commit}"]]
+
+    def test_branch_create_argv_never_bare_name(self, tmp_path, fake_sandbox):
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        tool._git_branch_create(tmp_path)
+
+        calls = [c[0] for inst in _FakeSandbox.instances for c in inst.calls]
+        branch_cmds = [c for c in calls if "branch" in c]
+        assert branch_cmds, "no branch-create command was run"
+        cmd = branch_cmds[-1]
+        assert cmd[-2:] == ["feature/x", "ok"]
+        assert cmd != ["git", "branch", "feature/x"]
+
+    def test_empty_resolution_errors_without_creating_branch(
+        self, tmp_path, fake_sandbox
+    ):
+        # exit 0 but empty stdout must NEVER create a branch with an empty
+        # start point: it is an explicit error instead.
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        result = tool._git_branch_create(tmp_path)
+
+        assert result.startswith("Error:")
+        assert calls == [["rev-parse", "--verify", "HEAD^{commit}"]]
 
 
 # ---------------------------------------------------------------------------

@@ -93,6 +93,14 @@ class GitWriteTool(GitReadTool):
         "branch_create, checkout, stage, unstage"
     )
 
+    base: Optional[str] = Field(
+        default=None,
+        description="Base ref for branch_create. The ref is resolved to an "
+        "immutable commit SHA (git rev-parse --verify <base>^{commit}) before "
+        "the branch is created. None (default) pins the branch to the "
+        "WORKSPACE checkout HEAD -- never the gitdir HEAD."
+    )
+
     def _flag_gate_error(self) -> str:
         """Return the git permission denial message (fail-closed gate)."""
         return 'Error: git:write denied: session git_write permission is not "write"'
@@ -452,7 +460,20 @@ class GitWriteTool(GitReadTool):
         return name
 
     def _git_branch_create(self, repo_root: Path) -> str:
-        """Create a new branch (git branch <name>)."""
+        """Create a new branch pinned to an immutable commit SHA.
+
+        ``branch_create`` is CREATE-ONLY: it never moves the working-tree
+        HEAD (that is ``checkout``'s job). The new branch is based on the
+        WORKSPACE checkout HEAD by default, or on the caller's explicit
+        ``base`` ref when supplied -- never on the gitdir HEAD (which may
+        point elsewhere for an operator-managed worktree).
+
+        The base is resolved to an immutable SHA via ``git rev-parse --verify
+        <base>^{commit}`` BEFORE the branch is created, so the branch-creation
+        argv always pins an explicit commit and never emits the bare ``git
+        branch <name>`` form (which would follow whatever HEAD happens to be
+        at create time).
+        """
         # git permission gate (fail closed): direct callers must also
         # pass the session git permission check.
         if not self._git_write_allowed():
@@ -463,8 +484,47 @@ class GitWriteTool(GitReadTool):
             name = self._validate_branch_name(self.branch)
         except ValueError as e:
             return self._truncate_output(f"Error: {e}")
-        output = self._run_git(repo_root, ["branch", name])
-        return self._with_mode(self._truncate_output(output))
+
+        # Resolve the base ref to an immutable SHA BEFORE creating the
+        # branch. A caller-supplied base is validated BEFORE any git call so
+        # an option-like value (e.g. a leading '-') can never reach
+        # rev-parse/branch as a smuggled flag.
+        if self.base is None:
+            base_expr = "HEAD"
+            resolve_args = ["rev-parse", "--verify", "HEAD^{commit}"]
+        else:
+            try:
+                base_expr = self._validate_branch_name(self.base)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if not self._is_valid_branch_ref(base_expr):
+                return self._truncate_output(
+                    f"Error: Invalid base ref: {base_expr!r}"
+                )
+            resolve_args = ["rev-parse", "--verify", f"{base_expr}^{{commit}}"]
+
+        exit_code, stdout, stderr = self._run_git_raw(
+            repo_root, resolve_args, timeout=30
+        )
+        if exit_code != 0:
+            return self._with_mode(self._truncate_output(
+                f"Git command failed (exit code {exit_code}):\n{stderr}"
+            ))
+        sha = stdout.strip()
+        if not sha:
+            # Fail closed: never create a branch named after an empty start
+            # point (rev-parse returned nothing despite exit_code == 0).
+            return self._with_mode(self._truncate_output(
+                "Error: could not resolve base ref to a commit SHA"
+            ))
+
+        output = self._run_git(repo_root, ["branch", name, sha])
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        return self._with_mode(self._truncate_output(
+            f"Created branch '{name}' at {sha} (base: {base_expr}); "
+            "working tree HEAD not moved \u2014 use checkout to switch."
+        ))
 
     def _git_checkout(self, repo_root: Path) -> str:
         """Check out an existing branch (git checkout <name>)."""
