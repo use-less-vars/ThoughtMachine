@@ -24,11 +24,12 @@ Security properties asserted per operation:
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tools.git_info_tool import GitInfoTool
+from tools.git_info_tool import GitInfoTool, GitUnavailableError
 from tools.git_write_tool import GitWriteTool
 
 FLAG_ERROR = 'Error: git:write denied: session git_write permission is not "write"'
@@ -228,10 +229,14 @@ class TestBranchCreate:
         )
         result = tool._git_branch_create(tmp_path)
 
-        _kind, command, kwargs = _last_manager_exec(fake_manager)
-        assert command == ["git", "branch", "feature/x"]
-        assert kwargs["workdir"] == "/workspace"
+        execs = [c for c in fake_manager.calls if c[0] == "exec"]
+        # first exec resolves the base -> immutable SHA; the second pins the
+        # branch to that SHA (never the bare `git branch <name>` form).
+        assert execs[0][1] == ["git", "rev-parse", "--verify", "HEAD^{commit}"]
+        assert execs[1][1] == ["git", "branch", "feature/x", "ok"]
+        assert execs[1][2]["workdir"] == "/workspace"
         assert "execution_mode: containerized" in result
+        assert "Created branch 'feature/x' at ok" in result
 
     def test_host_argv_and_trailer(self, tmp_path, fake_sandbox):
         tool = _host_tool(
@@ -239,9 +244,12 @@ class TestBranchCreate:
         )
         result = tool._git_branch_create(tmp_path)
 
-        command = _last_sandbox_command()
-        assert command[-2:] == ["branch", "feature/x"]
+        # each host git invocation builds its own sandbox instance; flatten
+        calls = [c[0] for inst in _FakeSandbox.instances for c in inst.calls]
+        assert calls[0][-3:] == ["rev-parse", "--verify", "HEAD^{commit}"]
+        assert calls[1][-3:] == ["branch", "feature/x", "ok"]
         assert "execution_mode: host" in result
+        assert "working tree HEAD not moved" in result
 
     @pytest.mark.parametrize(
         "bad", ["-x", ".x", "a..b", "a@{b}", "a b", "a--no-verify"]
@@ -259,6 +267,85 @@ class TestBranchCreate:
 
         assert result == "Error: branch is required for branch_create operation"
         assert not _FakeSandbox.instances
+
+    # --- defect A3: the branch is pinned to an immutable base SHA ---------
+    def test_default_base_resolves_workspace_head(self, tmp_path, fake_sandbox):
+        # base=None -> rev-parse HEAD^{commit}; branch argv pins the resolved SHA
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        calls = _shadow_run_git_raw(tool, stdout="cafe1234\n")
+        result = tool._git_branch_create(tmp_path)
+
+        assert calls[0] == ["rev-parse", "--verify", "HEAD^{commit}"]
+        assert calls[1] == ["branch", "feature/x", "cafe1234"]
+        assert "Created branch 'feature/x' at cafe1234 (base: HEAD)" in result
+        assert "HEAD not moved" in result
+
+    def test_explicit_base_resolved_to_sha(self, tmp_path, fake_sandbox):
+        # explicit base -> rev-parse <base>^{commit}, branch pinned to the SHA
+        tool = _host_tool(
+            tmp_path, operation="branch_create", branch="feature/x",
+            base="origin/main",
+        )
+        calls = _shadow_run_git_raw(tool, stdout="deadbeef\n")
+        result = tool._git_branch_create(tmp_path)
+
+        assert calls[0] == ["rev-parse", "--verify", "origin/main^{commit}"]
+        assert calls[1] == ["branch", "feature/x", "deadbeef"]
+        assert "(base: origin/main)" in result
+
+    @pytest.mark.parametrize(
+        "bad", ["-x", "--force", ".x", "a..b", "a@{b}", "a b"]
+    )
+    def test_unsafe_base_rejected_before_git(self, tmp_path, fake_sandbox, bad):
+        # a caller base starting with '-' (or otherwise unsafe) must error
+        # BEFORE any git call: it can never reach rev-parse as a flag.
+        tool = _host_tool(
+            tmp_path, operation="branch_create", branch="feature/x", base=bad
+        )
+        calls = _shadow_run_git_raw(tool)
+        result = tool._git_branch_create(tmp_path)
+
+        assert result.startswith("Error: Invalid branch name")
+        assert calls == []
+        assert not _FakeSandbox.instances
+
+    def test_unresolvable_base_errors_without_creating_branch(
+        self, tmp_path, fake_sandbox
+    ):
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Needed a single revision",
+        )
+        result = tool._git_branch_create(tmp_path)
+
+        assert result.startswith("Git command failed (exit code 128):")
+        assert "fatal: Needed a single revision" in result
+        # only the rev-parse ran; no branch was created
+        assert calls == [["rev-parse", "--verify", "HEAD^{commit}"]]
+
+    def test_branch_create_argv_never_bare_name(self, tmp_path, fake_sandbox):
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        tool._git_branch_create(tmp_path)
+
+        calls = [c[0] for inst in _FakeSandbox.instances for c in inst.calls]
+        branch_cmds = [c for c in calls if "branch" in c]
+        assert branch_cmds, "no branch-create command was run"
+        cmd = branch_cmds[-1]
+        assert cmd[-2:] == ["feature/x", "ok"]
+        assert cmd != ["git", "branch", "feature/x"]
+
+    def test_empty_resolution_errors_without_creating_branch(
+        self, tmp_path, fake_sandbox
+    ):
+        # exit 0 but empty stdout must NEVER create a branch with an empty
+        # start point: it is an explicit error instead.
+        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        result = tool._git_branch_create(tmp_path)
+
+        assert result.startswith("Error:")
+        assert calls == [["rev-parse", "--verify", "HEAD^{commit}"]]
 
 
 # ---------------------------------------------------------------------------
@@ -936,4 +1023,887 @@ class TestHostFallbackNoWorkspaceIdGate:
             tool._git_status(tmp_path)
         assert tool._last_execution_mode == "unavailable"
         assert not _FakeSandbox.instances
+
+
+
+# ---------------------------------------------------------------------------
+# _git_repo_root: a missing git binary must NEVER read as "not a repository"
+# ---------------------------------------------------------------------------
+class TestGitRepoRootAvailability:
+    """Defect A5: git-unavailable and not-a-repo were conflated."""
+
+    @staticmethod
+    def _spawn_failure(repo_root, args, timeout=30):
+        raise FileNotFoundError("git")
+
+    def test_t1_spawn_failure_reports_unavailable(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        monkeypatch.setattr(tool, "_run_git_raw", self._spawn_failure)
+        with pytest.raises(GitUnavailableError):
+            tool._git_repo_root(tmp_path)
+        result = tool.execute()
+        assert "git executable not available" in result
+        assert "Not a git repository" not in result
+
+    def test_t1b_exit_127_reports_unavailable(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        monkeypatch.setattr(
+            tool, "_run_git_raw",
+            lambda repo_root, args, timeout=30: (127, "", "git: not found"),
+        )
+        result = tool.execute()
+        assert "git executable not available" in result
+        assert "Not a git repository" not in result
+
+    def test_t2_not_a_repo_message(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        monkeypatch.setattr(
+            tool, "_run_git_raw",
+            lambda repo_root, args, timeout=30: (
+                128, "",
+                "fatal: not a git repository (or any of the parent directories): .git",
+            ),
+        )
+        result = tool.execute()
+        assert "Not a git repository" in result
+        assert "not available" not in result
+
+    def test_t3_happy_path_still_resolves_root(self, tmp_path, monkeypatch):
+        tool = _read_tool(tmp_path, operation="status")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            tool, "_run_git_raw",
+            lambda repo_root, args, timeout=30: (0, str(repo), ""),
+        )
+        assert tool._git_repo_root(tmp_path) == repo
+        result = tool.execute()
+        assert "not available" not in result
+        assert "Not a git repository" not in result
+
+    def test_t4_conflated_string_absent_from_sources(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for rel in ("tools/git_info_tool.py", "tools/git_write_tool.py"):
+            src = (repo_root / rel).read_text(encoding="utf-8")
+            assert "not available or not a git repository" not in src, rel
+
+
+
+# ---------------------------------------------------------------------------
+# A2: the workspace's OWN container mount as ``working_dir`` is accepted
+# ---------------------------------------------------------------------------
+class TestContainerWorkingDirAccepted:
+    """``working_dir`` naming the workspace's own container mount (``/workspace``
+    and below) is normalised to the canonical host workspace root, so the
+    container path an agent actually speaks is no longer rejected as "outside
+    workspace".  Genuine escapes keep the byte-exact rejection.
+
+    Container mode is OFF in this module: no ``session_id``/registry is bound,
+    so ``_resolve_registry_workspace_info()`` returns ``(None, None)`` and
+    ``_use_container_mode()`` is False.  The mapping is nonetheless observable
+    because ``_normalise_working_dir`` resolves the host root through
+    ``ToolBase._resolve_registry_workspace``'s deprecated ``workspace_path``
+    fallback (the value the module helpers bind).  The assertions therefore pin
+    (a) the mapped return value of ``_normalise_working_dir`` and (b) that
+    ``execute()`` no longer rejects the alias -- not container-mode plumbing.
+    """
+
+    @staticmethod
+    def _shadow_git(tool):
+        calls = []
+        def _raw(repo_root, args, timeout=30):
+            calls.append((str(repo_root), list(args)))
+            return (0, "ok", "")
+        object.__setattr__(tool, "_run_git_raw", _raw)
+        return calls
+
+    @staticmethod
+    def _ws_abs(tmp_path):
+        return str(Path(tmp_path).resolve())
+
+    def test_t1_mount_accepted_by_read_tool(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        tool = _read_tool(tmp_path, operation="status", working_dir="/workspace")
+        calls = self._shadow_git(tool)
+        result = tool.execute()
+        assert "outside workspace" not in result
+        assert calls
+
+    def test_t2_trailing_slash_and_redundant_separators(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "sub" / ".git").mkdir(parents=True)
+        for rawdir, expect in (
+            ("/workspace/", tmp_path),
+            ("/workspace//sub", tmp_path / "sub"),
+        ):
+            tool = _read_tool(tmp_path, operation="status", working_dir=rawdir)
+            assert Path(tool._normalise_working_dir(rawdir)).resolve() == expect.resolve(), rawdir
+            calls = self._shadow_git(tool)
+            result = tool.execute()
+            assert "outside workspace" not in result, rawdir
+            assert calls, rawdir
+
+    @pytest.mark.parametrize(
+        "rawdir", ["/etc", "/tmp", "/workspace/../outside", "/outside/workspace"]
+    )
+    def test_t3_genuine_violations_rejected_byte_exact(self, tmp_path, rawdir):
+        tool = _read_tool(tmp_path, operation="status", working_dir=rawdir)
+        result = tool.execute()
+        expected = (
+            f"Error: Path {rawdir} is outside workspace {self._ws_abs(tmp_path)}"
+        )
+        assert result == expected
+
+    @pytest.mark.parametrize("kind", ["read", "write"])
+    def test_t4_read_and_write_tools_agree_on_accept(self, tmp_path, kind):
+        (tmp_path / ".git").mkdir()
+        if kind == "read":
+            tool = _read_tool(tmp_path, operation="status", working_dir="/workspace")
+        else:
+            tool = _tool(tmp_path, operation="branch_create", branch="feature/x",
+                         working_dir="/workspace")
+        calls = self._shadow_git(tool)
+        result = tool.execute()
+        assert "outside workspace" not in result, kind
+        assert calls, kind
+
+    @pytest.mark.parametrize("kind", ["read", "write"])
+    def test_t4b_read_and_write_tools_agree_on_reject(self, tmp_path, kind):
+        if kind == "read":
+            tool = _read_tool(tmp_path, operation="status", working_dir="/etc")
+        else:
+            tool = _tool(tmp_path, operation="branch_create", branch="feature/x",
+                         working_dir="/etc")
+        result = tool.execute()
+        expected = f"Error: Path /etc is outside workspace {self._ws_abs(tmp_path)}"
+        assert result == expected, kind
+
+    def test_t5_host_path_working_dir_unchanged(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        raw = str(tmp_path)
+        tool = _read_tool(tmp_path, operation="status", working_dir=raw)
+        assert tool._normalise_working_dir(raw) == raw
+        calls = self._shadow_git(tool)
+        result = tool.execute()
+        assert "outside workspace" not in result
+        assert calls
+
+    def test_t6_normalise_working_dir_matrix(self, tmp_path):
+        tool = _read_tool(tmp_path, operation="status")
+        root = Path(self._ws_abs(tmp_path))
+        sub = (tmp_path / "sub").resolve()
+        assert Path(tool._normalise_working_dir("/workspace")).resolve() == root
+        assert Path(tool._normalise_working_dir("/workspace/sub")).resolve() == sub
+        assert tool._normalise_working_dir("/etc") == "/etc"
+        assert tool._normalise_working_dir("/workspaceX") == "/workspaceX"
+        assert tool._normalise_working_dir("/workspace/../outside") == "/workspace/../outside"
+
+
+# ---------------------------------------------------------------------------
+# show honours file scope + optional line range (defect A1)
+# ---------------------------------------------------------------------------
+def _shadow_run_git_raw(tool, stdout="ok", exit_code=0, stderr=""):
+    """Shadow the git seam on ``tool``, recording argv per invocation."""
+    calls = []
+
+    def fake(repo_root, args, timeout=30):
+        calls.append(list(args))
+        return (exit_code, stdout, stderr)
+
+    object.__setattr__(tool, "_run_git_raw", fake)
+    return calls
+
+
+class TestShowHonoursScope:
+    """`show` must honour file_path / line range, never silently drop them."""
+
+    UNSCOPED = ["show", "--no-ext-diff", "--no-textconv", "HEAD"]
+
+    def test_file_path_scopes_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD", file_path="a.txt"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show(tmp_path)
+        assert calls == [self.UNSCOPED + ["--", "a.txt"]]
+        assert calls[0] != self.UNSCOPED
+
+    def test_no_scope_argv_unchanged(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show(tmp_path)
+        assert calls == [self.UNSCOPED]
+
+    def test_format_only_argv_unchanged(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show", format="%H %s")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show(tmp_path)
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "--format=%H %s", "HEAD"]
+        ]
+
+    def test_range_reads_scoped_blob_and_slices(self, tmp_path):
+        blob = "L1\nL2\nL3\nL4\nL5\n"
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD",
+            file_path="a.txt", line_start=2, line_end=4,
+        )
+        calls = _shadow_run_git_raw(tool, stdout=blob)
+        out = tool._git_show(tmp_path)
+        # the range is honoured via the scoped blob <commit>:<path>
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]
+        ]
+        assert "L2" in out and "L4" in out
+        assert "L1" not in out and "L5" not in out
+        assert "L1\nL2\nL3\nL4\nL5" not in out  # not the whole blob
+
+    def test_range_without_file_path_errors_before_git(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", line_start=1, line_end=2
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show(tmp_path)
+        assert out.startswith("Error:")
+        assert "line_start" in out or "line_end" in out
+        assert calls == []  # no git run -> not a silent success
+
+    def test_invalid_range_errors_before_git(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", file_path="a.txt",
+            line_start=5, line_end=2,
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_path_matching_nothing_is_scoped_not_full_patch(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD", file_path="nope.txt"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="")
+        tool._git_show(tmp_path)
+        assert calls == [self.UNSCOPED + ["--", "nope.txt"]]
+        assert calls[0] != self.UNSCOPED  # never the full unscoped patch
+
+
+    def test_ranged_show_git_failure_is_error_not_sliced(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show", commit="HEAD",
+            file_path="a.txt", line_start=2, line_end=4,
+        )
+        calls = _shadow_run_git_raw(
+            tool, stdout="SHOULD-NOT-LEAK", exit_code=128,
+            stderr="fatal: bad object HEAD:a.txt",
+        )
+        out = tool._git_show(tmp_path)
+        # the ranged invocation did run ...
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]
+        ]
+        # ... and its failure surfaced as an error, never sliced as content
+        assert out.startswith("Git command failed")
+        assert "fatal: bad object HEAD:a.txt" in out
+        assert "SHOULD-NOT-LEAK" not in out
+
+
+
+
+# ---------------------------------------------------------------------------
+# Literal acceptance: the 5 new read operation names must be constructible
+# ---------------------------------------------------------------------------
+class TestNewOperationNamesAccepted:
+    @pytest.mark.parametrize(
+        "name", ["rev_parse", "show_ref", "for_each_ref", "ls_tree", "cat_file"]
+    )
+    def test_literal_accepts_new_operation(self, tmp_path, name):
+        tool = _read_host_tool(tmp_path, operation=name)
+        assert tool.operation == name
+
+
+# ---------------------------------------------------------------------------
+# rev_parse
+# ---------------------------------------------------------------------------
+class TestRevParse:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="rev_parse")
+        calls = _shadow_run_git_raw(tool, stdout="abc123\n")
+        out = tool._git_rev_parse(tmp_path)
+        assert calls == [["rev-parse", "HEAD"]]
+        assert "abc123" in out
+
+    def test_abbrev_ref_and_explicit_ref(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="rev_parse", abbrev=True, ref="main"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="main\n")
+        tool._git_rev_parse(tmp_path)
+        assert calls == [["rev-parse", "--abbrev-ref", "main"]]
+
+    @pytest.mark.parametrize("bad", ["-x", "--abbrev-ref", "a b", "", "x\ny", " a", None])
+    def test_invalid_ref_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="rev_parse", ref=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_rev_parse(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="rev_parse", ref="deadbeef")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: ambiguous argument 'deadbeef'",
+        )
+        out = tool._git_rev_parse(tmp_path)
+        assert calls == [["rev-parse", "deadbeef"]]
+        assert out.startswith("Git command failed")
+        assert "ambiguous argument" in out
+
+
+# ---------------------------------------------------------------------------
+# show_ref
+# ---------------------------------------------------------------------------
+class TestShowRef:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_ref")
+        calls = _shadow_run_git_raw(tool, stdout="abc123 refs/heads/main\n")
+        out = tool._git_show_ref(tmp_path)
+        assert calls == [["show-ref"]]
+        assert "refs/heads/main" in out
+
+    def test_pattern_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_ref", pattern="refs/heads/*"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show_ref(tmp_path)
+        assert calls == [["show-ref", "refs/heads/*"]]
+
+    def test_empty_match_is_benign(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_ref", pattern="refs/heads/*"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=1)
+        out = tool._git_show_ref(tmp_path)
+        assert "No matching refs." in out
+        assert "Git command failed" not in out
+
+    def test_real_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_ref")
+        calls = _shadow_run_git_raw(
+            tool, stdout="whatever", exit_code=128,
+            stderr="fatal: not a git repository",
+        )
+        out = tool._git_show_ref(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "fatal: not a git repository" in out
+        assert "whatever" not in out
+
+    @pytest.mark.parametrize(
+        "bad", ["a b", ";", "|", "&", "$", "`", ">", "<", "x\ny", "-x"]
+    )
+    def test_invalid_pattern_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="show_ref", pattern=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_ref(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# for_each_ref
+# ---------------------------------------------------------------------------
+class TestForEachRef:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref")
+        calls = _shadow_run_git_raw(tool, stdout="abc123 refs/heads/main\n")
+        out = tool._git_for_each_ref(tmp_path)
+        assert calls == [["for-each-ref"]]
+        assert "refs/heads/main" in out
+
+    def test_format_and_prefix_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="for_each_ref",
+            format="%(refname:short) %(objectname)", prefix="refs/heads/",
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_for_each_ref(tmp_path)
+        assert calls == [
+            ["for-each-ref",
+             "--format=%(refname:short) %(objectname)", "refs/heads/"]
+        ]
+
+    def test_empty_output_benign(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_for_each_ref(tmp_path)
+        assert "Git command failed" not in out
+
+    def test_valid_format_accepted(self, tmp_path):
+        fmt = "%(refname) %(objectname)"
+        assert GitInfoTool._validate_for_each_ref_format(fmt) == fmt
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["$(bogus)", "no-token-here %(refname", "%x", "%(subject) %(bad)", "a\nb"],
+    )
+    def test_invalid_format_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref", format=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_for_each_ref(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    @pytest.mark.parametrize("bad", ["a b", "$(x)", "refs;heads", "-x"])
+    def test_invalid_prefix_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref", prefix=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_for_each_ref(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# ls_tree
+# ---------------------------------------------------------------------------
+class TestLsTree:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="ls_tree")
+        calls = _shadow_run_git_raw(tool, stdout="100644 blob abc\tf.txt\n")
+        out = tool._git_ls_tree(tmp_path)
+        assert calls == [["ls-tree", "HEAD"]]
+
+    def test_recursive_treeish_and_path_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="ls_tree", treeish="main",
+            recursive=True, path="src",
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_ls_tree(tmp_path)
+        assert calls == [["ls-tree", "-r", "main", "--", "src"]]
+
+    def test_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="ls_tree", treeish="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Not a valid object name nope",
+        )
+        out = tool._git_ls_tree(tmp_path)
+        assert calls == [["ls-tree", "nope"]]
+        assert out.startswith("Git command failed")
+        assert "Not a valid object name" in out
+
+    @pytest.mark.parametrize("bad", ["-r", "a b", "", "x\ny"])
+    def test_invalid_treeish_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="ls_tree", treeish=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_ls_tree(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# cat_file
+# ---------------------------------------------------------------------------
+class TestCatFile:
+    def test_default_pretty_print_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="cat_file", object="HEAD:a.txt"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="hello\n")
+        out = tool._git_cat_file(tmp_path)
+        assert calls == [["cat-file", "-p", "HEAD:a.txt"]]
+        assert "hello" in out
+
+    def test_explicit_type_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="cat_file", object="abc123", type="commit"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_cat_file(tmp_path)
+        assert calls == [["cat-file", "commit", "abc123"]]
+
+    def test_missing_object_errors_before_git(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="cat_file")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_cat_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    @pytest.mark.parametrize("bad", ["nope", "BLOB", "-p", "blobby"])
+    def test_invalid_type_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(
+            tmp_path, operation="cat_file", object="abc", type=bad
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_cat_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_unknown_object_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="cat_file", object="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Not a valid object name nope",
+        )
+        out = tool._git_cat_file(tmp_path)
+        assert calls == [["cat-file", "-p", "nope"]]
+        assert out.startswith("Git command failed")
+        assert "Not a valid object name" in out
+
+
+# ---------------------------------------------------------------------------
+# merge_base / stash_list / reflog / show_file (B2)
+# ---------------------------------------------------------------------------
+class TestNewOperationNamesAcceptedB2:
+    @pytest.mark.parametrize(
+        "name", ["merge_base", "stash_list", "reflog", "show_file"]
+    )
+    def test_literal_accepts_new_operation(self, tmp_path, name):
+        tool = _read_host_tool(tmp_path, operation=name)
+        assert tool.operation == name
+
+
+class TestLogRevisionHonoured:
+    BASE = [
+        "log", "--no-ext-diff", "--no-textconv", "--max-count=50", "--oneline"
+    ]
+
+    def test_no_branch_argv_unchanged(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls == [list(self.BASE)]
+
+    def test_branch_inserted_as_revision(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", branch="main")
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls == [self.BASE + ["main"]]
+
+    def test_branch_precedes_path_separator(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="log", branch="main", file_path="a.txt"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls == [self.BASE + ["main", "--", "a.txt"]]
+
+    def test_unknown_revision_surfaced_as_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", branch="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128, stderr="fatal: bad revision 'nope'"
+        )
+        out = tool._git_log(tmp_path)
+        assert calls == [self.BASE + ["nope"]]
+        assert out.startswith("Git command failed")
+        assert "bad revision" in out
+
+    @pytest.mark.parametrize("bad", ["-x", "a b", "\tx", "x\ny"])
+    def test_invalid_branch_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="log", branch=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_log(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_max_count_clamped_high(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", max_count=99999)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls[0][3] == "--max-count=1000"
+
+    def test_max_count_clamped_low(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="log", max_count=0)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert calls[0][3] == "--max-count=1"
+
+    def test_since_until_still_honoured(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="log", since="2020-01-01", until="2021-01-01"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_log(tmp_path)
+        assert "--since=2020-01-01" in calls[0]
+        assert "--until=2021-01-01" in calls[0]
+
+
+class TestMergeBase:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a="main", b="dev")
+        calls = _shadow_run_git_raw(tool, stdout="abc123\n")
+        out = tool._git_merge_base(tmp_path)
+        assert calls == [["merge-base", "main", "dev"]]
+        assert "abc123" in out
+
+    def test_is_ancestor_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="merge_base", a="main", b="dev", is_ancestor=True
+        )
+        calls = _shadow_run_git_raw(tool, stdout="")
+        tool._git_merge_base(tmp_path)
+        assert calls == [["merge-base", "--is-ancestor", "main", "dev"]]
+
+    def test_no_common_ancestor_exit1_meaningful(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a="main", b="dev")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=1)
+        out = tool._git_merge_base(tmp_path)
+        assert calls == [["merge-base", "main", "dev"]]
+        assert "No common ancestor (no merge base)." in out
+        assert out.strip() != ""
+
+    def test_is_ancestor_true_exit0_positive(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="merge_base", a="main", b="dev", is_ancestor=True
+        )
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_merge_base(tmp_path)
+        assert "is an ancestor of" in out
+
+    def test_is_ancestor_false_exit1_negative(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="merge_base", a="main", b="dev", is_ancestor=True
+        )
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=1)
+        out = tool._git_merge_base(tmp_path)
+        assert "is not an ancestor of" in out
+        assert out.strip() != ""
+
+    def test_other_nonzero_exit_is_standard_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a="main", b="dev")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Not a valid object name main",
+        )
+        out = tool._git_merge_base(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "Not a valid object name" in out
+
+    @pytest.mark.parametrize(
+        "a,b",
+        [(None, "dev"), ("main", None), ("", "dev"), ("main", "")],
+    )
+    def test_missing_refs_error_before_git(self, tmp_path, a, b):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a=a, b=b)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_merge_base(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    @pytest.mark.parametrize("bad", ["-x", "a b", "x\ny"])
+    def test_invalid_ref_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="merge_base", a=bad, b="dev")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_merge_base(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+class TestStashList:
+    def test_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="stash_list")
+        calls = _shadow_run_git_raw(tool, stdout="stash@{0}: WIP\n")
+        out = tool._git_stash_list(tmp_path)
+        assert calls == [["stash", "list"]]
+        assert "WIP" in out
+
+    def test_empty_is_benign(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="stash_list")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_stash_list(tmp_path)
+        assert calls == [["stash", "list"]]
+        assert "No stashes." in out
+        assert not out.startswith("Git command failed")
+
+    def test_nonzero_is_standard_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="stash_list")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128, stderr="fatal: not a git repository"
+        )
+        out = tool._git_stash_list(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "not a git repository" in out
+
+
+class TestReflog:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog")
+        calls = _shadow_run_git_raw(tool, stdout="abc HEAD@{0}: commit\n")
+        out = tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n20", "HEAD"]]
+        assert "HEAD@{0}" in out
+
+    def test_custom_ref_and_limit(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", ref="main", limit=5)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n5", "main"]]
+
+    def test_limit_clamped_high(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", limit=5000)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n1000", "HEAD"]]
+
+    def test_limit_clamped_low(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", limit=0)
+        calls = _shadow_run_git_raw(tool)
+        tool._git_reflog(tmp_path)
+        assert calls == [["reflog", "-n1", "HEAD"]]
+
+    def test_empty_is_benign(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_reflog(tmp_path)
+        assert "No reflog entries." in out
+        assert not out.startswith("Git command failed")
+
+    def test_bad_ref_nonzero_is_standard_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="reflog", ref="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: ambiguous argument 'nope'",
+        )
+        out = tool._git_reflog(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "ambiguous argument" in out
+
+    @pytest.mark.parametrize("bad", ["-x", "a b", "x\ny"])
+    def test_invalid_ref_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="reflog", ref=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_reflog(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+class TestShowFile:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        calls = _shadow_run_git_raw(tool, stdout="hello\n")
+        out = tool._git_show_file(tmp_path)
+        assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]
+        assert "hello" in out
+
+    def test_custom_ref(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", ref="main", path="a.txt"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="x\n")
+        tool._git_show_file(tmp_path)
+        assert calls == [
+            ["show", "--no-ext-diff", "--no-textconv", "main:a.txt"]
+        ]
+
+    def test_missing_ref_error_before_git(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", ref=None, path="a.txt")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_missing_path_error_before_git(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_path_escaping_workspace_rejected(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", path="../outside.txt"
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_not_tracked_at_ref_is_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: path 'a.txt' does not exist in 'HEAD'",
+        )
+        out = tool._git_show_file(tmp_path)
+        assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]
+        assert out.startswith("Git command failed")
+        assert "does not exist" in out
+
+    def test_empty_file_is_not_error(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_show_file(tmp_path)
+        assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]
+        assert not out.startswith("Git command failed")
+        assert not out.startswith("Error:")
+
+
+
+
+# ---------------------------------------------------------------------------
+# containerized commit round-trip: the container's commit stdout AND the
+# git-routed hook stderr (§E3) both surface back through the tool
+# ---------------------------------------------------------------------------
+class _RoundTripManager(_FakeManager):
+    """Container manager returning a commit-style stdout/stderr pair.
+
+    The non-commit invocation (the ``git add`` that precedes the commit)
+    returns empty output; the ``git commit`` invocation returns the recorded
+    pair so the *round-trip* of container output back to the agent can be
+    asserted end-to-end.
+    """
+
+    def __init__(self, commit_stdout, commit_stderr):
+        super().__init__(mode="containerized")
+        self._commit_stdout = commit_stdout
+        self._commit_stderr = commit_stderr
+
+    def exec(self, command, **kwargs):
+        self.calls.append(("exec", command, kwargs))
+        if "commit" in command:
+            return {
+                "exit_code": 0,
+                "stdout": self._commit_stdout,
+                "stderr": self._commit_stderr,
+            }
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+
+class TestCommitContainerRoundTrip:
+    def test_containerized_commit_round_trips_stdout_and_hook_stderr(self, tmp_path):
+        """A commit through the CONTAINER path surfaces the container's commit
+        stdout plus the git-routed hook stderr (§E3 -- git routes hook stdout
+        to its own stderr, so a successful commit would otherwise hide it),
+        followed by the execution-mode trailer.
+        """
+        (tmp_path / ".git").mkdir()  # real repo dir -> not a worktree gitfile
+        (tmp_path / "hello.txt").write_text("hi\n", encoding="utf-8")
+        manager = _RoundTripManager(
+            commit_stdout="[main abc1234] add hello\n",
+            commit_stderr="pre-commit: hook passed\n",
+        )
+        tool = _container_tool(
+            tmp_path, manager, operation="commit",
+            message="add hello", file_path="hello.txt",
+        )
+
+        result = tool._git_commit(tmp_path)
+
+        execs = [c for c in manager.calls if c[0] == "exec"]
+        # 1st exec stages the named path; 2nd is the hooksPath-pinned commit.
+        assert execs[0][1] == ["git", "add", "--", "hello.txt"]
+        assert execs[1][1] == [
+            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "commit", "-m", "add hello", "--", "hello.txt",
+        ]
+        assert "--no-verify" not in execs[1][1]
+        # Round-trip: both the container's commit stdout and the hook stderr
+        # reach the agent (newline-guarded join), then the mode trailer.
+        assert result.startswith(
+            "[main abc1234] add hello\npre-commit: hook passed"
+        )
+        assert "execution_mode: containerized" in result
+        assert "failure_reason: none" in result
 

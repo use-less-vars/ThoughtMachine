@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 # slashes, underscores, hyphens only).
 _BRANCH_NAME_RE = re.compile(r'^[A-Za-z0-9._/\-]+$')
 
+# Detached-HEAD refusal. ``git rev-parse --abbrev-ref HEAD`` reports the
+# literal string "HEAD" when HEAD is detached. "HEAD" is a *valid* ref and is
+# NOT in ``_PROTECTED_BRANCHES``, so the commit gates below would otherwise
+# treat a detached HEAD as an unprotected branch and permit the commit
+# (fail-OPEN). A detached HEAD is not on a branch: both commit gates refuse.
+_DETACHED_HEAD_ERROR = (
+    "Error: refusing to commit: the workspace HEAD is detached "
+    "(not on a branch); check out a branch before committing"
+)
+
 
 class GitWriteTool(GitReadTool):
     """
@@ -75,12 +85,49 @@ class GitWriteTool(GitReadTool):
 
     tool: Literal["GitWriteTool"] = "GitWriteTool"
 
+    # Deliberately NOT exposed on the WRITE surface (design §C, §E6): push,
+    # fetch, reset, clean, config, cherry-pick, rebase, and any ref/branch
+    # deletion. The READ surface likewise exposes no C-list op, except the
+    # pre-existing READ-ONLY `config` inspection op (git config --list /
+    # --get), which cannot mutate config. Policy for a future delete op (§E4):
+    # it MUST refuse to delete a checked-out or protected branch AND require
+    # explicit confirmation for a non-merged ref.
     operation: Literal[
         "commit", "init", "clone", "branch_create", "checkout", "stage",
-        "unstage",
+        "unstage", "worktree_add", "worktree_remove", "stash_push",
+        "stash_pop",
     ] = Field(
         description="Git write operation to perform: commit, init, clone, "
-        "branch_create, checkout, stage, unstage"
+        "branch_create, checkout, stage, unstage, worktree_add, "
+        "worktree_remove, stash_push, stash_pop"
+    )
+
+    force: bool = Field(
+        default=False,
+        description="Force a destructive worktree operation. worktree_remove "
+        "refuses a locked worktree or one with local changes unless this is "
+        "true (maps to git worktree remove --force)."
+    )
+
+    paths: Optional[List[str]] = Field(
+        default=None,
+        description="Optional path list for stash_push: only the named "
+        "pathspecs are stashed (git stash push -m <msg> -- <paths>). When "
+        "omitted, git's default tracked-file stash is used (never -a/-u)."
+    )
+
+    index: int = Field(
+        default=0,
+        description="Stash index for stash_pop (git stash pop stash@{index}). "
+        "Must be a non-negative integer; default 0 is the most recent stash."
+    )
+
+    base: Optional[str] = Field(
+        default=None,
+        description="Base ref for branch_create. The ref is resolved to an "
+        "immutable commit SHA (git rev-parse --verify <base>^{commit}) before "
+        "the branch is created. None (default) pins the branch to the "
+        "WORKSPACE checkout HEAD -- never the gitdir HEAD."
     )
 
     def _flag_gate_error(self) -> str:
@@ -184,9 +231,14 @@ class GitWriteTool(GitReadTool):
         try:
             # Determine working directory
             if self.working_dir:
-                # Validate working_dir is within workspace
+                # Validate working_dir is within workspace. The workspace's
+                # own container mount (/workspace and below) is accepted (see
+                # _normalise_working_dir); genuine violations are still
+                # rejected here with their byte-exact message.
                 try:
-                    validated_working_dir = self._validate_path(self.working_dir)
+                    validated_working_dir = self._validate_path(
+                        self._normalise_working_dir(self.working_dir)
+                    )
                 except ValueError as e:
                     return self._truncate_output(f"Error: {e}")
                 repo_root = Path(validated_working_dir).expanduser().resolve()
@@ -236,8 +288,16 @@ class GitWriteTool(GitReadTool):
             # path before re-validation.
             try:
                 resolved_root = self._git_repo_root(repo_root)
-            except (subprocess.TimeoutExpired, TimeoutError, FileNotFoundError):
-                return self._truncate_output(f"Git not available or not a git repository: {repo_root}")
+            except (subprocess.TimeoutExpired, TimeoutError) as e:
+                # A hung git binary is an availability failure, not a
+                # "not a repository" condition.
+                return self._truncate_output(f"git executable not available (timed out): {e}")
+            except FileNotFoundError as e:
+                # GitUnavailableError (raised by _git_repo_root when the git
+                # binary is missing or unspawnable) subclasses
+                # FileNotFoundError, so it lands here and is reported as an
+                # availability failure rather than as "not a git repository".
+                return self._truncate_output(f"git executable not available: {e}")
             if resolved_root is None:
                 return self._truncate_output(f"Not a git repository: {repo_root}")
             repo_root = resolved_root
@@ -279,6 +339,14 @@ class GitWriteTool(GitReadTool):
                 return self._git_stage(repo_root)
             elif self.operation == "unstage":
                 return self._git_unstage(repo_root)
+            elif self.operation == "worktree_add":
+                return self._git_worktree_add(repo_root)
+            elif self.operation == "worktree_remove":
+                return self._git_worktree_remove(repo_root)
+            elif self.operation == "stash_push":
+                return self._git_stash_push(repo_root)
+            elif self.operation == "stash_pop":
+                return self._git_stash_pop(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         except Exception as e:
@@ -305,6 +373,10 @@ class GitWriteTool(GitReadTool):
         Any violation returns False so the caller keeps the existing
         operator-managed-worktree block.
         """
+        # Clear any refusal reason left over from a previous call (tool
+        # instances may be reused); it is set only when THIS call detects a
+        # detached HEAD, so the caller can surface a distinguishable error.
+        self._agent_commit_refusal_reason = None
         if not self._git_write_allowed():
             return False
         if not self._use_container_mode():
@@ -319,6 +391,13 @@ class GitWriteTool(GitReadTool):
             # unavailable, policy denial): fail closed, never degrade.
             return False
         branch = (output or "").strip()
+        if branch == "HEAD":
+            # Detached HEAD: rev-parse --abbrev-ref HEAD reports the literal
+            # string "HEAD" -- a valid ref that is NOT protected, so the
+            # checks below would permit the commit (fail-OPEN). Refuse, and
+            # record the reason so the commit entry point can surface it.
+            self._agent_commit_refusal_reason = _DETACHED_HEAD_ERROR
+            return False
         if not self._is_valid_branch_ref(branch):
             # Invalid branch output (empty / multi-line / error-shaped /
             # over-long): fail closed.  Closes the fail-open where a swallowed
@@ -418,7 +497,20 @@ class GitWriteTool(GitReadTool):
         return name
 
     def _git_branch_create(self, repo_root: Path) -> str:
-        """Create a new branch (git branch <name>)."""
+        """Create a new branch pinned to an immutable commit SHA.
+
+        ``branch_create`` is CREATE-ONLY: it never moves the working-tree
+        HEAD (that is ``checkout``'s job). The new branch is based on the
+        WORKSPACE checkout HEAD by default, or on the caller's explicit
+        ``base`` ref when supplied -- never on the gitdir HEAD (which may
+        point elsewhere for an operator-managed worktree).
+
+        The base is resolved to an immutable SHA via ``git rev-parse --verify
+        <base>^{commit}`` BEFORE the branch is created, so the branch-creation
+        argv always pins an explicit commit and never emits the bare ``git
+        branch <name>`` form (which would follow whatever HEAD happens to be
+        at create time).
+        """
         # git permission gate (fail closed): direct callers must also
         # pass the session git permission check.
         if not self._git_write_allowed():
@@ -429,8 +521,47 @@ class GitWriteTool(GitReadTool):
             name = self._validate_branch_name(self.branch)
         except ValueError as e:
             return self._truncate_output(f"Error: {e}")
-        output = self._run_git(repo_root, ["branch", name])
-        return self._with_mode(self._truncate_output(output))
+
+        # Resolve the base ref to an immutable SHA BEFORE creating the
+        # branch. A caller-supplied base is validated BEFORE any git call so
+        # an option-like value (e.g. a leading '-') can never reach
+        # rev-parse/branch as a smuggled flag.
+        if self.base is None:
+            base_expr = "HEAD"
+            resolve_args = ["rev-parse", "--verify", "HEAD^{commit}"]
+        else:
+            try:
+                base_expr = self._validate_branch_name(self.base)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if not self._is_valid_branch_ref(base_expr):
+                return self._truncate_output(
+                    f"Error: Invalid base ref: {base_expr!r}"
+                )
+            resolve_args = ["rev-parse", "--verify", f"{base_expr}^{{commit}}"]
+
+        exit_code, stdout, stderr = self._run_git_raw(
+            repo_root, resolve_args, timeout=30
+        )
+        if exit_code != 0:
+            return self._with_mode(self._truncate_output(
+                f"Git command failed (exit code {exit_code}):\n{stderr}"
+            ))
+        sha = stdout.strip()
+        if not sha:
+            # Fail closed: never create a branch named after an empty start
+            # point (rev-parse returned nothing despite exit_code == 0).
+            return self._with_mode(self._truncate_output(
+                "Error: could not resolve base ref to a commit SHA"
+            ))
+
+        output = self._run_git(repo_root, ["branch", name, sha])
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        return self._with_mode(self._truncate_output(
+            f"Created branch '{name}' at {sha} (base: {base_expr}); "
+            "working tree HEAD not moved \u2014 use checkout to switch."
+        ))
 
     def _git_checkout(self, repo_root: Path) -> str:
         """Check out an existing branch (git checkout <name>)."""
@@ -592,6 +723,11 @@ class GitWriteTool(GitReadTool):
             except (RuntimeError, PermissionError):
                 branch_output = ""
             branch = (branch_output or "").strip()
+            if branch == "HEAD":
+                # Detached HEAD (see _unprotected_branch_agent_commit_allowed):
+                # fail closed instead of reading the literal "HEAD" as an
+                # unprotected branch.
+                return self._truncate_output(_DETACHED_HEAD_ERROR)
             if not self._is_valid_branch_ref(branch) or branch in self._PROTECTED_BRANCHES:
                 branch_label = branch or "unknown"
                 return self._truncate_output(
@@ -611,8 +747,12 @@ class GitWriteTool(GitReadTool):
         if self._is_operator_managed_worktree(repo_root):
             if not self._unprotected_branch_agent_commit_allowed(repo_root):
                 return self._truncate_output(
-                    "Error: commits in this workspace are performed host-side by "
-                    "the operator (workspace is an operator-managed git worktree)"
+                    getattr(self, "_agent_commit_refusal_reason", None)
+                    or (
+                        "Error: commits in this workspace are performed "
+                        "host-side by the operator (workspace is an "
+                        "operator-managed git worktree)"
+                    )
                 )
 
         if not self.message or not self.message.strip():
@@ -687,3 +827,186 @@ class GitWriteTool(GitReadTool):
 
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
+
+    @staticmethod
+    def _resolved_worktree_path(path: str) -> str:
+        """Best-effort resolved form of a worktree path, for comparison."""
+        try:
+            return str(Path(path).resolve())
+        except OSError:
+            return str(path)
+
+    def _git_worktree_add(self, repo_root: Path) -> str:
+        """Create a linked git worktree (git worktree add <path> <base>)."""
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if not self.path:
+            return "Error: path is required for worktree_add operation"
+        # Validate the target path BEFORE any git call: a target outside the
+        # workspace (or outside the repo) must never reach git.
+        try:
+            target_abs = self._validate_path(
+                str((repo_root / self.path).resolve())
+            )
+            rel = str(Path(target_abs).relative_to(repo_root))
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        if not rel or rel in (".", ".."):
+            return self._truncate_output(
+                f"Error: invalid worktree path: {self.path!r}"
+            )
+        base = self.base or "HEAD"
+        if not self._is_valid_branch_ref(base):
+            return self._truncate_output(
+                f"Error: invalid base ref for worktree_add: {base!r}"
+            )
+        # Probe the existing registrations ONCE (read-only). If a worktree is
+        # already registered at the target path, refuse without running
+        # `git worktree add` (which would fail or reuse the registration).
+        target_norm = self._resolved_worktree_path(target_abs)
+        probe_exit, probe_out, _probe_err = self._run_git_raw(
+            repo_root, ["worktree", "list", "--porcelain"], timeout=30
+        )
+        if probe_exit == 0:
+            for line in probe_out.splitlines():
+                if line.startswith("worktree "):
+                    existing = line[len("worktree "):].strip()
+                    if self._resolved_worktree_path(existing) == target_norm:
+                        return self._truncate_output(
+                            f"Error: a worktree is already registered at "
+                            f"'{rel}'; remove it before adding"
+                        )
+        output = self._run_git(repo_root, ["worktree", "add", rel, base])
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        return self._with_mode(self._truncate_output(
+            f"Created worktree at '{rel}' (base: {base})"
+        ))
+
+    def _git_worktree_remove(self, repo_root: Path) -> str:
+        """Remove a linked git worktree (git worktree remove [--force] <path>)."""
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if not self.path:
+            return "Error: path is required for worktree_remove operation"
+        try:
+            target_abs = self._validate_path(
+                str((repo_root / self.path).resolve())
+            )
+            rel = str(Path(target_abs).relative_to(repo_root))
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        # Never remove the PRIMARY worktree (the repo root itself): that is a
+        # whole-repo deletion, not a linked-worktree cleanup. Refuse before
+        # any git call.
+        if self._resolved_worktree_path(target_abs) == self._resolved_worktree_path(
+            str(repo_root)
+        ) or rel in (".", "..") or not rel:
+            return self._truncate_output(
+                f"Error: refusing to remove the primary worktree ({repo_root}); "
+                "worktree_remove only removes linked worktrees"
+            )
+        # Probe registrations ONCE (read-only) to detect a registered, locked
+        # or dirty worktree; refuse without `worktree remove` unless forced.
+        registered = False
+        locked = False
+        probe_exit, probe_out, _probe_err = self._run_git_raw(
+            repo_root, ["worktree", "list", "--porcelain"], timeout=30
+        )
+        if probe_exit == 0:
+            entries = {}
+            order = []
+            current = None
+            for line in probe_out.splitlines():
+                if line.startswith("worktree "):
+                    current = line[len("worktree "):].strip()
+                    entries[current] = False
+                    order.append(current)
+                elif current is not None and (
+                    line == "locked" or line.startswith("locked ")
+                ):
+                    entries[current] = True
+            target_norm = self._resolved_worktree_path(target_abs)
+            for candidate in order:
+                if self._resolved_worktree_path(candidate) == target_norm:
+                    registered = True
+                    locked = entries[candidate]
+                    break
+        if registered and not self.force:
+            reason = None
+            if locked:
+                reason = "locked"
+            else:
+                status_exit, status_out, _status_err = self._run_git_raw(
+                    repo_root, ["-C", rel, "status", "--porcelain"], timeout=30
+                )
+                if status_exit == 0 and status_out.strip():
+                    reason = "has local changes"
+            if reason:
+                return self._truncate_output(
+                    f"Error: refusing to remove worktree '{rel}': it is "
+                    f"{reason}; retry with force=true"
+                )
+        args = ["worktree", "remove"]
+        if self.force:
+            args.append("--force")
+        args.append(rel)
+        output = self._run_git(repo_root, args)
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        return self._with_mode(self._truncate_output(
+            f"Removed worktree '{rel}'"
+        ))
+
+    def _git_stash_push(self, repo_root: Path) -> str:
+        """Stash changes (git stash push -m <msg> [-- <paths>]).
+
+        Never uses ``-a``/``-u``: only tracked changes (or the explicitly
+        named pathspecs) are stashed, so untracked/ignored files are left in
+        the worktree.
+        """
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if not self.message or not self.message.strip():
+            return "Error: message is required for stash_push operation"
+        args = ["stash", "push", "-m", self.message]
+        if self.paths:
+            try:
+                rels = self._validated_rel_paths(repo_root, self.paths)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if rels:
+                args.append("--")
+                args.extend(rels)
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args, timeout=30)
+        if exit_code != 0:
+            return self._with_mode(self._truncate_output(
+                f"Git command failed (exit code {exit_code}):\n{stderr}"
+            ))
+        if "No local changes" in stdout:
+            return self._with_mode(self._truncate_output(
+                "No local changes to save."
+            ))
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_stash_pop(self, repo_root: Path) -> str:
+        """Pop a stash (git stash pop stash@{index})."""
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
+            return "Error: index must be a non-negative integer for stash_pop"
+        args = ["stash", "pop", f"stash@{{{self.index}}}"]
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args, timeout=30)
+        if exit_code != 0:
+            return self._with_mode(self._truncate_output(
+                f"Git command failed (exit code {exit_code}):\n{stdout}{stderr}"
+            ))
+        return self._with_mode(self._truncate_output(stdout))

@@ -13,6 +13,43 @@ from agent.config.resource_catalog import catalog_entry
 
 logger = logging.getLogger(__name__)
 
+# Read-op hardening: the allowlisted for-each-ref format atoms, the characters
+# that may never appear in an agent-supplied ref pattern/prefix/format (a shell
+# could re-interpret them), and the allowlisted cat-file object types.
+_FOR_EACH_REF_ALLOWED_TOKENS = frozenset({
+    "refname", "refname:short", "objectname", "objectname:short",
+    "objecttype", "subject",
+})
+_REF_PATTERN_FORBIDDEN = frozenset({";", "|", "&", "$", "`", ">", "<", "\n", "\r"})
+_CAT_FILE_ALLOWED_TYPES = frozenset({"blob", "tree", "commit", "tag"})
+
+
+class GitUnavailableError(FileNotFoundError):
+    """The git executable could not be run (missing binary / unspawnable).
+
+    Raised by ``GitReadTool._git_repo_root`` so that "git is unavailable" is
+    never reported as "not a git repository".
+
+    Subclasses ``FileNotFoundError`` deliberately: ``GitWriteTool`` (which
+    shares ``_git_repo_root``) only catches
+    ``(subprocess.TimeoutExpired, TimeoutError, FileNotFoundError)`` around its
+    call, so this keeps that call site fail-closed without modification.
+    """
+
+
+def _git_run_indicates_missing_git(exit_code: int, stderr: Optional[str]) -> bool:
+    """True when a failed ``git`` run looks like a missing git executable.
+
+    Distinguishes "git could not be found" (a POSIX shell exits 127, or the
+    runtime prints a "command not found"-style message) from "git ran and this
+    is not a repository" (e.g. exit 128 with "fatal: not a git repository"), so
+    the two failure modes are never reported with the same message.
+    """
+    if exit_code == 127:
+        return True
+    text = (stderr or "").strip().lower()
+    return "command not found" in text or "not found" in text
+
 
 def _migrate_legacy_git_execution_mode(agent_config: Optional[dict]) -> None:
     """Pop the retired ``git_execution_mode`` session/agent-config key.
@@ -129,7 +166,8 @@ class GitReadTool(ToolBase):
     Read-only git repository inspection tool.
 
     Operations: status, diff, diff_cached, log, branch, branch_list, show,
-    remote, blame, config. Write operations (commit, init, clone,
+    remote, blame, config, rev_parse, show_ref, for_each_ref, ls_tree,
+    cat_file. Write operations (commit, init, clone,
     branch_create, checkout, stage, unstage) live in ``GitWriteTool``
     (tools/git_write_tool.py), which gates every write on the session
     ``git_write`` permission (``session_permissions['git_write']`` / the
@@ -243,9 +281,13 @@ class GitReadTool(ToolBase):
     operation: Literal[
         "status", "diff", "diff_cached", "log", "branch", "branch_list",
         "show", "remote", "blame", "config",
+        "rev_parse", "show_ref", "for_each_ref", "ls_tree", "cat_file",
+        "merge_base", "stash_list", "reflog", "show_file",
     ] = Field(
         description="Git read operation to perform: status, diff, diff_cached, log, "
-        "branch, branch_list, show, remote, blame, config"
+        "branch, branch_list, show, remote, blame, config, rev_parse, "
+        "show_ref, for_each_ref, ls_tree, cat_file, merge_base, stash_list, "
+        "reflog, show_file"
     )
     
     # Common parameters
@@ -350,6 +392,75 @@ class GitReadTool(ToolBase):
         description="Config name to retrieve (if not specified, list all configs)"
     )
 
+    # rev_parse parameters
+    ref: Optional[str] = Field(
+        default="HEAD",
+        description="Ref for rev_parse (default HEAD); a commit SHA or ref name, "
+        "never '-...'."
+    )
+    abbrev: bool = Field(
+        default=False,
+        description="Use --abbrev-ref for rev_parse."
+    )
+
+    # show_ref parameters
+    pattern: Optional[str] = Field(
+        default=None,
+        description="Ref pattern for show_ref (optional)."
+    )
+
+    # for_each_ref parameters
+    prefix: Optional[str] = Field(
+        default=None,
+        description="Ref prefix for for_each_ref (optional)."
+    )
+
+    # ls_tree parameters
+    treeish: Optional[str] = Field(
+        default="HEAD",
+        description="Tree-ish for ls_tree (default HEAD)."
+    )
+    recursive: bool = Field(
+        default=False,
+        description="Recurse subtrees for ls_tree (-r)."
+    )
+    path: Optional[str] = Field(
+        default=None,
+        description="Single path to scope ls_tree."
+    )
+
+    # cat_file parameters
+    object: Optional[str] = Field(
+        default=None,
+        description="Object name/ref for cat_file."
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="Object type for cat_file: blob|tree|commit|tag "
+        "(default pretty-print -p)."
+    )
+
+    # merge_base parameters
+    a: Optional[str] = Field(
+        default=None,
+        description="First ref for merge_base operation."
+    )
+    b: Optional[str] = Field(
+        default=None,
+        description="Second ref for merge_base operation."
+    )
+    is_ancestor: bool = Field(
+        default=False,
+        description="Use --is-ancestor for merge_base (exit 1 = not an "
+        "ancestor)."
+    )
+
+    # reflog parameters (reuses the ``ref`` field)
+    limit: Optional[int] = Field(
+        default=20,
+        description="Maximum number of reflog entries (clamped to 1..1000)."
+    )
+
     def _validate_repo_root(self, repo_root: Path) -> Path:
         """
         Ensure the git repository root stays inside the workspace.
@@ -374,6 +485,46 @@ class GitReadTool(ToolBase):
             ) from None
         return repo_root
 
+    def _normalise_working_dir(self, working_dir: str) -> str:
+        """Accept the workspace's OWN container mount as a valid working_dir.
+
+        An agent that speaks container paths (``/workspace`` and anything
+        below it) must be able to target the very workspace it is bound to;
+        the ``working_dir`` param is otherwise host-pathed, so ``/workspace``
+        was rejected as "outside workspace". A clean mount path is mapped back
+        to the canonical host workspace root through the existing
+        ``_from_container_path`` helper, so behaviour is identical to passing
+        that host path.
+
+        Anything that is not an unambiguous mount path is returned UNCHANGED
+        so the existing validator still rejects it with its byte-for-byte
+        message: host paths, ``/workspace``-lookalikes (e.g. ``/workspaceX``)
+        and -- critically -- any ``..`` escape such as
+        ``/workspace/../outside``.
+        """
+        raw = str(working_dir).strip()
+        mount = (getattr(self, "container_workspace_path", None) or "/workspace")
+        mount = mount.rstrip("/") or "/workspace"
+        if not raw.startswith("/"):
+            return working_dir
+        # Classify lexically: reject any '..' and any boundary that is not the
+        # mount itself nor a descendant of it (drops redundant separators and
+        # a trailing slash in the process).
+        segs = [s for s in raw.split("/") if s not in ("", ".")]
+        if any(s == ".." for s in segs):
+            return working_dir
+        norm = "/" + "/".join(segs)
+        if norm != mount and not norm.startswith(mount + "/"):
+            return working_dir
+        ws_path = self._resolved_workspace_path or self._resolve_registry_workspace()
+        if not ws_path:
+            return working_dir
+        self._resolved_workspace_path = ws_path
+        try:
+            return str(self._from_container_path(norm))
+        except (ValueError, TypeError):
+            return working_dir
+
     def execute(self) -> str:
         # Reset per-call runtime state (tool instances may be reused).
         self._resource_manager = None
@@ -385,9 +536,14 @@ class GitReadTool(ToolBase):
         try:
             # Determine working directory
             if self.working_dir:
-                # Validate working_dir is within workspace
+                # Validate working_dir is within workspace. The workspace's
+                # own container mount (/workspace and below) is accepted (see
+                # _normalise_working_dir); genuine violations are still
+                # rejected here with their byte-exact message.
                 try:
-                    validated_working_dir = self._validate_path(self.working_dir)
+                    validated_working_dir = self._validate_path(
+                        self._normalise_working_dir(self.working_dir)
+                    )
                 except ValueError as e:
                     return self._truncate_output(f"Error: {e}")
                 repo_root = Path(validated_working_dir).expanduser().resolve()
@@ -436,8 +592,24 @@ class GitReadTool(ToolBase):
             # path before re-validation.
             try:
                 resolved_root = self._git_repo_root(repo_root)
-            except (subprocess.TimeoutExpired, TimeoutError, FileNotFoundError):
-                return self._truncate_output(f"Git not available or not a git repository: {repo_root}")
+            except GitUnavailableError as e:
+                # The git binary is missing / could not be spawned: an
+                # availability failure, NOT a "not a repository" condition.
+                return self._truncate_output(
+                    f"git executable not available: {e}"
+                )
+            except (subprocess.TimeoutExpired, TimeoutError) as e:
+                # A hung git binary is also an availability failure; never
+                # report it as "not a git repository".
+                return self._truncate_output(
+                    f"git executable not available (timed out): {e}"
+                )
+            except FileNotFoundError as e:
+                # Defensive parity with the previous spawn-error handling: an
+                # unwrapped "git not found" is still an availability failure.
+                return self._truncate_output(
+                    f"git executable not available: {e}"
+                )
             if resolved_root is None:
                 return self._truncate_output(f"Not a git repository: {repo_root}")
             repo_root = resolved_root
@@ -491,6 +663,24 @@ class GitReadTool(ToolBase):
                 return self._git_blame(repo_root)
             elif self.operation == "config":
                 return self._git_config(repo_root)
+            elif self.operation == "rev_parse":
+                return self._git_rev_parse(repo_root)
+            elif self.operation == "show_ref":
+                return self._git_show_ref(repo_root)
+            elif self.operation == "for_each_ref":
+                return self._git_for_each_ref(repo_root)
+            elif self.operation == "ls_tree":
+                return self._git_ls_tree(repo_root)
+            elif self.operation == "cat_file":
+                return self._git_cat_file(repo_root)
+            elif self.operation == "merge_base":
+                return self._git_merge_base(repo_root)
+            elif self.operation == "stash_list":
+                return self._git_stash_list(repo_root)
+            elif self.operation == "reflog":
+                return self._git_reflog(repo_root)
+            elif self.operation == "show_file":
+                return self._git_show_file(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         
@@ -530,6 +720,13 @@ class GitReadTool(ToolBase):
             )
             if exit_code != 0:
                 return f"Git command failed (exit code {exit_code}):\n{stderr}"
+            # §E3: git routes hook stdout to its own stderr (run_hook_ve sets
+            # stdout_to_stderr=1), so a successful commit otherwise hides the
+            # pre-commit hook result. Record it instead of discarding stderr.
+            if args and args[0] == "commit" and stderr:
+                if stdout and not stdout.endswith("\n"):
+                    stdout += "\n"
+                return stdout + stderr
             return stdout
         except subprocess.TimeoutExpired:
             # Fail closed: a timeout must surface as an exception, never as a
@@ -637,6 +834,22 @@ class GitReadTool(ToolBase):
         self, repo_root: Path, args: List[str], timeout: int = 30
     ) -> tuple:
         """Run git on the host inside the hermetic sandbox."""
+        # §E3 host-mode parity: host execution neutralizes hooks
+        # (core.hooksPath=/dev/null + --no-verify), silently bypassing
+        # configured repository hooks. Fail closed when hooks are actually
+        # configured (design §E3: fail closed only when hooks are
+        # configured-but-unenforceable).
+        if args and args[0] == "commit":
+            _ws = getattr(self, "_resolved_workspace_path", None)
+            _hook = Path(_ws) / ".githooks" / "pre-commit" if _ws else None
+            if _hook is not None and _hook.is_file():
+                return (1, "", (
+                    "Error: refusing commit: repository hooks are configured "
+                    "(.githooks/pre-commit) but host execution mode neutralizes "
+                    "them (core.hooksPath=/dev/null, --no-verify); hooks cannot "
+                    "be enforced on the host. Use container mode, or remove the "
+                    "configured hooks to accept the bypass."
+                ))
         # Hardened args, applied to EVERY git invocation: hooks are
         # neutralized (core.hooksPath=/dev/null), external diff drivers /
         # textconv filters, fsmonitor helpers and credential helpers are
@@ -805,15 +1018,34 @@ class GitReadTool(ToolBase):
         Fast path: ``<repo_root>/.git`` exists as a directory. Otherwise
         consult ``git rev-parse --show-toplevel``; in container mode the
         returned ``/workspace`` path is reverse-mapped to the host path.
+
+        Returns ``None`` ONLY when git ran and reported that ``repo_root`` is
+        not inside a repository. When the git executable itself cannot be run
+        (missing binary, exit 127, or an unspawnable process) this raises
+        ``GitUnavailableError`` instead, so an unavailable git is never
+        conflated with a genuine "not a git repository" result.
         """
         dot_git = repo_root / ".git"
         if dot_git.exists() and dot_git.is_dir():
             return repo_root
 
-        exit_code, stdout, _stderr = self._run_git_raw(
-            repo_root, ["rev-parse", "--show-toplevel"], timeout=10
-        )
+        try:
+            exit_code, stdout, stderr = self._run_git_raw(
+                repo_root, ["rev-parse", "--show-toplevel"], timeout=10
+            )
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            # The git binary could not be spawned at all -- not a repository
+            # problem. Surface it as unavailability so the caller never emits
+            # the misleading "Not a git repository" message.
+            raise GitUnavailableError(
+                f"git command could not be executed: {e}"
+            ) from e
         if exit_code != 0 or not stdout.strip():
+            if _git_run_indicates_missing_git(exit_code, stderr):
+                raise GitUnavailableError(
+                    f"git command failed (exit code {exit_code}): "
+                    f"{(stderr or '').strip() or 'no output'}"
+                )
             return None
         if self._use_container_mode():
             return self._from_container_path(stdout.strip())
@@ -1112,7 +1344,12 @@ class GitReadTool(ToolBase):
     
     def _git_log(self, repo_root: Path) -> str:
         """Run git log."""
-        args = ["log", "--no-ext-diff", "--no-textconv", f"--max-count={self.max_count}", "--oneline"]
+        try:
+            raw_max = self.max_count if self.max_count is not None else 50
+            max_count = max(1, min(1000, int(raw_max)))
+        except (TypeError, ValueError):
+            return self._truncate_output("Error: max_count must be an integer")
+        args = ["log", "--no-ext-diff", "--no-textconv", f"--max-count={max_count}", "--oneline"]
         if self.since:
             args.append(f"--since={self.since}")
         if self.until:
@@ -1121,6 +1358,15 @@ class GitReadTool(ToolBase):
             args.append(f"--author={self.author}")
         if self.grep:
             args.append(f"--grep={self.grep}")
+        if self.branch:
+            # The revision is now HONORED: a single validated argv element
+            # AFTER the option flags and BEFORE the '--' path separator. An
+            # unknown revision yields a non-zero exit surfaced as the standard
+            # error form, never silently ignored.
+            try:
+                args.append(self._validate_git_ref(self.branch, field="branch"))
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
         if self.file_path:
             # Validate file paths are within workspace (list-safe)
             try:
@@ -1239,11 +1485,81 @@ class GitReadTool(ToolBase):
         return self._with_mode(self._truncate_output(output))
 
     def _git_show(self, repo_root: Path) -> str:
-        """Run git show."""
+        """Run git show, honouring file scope and an optional line range.
+
+        ``git show`` has no line-range selector, so a requested line range is
+        honoured by reading the file's blob at ``<commit>:<path>`` and slicing
+        the requested lines. Any ``file_path``/``line_start``/``line_end``
+        argument that cannot be honoured is reported as an explicit error --
+        never silently dropped (defect A1).
+        """
+        range_requested = self.line_start is not None or self.line_end is not None
+        file_path = self.file_path
+
+        # Any range/file argument that cannot be honoured must fail loudly
+        # instead of being silently dropped (defect A1).
+        if range_requested:
+            if file_path is None:
+                return self._truncate_output(
+                    "Error: show: line_start/line_end require file_path "
+                    "(a line range is only honoured for a single scoped file)."
+                )
+            if self.line_start is None or self.line_end is None:
+                return self._truncate_output(
+                    "Error: show: both line_start and line_end are required "
+                    "together for a line range."
+                )
+            if (
+                self.line_start < 1
+                or self.line_end < 1
+                or self.line_start > self.line_end
+            ):
+                return self._truncate_output(
+                    "Error: show: invalid line range; require "
+                    "1 <= line_start <= line_end."
+                )
+            if isinstance(file_path, list):
+                return self._truncate_output(
+                    "Error: show: a line range requires a single file_path "
+                    "(got a list)."
+                )
+
+        rel_paths: List[str] = []
+        if file_path is not None:
+            try:
+                rel_paths = self._validated_rel_paths(repo_root, file_path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+
+        if range_requested:
+            # git show cannot select a line range; read the scoped blob at
+            # <commit>:<path> and slice the requested lines.
+            args = ["show", "--no-ext-diff", "--no-textconv"]
+            if self.format:
+                args.append(f"--format={self.format}")
+            args.append(f"{self.commit}:{rel_paths[0]}")
+            exit_code, stdout, stderr = self._run_git_raw(
+                repo_root, args, timeout=30
+            )
+            if exit_code != 0:
+                # Same git-error convention as _run_git / the other handlers;
+                # never slice an error string as if it were file content.
+                return self._with_mode(self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                ))
+            lines = stdout.split("\n")
+            if lines and lines[-1] == "":
+                lines.pop()
+            sliced = "\n".join(lines[self.line_start - 1:self.line_end])
+            return self._with_mode(self._truncate_output(sliced))
+
         args = ["show", "--no-ext-diff", "--no-textconv"]
         if self.format:
             args.append(f"--format={self.format}")
         args.append(self.commit)
+        if rel_paths:
+            args.append("--")
+            args.extend(rel_paths)
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
     
@@ -1282,6 +1598,309 @@ class GitReadTool(ToolBase):
         if self.config_name:
             args = ["config", "--get", self.config_name]
         output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    # ------------------------------------------------------------------
+    # Additional read operations: rev_parse, show_ref, for_each_ref,
+    # ls_tree, cat_file. Every one obeys the fixed-argv contract: no
+    # agent-supplied flags, a leading '-' is rejected, ref/pattern/format
+    # tokens are validated BEFORE any git call, and non-zero exits are
+    # surfaced via the standard "Git command failed (exit code N):" form.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_git_ref(value: str, *, field: str) -> str:
+        """Validate a ref/object/tree-ish token used as one fixed argv element.
+
+        Rejects non-strings, empty or surrounding-whitespace values, any value
+        beginning with '-' (which git would parse as a flag) and any value
+        containing whitespace or a control character. Raises ``ValueError``;
+        callers convert it to an ``Error:`` string without spawning git.
+        """
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        if value == "" or value.strip() != value:
+            raise ValueError(f"invalid {field}: {value!r}")
+        if value.startswith("-"):
+            raise ValueError(
+                f"invalid {field}: {value!r} (must not start with '-')"
+            )
+        for ch in value:
+            if ch.isspace() or ord(ch) < 0x20:
+                raise ValueError(
+                    f"invalid {field}: {value!r} (must not contain whitespace "
+                    "or control characters)"
+                )
+        return value
+
+    @staticmethod
+    def _validate_ref_pattern(value: str, *, field: str) -> str:
+        """Validate a ref pattern/prefix (show_ref, for_each-ref).
+
+        Applies the ``_validate_git_ref`` rules and additionally rejects any
+        character in ``_REF_PATTERN_FORBIDDEN`` (shell metacharacters) so the
+        token can never be re-interpreted outside argv. Raises ``ValueError``.
+        """
+        validated = GitReadTool._validate_git_ref(value, field=field)
+        if any(ch in _REF_PATTERN_FORBIDDEN for ch in validated):
+            raise ValueError(
+                f"invalid {field}: {value!r} (must not contain shell "
+                "metacharacters)"
+            )
+        return validated
+
+    @staticmethod
+    def _validate_for_each_ref_format(fmt: str) -> str:
+        """Validate a ``for-each-ref --format`` string.
+
+        The format travels as a single ``--format=<fmt>`` argv element (never
+        shell-interpreted). Structural rules: non-empty string, no newlines and
+        no ``_REF_PATTERN_FORBIDDEN`` characters; then every '%' must open a
+        ``%(...)`` token whose atom is in ``_FOR_EACH_REF_ALLOWED_TOKENS``.
+        Literal text (without metacharacters or a bare '%') is allowed. Raises
+        ``ValueError`` naming the allowed atoms otherwise.
+        """
+        if not isinstance(fmt, str) or fmt == "":
+            raise ValueError("format must be a non-empty string")
+        if "\n" in fmt or "\r" in fmt:
+            raise ValueError("invalid format: must not contain newlines")
+        if any(ch in _REF_PATTERN_FORBIDDEN for ch in fmt):
+            raise ValueError(
+                f"invalid format: {fmt!r} (must not contain shell "
+                "metacharacters)"
+            )
+        allowed = ", ".join(sorted(_FOR_EACH_REF_ALLOWED_TOKENS))
+        i, n = 0, len(fmt)
+        while i < n:
+            if fmt[i] != "%":
+                i += 1
+                continue
+            if i + 1 >= n or fmt[i + 1] != "(":
+                raise ValueError(
+                    f"invalid format: bare '%' at position {i}; every '%' must "
+                    "begin a '%(token)' atom"
+                )
+            close = fmt.find(")", i + 2)
+            if close == -1:
+                raise ValueError(
+                    f"invalid format: unterminated '%(' token at position {i}"
+                )
+            token = fmt[i + 2:close]
+            if token not in _FOR_EACH_REF_ALLOWED_TOKENS:
+                raise ValueError(
+                    f"invalid format: unsupported atom '%({token})'; allowed "
+                    f"atoms are: {allowed}"
+                )
+            i = close + 1
+        return fmt
+
+    def _git_rev_parse(self, repo_root: Path) -> str:
+        """Run git rev-parse, optionally --abbrev-ref, on a ref/SHA."""
+        try:
+            ref = self._validate_git_ref(self.ref, field="ref")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        args = ["rev-parse"]
+        if self.abbrev:
+            args.append("--abbrev-ref")
+        args.append(ref)
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_show_ref(self, repo_root: Path) -> str:
+        """Run git show-ref; an empty match (exit 1) is benign, not an error."""
+        args = ["show-ref"]
+        if self.pattern is not None:
+            try:
+                args.append(
+                    self._validate_ref_pattern(self.pattern, field="pattern")
+                )
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args)
+        if exit_code == 1 and not stdout.strip():
+            return self._with_mode(self._truncate_output("No matching refs."))
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_for_each_ref(self, repo_root: Path) -> str:
+        """Run git for-each-ref with an optional validated format/prefix."""
+        args = ["for-each-ref"]
+        if self.format is not None:
+            try:
+                fmt = self._validate_for_each_ref_format(self.format)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            args.append(f"--format={fmt}")
+        if self.prefix is not None:
+            try:
+                prefix = self._validate_ref_pattern(self.prefix, field="prefix")
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            args.append(prefix)
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_ls_tree(self, repo_root: Path) -> str:
+        """Run git ls-tree with optional recursion and path scope."""
+        try:
+            treeish = self._validate_git_ref(self.treeish, field="treeish")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        args = ["ls-tree"]
+        if self.recursive:
+            args.append("-r")
+        args.append(treeish)
+        if self.path:
+            try:
+                rels = self._validated_rel_paths(repo_root, self.path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if rels:
+                args.append("--")
+                args.extend(rels)
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_merge_base(self, repo_root: Path) -> str:
+        """Run git merge-base on two validated refs.
+
+        Exit code 1 is MEANINGFUL and is never mapped to empty/None: for the
+        plain form it means no common ancestor; for ``--is-ancestor`` it means
+        the first ref is NOT an ancestor of the second. Any other non-zero
+        exit is the standard error form.
+        """
+        if not self.a or not self.b:
+            return self._truncate_output(
+                "Error: a and b are required for merge_base operation"
+            )
+        try:
+            a = self._validate_git_ref(self.a, field="a")
+            b = self._validate_git_ref(self.b, field="b")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        args = ["merge-base"] + (
+            ["--is-ancestor"] if self.is_ancestor else []
+        ) + [a, b]
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args)
+        if self.is_ancestor:
+            if exit_code == 0:
+                return self._with_mode(
+                    self._truncate_output(f"{a!r} is an ancestor of {b!r}.")
+                )
+            if exit_code == 1:
+                return self._with_mode(
+                    self._truncate_output(f"{a!r} is not an ancestor of {b!r}.")
+                )
+        else:
+            if exit_code == 1:
+                return self._with_mode(
+                    self._truncate_output("No common ancestor (no merge base).")
+                )
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_stash_list(self, repo_root: Path) -> str:
+        """Run git stash list; empty output is benign, non-zero is an error."""
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, ["stash", "list"])
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        if not stdout.strip():
+            return self._with_mode(self._truncate_output("No stashes."))
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_reflog(self, repo_root: Path) -> str:
+        """Run git reflog on a validated ref with a clamped entry limit."""
+        try:
+            ref = self._validate_git_ref(self.ref or "HEAD", field="ref")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        try:
+            limit = int(self.limit) if self.limit is not None else 20
+        except (TypeError, ValueError):
+            return self._truncate_output("Error: limit must be an integer")
+        limit = max(1, min(1000, limit))
+        args = ["reflog", f"-n{limit}", ref]
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args)
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        if not stdout.strip():
+            return self._with_mode(self._truncate_output("No reflog entries."))
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_show_file(self, repo_root: Path) -> str:
+        """Show a single tracked file at a ref (``git show <ref>:<path>``).
+
+        A non-zero exit is the explicit "path not tracked at ref" signal and is
+        surfaced as the standard error form; exit 0 with empty stdout is a
+        legitimately empty file and is returned as empty content, not an error.
+        """
+        if not self.ref:
+            return self._truncate_output(
+                "Error: ref is required for show_file operation"
+            )
+        if not self.path:
+            return self._truncate_output(
+                "Error: path is required for show_file operation"
+            )
+        try:
+            ref = self._validate_git_ref(self.ref, field="ref")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        try:
+            rels = self._validated_rel_paths(repo_root, self.path)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        rel = rels[0]
+        exit_code, stdout, stderr = self._run_git_raw(
+            repo_root,
+            ["show", "--no-ext-diff", "--no-textconv", f"{ref}:{rel}"],
+        )
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_cat_file(self, repo_root: Path) -> str:
+        """Run git cat-file (-p by default, or a validated object type)."""
+        if not self.object:
+            return self._truncate_output(
+                "Error: object is required for cat_file operation"
+            )
+        try:
+            obj = self._validate_git_ref(self.object, field="object")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        mode = "-p"
+        if self.type is not None:
+            if self.type not in _CAT_FILE_ALLOWED_TYPES:
+                allowed = ", ".join(sorted(_CAT_FILE_ALLOWED_TYPES))
+                return self._truncate_output(
+                    f"Error: invalid type {self.type!r}; allowed types are: "
+                    f"{allowed}"
+                )
+            mode = self.type
+        output = self._run_git(repo_root, ["cat-file", mode, obj])
         return self._with_mode(self._truncate_output(output))
 
 # Backward-compatible alias: legacy code, imports and tests reference the old
