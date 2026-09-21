@@ -839,7 +839,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           console.warn('[SessionTab] default_config_saved for different session, ignoring:', msg.session_id)
           break
         }
-        setDefaultConfigSaveStatus(msg.status)
+        setDefaultConfigSaveStatus({
+          status: msg.status,
+          saved_keys: msg.saved_keys ?? [],
+          dropped_keys: msg.dropped_keys ?? [],
+          session_id: msg.session_id ?? null,
+          message: msg.message ?? null,
+        })
         break
 
       case 'session_saved':
