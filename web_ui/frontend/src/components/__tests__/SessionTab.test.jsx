@@ -534,6 +534,43 @@ describe('SessionTab — event handling', () => {
     expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
   }, 20000);
 
+  // Fix 3C: a command routed through sendCommand while the session is stale is
+  // blocked (unchanged) but the user must get visual feedback — the ALREADY-
+  // EXISTING recovery banner pulses briefly. No new banner/text/retry is added.
+  it('a blocked command on a stale session pulses the recovery banner briefly', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    act(() => {
+      useStore.getState().setSessions([{ session_id: 'sess-1', name: 'Dead Session' }]);
+      useStore.getState().setSessionMode('sess-1', 'agent');
+      useStore.getState().setTabRunningState('sess-1', 'RUNNING');
+      useStore.getState().registerSession('sess-1');
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'replacement-sess',
+        session_name: 'Replacement Session',
+        workspace_id: 'ws-2',
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    await screen.findByText(/no longer available/i);
+    // The banner is present but not pulsing before the blocked click.
+    const bannerBefore = document.querySelector('.session-error-banner');
+    expect(bannerBefore).not.toBeNull();
+    expect(bannerBefore).not.toHaveClass('session-error-banner--pulse');
+    // A command routed through the gate pulses the banner (and stays blocked).
+    const registered = mocks.onRegister.mock.calls[0][0];
+    act(() => registered.sendCommand('start_session', { query: 'ignored' }));
+    expect(document.querySelector('.session-error-banner')).toHaveClass('session-error-banner--pulse');
+    expect(sentCommands(ws).some((c) => c.command === 'start_session')).toBe(false);
+  }, 20000);
+
   // Intentional replacement (workspace switch via apply_config): the backend
   // flags the new session_loaded with `replacement: true`. The tab must adopt
   // it SILENTLY — no stale banner, no purge of the old session's store slices
