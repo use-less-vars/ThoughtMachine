@@ -192,6 +192,59 @@ describe('Save as Default', () => {
     renderPanel({ defaultConfigSaveStatus: 'error' });
     expect(screen.getByRole('button', { name: '✗ Save failed' })).toBeInTheDocument();
   });
+
+  // GUARD (characterization): the payload already strips session_permissions and
+  // carries all 12 safe-draft keys — expected GREEN pre-change.
+  it('sends set_default_config with the full defaults payload (session_permissions stripped)', () => {
+    const { sendCommand } = renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Save as Default' }));
+    const [command, payload] = sendCommand.mock.calls[0];
+    expect(command).toBe('set_default_config');
+    expect(payload.config.session_permissions).toBeUndefined();
+    expect(Object.keys(payload.config).sort()).toEqual([
+      'max_turns',
+      'mode',
+      'model',
+      'provider',
+      'provider_id',
+      'system_prompt',
+      'temperature',
+      'token_monitor_critical_threshold',
+      'token_monitor_warning_threshold',
+      'tool_output_token_limit',
+      'tools',
+      'workspace_path',
+    ]);
+  });
+
+  it('renders the saved/dropped notice on backend confirmation', () => {
+    renderPanel({
+      defaultConfigSaveStatus: {
+        status: 'ok',
+        saved_keys: ['provider_id', 'model'],
+        dropped_keys: ['mode', 'provider_type'],
+      },
+    });
+    const notice = screen.getByRole('status');
+    expect(notice.textContent).toContain('Saved 2 settings');
+    expect(notice.textContent).toContain('Not global defaults: Mode, Provider');
+  });
+
+  it('shows the stale-session timeout message when no confirmation arrives', () => {
+    vi.useFakeTimers();
+    try {
+      renderPanel();
+      fireEvent.click(screen.getByRole('button', { name: 'Save as Default' }));
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(screen.getByRole('alert').textContent).toBe(
+        'Not saved — session may be stale. Try Start New Session.'
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ==========================================================================
