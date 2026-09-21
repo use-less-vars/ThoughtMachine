@@ -321,3 +321,127 @@ def test_server_set_default_config_fallback_args():
     assert captured["workspace_id"] == "ws1"
     assert captured["session_id"] == "s1"
     assert captured["provider_id"] == "p1"
+
+
+
+# ── server.set_default_config honesty keys (Wave 1 fix 3A) ──────────────────
+
+
+def _run_set_default_config(monkeypatch, tmp_path, config, *, save_raises=False):
+    """Drive the real ``server.websocket_endpoint`` handler for one message.
+
+    Feeds exactly one ``set_default_config`` frame into the endpoint, then lets
+    the next ``receive_text`` raise ``WebSocketDisconnect`` so the endpoint's
+    outer handler exits cleanly.  Returns ``(sent, recorded)`` where ``sent``
+    is the list of payloads emitted via ``ws.send_json`` and ``recorded`` holds
+    the ``cfg_dict`` handed to the (patched) ``save_global_defaults``.
+    """
+    import asyncio
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    import web_ui.backend.server as server_mod
+    from fastapi import WebSocketDisconnect
+
+    recorded = {}
+
+    def _fake_save(cfg_dict):
+        recorded["cfg"] = cfg_dict
+        if save_raises:
+            raise RuntimeError("boom")
+        return tmp_path / "user" / "defaults.json"
+
+    monkeypatch.setattr(server_mod, "save_global_defaults", _fake_save)
+
+    inbox = [json.dumps({"command": "set_default_config", "config": config})]
+    sent = []
+
+    class FakeWS:
+        _closed = False
+        client = "fake-client"
+
+        async def accept(self):
+            return None
+
+        async def receive_text(self):
+            if inbox:
+                return inbox.pop(0)
+            raise WebSocketDisconnect(1000)
+
+        async def send_json(self, data):
+            sent.append(data)
+
+    asyncio.run(server_mod.websocket_endpoint(FakeWS()))
+    return sent, recorded
+
+
+def test_server_set_default_config_honesty_keys(monkeypatch, tmp_path):
+    """The ok ``default_config_saved`` payload must report which keys were
+    persisted vs. dropped, plus the active session id."""
+    config = {
+        "provider_id": "p1",
+        "model": "gpt-4o",
+        "temperature": 0.7,
+        "max_turns": 10,
+        "system_prompt": "Be nice",
+        # all of the below are outside GLOBAL_DEFAULT_KEYS and must be dropped
+        "provider": "openai",          # → provider_type after translation
+        "tools": [{"name": "read_file", "enabled": True}],  # → enabled_tools
+        "workspace_path": "/x",
+        "token_monitor_warning_threshold": 65000,
+        "mode": "custom",
+    }
+    sent, recorded = _run_set_default_config(monkeypatch, tmp_path, config)
+
+    saved = [m for m in sent if m.get("type") == "default_config_saved"]
+    assert saved, f"no default_config_saved emitted; got {sent!r}"
+    last = saved[-1]
+    assert last["status"] == "ok"
+    assert last["saved_keys"] == [
+        "max_turns",
+        "model",
+        "provider_id",
+        "system_prompt",
+        "temperature",
+    ]
+    assert last["dropped_keys"] == [
+        "enabled_tools",
+        "mode",
+        "provider_type",
+        "token_monitor_warning_threshold",
+        "workspace_path",
+    ]
+    assert last["session_id"] is None
+
+
+def test_server_set_default_config_honesty_keys_on_error(monkeypatch, tmp_path):
+    """The error ``default_config_saved`` payload must still report the
+    saved/dropped keys (computed before the failing save) and session id."""
+    config = {"provider_id": "p1", "model": "gpt-4o", "mode": "custom"}
+    sent, recorded = _run_set_default_config(
+        monkeypatch, tmp_path, config, save_raises=True
+    )
+
+    saved = [m for m in sent if m.get("type") == "default_config_saved"]
+    assert saved, f"no default_config_saved emitted; got {sent!r}"
+    last = saved[-1]
+    assert last["status"] == "error"
+    assert last["saved_keys"] == ["model", "provider_id"]
+    assert last["dropped_keys"] == ["mode"]
+    assert last["session_id"] is None
+
+
+def test_server_set_default_config_no_config_no_session(monkeypatch, tmp_path):
+    """With no config payload and no active bridge, the error payload must
+    still carry empty honesty keys and a None session id."""
+    sent, recorded = _run_set_default_config(monkeypatch, tmp_path, None)
+
+    saved = [m for m in sent if m.get("type") == "default_config_saved"]
+    assert saved, f"no default_config_saved emitted; got {sent!r}"
+    last = saved[-1]
+    assert last["status"] == "error"
+    assert last["saved_keys"] == []
+    assert last["dropped_keys"] == []
+    assert last["session_id"] is None
+
