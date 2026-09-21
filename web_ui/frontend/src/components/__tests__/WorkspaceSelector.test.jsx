@@ -304,4 +304,18 @@ describe('WorkspaceSelector', () => {
     await screen.findByText('No workspaces yet. Create one to get started.')
     expect(screen.queryByRole('button', { name: '+ New Session' })).toBeNull()
   })
+
+  it('surfaces a notice when a prompt is selected from the library', async () => {
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/prompts'
+          ? { match: r.match, value: jsonOk([{ name: 'summarize', content: 'Summarize the text.' }]) }
+          : r
+      )
+    )
+    render(<WorkspaceSelector />)
+    await screen.findByText('summarize')
+    fireEvent.click(screen.getByText('summarize'))
+    expect(screen.getByText('Prompt selected - open a session to apply it')).toBeInTheDocument()
+  })
 })
