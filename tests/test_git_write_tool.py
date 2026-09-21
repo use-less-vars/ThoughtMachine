@@ -606,3 +606,102 @@ def test_commit_empty_paths_errors_no_subprocess(empty_paths):
     assert calls == []
     _assert_no_commit_subprocess(exec_container, exec_host)
 
+
+
+# --- Detached-HEAD fail-open defect (A4) -------------------------------------
+#
+# ``git rev-parse --abbrev-ref HEAD`` reports the literal string "HEAD" when
+# HEAD is detached. "HEAD" is a *valid* branch ref and is NOT in
+# ``_PROTECTED_BRANCHES``, so both commit gates would otherwise treat a
+# detached HEAD as an unprotected branch and PERMIT the commit (fail-OPEN).
+# A detached HEAD is not on a branch: both gates must refuse it with a
+# distinguishable "not on a branch" message, and no add/commit may run.
+
+
+def test_detached_head_denied_by_agent_commit_gate():
+    """Gate (1) refuses a detached HEAD and records the refusal reason."""
+    tool = _tool(agent_config={"session_permissions": {"git": "write"}})
+    calls = []
+    tool._use_container_mode = lambda: True  # noqa: SLF001
+    tool._run_git = _branch_fake(calls, "HEAD")  # noqa: SLF001
+
+    allowed = tool._unprotected_branch_agent_commit_allowed("/tmp/repo")
+
+    assert allowed is False
+    assert "not on a branch" in tool._agent_commit_refusal_reason
+    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
+
+
+def test_detached_head_commit_denied_operator_managed():
+    """Operator-managed worktree + detached HEAD -> refused, no subprocess.
+
+    ``_git_commit`` must not fall back to the operator-managed-worktree error
+    (which would be misleading) and must not run any add/commit subprocess.
+    """
+    tool = _tool(
+        file_path="agent_change.py",
+        agent_config={"session_permissions": {"git": "write"}},
+    )
+    calls = []
+    exec_container = _RecordingExec()
+    exec_host = _RecordingExec()
+    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
+    tool._use_container_mode = lambda: True  # noqa: SLF001
+    tool._run_git = _branch_fake(calls, "HEAD")  # noqa: SLF001
+    tool._exec_container_raw = exec_container  # noqa: SLF001
+    tool._exec_host_raw = exec_host  # noqa: SLF001
+
+    result = tool._git_commit("/tmp/repo")
+
+    assert "not on a branch" in result
+    assert OPERATOR_ERROR not in result
+    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
+    _assert_no_commit_subprocess(exec_container, exec_host)
+
+
+def test_detached_head_denied_by_wofb_commit_gate(tmp_path):
+    """write_on_feature_branch grant + detached HEAD -> gate (2) refuses."""
+    (tmp_path / "note.txt").write_text("x\n")
+    tool = _tool(
+        file_path=["note.txt"],
+        agent_config={"session_permissions": {"git": "write_on_feature_branch"}},
+    )
+    calls = []
+    exec_container = _RecordingExec()
+    exec_host = _RecordingExec()
+    tool._is_operator_managed_worktree = lambda root: False  # noqa: SLF001
+    tool._run_git = _branch_fake(calls, "HEAD")  # noqa: SLF001
+    tool._exec_container_raw = exec_container  # noqa: SLF001
+    tool._exec_host_raw = exec_host  # noqa: SLF001
+
+    result = tool._git_commit(tmp_path)
+
+    assert "not on a branch" in result
+    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
+    _assert_no_commit_subprocess(exec_container, exec_host)
+
+
+def test_normal_branch_commit_still_allowed_regression(tmp_path):
+    """Regression: a real unprotected branch is still permitted unchanged."""
+    (tmp_path / "agent_change.py").write_text("print('x')\n")
+    tool = _tool(
+        file_path="agent_change.py",
+        agent_config={"session_permissions": {"git": "write"}},
+    )
+    calls = []
+    exec_container = _RecordingExec()
+    exec_host = _RecordingExec()
+    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
+    tool._use_container_mode = lambda: True  # noqa: SLF001
+    tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
+    tool._exec_container_raw = exec_container  # noqa: SLF001
+    tool._exec_host_raw = exec_host  # noqa: SLF001
+
+    result = tool._git_commit(tmp_path)
+
+    assert "ok\n" in result
+    assert "not on a branch" not in result
+    assert OPERATOR_ERROR not in result
+    assert [c[0] for c in calls] == ["rev-parse", "add", "commit"]
+    _assert_no_commit_subprocess(exec_container, exec_host)
+

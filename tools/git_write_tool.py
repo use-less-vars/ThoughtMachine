@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 # slashes, underscores, hyphens only).
 _BRANCH_NAME_RE = re.compile(r'^[A-Za-z0-9._/\-]+$')
 
+# Detached-HEAD refusal. ``git rev-parse --abbrev-ref HEAD`` reports the
+# literal string "HEAD" when HEAD is detached. "HEAD" is a *valid* ref and is
+# NOT in ``_PROTECTED_BRANCHES``, so the commit gates below would otherwise
+# treat a detached HEAD as an unprotected branch and permit the commit
+# (fail-OPEN). A detached HEAD is not on a branch: both commit gates refuse.
+_DETACHED_HEAD_ERROR = (
+    "Error: refusing to commit: the workspace HEAD is detached "
+    "(not on a branch); check out a branch before committing"
+)
+
 
 class GitWriteTool(GitReadTool):
     """
@@ -305,6 +315,10 @@ class GitWriteTool(GitReadTool):
         Any violation returns False so the caller keeps the existing
         operator-managed-worktree block.
         """
+        # Clear any refusal reason left over from a previous call (tool
+        # instances may be reused); it is set only when THIS call detects a
+        # detached HEAD, so the caller can surface a distinguishable error.
+        self._agent_commit_refusal_reason = None
         if not self._git_write_allowed():
             return False
         if not self._use_container_mode():
@@ -319,6 +333,13 @@ class GitWriteTool(GitReadTool):
             # unavailable, policy denial): fail closed, never degrade.
             return False
         branch = (output or "").strip()
+        if branch == "HEAD":
+            # Detached HEAD: rev-parse --abbrev-ref HEAD reports the literal
+            # string "HEAD" -- a valid ref that is NOT protected, so the
+            # checks below would permit the commit (fail-OPEN). Refuse, and
+            # record the reason so the commit entry point can surface it.
+            self._agent_commit_refusal_reason = _DETACHED_HEAD_ERROR
+            return False
         if not self._is_valid_branch_ref(branch):
             # Invalid branch output (empty / multi-line / error-shaped /
             # over-long): fail closed.  Closes the fail-open where a swallowed
@@ -592,6 +613,11 @@ class GitWriteTool(GitReadTool):
             except (RuntimeError, PermissionError):
                 branch_output = ""
             branch = (branch_output or "").strip()
+            if branch == "HEAD":
+                # Detached HEAD (see _unprotected_branch_agent_commit_allowed):
+                # fail closed instead of reading the literal "HEAD" as an
+                # unprotected branch.
+                return self._truncate_output(_DETACHED_HEAD_ERROR)
             if not self._is_valid_branch_ref(branch) or branch in self._PROTECTED_BRANCHES:
                 branch_label = branch or "unknown"
                 return self._truncate_output(
@@ -611,8 +637,12 @@ class GitWriteTool(GitReadTool):
         if self._is_operator_managed_worktree(repo_root):
             if not self._unprotected_branch_agent_commit_allowed(repo_root):
                 return self._truncate_output(
-                    "Error: commits in this workspace are performed host-side by "
-                    "the operator (workspace is an operator-managed git worktree)"
+                    getattr(self, "_agent_commit_refusal_reason", None)
+                    or (
+                        "Error: commits in this workspace are performed "
+                        "host-side by the operator (workspace is an "
+                        "operator-managed git worktree)"
+                    )
                 )
 
         if not self.message or not self.message.strip():
