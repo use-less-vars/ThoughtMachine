@@ -17,7 +17,7 @@ _EXPECTED_KEYS = {
     "display_name",
     "description",
     "permission_grain_set",
-    "default_execution_context",
+    "execution_mode",
     "container_image",
     "dockerfile_reference",
     "tools",
@@ -88,5 +88,5 @@ def test_resource_catalog_git_entry_exact_fields(client):
     git = next(entry for entry in resp.json() if entry["name"] == "git")
     assert git["dockerfile_reference"] == "docker/resource/git_overlay.Dockerfile"
     assert git["tools"] == ["git_read", "git_write"]
-    assert git["default_execution_context"] == "containerized"
+    assert git["execution_mode"] == "container"
     assert git["permission_grain_set"] == ["banned", "read", "ask", "write"]

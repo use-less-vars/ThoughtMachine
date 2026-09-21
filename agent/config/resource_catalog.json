@@ -9,7 +9,7 @@
       "ask",
       "write"
     ],
-    "default_execution_context": "containerized",
+    "execution_mode": "container",
     "container_image": null,
     "dockerfile_reference": "docker/resource/git_overlay.Dockerfile",
     "tools": [
@@ -27,7 +27,7 @@
       "ask",
       "write"
     ],
-    "default_execution_context": "containerized",
+    "execution_mode": "container",
     "container_image": null,
     "dockerfile_reference": null,
     "tools": [
@@ -48,7 +48,7 @@
       "ask",
       "write"
     ],
-    "default_execution_context": "containerized",
+    "execution_mode": "container",
     "container_image": null,
     "dockerfile_reference": "docker/resource/default_runtime.Dockerfile",
     "tools": [
@@ -66,7 +66,7 @@
       "ask",
       "write"
     ],
-    "default_execution_context": "containerized",
+    "execution_mode": "host",
     "container_image": null,
     "dockerfile_reference": null,
     "tools": [
@@ -83,7 +83,7 @@
       "ask",
       "write"
     ],
-    "default_execution_context": "containerized",
+    "execution_mode": "host",
     "container_image": null,
     "dockerfile_reference": null,
     "tools": []
@@ -98,7 +98,7 @@
       "ask",
       "write"
     ],
-    "default_execution_context": "containerized",
+    "execution_mode": "host",
     "container_image": null,
     "dockerfile_reference": null,
     "tools": []

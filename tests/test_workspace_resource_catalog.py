@@ -98,7 +98,7 @@ def test_resource_catalog_json_matches_loader():
     for entry in raw:
         assert set(entry.keys()) == {
             "name", "display_name", "description", "permission_grain_set",
-            "default_execution_context", "container_image",
+            "execution_mode", "container_image",
             "dockerfile_reference", "tools",
         }
     git_entry = next(e for e in raw if e["name"] == "git")

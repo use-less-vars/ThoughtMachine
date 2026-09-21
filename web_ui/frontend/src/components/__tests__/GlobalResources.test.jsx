@@ -41,7 +41,7 @@ const RESOURCE = {
   display_name: 'npm cache',
   description: 'Shared npm cache',
   permission_grain_set: ['read', 'write'],
-  default_execution_context: 'container',
+  execution_mode: 'container',
   tools: ['npm'],
   dockerfile_reference: 'cache.Dockerfile',
 }

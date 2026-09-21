@@ -44,7 +44,7 @@ import sys
 
 # Measured on branch fix/git-host-fallback-closure: 3649 tests collect in total
 # and `-m "not docker and not e2e"` selects 3644 of them (5 deselected).
-DEFAULT_EXPECTED = 3644
+DEFAULT_EXPECTED = 3642
 DEFAULT_MARKER = "not docker and not e2e"
 
 # "3644/3649 tests collected (5 deselected)" -> 3644 (the selected count).

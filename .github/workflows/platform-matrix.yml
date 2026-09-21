@@ -73,7 +73,7 @@ jobs:
       - name: Assert collected test count (anti-vacuity)
         run: >
           python scripts/ci_assert_collected.py
-          --expected 3644
+          --expected 3642
           --marker "not docker and not e2e"
 
       - name: Run test suite
@@ -243,7 +243,7 @@ jobs:
       - name: Assert collected test count (anti-vacuity)
         run: >
           python scripts/ci_assert_collected.py
-          --expected 3644
+          --expected 3642
           --marker "not docker and not e2e"
 
       - name: Run test suite

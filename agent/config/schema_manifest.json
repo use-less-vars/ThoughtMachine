@@ -77,7 +77,7 @@
           "display_name": "Git",
           "description": "Git repository operations (read and write) via the git tools.",
           "permission_grain_set": ["banned", "read", "ask", "write"],
-          "default_execution_context": "containerized",
+          "execution_mode": "container",
           "container_image": null,
           "dockerfile_reference": "docker/resource/git_overlay.Dockerfile",
           "tools": ["git_read", "git_write"]
@@ -87,7 +87,7 @@
           "display_name": "Filesystem",
           "description": "File read/write access to the workspace tree.",
           "permission_grain_set": ["banned", "read", "ask", "write"],
-          "default_execution_context": "containerized",
+          "execution_mode": "container",
           "container_image": null,
           "dockerfile_reference": null,
           "tools": ["read_file", "file_editor", "apply_edits", "file_search", "glob"]
@@ -97,7 +97,7 @@
           "display_name": "Container",
           "description": "Container lifecycle and sandboxed code execution (Docker runtime).",
           "permission_grain_set": ["banned", "read", "ask", "write"],
-          "default_execution_context": "containerized",
+          "execution_mode": "container",
           "container_image": null,
           "dockerfile_reference": "docker/resource/default_runtime.Dockerfile",
           "tools": ["docker_code_runner", "container_control"]
@@ -107,7 +107,7 @@
           "display_name": "Host Bash",
           "description": "Supervised shell command execution on the host machine.",
           "permission_grain_set": ["banned", "read", "ask", "write"],
-          "default_execution_context": "containerized",
+          "execution_mode": "host",
           "container_image": null,
           "dockerfile_reference": null,
           "tools": ["host_bash"]
@@ -117,7 +117,7 @@
           "display_name": "TTY",
           "description": "Interactive terminal sessions.",
           "permission_grain_set": ["banned", "read", "ask", "write"],
-          "default_execution_context": "containerized",
+          "execution_mode": "host",
           "container_image": null,
           "dockerfile_reference": null,
           "tools": []
@@ -127,7 +127,7 @@
           "display_name": "JTAG",
           "description": "JTAG hardware debug probe access.",
           "permission_grain_set": ["banned", "read", "ask", "write"],
-          "default_execution_context": "containerized",
+          "execution_mode": "host",
           "container_image": null,
           "dockerfile_reference": null,
           "tools": []

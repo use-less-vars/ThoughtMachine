@@ -46,8 +46,8 @@ export default function GlobalResources() {
               ))}
             </div>
           ) : null}
-          {r.default_execution_context ? (
-            <div className="gms-resource-line">Context: {r.default_execution_context}</div>
+          {r.execution_mode ? (
+            <div className="gms-resource-line">Context: {r.execution_mode}</div>
           ) : null}
           {Array.isArray(r.tools) && r.tools.length > 0 ? (
             <div className="gms-resource-line">Tools: {r.tools.join(', ')}</div>
