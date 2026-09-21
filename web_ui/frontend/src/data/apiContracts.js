@@ -172,9 +172,12 @@ export const API_ENDPOINTS = {
     {
       method: 'GET',
       path: '/api/workspace/:workspace_id/containers/:container_name/logs',
-      query: { workspace_path: 'string (workspace root)' },
-      status: 'pending',
-      notes: 'No backend route. UI fallback: the Containers tab "Logs" button opens a PlaceholderModal ("Live container logs are coming soon.").',
+      query: {
+        workspace_path: 'string (workspace root)',
+        tail: 'number (default 200, max 10000)',
+      },
+      status: 'implemented',
+      notes: 'Implemented at web_ui/backend/server.py:3690 (GET /api/workspace/{workspace_id}/containers/{container_name}/logs, tail default 200 clamped to 10000); returns {container, success, stdout, stderr, duration}. Consumed by src/components/workspace/ContainerLogsViewer.jsx.',
     },
   ],
 }
