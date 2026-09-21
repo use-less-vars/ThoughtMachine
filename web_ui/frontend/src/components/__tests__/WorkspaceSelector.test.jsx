@@ -318,4 +318,54 @@ describe('WorkspaceSelector', () => {
     fireEvent.click(screen.getByText('summarize'))
     expect(screen.getByText('Prompt selected - open a session to apply it')).toBeInTheDocument()
   })
+
+  it('saves a new provider through the REST provider API', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers') && (init?.method || 'GET').toUpperCase() === 'POST',
+        value: jsonOk({ created: true, provider: { id: 'test-provider-1' } }),
+      },
+    ]
+    const { fetchMock } = stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    // Open the modal: this button label cannot collide with the modal's own
+    // 'Manage Providers' header (that is a <strong>, not a button).
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+
+    // List view -> '+ Add Provider' opens the create form.
+    fireEvent.click(await screen.findByRole('button', { name: /Add Provider/i }))
+
+    fireEvent.change(screen.getByPlaceholderText('e.g., openai, my-custom-vllm'), {
+      target: { value: 'test-provider-1' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('e.g., OpenAI GPT-4, My Local vLLM'), {
+      target: { value: 'Test Provider' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('https://api.openai.com/v1'), {
+      target: { value: 'https://example.test/v1' },
+    })
+
+    // The create form replaces the list, so the footer '+ Add Provider' is gone;
+    // the only remaining 'Add Provider' button is the form's submit.
+    fireEvent.click(screen.getByRole('button', { name: /^Add Provider$/ }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const postCalls = fetchMock.mock.calls
+      .map(([input, init]) => ({
+        url: typeof input === 'string' ? input : String(input),
+        method: (init?.method || 'GET').toUpperCase(),
+        body: init?.body,
+      }))
+      .filter((c) => c.method === 'POST' && c.url.endsWith('/api/providers'))
+
+    expect(postCalls.length).toBe(1)
+    const sent = JSON.parse(postCalls[0].body)
+    expect(sent.id ?? sent.provider?.id).toBe('test-provider-1')
+  })
 })
