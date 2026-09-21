@@ -18,10 +18,9 @@ Security properties asserted per operation:
 - the agent-visible param surface exposes no raw git flags (``--no-verify``,
   ``-c``/``--config``, ``core.hooksPath``).
 - commit messages travel as a single argv element, never re-parsed.
-- every operation reports three trailing lines ``execution_mode: <mode>``,
-  ``failure_reason: <reason-or-none>`` and ``fallback_used: <bool>`` (legacy
-  operations included); argument-validation errors keep their byte-exact form
-  (no trailer).
+- every operation reports two trailing lines ``execution_mode: <mode>`` and
+  ``failure_reason: <reason-or-none>`` (legacy operations included);
+  argument-validation errors keep their byte-exact form (no trailer).
 """
 
 import json
@@ -242,7 +241,7 @@ class TestBranchCreate:
 
         command = _last_sandbox_command()
         assert command[-2:] == ["branch", "feature/x"]
-        assert "execution_mode: host_fallback" in result
+        assert "execution_mode: host" in result
 
     @pytest.mark.parametrize(
         "bad", ["-x", ".x", "a..b", "a@{b}", "a b", "a--no-verify"]
@@ -447,7 +446,7 @@ class TestDiffCached:
         command = _last_sandbox_command()
         assert command[-4:] == ["diff", "--cached", "--no-ext-diff", "--no-textconv"]
         assert "--" not in command
-        assert "execution_mode: host_fallback" in result
+        assert "execution_mode: host" in result
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +491,6 @@ class TestCommit:
         assert "--no-verify" not in command
         assert "execution_mode: containerized" in result
         assert "failure_reason: none" in result
-        assert "fallback_used: false" in result
 
     def test_containerized_commit_without_file_path_rejected(self, tmp_path, fake_manager):
         (tmp_path / ".git").mkdir()
@@ -711,7 +709,7 @@ class TestExecutionModeTrailer:
     def test_host_fallback_trailer(self, tmp_path, fake_sandbox, op, params):
         tool = _host_tool(tmp_path, operation=op, **params)
         result = getattr(tool, f"_git_{op}")(tmp_path)
-        assert "execution_mode: host_fallback" in result
+        assert "execution_mode: host" in result
 
     @pytest.mark.parametrize(
         "op,params",
@@ -723,7 +721,7 @@ class TestExecutionModeTrailer:
     def test_host_fallback_read_trailer(self, tmp_path, fake_sandbox, op, params):
         tool = _read_host_tool(tmp_path, operation=op, **params)
         result = getattr(tool, f"_git_{op}")(tmp_path)
-        assert "execution_mode: host_fallback" in result
+        assert "execution_mode: host" in result
 
     @pytest.mark.parametrize(
         "op,params",
@@ -804,9 +802,8 @@ class TestLegacyOperationsTrailer:
         result = getattr(tool, f"_git_{op}")(tmp_path)
 
         assert result.startswith("ok")
-        assert "execution_mode: host_fallback" in result
+        assert "execution_mode: host" in result
         assert "failure_reason: none" in result
-        assert "fallback_used: false" in result
 
 
 # ---------------------------------------------------------------------------
@@ -836,8 +833,8 @@ class TestHostFallbackWorkspaceGate:
         result = tool._git_status(tmp_path)
 
         assert result.startswith("ok")
-        assert "execution_mode: host_fallback" in result
-        assert tool._last_execution_mode == "host_fallback"
+        assert "execution_mode: host" in result
+        assert tool._last_execution_mode == "host"
         assert _FakeSandbox.instances  # host-side git actually ran
 
     def test_denied_when_workspace_config_disallows(

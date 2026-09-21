@@ -42,12 +42,11 @@ class GitWriteTool(GitReadTool):
     --no-verify, -c/--config/core.hooksPath, credential/filter/textconv
     configuration and hooks are never taken from agent input (the execution
     backends inject their own hardening flags). Execution mode and failure
-    diagnostics are reported per call for EVERY operation via three trailing
-    lines: ``execution_mode: <mode>`` (containerized | host_fallback |
-    unavailable), ``failure_reason: <reason>`` (why a containerized resource
-    could not be used, or ``none``) and ``fallback_used: <bool>`` (True when
-    the call degraded to a host-side operation). Argument-validation errors
-    keep their historical byte-exact form (no trailer).
+    diagnostics are reported per call for EVERY operation via two trailing
+    lines: ``execution_mode: <mode>`` (containerized | host | unavailable)
+    and ``failure_reason: <reason>`` (why a containerized resource could not
+    be used, or ``none``). Argument-validation errors keep their historical
+    byte-exact form (no trailer).
     """
 
     # Stable tool identifier: used in LLM schemas, preset lists and the
@@ -147,7 +146,6 @@ class GitWriteTool(GitReadTool):
         self._resolved_workspace_id = None
         self._last_execution_mode = None
         self._last_failure_reason = None
-        self._last_fallback_used = False
 
         # git permission gate (fail closed): every write requires a
         # write-capable session git permission (effective or session_permissions).
@@ -296,10 +294,11 @@ class GitWriteTool(GitReadTool):
         when ALL of the following hold:
         1. The session git permission is write-capable (``_git_write_allowed()``).
         2. Container git execution is active (``_use_container_mode()``).
-        3. Container execution is mandatory for the branch check too: no
-           host fallback may resolve the branch, because the host backend
-           injects ``--no-verify`` / ``core.hooksPath=/dev/null`` and would
-           bypass the QA gate.
+        3. The branch check runs through the normal execution-mode dispatch
+           (no silent host fallback exists any more): a container-mode call
+           whose git resource is unavailable/degraded raises, so the hardened
+           host backend (which injects ``--no-verify`` /
+           ``core.hooksPath=/dev/null``) can never silently bypass the gate.
         4. The current branch is NOT a protected branch (``dev``, ``master``,
            ``main``); every other branch (feat/*, fix/*, refactor/*, chore/*,
            docs/*, ...) is allowed.
@@ -314,7 +313,6 @@ class GitWriteTool(GitReadTool):
             output = self._run_git(
                 repo_root,
                 ["rev-parse", "--abbrev-ref", "HEAD"],
-                allow_host_fallback=False,
             )
         except (RuntimeError, PermissionError):
             # Container-mandatory branch resolution failed (container
@@ -530,15 +528,8 @@ class GitWriteTool(GitReadTool):
             return False
         return len(output) <= 255
 
-    def _git_add(
-        self, repo_root: Path, allow_host_fallback: bool = True
-    ) -> str:
-        """Run git add. Accepts single file path (str) or multiple (list).
-
-        ``allow_host_fallback`` is forwarded to ``_run_git``; the commit
-        flow passes False so staging cannot degrade to the host backend
-        when a policy-allowed worktree commit mandates container execution.
-        """
+    def _git_add(self, repo_root: Path) -> str:
+        """Run git add. Accepts single file path (str) or multiple (list)."""
         args = ["add"]
         if self.file_path:
             # Same validation choke point as every other path consumer
@@ -555,7 +546,7 @@ class GitWriteTool(GitReadTool):
             # The full-worktree sweep (git add -A) is removed: every caller
             # must name the paths to stage explicitly.
             return "Error: file_path is required for stage operation (at least one path)"
-        output = self._run_git(repo_root, args, allow_host_fallback=allow_host_fallback)
+        output = self._run_git(repo_root, args)
         return self._truncate_output(output)
 
     def _git_commit(self, repo_root: Path) -> str:
@@ -569,10 +560,9 @@ class GitWriteTool(GitReadTool):
         explicitly (never ``-A``) before committing: ``git commit -- <paths>``
         only commits files git already knows, so untracked files (e.g. the
         first commit of a fresh repo) would otherwise fail with "pathspec ...
-        did not match any file(s) known to git". In the policy-allowed
-        worktree path the staging is container-mandatory
-        (allow_host_fallback=False); otherwise it uses the default fallback
-        policy.
+        did not match any file(s) known to git". Staging and commit both run
+        through the normal execution-mode dispatch; no silent host fallback
+        exists, so a container-mode resource outage fails loudly.
 
         Commit hook policy lives in the execution backends: container mode
         runs the workspace-local .githooks dir (core.hooksPath override);
@@ -613,8 +603,8 @@ class GitWriteTool(GitReadTool):
         # on feat/* or fix/* branches with the explicit config flag and
         # mandatory container execution (see
         # _unprotected_branch_agent_commit_allowed). When the exception applies,
-        # container execution stays mandatory for the add/commit subprocesses
-        # themselves (allow_host_fallback=False).
+        # the add/commit subprocesses themselves run with no silent host
+        # fallback (a container outage fails loudly).
         worktree_commit_allowed = False
         if self._is_operator_managed_worktree(repo_root):
             if not self._unprotected_branch_agent_commit_allowed(repo_root):
@@ -637,18 +627,11 @@ class GitWriteTool(GitReadTool):
 
         if worktree_commit_allowed:
             # Policy-allowed agent commit: stage ONLY the named paths
-            # (never ``-A``; _git_add uses self.file_path) and commit,
-            # with mandatory container execution for both subprocesses.
-            add_output = self._git_add(
-                repo_root, allow_host_fallback=False
-            )
+            # (never ``-A``; _git_add uses self.file_path) and commit.
+            add_output = self._git_add(repo_root)
             if self._is_git_error_output(add_output):
                 return self._truncate_output(add_output)
-            output = self._run_git(
-                repo_root,
-                ["commit", "-m", self.message],
-                allow_host_fallback=False,
-            )
+            output = self._run_git(repo_root, ["commit", "-m", self.message])
             return self._with_mode(self._truncate_output(output))
 
         try:
@@ -664,9 +647,7 @@ class GitWriteTool(GitReadTool):
         if self._is_git_error_output(add_output):
             return self._truncate_output(add_output)
         args = ["commit", "-m", self.message, "--"] + rels
-        output = self._run_git(
-            repo_root, args, allow_host_fallback=not worktree_commit_allowed
-        )
+        output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
 
     def _git_init(self, repo_root: Path) -> str:

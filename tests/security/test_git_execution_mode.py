@@ -1,7 +1,7 @@
 """Tests for git execution-mode resolution and the hook-path policy.
 
 Covers:
-1. ``resolve_git_execution_mode`` — containerized / host_fallback / unavailable,
+1. ``resolve_git_execution_mode`` — containerized / host / unavailable,
    mirroring GitInfoTool's execution-mode decision, which is driven by the
    resource catalog's ``execution_mode`` field for the ``git`` resource.
 2. ``validate_path`` allows workspace-local ``.githooks`` scripts while still
@@ -41,7 +41,7 @@ class TestResolveGitExecutionMode:
             "tools.git_info_tool.catalog_entry",
             lambda name: {"execution_mode": "host"} if name == "git" else {},
         )
-        assert resolve_git_execution_mode({}, {}, "/ws", "ws-1") == "host_fallback"
+        assert resolve_git_execution_mode({}, {}, "/ws", "ws-1") == "host"
 
     def test_legacy_agent_config_keys_ignored(self):
         for legacy_value in ("host", "container"):
@@ -61,7 +61,7 @@ class TestResolveGitExecutionMode:
         )
 
     def test_missing_workspace_id_falls_back_to_host(self):
-        assert resolve_git_execution_mode({}, {}, "/ws", None) == "host_fallback"
+        assert resolve_git_execution_mode({}, {}, "/ws", None) == "host"
 
     def test_missing_path_unavailable(self):
         assert resolve_git_execution_mode({}, {}, None, "ws-1") == "unavailable"
@@ -275,7 +275,15 @@ class TestSelfHealingModeRouting:
         ]
         assert "--no-verify" not in command
 
-    def test_host_fallback_commit_uses_hardened_host_path(self, tmp_path, monkeypatch):
+    def test_host_fallback_commit_does_not_silently_run_on_host(
+        self, tmp_path, monkeypatch
+    ):
+        """A degraded (host_fallback) resource must FAIL LOUD, never host-run.
+
+        Silent host fallback is removed: when ``ensure_resource`` reports the
+        git resource degraded to host mode, ``_run_git_raw`` raises instead of
+        silently executing on the hardened host path.
+        """
         self._allow_host_resources(tmp_path, monkeypatch)
         _FakeSandbox = self._host_sandbox(monkeypatch)
         manager = _FakeEnsureManager(
@@ -290,16 +298,14 @@ class TestSelfHealingModeRouting:
         tool = self._container_tool(tmp_path)
         object.__setattr__(tool, "_resource_manager", manager)
 
-        tool._run_git_raw(tmp_path, ["commit", "-m", "x"])
+        with pytest.raises(
+            RuntimeError, match="containerized git execution unavailable"
+        ):
+            tool._run_git_raw(tmp_path, ["commit", "-m", "x"])
 
-        # Degradation must NOT reach the container exec path.
+        # Neither the container exec path nor the hardened host path may run.
         assert not [c for c in manager.calls if c[0] == "exec"]
-        assert len(_FakeSandbox.instances) == 1
-        command, _kwargs = _FakeSandbox.instances[0].calls[0]
-        assert command[0] == "git"
-        assert command.index("core.hooksPath=/dev/null") < command.index("commit")
-        assert "--no-verify" in command
-        assert "core.hooksPath=.githooks" not in command
+        assert not _FakeSandbox.instances
 
     def test_unavailable_policy_denial_raises_clear_error(self, tmp_path):
         manager = _FakeEnsureManager(
@@ -320,7 +326,10 @@ class TestSelfHealingModeRouting:
         assert "container resources disabled/denied" in str(excinfo.value)
         assert not [c for c in manager.calls if c[0] == "exec"]
 
-    def test_host_fallback_status_runs_without_no_verify(self, tmp_path, monkeypatch):
+    def test_host_fallback_status_does_not_silently_run_on_host(
+        self, tmp_path, monkeypatch
+    ):
+        """A degraded resource fails loud for read ops too (no silent host run)."""
         self._allow_host_resources(tmp_path, monkeypatch)
         _FakeSandbox = self._host_sandbox(monkeypatch)
         manager = _FakeEnsureManager(
@@ -335,13 +344,13 @@ class TestSelfHealingModeRouting:
         tool = self._container_tool(tmp_path, operation="status")
         object.__setattr__(tool, "_resource_manager", manager)
 
-        tool._run_git_raw(tmp_path, ["status"])
+        with pytest.raises(
+            RuntimeError, match="containerized git execution unavailable"
+        ):
+            tool._run_git_raw(tmp_path, ["status"])
 
         assert not [c for c in manager.calls if c[0] == "exec"]
-        assert len(_FakeSandbox.instances) == 1
-        command, _kwargs = _FakeSandbox.instances[0].calls[0]
-        assert "--no-verify" not in command
-        assert command.index("core.hooksPath=/dev/null") < command.index("status")
+        assert not _FakeSandbox.instances
 
     def test_manager_ctor_receives_session_permissions(self, tmp_path, monkeypatch):
         captured = {}
@@ -385,9 +394,9 @@ class TestSelfHealingModeRouting:
 
 
     def test_host_fallback_failure_reason_plumbing(self, tmp_path, monkeypatch):
-        """failure_reason/fallback_used from ensure_resource reach the trailer."""
+        """A degraded resource's failure_reason surfaces in the raised error."""
         self._allow_host_resources(tmp_path, monkeypatch)
-        _FakeSandbox = self._host_sandbox(monkeypatch)
+        self._host_sandbox(monkeypatch)
         manager = _FakeEnsureManager(
             {
                 "mode": "host_fallback",
@@ -396,23 +405,21 @@ class TestSelfHealingModeRouting:
                 "image": None,
                 "detail": self.HOST_FALLBACK_DETAIL,
                 "failure_reason": "build_failed",
-                "fallback_used": True,
             }
         )
         tool = self._container_tool(tmp_path)
         object.__setattr__(tool, "_resource_manager", manager)
 
-        tool._run_git_raw(tmp_path, ["status"])
+        with pytest.raises(RuntimeError) as excinfo:
+            tool._run_git_raw(tmp_path, ["status"])
 
+        assert "containerized git execution unavailable" in str(excinfo.value)
+        assert "(failure_reason: build_failed)" in str(excinfo.value)
         assert tool._last_failure_reason == "build_failed"
-        assert tool._last_fallback_used is True
-        trailer = tool._with_mode("out")
-        assert "execution_mode: host_fallback" in trailer
-        assert "failure_reason: build_failed" in trailer
-        assert "fallback_used: true" in trailer
+        assert tool._last_execution_mode == "unavailable"
 
     def test_containerized_no_failure_keys_defaults(self, tmp_path):
-        """Missing failure_reason/fallback_used keys default to None/False."""
+        """A containerized resource with no failure_reason defaults to None."""
         manager = _FakeEnsureManager(
             {
                 "mode": "containerized",
@@ -428,7 +435,6 @@ class TestSelfHealingModeRouting:
         tool._run_git_raw(tmp_path, ["status"])
 
         assert tool._last_failure_reason is None
-        assert tool._last_fallback_used is False
 
     def test_unavailable_with_failure_reason_suffix(self, tmp_path):
         """unavailable with a failure_reason includes it in the raise message."""

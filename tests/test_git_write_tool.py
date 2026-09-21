@@ -11,9 +11,9 @@ are allowed only when all of the following hold:
    ``chore/*``, ``docs/*``, ``release/*``, others) are allowed, and a bare
    ``feat/`` prefix (including whitespace-only suffixes) is also allowed;
 3. the tool is in containerized execution mode (``_use_container_mode()``);
-4. the branch check plus the add/commit steps run with
-   ``allow_host_fallback=False`` (host fallback is never permitted for
-   worktree agent commits);
+4. host execution is never permitted for worktree agent commits: the
+   container-mandatory branch check and the add/commit steps hard-fail
+   rather than degrade to the host;
 5. explicit ``file_path``(s) are provided -- ``git add -A`` is never issued.
 
 These tests exercise ``GitWriteTool._git_commit`` directly (bypassing the
@@ -70,10 +70,10 @@ class _RecordingExec:
 
 
 def _branch_fake(recorder, branch):
-    """Fake _run_git that records (args, allow_host_fallback) tuples."""
+    """Fake _run_git that records each call's argv."""
 
-    def fake_run_git(repo_root, args, timeout=30, allow_host_fallback=True):
-        recorder.append((list(args), allow_host_fallback))
+    def fake_run_git(repo_root, args, timeout=30):
+        recorder.append(list(args))
         if args[:2] == ["rev-parse", "--abbrev-ref"]:
             return branch + "\n"
         return "ok\n"
@@ -121,7 +121,7 @@ def test_worktree_commit_blocked_on_main_with_flag():
 
     assert OPERATOR_ERROR in result
     assert len(calls) == 1
-    assert calls[0] == (["rev-parse", "--abbrev-ref", "HEAD"], False)
+    assert calls[0] == ["rev-parse", "--abbrev-ref", "HEAD"]
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
@@ -199,11 +199,11 @@ def test_feature_branch_commit_allowed_on_non_protected_branch(tmp_path):
     assert "ok\n" in result
     assert OPERATOR_ERROR not in result
     assert calls == [
-        (["rev-parse", "--abbrev-ref", "HEAD"], False),
-        (["add", "--", "agent_change.py"], False),
-        (["commit", "-m", "agent commit"], False),
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["add", "--", "agent_change.py"],
+        ["commit", "-m", "agent commit"],
     ]
-    assert all("-A" not in c[0] for c in calls)
+    assert all("-A" not in c for c in calls)
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
@@ -288,9 +288,9 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
 
     assert "ok\n" in result
     assert OPERATOR_ERROR not in result
-    assert [c[0][0] for c in calls] == ["rev-parse", "add", "commit"]
-    assert calls[2][0] == ["commit", "-m", "Merge branch 'main' into feat/x"]
-    assert all("--no-verify" not in c[0] for c in calls)
+    assert [c[0] for c in calls] == ["rev-parse", "add", "commit"]
+    assert calls[2] == ["commit", "-m", "Merge branch 'main' into feat/x"]
+    assert all("--no-verify" not in c for c in calls)
     assert exec_host.calls == []
 
     # Same intent but on a protected branch -> denied.
@@ -311,7 +311,6 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
 
     assert OPERATOR_ERROR in result2
     assert len(calls2) == 1
-    assert calls2[0][1] is False
     _assert_no_commit_subprocess(exec_container2, exec_host2)
 
 
@@ -323,8 +322,7 @@ def test_unprotected_branch_allows_bare_feature_prefix():
     tool._run_git = _branch_fake(calls, "feat/")  # noqa: SLF001
 
     assert tool._unprotected_branch_agent_commit_allowed("/tmp/repo") is True
-    assert [c[0] for c in calls] == [["rev-parse", "--abbrev-ref", "HEAD"]]
-    assert calls[0][1] is False
+    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
 
 
 def test_unprotected_branch_allows_whitespace_only_suffix():
@@ -335,8 +333,7 @@ def test_unprotected_branch_allows_whitespace_only_suffix():
     tool._run_git = _branch_fake(calls, "feat/   ")  # noqa: SLF001
 
     assert tool._unprotected_branch_agent_commit_allowed("/tmp/repo") is True
-    assert [c[0] for c in calls] == [["rev-parse", "--abbrev-ref", "HEAD"]]
-    assert calls[0][1] is False
+    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
 
 
 def test_commit_requires_file_path():
@@ -354,7 +351,7 @@ def test_commit_requires_file_path():
     result = tool._git_commit("/tmp/repo")
 
     assert result == "Error: file_path is required for commit operation (at least one path)"
-    assert calls == [(["rev-parse", "--abbrev-ref", "HEAD"], False)]
+    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
@@ -380,11 +377,11 @@ def test_feature_branch_commit_stages_only_named_path(tmp_path):
     assert "ok\n" in result
     assert OPERATOR_ERROR not in result
     assert calls == [
-        (["rev-parse", "--abbrev-ref", "HEAD"], False),
-        (["add", "--", "agent_change.py"], False),
-        (["commit", "-m", "agent commit"], False),
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["add", "--", "agent_change.py"],
+        ["commit", "-m", "agent commit"],
     ]
-    assert all("-A" not in c[0] for c in calls)
+    assert all("-A" not in c for c in calls)
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
@@ -412,7 +409,7 @@ class _TimeoutOnBranchProbe:
         self.timeout_exc = timeout_exc
         self.calls = []
 
-    def __call__(self, repo_root, args, timeout=30, allow_host_fallback=True):
+    def __call__(self, repo_root, args, timeout=30):
         self.calls.append(list(args))
         if list(args)[:2] == ["rev-parse", "--abbrev-ref"]:
             raise self.timeout_exc

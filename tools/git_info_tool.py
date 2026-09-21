@@ -1,5 +1,4 @@
 # tools/git_info_tool.py
-import json
 from typing import Any, ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import logging
@@ -56,7 +55,7 @@ def resolve_git_execution_mode(
 
     Returns:
         "containerized": git runs inside the workspace resource container.
-        "host_fallback": git runs on the host inside the hermetic sandbox.
+        "host": git runs on the host inside the hermetic sandbox.
         "unavailable": no resolvable workspace to run against.
     """
     _migrate_legacy_git_execution_mode(agent_config)
@@ -68,7 +67,7 @@ def resolve_git_execution_mode(
     if not resolved_workspace_path:
         return "unavailable"
     if effective_mode == "host" or not resolved_workspace_id:
-        return "host_fallback"
+        return "host"
     return "containerized"
 
 
@@ -148,12 +147,11 @@ class GitReadTool(ToolBase):
     --no-verify, -c/--config/core.hooksPath, credential/filter/textconv
     configuration and hooks are never taken from agent input (the execution
     backends inject their own hardening flags). Execution mode and failure
-    diagnostics are reported per call for EVERY operation via three trailing
-    lines: ``execution_mode: <mode>`` (containerized | host_fallback |
-    unavailable), ``failure_reason: <reason>`` (why a containerized resource
-    could not be used, or ``none``) and ``fallback_used: <bool>`` (True when
-    the call degraded to a host-side operation). Argument-validation errors
-    keep their historical byte-exact form (no trailer).
+    diagnostics are reported per call for EVERY operation via two trailing
+    lines: ``execution_mode: <mode>`` (containerized | host | unavailable)
+    and ``failure_reason: <reason>`` (why a containerized resource could not
+    be used, or ``none``). Argument-validation errors keep their historical
+    byte-exact form (no trailer).
     """
 
     # Stable tool identifier: used in LLM schemas, preset lists and the
@@ -178,7 +176,6 @@ class GitReadTool(ToolBase):
     _last_mode: Optional[str] = None
     _last_execution_mode: Optional[str] = None
     _last_failure_reason: Optional[str] = None
-    _last_fallback_used: bool = False
 
     def _host_execution_denied_reason(self) -> Optional[str]:
         """Return a deny reason when the workspace ceiling blocks host git.
@@ -229,86 +226,6 @@ class GitReadTool(ToolBase):
         "off" -> host execution is denied (fail-closed) for this workspace.
         """
         return "off" if self._host_execution_denied_reason() else "on"
-
-    def _host_fallback_event_path(self) -> Optional[Path]:
-        """Vault JSONL path for this workspace's host-fallback event log.
-
-        Mirrors the ``thoughtmachine.container_record.storage`` vault layout
-        (``<vault>/workspaces/<ws>/...``) and is keyed by workspace id; returns
-        ``None`` when no workspace id is resolvable (nothing to key on).
-        """
-        ws_id = self._resolved_workspace_id or getattr(self, "workspace_id", None)
-        if not ws_id:
-            return None
-        try:
-            from thoughtmachine.vault import vault_root
-
-            return (
-                Path(vault_root())
-                / "workspaces"
-                / ws_id
-                / "resources"
-                / "git.host_execution.jsonl"
-            )
-        except Exception:
-            return None
-
-    def _record_host_fallback_event(self, detail: Optional[str] = None) -> None:
-        """Append one host-fallback event to the workspace vault JSONL log.
-
-        Append-only, one JSON object per line, mirroring
-        ``container_record.storage._append_line`` (``O_APPEND``, mode ``0o600``,
-        ``fsync``, parents created on demand).  Best-effort: this observability
-        side-channel can NEVER raise -- any failure (no vault, unwritable path,
-        serialization error) is swallowed AND logged at WARNING so a working git
-        call is never turned into an error by logging, while a lost event is
-        never silent.
-        """
-        path = None
-        ws_id = self._resolved_workspace_id or getattr(self, "workspace_id", None)
-        try:
-            path = self._host_fallback_event_path()
-            if path is None:
-                return
-            import os
-            from datetime import datetime, timezone
-
-            entry = {
-                "timestamp": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "event_type": "host_execution",
-                "actor": "git_read",
-                "payload": {
-                    "fallback": True,
-                    "reason": "container_unavailable",
-                    "workspace_id": ws_id,
-                    "operation": self.operation,
-                    "kill_switch_state": self._kill_switch_state(),
-                    "detail": detail,
-                },
-            }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
-            try:
-                os.write(fd, (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        except Exception as exc:  # R3: swallow, but never silent
-            try:
-                logger.warning(
-                    "GitReadTool host_execution event write failed: "
-                    "reason=event_write_failed path=%s workspace_id=%s "
-                    "operation=%s exc_class=%s",
-                    path if path is not None else "<unresolved>",
-                    ws_id if ws_id else "<unresolved>",
-                    getattr(self, "operation", None),
-                    type(exc).__name__,
-                )
-            except Exception:
-                pass
-            return
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
@@ -464,7 +381,6 @@ class GitReadTool(ToolBase):
         self._resolved_workspace_id = None
         self._last_execution_mode = None
         self._last_failure_reason = None
-        self._last_fallback_used = False
 
         try:
             # Determine working directory
@@ -590,16 +506,15 @@ class GitReadTool(ToolBase):
         repo_root: Path,
         args: List[str],
         timeout: int = 30,
-        allow_host_fallback: bool = True,
     ) -> str:
         """Run git command and return output.
 
-        ``allow_host_fallback=False`` makes container execution mandatory: if
-        container mode is required but unavailable (no container, degraded
-        host_fallback, policy denial), ``_run_git_raw`` raises RuntimeError
-        instead of degrading to the host backend. The host backend injects
-        ``--no-verify`` and ``core.hooksPath=/dev/null``, which would bypass
-        the QA gate -- forbidden for policy-allowed agent commits.
+        ``_run_git_raw`` selects the backend: the workspace resource container
+        when container mode is active and the git resource is available,
+        otherwise the hardened host backend (config/catalog host mode). There
+        is NO silent fallback: an unavailable OR degraded container resource
+        raises RuntimeError, so the host backend (which injects ``--no-verify``
+        / ``core.hooksPath=/dev/null``) can never silently bypass the QA gate.
         """
         # Defense-in-depth: never run git with a cwd outside the workspace.
         # Raises ValueError (handled by execute()'s caller) if repo_root
@@ -612,7 +527,6 @@ class GitReadTool(ToolBase):
                 repo_root,
                 args,
                 timeout=timeout,
-                allow_host_fallback=allow_host_fallback,
             )
             if exit_code != 0:
                 return f"Git command failed (exit code {exit_code}):\n{stderr}"
@@ -645,7 +559,6 @@ class GitReadTool(ToolBase):
         repo_root: Path,
         args: List[str],
         timeout: int = 30,
-        allow_host_fallback: bool = True,
     ) -> tuple:
         """Execute git in the active execution mode.
 
@@ -655,38 +568,33 @@ class GitReadTool(ToolBase):
         that lives in ``_run_git`` so internal callers (e.g.
         ``_git_repo_root``) do not re-validate.
 
-        The container path is self-healing: ``_resolve_resource_execution()``
+        Host mode (``_use_container_mode()`` is False) is a first-class,
+        config/catalog-selected mode: ``_run_git_raw`` runs the hardened host
+        backend directly, gated by the host-resource kill switch
+        (``_host_execution_denied_reason``).
+
+        Container mode is self-healing: ``_resolve_resource_execution()``
         consults ``ensure_resource("git")`` at execution time and honors the
-        ACTUAL resource mode. A docker/image outage degrades to the hardened
-        host path (host_fallback, logged); a policy denial or unknown
-        resource surfaces as a clear RuntimeError (unavailable) instead of a
-        generic failure.
+        ACTUAL resource mode. There is NO silent fallback: an unavailable
+        resource OR a resource that degraded (docker/image outage) raises a
+        LOUD RuntimeError naming the resource and the reason, so a broken
+        container can never silently bypass the container QA gate / hooks.
         """
         if not self._use_container_mode():
-            if not allow_host_fallback:
-                raise RuntimeError(
-                    "GitReadTool: containerized git execution is mandatory "
-                    "for this operation but container mode is not active "
-                    "(host backend would bypass the commit QA gate)"
-                )
+            # Host mode: config/catalog selects host execution. Fail closed on
+            # the workspace host-resource kill switch.
             denied = self._host_execution_denied_reason()
             if denied:
                 self._last_execution_mode = "unavailable"
                 self._last_failure_reason = denied
                 raise RuntimeError(denied)
-            self._last_execution_mode = "host_fallback"
+            self._last_execution_mode = "host"
             self._last_failure_reason = None
-            self._last_fallback_used = False
-            # Persist the fallback event (observability; never raises).
-            self._record_host_fallback_event()
-            logger.warning(
-                "GitReadTool host fallback: reason=%s command=%s "
-                "workspace_id=%s kill_switch_state=%s (operation=%s)",
-                "container_unavailable",
-                " ".join(args),
-                self._resolved_workspace_id or "none",
-                self._kill_switch_state(),
+            logger.info(
+                "GitReadTool effective git execution mode: host "
+                "(operation=%s, workspace_id=%s)",
                 self.operation,
+                self._resolved_workspace_id or "none",
             )
             return self._exec_host_raw(repo_root, args, timeout=timeout)
 
@@ -694,7 +602,6 @@ class GitReadTool(ToolBase):
         effective = mode.get("mode")
         detail = mode.get("detail", "")
         failure_reason = mode.get("failure_reason")
-        fallback_used = bool(mode.get("fallback_used", False))
         if effective == "containerized" and manager is not None:
             logger.info(
                 "GitReadTool effective git execution mode: containerized "
@@ -704,57 +611,27 @@ class GitReadTool(ToolBase):
             )
             self._last_execution_mode = "containerized"
             self._last_failure_reason = failure_reason
-            self._last_fallback_used = fallback_used
             return self._exec_container_raw(
                 repo_root, args, timeout=timeout, manager=manager
             )
-        if effective == "unavailable":
-            logger.error(
-                "GitReadTool containerized git execution unavailable: %s "
-                "(operation=%s)",
-                detail,
-                self.operation,
-            )
-            self._last_execution_mode = "unavailable"
-            self._last_failure_reason = failure_reason
-            self._last_fallback_used = fallback_used
-            if failure_reason:
-                raise RuntimeError(
-                    f"GitReadTool: containerized git execution unavailable: "
-                    f"{detail} (failure_reason: {failure_reason})"
-                )
-            raise RuntimeError(
-                f"GitReadTool: containerized git execution unavailable: {detail}"
-            )
-        # host_fallback: graceful degradation to the hardened host path --
-        # unless container execution is mandatory for this call.
-        if not allow_host_fallback:
-            raise RuntimeError(
-                "GitReadTool: containerized git execution is mandatory for "
-                f"this operation but execution degraded to host: {detail}"
-            )
-        denied = self._host_execution_denied_reason()
-        if denied:
-            self._last_execution_mode = "unavailable"
-            self._last_failure_reason = denied
-            raise RuntimeError(denied)
-        logger.warning(
-            "GitReadTool degraded containerized git execution to hardened "
-            "host git: reason=%s command=%s workspace_id=%s "
-            "kill_switch_state=%s detail=%s (operation=%s)",
-            "container_unavailable",
-            " ".join(args),
-            self._resolved_workspace_id or "none",
-            self._kill_switch_state(),
+        # "unavailable" OR degraded ("host_fallback"): FAIL LOUD. There is no
+        # host fallback any more -- a container-mode call whose resource is
+        # missing or degraded must not degrade to the host backend.
+        logger.error(
+            "GitReadTool git resource unavailable: %s (operation=%s)",
             detail,
             self.operation,
         )
-        self._last_execution_mode = "host_fallback"
+        self._last_execution_mode = "unavailable"
         self._last_failure_reason = failure_reason
-        self._last_fallback_used = fallback_used
-        # Persist the fallback event with the resolver's degradation detail.
-        self._record_host_fallback_event(detail=detail)
-        return self._exec_host_raw(repo_root, args, timeout=timeout)
+        if failure_reason:
+            raise RuntimeError(
+                f"GitReadTool: containerized git execution unavailable: "
+                f"{detail} (failure_reason: {failure_reason})"
+            )
+        raise RuntimeError(
+            f"GitReadTool: containerized git execution unavailable: {detail}"
+        )
 
     def _exec_host_raw(
         self, repo_root: Path, args: List[str], timeout: int = 30
@@ -1003,22 +880,30 @@ class GitReadTool(ToolBase):
         """Resolve the ACTUAL git resource execution mode at runtime.
 
         Returns ``(mode_dict, manager_or_None)``. ``mode_dict`` carries
-        ``mode`` ("containerized" | "host_fallback" | "unavailable") and
-        ``detail`` (human-readable reason). ``manager_or_None`` is the live
-        ``ResourceContainerManager`` when ``mode == "containerized"``, else
-        ``None``.
+        ``mode`` (see the two vocabularies below) and ``detail``
+        (human-readable reason). ``manager_or_None`` is the live
+        ``ResourceContainerManager`` when the resolved mode is
+        ``containerized``, else ``None``.
+
+        Two vocabularies meet here. The config-selected (host) branch returns
+        the tool-side vocabulary used by ``resolve_git_execution_mode``:
+        ``"containerized" | "host" | "unavailable"``. The container-mode
+        branch returns the infra/resource-manager vocabulary passed through
+        UNCHANGED: ``"containerized" | "host_fallback" | "unavailable"`` -- so
+        a docker/image outage surfaces as ``host_fallback`` (NOT ``host``),
+        while a policy denial or unknown resource surfaces as ``unavailable``.
 
         Config-level ``_use_container_mode()`` decides whether the container
         path is *desired*; ``ensure_resource("git")`` then self-heals
         (auto-build image, recreate stale containers) and reports the mode
-        that is actually achievable: a docker/image outage degrades to
-        ``host_fallback``, while a policy denial or unknown resource
-        surfaces as ``unavailable``. Never raises.
+        that is actually achievable. ``_run_git_raw`` treats only
+        ``containerized`` as usable and raises loudly on anything else.
+        Never raises.
         """
         if not self._use_container_mode():
             return (
                 {
-                    "mode": "host_fallback",
+                    "mode": "host",
                     "detail": "config selects host mode or no registry workspace",
                 },
                 None,
@@ -1319,16 +1204,14 @@ class GitReadTool(ToolBase):
     def _with_mode(self, output: str) -> str:
         """Append effective execution mode + failure diagnostics.
 
-        Appends three trailing lines — ``execution_mode`` (containerized |
-        host_fallback | unavailable), ``failure_reason`` (why a
-        containerized resource could not be used, or ``none``) and
-        ``fallback_used`` (True when the call degraded to a host-side
-        operation) — so every operation reports how it actually executed.
+        Appends two trailing lines — ``execution_mode`` (containerized |
+        host | unavailable) and ``failure_reason`` (why a containerized
+        resource could not be used, or ``none``) — so every operation
+        reports how it actually executed.
         """
         return (
             f"{output}\nexecution_mode: {self._last_execution_mode or 'unavailable'}"
             f"\nfailure_reason: {self._last_failure_reason or 'none'}"
-            f"\nfallback_used: {str(bool(self._last_fallback_used)).lower()}"
         )
 
     def _git_diff_cached(self, repo_root: Path) -> str:

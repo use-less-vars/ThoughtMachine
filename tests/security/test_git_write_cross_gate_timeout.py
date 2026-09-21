@@ -31,7 +31,7 @@ class _BranchProbe:
         self.exc = exc
         self.calls = []
 
-    def __call__(self, repo_root, args, timeout=30, allow_host_fallback=True):
+    def __call__(self, repo_root, args, timeout=30):
         self.calls.append(list(args))
         if list(args)[:2] == ["rev-parse", "--abbrev-ref"]:
             raise self.exc
