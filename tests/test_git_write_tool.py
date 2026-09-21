@@ -21,6 +21,7 @@ These tests exercise ``GitWriteTool._git_commit`` directly (bypassing the
 """
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -1314,4 +1315,38 @@ def test_exec_host_raw_commit_without_hooks_not_short_circuited(tmp_path, monkey
     result = tool._exec_host_raw(tmp_path, ["commit", "-m", "m", "--", "f"])
     assert result[0] == 0
     assert result[1] == "HOSTOUT"
+
+
+
+def test_run_git_surfaces_commit_stderr(monkeypatch):
+    """§E3-A: commit stderr (hook output) must reach the returned text; other
+    ops and the failure branch must be unchanged."""
+    tool = _write_tool()
+    tool._resolved_workspace_path = "/workspace"
+
+    # (a) successful commit with hook output on stderr -> append it
+    monkeypatch.setattr(
+        tool,
+        "_run_git_raw",
+        lambda *a, **k: (
+            0,
+            "[main abc1234] msg\n 1 file changed\n",
+            "[pre-commit] 1/4 import gate\n",
+        ),
+    )
+    out = tool._run_git(Path("/workspace"), ["commit", "-m", "msg", "--", "f.txt"])
+    assert "[pre-commit] 1/4 import gate" in out  # banner surfaced
+    assert "[main abc1234] msg" in out  # stdout preserved
+    assert out.index("[main abc1234] msg") < out.index("[pre-commit] 1/4")  # stdout first
+
+    # (b) successful non-commit op with stderr -> stderr must NOT be appended
+    monkeypatch.setattr(tool, "_run_git_raw", lambda *a, **k: (0, "clean\n", "some-noise\n"))
+    out2 = tool._run_git(Path("/workspace"), ["status", "--porcelain"])
+    assert out2 == "clean\n" and "some-noise" not in out2
+
+    # (c) failure branch unchanged (stderr surfaced via the failure message)
+    monkeypatch.setattr(tool, "_run_git_raw", lambda *a, **k: (1, "", "boom"))
+    out3 = tool._run_git(Path("/workspace"), ["commit", "-m", "msg"])
+    assert out3.startswith("Git command failed (exit code 1)")
+    assert "boom" in out3
 
