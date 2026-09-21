@@ -13,7 +13,7 @@
 
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import WorkerManagementPanel from '../WorkerManagementPanel'
 
@@ -140,5 +140,103 @@ describe('WorkerManagementPanel — deliverable 1 tray', () => {
     renderPanel({ runtime_status: 'paused' })
     await waitForRow()
     expect(screen.getByText('Paused')).toBeInTheDocument()
+  })
+})
+
+// ── Stop All Workers button ───────────────────────────────────────────────
+// Promotes the backend POST /api/workspace/{ws_id}/workers/stop_all route
+// into a single destructive "Stop All Workers" action guarded by a
+// confirmation dialog.
+function renderWithFetch(stopAllResponse) {
+  const calls = []
+  workersPayload = [makeWorker()]
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url, opts = {}) => {
+      const u = String(url)
+      calls.push({ url: u, method: (opts.method || 'GET').toUpperCase() })
+      if (u.includes('/workers/stop_all')) {
+        return stopAllResponse
+      }
+      if (u.includes('/workers')) {
+        return { ok: true, status: 200, json: async () => workersPayload }
+      }
+      return { ok: true, status: 200, json: async () => [] }
+    })
+  )
+  render(
+    <WorkerManagementPanel
+      workspaceId="ws-1"
+      sessionId="sess-1"
+      onSelectWorker={vi.fn()}
+      selectedWorker={null}
+      isActive
+    />
+  )
+  return calls
+}
+
+describe('WorkerManagementPanel — Stop All Workers', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('renders a single "Stop All Workers" button', async () => {
+    renderWithFetch({ ok: true, status: 200, json: async () => [] })
+    await waitForRow()
+    expect(
+      screen.getByRole('button', { name: 'Stop All Workers' })
+    ).toBeInTheDocument()
+  })
+
+  it('shows a confirmation dialog and sends no request until confirmed', async () => {
+    const calls = renderWithFetch({ ok: true, status: 200, json: async () => [] })
+    await waitForRow()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop All Workers' }))
+
+    expect(
+      screen.getByRole('heading', { name: 'Stop All Workers' })
+    ).toBeInTheDocument()
+    expect(calls.filter((c) => c.url.includes('/workers/stop_all'))).toHaveLength(0)
+  })
+
+  it('POSTs exactly once to the stop_all endpoint after confirming', async () => {
+    const calls = renderWithFetch({ ok: true, status: 200, json: async () => [] })
+    await waitForRow()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop All Workers' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Stop All' }))
+
+    await waitFor(() => {
+      expect(calls.filter((c) => c.url.includes('/workers/stop_all'))).toHaveLength(1)
+    })
+    const call = calls.find((c) => c.url.includes('/workers/stop_all'))
+    expect(call.url).toBe('/api/workspace/ws-1/workers/stop_all')
+    expect(call.method).toBe('POST')
+    expect(calls.filter((c) => c.url.includes('/workers/stop_all'))).toHaveLength(1)
+  })
+
+  it('surfaces a failed stop_all response via an alert role', async () => {
+    renderWithFetch({
+      ok: false,
+      status: 500,
+      json: async () => ({ detail: { error: 'stop_all exploded' } }),
+    })
+    await waitForRow()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop All Workers' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Stop All' }))
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent('stop_all exploded')
+    )
   })
 })
