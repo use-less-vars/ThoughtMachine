@@ -1001,3 +1001,114 @@ class TestGitRepoRootAvailability:
             src = (repo_root / rel).read_text(encoding="utf-8")
             assert "not available or not a git repository" not in src, rel
 
+
+
+# ---------------------------------------------------------------------------
+# A2: the workspace's OWN container mount as ``working_dir`` is accepted
+# ---------------------------------------------------------------------------
+class TestContainerWorkingDirAccepted:
+    """``working_dir`` naming the workspace's own container mount (``/workspace``
+    and below) is normalised to the canonical host workspace root, so the
+    container path an agent actually speaks is no longer rejected as "outside
+    workspace".  Genuine escapes keep the byte-exact rejection.
+
+    Container mode is OFF in this module: no ``session_id``/registry is bound,
+    so ``_resolve_registry_workspace_info()`` returns ``(None, None)`` and
+    ``_use_container_mode()`` is False.  The mapping is nonetheless observable
+    because ``_normalise_working_dir`` resolves the host root through
+    ``ToolBase._resolve_registry_workspace``'s deprecated ``workspace_path``
+    fallback (the value the module helpers bind).  The assertions therefore pin
+    (a) the mapped return value of ``_normalise_working_dir`` and (b) that
+    ``execute()`` no longer rejects the alias -- not container-mode plumbing.
+    """
+
+    @staticmethod
+    def _shadow_git(tool):
+        calls = []
+        def _raw(repo_root, args, timeout=30):
+            calls.append((str(repo_root), list(args)))
+            return (0, "ok", "")
+        object.__setattr__(tool, "_run_git_raw", _raw)
+        return calls
+
+    @staticmethod
+    def _ws_abs(tmp_path):
+        return str(Path(tmp_path).resolve())
+
+    def test_t1_mount_accepted_by_read_tool(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        tool = _read_tool(tmp_path, operation="status", working_dir="/workspace")
+        calls = self._shadow_git(tool)
+        result = tool.execute()
+        assert "outside workspace" not in result
+        assert calls
+
+    def test_t2_trailing_slash_and_redundant_separators(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "sub" / ".git").mkdir(parents=True)
+        for rawdir, expect in (
+            ("/workspace/", tmp_path),
+            ("/workspace//sub", tmp_path / "sub"),
+        ):
+            tool = _read_tool(tmp_path, operation="status", working_dir=rawdir)
+            assert Path(tool._normalise_working_dir(rawdir)).resolve() == expect.resolve(), rawdir
+            calls = self._shadow_git(tool)
+            result = tool.execute()
+            assert "outside workspace" not in result, rawdir
+            assert calls, rawdir
+
+    @pytest.mark.parametrize(
+        "rawdir", ["/etc", "/tmp", "/workspace/../outside", "/outside/workspace"]
+    )
+    def test_t3_genuine_violations_rejected_byte_exact(self, tmp_path, rawdir):
+        tool = _read_tool(tmp_path, operation="status", working_dir=rawdir)
+        result = tool.execute()
+        expected = (
+            f"Error: Path {rawdir} is outside workspace {self._ws_abs(tmp_path)}"
+        )
+        assert result == expected
+
+    @pytest.mark.parametrize("kind", ["read", "write"])
+    def test_t4_read_and_write_tools_agree_on_accept(self, tmp_path, kind):
+        (tmp_path / ".git").mkdir()
+        if kind == "read":
+            tool = _read_tool(tmp_path, operation="status", working_dir="/workspace")
+        else:
+            tool = _tool(tmp_path, operation="branch_create", branch="feature/x",
+                         working_dir="/workspace")
+        calls = self._shadow_git(tool)
+        result = tool.execute()
+        assert "outside workspace" not in result, kind
+        assert calls, kind
+
+    @pytest.mark.parametrize("kind", ["read", "write"])
+    def test_t4b_read_and_write_tools_agree_on_reject(self, tmp_path, kind):
+        if kind == "read":
+            tool = _read_tool(tmp_path, operation="status", working_dir="/etc")
+        else:
+            tool = _tool(tmp_path, operation="branch_create", branch="feature/x",
+                         working_dir="/etc")
+        result = tool.execute()
+        expected = f"Error: Path /etc is outside workspace {self._ws_abs(tmp_path)}"
+        assert result == expected, kind
+
+    def test_t5_host_path_working_dir_unchanged(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        raw = str(tmp_path)
+        tool = _read_tool(tmp_path, operation="status", working_dir=raw)
+        assert tool._normalise_working_dir(raw) == raw
+        calls = self._shadow_git(tool)
+        result = tool.execute()
+        assert "outside workspace" not in result
+        assert calls
+
+    def test_t6_normalise_working_dir_matrix(self, tmp_path):
+        tool = _read_tool(tmp_path, operation="status")
+        root = Path(self._ws_abs(tmp_path))
+        sub = (tmp_path / "sub").resolve()
+        assert Path(tool._normalise_working_dir("/workspace")).resolve() == root
+        assert Path(tool._normalise_working_dir("/workspace/sub")).resolve() == sub
+        assert tool._normalise_working_dir("/etc") == "/etc"
+        assert tool._normalise_working_dir("/workspaceX") == "/workspaceX"
+        assert tool._normalise_working_dir("/workspace/../outside") == "/workspace/../outside"
+

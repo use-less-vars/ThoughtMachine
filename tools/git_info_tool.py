@@ -401,6 +401,46 @@ class GitReadTool(ToolBase):
             ) from None
         return repo_root
 
+    def _normalise_working_dir(self, working_dir: str) -> str:
+        """Accept the workspace's OWN container mount as a valid working_dir.
+
+        An agent that speaks container paths (``/workspace`` and anything
+        below it) must be able to target the very workspace it is bound to;
+        the ``working_dir`` param is otherwise host-pathed, so ``/workspace``
+        was rejected as "outside workspace". A clean mount path is mapped back
+        to the canonical host workspace root through the existing
+        ``_from_container_path`` helper, so behaviour is identical to passing
+        that host path.
+
+        Anything that is not an unambiguous mount path is returned UNCHANGED
+        so the existing validator still rejects it with its byte-for-byte
+        message: host paths, ``/workspace``-lookalikes (e.g. ``/workspaceX``)
+        and -- critically -- any ``..`` escape such as
+        ``/workspace/../outside``.
+        """
+        raw = str(working_dir).strip()
+        mount = (getattr(self, "container_workspace_path", None) or "/workspace")
+        mount = mount.rstrip("/") or "/workspace"
+        if not raw.startswith("/"):
+            return working_dir
+        # Classify lexically: reject any '..' and any boundary that is not the
+        # mount itself nor a descendant of it (drops redundant separators and
+        # a trailing slash in the process).
+        segs = [s for s in raw.split("/") if s not in ("", ".")]
+        if any(s == ".." for s in segs):
+            return working_dir
+        norm = "/" + "/".join(segs)
+        if norm != mount and not norm.startswith(mount + "/"):
+            return working_dir
+        ws_path = self._resolved_workspace_path or self._resolve_registry_workspace()
+        if not ws_path:
+            return working_dir
+        self._resolved_workspace_path = ws_path
+        try:
+            return str(self._from_container_path(norm))
+        except (ValueError, TypeError):
+            return working_dir
+
     def execute(self) -> str:
         # Reset per-call runtime state (tool instances may be reused).
         self._resource_manager = None
@@ -412,9 +452,14 @@ class GitReadTool(ToolBase):
         try:
             # Determine working directory
             if self.working_dir:
-                # Validate working_dir is within workspace
+                # Validate working_dir is within workspace. The workspace's
+                # own container mount (/workspace and below) is accepted (see
+                # _normalise_working_dir); genuine violations are still
+                # rejected here with their byte-exact message.
                 try:
-                    validated_working_dir = self._validate_path(self.working_dir)
+                    validated_working_dir = self._validate_path(
+                        self._normalise_working_dir(self.working_dir)
+                    )
                 except ValueError as e:
                     return self._truncate_output(f"Error: {e}")
                 repo_root = Path(validated_working_dir).expanduser().resolve()

@@ -194,9 +194,14 @@ class GitWriteTool(GitReadTool):
         try:
             # Determine working directory
             if self.working_dir:
-                # Validate working_dir is within workspace
+                # Validate working_dir is within workspace. The workspace's
+                # own container mount (/workspace and below) is accepted (see
+                # _normalise_working_dir); genuine violations are still
+                # rejected here with their byte-exact message.
                 try:
-                    validated_working_dir = self._validate_path(self.working_dir)
+                    validated_working_dir = self._validate_path(
+                        self._normalise_working_dir(self.working_dir)
+                    )
                 except ValueError as e:
                     return self._truncate_output(f"Error: {e}")
                 repo_root = Path(validated_working_dir).expanduser().resolve()
