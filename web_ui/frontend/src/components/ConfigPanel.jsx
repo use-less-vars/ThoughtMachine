@@ -88,6 +88,7 @@ const DEFAULT_SAVE_TIMEOUT_MS = 5000;
 function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, configQueued = false, applyFailed = null }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error' | 'timeout'
   const [notice, setNotice] = useState(null);  // null | { kind: 'status' | 'alert', text }
+  const [confirmReset, setConfirmReset] = useState(false);
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
   const [allTools, setAllTools] = useState([]);
@@ -516,18 +517,27 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       )}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
         <h3 style={{ margin: 0 }}>Config</h3>
-        <button
-          className="btn btn-accent"
-          style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
-          onClick={() => {
-            // Save-as-Default never carries session_permissions (disk-pure split).
-            const { session_permissions, ...defaultsPayload } = draft;
-            sendCommand('set_default_config', { config: defaultsPayload });
-            setDefaultSaved('pending');
-          }}
-        >
-          {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
-        </button>
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            className="btn btn-accent"
+            style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+            onClick={() => {
+              // Save-as-Default never carries session_permissions (disk-pure split).
+              const { session_permissions, ...defaultsPayload } = draft;
+              sendCommand('set_default_config', { config: defaultsPayload });
+              setDefaultSaved('pending');
+            }}
+          >
+            {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
+          </button>
+          <button
+            className="btn"
+            style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+            onClick={() => setConfirmReset(true)}
+          >
+            Reset
+          </button>
+        </div>
       </div>
       {notice && (
         <p
@@ -536,6 +546,51 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         >
           {notice.text}
         </p>
+      )}
+      {confirmReset && (
+        <div
+          role="alertdialog"
+          aria-label="Confirm config reset"
+          style={{ margin: '0.5rem 0 0 0', padding: '0.6rem 0.75rem', border: '1px solid #f38ba8', borderRadius: '4px', background: '#f38ba811' }}
+        >
+          <p style={{ margin: '0 0 0.5rem 0', fontSize: '0.85rem', color: '#f38ba8' }}>
+            Reset config to factory defaults? This deletes your custom system prompt and global config, and cannot be undone.
+          </p>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <button
+              className="btn"
+              style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+              onClick={async () => {
+                // Destructive + global: POST once; only carry session_id when known.
+                setConfirmReset(false);
+                const body = sessionId ? { session_id: sessionId } : {};
+                try {
+                  const res = await fetch(apiUrl('/api/config/reset'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                  });
+                  if (!res.ok) {
+                    setNotice({ kind: 'alert', text: `Reset failed: HTTP ${res.status}` });
+                    return;
+                  }
+                  setNotice({ kind: 'status', text: 'Config reset to factory defaults' });
+                } catch (err) {
+                  setNotice({ kind: 'alert', text: `Reset failed: ${err?.message || err}` });
+                }
+              }}
+            >
+              Confirm reset
+            </button>
+            <button
+              className="btn"
+              style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+              onClick={() => setConfirmReset(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
 
       {/* Tab bar */}
