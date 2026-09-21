@@ -1,21 +1,23 @@
 /*
  * QueryBar.jsx
  *
- * Text input + contextual action buttons.
+ * Text input + a single Run/Pause toggle button (no Stop/Resume buttons).
  *
  * Button logic:
- *   status     Run | Pause | Stop         Command sent
- *   ────────────────────────────────────────────────────
- *   IDLE       ✓   |       |              start_session (fresh) /
- *                                            continue_session (if isRunning)
- *   RUNNING        | ✓    | ✓            pause_session / stop_session
- *   PAUSING    ⛔  |      |              single disabled Pause button
- *   PAUSED     ✓   |       | ✓            continue_session(query) / stop_session
- *   WAITING... ✓   |       | ✓            continue_session(query)
+ *   status      Button                 Command sent
+ *   ─────────────────────────────────────────────────────────────
+ *   RUNNING     ⏸ Pause                pause_session
+ *   PAUSING     ⏸ Pausing… (disabled)  —
+ *   otherwise   ▶ Run                  start_session (fresh session) /
+ *                                      continue_session(query) (loaded session)
+ *
+ * The Run button is disabled while the session is connecting and, when IDLE,
+ * until the query is non-empty. Enter (without Shift) triggers the same toggle
+ * from IDLE / WAITING_FOR_USER / PAUSED.
  *
  * Props:
  *   sendCommand(command, payload)
- *   status, isRunning, config
+ *   status, isRunning, config, mode, sessionId, sessionReady
  */
 
 import React, { useState, useRef } from 'react'
