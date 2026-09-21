@@ -13,6 +13,16 @@ from agent.config.resource_catalog import catalog_entry
 
 logger = logging.getLogger(__name__)
 
+# Read-op hardening: the allowlisted for-each-ref format atoms, the characters
+# that may never appear in an agent-supplied ref pattern/prefix/format (a shell
+# could re-interpret them), and the allowlisted cat-file object types.
+_FOR_EACH_REF_ALLOWED_TOKENS = frozenset({
+    "refname", "refname:short", "objectname", "objectname:short",
+    "objecttype", "subject",
+})
+_REF_PATTERN_FORBIDDEN = frozenset({";", "|", "&", "$", "`", ">", "<", "\n", "\r"})
+_CAT_FILE_ALLOWED_TYPES = frozenset({"blob", "tree", "commit", "tag"})
+
 
 class GitUnavailableError(FileNotFoundError):
     """The git executable could not be run (missing binary / unspawnable).
@@ -156,7 +166,8 @@ class GitReadTool(ToolBase):
     Read-only git repository inspection tool.
 
     Operations: status, diff, diff_cached, log, branch, branch_list, show,
-    remote, blame, config. Write operations (commit, init, clone,
+    remote, blame, config, rev_parse, show_ref, for_each_ref, ls_tree,
+    cat_file. Write operations (commit, init, clone,
     branch_create, checkout, stage, unstage) live in ``GitWriteTool``
     (tools/git_write_tool.py), which gates every write on the session
     ``git_write`` permission (``session_permissions['git_write']`` / the
@@ -270,9 +281,11 @@ class GitReadTool(ToolBase):
     operation: Literal[
         "status", "diff", "diff_cached", "log", "branch", "branch_list",
         "show", "remote", "blame", "config",
+        "rev_parse", "show_ref", "for_each_ref", "ls_tree", "cat_file",
     ] = Field(
         description="Git read operation to perform: status, diff, diff_cached, log, "
-        "branch, branch_list, show, remote, blame, config"
+        "branch, branch_list, show, remote, blame, config, rev_parse, "
+        "show_ref, for_each_ref, ls_tree, cat_file"
     )
     
     # Common parameters
@@ -375,6 +388,54 @@ class GitReadTool(ToolBase):
     config_name: Optional[str] = Field(
         default=None,
         description="Config name to retrieve (if not specified, list all configs)"
+    )
+
+    # rev_parse parameters
+    ref: Optional[str] = Field(
+        default="HEAD",
+        description="Ref for rev_parse (default HEAD); a commit SHA or ref name, "
+        "never '-...'."
+    )
+    abbrev: bool = Field(
+        default=False,
+        description="Use --abbrev-ref for rev_parse."
+    )
+
+    # show_ref parameters
+    pattern: Optional[str] = Field(
+        default=None,
+        description="Ref pattern for show_ref (optional)."
+    )
+
+    # for_each_ref parameters
+    prefix: Optional[str] = Field(
+        default=None,
+        description="Ref prefix for for_each_ref (optional)."
+    )
+
+    # ls_tree parameters
+    treeish: Optional[str] = Field(
+        default="HEAD",
+        description="Tree-ish for ls_tree (default HEAD)."
+    )
+    recursive: bool = Field(
+        default=False,
+        description="Recurse subtrees for ls_tree (-r)."
+    )
+    path: Optional[str] = Field(
+        default=None,
+        description="Single path to scope ls_tree."
+    )
+
+    # cat_file parameters
+    object: Optional[str] = Field(
+        default=None,
+        description="Object name/ref for cat_file."
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="Object type for cat_file: blob|tree|commit|tag "
+        "(default pretty-print -p)."
     )
 
     def _validate_repo_root(self, repo_root: Path) -> Path:
@@ -579,6 +640,16 @@ class GitReadTool(ToolBase):
                 return self._git_blame(repo_root)
             elif self.operation == "config":
                 return self._git_config(repo_root)
+            elif self.operation == "rev_parse":
+                return self._git_rev_parse(repo_root)
+            elif self.operation == "show_ref":
+                return self._git_show_ref(repo_root)
+            elif self.operation == "for_each_ref":
+                return self._git_for_each_ref(repo_root)
+            elif self.operation == "ls_tree":
+                return self._git_ls_tree(repo_root)
+            elif self.operation == "cat_file":
+                return self._git_cat_file(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         
@@ -1459,6 +1530,194 @@ class GitReadTool(ToolBase):
         if self.config_name:
             args = ["config", "--get", self.config_name]
         output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    # ------------------------------------------------------------------
+    # Additional read operations: rev_parse, show_ref, for_each_ref,
+    # ls_tree, cat_file. Every one obeys the fixed-argv contract: no
+    # agent-supplied flags, a leading '-' is rejected, ref/pattern/format
+    # tokens are validated BEFORE any git call, and non-zero exits are
+    # surfaced via the standard "Git command failed (exit code N):" form.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_git_ref(value: str, *, field: str) -> str:
+        """Validate a ref/object/tree-ish token used as one fixed argv element.
+
+        Rejects non-strings, empty or surrounding-whitespace values, any value
+        beginning with '-' (which git would parse as a flag) and any value
+        containing whitespace or a control character. Raises ``ValueError``;
+        callers convert it to an ``Error:`` string without spawning git.
+        """
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        if value == "" or value.strip() != value:
+            raise ValueError(f"invalid {field}: {value!r}")
+        if value.startswith("-"):
+            raise ValueError(
+                f"invalid {field}: {value!r} (must not start with '-')"
+            )
+        for ch in value:
+            if ch.isspace() or ord(ch) < 0x20:
+                raise ValueError(
+                    f"invalid {field}: {value!r} (must not contain whitespace "
+                    "or control characters)"
+                )
+        return value
+
+    @staticmethod
+    def _validate_ref_pattern(value: str, *, field: str) -> str:
+        """Validate a ref pattern/prefix (show_ref, for_each-ref).
+
+        Applies the ``_validate_git_ref`` rules and additionally rejects any
+        character in ``_REF_PATTERN_FORBIDDEN`` (shell metacharacters) so the
+        token can never be re-interpreted outside argv. Raises ``ValueError``.
+        """
+        validated = GitReadTool._validate_git_ref(value, field=field)
+        if any(ch in _REF_PATTERN_FORBIDDEN for ch in validated):
+            raise ValueError(
+                f"invalid {field}: {value!r} (must not contain shell "
+                "metacharacters)"
+            )
+        return validated
+
+    @staticmethod
+    def _validate_for_each_ref_format(fmt: str) -> str:
+        """Validate a ``for-each-ref --format`` string.
+
+        The format travels as a single ``--format=<fmt>`` argv element (never
+        shell-interpreted). Structural rules: non-empty string, no newlines and
+        no ``_REF_PATTERN_FORBIDDEN`` characters; then every '%' must open a
+        ``%(...)`` token whose atom is in ``_FOR_EACH_REF_ALLOWED_TOKENS``.
+        Literal text (without metacharacters or a bare '%') is allowed. Raises
+        ``ValueError`` naming the allowed atoms otherwise.
+        """
+        if not isinstance(fmt, str) or fmt == "":
+            raise ValueError("format must be a non-empty string")
+        if "\n" in fmt or "\r" in fmt:
+            raise ValueError("invalid format: must not contain newlines")
+        if any(ch in _REF_PATTERN_FORBIDDEN for ch in fmt):
+            raise ValueError(
+                f"invalid format: {fmt!r} (must not contain shell "
+                "metacharacters)"
+            )
+        allowed = ", ".join(sorted(_FOR_EACH_REF_ALLOWED_TOKENS))
+        i, n = 0, len(fmt)
+        while i < n:
+            if fmt[i] != "%":
+                i += 1
+                continue
+            if i + 1 >= n or fmt[i + 1] != "(":
+                raise ValueError(
+                    f"invalid format: bare '%' at position {i}; every '%' must "
+                    "begin a '%(token)' atom"
+                )
+            close = fmt.find(")", i + 2)
+            if close == -1:
+                raise ValueError(
+                    f"invalid format: unterminated '%(' token at position {i}"
+                )
+            token = fmt[i + 2:close]
+            if token not in _FOR_EACH_REF_ALLOWED_TOKENS:
+                raise ValueError(
+                    f"invalid format: unsupported atom '%({token})'; allowed "
+                    f"atoms are: {allowed}"
+                )
+            i = close + 1
+        return fmt
+
+    def _git_rev_parse(self, repo_root: Path) -> str:
+        """Run git rev-parse, optionally --abbrev-ref, on a ref/SHA."""
+        try:
+            ref = self._validate_git_ref(self.ref, field="ref")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        args = ["rev-parse"]
+        if self.abbrev:
+            args.append("--abbrev-ref")
+        args.append(ref)
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_show_ref(self, repo_root: Path) -> str:
+        """Run git show-ref; an empty match (exit 1) is benign, not an error."""
+        args = ["show-ref"]
+        if self.pattern is not None:
+            try:
+                args.append(
+                    self._validate_ref_pattern(self.pattern, field="pattern")
+                )
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args)
+        if exit_code == 1 and not stdout.strip():
+            return self._with_mode(self._truncate_output("No matching refs."))
+        if exit_code != 0:
+            return self._with_mode(
+                self._truncate_output(
+                    f"Git command failed (exit code {exit_code}):\n{stderr}"
+                )
+            )
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _git_for_each_ref(self, repo_root: Path) -> str:
+        """Run git for-each-ref with an optional validated format/prefix."""
+        args = ["for-each-ref"]
+        if self.format is not None:
+            try:
+                fmt = self._validate_for_each_ref_format(self.format)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            args.append(f"--format={fmt}")
+        if self.prefix is not None:
+            try:
+                prefix = self._validate_ref_pattern(self.prefix, field="prefix")
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            args.append(prefix)
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_ls_tree(self, repo_root: Path) -> str:
+        """Run git ls-tree with optional recursion and path scope."""
+        try:
+            treeish = self._validate_git_ref(self.treeish, field="treeish")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        args = ["ls-tree"]
+        if self.recursive:
+            args.append("-r")
+        args.append(treeish)
+        if self.path:
+            try:
+                rels = self._validated_rel_paths(repo_root, self.path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if rels:
+                args.append("--")
+                args.extend(rels)
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_cat_file(self, repo_root: Path) -> str:
+        """Run git cat-file (-p by default, or a validated object type)."""
+        if not self.object:
+            return self._truncate_output(
+                "Error: object is required for cat_file operation"
+            )
+        try:
+            obj = self._validate_git_ref(self.object, field="object")
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        mode = "-p"
+        if self.type is not None:
+            if self.type not in _CAT_FILE_ALLOWED_TYPES:
+                allowed = ", ".join(sorted(_CAT_FILE_ALLOWED_TYPES))
+                return self._truncate_output(
+                    f"Error: invalid type {self.type!r}; allowed types are: "
+                    f"{allowed}"
+                )
+            mode = self.type
+        output = self._run_git(repo_root, ["cat-file", mode, obj])
         return self._with_mode(self._truncate_output(output))
 
 # Backward-compatible alias: legacy code, imports and tests reference the old

@@ -1307,3 +1307,248 @@ class TestShowHonoursScope:
         assert "fatal: bad object HEAD:a.txt" in out
         assert "SHOULD-NOT-LEAK" not in out
 
+
+
+
+# ---------------------------------------------------------------------------
+# Literal acceptance: the 5 new read operation names must be constructible
+# ---------------------------------------------------------------------------
+class TestNewOperationNamesAccepted:
+    @pytest.mark.parametrize(
+        "name", ["rev_parse", "show_ref", "for_each_ref", "ls_tree", "cat_file"]
+    )
+    def test_literal_accepts_new_operation(self, tmp_path, name):
+        tool = _read_host_tool(tmp_path, operation=name)
+        assert tool.operation == name
+
+
+# ---------------------------------------------------------------------------
+# rev_parse
+# ---------------------------------------------------------------------------
+class TestRevParse:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="rev_parse")
+        calls = _shadow_run_git_raw(tool, stdout="abc123\n")
+        out = tool._git_rev_parse(tmp_path)
+        assert calls == [["rev-parse", "HEAD"]]
+        assert "abc123" in out
+
+    def test_abbrev_ref_and_explicit_ref(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="rev_parse", abbrev=True, ref="main"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="main\n")
+        tool._git_rev_parse(tmp_path)
+        assert calls == [["rev-parse", "--abbrev-ref", "main"]]
+
+    @pytest.mark.parametrize("bad", ["-x", "--abbrev-ref", "a b", "", "x\ny", " a", None])
+    def test_invalid_ref_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="rev_parse", ref=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_rev_parse(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="rev_parse", ref="deadbeef")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: ambiguous argument 'deadbeef'",
+        )
+        out = tool._git_rev_parse(tmp_path)
+        assert calls == [["rev-parse", "deadbeef"]]
+        assert out.startswith("Git command failed")
+        assert "ambiguous argument" in out
+
+
+# ---------------------------------------------------------------------------
+# show_ref
+# ---------------------------------------------------------------------------
+class TestShowRef:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_ref")
+        calls = _shadow_run_git_raw(tool, stdout="abc123 refs/heads/main\n")
+        out = tool._git_show_ref(tmp_path)
+        assert calls == [["show-ref"]]
+        assert "refs/heads/main" in out
+
+    def test_pattern_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_ref", pattern="refs/heads/*"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_show_ref(tmp_path)
+        assert calls == [["show-ref", "refs/heads/*"]]
+
+    def test_empty_match_is_benign(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="show_ref", pattern="refs/heads/*"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=1)
+        out = tool._git_show_ref(tmp_path)
+        assert "No matching refs." in out
+        assert "Git command failed" not in out
+
+    def test_real_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="show_ref")
+        calls = _shadow_run_git_raw(
+            tool, stdout="whatever", exit_code=128,
+            stderr="fatal: not a git repository",
+        )
+        out = tool._git_show_ref(tmp_path)
+        assert out.startswith("Git command failed")
+        assert "fatal: not a git repository" in out
+        assert "whatever" not in out
+
+    @pytest.mark.parametrize(
+        "bad", ["a b", ";", "|", "&", "$", "`", ">", "<", "x\ny", "-x"]
+    )
+    def test_invalid_pattern_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="show_ref", pattern=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_show_ref(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# for_each_ref
+# ---------------------------------------------------------------------------
+class TestForEachRef:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref")
+        calls = _shadow_run_git_raw(tool, stdout="abc123 refs/heads/main\n")
+        out = tool._git_for_each_ref(tmp_path)
+        assert calls == [["for-each-ref"]]
+        assert "refs/heads/main" in out
+
+    def test_format_and_prefix_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="for_each_ref",
+            format="%(refname:short) %(objectname)", prefix="refs/heads/",
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_for_each_ref(tmp_path)
+        assert calls == [
+            ["for-each-ref",
+             "--format=%(refname:short) %(objectname)", "refs/heads/"]
+        ]
+
+    def test_empty_output_benign(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref")
+        calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
+        out = tool._git_for_each_ref(tmp_path)
+        assert "Git command failed" not in out
+
+    def test_valid_format_accepted(self, tmp_path):
+        fmt = "%(refname) %(objectname)"
+        assert GitInfoTool._validate_for_each_ref_format(fmt) == fmt
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["$(bogus)", "no-token-here %(refname", "%x", "%(subject) %(bad)", "a\nb"],
+    )
+    def test_invalid_format_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref", format=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_for_each_ref(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    @pytest.mark.parametrize("bad", ["a b", "$(x)", "refs;heads", "-x"])
+    def test_invalid_prefix_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="for_each_ref", prefix=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_for_each_ref(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# ls_tree
+# ---------------------------------------------------------------------------
+class TestLsTree:
+    def test_default_argv(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="ls_tree")
+        calls = _shadow_run_git_raw(tool, stdout="100644 blob abc\tf.txt\n")
+        out = tool._git_ls_tree(tmp_path)
+        assert calls == [["ls-tree", "HEAD"]]
+
+    def test_recursive_treeish_and_path_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="ls_tree", treeish="main",
+            recursive=True, path="src",
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_ls_tree(tmp_path)
+        assert calls == [["ls-tree", "-r", "main", "--", "src"]]
+
+    def test_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="ls_tree", treeish="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Not a valid object name nope",
+        )
+        out = tool._git_ls_tree(tmp_path)
+        assert calls == [["ls-tree", "nope"]]
+        assert out.startswith("Git command failed")
+        assert "Not a valid object name" in out
+
+    @pytest.mark.parametrize("bad", ["-r", "a b", "", "x\ny"])
+    def test_invalid_treeish_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(tmp_path, operation="ls_tree", treeish=bad)
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_ls_tree(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# cat_file
+# ---------------------------------------------------------------------------
+class TestCatFile:
+    def test_default_pretty_print_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="cat_file", object="HEAD:a.txt"
+        )
+        calls = _shadow_run_git_raw(tool, stdout="hello\n")
+        out = tool._git_cat_file(tmp_path)
+        assert calls == [["cat-file", "-p", "HEAD:a.txt"]]
+        assert "hello" in out
+
+    def test_explicit_type_argv(self, tmp_path):
+        tool = _read_host_tool(
+            tmp_path, operation="cat_file", object="abc123", type="commit"
+        )
+        calls = _shadow_run_git_raw(tool)
+        tool._git_cat_file(tmp_path)
+        assert calls == [["cat-file", "commit", "abc123"]]
+
+    def test_missing_object_errors_before_git(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="cat_file")
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_cat_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    @pytest.mark.parametrize("bad", ["nope", "BLOB", "-p", "blobby"])
+    def test_invalid_type_rejected_before_git(self, tmp_path, bad):
+        tool = _read_host_tool(
+            tmp_path, operation="cat_file", object="abc", type=bad
+        )
+        calls = _shadow_run_git_raw(tool)
+        out = tool._git_cat_file(tmp_path)
+        assert out.startswith("Error:")
+        assert calls == []
+
+    def test_unknown_object_failure_surfaced(self, tmp_path):
+        tool = _read_host_tool(tmp_path, operation="cat_file", object="nope")
+        calls = _shadow_run_git_raw(
+            tool, stdout="", exit_code=128,
+            stderr="fatal: Not a valid object name nope",
+        )
+        out = tool._git_cat_file(tmp_path)
+        assert calls == [["cat-file", "-p", "nope"]]
+        assert out.startswith("Git command failed")
+        assert "Not a valid object name" in out
+
