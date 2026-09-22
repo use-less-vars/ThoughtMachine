@@ -288,9 +288,11 @@ def test_serialise_drift_is_read_only(vault, client, monkeypatch):
 
     detected = []
     writes = []
+    captured_kwargs = []
 
-    def _spy_detect(record, containers):
+    def _spy_detect(record, containers, **kwargs):
         detected.append(record.id)
+        captured_kwargs.append(kwargs)
         return []
 
     monkeypatch.setattr(drift_mod, "detect_record_drift", _spy_detect)
@@ -308,3 +310,50 @@ def test_serialise_drift_is_read_only(vault, client, monkeypatch):
     assert detected == ["rec-a", "rec-a"]  # pure detector used on both routes
     assert writes == []  # nothing was ever appended
     assert _snapshot(vault) == before  # store untouched on disk
+
+    # Both axes must be threaded through to the detector: a real
+    # ``capabilities`` object (never ``None`` -- otherwise config resolution
+    # fails with ``capabilities_required`` and the policy axis is silently
+    # suppressed) and a ``permissions`` mapping (required by the resolver).
+    assert captured_kwargs, "the pure detector was never invoked"
+    assert all(kw.get("capabilities") is not None for kw in captured_kwargs)
+    assert all(kw.get("permissions") is not None for kw in captured_kwargs)
+
+
+def test_serialise_drift_evaluates_policy_axis(vault, client, monkeypatch):
+    """The route threads real capabilities so the policy axis is evaluated.
+
+    A record whose recorded intent (``network_mode='bridge'``) disagrees with
+    the policy resolved for its lifecycle (``ephemeral`` resolves to
+    ``network_mode='none'`` under the default capabilities) must surface a
+    ``policy`` / ``drift.policy_config_changed`` finding on the wire.  Before
+    the fix the route passed no ``capabilities``, so config resolution failed
+    with ``capabilities_required`` and the policy axis was silently suppressed
+    (never producing the finding).
+    """
+    from thoughtmachine.container_record import drift as drift_mod
+
+    api.create_record(
+        "ws1",
+        "ephemeral",
+        "workspace-owned",
+        id="rec-a",
+        intent_snapshot={"network_mode": "bridge"},
+        vault_root=vault,
+    )
+    api.attach_container("ws1", "rec-a", "docker-aaa", vault_root=vault)
+    _fake_docker(
+        monkeypatch,
+        [_FakeContainer("docker-aaa", labels={RECORD_LABEL_KEY: "rec-a"}, attrs={})],
+    )
+
+    resp = client.get("/api/container-records/rec-a", params={"workspace_id": "ws1"})
+    assert resp.status_code == 200
+    findings = resp.json()["drift"]
+    assert isinstance(findings, list), findings
+    classes = [f["drift_class"] for f in findings]
+    assert drift_mod.CLASS_POLICY in classes, findings
+    policy = next(f for f in findings if f["drift_class"] == drift_mod.CLASS_POLICY)
+    assert policy["event_type"] == drift_mod.EVENT_POLICY_CONFIG_CHANGED
+    assert policy["expected"] == "none"
+    assert policy["actual"] == "bridge"

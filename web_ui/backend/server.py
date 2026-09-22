@@ -652,6 +652,10 @@ async def lifespan(app: FastAPI):
         from thoughtmachine.container_record import api as _cr_api
         from thoughtmachine.container_record import storage as _cr_storage
         from thoughtmachine.container_record.drift import scan_record
+        from thoughtmachine.workspace_capabilities import (
+            WorkspaceCapabilities,
+            load_workspace_capabilities,
+        )
 
         client = docker.from_env()
         # ONE server-side-narrowed list call: only containers owned by the
@@ -683,8 +687,25 @@ async def lifespan(app: FastAPI):
                     pending.append((ws, record))
 
         inspected = 0
+        # Capabilities are loaded once per unique workspace (not once per
+        # record): the boot scan can touch many records from the same
+        # workspace, so a small per-boot cache avoids redundant disk reads.
+        caps_cache: dict = {}
         for ws, record in pending[:_BOOT_DRIFT_SCAN_LIMIT]:
-            scan_record(record, containers, workspace_id=ws)
+            if ws not in caps_cache:
+                caps_cache[ws] = (
+                    load_workspace_capabilities(ws)
+                    or WorkspaceCapabilities.default()
+                )
+            caps = caps_cache[ws]
+            # permissions={} -> framework-default SessionPermissions; no ambient SessionConfig at this site (real per-workspace grants are a separate design question)
+            scan_record(
+                record,
+                containers,
+                workspace_id=ws,
+                permissions={},
+                capabilities=caps,
+            )
             inspected += 1
 
         skipped = len(pending) - inspected

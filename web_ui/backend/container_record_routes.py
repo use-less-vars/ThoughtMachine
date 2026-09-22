@@ -45,7 +45,7 @@ def _finding_dict(finding: Any) -> dict[str, Any]:
     }
 
 
-def _compute_drift(record: Any) -> Optional[list[dict[str, Any]]]:
+def _compute_drift(record: Any, workspace_id: str) -> Optional[list[dict[str, Any]]]:
     """Return the record's *live* drift as JSON-ready findings (read-only).
 
     Resolves the record's live container(s) through the Docker client -- matched
@@ -71,6 +71,10 @@ def _compute_drift(record: Any) -> Optional[list[dict[str, Any]]]:
 
         from thoughtmachine.container_record import RECORD_LABEL_KEY
         from thoughtmachine.container_record.drift import detect_record_drift
+        from thoughtmachine.workspace_capabilities import (
+            WorkspaceCapabilities,
+            load_workspace_capabilities,
+        )
 
         client = docker.from_env()
         resolved = client.containers.list(
@@ -84,7 +88,14 @@ def _compute_drift(record: Any) -> Optional[list[dict[str, Any]]]:
             def list(self, all: bool = True) -> list[Any]:  # noqa: A002 - docker API
                 return list(resolved)
 
-        findings = detect_record_drift(record, _ResolvedContainers())
+        caps = load_workspace_capabilities(workspace_id) or WorkspaceCapabilities.default()
+        # permissions={} -> framework-default SessionPermissions; no ambient SessionConfig at this site (real per-workspace grants are a separate design question)
+        findings = detect_record_drift(
+            record,
+            _ResolvedContainers(),
+            permissions={},
+            capabilities=caps,
+        )
         return [_finding_dict(finding) for finding in findings]
     except Exception:
         return None
@@ -106,7 +117,7 @@ def _serialise(record: Any, workspace_id: str) -> dict[str, Any]:
     data = record.to_dict()
     data["workspace_id"] = workspace_id
     data["container_id"] = record.id
-    data["drift"] = _compute_drift(record)
+    data["drift"] = _compute_drift(record, workspace_id)
     return data
 
 
