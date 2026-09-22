@@ -4,13 +4,14 @@
 #
 #  Preflight doctor + launcher for ThoughtMachine.
 #  Runs all checks first; when they pass it starts the app:
-#    * default (dev):  vite on the frontend port (default 5173) in the background, plus the
-#                      backend (.venv/bin/python -m web_ui.backend.server).
-#                      The backend is health-checked (GET /api/health) BEFORE
-#                      the frontend is started; when the backend exits, vite
-#                      is stopped too.
-#    * --prod / -p:    production mode, single process:
-#                      .venv/bin/python -m web_ui.backend.server --serve-frontend
+#    * default (prod): production mode, single process -- backend serves the
+#                      built frontend from web_ui/frontend/dist on
+#                      TM_BACKEND_PORT (default 8000). Fast. For daily use.
+#                      Auto-builds dist/ on first run if missing.
+#    * --dev / -d:     development mode -- vite dev server on TM_FRONTEND_PORT
+#                      (default 5173) in the background, plus the backend.
+#                      Slow (unbundled modules, HMR, dev React). For editing
+#                      frontend code only.
 #    * --doctor:       preflight (tolerates a missing/unusable Docker daemon) +
 #                      start the backend, verify /api/health, print
 #                      BACKEND-HEALTHY and keep running.
@@ -35,18 +36,20 @@ case ":$PATH:" in *:/usr/sbin:*) ;; *) export PATH="/usr/sbin:$PATH" ;; esac
 mkdir -p "$SCRIPT_DIR/logs"
 
 DOCTOR="$SCRIPT_DIR/scripts/doctor_checks.py"
-PROD_MODE=false
+DEV_MODE=false
 CHECK_ONLY=false
 DOCTOR_MODE=false
 
 for arg in "$@"; do
     case "$arg" in
-        --prod|-p)          PROD_MODE=true ;;
+        --dev|-d)           DEV_MODE=true ;;
+        --prod|-p)          DEV_MODE=false ;;   # legacy alias; prod is now default
         --check-only)       CHECK_ONLY=true ;;
         --doctor)           DOCTOR_MODE=true ;;
         --help|-h)
-            echo "Usage: $0 [--prod] [--check-only] [--doctor]"
-            echo "  --prod / -p   production mode: backend serves the built frontend"
+            echo "Usage: $0 [--dev] [--check-only] [--doctor]"
+            echo "  (default)     production: backend serves the built frontend on one port"
+            echo "  --dev / -d    development: vite dev server on TM_FRONTEND_PORT (slow, HMR)"
             echo "  --check-only  run preflight checks only, then exit 0"
             echo "  --doctor      preflight (Docker problems only warn) + start the backend,"
             echo "                verify /api/health, print BACKEND-HEALTHY and keep running"
@@ -54,7 +57,7 @@ for arg in "$@"; do
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [--prod] [--check-only] [--doctor]"
+            echo "Usage: $0 [--dev] [--check-only] [--doctor]"
             exit 1
             ;;
     esac
@@ -411,10 +414,30 @@ if $DOCTOR_MODE; then
     exit "$BACKEND_RC"
 fi
 
-if $PROD_MODE; then
+if ! $DEV_MODE; then
+    FRONTEND_DIR="$SCRIPT_DIR/web_ui/frontend"
+    DIST_DIR="$FRONTEND_DIR/dist"
+    VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
+    if [ ! -f "$DIST_DIR/index.html" ]; then
+        echo "============================================"
+        echo "  ThoughtMachine - first-run setup"
+        echo "  Building the production frontend bundle ..."
+        echo "============================================"
+        echo ""
+        if [ -x "$VITE_BIN" ]; then
+            (cd "$FRONTEND_DIR" && "$VITE_BIN" build) || {
+                echo ""; echo "  FAILED: production build failed."; exit 1; }
+        else
+            (cd "$FRONTEND_DIR" && npm run build) || {
+                echo ""; echo "  FAILED: production build failed."; exit 1; }
+        fi
+        echo ""
+    fi
     echo "============================================"
-    echo "  ThoughtMachine - production mode"
-    echo "  http://localhost:$TM_BACKEND_PORT  (backend serves the built frontend)"
+    echo "  ThoughtMachine - production mode (default)"
+    echo "  MODE:      production (single process, no vite dev server)"
+    echo "  Open:      http://localhost:$TM_BACKEND_PORT"
+    echo "  (backend serves the built frontend from web_ui/frontend/dist)"
     echo "============================================"
     echo ""
     export TM_NPM_CMD="$(command -v npm 2>/dev/null || true)"
@@ -428,9 +451,10 @@ if $PROD_MODE; then
 fi
 
 echo "============================================"
-echo "  ThoughtMachine - starting (dev mode)"
+echo "  ThoughtMachine - development mode (--dev)"
+echo "  MODE:      development (vite dev server, HMR, slow -- for editing code only)"
 echo "  Backend:   http://localhost:$TM_BACKEND_PORT"
-echo "  Frontend:  http://localhost:$TM_FRONTEND_PORT"
+echo "  Frontend:  http://localhost:$TM_FRONTEND_PORT  <-- open this"
 echo "============================================"
 echo ""
 
