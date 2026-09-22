@@ -1860,6 +1860,12 @@ class GitReadTool(ToolBase):
             return self._truncate_output(
                 "Error: path is required for show_file operation"
             )
+        if ":" in self.ref:
+            return self._truncate_output(
+                "Error: ref must not contain ':' -- show_file builds the "
+                "<ref>:<path> selector itself, so a colon in ref would yield "
+                "a malformed doubled selector"
+            )
         try:
             ref = self._validate_git_ref(self.ref, field="ref")
         except ValueError as e:
