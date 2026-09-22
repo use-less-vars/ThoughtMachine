@@ -777,7 +777,10 @@ def test_worktree_add_defaults_base_to_head(tmp_path):
     result = tool._git_worktree_add(tmp_path)
 
     assert raw.calls == [["worktree", "list", "--porcelain"]]
-    assert add_calls == [["worktree", "add", "wt", "HEAD"]]
+    assert add_calls == [
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["worktree", "add", "wt", "HEAD"],
+    ]
     assert result == f"Created worktree at 'wt' (base: HEAD)\n{_TRAILER}"
 
 
@@ -808,7 +811,7 @@ def test_worktree_add_already_registered_refused(tmp_path):
         "Error: a worktree is already registered at 'wt'; remove it before adding"
     )
     assert raw.calls == [["worktree", "list", "--porcelain"]]
-    assert add_calls == []
+    assert add_calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
 
 
 def test_worktree_add_invalid_base_ref_refused(tmp_path):

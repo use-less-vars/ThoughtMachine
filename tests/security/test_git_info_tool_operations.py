@@ -230,11 +230,13 @@ class TestBranchCreate:
         result = tool._git_branch_create(tmp_path)
 
         execs = [c for c in fake_manager.calls if c[0] == "exec"]
-        # first exec resolves the base -> immutable SHA; the second pins the
-        # branch to that SHA (never the bare `git branch <name>` form).
-        assert execs[0][1] == ["git", "rev-parse", "--verify", "HEAD^{commit}"]
-        assert execs[1][1] == ["git", "branch", "feature/x", "ok"]
-        assert execs[1][2]["workdir"] == "/workspace"
+        # the first exec is the detached-HEAD probe; the second resolves the
+        # base -> immutable SHA and the third pins the branch to that SHA
+        # (never the bare `git branch <name>` form).
+        assert execs[0][1] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
+        assert execs[1][1] == ["git", "rev-parse", "--verify", "HEAD^{commit}"]
+        assert execs[2][1] == ["git", "branch", "feature/x", "ok"]
+        assert execs[2][2]["workdir"] == "/workspace"
         assert "execution_mode: containerized" in result
         assert "Created branch 'feature/x' at ok" in result
 
@@ -246,8 +248,10 @@ class TestBranchCreate:
 
         # each host git invocation builds its own sandbox instance; flatten
         calls = [c[0] for inst in _FakeSandbox.instances for c in inst.calls]
-        assert calls[0][-3:] == ["rev-parse", "--verify", "HEAD^{commit}"]
-        assert calls[1][-3:] == ["branch", "feature/x", "ok"]
+        # the first host call is the detached-HEAD probe
+        assert calls[0][-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]
+        assert calls[1][-3:] == ["rev-parse", "--verify", "HEAD^{commit}"]
+        assert calls[2][-3:] == ["branch", "feature/x", "ok"]
         assert "execution_mode: host" in result
         assert "working tree HEAD not moved" in result
 
@@ -275,8 +279,9 @@ class TestBranchCreate:
         calls = _shadow_run_git_raw(tool, stdout="cafe1234\n")
         result = tool._git_branch_create(tmp_path)
 
-        assert calls[0] == ["rev-parse", "--verify", "HEAD^{commit}"]
-        assert calls[1] == ["branch", "feature/x", "cafe1234"]
+        assert calls[0] == ["rev-parse", "--abbrev-ref", "HEAD"]
+        assert calls[1] == ["rev-parse", "--verify", "HEAD^{commit}"]
+        assert calls[2] == ["branch", "feature/x", "cafe1234"]
         assert "Created branch 'feature/x' at cafe1234 (base: HEAD)" in result
         assert "HEAD not moved" in result
 
@@ -321,8 +326,11 @@ class TestBranchCreate:
 
         assert result.startswith("Git command failed (exit code 128):")
         assert "fatal: Needed a single revision" in result
-        # only the rev-parse ran; no branch was created
-        assert calls == [["rev-parse", "--verify", "HEAD^{commit}"]]
+        # the detached-HEAD probe and the base rev-parse ran; no branch created
+        assert calls == [
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+        ]
 
     def test_branch_create_argv_never_bare_name(self, tmp_path, fake_sandbox):
         tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
@@ -345,7 +353,10 @@ class TestBranchCreate:
         result = tool._git_branch_create(tmp_path)
 
         assert result.startswith("Error:")
-        assert calls == [["rev-parse", "--verify", "HEAD^{commit}"]]
+        assert calls == [
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -611,9 +622,10 @@ class TestCommit:
         result = tool._git_commit(tmp_path)
 
         execs = [c for c in fake_manager.calls if c[0] == "exec"]
-        assert len(execs) == 2  # explicit stage of the named path + commit
-        assert execs[0][1] == ["git", "add", "--", "hello.txt"]
-        assert "-A" not in execs[0][1]
+        # detached-HEAD probe + explicit stage of the named path + commit
+        assert len(execs) == 3
+        assert execs[1][1] == ["git", "add", "--", "hello.txt"]
+        assert "-A" not in execs[1][1]
         _kind, command, _kwargs = execs[-1]
         assert command == [
             "git", "-c", "core.hooksPath=/workspace/.githooks",
@@ -652,11 +664,11 @@ class TestCommit:
         )
         tool._git_commit(tmp_path)
 
-        # Selective commit = explicit stage of the named path (git add -- <path>)
-        # + git commit -- <path>; each _run_git creates its own
-        # SandboxedExecution instance, so sum calls across all instances.
-        # No index reset.
-        assert sum(len(i.calls) for i in _FakeSandbox.instances) == 2
+        # Selective commit = the detached-HEAD probe + explicit stage of the
+        # named path (git add -- <path>) + git commit -- <path>; each _run_git
+        # creates its own SandboxedExecution instance, so sum calls across all
+        # instances. No index reset.
+        assert sum(len(i.calls) for i in _FakeSandbox.instances) == 3
         assert all(
             "reset" not in command
             for inst in _FakeSandbox.instances
@@ -667,7 +679,7 @@ class TestCommit:
             for inst in _FakeSandbox.instances
             for command, _kwargs in inst.calls
         ]
-        add_cmd, commit_cmd = commands[0], commands[-1]
+        add_cmd, commit_cmd = commands[1], commands[-1]
         assert add_cmd[add_cmd.index("add"):] == ["add", "--", "a.txt"]
         assert "-A" not in add_cmd
         command = commit_cmd
@@ -687,12 +699,13 @@ class TestCommit:
         tool._git_commit(tmp_path)
 
         execs = [c for c in fake_manager.calls if c[0] == "exec"]
-        assert len(execs) == 2  # selective commit: explicit stage + commit
+        # detached-HEAD probe + selective commit: explicit stage + commit
+        assert len(execs) == 3
         assert all("reset" not in c[1] for c in execs)  # no index reset
         # The stage subprocess precedes the commit; the message only ever
         # appears in the commit argv, as a single element.
-        assert execs[0][1] == ["git", "add", "--", "a.txt"]
-        assert "-A" not in execs[0][1]
+        assert execs[1][1] == ["git", "add", "--", "a.txt"]
+        assert "-A" not in execs[1][1]
         _kind, command, _kwargs = execs[-1]
         assert "x --no-verify" in command
         assert "--no-verify" not in command
@@ -1892,13 +1905,15 @@ class TestCommitContainerRoundTrip:
         result = tool._git_commit(tmp_path)
 
         execs = [c for c in manager.calls if c[0] == "exec"]
-        # 1st exec stages the named path; 2nd is the hooksPath-pinned commit.
-        assert execs[0][1] == ["git", "add", "--", "hello.txt"]
-        assert execs[1][1] == [
+        # 1st exec is the detached-HEAD probe; then the named path is staged
+        # and finally the hooksPath-pinned commit runs.
+        assert execs[0][1] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
+        assert execs[1][1] == ["git", "add", "--", "hello.txt"]
+        assert execs[2][1] == [
             "git", "-c", "core.hooksPath=/workspace/.githooks",
             "commit", "-m", "add hello", "--", "hello.txt",
         ]
-        assert "--no-verify" not in execs[1][1]
+        assert "--no-verify" not in execs[2][1]
         # Round-trip: both the container's commit stdout and the hook stderr
         # reach the agent (newline-guarded join), then the mode trailer.
         assert result.startswith(

@@ -407,6 +407,24 @@ class GitWriteTool(GitReadTool):
             return False
         return branch not in self._PROTECTED_BRANCHES
 
+    def _is_detached_head(self, repo_root: Path) -> bool:
+        """True when the workspace HEAD is detached (not on a branch).
+
+        ``git rev-parse --abbrev-ref HEAD`` reports the literal string
+        ``"HEAD"`` when HEAD is detached. "HEAD" is a *valid* ref and is NOT
+        in ``_PROTECTED_BRANCHES``, so the branch-mutating entry points must
+        refuse BEFORE issuing their argv. The parse mirrors the two
+        pre-existing commit gates exactly (``.strip()`` then ``== "HEAD"``).
+        A resolution failure returns False; the subsequent git call then
+        surfaces the real error loudly rather than masking it behind a
+        detached-HEAD refusal.
+        """
+        try:
+            output = self._run_git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+        except (RuntimeError, PermissionError):
+            return False
+        return (output or "").strip() == "HEAD"
+
     @staticmethod
     def _validate_clone_url(clone_url: str) -> bool:
         """
@@ -521,6 +539,14 @@ class GitWriteTool(GitReadTool):
             name = self._validate_branch_name(self.branch)
         except ValueError as e:
             return self._truncate_output(f"Error: {e}")
+
+        # Detached-HEAD gate (fail closed): creating a branch based on the
+        # DEFAULT (workspace HEAD) is only meaningful on a branch. When HEAD
+        # is detached, rev-parse would resolve the literal "HEAD" sha and
+        # silently pin the new branch to a dangling commit -- refuse before
+        # any git subprocess. An EXPLICIT base is honoured as-is.
+        if self.base is None and self._is_detached_head(repo_root):
+            return self._truncate_output(_DETACHED_HEAD_ERROR)
 
         # Resolve the base ref to an immutable SHA BEFORE creating the
         # branch. A caller-supplied base is validated BEFORE any git call so
@@ -766,6 +792,22 @@ class GitWriteTool(GitReadTool):
                 "Error: file_path is required for commit operation (at least one path)"
             )
 
+        # Detached-HEAD gate (fail closed) on the PLAIN path. The two gates
+        # above cover the write_on_feature_branch and operator-managed paths;
+        # neither runs for an ordinary checkout with a write/full/ask grant, so
+        # rev-parse --abbrev-ref HEAD == "HEAD" was read as an unprotected
+        # branch and the add/commit below would create a DANGLING commit
+        # (HEAD advances, no branch ref updated). Refuse before any git
+        # subprocess runs. Guarded on the plain path only so the two upstream
+        # gates are never double-probed, and placed after the empty-file_path
+        # guard so a no-op commit request still issues no subprocess at all.
+        if (
+            not self._git_write_restricted_to_feature_branch()
+            and not self._is_operator_managed_worktree(repo_root)
+            and self._is_detached_head(repo_root)
+        ):
+            return self._truncate_output(_DETACHED_HEAD_ERROR)
+
         # Single path-scoped commit flow for EVERY code path (plain and
         # operator-managed-worktree alike). Validate the named paths first,
         # then stage exactly those paths (never ``-A``) and commit only them.
@@ -862,6 +904,12 @@ class GitWriteTool(GitReadTool):
             return self._truncate_output(
                 f"Error: invalid base ref for worktree_add: {base!r}"
             )
+        # Detached-HEAD gate (fail closed): a worktree based on the DEFAULT
+        # (workspace HEAD) inherits whatever HEAD points at -- a dangling
+        # commit when detached. Refuse before probing/adding. An EXPLICIT
+        # non-HEAD base is honoured as-is.
+        if base == "HEAD" and self._is_detached_head(repo_root):
+            return self._truncate_output(_DETACHED_HEAD_ERROR)
         # Probe the existing registrations ONCE (read-only). If a worktree is
         # already registered at the target path, refuse without running
         # `git worktree add` (which would fail or reuse the registration).
