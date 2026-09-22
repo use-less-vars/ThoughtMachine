@@ -1537,6 +1537,17 @@ class GitReadTool(ToolBase):
             args = ["show", "--no-ext-diff", "--no-textconv"]
             if self.format:
                 args.append(f"--format={self.format}")
+            if not isinstance(self.commit, str) or not self.commit:
+                return self._truncate_output(
+                    "Error: commit must be a non-empty string for a show "
+                    "line range"
+                )
+            if ":" in self.commit:
+                return self._truncate_output(
+                    "Error: commit must not contain ':' -- show builds the "
+                    "<commit>:<path> selector itself, so a colon in commit "
+                    "would yield a malformed doubled selector"
+                )
             args.append(f"{self.commit}:{rel_paths[0]}")
             exit_code, stdout, stderr = self._run_git_raw(
                 repo_root, args, timeout=30
