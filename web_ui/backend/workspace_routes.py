@@ -550,8 +550,10 @@ def _collect_active_workers(ws_id: str) -> List[Dict[str, Any]]:
       1. Sessions registered for this workspace (``SessionRegistry``); worker
          threads are looked up per session via the WorkerManager.
       2. Fallback when no open session maps to the workspace: scan the entire
-         worker registry and keep threads whose session id is empty or whose
-         thread cannot be attributed to another workspace.
+         worker registry and keep only threads attributable to this workspace.
+         Threads with no session id, or whose session maps to a different
+         workspace, are not listed here. See design/unattributed-worker-surface
+         for where unattributed workers should surface.
     """
     manager = _resolve_worker_manager()
     if manager is None:
@@ -596,8 +598,7 @@ def _collect_active_workers(ws_id: str) -> List[Dict[str, Any]]:
             for thread in threads:
                 _append(thread)
     else:
-        # No open session maps to this workspace: fall back to a full-registry
-        # scan and keep threads that are not attributable to another workspace.
+        # keep only threads attributable to this workspace. Empty-session and other-workspace threads are excluded; see design/unattributed-worker-surface.
         try:
             registry = getattr(manager, "_registry", None)
             all_workers = getattr(registry, "get_all_workers", lambda: {})() or {}
@@ -613,7 +614,7 @@ def _collect_active_workers(ws_id: str) -> List[Dict[str, Any]]:
                     s = sessions.get(str(sid))
                     if isinstance(s, dict):
                         owner_ws = s.get("workspace_id")
-                if sid and owner_ws != ws_id:
+                if not sid or owner_ws != ws_id:
                     continue
             except Exception:
                 pass

@@ -187,8 +187,8 @@ def test_get_active_workers_session_scoped(tmp_path, monkeypatch):
 
 def test_get_active_workers_fallback_all_registry(tmp_path, monkeypatch):
     """No open session maps to the workspace -> fall back to scanning the
-    whole registry, keeping threads whose session maps to this workspace
-    (or whose session id is empty) and skipping other workspaces' threads."""
+    whole registry, keeping threads attributable to this workspace; empty-
+    session threads are excluded (see design/unattributed-worker-surface)."""
     _use_tmp_workspace(monkeypatch, tmp_path)
     started = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
 
@@ -201,6 +201,7 @@ def test_get_active_workers_fallback_all_registry(tmp_path, monkeypatch):
                                      started_at=started, session_id="s1"),
             ("s9", "w9", 1): _thread("w9", instance_id=1, status="ready",
                                      started_at=started, session_id="s9"),
+            # empty session_id -> not attributable to any workspace, excluded
             ("", "orphan", 1): _thread("orphan", instance_id=1, status="ready",
                                        started_at=started, session_id=""),
         }),
@@ -214,7 +215,7 @@ def test_get_active_workers_fallback_all_registry(tmp_path, monkeypatch):
     })
 
     rows = asyncio.run(workspace_routes.get_active_workers("ws-1"))
-    assert {e["worker_name"] for e in rows} == {"w1", "w2", "orphan"}, rows
+    assert {e["worker_name"] for e in rows} == {"w1", "w2"}, rows
     for entry in rows:
         assert set(entry.keys()) == {
             "worker_name", "instance_id", "status", "elapsed",
