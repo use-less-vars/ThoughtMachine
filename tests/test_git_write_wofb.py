@@ -145,8 +145,9 @@ def test_full_write_grant_commit_allowed_on_protected_branch(tmp_path):
     ), mock.patch.object(tool_sp, "_git_add", return_value=""):
         result_sp = tool_sp._git_commit(repo)
     assert "git:write denied" not in result_sp
-    assert run_sp.call_count == 1
-    assert run_sp.call_args_list[0].args[1][0] == "commit"
+    assert run_sp.call_count == 2
+    assert run_sp.call_args_list[0].args[1] == ["rev-parse", "--abbrev-ref", "HEAD"]
+    assert run_sp.call_args_list[1].args[1][0] == "commit"
 
     tool_eff = _commit_tool(
         agent_config={},
@@ -159,8 +160,9 @@ def test_full_write_grant_commit_allowed_on_protected_branch(tmp_path):
     ), mock.patch.object(tool_eff, "_git_add", return_value=""):
         result_eff = tool_eff._git_commit(repo)
     assert "git:write denied" not in result_eff
-    assert run_eff.call_count == 1
-    assert run_eff.call_args_list[0].args[1][0] == "commit"
+    assert run_eff.call_count == 2
+    assert run_eff.call_args_list[0].args[1] == ["rev-parse", "--abbrev-ref", "HEAD"]
+    assert run_eff.call_args_list[1].args[1][0] == "commit"
 
 
 # ── Worker path: ask git level auto-denied (no interactive user) ──────────
