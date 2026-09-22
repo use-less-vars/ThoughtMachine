@@ -1,7 +1,7 @@
 /*
  * QueryBar.jsx
  *
- * Text input + a single Run/Pause toggle button (no Stop/Resume buttons).
+ * Text input + a Run/Pause toggle plus separate Stop/Resume controls.
  *
  * Button logic:
  *   status      Button                 Command sent
@@ -10,6 +10,9 @@
  *   PAUSING     ⏸ Pausing… (disabled)  —
  *   otherwise   ▶ Run                  start_session (fresh session) /
  *                                      continue_session(query) (loaded session)
+ *   not IDLE /  ⏹ Stop                 stop_session
+ *   not connecting
+ *   PAUSED      ▶ Resume               resume_session
  *
  * The Run button is disabled while the session is connecting and, when IDLE,
  * until the query is non-empty. Enter (without Shift) triggers the same toggle
@@ -67,6 +70,14 @@ function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, ses
     }
   }
 
+  const handleStop = () => {
+    sendCommand('stop_session', {})
+  }
+
+  const handleResume = () => {
+    sendCommand('resume_session', {})
+  }
+
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey && (isIdle || isWaiting || isPaused)) {
       e.preventDefault()
@@ -101,7 +112,7 @@ function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, ses
         rows={1}
       />
       <div className="query-buttons">
-        {/* Toggle Run/Pause — always visible. No Resume button. */}
+        {/* Toggle Run/Pause — always visible. Stop/Resume are separate controls. */}
         {isBusy ? (
           <button className="btn btn-pause" onClick={handleToggle}>
             ⏸ Pause
@@ -119,6 +130,13 @@ function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, ses
             {isConnecting ? 'Connecting…' : '▶ Run'}
           </button>
         )}
+        {/* Stop — disabled while idle/connecting. Resume — enabled only when PAUSED. */}
+        <button className="btn btn-stop" onClick={handleStop} disabled={isIdle || isConnecting}>
+          ⏹ Stop
+        </button>
+        <button className="btn btn-resume" onClick={handleResume} disabled={!isPaused}>
+          ▶ Resume
+        </button>
       </div>
     </div>
   )

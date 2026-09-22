@@ -675,6 +675,14 @@ body {
   filter: brightness(1.1);
 }
 
+.btn-resume {
+  background: var(--accent);
+  color: var(--bg-primary);
+}
+.btn-resume:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    SessionList (right sidebar)
    ────────────────────────────────────────────────────────────────────────── */
