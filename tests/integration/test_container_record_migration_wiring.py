@@ -544,7 +544,7 @@ def test_lifespan_boot_drift_scan_inspects_each_container_record(
 
     scanned = []
 
-    def fake_scan(record, containers, *, workspace_id):
+    def fake_scan(record, containers, *, workspace_id, **kwargs):
         scanned.append((workspace_id, record.id))
 
     monkeypatch.setattr(drift_module, "scan_record", fake_scan)
@@ -576,7 +576,7 @@ def test_lifespan_boot_drift_scan_is_capped(monkeypatch, vault):
 
     scanned = []
 
-    def fake_scan(record, containers, *, workspace_id):
+    def fake_scan(record, containers, *, workspace_id, **kwargs):
         scanned.append(record.id)
 
     monkeypatch.setattr(drift_module, "scan_record", fake_scan)
@@ -603,7 +603,7 @@ def test_boot_drift_scan_exception_does_not_break_startup(monkeypatch, vault):
 
     from thoughtmachine.container_record import drift as drift_module
 
-    def boom(record, containers, *, workspace_id):
+    def boom(record, containers, *, workspace_id, **kwargs):
         raise RuntimeError("drift detector exploded")
 
     monkeypatch.setattr(drift_module, "scan_record", boom)
@@ -618,4 +618,85 @@ def test_boot_drift_scan_exception_does_not_break_startup(monkeypatch, vault):
     assert warned, events
     # Startup continued past the failure (later lifecycle steps still ran).
     assert any("sweep scheduled" in e[2] for e in events), events
+
+
+def test_lifespan_boot_drift_scan_threads_capabilities_and_permissions(
+    monkeypatch, vault
+):
+    """Every boot-scan call must carry real capabilities + a permissions map.
+
+    Without them ``resolve_container_config`` fails (``capabilities_required``
+    / ``bad_permissions``) and the policy axis of drift detection is silently
+    suppressed.  The scan must therefore thread the live workspace
+    capabilities (never ``None``) and a ``permissions`` mapping through to
+    ``scan_record``.
+    """
+    server = _load_server()
+    ws = "ws-drift-axes"
+    _make_container_record(ws, "cid-a", vault)
+    _make_container_record(ws, "cid-b", vault)
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    _record_log(monkeypatch, server)
+
+    from thoughtmachine.container_record import drift as drift_module
+
+    calls = []
+
+    def fake_scan(record, containers, *, workspace_id, **kwargs):
+        calls.append((workspace_id, record.id, kwargs))
+
+    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+
+    _run_lifespan(server)
+
+    assert calls, "the boot scan never invoked scan_record"
+    assert all(kw.get("capabilities") is not None for _ws, _rid, kw in calls)
+    assert all(kw.get("permissions") is not None for _ws, _rid, kw in calls)
+
+
+def test_boot_drift_scan_loads_capabilities_once_per_workspace(
+    monkeypatch, vault
+):
+    """Capabilities are looked up at most once per unique workspace per boot."""
+    server = _load_server()
+    ws_a = "ws-cache-a"
+    ws_b = "ws-cache-b"
+    _make_container_record(ws_a, "cid-a1", vault)
+    _make_container_record(ws_a, "cid-a2", vault)
+    _make_container_record(ws_b, "cid-b1", vault)
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    _record_log(monkeypatch, server)
+
+    from thoughtmachine import workspace_capabilities as caps_module
+    from thoughtmachine.container_record import drift as drift_module
+
+    load_calls = []
+
+    def counting_load(workspace_id):
+        load_calls.append(workspace_id)
+        return None  # force the default-capabilities fallback
+
+    # The source imports ``load_workspace_capabilities`` lazily (function-local)
+    # so patching the module attribute is what the running code observes.
+    monkeypatch.setattr(caps_module, "load_workspace_capabilities", counting_load)
+
+    scanned = []
+
+    def fake_scan(record, containers, *, workspace_id, **kwargs):
+        scanned.append((workspace_id, record.id))
+
+    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+
+    _run_lifespan(server)
+
+    assert len(scanned) == 3, scanned
+    # Exactly once per unique container-bearing workspace (never once per
+    # record): the two records in ``ws_a`` share a single lookup.
+    assert set(load_calls) == {ws_a, ws_b}, load_calls
+    assert load_calls.count(ws_a) == 1, load_calls
+    assert load_calls.count(ws_b) == 1, load_calls
 
