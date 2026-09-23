@@ -563,11 +563,11 @@ def test_git_info_tool_resolves_overlay_image(monkeypatch, tmp_path):
     assert fake_mgr.ensure_calls == ["git"]
     assert len(fake_mgr.exec_calls) == 1
     argv = fake_mgr.exec_calls[0]["cmd"]
-    assert argv == ["git", "status", "--short"]
+    assert argv == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "status", "--short"]
     assert argv[0] == "git"
     # raw argv dispatch: no shell wrapper, no host-only --no-verify hardening
     assert "/bin/sh" not in argv
-    assert "-c" not in argv
+    assert argv.count("-c") == 2
     assert "--no-verify" not in argv
     # repo root maps to the containerized /workspace
     assert fake_mgr.exec_calls[0]["workdir"] == "/workspace"

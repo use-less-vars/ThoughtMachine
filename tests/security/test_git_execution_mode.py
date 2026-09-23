@@ -124,7 +124,7 @@ class TestContainerCommitArgs:
 
         assert len(manager.calls) == 1
         command, _kwargs = manager.calls[0]
-        assert command == ["git", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
+        assert command == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
         assert "--no-verify" not in command
 
     def test_non_commit_ops_unaffected(self, tmp_path):
@@ -136,7 +136,7 @@ class TestContainerCommitArgs:
 
         assert len(manager.calls) == 1
         command, _kwargs = manager.calls[0]
-        assert command == ["git", "status"]
+        assert command == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "status"]
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,8 @@ class TestSelfHealingModeRouting:
         assert len(execs) == 1
         command = execs[0][1]
         assert command == [
-            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "-c", "core.hooksPath=/workspace/.githooks",
             "commit", "-m", "x",
         ]
         assert "--no-verify" not in command

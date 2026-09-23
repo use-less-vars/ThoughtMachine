@@ -335,7 +335,7 @@ def test_container_commit_does_not_skip_hooks(tmp_path):
 
     assert len(manager.calls) == 1
     command, _kwargs = manager.calls[0]
-    assert command == ["git", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
+    assert command == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
     assert "--no-verify" not in command
 
 
