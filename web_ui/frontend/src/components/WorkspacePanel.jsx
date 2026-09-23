@@ -1,6 +1,7 @@
 import React from 'react';
 import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
 import WorkerManagementPanel from './WorkerManagementPanel';
+import WorkerBlueprintPanel from './WorkerBlueprintPanel';
 import DockerfileEditor from './DockerfileEditor';
 import DomainAllowlistEditor from './DomainAllowlistEditor';
 import ContainerListPanel from './workspace/ContainerListPanel';
@@ -190,6 +191,12 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Workers</strong></label>
         <WorkerManagementPanel workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} sessionId={sessionId} isActive={isActive} />
+      </div>
+
+      {/* Worker Blueprints */}
+      <div style={sectionStyle}>
+        <label style={labelStyle}><strong>Worker Blueprints</strong></label>
+        <WorkerBlueprintPanel workspaceId={workspaceId} />
       </div>
 
       {/* Containers */}

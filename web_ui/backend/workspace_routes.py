@@ -648,6 +648,134 @@ async def get_active_workers(
     return entries
 
 
+# ── Worker blueprints /api/workspace/{ws_id}/workers/blueprints ───────────────
+#
+# Blueprint endpoints expose the workspace's worker definitions as validated,
+# fully-normalised ``WorkerDefinition`` payloads and support in-place field
+# edits.  They are registered BEFORE the ``/{ws_id}/workers/{name}``
+# PUT/DELETE routes so the literal ``blueprints`` path segment wins over the
+# ``{name}`` path parameter.
+
+
+def _load_worker_blueprints(ws_id: str) -> List[Any]:
+    """Read the raw ``workers.json`` list for *ws_id*.
+
+    Raises 404 when the file does not exist (blueprint writes never create it)
+    and 422 when the file is unreadable or not a JSON array.
+    """
+    path = _workspace_dir(ws_id) / "workers.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workers file not found",
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid workers.json: {exc}",
+        )
+    if not isinstance(data, list):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="workers.json is not a JSON array",
+        )
+    return data
+
+
+def _blueprint_name(entry: Any) -> Optional[str]:
+    """Return the worker name of a raw ``workers.json`` entry (else None)."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        name = entry.get("name")
+        return name if isinstance(name, str) else None
+    return None
+
+
+def _normalise_blueprint(entry: Any) -> Dict[str, Any]:
+    """Validate a raw entry through ``WorkerDefinition`` and dump every field.
+
+    Legacy string entries are treated as a bare worker name.  Invalid entries
+    raise 422 (naming the offending worker when known).
+    """
+    candidate = {"name": entry} if isinstance(entry, str) else entry
+    try:
+        return WorkerDefinition.model_validate(candidate).model_dump()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(f"Invalid worker blueprint '{_blueprint_name(entry)}': {exc}"),
+        )
+
+
+@router.get("/{ws_id}/workers/blueprints")
+async def list_worker_blueprints(ws_id: str) -> List[Dict[str, Any]]:
+    """Return the workspace's worker blueprints as normalised definitions."""
+    raw = _load_worker_blueprints(ws_id)
+    return [_normalise_blueprint(entry) for entry in raw]
+
+
+@router.get("/{ws_id}/workers/blueprints/{name}")
+async def get_worker_blueprint(ws_id: str, name: str) -> Dict[str, Any]:
+    """Return a single normalised worker blueprint by name (404 when absent)."""
+    raw = _load_worker_blueprints(ws_id)
+    for entry in raw:
+        if _blueprint_name(entry) == name:
+            return _normalise_blueprint(entry)
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Worker '{name}' not found",
+    )
+
+
+@router.patch("/{ws_id}/workers/blueprints/{name}")
+async def patch_worker_blueprint(
+    ws_id: str, name: str, request: Request
+) -> Dict[str, Any]:
+    """Apply a partial update to a worker blueprint in place.
+
+    Only the fields present in the request body are changed; the merged result
+    is validated against ``WorkerDefinition`` and ``workers.json`` is rewritten
+    atomically.  Every other entry is preserved verbatim and the file is never
+    created when it is missing.
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}")
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must be a JSON object",
+        )
+
+    raw = _load_worker_blueprints(ws_id)
+    index = next(
+        (i for i, entry in enumerate(raw) if _blueprint_name(entry) == name),
+        None,
+    )
+    if index is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Worker '{name}' not found",
+        )
+
+    existing = raw[index]
+    merged = dict(existing) if isinstance(existing, dict) else {"name": existing}
+    merged.update(body)
+    try:
+        updated = WorkerDefinition.model_validate(merged)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    raw[index] = updated.model_dump()
+    path = _workspace_dir(ws_id) / "workers.json"
+    _atomic_write_json(raw, path)
+    return updated.model_dump()
+
+
 # ── POST /api/workspace/{ws_id}/workers ───────────────────────────────────────
 
 @router.post("/{ws_id}/workers", status_code=status.HTTP_201_CREATED)

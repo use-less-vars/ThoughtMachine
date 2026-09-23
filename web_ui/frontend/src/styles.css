@@ -2409,3 +2409,143 @@ body {
   color: var(--text-primary);
 }
 
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Worker blueprint editor (feature C.2)
+   ────────────────────────────────────────────────────────────────────────── */
+.worker-blueprint-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.blueprint-load-error {
+  background: rgba(243, 139, 168, 0.12);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  color: var(--danger);
+  font-size: 0.8rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.blueprint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.blueprint-empty {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  padding: 0.5rem 0;
+}
+
+.blueprint-row {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.blueprint-row:hover {
+  border-color: var(--accent);
+}
+
+.blueprint-row--selected {
+  border-color: var(--accent);
+  background: rgba(137, 180, 250, 0.12);
+}
+
+.blueprint-row-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.blueprint-row-description {
+  color: var(--text-secondary);
+  flex: 1;
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.blueprint-row-thresholds {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.blueprint-edit-form {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+}
+
+.blueprint-edit-title {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.blueprint-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.blueprint-field-label {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.blueprint-field-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  outline: none;
+  padding: 0.35rem 0.45rem;
+  width: 100%;
+}
+
+.blueprint-field-input:focus {
+  border-color: var(--accent);
+}
+
+.blueprint-field-input--multiline {
+  font-family: var(--font-mono);
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.blueprint-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.blueprint-error {
+  background: rgba(243, 139, 168, 0.12);
+  border: 1px solid var(--danger);
+  border-radius: 4px;
+  color: var(--danger);
+  font-size: 0.8rem;
+  padding: 0.35rem 0.5rem;
+}
+
+.restart-to-apply-hint {
+  color: var(--warning);
+  font-size: 0.75rem;
+}
+
