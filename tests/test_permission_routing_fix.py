@@ -177,7 +177,7 @@ class TestContainerPath:
         # container-mapped absolute workspace .githooks dir; workspace-local
         # hooks only) and does NOT inject --no-verify: the resource
         # container is the security boundary.
-        assert command == ["git", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
+        assert command == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
 
     def test_container_banned_commit_denied(self, tmp_path):
         manager = FakeManager()

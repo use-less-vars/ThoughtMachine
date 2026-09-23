@@ -1002,7 +1002,7 @@ class TestPermissionRouting:
         assert len(manager.calls) == 1
         command, _kwargs = manager.calls[0]
         assert command == [
-            "git", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x",
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x",
         ]
 
     def test_container_banned_commit_denied(self, tmp_path):

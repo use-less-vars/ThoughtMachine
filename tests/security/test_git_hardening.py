@@ -177,13 +177,13 @@ def test_container_path_commit_runs_githooks_only(tmp_path):
 
     assert len(manager.calls) == 1
     command, _kwargs = manager.calls[0]
-    assert command == ["git", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
+    assert command == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
     assert "--no-verify" not in command
 
     # Non-commit operations are unaffected by the hook-path override.
     tool._exec_container_raw(tmp_path, ["status"])
     command2, _kwargs2 = manager.calls[1]
-    assert command2 == ["git", "status"]
+    assert command2 == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "status"]
 
 
 def test_commit_still_succeeds(hardened_repo):
