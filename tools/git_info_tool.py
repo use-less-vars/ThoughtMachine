@@ -864,6 +864,12 @@ class GitReadTool(ToolBase):
             "-c", "filter.smudge=",
             "-c", "diff.textconv=",
             "-c", "credential.helper=",
+            # EOL policy: system gitconfig is nulled (GIT_CONFIG_SYSTEM=/dev/null),
+            # so on Windows a system core.autocrlf=true would be silently dropped
+            # and a git-windows checkout could rewrite line endings; pin EOL
+            # handling explicitly (all -c pins precede the subcommand).
+            "-c", "core.autocrlf=input",
+            "-c", "core.eol=lf",
         ]
         # commit additionally skips pre-commit/commit-msg hooks via
         # --no-verify as a second line of defense.
@@ -1004,8 +1010,14 @@ class GitReadTool(ToolBase):
                 if isinstance(key, str) and isinstance(value, str):
                     environment[key] = value
 
+        # EOL policy: system gitconfig is nulled (GIT_CONFIG_SYSTEM=/dev/null),
+        # so on Windows a system core.autocrlf=true would be silently dropped and
+        # a git-windows checkout could rewrite line endings; pin EOL handling
+        # explicitly. These -c pairs MUST precede the subcommand.
+        eol_args = ["-c", "core.autocrlf=input", "-c", "core.eol=lf"]
+
         result = manager.exec(
-            ["git"] + args,
+            ["git"] + eol_args + args,
             workdir=self._to_container_path(repo_root),
             environment=environment,
             timeout=timeout,

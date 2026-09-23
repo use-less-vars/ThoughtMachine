@@ -233,9 +233,18 @@ class TestBranchCreate:
         # the first exec is the detached-HEAD probe; the second resolves the
         # base -> immutable SHA and the third pins the branch to that SHA
         # (never the bare `git branch <name>` form).
-        assert execs[0][1] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
-        assert execs[1][1] == ["git", "rev-parse", "--verify", "HEAD^{commit}"]
-        assert execs[2][1] == ["git", "branch", "feature/x", "ok"]
+        assert execs[0][1] == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "rev-parse", "--abbrev-ref", "HEAD",
+        ]
+        assert execs[1][1] == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "rev-parse", "--verify", "HEAD^{commit}",
+        ]
+        assert execs[2][1] == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "branch", "feature/x", "ok",
+        ]
         assert execs[2][2]["workdir"] == "/workspace"
         assert "execution_mode: containerized" in result
         assert "Created branch 'feature/x' at ok" in result
@@ -370,7 +379,10 @@ class TestCheckout:
         result = tool._git_checkout(tmp_path)
 
         _kind, command, _kwargs = _last_manager_exec(fake_manager)
-        assert command == ["git", "checkout", "feature/x"]
+        assert command == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "checkout", "feature/x",
+        ]
         assert "execution_mode: containerized" in result
 
     def test_no_b_or_double_dash_smuggled(self, tmp_path, fake_sandbox):
@@ -411,7 +423,10 @@ class TestStage:
         result = tool._git_stage(tmp_path)
 
         _kind, command, _kwargs = _last_manager_exec(fake_manager)
-        assert command == ["git", "add", "--", "a.txt", "b.txt"]
+        assert command == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "add", "--", "a.txt", "b.txt",
+        ]
         assert "execution_mode: containerized" in result
 
     def test_single_str_path(self, tmp_path, fake_sandbox):
@@ -499,7 +514,10 @@ class TestUnstage:
         result = tool._git_unstage(tmp_path)
 
         _kind, command, _kwargs = _last_manager_exec(fake_manager)
-        assert command == ["git", "reset", "HEAD", "--", "a.txt"]
+        assert command == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "reset", "HEAD", "--", "a.txt",
+        ]
         assert "execution_mode: containerized" in result
 
     def test_never_bare_reset(self, tmp_path, fake_sandbox):
@@ -532,7 +550,8 @@ class TestDiffCached:
 
         _kind, command, _kwargs = _last_manager_exec(fake_manager)
         assert command == [
-            "git", "diff", "--cached", "--no-ext-diff", "--no-textconv",
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "diff", "--cached", "--no-ext-diff", "--no-textconv",
             "--", "a.txt",
         ]
         assert "execution_mode: containerized" in result
@@ -556,7 +575,10 @@ class TestBranchList:
         result = tool._git_branch_list(tmp_path)
 
         _kind, command, _kwargs = _last_manager_exec(fake_manager)
-        assert command == ["git", "branch", "--list"]
+        assert command == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "branch", "--list",
+        ]
         assert "execution_mode: containerized" in result
 
     def test_all_branches_flag(self, tmp_path, fake_sandbox):
@@ -583,7 +605,8 @@ class TestCommit:
 
         _kind, command, _kwargs = _last_manager_exec(fake_manager)
         assert command == [
-            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "-c", "core.hooksPath=/workspace/.githooks",
             "commit", "-m", "msg", "--", "a.txt",
         ]
         assert "--no-verify" not in command
@@ -624,11 +647,15 @@ class TestCommit:
         execs = [c for c in fake_manager.calls if c[0] == "exec"]
         # detached-HEAD probe + explicit stage of the named path + commit
         assert len(execs) == 3
-        assert execs[1][1] == ["git", "add", "--", "hello.txt"]
+        assert execs[1][1] == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "add", "--", "hello.txt",
+        ]
         assert "-A" not in execs[1][1]
         _kind, command, _kwargs = execs[-1]
         assert command == [
-            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "-c", "core.hooksPath=/workspace/.githooks",
             "commit", "-m", "add hello", "--", "hello.txt",
         ]
         assert "-A" not in command
@@ -704,7 +731,10 @@ class TestCommit:
         assert all("reset" not in c[1] for c in execs)  # no index reset
         # The stage subprocess precedes the commit; the message only ever
         # appears in the commit argv, as a single element.
-        assert execs[1][1] == ["git", "add", "--", "a.txt"]
+        assert execs[1][1] == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "add", "--", "a.txt",
+        ]
         assert "-A" not in execs[1][1]
         _kind, command, _kwargs = execs[-1]
         assert "x --no-verify" in command
@@ -1907,10 +1937,17 @@ class TestCommitContainerRoundTrip:
         execs = [c for c in manager.calls if c[0] == "exec"]
         # 1st exec is the detached-HEAD probe; then the named path is staged
         # and finally the hooksPath-pinned commit runs.
-        assert execs[0][1] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
-        assert execs[1][1] == ["git", "add", "--", "hello.txt"]
+        assert execs[0][1] == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "rev-parse", "--abbrev-ref", "HEAD",
+        ]
+        assert execs[1][1] == [
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "add", "--", "hello.txt",
+        ]
         assert execs[2][1] == [
-            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "git", "-c", "core.autocrlf=input", "-c", "core.eol=lf",
+            "-c", "core.hooksPath=/workspace/.githooks",
             "commit", "-m", "add hello", "--", "hello.txt",
         ]
         assert "--no-verify" not in execs[2][1]
@@ -1921,4 +1958,119 @@ class TestCommitContainerRoundTrip:
         )
         assert "execution_mode: containerized" in result
         assert "failure_reason: none" in result
+
+
+# ---------------------------------------------------------------------------
+# EOL normalization (fix/git-eol-normalization-windows)
+#
+# Every git invocation, on BOTH execution backends, must pin
+# ``core.autocrlf=input`` and ``core.eol=lf`` so a Windows checkout (or a
+# git-for-windows git) never rewrites line endings in the workspace tree.
+# The pin MUST travel as ``-c key=value`` ARGV pairs placed BEFORE the git
+# subcommand (git only honours ``-c`` before the subcommand); it must NOT be
+# smuggled through the child environment and must NOT be a bare token.
+# ---------------------------------------------------------------------------
+
+# The exact config pins that must appear as ``-c key=value`` argv pairs.
+_EOL_CONFIG_PINS = ("core.autocrlf=input", "core.eol=lf")
+
+
+def _c_pair_index(command, pin):
+    """Index of ``pin`` iff it is the value of a ``-c`` flag, else ``-1``.
+
+    A pin that is bare (no ``-c`` immediately before it) is NOT a config pin
+    and yields ``-1``.
+    """
+    if pin not in command:
+        return -1
+    idx = command.index(pin)
+    if idx == 0 or command[idx - 1] != "-c":
+        return -1
+    return idx
+
+
+def _git_subcommand_index(command):
+    """Index of the git subcommand, skipping the executable + ``-c`` pairs."""
+    i = 1  # command[0] is the executable ("git")
+    while i < len(command) and command[i] == "-c":
+        i += 2
+    return i
+
+
+def _assert_no_eol_in_env(env):
+    flat = " ".join(f"{k}={v}" for k, v in env.items())
+    assert "core.autocrlf" not in flat, (
+        f"EOL pins must be argv, not environment: {env!r}"
+    )
+    assert "core.eol" not in flat, (
+        f"EOL pins must be argv, not environment: {env!r}"
+    )
+
+
+class TestGitEolNormalization:
+    """The hardened git argv normalizes line endings on every backend."""
+
+    def test_host_argv_pins_autocrlf_input_and_eol_lf(self, tmp_path, fake_sandbox):
+        """T1: the HOST backend's git argv carries both ``-c`` EOL pins."""
+        tool = _read_host_tool(tmp_path, operation="status")
+        tool._exec_host_raw(tmp_path, ["status", "--porcelain"])
+
+        command = _last_sandbox_command()
+        for pin in _EOL_CONFIG_PINS:
+            assert _c_pair_index(command, pin) != -1, (
+                f"host git argv must pin {pin!r} as '-c {pin}'; got {command!r}"
+            )
+
+    def test_container_argv_pins_autocrlf_input_and_eol_lf(
+        self, tmp_path, fake_manager
+    ):
+        """T2: the CONTAINER backend's git argv carries both ``-c`` EOL pins."""
+        tool = _read_container_tool(tmp_path, fake_manager, operation="status")
+        tool._exec_container_raw(tmp_path, ["status"], manager=fake_manager)
+
+        _kind, command, _kwargs = _last_manager_exec(fake_manager)
+        for pin in _EOL_CONFIG_PINS:
+            assert _c_pair_index(command, pin) != -1, (
+                f"container git argv must pin {pin!r} as '-c {pin}'; "
+                f"got {command!r}"
+            )
+
+    def test_eol_pins_are_pre_subcommand_argv_not_env(
+        self, tmp_path, fake_sandbox, fake_manager
+    ):
+        """T3: the pins are ``-c key=value`` argv args BEFORE the subcommand --
+        never environment variables and never bare tokens -- on both backends."""
+        # --- Host backend ---------------------------------------------------
+        host_tool = _read_host_tool(tmp_path, operation="status")
+        host_tool._exec_host_raw(tmp_path, ["status", "--porcelain"])
+        host_command, host_kwargs = _FakeSandbox.instances[-1].calls[-1]
+
+        host_sub = _git_subcommand_index(host_command)
+        for pin in _EOL_CONFIG_PINS:
+            idx = _c_pair_index(host_command, pin)
+            assert idx != -1, (
+                f"host argv missing '-c {pin}': {host_command!r}"
+            )
+            assert idx < host_sub, (
+                f"host '-c {pin}' must precede the subcommand "
+                f"{host_command[host_sub]!r}; got {host_command!r}"
+            )
+        _assert_no_eol_in_env(host_kwargs.get("extra_env") or {})
+
+        # --- Container backend ---------------------------------------------
+        cont_tool = _read_container_tool(tmp_path, fake_manager, operation="status")
+        cont_tool._exec_container_raw(tmp_path, ["status"], manager=fake_manager)
+        _kind, cont_command, cont_kwargs = _last_manager_exec(fake_manager)
+
+        cont_sub = _git_subcommand_index(cont_command)
+        for pin in _EOL_CONFIG_PINS:
+            idx = _c_pair_index(cont_command, pin)
+            assert idx != -1, (
+                f"container argv missing '-c {pin}': {cont_command!r}"
+            )
+            assert idx < cont_sub, (
+                f"container '-c {pin}' must precede the subcommand "
+                f"{cont_command[cont_sub]!r}; got {cont_command!r}"
+            )
+        _assert_no_eol_in_env(cont_kwargs.get("environment") or {})
 
