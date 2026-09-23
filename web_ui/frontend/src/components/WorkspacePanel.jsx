@@ -3,6 +3,7 @@ import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
 import WorkerManagementPanel from './WorkerManagementPanel';
 import DockerfileEditor from './DockerfileEditor';
 import DomainAllowlistEditor from './DomainAllowlistEditor';
+import ContainerListPanel from './workspace/ContainerListPanel';
 import { getPill } from '../data/permissionVocab';
 
 // ── Catppuccin palette matching ConfigPanel ──────────────────────────────
@@ -189,6 +190,12 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Workers</strong></label>
         <WorkerManagementPanel workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} sessionId={sessionId} isActive={isActive} />
+      </div>
+
+      {/* Containers */}
+      <div style={sectionStyle}>
+        <label style={labelStyle}><strong>Containers</strong></label>
+        <ContainerListPanel workspaceId={workspaceId} />
       </div>
 
       {/* Effective Permissions */}

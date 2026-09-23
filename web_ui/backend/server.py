@@ -159,6 +159,10 @@ from web_ui.backend.global_routes import router as global_router
 from web_ui.backend.provider_routes import router as provider_router
 from web_ui.backend.vault_repair_routes import router as vault_repair_router
 from web_ui.backend.container_record_routes import router as container_record_router
+from web_ui.backend.container_record_routes import (
+    _compute_drift,
+    _serialise,
+)
 
 # ── ConfigManager (facade for all config operations) ────────────────────────
 from web_ui.backend.config_manager import (
@@ -3204,6 +3208,117 @@ def _hardening_json(container) -> dict:
     return {"status": "conformant", "failed": []}
 
 
+# Raw Docker container status -> container-view entry ``state`` mapping.
+_CONTAINER_VIEW_RAW_STATE = {
+    "running": "running",
+    "restarting": "running",
+    "paused": "paused",
+    "exited": "exited",
+    "dead": "exited",
+    "created": "stopped",
+    "stopped": "stopped",
+    "removing": "stopped",
+    "missing": "stopped",
+    "error": "stopped",
+}
+
+#: Record ``state`` (fallback when no live status can be read) -> entry state.
+_CONTAINER_VIEW_RECORD_STATE = {
+    "running": "running",
+    "creating": "stopped",
+    "": "stopped",
+}
+
+
+def _map_container_view_state(status, record_state):
+    """Map (raw status dict-or-None, record.state) -> entry ``state`` value.
+
+    OOMKilled True overrides everything -> ``oom``; otherwise the raw Docker
+    status is mapped; when no usable live status exists the record's last
+    observed state is mapped instead (fail-safe default ``stopped``).
+    """
+    if isinstance(status, dict):
+        if status.get("oom_killed"):
+            return "oom"
+        raw = status.get("status")
+        if raw in _CONTAINER_VIEW_RAW_STATE:
+            return _CONTAINER_VIEW_RAW_STATE[raw]
+    return _CONTAINER_VIEW_RECORD_STATE.get(record_state or "", "stopped")
+
+
+def _container_view_entry(record, manager, workspace_id):
+    """Build one container-view entry dict from a record (+ its live status).
+
+    Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
+    permission_drift, shared``. ``kind`` is ``ephemeral`` for ephemeral
+    lifecycle records and ``runtime`` otherwise (there is no ``runtime``
+    lifecycle_class). ``shared`` is True for runtime containers.
+    ``permission_drift`` is ``None`` when either side is unknown (an unwired /
+    pre-v5 record has no ``permissions``) -- the underlying drift helper is
+    already fail-safe and returns ``None`` when Docker is unavailable.
+    """
+    lifecycle = getattr(record, "lifecycle_class", "") or ""
+    kind = "ephemeral" if lifecycle == "ephemeral" else "runtime"
+    permissions = getattr(record, "permissions", None)
+    if permissions is None:
+        permission_drift = None
+    else:
+        try:
+            permission_drift = _compute_drift(record, workspace_id)
+        except Exception:
+            permission_drift = None
+    docker_id = getattr(record, "docker_id", None)
+    status = None
+    if docker_id:
+        try:
+            status = manager.status(docker_id)
+        except Exception:
+            status = None
+    state = _map_container_view_state(status, getattr(record, "state", ""))
+    return {
+        "id": record.id,
+        "name": getattr(record, "name", "") or "",
+        "kind": kind,
+        "state": state,
+        "intent_snapshot": getattr(record, "intent_snapshot", None),
+        "permissions": permissions,
+        "permission_drift": permission_drift,
+        "shared": kind == "runtime",
+    }
+
+
+def _build_container_view_lists(manager, workspace_id):
+    """Return ``(session, workspace)`` entry lists for the container-view GET.
+
+    Records come from the durable store (``api.list_records``) split by
+    ``lifecycle_class``: ephemeral -> ``session`` (shared False); every other
+    lifecycle (resource/service/persistent) -> ``workspace`` (kind ``runtime``,
+    shared True). ``ContainerManager.list_containers()`` hides resource
+    containers, so it cannot enumerate the workspace group.
+    """
+    from thoughtmachine.container_record import api as _cr_api
+
+    records = _cr_api.list_records(workspace_id) or []
+    session = []
+    workspace = []
+    for record in records:
+        entry = _container_view_entry(record, manager, workspace_id)
+        if entry["kind"] == "ephemeral":
+            session.append(entry)
+        else:
+            workspace.append(entry)
+    return session, workspace
+
+
+def _view_action_container_id(manager, record):
+    """Resolve a record's container handle via the name index, then docker_id."""
+    try:
+        container_id = _find_container_id(manager, record.name) if record.name else None
+    except Exception:
+        container_id = None
+    return container_id or record.docker_id or None
+
+
 @app.get("/api/workspace/{workspace_id}/containers")
 def workspace_containers(workspace_id: str, workspace_path: str = ""):
     """List containers for the workspace."""
@@ -3232,10 +3347,20 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
             cap = max(1, int(raw_cap))
         except (TypeError, ValueError):
             cap = 6
+        # Best-effort extension: a record-store failure must never sink the
+        # legacy container list -- the three legacy keys are always returned.
+        try:
+            session, workspace = _build_container_view_lists(manager, workspace_id)
+        except Exception as exc:
+            log("ERROR", "server.workspace_containers",
+                f"Container-view lists failed: {exc}")
+            session, workspace = [], []
         return {
             "containers": containers,
             "containers_in_use": containers_in_use,
             "containers_available": max(0, cap - containers_in_use),
+            "session": session,
+            "workspace": workspace,
         }
     except Exception as exc:
         log("ERROR", "server.workspace_containers", f"List failed: {exc}")
@@ -3673,8 +3798,6 @@ def _record_user_action(record_id: str, action: str, request: Request,
         _cr_api.read_event_log(workspace_id, record_id)
     except Exception:
         pass
-    from web_ui.backend.container_record_routes import _serialise
-
     return JSONResponse(_serialise(record_after, workspace_id))
 
 
@@ -3700,6 +3823,199 @@ def container_record_recreate(record_id: str, request: Request,
                               body: Optional[dict] = Body(default=None)):
     """Recreate the record's container (remove then start via the name index)."""
     return _record_user_action(record_id, "recreate", request, workspace_id, body)
+
+
+#: Accepted container-view action verbs, mapped to their canonical operation.
+#: ``start`` is an alias of ``restart`` (there is no distinct "create" verb).
+_CONTAINER_VIEW_ACTIONS = {
+    "stop": "stop",
+    "start": "restart",
+    "restart": "restart",
+    "remove": "remove",
+}
+
+
+@app.post("/api/workspace/{workspace_id}/containers/{record_id}/action")
+def workspace_container_action(workspace_id: str, record_id: str,
+                               request: Request,
+                               body: Optional[dict] = Body(default=None)):
+    """Apply a lifecycle action to a workspace container record.
+
+    Body ``{"action": "stop"|"start"|"restart"|"remove"}``. ``start`` is an
+    alias of ``restart`` (reported as such). ``remove`` is refused for runtime
+    (non-ephemeral) containers (403 ``permission_denied``). The response is the
+    same entry shape the container-view GET emits.
+
+    restart semantics: ephemeral -> stop then start (``allow_fresh=False``);
+    runtime -> remove then start (``allow_fresh=True``, i.e. a recreate).
+    """
+    actor, actor_error = _resolve_actor(request, body)
+    if actor_error is not None:
+        return actor_error
+    raw_action = body.get("action") if isinstance(body, dict) else None
+    if raw_action not in _CONTAINER_VIEW_ACTIONS:
+        return _json_error(
+            "action must be one of stop, start, restart, remove",
+            status_code=400)
+    action = _CONTAINER_VIEW_ACTIONS[raw_action]
+
+    from thoughtmachine.container_record import api as _cr_api
+
+    try:
+        record = _cr_api.load_record(workspace_id, record_id)
+    except Exception as exc:
+        return _json_error(str(exc), status_code=503)
+    if record is None:
+        return _json_error(f"record '{record_id}' not found", status_code=404)
+
+    lifecycle = getattr(record, "lifecycle_class", "") or ""
+    is_runtime = lifecycle != "ephemeral"
+
+    # remove is permitted only for ephemeral (session) containers -- refuse
+    # BEFORE building the manager so no Docker verb is ever reached.
+    if action == "remove" and is_runtime:
+        return JSONResponse(
+            {"error": "removing a runtime container is not permitted",
+             "code": "permission_denied"},
+            status_code=403)
+
+    allowed, deny_reason = _container_write_allowed(workspace_id)
+    if not allowed:
+        return JSONResponse({"error": deny_reason, "code": "permission_denied"},
+                            status_code=403)
+
+    try:
+        manager = _make_container_manager(workspace_id)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_action",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+
+    container_id = _view_action_container_id(manager, record)
+
+    try:
+        if action == "stop":
+            if container_id:
+                manager.stop(container_id)
+            _cr_api.update_record(workspace_id, record_id, state="stopped")
+        elif action == "remove":
+            if container_id:
+                manager.remove(container_id)
+            _cr_api.delete_record(workspace_id, record_id)
+            return JSONResponse({"id": record_id, "removed": True})
+        else:  # restart (start is an alias)
+            # Delegate the Docker verb to the record-keyed handler
+            # (kill/restart/recreate) so the two surfaces cannot drift: a
+            # runtime container is recreated (allow_fresh=True), an ephemeral
+            # one is restarted (stop + start, allow_fresh=False). The delegated
+            # response is discarded -- this route emits the container-view
+            # entry shape below.
+            delegate_action = "recreate" if is_runtime else "restart"
+            resp = _record_user_action(record_id, delegate_action, request,
+                                       workspace_id, body)
+            if getattr(resp, "status_code", 200) >= 400:
+                return resp
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_action",
+            f"{action} failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+    record_after = _cr_api.load_record(workspace_id, record_id)
+    if record_after is None:
+        return _json_error("record disappeared during action", status_code=500)
+    return JSONResponse(
+        _container_view_entry(record_after, manager, workspace_id))
+
+
+@app.patch("/api/workspace/{workspace_id}/containers/{record_id}/resources")
+def workspace_container_resources(workspace_id: str, record_id: str,
+                                  request: Request,
+                                  body: Optional[dict] = Body(default=None)):
+    """Edit a record's resource limits by recreating the container.
+
+    Body ``{"mem_limit"?: str, "cpu_quota"?: int}`` -- at least one required.
+    Applies to BOTH ephemeral and runtime containers (an ephemeral edit is NOT
+    refused): the record's ``intent_snapshot`` is updated, then the container
+    is removed and started fresh (``allow_fresh=True``). The record ``id``
+    stays stable across the recreate; the response is the same entry shape the
+    container-view GET emits.
+    """
+    actor, actor_error = _resolve_actor(request, body)
+    if actor_error is not None:
+        return actor_error
+    if not isinstance(body, dict):
+        return _json_error("request body must be a JSON object", status_code=400)
+
+    updates = {}
+    if "mem_limit" in body:
+        updates["mem_limit"] = body["mem_limit"]
+    if "cpu_quota" in body:
+        updates["cpu_quota"] = body["cpu_quota"]
+    if not updates:
+        return _json_error(
+            "at least one of mem_limit, cpu_quota is required",
+            status_code=400)
+
+    from thoughtmachine.container_record import api as _cr_api
+
+    try:
+        record = _cr_api.load_record(workspace_id, record_id)
+    except Exception as exc:
+        return _json_error(str(exc), status_code=503)
+    if record is None:
+        return _json_error(f"record '{record_id}' not found", status_code=404)
+
+    allowed, deny_reason = _container_write_allowed(workspace_id)
+    if not allowed:
+        return JSONResponse({"error": deny_reason, "code": "permission_denied"},
+                            status_code=403)
+
+    try:
+        manager = _make_container_manager(workspace_id)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_resources",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+
+    container_id = _view_action_container_id(manager, record)
+    snapshot = dict(getattr(record, "intent_snapshot", None) or {})
+    snapshot.update(updates)
+
+    try:
+        # Ordering matters: persist the new intent FIRST so a container that
+        # starts below reads the updated limits from its record. Removing the
+        # old container and rebinding the record's docker_id happen afterwards.
+        _cr_api.update_record(workspace_id, record_id, intent_snapshot=snapshot)
+        if container_id:
+            pre = manager.remove(container_id)
+            if isinstance(pre, dict) and pre.get("status") == "error":
+                return _json_error(pre.get("error", "remove failed"),
+                                   status_code=503)
+        start_result = manager.start(name=record.name, note=record.notes,
+                                     allow_fresh=True)
+        if isinstance(start_result, dict) and start_result.get("error"):
+            return _json_error(start_result["error"], status_code=409)
+        new_docker_id = (start_result or {}).get("id") or container_id
+        _cr_api.update_record(workspace_id, record_id,
+                              docker_id=new_docker_id, state="running")
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_resources",
+            f"resource edit failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+    record_after = _cr_api.load_record(workspace_id, record_id)
+    if record_after is None:
+        return _json_error("record disappeared during action", status_code=500)
+    return JSONResponse(
+        _container_view_entry(record_after, manager, workspace_id))
 
 
 # Container logs: upper bound on ``tail`` accepted by the REST route. The
