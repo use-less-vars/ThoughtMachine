@@ -3480,7 +3480,7 @@ class Worker(ToolBase):
             return _load_template_workers()
 
     @staticmethod
-    def _merge_template_workers(workers: list) -> list:
+    def _merge_template_workers(workers: list, *, include_bundled: bool = True) -> list:
         """
         Merge template workers from disk into *workers* (in-place of the list
         object, but returned for chaining).
@@ -3497,7 +3497,7 @@ class Worker(ToolBase):
             w["name"] for w in workers
             if isinstance(w, dict) and w.get("name")
         }
-        for template in _load_template_workers():
+        for template in _load_template_workers(include_bundled=include_bundled):
             name = template.get("name")
             if name and name not in existing_names:
                 workers.append(template)
