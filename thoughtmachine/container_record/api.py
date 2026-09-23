@@ -104,6 +104,7 @@ def _create(
     state: str,
     vault_root: str | os.PathLike | None,
     name: str = "",
+    permissions: dict | None = None,
 ) -> Record:
     """Shared create path for :func:`create_record` / :func:`begin_record`."""
     validate_lifecycle_class(lifecycle_class)
@@ -133,6 +134,7 @@ def _create(
             created_at=now,
             updated_at=now,
             name=name,
+            permissions=permissions,
         )
         storage.write_record_file(path, record.to_dict())
     return record
@@ -148,6 +150,7 @@ def create_record(
     *,
     name: str = "",
     vault_root: str | os.PathLike | None = None,
+    permissions: dict | None = None,
 ) -> Record:
     """Create (or idempotently re-materialise) a record (§3, doc signature).
 
@@ -168,6 +171,7 @@ def create_record(
         state="",
         vault_root=vault_root,
         name=name,
+        permissions=permissions,
     )
 
 
@@ -181,6 +185,7 @@ def begin_record(
     *,
     name: str = "",
     vault_root: str | os.PathLike | None = None,
+    permissions: dict | None = None,
 ) -> Record:
     """Persist a pre-run intent stub: ``state="creating"``, ``docker_id=""``.
 
@@ -198,6 +203,7 @@ def begin_record(
         id,
         state=STATE_CREATING,
         vault_root=vault_root,
+        permissions=permissions,
         name=name,
     )
 

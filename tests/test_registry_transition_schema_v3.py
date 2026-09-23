@@ -4,7 +4,8 @@ Pins the ``feat/registry-transition`` behaviour of ``infra/container_manager``
 and the record schema:
 
   1. Schema v3 adds ``name`` (workspace-scoped container identity) to the record
-     field set; v4 appends ``retention_days``; ``SCHEMA_VERSION_CURRENT == 4``;
+     field set; v4 appends ``retention_days``; v5 appends the resolved
+     ``permissions`` grant; ``SCHEMA_VERSION_CURRENT == 5``;
      a native record round-trips the
      name (present -> kept, absent -> ``""``), and the legacy migration
      ``_materialise`` NEVER synthesises one.
@@ -194,14 +195,16 @@ def _reset_module_memos():
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_current_is_4():
-    assert SCHEMA_VERSION_CURRENT == 4
+def test_schema_version_current_is_5():
+    assert SCHEMA_VERSION_CURRENT == 5
 
 
-def test_name_is_a_schema_field_and_user_is_last():
+def test_name_is_a_schema_field_and_permissions_is_last():
     assert "name" in SCHEMA_FIELD_NAMES
     assert "user" in SCHEMA_FIELD_NAMES
-    assert SCHEMA_FIELD_NAMES[-1] == "user"
+    assert "permissions" in SCHEMA_FIELD_NAMES
+    assert SCHEMA_FIELD_NAMES[-2] == "user"
+    assert SCHEMA_FIELD_NAMES[-1] == "permissions"
 
 
 def test_record_round_trip_name_present(tmp_path):

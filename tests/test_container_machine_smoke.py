@@ -398,7 +398,7 @@ def test_g5_record_schema_and_one_file_per_container(smoke_env):
     for rec in (rec_a, rec_b):
         data = rec.to_dict()
         assert tuple(data.keys()) == tuple(SCHEMA_FIELD_NAMES)
-        assert len(data) == 17
+        assert len(data) == 18
         assert data["schema_version"] == SCHEMA_VERSION_CURRENT
         assert "inferred" in data
         assert data["inferred"] is False

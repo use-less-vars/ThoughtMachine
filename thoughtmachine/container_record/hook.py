@@ -213,6 +213,7 @@ def record_creation(
     labels: dict[str, str] | None = None,
     name: str = "",
     vault_root: str | Any | None = None,
+    permissions: dict | None = None,
 ) -> Iterator[_RecordHandle]:
     """Two-phase record context manager for a fresh container creation.
 
@@ -248,6 +249,7 @@ def record_creation(
         intent_snapshot,
         name=name,
         vault_root=vault_root,
+        permissions=permissions,
     )
 
     handle = _RecordHandle(record, workspace_id, vault_root)

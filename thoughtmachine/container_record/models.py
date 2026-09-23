@@ -46,7 +46,9 @@ SCHEMA_VERSION_LEGACY = 0
 #: v2 adds the ``restart_policy`` intent field (absent in v1 records).
 #: v3 adds the ``name`` identity field (absent in v1/v2 records).
 #: v4 adds the ``retention_days`` lifecycle field (absent in v1-v3 records).
-SCHEMA_VERSION_CURRENT = 4
+#: v5 adds the ``permissions`` resolved-grant field (absent in v1-v4 records;
+#: ``None`` = the record predates the field, i.e. no recorded grant to diff).
+SCHEMA_VERSION_CURRENT = 5
 
 LIFECYCLE_EPHEMERAL = "ephemeral"
 LIFECYCLE_PERSISTENT = "persistent"
@@ -99,6 +101,11 @@ SCHEMA_FIELD_NAMES: tuple[str, ...] = (
     # ("" = the record predates the field). Appended last to keep the on-disk
     # key order of v1-v4 records stable.
     "user",
+    # ``permissions`` is the resolved six-category grant dict captured at
+    # create time (``None`` = the record predates the field, i.e. no recorded
+    # grant is available to diff against). Appended last to keep the on-disk
+    # key order of v1-v5 records stable.
+    "permissions",
 )
 
 #: Nested ``intent_snapshot`` field order (§1.1).
@@ -194,6 +201,9 @@ class Record:
     retention_days: int | None = None
     #: The container user (``uid:gid``) recorded at attach time ("" = unset).
     user: str = ""
+    #: The resolved six-category grant captured at create time
+    #: (``None`` = the record predates the field, i.e. no recorded grant).
+    permissions: dict | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the record as a plain dict in §1 field order."""
@@ -215,6 +225,7 @@ class Record:
             "name": self.name,
             "retention_days": self.retention_days,
             "user": self.user,
+            "permissions": self.permissions,
         }
 
     @classmethod
@@ -254,6 +265,14 @@ class Record:
         else:
             retention_days = None
 
+        # ``permissions`` is lenient: absent / non-dict / empty fall back to
+        # ``None`` (no recorded grant); a non-empty dict is copied as-is.
+        permissions = data.get("permissions")
+        if not isinstance(permissions, dict) or not permissions:
+            permissions = None
+        else:
+            permissions = dict(permissions)
+
         return cls(
             id=str(data.get("id", "")),
             lifecycle_class=str(data.get("lifecycle_class", "")),
@@ -272,4 +291,5 @@ class Record:
             name=str(data.get("name", "") or ""),
             retention_days=retention_days,
             user=str(data.get("user", "") or ""),
+            permissions=permissions,
         )
