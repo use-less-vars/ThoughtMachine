@@ -657,14 +657,18 @@ async def get_active_workers(
 # ``{name}`` path parameter.
 
 
-def _load_worker_blueprints(ws_id: str) -> List[Any]:
+def _load_worker_blueprints(ws_id: str, *, required: bool = True) -> List[Any]:
     """Read the raw ``workers.json`` list for *ws_id*.
 
-    Raises 404 when the file does not exist (blueprint writes never create it)
-    and 422 when the file is unreadable or not a JSON array.
+    When *required* is True (the default) an absent file raises 404.  When it
+    is False an absent file yields an empty list instead, so read/projection
+    callers can fall back to template workers without synthesising the file.
+    Raises 422 when the file is unreadable or not a JSON array.
     """
     path = _workspace_dir(ws_id) / "workers.json"
     if not path.exists():
+        if not required:
+            return []
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workers file not found",
@@ -710,17 +714,32 @@ def _normalise_blueprint(entry: Any) -> Dict[str, Any]:
         )
 
 
+def _merged_worker_blueprints(ws_id: str) -> list:
+    """Return *ws_id*'s ``workers.json`` entries plus projected templates.
+
+    Reuses ``Worker._merge_template_workers`` — the exact merge the worker-spawn
+    path applies — so the blueprint routes and the runtime agree on the
+    effective worker set.  The import is lazy (function body) so importing the
+    web backend never pays the worker module's import cost.
+    """
+    from tools.workspace.worker_thread import Worker
+
+    raw = _load_worker_blueprints(ws_id, required=False)
+
+    return Worker._merge_template_workers(raw, include_bundled=False)
+
+
 @router.get("/{ws_id}/workers/blueprints")
 async def list_worker_blueprints(ws_id: str) -> List[Dict[str, Any]]:
     """Return the workspace's worker blueprints as normalised definitions."""
-    raw = _load_worker_blueprints(ws_id)
+    raw = _merged_worker_blueprints(ws_id)
     return [_normalise_blueprint(entry) for entry in raw]
 
 
 @router.get("/{ws_id}/workers/blueprints/{name}")
 async def get_worker_blueprint(ws_id: str, name: str) -> Dict[str, Any]:
     """Return a single normalised worker blueprint by name (404 when absent)."""
-    raw = _load_worker_blueprints(ws_id)
+    raw = _merged_worker_blueprints(ws_id)
     for entry in raw:
         if _blueprint_name(entry) == name:
             return _normalise_blueprint(entry)
@@ -751,16 +770,29 @@ async def patch_worker_blueprint(
             detail="Request body must be a JSON object",
         )
 
-    raw = _load_worker_blueprints(ws_id)
+    raw = _load_worker_blueprints(ws_id, required=False)
     index = next(
         (i for i, entry in enumerate(raw) if _blueprint_name(entry) == name),
         None,
     )
     if index is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Worker '{name}' not found",
+        # Not in workers.json — a same-named template may be projected in.
+        # Materialise it by appending the template entry, then patch that entry.
+        template = next(
+            (
+                entry
+                for entry in _merged_worker_blueprints(ws_id)
+                if _blueprint_name(entry) == name
+            ),
+            None,
         )
+        if template is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Worker '{name}' not found",
+            )
+        raw.append(template)
+        index = len(raw) - 1
 
     existing = raw[index]
     merged = dict(existing) if isinstance(existing, dict) else {"name": existing}
@@ -772,6 +804,8 @@ async def patch_worker_blueprint(
 
     raw[index] = updated.model_dump()
     path = _workspace_dir(ws_id) / "workers.json"
+    if not path.parent.exists():
+        ensure_workspace_dirs(ws_id)
     _atomic_write_json(raw, path)
     return updated.model_dump()
 

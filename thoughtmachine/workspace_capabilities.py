@@ -337,7 +337,7 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
 # ── Worker template helpers ───────────────────────────────────────────────────
 
 
-def _load_template_workers() -> list[dict]:
+def _load_template_workers(include_bundled: bool = True) -> list[dict]:
     """
     Load template worker definitions from disk.
 
@@ -355,8 +355,10 @@ def _load_template_workers() -> list[dict]:
     user_template_dir = _user_dir() / "worker_templates"
     if user_template_dir.is_dir() and any(user_template_dir.iterdir()):
         template_dir = user_template_dir
-    else:
+    elif include_bundled:
         template_dir = _resources_dir() / "worker_templates"
+    else:
+        return []
 
     if not template_dir.is_dir():
         return []
