@@ -2205,3 +2205,207 @@ body {
 .vault-health-file { font-family: monospace; }
 .vault-health-action { color: #f9e2af; }
 
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+   ContainerListPanel (feature C.1 — session-panel container view)
+   ────────────────────────────────────────────────────────────────────────── */
+.container-list-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.container-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.container-group-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.container-empty {
+  color: var(--text-secondary);
+  font-style: italic;
+  font-size: 0.8rem;
+  padding: 0.35rem 0;
+}
+
+.container-list-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
+.container-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.5rem;
+  background: var(--bg-surface);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+}
+
+.container-row-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.container-row-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.container-state-chip {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.container-state-chip--oom {
+  background: rgba(243, 139, 168, 0.18);
+  color: var(--danger);
+}
+
+.container-shared-chip {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  background: rgba(137, 180, 250, 0.18);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.permission-badge {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.container-drift {
+  font-size: 0.72rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  white-space: normal;
+}
+
+.container-drift--amber {
+  background: rgba(249, 226, 175, 0.15);
+  color: var(--warning);
+}
+
+.container-drift--neutral {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+.container-row-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.container-resources-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.container-resources-label {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+.container-resources-mem {
+  width: 5rem;
+  padding: 0.2rem 0.4rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  outline: none;
+}
+
+.container-resources-mem:focus {
+  border-color: var(--accent);
+}
+
+.container-action {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.container-action:hover {
+  background: var(--border);
+}
+
+.container-confirm-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.container-confirm-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  max-width: 360px;
+  width: 100%;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.container-confirm-message {
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.container-confirm-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.btn-cancel {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+

@@ -2873,6 +2873,10 @@ class ContainerManager:
             "uptime_seconds": uptime_seconds,
             "memory_usage_bytes": memory_usage_bytes,
             "note": self._read_note(container),
+            # Read from the SAME attrs["State"] dict already inspected above --
+            # no extra Docker call. Surfaces OOM-killed containers (which may
+            # already be "running" again) to the container-view state mapper.
+            "oom_killed": bool((container.attrs.get("State") or {}).get("OOMKilled")),
         }
 
         # Phase 6: live introspection only for running containers. Every probe
