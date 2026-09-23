@@ -31,6 +31,7 @@ from .models import (
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     OWNER_WORKSPACE,
+    SCHEMA_VERSION_CURRENT,
     SCHEMA_VERSION_LEGACY,
     Record,
     iso_now,
@@ -352,3 +353,56 @@ def migrate_records(
             )
 
     return summary
+
+
+
+def upgrade_record_schema(
+    workspace_id: str,
+    *,
+    vault_root: Any = None,
+) -> dict:
+    """Bring every record's ``schema_version`` up to the current schema (§4).
+
+    A focused, record-file-only upgrade pass: it walks the workspace's record
+    files and rewrites ``schema_version`` to :data:`SCHEMA_VERSION_CURRENT`.
+    It never stops, restarts, mutates or relabels a container and never adds or
+    removes any other record field — the on-disk key order (and the position of
+    ``schema_version``) is preserved.  The pass is idempotent: a re-run simply
+    rewrites the same value.
+
+    Args:
+        workspace_id: the workspace whose records are upgraded.
+        vault_root: explicit vault root override (defaults to ``vault_root()``).
+
+    Returns:
+        A summary dict with ``workspace_id``, ``scanned`` / ``upgraded`` /
+        ``skipped`` / ``failed`` counts and ``errors``.
+    """
+    summary: dict[str, Any] = {
+        "workspace_id": workspace_id,
+        "scanned": 0,
+        "upgraded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "errors": [],
+    }
+
+    containers = storage.containers_dir(workspace_id, vault_root)
+    for path in storage.iter_record_files(containers):
+        summary["scanned"] += 1
+        try:
+            data = storage.read_record_file(path)
+            if data is None:
+                summary["skipped"] += 1
+                continue
+            # assigning an existing key preserves its on-disk position.
+            data["schema_version"] = SCHEMA_VERSION_CURRENT
+            storage.write_record_file(path, data)
+            summary["upgraded"] += 1
+        except Exception as exc:  # per-record best-effort
+            summary["failed"] += 1
+            summary["errors"].append(str(exc))
+            logger.warning("record schema upgrade skipped one record: %s", exc)
+
+    return summary
+

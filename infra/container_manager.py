@@ -597,6 +597,22 @@ def _load_capabilities(workspace_id):
         return None
 
 
+class _ComputedContainerConfig(tuple):
+    """``(network_mode, workspace_mode)`` plus the resolved ``effective`` profile.
+
+    A 2-tuple SUBCLASS so that every existing consumer keeps working
+    byte-for-byte: two-name unpacking still yields the two modes, and
+    equality against ``("none", "ro")`` still holds.  The resolved
+    six-category ``effective`` profile rides along as an attribute so
+    callers never need a second ``resolve_container_config`` call.
+    """
+
+    def __new__(cls, network_mode, workspace_mode, effective=None):
+        obj = super().__new__(cls, (network_mode, workspace_mode))
+        obj.effective = effective
+        return obj
+
+
 class ContainerManager:
     """Owns the Docker containers for one session (start -> exec -> stop)."""
 
@@ -1197,12 +1213,14 @@ class ContainerManager:
         # Desired isolation (all paths). Computed here so the workspace-label
         # reuse path can honour a newly-granted network/workspace mode instead
         # of silently reusing a drifted container.
-        want_network, want_workspace = self._compute_config(
+        computed = self._compute_config(
             self.workspace_path,
             self.workspace_id,
             self.session_permissions,
             lifecycle_class,
         )
+        want_network, want_workspace = computed
+        want_effective = getattr(computed, "effective", None)
 
         # ── Record-first identity ladder (schema v3) ─────────────────────────
         # The container RECORD is the source of truth for identity: a name
@@ -1244,7 +1262,8 @@ class ContainerManager:
                         image=image, name=name, note=note, worker_name=None,
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
-                        reuse_record_id=record_id)
+                        reuse_record_id=record_id,
+                        permissions=want_effective)
                 # (b) Record exists but names no container yet -> REFUSE.
                 self._warn_note_once(
                     ("name.record_without_container", self.workspace_id, name),
@@ -1264,7 +1283,8 @@ class ContainerManager:
                         image=image, name=name, note=note, worker_name=None,
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
-                        reuse_record_id=record_id)
+                        reuse_record_id=record_id,
+                        permissions=want_effective)
                 # Guardrail 5: auto-heal is reachable ONLY from this
                 # container_missing path (never on drift).  It is the agent
                 # counterpart to the operator-only allow_fresh recreate above
@@ -1317,6 +1337,7 @@ class ContainerManager:
                     lifecycle_class=lifecycle_class,
                     network_mode=want_network, workspace_mode=want_workspace,
                     reuse_record_id=record_id,
+                    permissions=want_effective,
                 )
             if note is not None:
                 self._write_note(self._record_id_for(container), note)
@@ -1408,6 +1429,7 @@ class ContainerManager:
                             network_mode=want_network,
                             workspace_mode=want_workspace,
                             reuse_record_id=None,
+                            permissions=want_effective,
                         )
                     if _action == "reuse":
                         _start_drift = _payload
@@ -1444,12 +1466,14 @@ class ContainerManager:
                              f"Stop or remove a running container to free a slot."}
 
         # ── Desired isolation from session permissions (all paths) ─────────
-        network_mode, workspace_mode = self._compute_config(
+        computed = self._compute_config(
             self.workspace_path,
             self.workspace_id,
             self.session_permissions,
             lifecycle_class,
         )
+        network_mode, workspace_mode = computed
+        effective = getattr(computed, "effective", None)
         _audit("CONTAINER_CONFIG",
                f"name={name} network={network_mode} workspace={workspace_mode} "
                f"session={self.session_permissions} workspace_id={self.workspace_id}")
@@ -1507,6 +1531,7 @@ class ContainerManager:
                     lifecycle_class=lifecycle_class,
                     network_mode=network_mode, workspace_mode=workspace_mode,
                     reuse_record_id=None,
+                    permissions=effective,
                 )
             self._ensure_running(container)
             self._containers[name] = container.id
@@ -1531,6 +1556,7 @@ class ContainerManager:
             image=image, name=name, note=note, worker_name=worker_name,
             lifecycle_class=lifecycle_class,
             network_mode=network_mode, workspace_mode=workspace_mode,
+            permissions=effective,
         )
 
     def _run_container(self, *, image, name, labels, mounts, tmpfs,
@@ -1586,7 +1612,8 @@ class ContainerManager:
         return container
 
     def _fresh_start(self, *, image, name, note, worker_name, lifecycle_class,
-                     network_mode, workspace_mode, reuse_record_id=None):
+                     network_mode, workspace_mode, reuse_record_id=None,
+                     permissions=None):
         """Create exactly one container (the single fresh-create path).
 
         With ``reuse_record_id`` unset a NEW record is minted alongside the
@@ -1755,6 +1782,7 @@ class ContainerManager:
             lifecycle_class=lifecycle_class,
             labels=labels,
             name=name,
+            permissions=permissions,
         ) as record:
             container = self._run_container(
                 image=image, name=name, labels=labels, mounts=mounts,
@@ -2374,9 +2402,11 @@ class ContainerManager:
                 _HEAL_ATTEMPTED.popitem(last=False)
 
         try:
-            network_mode, workspace_mode = self._compute_config(
+            computed = self._compute_config(
                 self.workspace_path, self.workspace_id,
                 self.session_permissions, lifecycle_class)
+            network_mode, workspace_mode = computed
+            effective = getattr(computed, "effective", None)
         except Exception:
             # Config uncomputable -> invent nothing; refuse via the heal signal
             # (start() then produces the ordinary refusal payload).
@@ -2407,7 +2437,8 @@ class ContainerManager:
             result = self._fresh_start(
                 image=image, name=name, note=note, worker_name=None,
                 lifecycle_class=lifecycle_class, network_mode=network_mode,
-                workspace_mode=workspace_mode, reuse_record_id=record_id)
+                workspace_mode=workspace_mode, reuse_record_id=record_id,
+                permissions=effective)
         except Exception:
             return None
 
@@ -3638,7 +3669,9 @@ class ContainerManager:
                     f"(got {type(cfg).__name__}); cannot resolve session policy"
                 )
             return "none", "ro"
-        return cfg.network_mode, cfg.workspace_mode
+        return _ComputedContainerConfig(
+            cfg.network_mode, cfg.workspace_mode, dict(cfg.effective)
+        )
 
     def _remove_container(self, container):
         """Stop and remove a container; best-effort, NEVER raises."""

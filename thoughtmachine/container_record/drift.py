@@ -77,6 +77,7 @@ CLASS_RUNTIME = "runtime"
 CLASS_IMAGE = "image"
 CLASS_HARDENING = "hardening"
 CLASS_RESTART_POLICY = "restart_policy"
+CLASS_PERMISSION = "permission"
 
 #: Drift event types.
 EVENT_IDENTITY_CHANGED = "drift.identity_changed"
@@ -86,6 +87,7 @@ EVENT_RUNTIME_MISMATCH = "drift.runtime_mismatch"
 EVENT_IMAGE_CHANGED = "drift.image_changed"
 EVENT_HARDENING_LOST = "drift.hardening_lost"
 EVENT_RESTART_POLICY_MISMATCH = "drift.restart_policy_mismatch"
+EVENT_PERMISSION_CHANGED = "drift.permission_changed"
 
 #: Auto-heal lifecycle events.  Deliberate DEVIATION from the ``drift.*``
 #: convention above: these are emitted by the container MANAGER
@@ -102,6 +104,18 @@ _IMAGE_AXES = ("image_ref", "image_hash")
 
 #: Key under which the live container id is stored in the ``live`` mapping.
 _LIVE_ID_KEY = "id"
+
+#: The framework-default *effective* grant (what ``permissions={}`` resolves to
+#: with permissive capabilities).  A recorded grant equal to this carries no
+#: information beyond the framework default and is never reported as drift.
+_FRAMEWORK_DEFAULT_PERMISSIONS: dict = {
+    "filesystem": "read",
+    "network": "banned",
+    "container": False,
+    "git": "read",
+    "mcp": "banned",
+    "host_bash": "banned",
+}
 
 
 @dataclass(frozen=True)
@@ -167,6 +181,31 @@ def _make_finding(
         expected=expected,
         actual=actual,
         signature=signature_for(event_type, expected, actual),
+    )
+
+
+def _permission_drift_finding(record: Any, config: Any) -> DriftFinding | None:
+    """Return a permission finding when the recorded grant no longer matches.
+
+    Silent (``None``) when the record carries no recorded grant (``None``), the
+    effective grant is unknown/non-mapping/empty, the effective grant equals
+    the framework default, or the effective grant is unchanged.  ``expected``
+    is the grant recorded on the record; ``actual`` is the currently effective
+    grant.
+    """
+    recorded = getattr(record, "permissions", None)
+    if recorded is None or not isinstance(recorded, dict):
+        return None
+    effective = getattr(config, "effective", None)
+    if (
+        not isinstance(effective, dict)
+        or not effective
+        or effective == _FRAMEWORK_DEFAULT_PERMISSIONS
+        or effective == recorded
+    ):
+        return None
+    return _make_finding(
+        CLASS_PERMISSION, EVENT_PERMISSION_CHANGED, recorded, effective
     )
 
 
@@ -396,7 +435,11 @@ def detect_record_drift(
         logger.warning("live container inspection failed; live axes skipped")
         live = None
 
-    return classify_drift(record, live, config)
+    findings = classify_drift(record, live, config)
+    permission = _permission_drift_finding(record, config)
+    if permission is not None:
+        findings.append(permission)
+    return findings
 
 
 def emit_drift_findings(
@@ -491,6 +534,7 @@ __all__ = [
     "CLASS_IMAGE",
     "CLASS_HARDENING",
     "CLASS_RESTART_POLICY",
+    "CLASS_PERMISSION",
     "EVENT_IDENTITY_CHANGED",
     "EVENT_CONTAINER_ABSENT",
     "EVENT_POLICY_CONFIG_CHANGED",
@@ -498,6 +542,7 @@ __all__ = [
     "EVENT_IMAGE_CHANGED",
     "EVENT_HARDENING_LOST",
     "EVENT_RESTART_POLICY_MISMATCH",
+    "EVENT_PERMISSION_CHANGED",
     "DriftFinding",
     "signature_for",
     "classify_drift",
