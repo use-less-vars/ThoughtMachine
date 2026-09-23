@@ -31,6 +31,7 @@ contract.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -621,6 +622,9 @@ def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
     """PIN: recording the effective profile must not perturb any OTHER create
     argument.  Every value except ``labels`` is byte-identical to the observed
     call; the label delta is exactly the record-id label."""
+    # Pin the host uid/gid so the byte-exact create-args assertion is env-independent.
+    monkeypatch.setattr(os, "getuid", lambda: 1000)
+    monkeypatch.setattr(os, "getgid", lambda: 1000)
     name = "agent-perm-t4"
     expected = {
         "cap_drop": ["ALL"],
