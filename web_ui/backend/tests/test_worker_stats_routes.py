@@ -27,6 +27,7 @@ import web_ui.backend.workspace_routes as workspace_routes
 from agent.core.worker_context import WorkerContext
 from tools.workspace.worker import WorkerThread
 from web_ui.backend.server import app
+from thoughtmachine.container_record import api as cr_api
 
 client = TestClient(app)
 
@@ -43,6 +44,15 @@ def fake_ws_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: ws_dir)
     monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
     return ws_dir
+
+
+@pytest.fixture
+def container_vault(tmp_path, monkeypatch):
+    """Redirect the container-record store to a throwaway vault root."""
+    root = tmp_path / "vault"
+    root.mkdir()
+    monkeypatch.setattr("thoughtmachine.vault.vault_root", lambda: root)
+    return root
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -192,7 +202,11 @@ class TestContainersEndpointStatsFields:
         )
         return client.get("/api/workspace/ws-test/containers")
 
-    def test_in_use_and_available(self, monkeypatch):
+    def test_in_use_and_available(self, monkeypatch, container_vault):
+        cr_api.create_record(
+            "ws-test", "ephemeral", "workspace-owned",
+            id="rec-e", name="c1", vault_root=container_vault,
+        )
         resp = self._get(monkeypatch, [{"name": "c1", "container_id": "id1"}], cap=4)
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -200,21 +214,21 @@ class TestContainersEndpointStatsFields:
         assert data["containers_available"] == 3
         assert len(data["containers"]) == 1
 
-    def test_full_cap_yields_zero_available(self, monkeypatch):
+    def test_full_cap_yields_zero_available(self, monkeypatch, container_vault):
         containers = [{"name": f"c{i}", "container_id": f"id{i}"} for i in range(4)]
         resp = self._get(monkeypatch, containers, cap=4)
         data = resp.json()
         assert data["containers_in_use"] == 4
         assert data["containers_available"] == 0
 
-    def test_available_clamped_at_zero(self, monkeypatch):
+    def test_available_clamped_at_zero(self, monkeypatch, container_vault):
         containers = [{"name": f"c{i}", "container_id": f"id{i}"} for i in range(4)]
         resp = self._get(monkeypatch, containers, cap=2)
         data = resp.json()
         assert data["containers_in_use"] == 4
         assert data["containers_available"] == 0
 
-    def test_no_containers(self, monkeypatch):
+    def test_no_containers(self, monkeypatch, container_vault):
         resp = self._get(monkeypatch, [], cap=4)
         data = resp.json()
         assert data["containers_in_use"] == 0

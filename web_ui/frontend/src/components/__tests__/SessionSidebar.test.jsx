@@ -431,15 +431,20 @@ describe('SessionSidebar — workers', () => {
 })
 
 // ===========================================================================
-// Containers: tm-resource-* filtering, dot colors, Start/Stop, error
+// Containers: kind==='resource' filtering, dot colors, Start/Stop, error
 // ===========================================================================
 describe('SessionSidebar — containers', () => {
   const CONTAINER_ROUTE = {
     '/api/workspace/ws-1/containers': jsonOk({
       containers: [
-        { name: 'tm-resource-sys', status: 'running' },
-        { name: 'app-1', status: 'running' },
-        { name: 'app-2', status: 'stopped' },
+        // A resource-class container is workspace infrastructure, so the
+        // sidebar must filter it out by KIND.  The name deliberately does NOT
+        // start with 'tm-resource-' so this proves the filter is kind-based,
+        // not name-based.  app-1 (ephemeral) and app-2 (persistent) exercise
+        // the two app-facing kind buckets.
+        { name: 'sys-resource', kind: 'resource', state: 'running' },
+        { name: 'app-1', kind: 'ephemeral', state: 'running' },
+        { name: 'app-2', kind: 'persistent', state: 'stopped' },
       ],
     }),
   }
@@ -455,12 +460,13 @@ describe('SessionSidebar — containers', () => {
     })
   }
 
-  it('lists containers, hides tm-resource-* entries, colors dots and shows Start/Stop', async () => {
+  it('lists containers, hides kind==="resource" entries, colors dots and shows Start/Stop', async () => {
     seedWorkspaceRoot()
     stubBackend(CONTAINER_ROUTE)
     renderSidebar({ tools: [] })
     await act(async () => {})
-    expect(screen.queryByText('tm-resource-sys')).not.toBeInTheDocument()
+    // Hidden because its kind is 'resource' (not because of its name).
+    expect(screen.queryByText('sys-resource')).not.toBeInTheDocument()
     expect(screen.getByText('app-1')).toBeInTheDocument()
     expect(screen.getByText('app-2')).toBeInTheDocument()
     const section = screen.getByRole('heading', { name: 'Containers' }).closest('section')

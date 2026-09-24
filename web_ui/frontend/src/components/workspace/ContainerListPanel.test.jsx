@@ -1,20 +1,22 @@
 // @vitest-environment jsdom
 // --- ContainerListPanel.test.jsx ---
-// RED tests for feature C.1 (session-panel container view).
+// RED tests for feature C.1 (session-panel container view) -- three-class split.
 // Component under test: ./ContainerListPanel.jsx, default export
 // `function ContainerListPanel({ workspaceId })`.
 //
 // Contract pinned by these tests:
 //   * on mount inline-fetches GET /api/workspace/${workspaceId}/containers
-//   * payload shape: { session: [ephemeral entries], workspace: [runtime entries] }
-//     flattened and grouped by each entry's `kind` ("ephemeral" | "runtime")
+//   * payload shape: { containers: [entries] } -- a FLAT list (PC3); the legacy
+//     `session`/`workspace` keys are GONE. Entries are grouped by `kind`.
 //   * entry keys: id, name, kind, state, intent_snapshot, permissions,
 //     permission_drift, shared
-//   * two group sections: container-group-ephemeral / container-group-runtime
+//   * `kind` is "ephemeral" | "persistent" | "resource" (PC5); the old
+//     "runtime" kind is RETIRED.
+//   * three group sections: container-group-ephemeral / -persistent / -resource
 //   * rows: container-row-{id}; state chip: container-state-{id}
 //   * permission badge: permission-badge-{id}
 //   * drift indicator: container-drift-{id} (data-drift amber|neutral, ABSENT when silent)
-//   * shared chip (runtime only): container-shared-{id}
+//   * shared chip (persistent/resource only): container-shared-{id}
 //   * controls: container-action-{id}-stop|start|restart|remove|resources
 //   * size-edit input: container-resources-mem-{id}
 //   * confirm modal: confirm-dialog / confirm-message / confirm-ok / confirm-cancel
@@ -24,7 +26,7 @@
 
 import React from 'react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import ContainerListPanel from './ContainerListPanel'
 
@@ -46,11 +48,11 @@ function ephemeralEntry(overrides = {}) {
   }
 }
 
-function runtimeEntry(overrides = {}) {
+function persistentEntry(overrides = {}) {
   return {
-    id: 'rt-1',
-    name: 'rt-1',
-    kind: 'runtime',
+    id: 'pers-1',
+    name: 'pers-1',
+    kind: 'persistent',
     state: 'running',
     intent_snapshot: {},
     permissions: { network: false, filesystem: 'ro', mem_limit: '1g' },
@@ -60,8 +62,22 @@ function runtimeEntry(overrides = {}) {
   }
 }
 
-function payload({ ephemeral = [], runtime = [] } = {}) {
-  return { session: ephemeral, workspace: runtime }
+function resourceEntry(overrides = {}) {
+  return {
+    id: 'res-1',
+    name: 'res-1',
+    kind: 'resource',
+    state: 'running',
+    intent_snapshot: {},
+    permissions: { network: false, filesystem: 'ro', mem_limit: '1g' },
+    permission_drift: null,
+    shared: true,
+    ...overrides,
+  }
+}
+
+function payload({ ephemeral = [], persistent = [], resource = [] } = {}) {
+  return { containers: [...ephemeral, ...persistent, ...resource] }
 }
 
 function stubFetch(body) {
@@ -87,29 +103,59 @@ afterEach(() => {
 })
 
 describe('ContainerListPanel (C.1 session-panel container view)', () => {
-  // ── T8 ──────────────────────────────────────────────────────────────────
-  // T8: both groups render the EXACT empty-state copy when their arrays are empty.
-  it('T8 renders ephemeral + runtime groups with exact empty-state copy when both arrays are empty', async () => {
+  // ── T5 ──────────────────────────────────────────────────────────────────
+  // T5: all three groups render with the EXACT heading + empty-state copy.
+  it('T5 renders the three groups with exact headings and empty-state copy when containers is empty', async () => {
     stubFetch(payload())
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
 
     expect(await screen.findByTestId('container-group-ephemeral')).toBeInTheDocument()
-    expect(screen.getByTestId('container-group-runtime')).toBeInTheDocument()
+    expect(screen.getByTestId('container-group-persistent')).toBeInTheDocument()
+    expect(screen.getByTestId('container-group-resource')).toBeInTheDocument()
 
-    expect(screen.getByText('No ephemeral containers in this workspace.')).toBeInTheDocument()
-    expect(screen.getByText('No runtime resources in use.')).toBeInTheDocument()
+    // exact headings (PC6)
+    expect(screen.getByText('Ephemeral containers')).toBeInTheDocument()
+    expect(screen.getByText('Persistent containers')).toBeInTheDocument()
+    expect(screen.getByText('Resource containers')).toBeInTheDocument()
+
+    // exact empty-state copy (PC6)
+    expect(screen.getByText('No ephemeral containers.')).toBeInTheDocument()
+    expect(screen.getByText('No persistent containers.')).toBeInTheDocument()
+    expect(screen.getByText('No resource containers.')).toBeInTheDocument()
   })
 
-  // T8: a populated group renders that row's testid and NOT its empty-state text.
-  it('T8 renders a populated group row and omits that group empty-state text', async () => {
+  // T5: populated group renders its row and omits that group's empty copy only.
+  it('T5 renders a populated ephemeral group row and omits only that group empty-state text', async () => {
     stubFetch(payload({ ephemeral: [ephemeralEntry({ id: 'eph-a' })] }))
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
 
     expect(await screen.findByTestId('container-row-eph-a')).toBeInTheDocument()
     // populated ephemeral group -> its empty copy must be gone
-    expect(screen.queryByText('No ephemeral containers in this workspace.')).toBeNull()
-    // the (empty) runtime group still shows its own copy
-    expect(screen.getByText('No runtime resources in use.')).toBeInTheDocument()
+    expect(screen.queryByText('No ephemeral containers.')).toBeNull()
+    // the (empty) persistent + resource groups still show their own copy
+    expect(screen.getByText('No persistent containers.')).toBeInTheDocument()
+    expect(screen.getByText('No resource containers.')).toBeInTheDocument()
+  })
+
+  // ── T7 ──────────────────────────────────────────────────────────────────
+  // T7: persistent and resource rows land in their OWN group (distinguishable).
+  it('T7 persistent and resource rows render in their own distinct groups', async () => {
+    stubFetch(
+      payload({
+        persistent: [persistentEntry({ id: 'pers-1' })],
+        resource: [resourceEntry({ id: 'res-1' })],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const persGroup = await screen.findByTestId('container-group-persistent')
+    const resGroup = screen.getByTestId('container-group-resource')
+
+    expect(within(persGroup).getByTestId('container-row-pers-1')).toBeInTheDocument()
+    expect(within(resGroup).getByTestId('container-row-res-1')).toBeInTheDocument()
+    // each row belongs to exactly one group
+    expect(within(persGroup).queryByTestId('container-row-res-1')).toBeNull()
+    expect(within(resGroup).queryByTestId('container-row-pers-1')).toBeNull()
   })
 
   // ── T9 ──────────────────────────────────────────────────────────────────
@@ -217,25 +263,28 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
   })
 
   // ── T11 ─────────────────────────────────────────────────────────────────
-  // T11: runtime rows carry a shared chip + shared confirm copy; ephemeral rows do not.
-  it('T11 runtime row shows the shared chip and its confirm modal contains the shared copy', async () => {
-    stubFetch(payload({ runtime: [runtimeEntry({ id: 'rt-shared', state: 'running' })] }))
+  // T11: persistent/resource rows carry a shared chip + shared confirm copy;
+  // ephemeral rows do not, and only ephemeral rows offer `remove`.
+  it('T11 persistent row shows the shared chip and its confirm modal contains the shared copy', async () => {
+    stubFetch(payload({ persistent: [persistentEntry({ id: 'pers-shared', state: 'running' })] }))
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
 
-    const chip = await screen.findByTestId('container-shared-rt-shared')
+    const chip = await screen.findByTestId('container-shared-pers-shared')
     expect(chip).toHaveAttribute('title', SHARED_TEXT)
 
-    fireEvent.click(screen.getByTestId('container-action-rt-shared-stop'))
+    fireEvent.click(screen.getByTestId('container-action-pers-shared-stop'))
     const dialog = await screen.findByTestId('confirm-dialog')
     expect(dialog).toHaveTextContent(SHARED_TEXT)
   })
 
-  it('T11 runtime row does NOT render a remove control (server refuses runtime removal)', async () => {
-    stubFetch(payload({ runtime: [runtimeEntry({ id: 'rt-norm', state: 'running' })] }))
+  it('T11 resource row does NOT render a remove control (server refuses non-ephemeral removal)', async () => {
+    stubFetch(payload({ resource: [resourceEntry({ id: 'res-norm', state: 'running' })] }))
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
 
-    await screen.findByTestId('container-row-rt-norm')
-    expect(screen.queryByTestId('container-action-rt-norm-remove')).toBeNull()
+    await screen.findByTestId('container-row-res-norm')
+    expect(screen.queryByTestId('container-action-res-norm-remove')).toBeNull()
+    // ... but it still carries the shared chip (resource is shared-class).
+    expect(screen.getByTestId('container-shared-res-norm')).toBeInTheDocument()
   })
 
   it('T11 ephemeral row has no shared chip and its confirm modal lacks the shared copy', async () => {

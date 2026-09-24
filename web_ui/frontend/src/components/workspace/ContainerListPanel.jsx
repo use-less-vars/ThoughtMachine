@@ -6,8 +6,9 @@ const DRIFT_AMBER_TEXT = 'Running under older permissions — restart to apply.'
 const DRIFT_NEUTRAL_TITLE =
   'Drift check not yet wired for this container — see backend/record-create-permission-snapshot.'
 
-const EPHEMERAL_EMPTY = 'No ephemeral containers in this workspace.'
-const RUNTIME_EMPTY = 'No runtime resources in use.'
+const EPHEMERAL_EMPTY = 'No ephemeral containers.'
+const PERSISTENT_EMPTY = 'No persistent containers.'
+const RESOURCE_EMPTY = 'No resource containers.'
 
 const ACTION_LABELS = {
   stop: 'Stop',
@@ -18,7 +19,7 @@ const ACTION_LABELS = {
 }
 
 // Which lifecycle controls a row exposes for a given state. `remove` is added
-// separately for ephemeral rows only (the server refuses runtime removal).
+// separately for ephemeral rows only (the server refuses resource removal).
 function lifecycleActions(state) {
   if (state === 'running') return ['stop', 'restart']
   if (state === 'paused') return ['start', 'restart']
@@ -76,7 +77,7 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
           {state}
         </span>
 
-        {entry.kind === 'runtime' && entry.shared ? (
+        {entry.shared ? (
           <span
             className="container-shared-chip"
             data-testid={`container-shared-${id}`}
@@ -164,9 +165,10 @@ export default function ContainerListPanel({ workspaceId }) {
     if (data && data.success === false) {
       throw new Error(data.error || 'Failed to load containers')
     }
-    const sessionArr = Array.isArray(data && data.session) ? data.session : []
-    const workspaceArr = Array.isArray(data && data.workspace) ? data.workspace : []
-    return [...sessionArr, ...workspaceArr]
+    // PC3: a single FLAT `containers` list; the legacy session/workspace
+    // split is gone and the UI groups entries by `kind`.
+    const arr = Array.isArray(data && data.containers) ? data.containers : []
+    return arr
   }, [workspaceId])
 
   useEffect(() => {
@@ -242,7 +244,8 @@ export default function ContainerListPanel({ workspaceId }) {
   const confirmCancel = () => setPending(null)
 
   const ephemeral = entries.filter((e) => e.kind === 'ephemeral')
-  const runtime = entries.filter((e) => e.kind === 'runtime')
+  const persistent = entries.filter((e) => e.kind === 'persistent')
+  const resource = entries.filter((e) => e.kind === 'resource')
 
   const renderGroup = (kind, testid, title, list, emptyCopy) => (
     <div className={`container-group container-group--${kind}`} data-testid={testid}>
@@ -281,7 +284,8 @@ export default function ContainerListPanel({ workspaceId }) {
       ) : null}
 
       {renderGroup('ephemeral', 'container-group-ephemeral', 'Ephemeral containers', ephemeral, EPHEMERAL_EMPTY)}
-      {renderGroup('runtime', 'container-group-runtime', 'Runtime resources', runtime, RUNTIME_EMPTY)}
+      {renderGroup('persistent', 'container-group-persistent', 'Persistent containers', persistent, PERSISTENT_EMPTY)}
+      {renderGroup('resource', 'container-group-resource', 'Resource containers', resource, RESOURCE_EMPTY)}
 
       {pending ? (
         <div className="container-confirm-overlay">

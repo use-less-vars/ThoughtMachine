@@ -3246,19 +3246,32 @@ def _map_container_view_state(status, record_state):
     return _CONTAINER_VIEW_RECORD_STATE.get(record_state or "", "stopped")
 
 
+# PC4/PC5: lifecycle_class -> view ``kind``. The retired ``runtime`` kind is
+# replaced by an explicit three-class split: ``ephemeral`` | ``persistent`` |
+# ``resource``. ``service`` is a persistent-class container in intent; it has no
+# producers today, so it renders in the persistent section rather than inventing
+# a UI section with no writers. Unknown classes fall back to ``persistent``.
+_CONTAINER_KIND_BY_LIFECYCLE = {
+    "ephemeral": "ephemeral",
+    "persistent": "persistent",
+    "service": "persistent",
+    "resource": "resource",
+}
+
+
 def _container_view_entry(record, manager, workspace_id):
     """Build one container-view entry dict from a record (+ its live status).
 
     Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
-    permission_drift, shared``. ``kind`` is ``ephemeral`` for ephemeral
-    lifecycle records and ``runtime`` otherwise (there is no ``runtime``
-    lifecycle_class). ``shared`` is True for runtime containers.
+    permission_drift, shared``. ``kind`` is one of ``ephemeral`` |
+    ``persistent`` | ``resource`` (PC5; see ``_CONTAINER_KIND_BY_LIFECYCLE``).
+    ``shared`` = ``kind in ('persistent', 'resource')``.
     ``permission_drift`` is ``None`` when either side is unknown (an unwired /
     pre-v5 record has no ``permissions``) -- the underlying drift helper is
     already fail-safe and returns ``None`` when Docker is unavailable.
     """
     lifecycle = getattr(record, "lifecycle_class", "") or ""
-    kind = "ephemeral" if lifecycle == "ephemeral" else "runtime"
+    kind = _CONTAINER_KIND_BY_LIFECYCLE.get(lifecycle, "persistent")
     permissions = getattr(record, "permissions", None)
     if permissions is None:
         permission_drift = None
@@ -3283,31 +3296,23 @@ def _container_view_entry(record, manager, workspace_id):
         "intent_snapshot": getattr(record, "intent_snapshot", None),
         "permissions": permissions,
         "permission_drift": permission_drift,
-        "shared": kind == "runtime",
+        "shared": kind in ("persistent", "resource"),
     }
 
 
-def _build_container_view_lists(manager, workspace_id):
-    """Return ``(session, workspace)`` entry lists for the container-view GET.
+def _build_container_view_entries(manager, workspace_id):
+    """Return the FLAT list of container-view entries for the GET (PC3).
 
-    Records come from the durable store (``api.list_records``) split by
-    ``lifecycle_class``: ephemeral -> ``session`` (shared False); every other
-    lifecycle (resource/service/persistent) -> ``workspace`` (kind ``runtime``,
-    shared True). ``ContainerManager.list_containers()`` hides resource
-    containers, so it cannot enumerate the workspace group.
+    Records come from the durable store (``api.list_records``).
+    ``ContainerManager.list_containers()`` hides resource containers, so it
+    cannot enumerate the full set.  Each entry carries the three-class ``kind``
+    (``ephemeral``|``persistent``|``resource``); the UI splits them.
     """
     from thoughtmachine.container_record import api as _cr_api
 
     records = _cr_api.list_records(workspace_id) or []
-    session = []
-    workspace = []
-    for record in records:
-        entry = _container_view_entry(record, manager, workspace_id)
-        if entry["kind"] == "ephemeral":
-            session.append(entry)
-        else:
-            workspace.append(entry)
-    return session, workspace
+    return [_container_view_entry(record, manager, workspace_id)
+            for record in records]
 
 
 def _view_action_container_id(manager, record):
@@ -3337,8 +3342,9 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
             f"workspace '{workspace_id}' not found or path unresolvable",
             status_code=404)
     try:
-        containers = manager.list_containers() or []
-        containers_in_use = len(containers)
+        # ``containers_in_use`` / ``containers_available`` stay manager-derived.
+        live = manager.list_containers() or []
+        containers_in_use = len(live)
         # Session container cap: ContainerManager.max_containers (workspace
         # config.json, default 6; clamped >= 1, mirroring
         # ContainerManager._get_max_containers()).
@@ -3348,19 +3354,18 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
         except (TypeError, ValueError):
             cap = 6
         # Best-effort extension: a record-store failure must never sink the
-        # legacy container list -- the three legacy keys are always returned.
+        # legacy keys -- they are always returned and the flat entry list
+        # degrades to [].
         try:
-            session, workspace = _build_container_view_lists(manager, workspace_id)
+            containers = _build_container_view_entries(manager, workspace_id)
         except Exception as exc:
             log("ERROR", "server.workspace_containers",
-                f"Container-view lists failed: {exc}")
-            session, workspace = [], []
+                f"Container-view entries failed: {exc}")
+            containers = []
         return {
             "containers": containers,
             "containers_in_use": containers_in_use,
             "containers_available": max(0, cap - containers_in_use),
-            "session": session,
-            "workspace": workspace,
         }
     except Exception as exc:
         log("ERROR", "server.workspace_containers", f"List failed: {exc}")

@@ -58,7 +58,7 @@ const CONFIG_ROUTES = {
   }),
   '/api/health/containers': jsonOk({ docker: 'reachable' }),
   '/api/workspace/ws-1/workers': jsonOk([{ name: 'w1', runtime_status: 'ready', system_prompt: 'p', tools: ['FileEditor'] }]),
-  '/api/workspace/ws-1/containers': jsonOk({ containers: [{ name: 'c1', status: 'running' }] }),
+  '/api/workspace/ws-1/containers': jsonOk({ containers: [{ name: 'c1', state: 'running' }] }),
   '/api/session/list': jsonOk([{ session_id: 's1' }]),
 }
 
@@ -159,7 +159,7 @@ describe('fetchWorkspaceConfig', () => {
     expect(st.currentWorkspace.workers).toEqual([
       expect.objectContaining({ name: 'w1', runtimeStatus: 'ready', systemPrompt: 'p' }),
     ])
-    expect(st.currentWorkspace.containers).toEqual([{ name: 'c1', status: 'running' }])
+    expect(st.currentWorkspace.containers).toEqual([{ name: 'c1', state: 'running' }])
     expect(st.currentWorkspace.sessions).toEqual([{ session_id: 's1' }])
     expect(st.containerStatus).toEqual({ c1: 'running' })
     expect(st.dockerAvailable).toBe(true)
@@ -245,8 +245,8 @@ describe('fetchContainers', () => {
     stubFetchByUrl({
       '/api/workspace/ws-1/containers': jsonOk({
         containers: [
-          { name: 'c1', status: 'running' },
-          { name: 'c2', status: 'stopped' },
+          { name: 'c1', state: 'running' },
+          { name: 'c2', state: 'stopped' },
         ],
       }),
     })
@@ -254,8 +254,8 @@ describe('fetchContainers', () => {
     const st = useWorkspaceStore.getState()
     expect(st.containerStatus).toEqual({ c1: 'running', c2: 'stopped' })
     expect(st.currentWorkspace.containers).toEqual([
-      { name: 'c1', status: 'running' },
-      { name: 'c2', status: 'stopped' },
+      { name: 'c1', state: 'running' },
+      { name: 'c2', state: 'stopped' },
     ])
     expect(st.error).toBe('')
   })
@@ -279,7 +279,7 @@ describe('containerAction (start/stop)', () => {
       currentWorkspace: { id: 'ws-1', root: '/root' },
     })
     const fetchMock = stubFetchByUrl({
-      '/api/workspace/ws-1/containers': jsonOk({ containers: [{ name: 'c1', status: 'running' }] }),
+      '/api/workspace/ws-1/containers': jsonOk({ containers: [{ name: 'c1', state: 'running' }] }),
     })
     await useWorkspaceStore.getState().containerAction('ws-1', 'c1', 'start')
     const actionCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/containers/c1/start'))
@@ -297,7 +297,7 @@ describe('containerAction (start/stop)', () => {
       currentWorkspace: { id: 'ws-1', root: '/root' },
     })
     const fetchMock = stubFetchByUrl({
-      '/api/workspace/ws-1/containers': jsonOk({ containers: [{ name: 'c1', status: 'stopped' }] }),
+      '/api/workspace/ws-1/containers': jsonOk({ containers: [{ name: 'c1', state: 'stopped' }] }),
     })
     await useWorkspaceStore.getState().containerAction('ws-1', 'c1', 'stop')
     const actionCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/containers/c1/stop'))
