@@ -222,10 +222,21 @@ def _registered_ws(tmp_home: str):
 
 # -- GET /api/workspace/{workspace_id}/containers ------------------------------
 
-def test_list_containers_endpoint(contract_server):
+def test_list_containers_endpoint(contract_server, tmp_path, monkeypatch):
     """GET .../containers?workspace_path=... -> 200 with the container list."""
     app, tmp_home = contract_server
     fake = _make_fake_manager()
+    # Redirect the durable container-record store to a throwaway vault root and
+    # seed exactly one record, so the record-derived ``containers`` list has one
+    # element (pattern: web_ui/backend/tests/test_worker_stats_routes.py).
+    from thoughtmachine.container_record import api as cr_api
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    monkeypatch.setattr("thoughtmachine.vault.vault_root", lambda: vault_root)
+    cr_api.create_record(
+        "ws-1", "ephemeral", "workspace-owned",
+        id="rec-e", name="c-e", vault_root=vault_root,
+    )
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
             with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
@@ -240,7 +251,13 @@ def test_list_containers_endpoint(contract_server):
     # minus in-use). The fake manager has no max_containers, so capacity
     # defaults to 6: 1 running container leaves 5 available.
     payload = resp.json()
-    assert payload["containers"] == fake.list_containers()
+    containers = payload["containers"]
+    assert len(containers) == 1
+    entry = containers[0]
+    assert entry["name"] == "c-e"
+    assert entry["kind"] == "ephemeral"
+    assert entry["state"] == "stopped"
+    assert entry["shared"] is False
     assert payload["containers_in_use"] == 1
     assert payload["containers_available"] == 5
     assert fake.list_calls >= 1
