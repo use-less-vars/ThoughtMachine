@@ -3,23 +3,29 @@
 Routes under test (in ``web_ui/backend/server.py``), and the manager contract
 they rest on (``infra/container_manager.py``)::
 
-    GET   /api/workspace/{ws}/containers                 -> {"session": [...], "workspace": [...]}
+    GET   /api/workspace/{ws}/containers                 -> {"containers": [...], "containers_in_use": n, "containers_available": m}
     POST  /api/workspace/{ws}/containers/{id}/action      body {"action": "stop"|"start"|"restart"|"remove"}
     PATCH /api/workspace/{ws}/containers/{id}/resources   body {"mem_limit"?: str, "cpu_quota"?: int}
 
 Pinned contract (from the C.1 brief + recon, dev=bf7fb9f):
 
-* The existing GET (server.py:3207) returns only ``containers`` /
-  ``containers_in_use`` / ``containers_available``; it is COMPATIBLY
-  EXTENDED with ``session`` (ephemeral records) and ``workspace`` (resource
-  records).  Both come from the record store (``api.list_records``) split by
-  ``lifecycle_class`` -- ``ContainerManager.list_containers()`` hides resource
-  containers, so it cannot enumerate the workspace group.
+* The GET returns ``containers`` / ``containers_in_use`` /
+  ``containers_available`` (PC3).  ``containers`` is a FLAT list of
+  record-derived entries (``api.list_records``); the legacy ``session`` /
+  ``workspace`` keys are GONE.  ``containers_in_use`` / ``containers_available``
+  stay derived from ``ContainerManager.list_containers()`` /
+  ``max_containers``.
 * Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
-  permission_drift, shared``.  ``kind`` is ``ephemeral``|``runtime`` (there is
-  NO ``runtime`` lifecycle_class: every non-ephemeral record maps to
-  ``runtime``).  ``shared`` is True for runtime.  There is NO
+  permission_drift, shared``.  ``kind`` is ``ephemeral``|``persistent``|
+  ``resource`` (PC5).  ``ephemeral`` lifecycle -> ``ephemeral``;
+  ``persistent`` and ``service`` -> ``persistent`` (PC4: ``service`` is a
+  persistent-class container in intent; it has no producers today, so it
+  renders in the persistent section rather than inventing a UI section with no
+  writers); ``resource`` -> ``resource``; anything else -> ``persistent``.
+  ``shared`` = ``kind in ('persistent', 'resource')``.  There is NO
   ``owner_session_id`` field (P6: workspace-wide, no session attribution).
+* The old ``runtime`` kind is RETIRED (PC5): it appears in neither the backend
+  payload nor the UI.
 * Raw Docker status -> entry ``state`` mapping: OOMKilled True -> ``oom``
   (override); running|restarting -> ``running``; paused -> ``paused``;
   exited|dead -> ``exited``; created|stopped|removing|missing|error ->
@@ -208,30 +214,40 @@ class FakeManager:
 def test_get_groups_and_entry_fields(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral")
+    _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
+          lifecycle_class="persistent")
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource")
+    _seed(vault, record_id="rec-s", name="c-s", docker_id="docker-s",
+          lifecycle_class="service")
     _install_manager(monkeypatch, FakeManager())
 
     resp = _list()
     assert resp.status_code == 200
     data = resp.json()
 
-    # Compatible extension: the legacy key survives.
-    assert "containers" in data
+    # PC3: the three legacy keys survive; ``session``/``workspace`` are gone.
+    assert {"containers", "containers_in_use", "containers_available"} <= set(data)
+    assert "session" not in data
+    assert "workspace" not in data
 
-    session = data["session"]
-    workspace = data["workspace"]
-    assert isinstance(session, list) and isinstance(workspace, list)
+    containers = data["containers"]
+    assert isinstance(containers, list)
 
-    s_entry = _find_entry(session, "rec-e")
-    assert s_entry["kind"] == "ephemeral"
-    assert s_entry["shared"] is False
+    # PC3/PC4/PC5: kind mapping -- ephemeral / persistent / resource; the
+    # ``service`` class is a persistent-class container in intent (PC4).
+    assert _find_entry(containers, "rec-e")["kind"] == "ephemeral"
+    assert _find_entry(containers, "rec-p")["kind"] == "persistent"
+    assert _find_entry(containers, "rec-r")["kind"] == "resource"
+    assert _find_entry(containers, "rec-s")["kind"] == "persistent"
 
-    w_entry = _find_entry(workspace, "rec-r")
-    assert w_entry["kind"] == "runtime"
-    assert w_entry["shared"] is True
+    # shared = kind in ('persistent', 'resource'); ephemeral is never shared.
+    assert _find_entry(containers, "rec-e")["shared"] is False
+    assert _find_entry(containers, "rec-p")["shared"] is True
+    assert _find_entry(containers, "rec-r")["shared"] is True
+    assert _find_entry(containers, "rec-s")["shared"] is True
 
-    for entry in session + workspace:
+    for entry in containers:
         missing = ENTRY_KEYS - set(entry)
         assert not missing, f"entry {entry!r} missing keys {missing}"
         # P6: no session attribution anywhere.
@@ -250,7 +266,7 @@ def test_unwired_record_permissions_and_drift_null(vault, monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
 
-    entry = _find_entry(data["session"], "rec-e")
+    entry = _find_entry(data["containers"], "rec-e")
     assert entry["permissions"] is None
     assert entry["permission_drift"] is None
 
@@ -274,9 +290,9 @@ def test_action_stop_ephemeral(vault, monkeypatch):
     assert rec is not None
 
 
-# ── T4: restart a runtime container => recreate path, new docker_id ─────────
+# ── T4: restart a resource container => recreate path, new docker_id ─────────
 
-def test_action_restart_runtime_recreates(vault, monkeypatch):
+def test_action_restart_resource_recreates(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource")
     mgr = _install_manager(monkeypatch, FakeManager(
@@ -296,9 +312,9 @@ def test_action_restart_runtime_recreates(vault, monkeypatch):
     assert rec.docker_id != "docker-r"
 
 
-# ── T5: remove a runtime container => refused ───────────────────────────────
+# ── T5: remove a resource container => refused ───────────────────────────────
 
-def test_action_remove_runtime_refused(vault, monkeypatch):
+def test_action_remove_resource_refused(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource")
     mgr = _install_manager(monkeypatch, FakeManager())
@@ -315,9 +331,9 @@ def test_action_remove_runtime_refused(vault, monkeypatch):
     assert mgr.calls == []
 
 
-# ── T6: PATCH runtime resources => stop + recreate, new limits ──────────────
+# ── T6: PATCH resource resources => stop + recreate, new limits ──────────────
 
-def test_patch_runtime_resources_recreates(vault, monkeypatch):
+def test_patch_resource_resources_recreates(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource",
           intent_snapshot={"mem_limit": "512m", "cpu_quota": 50000})
@@ -439,7 +455,7 @@ def test_get_entry_state_oom(vault, monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
 
-    entry = _find_entry(data["session"], "rec-e")
+    entry = _find_entry(data["containers"], "rec-e")
     assert entry["state"] == "oom"
     assert entry["state"] != "running"
 
@@ -462,6 +478,19 @@ def test_action_remove_ephemeral(vault, monkeypatch):
     assert cr_api.load_record("ws1", "rec-e", vault_root=vault) is None
 
 
+# ── Empty workspace => empty flat entry list (PC3) ────────
+
+def test_empty_workspace_yields_empty_container_list(vault, monkeypatch):
+    _install_manager(monkeypatch, FakeManager(statuses={}))
+
+    resp = _list("ws-empty")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["containers"] == []
+    assert data["containers_in_use"] == 0
+    assert "session" not in data and "workspace" not in data
+
+
 # ── T15: GET legacy contract survives a record-store failure ────────────────
 
 def test_get_legacy_contract_and_store_failure(vault, monkeypatch):
@@ -473,13 +502,14 @@ def test_get_legacy_contract_and_store_failure(vault, monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
 
-    # The three legacy keys are ALWAYS present, regardless of the extension.
+    # The three legacy keys are ALWAYS present (PC3).
     assert {"containers", "containers_in_use", "containers_available"} <= set(data)
     assert isinstance(data["containers"], list) and data["containers"]
     for item in data["containers"]:
-        assert {"name", "status"} <= set(item)
+        assert ENTRY_KEYS <= set(item)
 
-    # Now make the record store explode: the legacy contract must survive.
+    # Now make the record store explode: the legacy keys must survive and the
+    # flat entry list degrades to [].
     def _boom(*args, **kwargs):
         raise RuntimeError("store exploded")
 
@@ -489,8 +519,7 @@ def test_get_legacy_contract_and_store_failure(vault, monkeypatch):
     assert resp2.status_code == 200
     data2 = resp2.json()
     assert {"containers", "containers_in_use", "containers_available"} <= set(data2)
-    assert data2["session"] == []
-    assert data2["workspace"] == []
+    assert data2["containers"] == []
 
 
 # ── T16: PATCH persists intent BEFORE the container is recreated ────────────

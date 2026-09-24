@@ -385,7 +385,7 @@ const useWorkspaceStore = create((set, get) => ({
       const containers = containersData && Array.isArray(containersData.containers) ? containersData.containers : []
       const containerStatus = {}
       containers.forEach((c) => {
-        if (c.name) containerStatus[c.name] = c.status
+        if (c.name) containerStatus[c.name] = c.state
       })
 
       // ── Sessions ──
@@ -593,7 +593,7 @@ const useWorkspaceStore = create((set, get) => ({
       const containers = data && Array.isArray(data.containers) ? data.containers : []
       const statusMap = {}
       containers.forEach((c) => {
-        if (c.name) statusMap[c.name] = c.status
+        if (c.name) statusMap[c.name] = c.state
       })
       set((state) => ({
         containerStatus: { ...state.containerStatus, ...statusMap },

@@ -19,7 +19,7 @@ const isRunningStatus = (status) => /^(running|active|up|started)$/i.test(status
  *  1. Permissions  — workspace ceiling + session-default effective (read-only)
  *  2. Active Tools — session tools checkboxes, applied via apply_config
  *  3. Workers      — runtime status per worker + Stop action
- *  4. Containers   — workspace containers (tm-resource-* excluded) + Start/Stop
+ *  4. Containers   — workspace containers (kind==='resource' excluded) + Start/Stop
  */
 export default function SessionSidebar({ workspaceId, config, tools, sendCommand, onClose }) {
   const currentWorkspace = useWorkspaceStore((s) => s.currentWorkspace)
@@ -85,7 +85,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
   const permissions = wsMatch ? (currentWorkspace.permissions || []) : []
   const workers = wsMatch ? activeWorkers : []
   const containers = (wsMatch ? (currentWorkspace.containers || []) : [])
-    .filter((c) => !(c.name || '').startsWith('tm-resource-'))
+    .filter((c) => c.kind !== 'resource')
 
   const effectiveTools = toolsOverride ?? (Array.isArray(tools) ? tools : [])
 
@@ -219,7 +219,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
           {workersError && <p className="session-sidebar-error">{workersError}</p>}
         </section>
 
-        {/* ── 4. Containers (tm-resource-* excluded) ──────────────────────── */}
+        {/* ── 4. Containers (kind==='resource' excluded) ──────────────────────── */}
         <section className="session-sidebar-section">
           <h4>Containers</h4>
           {containers.length === 0 ? (
@@ -227,7 +227,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
           ) : (
             <ul className="session-sidebar-containers">
               {containers.map((c) => {
-                const status = (containerStatus && containerStatus[c.name]) || c.status || 'unknown'
+                const status = (containerStatus && containerStatus[c.name]) || c.state || 'unknown'
                 const running = isRunningStatus(status)
                 const busy = !!(busyContainers && busyContainers[c.name])
                 return (
