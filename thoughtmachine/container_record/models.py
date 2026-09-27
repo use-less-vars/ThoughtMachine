@@ -70,6 +70,11 @@ OWNER_VALUES: tuple[str, ...] = (OWNER_WORKSPACE, OWNER_SYSTEM)
 #: ratification (see the subsystem report).
 STATE_CREATING = "creating"
 
+#: Post-run state written when a freshly created container is attached: the
+#: record advances ``creating`` -> ``running`` in the same ``attach`` call that
+#: binds the docker container (the five fresh-create sites).
+STATE_RUNNING = "running"
+
 #: Field order of §1 (also the on-disk JSON key order).
 SCHEMA_FIELD_NAMES: tuple[str, ...] = (
     "id",

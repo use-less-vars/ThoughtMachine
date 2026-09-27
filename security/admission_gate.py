@@ -406,6 +406,9 @@ def _admit(request: Any, probes: Optional[Any]) -> Decision:
             getattr(request, "permissions", None),
             getattr(request, "capabilities", None),
             lifecycle_class,
+            session_id=getattr(spec, "session_id", None),
+            workspace_id=workspace_id,
+            use_disk=True,
         )
     except Exception as exc:
         return Deny(REASON_RESOLUTION_FAILED, f"resolution raised: {exc!r}")

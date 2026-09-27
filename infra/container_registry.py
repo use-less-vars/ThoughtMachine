@@ -56,6 +56,7 @@ from thoughtmachine.container_record import (
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
+    STATE_RUNNING,
     docker_restart_policy,
 )
 from thoughtmachine.container_record.hook import record_creation
@@ -482,7 +483,9 @@ class ContainerRegistry:
         max_containers = self._get_max_containers(session_id, session_config)
 
         # Permission-derived network mode wins over any kwargs network_mode.
-        network_mode = _resolve_network_mode_via_gate(workspace_id, permissions)
+        network_mode = _resolve_network_mode_via_gate(
+            workspace_id, permissions, session_id=session_id
+        )
 
         profile_kwargs = {}
         for field_name in (
@@ -561,7 +564,7 @@ class ContainerRegistry:
                     permissions=permissions,
                     session_config=session_config,
                 )
-                record.attach(container)
+                record.attach(container, state=STATE_RUNNING)
         except Exception:
             # Roll back the reservation so a failed create frees its slot.
             self.unregister(container_name)
@@ -689,7 +692,7 @@ class ContainerRegistry:
                 permissions={},
                 session_config=None,
             )
-            record.attach(container)
+            record.attach(container, state=STATE_RUNNING)
         container_id = getattr(container, "id", "") or ""
         self.register(name, session_id, workspace_id, "resource", profile)
         with self._lock:
@@ -820,7 +823,7 @@ class ContainerRegistry:
                 continue
             old_mode = state["profile"].network_mode
             new_mode = _resolve_network_mode_via_gate(
-                state["workspace_id"], new_permissions
+                state["workspace_id"], new_permissions, session_id=session_id
             )
             if old_mode == new_mode:
                 continue  # still compliant — idempotent no-op
@@ -952,7 +955,7 @@ def _load_capabilities(workspace_id):
         return None
 
 
-def _resolve_network_mode_via_gate(workspace_id, permissions) -> str:
+def _resolve_network_mode_via_gate(workspace_id, permissions, session_id=None) -> str:
     """Resolve a container network mode via the SSoT security gate.
 
     Delegates to ``security.security_gate`` (``resolve_container_config`` plus
@@ -970,7 +973,9 @@ def _resolve_network_mode_via_gate(workspace_id, permissions) -> str:
 
         capabilities = get_workspace_capabilities(workspace_id)
         cfg = resolve_container_config(
-            permissions or {}, capabilities, LIFECYCLE_PERSISTENT
+            permissions or {}, capabilities, LIFECYCLE_PERSISTENT,
+            session_id=session_id, workspace_id=workspace_id,
+            use_disk=True,
         )
         if isinstance(cfg, ContainerConfig):
             return cfg.network_mode

@@ -185,10 +185,17 @@ def test_requires_lifecycle_class_positional():
         resolve_container_config({"network": "write"}, PERMISSIVE)
 
 
-def test_workspace_id_kwarg_is_rejected():
+def test_workspace_id_kwarg_is_keyword_only():
+    # ``workspace_id`` (like ``session_id``) is KEYWORD-ONLY: supplying it as a
+    # keyword is accepted and -- with no ``session_id`` -- stays pure...
+    cfg = resolve_container_config(
+        {"network": "write"}, PERMISSIVE, "persistent", workspace_id="ws"
+    )
+    assert isinstance(cfg, (ContainerConfig, ContainerConfigError))
+    # ...but a 4th POSITIONAL argument is rejected by the keyword-only signature.
     with pytest.raises(TypeError):
         resolve_container_config(
-            {"network": "write"}, PERMISSIVE, "persistent", workspace_id="ws"
+            {"network": "write"}, PERMISSIVE, "persistent", "ws"
         )
 
 

@@ -186,6 +186,29 @@ def permissive_caps(monkeypatch):
     )
 
 
+def _write_disk_grant(vault, workspace_id, session_id, grants):
+    """Seed the on-disk permission store so disk-mode resolution is portable.
+
+    ``request_container`` / ``on_permission_changed`` resolve the network mode
+    through the security gate with BOTH the session and workspace ids, so the
+    vault permission store is the source of truth and the ``permissions``
+    mirror argument is ignored.  A test therefore seeds the session grant
+    (sidecar) AND the matching workspace ceiling (``config.json``) under the
+    hermetic vault.  Re-call with new ``grants`` to change the grant between a
+    create and a reconcile.
+    """
+    import json as _json
+
+    from thoughtmachine.permission_store import write_session_permissions
+
+    write_session_permissions(vault, workspace_id, session_id, grants)
+    cfg_dir = vault / "workspaces" / workspace_id
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        _json.dumps({"permissions": dict(grants)})
+    )
+
+
 # ---------------------------------------------------------------------------
 # ContainerProfile
 # ---------------------------------------------------------------------------
@@ -403,8 +426,12 @@ class TestRegistration:
 
 class TestRequestContainer:
     def test_request_creates_registers_and_returns_handle(
-        self, registry, fake_client, permissive_caps
+        self, registry, fake_client, permissive_caps, hermetic_vault
     ):
+        _write_disk_grant(
+            hermetic_vault, "ws-123", "sess-1",
+            {"network": "write", "filesystem": "write"},
+        )
         handle = registry.request_container(
             "worker-1", "sess-1", {"network": "write", "filesystem": "write"},
             workspace_id="ws-123",
@@ -436,17 +463,29 @@ class TestRequestContainer:
         assert state["quarantined"] is False
         assert registry.get_containers_for_session("sess-1") == [handle]
 
-    def test_request_network_resolution(self, registry, fake_client, permissive_caps):
+    def test_request_network_resolution(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        # The network mode is now resolved from the disk-side permission store
+        # (both ids present), not the ``permissions`` mirror argument, so each
+        # request's grant is seeded on disk first.
+        _write_disk_grant(hermetic_vault, "ws", "s", {"network": "write"})
         registry.request_container("w", "s", {"network": "write"}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
         # all calls here share the explicit workspace "ws"; the 5 requests stay
         # under DEFAULT_MAX_CONTAINERS (6) so the budget is never reached
+        _write_disk_grant(hermetic_vault, "ws", "s2", {"network": "outbound"})
         registry.request_container("w", "s2", {"network": "outbound"}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
+        # ``True`` is not a catalog level for ``network``; the disk grant must be
+        # the canonical ``"write"`` to resolve to bridge.
+        _write_disk_grant(hermetic_vault, "ws", "s", {"network": "write"})
         registry.request_container("w", "s", {"network": True}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
+        _write_disk_grant(hermetic_vault, "ws", "s", {"network": "banned"})
         registry.request_container("w", "s", {"network": False}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "none"
+        _write_disk_grant(hermetic_vault, "ws", "s", {})
         registry.request_container("w", "s", {}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "none"
 
@@ -665,11 +704,13 @@ class TestPermissionReconciliation:
         assert registry._containers[handle["name"]]["status"] == "running"
 
     def test_recreate_on_network_change_same_name(
-        self, registry, fake_client, permissive_caps
+        self, registry, fake_client, permissive_caps, hermetic_vault
     ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "banned"})
         handle = registry.request_container("w", "sess-p", {"network": False}, workspace_id="ws")
         assert _run_kwargs(fake_client)["network_mode"] == "none"
 
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "write"})
         registry.on_permission_changed("sess-p", {"network": "write"})
         assert fake_client.containers.run.call_count == 2
         assert _run_kwargs(fake_client)["network_mode"] == "bridge"
@@ -687,16 +728,22 @@ class TestPermissionReconciliation:
         assert state["quarantined"] is False
 
     def test_idempotent_second_event_is_noop(
-        self, registry, fake_client, permissive_caps
+        self, registry, fake_client, permissive_caps, hermetic_vault
     ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "banned"})
         registry.request_container("w", "sess-p", {"network": False}, workspace_id="ws")
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "write"})
         registry.on_permission_changed("sess-p", {"network": "write"})
         assert fake_client.containers.run.call_count == 2
         registry.on_permission_changed("sess-p", {"network": "write"})
         assert fake_client.containers.run.call_count == 2  # no third create
 
-    def test_teardown_failure_quarantines(self, registry, fake_client, permissive_caps):
+    def test_teardown_failure_quarantines(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-q", {"network": "banned"})
         handle = registry.request_container("w", "sess-q", {"network": False}, workspace_id="ws")
+        _write_disk_grant(hermetic_vault, "ws", "sess-q", {"network": "write"})
 
         class BoomStop(FakeContainer):
             def stop(self, timeout=None):
@@ -712,9 +759,11 @@ class TestPermissionReconciliation:
         assert handle["name"] not in registry._session_map["sess-q"]
 
     def test_recreate_failure_does_not_raise(
-        self, registry, fake_client, permissive_caps
+        self, registry, fake_client, permissive_caps, hermetic_vault
     ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-r", {"network": "banned"})
         handle = registry.request_container("w", "sess-r", {"network": False}, workspace_id="ws")
+        _write_disk_grant(hermetic_vault, "ws", "sess-r", {"network": "write"})
         fake_client.containers.run.side_effect = docker.errors.DockerException("create failed")
         registry.on_permission_changed("sess-r", {"network": "write"})
         state = registry._containers[handle["name"]]
@@ -743,6 +792,8 @@ class TestDriftEventBindingConstraint:
         )
         from thoughtmachine.container_record import RECORD_LABEL_KEY, read_event_log
 
+        vault = tmp_path / "vault"
+        _write_disk_grant(vault, "ws-drift", "sess-drift", {"network": "banned"})
         handle = registry.request_container(
             "w", "sess-drift", {"network": False}, workspace_id="ws-drift"
         )
@@ -750,6 +801,7 @@ class TestDriftEventBindingConstraint:
         record_id = registry._containers[name]["profile"].labels[RECORD_LABEL_KEY]
         assert record_id  # the record-creation hook injected a record id
 
+        _write_disk_grant(vault, "ws-drift", "sess-drift", {"network": "write"})
         registry.on_permission_changed("sess-drift", {"network": "write"})
 
         events = [
@@ -771,12 +823,13 @@ class TestDriftEventBindingConstraint:
         assert len(events_again) == 1
 
     def test_drift_event_skipped_when_no_record_id(
-        self, registry, fake_client, monkeypatch
+        self, registry, fake_client, monkeypatch, hermetic_vault
     ):
         monkeypatch.setattr(
             "security.security_gate.get_workspace_capabilities",
             lambda workspace_id=None: _default_caps(),
         )
+        _write_disk_grant(hermetic_vault, "ws-nr", "sess-nr", {"network": "write"})
         name = "tm-user-norecord"
         registry.register(
             name,

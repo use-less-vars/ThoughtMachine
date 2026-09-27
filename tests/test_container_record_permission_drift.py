@@ -496,6 +496,24 @@ class _RunDockerClient:
         return True
 
 
+def _write_disk_grant(vault, workspace_id, session_id, grants):
+    """Seed the on-disk permission store so disk-mode resolution is positive.
+
+    ``cm.start`` resolves the profile through the security gate with BOTH the
+    session and workspace ids, so the vault permission store is the source of
+    truth; without a seeded grant the gate fail-closes to ``("none", "ro")``
+    and the create arguments (``ReadOnly`` mounts, ``network_mode``) drift.
+    """
+    import json as _json
+
+    from thoughtmachine.permission_store import write_session_permissions
+
+    write_session_permissions(vault, workspace_id, session_id, grants)
+    cfg_dir = vault / "workspaces" / workspace_id
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(_json.dumps({"permissions": dict(grants)}))
+
+
 def _make_start_manager(
     monkeypatch, permissive_caps, *, workspace_id=WS, session_id="s1", grants=None
 ):
@@ -547,6 +565,7 @@ def test_start_records_effective_merge_not_raw_grants(
         f"effective == raw ({_GRANTS!r})"
     )
 
+    _write_disk_grant(vault, WS, "s1", _GRANTS)
     cm, client = _make_start_manager(monkeypatch, permissive_caps, grants=_GRANTS)
     result = cm.start(image="agent-executor", name="agent-perm-t1")
     assert "error" not in result, result
@@ -666,6 +685,7 @@ def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
         "user": "1000:1000",
     }
 
+    _write_disk_grant(vault, WS, "s1", _GRANTS)
     cm, client = _make_start_manager(monkeypatch, permissive_caps, grants=_GRANTS)
     cm.start(image="agent-executor", name=name)
 
