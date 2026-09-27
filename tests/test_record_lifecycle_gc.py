@@ -153,13 +153,14 @@ def test_registered_workspace_record_is_also_reaped():
 
 
 # ---------------------------------------------------------------------------
-# (d) own-lifecycle classes are exempt
+# (d) own-lifecycle SERVICE records are exempt
+#     (resource records are NOT exempt from the RECORD sweeper -- see the
+#     resource-reaper section at the end; bug/resource-record-reaper)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("lifecycle_class", [LIFECYCLE_RESOURCE, LIFECYCLE_SERVICE])
-def test_own_lifecycle_classes_are_exempt(lifecycle_class):
-    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=lifecycle_class,
+def test_own_lifecycle_service_record_is_exempt():
+    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_SERVICE,
                  age_days=10)
     result = _sweep()
     assert result["removed"] == 0
@@ -315,6 +316,57 @@ def test_persistent_ttl_comes_from_policy_not_global_default():
     path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_PERSISTENT,
                  age_days=2)
     result = _sweep(default_max_age_s=30 * 86400)
+    assert result["removed"] == 1
+    assert result["removed_records"] == ["rec-1"]
+    assert not path.is_file()
+
+
+
+# ---------------------------------------------------------------------------
+# (m) resource records: orphaned -> reaped; live-bound -> retained
+#     Regression for bug/resource-record-reaper.  Resource records own their
+#     container's lifecycle (``own_lifecycle=True``), so they were previously
+#     exempt from the RECORD sweeper wholesale and accumulated forever.  The
+#     orphan RECORD sweeper must still reap a resource record whose bound
+#     container is gone, while leaving live-bound ones untouched.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("docker_id", ["c" * 16, ""])
+def test_orphaned_resource_record_is_reaped(docker_id):
+    # Test A -- resource record whose docker_id resolves to no live container
+    # (stale id, or never bound).  On the buggy tree the record stays; after
+    # the fix it is reaped like any other orphan.
+    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_RESOURCE,
+                 docker_id=docker_id, age_days=10)
+    result = _sweep()
+    assert result["removed"] == 1
+    assert result["removed_records"] == ["rec-1"]
+    assert not path.is_file()
+    assert load_record(_ORPHAN_WS, "rec-1") is None
+
+
+def test_live_bound_resource_record_is_retained():
+    # Test B -- resource record bound to a LIVE container is never reaped.
+    # Trivially green on the buggy tree (nothing is reaped); the regression
+    # guard is that it STAYS green after the fix.
+    live = "c" * 16
+    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_RESOURCE,
+                 docker_id=live, age_days=10)
+    result = _sweep(docker_client=_FakeDocker([live]))
+    assert result["removed"] == 0
+    assert result["skipped"] == 1
+    assert path.is_file()
+    assert load_record(_ORPHAN_WS, "rec-1") is not None
+
+
+def test_persistent_record_with_stale_docker_id_is_reaped():
+    # Test C -- non-resource classes are unaffected by the resource carve-out.
+    # Documented current-tree behaviour: a stale PERSISTENT record is reaped
+    # (unchanged before and after the fix).
+    path = _mint(_ORPHAN_WS, "rec-1", lifecycle_class=LIFECYCLE_PERSISTENT,
+                 docker_id="c" * 16, age_days=10)
+    result = _sweep()
     assert result["removed"] == 1
     assert result["removed_records"] == ["rec-1"]
     assert not path.is_file()
