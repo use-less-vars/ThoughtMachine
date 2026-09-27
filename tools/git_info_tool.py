@@ -1187,7 +1187,12 @@ class GitReadTool(ToolBase):
                     else None
                 )
                 expected = resolve_container_config(
-                    self.session_permissions or {}, capabilities, LIFECYCLE_RESOURCE
+                    self.session_permissions or {},
+                    capabilities,
+                    LIFECYCLE_RESOURCE,
+                    session_id=getattr(self, "session_id", None),
+                    workspace_id=workspace_id,
+                    use_disk=True,
                 )
                 network_mode = (
                     expected.network_mode

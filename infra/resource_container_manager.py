@@ -1255,7 +1255,11 @@ class ResourceContainerManager:
             str or None: the denial reason, or None when containers are
                 allowed or the gate is unavailable.
         """
-        return _container_policy_denied(self.session_permissions)
+        return _container_policy_denied(
+            self.session_permissions,
+            workspace_id=getattr(self, "workspace_id", None),
+            session_id=getattr(self, "session_id", None),
+        )
 
     @staticmethod
     def _resource_result(
@@ -1590,7 +1594,9 @@ def _load_capabilities(workspace_id):
         return None
 
 
-def _container_policy_denied(session_permissions=None):
+def _container_policy_denied(
+    session_permissions=None, workspace_id=None, session_id=None
+):
     """Reason string when session/workspace policy denies containers.
 
     Module-level twin of ``ResourceContainerManager._container_policy_denied``
@@ -1634,7 +1640,12 @@ def _container_policy_denied(session_permissions=None):
         # returns ``ContainerConfigError("capabilities_required")``, which the
         # fail-closed mapping below turns into an explicit DENY.
         cfg = resolve_container_config(
-            session_permissions, None, LIFECYCLE_RESOURCE
+            session_permissions,
+            None,
+            LIFECYCLE_RESOURCE,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            use_disk=True,
         )
     except Exception as exc:
         _LOG.warning("Security gate container policy check failed: %s", exc)
@@ -2097,7 +2108,12 @@ def provision_workspace_resource(workspace_id, workspace_path, session_permissio
 
         capabilities = get_workspace_capabilities(workspace_id)
         config = resolve_container_config(
-            session_permissions or {}, capabilities, LIFECYCLE_RESOURCE
+            session_permissions or {},
+            capabilities,
+            LIFECYCLE_RESOURCE,
+            session_id=None,
+            workspace_id=workspace_id,
+            use_disk=True,
         )
         if isinstance(config, ContainerConfig):
             resolved = config.network_mode
