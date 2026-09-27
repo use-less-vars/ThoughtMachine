@@ -588,10 +588,10 @@ def test_map_container_view_state_raw_mapping():
 
     # (d) unknown raw string falls back to the record state
     assert map_state({"status": "bogus"}, "running") == "running"
-    assert map_state({"status": "bogus"}, "creating") == "stopped"
+    assert map_state({"status": "bogus"}, "creating") == "creating"
 
     # (e) no usable status -> record-state fallback (default 'stopped')
     assert map_state(None, "running") == "running"
-    assert map_state(None, "creating") == "stopped"
+    assert map_state(None, "creating") == "creating"
     assert map_state(None, "") == "stopped"
 

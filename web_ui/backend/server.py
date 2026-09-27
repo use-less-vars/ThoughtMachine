@@ -3225,7 +3225,7 @@ _CONTAINER_VIEW_RAW_STATE = {
 #: Record ``state`` (fallback when no live status can be read) -> entry state.
 _CONTAINER_VIEW_RECORD_STATE = {
     "running": "running",
-    "creating": "stopped",
+    "creating": "creating",
     "": "stopped",
 }
 

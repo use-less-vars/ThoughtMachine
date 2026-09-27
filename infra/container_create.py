@@ -44,7 +44,7 @@ from security.admission_gate import (
     Transform,
     admit,
 )
-from thoughtmachine.container_record import docker_restart_policy
+from thoughtmachine.container_record import STATE_RUNNING, docker_restart_policy
 from thoughtmachine.container_record.hook import record_creation
 
 __all__ = [
@@ -387,7 +387,7 @@ def create_hardened_container(
             name=spec.name,
         ) as handle:
             container = _run()
-            handle.attach(container)
+            handle.attach(container, state=STATE_RUNNING)
     else:
         container = _run()
 

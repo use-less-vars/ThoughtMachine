@@ -116,6 +116,7 @@ from thoughtmachine.container_record import (
     RECORD_LABEL_KEY,
     RESOURCE_LABEL,
     RESOURCE_NAME_PREFIX,
+    STATE_RUNNING,
     RecordLocked,
     RecordNotFound,
     UnknownLifecycleClass,
@@ -1788,7 +1789,7 @@ class ContainerManager:
                 image=image, name=name, labels=labels, mounts=mounts,
                 tmpfs=tmpfs, network_mode=network_mode,
                 lifecycle_class=lifecycle_class)
-            record.attach(container)
+            record.attach(container, state=STATE_RUNNING)
             # Record-first identity: index the freshly minted record so a
             # subsequent start(name=...) reuses it instead of re-creating.
             self._name_index_register(name, getattr(record, "id", ""))

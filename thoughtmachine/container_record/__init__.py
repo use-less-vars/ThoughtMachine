@@ -43,6 +43,7 @@ from .models import (
     SCHEMA_VERSION_CURRENT,
     SCHEMA_VERSION_LEGACY,
     STATE_CREATING,
+    STATE_RUNNING,
     ContainerRecordError,
     Record,
     RecordCorrupt,
@@ -89,6 +90,7 @@ __all__ = [
     "OWNER_WORKSPACE",
     "OWNER_SYSTEM",
     "STATE_CREATING",
+    "STATE_RUNNING",
     # snapshot extraction (§1.1 / §4)
     "snapshot_from_attrs",
     "snapshot_has_evidence",

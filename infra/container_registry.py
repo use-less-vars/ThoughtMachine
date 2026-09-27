@@ -56,6 +56,7 @@ from thoughtmachine.container_record import (
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
+    STATE_RUNNING,
     docker_restart_policy,
 )
 from thoughtmachine.container_record.hook import record_creation
@@ -561,7 +562,7 @@ class ContainerRegistry:
                     permissions=permissions,
                     session_config=session_config,
                 )
-                record.attach(container)
+                record.attach(container, state=STATE_RUNNING)
         except Exception:
             # Roll back the reservation so a failed create frees its slot.
             self.unregister(container_name)
@@ -689,7 +690,7 @@ class ContainerRegistry:
                 permissions={},
                 session_config=None,
             )
-            record.attach(container)
+            record.attach(container, state=STATE_RUNNING)
         container_id = getattr(container, "id", "") or ""
         self.register(name, session_id, workspace_id, "resource", profile)
         with self._lock:

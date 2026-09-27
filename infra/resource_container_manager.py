@@ -188,6 +188,7 @@ from infra.container_create import (
 from thoughtmachine.container_record import (
     LIFECYCLE_RESOURCE,
     RESOURCE_NAME_PREFIX,
+    STATE_RUNNING,
     docker_restart_policy,
 )
 from thoughtmachine.container_record import RESOURCE_LABEL as _SHARED_RESOURCE_LABEL
@@ -1197,7 +1198,7 @@ class ResourceContainerManager:
                 container = create_hardened_container(
                     self.client, create_spec, admission=None, record=False
                 ).container
-                record.attach(container)
+                record.attach(container, state=STATE_RUNNING)
         except Exception as e:
             # Wrap image-missing with actionable build instructions.
             raise RuntimeError(
