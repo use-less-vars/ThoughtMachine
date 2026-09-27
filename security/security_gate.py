@@ -760,6 +760,37 @@ def _session_exceeds_ceiling_message(
     )
 
 
+def _read_disk_permission_sources(
+    workspace_id: Any,
+    session_id: Any,
+) -> tuple:
+    """Read ``(session_grants, workspace_ceiling)`` from the vault permission store.
+
+    RAISES on ANY failure (missing/corrupt sidecar or config, I/O error,
+    unexpected exception) — it never swallows.  Callers choose the fail-closed
+    policy that suits them:
+
+    * :func:`get_effective_permissions` (disk mode) substitutes the deny-all
+      session + deny-all ceiling so a disk-mode caller never receives default
+      grants.
+    * :func:`resolve_container_config` (``use_disk=True``) falls back to the
+      caller-supplied in-memory session.
+
+    Imports are lazy so the in-memory path never depends on
+    ``thoughtmachine.permission_store`` / ``thoughtmachine.vault``.
+    """
+    import thoughtmachine.vault as _vault_module
+    from thoughtmachine.permission_store import (
+        read_session_permissions,
+        workspace_ceiling,
+    )
+
+    _vault_root = _vault_module.vault_root()
+    grants = read_session_permissions(_vault_root, workspace_id, session_id)
+    ceiling = workspace_ceiling(_vault_root, workspace_id)
+    return grants, ceiling
+
+
 def get_effective_permissions(
     session: SessionPermissions,
     workspace: WorkspaceCapabilities,
@@ -841,17 +872,22 @@ def get_effective_permissions(
     # vault.  Any store error fails CLOSED (deny-all session + deny-all
     # ceiling); the merged result below can then only be restrictive.
     if workspace_permissions is None and session_id is not None and workspace_id is not None:
-        import thoughtmachine.vault as _vault_module
-        from thoughtmachine.permission_store import (
-            read_session_permissions,
-            workspace_ceiling,
-        )
-
         try:
-            _vault_root = _vault_module.vault_root()
-            disk_grants = read_session_permissions(_vault_root, workspace_id, session_id)
-            disk_ceiling = workspace_ceiling(_vault_root, workspace_id)
-        except Exception:
+            disk_grants, disk_ceiling = _read_disk_permission_sources(
+                workspace_id, session_id
+            )
+        except Exception as exc:
+            # Fail CLOSED, but never silently: an unreadable vault store
+            # (missing/corrupt sidecar or config, I/O error, unexpected
+            # exception) must be observable rather than indistinguishable
+            # from an honest all-banned grant set.
+            logger.warning(
+                "get_effective_permissions: vault permission read failed "
+                "(workspace_id=%s session_id=%s): %s; failing CLOSED",
+                workspace_id,
+                session_id,
+                type(exc).__name__,
+            )
             session = _DISK_FAIL_CLOSED_SESSION
             workspace_permissions = _DISK_FAIL_CLOSED_CEILING
         else:
@@ -1002,14 +1038,25 @@ def resolve_container_config(
     permissions: Any,
     capabilities: Optional[WorkspaceCapabilities],
     lifecycle_class: str,
+    *,
+    session_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    use_disk: bool = False,
 ) -> ContainerConfig | ContainerConfigError:
     """Resolve the container configuration from permissions + capabilities.
 
-    This is a **pure**, **total** and **fail-closed** replacement for the old
+    This is a **total** and **fail-closed** replacement for the old
     ``get_expected_container_config`` helper:
 
-    * **Pure** — no filesystem, vault, environment or network IO. Everything is
-      derived from the three arguments supplied by the caller.
+    * **Pure by default** — it performs no filesystem, vault, environment or
+      network IO unless explicitly opted in with ``use_disk=True``; otherwise
+      everything is derived from the three positional arguments.  With
+      ``use_disk=True`` AND both keyword-only ``session_id`` and ``workspace_id``
+      supplied, the session grants and workspace ceiling are read from the vault
+      permission store (``thoughtmachine.permission_store``) — the disk is then
+      the source of truth and the in-memory ``permissions`` argument is ignored.
+      A store read failure is observable (a WARNING naming the ids) and falls
+      back to the caller-supplied in-memory session rather than denying.
     * **Total** — it never raises; every input maps to exactly one
       :class:`ContainerConfig` or :class:`ContainerConfigError` value.
     * **Fail-closed** — any ambiguity (unknown lifecycle class, missing
@@ -1025,6 +1072,15 @@ def resolve_container_config(
         capabilities: A ``WorkspaceCapabilities`` instance. ``None`` is rejected
             with ``ContainerConfigError("capabilities_required")``.
         lifecycle_class: One of :data:`LIFECYCLE_CLASSES`.
+        session_id: Optional session id.  When supplied together with
+            ``workspace_id`` the disk permission store is consulted.
+        workspace_id: Optional workspace id.  Required (with ``session_id``) to
+            enable the disk-store read.
+        use_disk: Opt-in (default ``False``) to consult the vault permission
+            store.  The disk read engages ONLY when ``use_disk`` is ``True``
+            AND both ``session_id`` and ``workspace_id`` are supplied; any
+            other combination stays pure.  On a store read failure the resolver
+            logs a WARNING and falls back to the in-memory ``permissions``.
 
     Returns:
         A :class:`ContainerConfig` on success, otherwise a
@@ -1061,7 +1117,39 @@ def resolve_container_config(
             )
 
         # 4. Merge permissions with capabilities.
-        eff = get_effective_permissions(session, capabilities)
+        # Disk-mode (opt-in): only when ``use_disk`` is True AND BOTH ids are
+        # supplied is the vault permission store the source of truth.  The
+        # session grants + workspace ceiling are read from disk and the
+        # in-memory ``session`` normalised above is ignored.  A store read
+        # failure is observable (WARNING naming the ids) and FALLS BACK to the
+        # caller-supplied ``session`` mirror rather than failing closed, so a
+        # store that cannot express the caller's ids (e.g. a uuid.UUID session
+        # id) does not override an already-correct mirror.  Every other
+        # combination uses the legacy 2-arg in-memory merge BYTE-FOR-BYTE.
+        if use_disk and session_id is not None and workspace_id is not None:
+            try:
+                disk_grants, disk_ceiling = _read_disk_permission_sources(
+                    workspace_id, session_id
+                )
+                loaded = SessionPermissions(
+                    **coerce_resource_permissions(disk_grants)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "resolve_container_config: vault permission read failed "
+                    "(workspace_id=%s session_id=%s): %s; falling back to "
+                    "caller-supplied session",
+                    workspace_id,
+                    session_id,
+                    type(exc).__name__,
+                )
+                eff = get_effective_permissions(session, capabilities)
+            else:
+                eff = get_effective_permissions(
+                    loaded, capabilities, disk_ceiling
+                )
+        else:
+            eff = get_effective_permissions(session, capabilities)
 
         # 5. Network mode.
         network_mode = resolve_network_mode(eff.get("network"))

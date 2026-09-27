@@ -3660,8 +3660,18 @@ class ContainerManager:
             )
 
             capabilities = get_workspace_capabilities(workspace_id)
+            # Thread the manager's own ids AND opt into the disk read so the
+            # vault permission store is the source of truth whenever BOTH ids
+            # are present.  When either id is absent the resolver stays pure
+            # and the legacy in-memory mirror is used byte-for-byte; on a store
+            # read failure (e.g. a uuid.UUID id the store path cannot express)
+            # the resolver falls back to the caller's mirror instead of failing
+            # closed.
+            _session_id = getattr(self, "session_id", None)
             cfg = resolve_container_config(
-                session_permissions or {}, capabilities, lifecycle_class
+                session_permissions or {}, capabilities, lifecycle_class,
+                session_id=_session_id, workspace_id=workspace_id,
+                use_disk=True,
             )
         except Exception:
             if strict:

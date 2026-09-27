@@ -104,6 +104,19 @@ class PermissionStoreError(Exception):
 # ---------------------------------------------------------------------------
 
 
+def _coerce_id(value: Any) -> str:
+    """Coerce a workspace/session identifier to ``str`` for path joins.
+
+    Callers pass either a plain ``str`` id or a ``uuid.UUID`` (the gate/app
+    resolve some sessions by UUID).  ``pathlib`` cannot join a raw ``UUID``
+    onto a ``Path`` (``TypeError: unsupported operand type(s) for /:
+    'PosixPath' and 'UUID'``), so every path join and record comparison in
+    this module coerces through here.  ``str()`` on a ``str`` is a no-op, so
+    plain-str behaviour is unchanged.
+    """
+    return str(value)
+
+
 def session_grants_path(
     vault_root, workspace_id: str, session_id: str
 ) -> Path:
@@ -114,16 +127,16 @@ def session_grants_path(
     return (
         Path(vault_root)
         / "workspaces"
-        / workspace_id
+        / _coerce_id(workspace_id)
         / "sessions"
-        / session_id
+        / _coerce_id(session_id)
         / "permissions.json"
     )
 
 
 def _workspace_sessions_dir(vault_root, workspace_id: str) -> Path:
     return (
-        Path(vault_root) / "workspaces" / workspace_id / "sessions"
+        Path(vault_root) / "workspaces" / _coerce_id(workspace_id) / "sessions"
     )
 
 
@@ -150,7 +163,7 @@ def _session_record_path(
                 data = json.load(f)
         except Exception:
             continue
-        if isinstance(data, dict) and data.get("session_id") == session_id:
+        if isinstance(data, dict) and data.get("session_id") == _coerce_id(session_id):
             return file_path
     return None
 
@@ -281,7 +294,7 @@ def workspace_ceiling(vault_root, workspace_id: str) -> Dict[str, Any]:
     purpose-preset/default fallback (blueprint section 8).
     """
     config_path = (
-        Path(vault_root) / "workspaces" / workspace_id / "config.json"
+        Path(vault_root) / "workspaces" / _coerce_id(workspace_id) / "config.json"
     )
     data = _read_json_strict(config_path, "workspace config")
     permissions = data.get("permissions")

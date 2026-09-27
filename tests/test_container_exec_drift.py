@@ -438,7 +438,7 @@ def test_unresolved_non_containerconfig_refuses(events, warnings, monkeypatch):
     monkeypatch.setattr(sg, "get_workspace_capabilities",
                         lambda _ws: object(), raising=True)
     monkeypatch.setattr(sg, "resolve_container_config",
-                        lambda perms, caps, lifecycle: object(), raising=True)
+                        lambda perms, caps, lifecycle, **kwargs: object(), raising=True)
 
     ctr = _FakeContainer("c1", labels={RECORD_LABEL_KEY: "rec-1"},
                          attrs=_attrs("bridge", True))
@@ -469,7 +469,7 @@ def test_resolved_restrictive_policy_still_denies(events, monkeypatch):
                         lambda _ws: None, raising=True)
     monkeypatch.setattr(
         sg, "resolve_container_config",
-        lambda perms, caps, lifecycle: sg.ContainerConfig(
+        lambda perms, caps, lifecycle, **kwargs: sg.ContainerConfig(
             network_mode="none", workspace_mode="ro",
             effective={}, lifecycle_class=lifecycle),
         raising=True,

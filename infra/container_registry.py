@@ -483,7 +483,9 @@ class ContainerRegistry:
         max_containers = self._get_max_containers(session_id, session_config)
 
         # Permission-derived network mode wins over any kwargs network_mode.
-        network_mode = _resolve_network_mode_via_gate(workspace_id, permissions)
+        network_mode = _resolve_network_mode_via_gate(
+            workspace_id, permissions, session_id=session_id
+        )
 
         profile_kwargs = {}
         for field_name in (
@@ -821,7 +823,7 @@ class ContainerRegistry:
                 continue
             old_mode = state["profile"].network_mode
             new_mode = _resolve_network_mode_via_gate(
-                state["workspace_id"], new_permissions
+                state["workspace_id"], new_permissions, session_id=session_id
             )
             if old_mode == new_mode:
                 continue  # still compliant — idempotent no-op
@@ -953,7 +955,7 @@ def _load_capabilities(workspace_id):
         return None
 
 
-def _resolve_network_mode_via_gate(workspace_id, permissions) -> str:
+def _resolve_network_mode_via_gate(workspace_id, permissions, session_id=None) -> str:
     """Resolve a container network mode via the SSoT security gate.
 
     Delegates to ``security.security_gate`` (``resolve_container_config`` plus
@@ -971,7 +973,9 @@ def _resolve_network_mode_via_gate(workspace_id, permissions) -> str:
 
         capabilities = get_workspace_capabilities(workspace_id)
         cfg = resolve_container_config(
-            permissions or {}, capabilities, LIFECYCLE_PERSISTENT
+            permissions or {}, capabilities, LIFECYCLE_PERSISTENT,
+            session_id=session_id, workspace_id=workspace_id,
+            use_disk=True,
         )
         if isinstance(cfg, ContainerConfig):
             return cfg.network_mode

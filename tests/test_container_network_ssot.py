@@ -35,6 +35,43 @@ def permissive_caps(monkeypatch):
     )
 
 
+def _write_disk_grant(vault, workspace_id, session_id, grants):
+    """Seed the on-disk permission store so disk-mode resolution is positive.
+
+    ``_compute_config`` threads BOTH the session and workspace ids into the
+    security gate, so the vault permission store is the source of truth and a
+    grant must be seeded for the gate to resolve ``("bridge", "rw")`` instead
+    of fail-closing to ``("none", "ro")``.
+    """
+    import json as _json
+
+    from thoughtmachine.permission_store import write_session_permissions
+
+    write_session_permissions(vault, workspace_id, session_id, grants)
+    cfg_dir = vault / "workspaces" / workspace_id
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(_json.dumps({"permissions": dict(grants)}))
+
+
+@pytest.fixture
+def disk_grant(tmp_path, monkeypatch):
+    """Pin ``vault_root`` to a hermetic vault holding the manager's grant.
+
+    ``_mgr`` builds a manager with ``workspace_id="ws-1"`` /
+    ``session_id="sess-1"``; both ids present engage disk mode, so the matching
+    session grant (sidecar) and workspace ceiling (``config.json``) are seeded.
+    """
+    import thoughtmachine.vault
+
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(thoughtmachine.vault, "vault_root", lambda: vault)
+    _write_disk_grant(
+        vault, "ws-1", "sess-1", {"network": "outbound", "filesystem": "write"}
+    )
+    return vault
+
+
 def _mgr():
     mgr = ContainerManager.__new__(ContainerManager)
     mgr.workspace_path = "/tmp/ws"
@@ -68,7 +105,7 @@ class _FakeContainer:
         return "running"
 
 
-def test_desired_config_matches_gate_ssot(permissive_caps):
+def test_desired_config_matches_gate_ssot(permissive_caps, disk_grant):
     mgr = _mgr()
     net, ws = mgr._compute_config(mgr.workspace_path, mgr.workspace_id, SP)
     cfg = resolve_container_config(SP, WorkspaceCapabilities.default(), LIFECYCLE_PERSISTENT)
@@ -118,7 +155,7 @@ def test_drifted_workspace_label_container_is_not_silently_reused(monkeypatch, p
     assert not mgr._remove_container.called
 
 
-def test_matching_workspace_label_container_is_reused(monkeypatch, permissive_caps):
+def test_matching_workspace_label_container_is_reused(monkeypatch, permissive_caps, disk_grant):
     import thoughtmachine.container_record as cr
 
     emitted = []
