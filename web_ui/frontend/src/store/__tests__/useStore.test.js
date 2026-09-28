@@ -361,6 +361,81 @@ describe('receiveConversationChanged', () => {
 });
 
 // ==========================================================================
+// receiveConversationChanged — explicit merge mode + client-only notice
+// survival (d2-cold-start-status-notice-wiped-by-session-load).
+//
+// The cold-start CASE-3 `status_message` notice is a CLIENT-ONLY bubble: the
+// server never echoes it back in a `conversation_changed` payload. These tests
+// pin the merge contract that lets it survive a server-driven replace.
+// ==========================================================================
+describe('receiveConversationChanged — explicit merge mode', () => {
+  it('append mode keeps existing history and adds incoming messages at the tail', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'hist' }]);
+    useStore.getState().receiveConversationChanged(
+      's1',
+      [{ role: 'system', content: 'notice', is_system_notification: true, client_only: true }],
+      { mode: 'append' }
+    );
+    expect(useStore.getState().sessionMessages.s1).toEqual([
+      { role: 'user', content: 'hist' },
+      { role: 'system', content: 'notice', is_system_notification: true, client_only: true },
+    ]);
+  });
+
+  it('prepend mode inserts older messages before the existing history', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'assistant', content: 'recent' }]);
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'older' }], {
+      mode: 'prepend',
+    });
+    expect(useStore.getState().sessionMessages.s1).toEqual([
+      { role: 'user', content: 'older' },
+      { role: 'assistant', content: 'recent' },
+    ]);
+  });
+
+  it('replace mode (default) discards the previous array', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'old' }]);
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'assistant', content: 'new' }]);
+    expect(useStore.getState().sessionMessages.s1).toEqual([{ role: 'assistant', content: 'new' }]);
+  });
+
+  it('replace + preserveClientOnly keeps client-only notices the payload omits', () => {
+    useStore.getState().receiveConversationChanged(
+      's1',
+      [{ role: 'system', content: 'cold-start notice', is_system_notification: true, client_only: true }],
+      { mode: 'append' }
+    );
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'server line' }], {
+      mode: 'replace',
+      preserveClientOnly: true,
+    });
+    expect(useStore.getState().sessionMessages.s1).toEqual([
+      { role: 'user', content: 'server line' },
+      { role: 'system', content: 'cold-start notice', is_system_notification: true, client_only: true },
+    ]);
+  });
+
+  it('replace WITHOUT preserveClientOnly drops client-only notices (session_cleared semantics)', () => {
+    useStore.getState().receiveConversationChanged(
+      's1',
+      [{ role: 'system', content: 'cold-start notice', is_system_notification: true, client_only: true }],
+      { mode: 'append' }
+    );
+    useStore.getState().receiveConversationChanged('s1', [], { mode: 'replace' });
+    expect(useStore.getState().sessionMessages.s1).toEqual([]);
+  });
+
+  it('preserveClientOnly does NOT resurrect already-replaced server messages', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'stale' }]);
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'assistant', content: 'fresh' }], {
+      mode: 'replace',
+      preserveClientOnly: true,
+    });
+    expect(useStore.getState().sessionMessages.s1).toEqual([{ role: 'assistant', content: 'fresh' }]);
+  });
+});
+
+// ==========================================================================
 // receiveStateChanged — derives isRunning, merges into session state
 // ==========================================================================
 describe('receiveStateChanged', () => {

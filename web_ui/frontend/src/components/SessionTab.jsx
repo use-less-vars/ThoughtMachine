@@ -571,7 +571,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         })) {
           setScrollToBottomKey(k => k + 1)
         }
-        useStore.getState().receiveConversationChanged(msg.session_id || currentSessionIdRef.current, visibleMessages)
+        // Server-authoritative replace, but client-only notices (e.g. the
+        // CASE-3 cold-start status notice) are not part of the server payload,
+        // so keep them instead of letting this replace wipe them.
+        useStore.getState().receiveConversationChanged(
+          msg.session_id || currentSessionIdRef.current,
+          visibleMessages,
+          { mode: 'replace', preserveClientOnly: true }
+        )
         // Pagination metadata from the server
         if (msg.total_count !== undefined) {
           setTotalMessages(msg.total_count)
@@ -592,8 +599,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         }))
         {
           const key = msg.session_id || currentSessionIdRef.current
-          const prevHistory = useStore.getState().sessionMessages[key] || []
-          useStore.getState().receiveConversationChanged(key, [...olderMessages, ...prevHistory])
+          useStore.getState().receiveConversationChanged(key, olderMessages, { mode: 'prepend' })
         }
         setHasMore(msg.has_more === true)
         break
@@ -658,11 +664,16 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         }
         {
           const key = msg.session_id || currentSessionIdRef.current
-          const prevHistory = useStore.getState().sessionMessages[key] || []
-          useStore.getState().receiveConversationChanged(key, [
-            ...prevHistory,
-            { role: 'system', content: msg.text ?? '', is_system_notification: true },
-          ])
+          // Client-only notice: the server never echoes it back in a
+          // conversation_changed payload, so it is flagged `client_only` and
+          // preserved across a later server-driven replace.
+          useStore.getState().receiveConversationChanged(
+            key,
+            [
+              { role: 'system', content: msg.text ?? '', is_system_notification: true, client_only: true },
+            ],
+            { mode: 'append' }
+          )
         }
         break
 
@@ -971,7 +982,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       case 'session_cleared':
         // bridge.py broadcasts session_cleared ({} — no session_id) on
         // close_session; the conversation is gone, so drop it and any error.
-        useStore.getState().receiveConversationChanged(msg.session_id || currentSessionIdRef.current, [])
+        useStore.getState().receiveConversationChanged(
+          msg.session_id || currentSessionIdRef.current,
+          [],
+          { mode: 'replace' }
+        )
         useStore.getState().clearSessionError(msg.session_id || currentSessionIdRef.current)
         break
 
