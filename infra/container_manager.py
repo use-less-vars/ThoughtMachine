@@ -4020,7 +4020,7 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
       manage their own CONTAINER lifecycle, but an orphaned resource RECORD
       is still reaped; service records remain exempt;
     - its ``docker_id`` is empty or names no LIVE container;
-    - its age (from ``updated_at`` else ``created_at``) is past its retention
+    - its age (from ``created_at`` else ``updated_at``) is past its retention
       window (``retention_days`` when set, else ``default_max_age_s``).
 
     The record's workspace registration is NOT a reap condition: a record
@@ -4140,8 +4140,8 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
                 continue
 
             timestamp_text = (
-                getattr(record, "updated_at", "")
-                or getattr(record, "created_at", "")
+                getattr(record, "created_at", "")
+                or getattr(record, "updated_at", "")
                 or ""
             )
             try:
