@@ -245,8 +245,10 @@ class DockerCodeRunner(ToolBase):
             delimiter = 'SCRIPT_EOF'
 
         # Write script using heredoc, make executable, run with interpreter
-        # Use /workspace/tmp directory with random name (writable location)
-        script_dir = "/workspace/tmp"
+        # Use the exec-capable /home/agent/tmp tmpfs (writable, mode 700, on a
+        # mount that is NOT the workspace bind) so scratch scripts never litter
+        # the repository. The path is still unique per invocation via the uuid.
+        script_dir = "/home/agent/tmp"
         script_path = f"{script_dir}/script_{uuid.uuid4().hex[:8]}.sh"
 
         # Build command:
