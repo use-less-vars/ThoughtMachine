@@ -1248,22 +1248,15 @@ class WebAgentBridge:
         picks it up on the next process_query() boundary.
         """
         # ── Apply config update if provided ──────────────────────────────
+        # apply_config resolves the provider, persists the session, pushes the
+        # new config to the live controller, and logs the outcome itself
+        # ("Config applied and persisted via apply_config").  The old success
+        # gate here keyed on result["success"], a key apply_config never sets,
+        # so its else-branch fired on every successful apply and emitted a
+        # bogus "Config update skipped during continue_session: unknown error"
+        # warning.  Rely on apply_config's own contract instead of re-gating.
         if config_dict:
-            result = self.apply_config(config_dict)
-            if result.get("success"):
-                log('INFO', 'server.bridge',
-                    f"Config updated during continue_session: "
-                    f"provider={self._session_config.provider_id}, "
-                    f"model={self._session_config.model}")
-                # Push to controller so running agent picks it up
-                if self._controller is not None:
-                    self._controller.request_config_update(
-                        self._session_config.to_agent_config()
-                    )
-            else:
-                log('WARNING', 'server.bridge',
-                    f"Config update skipped during continue_session: "
-                    f"{result.get('error', 'unknown error')}")
+            self.apply_config(config_dict)
 
         # ── Submit the query ──────────────────────────────────────────────
         if self._controller is not None:
