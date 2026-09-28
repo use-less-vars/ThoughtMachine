@@ -229,8 +229,33 @@ const useStore = create((set) => ({
       },
     })),
 
-  receiveConversationChanged: (sessionId, messages) =>
-    set((state) => ({ sessionMessages: { ...state.sessionMessages, [sessionId]: messages || [] } })),
+  // The merge strategy is EXPLICIT at every call site (cold-start
+  // status-notice fix).  `mode`:
+  //   'replace' — the server payload is authoritative; the previous array is
+  //               discarded.  When `preserveClientOnly` is true, client-only
+  //               notices flagged `client_only: true` (e.g. the CASE-3 cold
+  //               start status notice) are kept and re-appended at the tail,
+  //               because the server never knows about them and would
+  //               otherwise silently wipe them on the next conversation_changed.
+  //   'append'  — append the incoming messages after the existing history.
+  //   'prepend' — insert the incoming (older) messages before the history.
+  receiveConversationChanged: (sessionId, messages, { mode = 'replace', preserveClientOnly = false } = {}) =>
+    set((state) => {
+      const incoming = messages || [];
+      const prev = state.sessionMessages[sessionId] || [];
+      let next;
+      if (mode === 'append') {
+        next = [...prev, ...incoming];
+      } else if (mode === 'prepend') {
+        next = [...incoming, ...prev];
+      } else {
+        const preserved = preserveClientOnly
+          ? prev.filter((m) => m && m.client_only === true)
+          : [];
+        next = [...incoming, ...preserved];
+      }
+      return { sessionMessages: { ...state.sessionMessages, [sessionId]: next } };
+    }),
 
   receiveStateChanged: (sessionId, newState) =>
     set((state) => ({

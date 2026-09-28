@@ -751,3 +751,92 @@ describe('SessionTab — security prompt', () => {
     expect(response.approved).toBe(true);
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Cold-start status notice survives a server-driven conversation_changed
+// replace (d2-cold-start-status-notice-wiped-by-session-load).
+//
+// The CASE-3 cold-start path emits a `status_message` whose echoed query text
+// becomes a CLIENT-ONLY bubble. A later server `conversation_changed` (cached
+// reuse, load_session, clear_loaded_session) carries only server-known history
+// and would otherwise wipe that bubble. These are integration tests over the
+// real WS event handlers, not the store primitive.
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — cold-start status notice vs conversation_changed', () => {
+  it('keeps the client-only notice after a server conversation_changed replace', async () => {
+    renderTab();
+    const ws = await connectWs();
+
+    // 1. Cold-start CASE-3 notice → client-only system bubble.
+    act(() => ws.receive({ type: 'status_message', text: 'cold-start-notice-marker' }));
+    expect(await screen.findByText('cold-start-notice-marker')).toBeInTheDocument();
+
+    // 2. A server-driven replace arrives carrying only server-known history.
+    //    The client-only notice must survive it.
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'server-history-marker' }],
+      })
+    );
+    expect(await screen.findByText('server-history-marker')).toBeInTheDocument();
+    expect(screen.getByText('cold-start-notice-marker')).toBeInTheDocument();
+  });
+
+  it('conversation_changed still replaces (no stale server messages linger)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'first-payload' }],
+      })
+    );
+    expect(await screen.findByText('first-payload')).toBeInTheDocument();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'second-payload' }],
+      })
+    );
+    expect(await screen.findByText('second-payload')).toBeInTheDocument();
+    expect(screen.queryByText('first-payload')).not.toBeInTheDocument();
+  });
+
+  it('status_message appends to existing history (does not replace it)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'existing-history' }],
+      })
+    );
+    expect(await screen.findByText('existing-history')).toBeInTheDocument();
+    act(() => ws.receive({ type: 'status_message', text: 'appended-notice-marker' }));
+    expect(await screen.findByText('appended-notice-marker')).toBeInTheDocument();
+    expect(screen.getByText('existing-history')).toBeInTheDocument();
+  });
+
+  it('more_messages prepends older history (does not replace it)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'assistant', content: 'recent-line' }],
+      })
+    );
+    expect(await screen.findByText('recent-line')).toBeInTheDocument();
+    act(() =>
+      ws.receive({
+        type: 'more_messages',
+        messages: [{ role: 'user', content: 'older-line' }],
+        has_more: false,
+      })
+    );
+    expect(await screen.findByText('older-line')).toBeInTheDocument();
+    expect(screen.getByText('recent-line')).toBeInTheDocument();
+  });
+});
+
