@@ -9,6 +9,8 @@ Public API
 ----------
 - ``WorkspaceRegistryEntry`` — dataclass for a single workspace entry.
 - ``WorkspaceRegistry`` — manages the JSON registry file.
+- ``WorkspaceRegistryUnavailable`` — raised by ``list_workspaces`` when the
+  registry file is corrupt (distinguishing corruption from an empty registry).
 """
 
 from __future__ import annotations
@@ -25,6 +27,17 @@ from typing import Any, Dict, List, Optional
 from thoughtmachine.vault import vault_root
 
 logger = logging.getLogger(__name__)
+
+
+class WorkspaceRegistryUnavailable(RuntimeError):
+    """The registry file exists but cannot be read as a JSON object.
+
+    This signals *corruption*: malformed JSON, an unreadable file, or valid
+    JSON that is not an object.  A *missing* registry file is NOT corruption —
+    it is the legitimate "no workspaces registered yet" state and is reported
+    as an empty registry by design.
+    """
+
 
 def generate_human_id() -> str:
     """Generate a short, human-readable workspace ID using random words + digits.
@@ -197,6 +210,10 @@ class WorkspaceRegistry:
         (a warning is logged for corrupt files).
         """
         if not self._path.exists():
+            logger.info(
+                "Workspace registry %s does not exist; treating as empty.",
+                self._path,
+            )
             return {}
 
         try:
@@ -216,6 +233,32 @@ class WorkspaceRegistry:
             )
             return {}
 
+    def _load_strict(self) -> Dict[str, Any]:
+        """Load the registry, raising on corruption (unlike :meth:`_load`).
+
+        A missing file is a legitimate empty registry (returns ``{}``).
+        Malformed JSON, an ``OSError``, or valid JSON that is not an object
+        raise :class:`WorkspaceRegistryUnavailable`.
+        """
+        if not self._path.exists():
+            logger.info(
+                "Workspace registry %s does not exist; treating as a "
+                "legitimately-empty registry.",
+                self._path,
+            )
+            return {}
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise WorkspaceRegistryUnavailable(
+                f"Workspace registry {self._path} could not be read: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise WorkspaceRegistryUnavailable(
+                f"Workspace registry {self._path} is not a JSON object."
+            )
+        return raw
+
     def _save(self, data: Dict[str, Any]) -> None:
         """Atomically write *data* to the registry JSON file."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,9 +272,17 @@ class WorkspaceRegistry:
     # ── Public API ──────────────────────────────────────────────────
 
     def list_workspaces(self) -> List[WorkspaceRegistryEntry]:
-        """Return all registered workspaces, sorted by label then id."""
+        """Return all registered workspaces, sorted by label then id.
+
+        Raises
+        ------
+        WorkspaceRegistryUnavailable
+            If the registry file exists but is corrupt (malformed JSON, an
+            unreadable file, or valid JSON that is not an object).  A missing
+            registry file is a legitimate empty registry and returns ``[]``.
+        """
         with self._lock:
-            raw = self._load()
+            raw = self._load_strict()
             entries = [
                 WorkspaceRegistryEntry.from_dict(v)
                 for v in raw.values()
