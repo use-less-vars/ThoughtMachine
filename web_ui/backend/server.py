@@ -3259,11 +3259,126 @@ _CONTAINER_KIND_BY_LIFECYCLE = {
 }
 
 
-def _container_view_entry(record, manager, workspace_id):
+#: Workspace-ownership label Docker containers carry (mirrors
+#: ``infra.container_manager`` / the record store).
+_CONTAINER_VIEW_WORKSPACE_LABEL = "thoughtmachine.workspace_id"
+
+
+def _list_workspace_live_containers(manager, workspace_id):
+    """Best-effort LIVE-container enumeration for *workspace_id* (GET view).
+
+    Returns a list of live container objects, or ``None`` when enumeration is
+    unavailable (no manager client / Docker error).  ``None`` means
+    "unverified", never "empty".
+
+    ``ContainerManager.list_containers()`` is unusable here: it deliberately
+    hides resource containers (see ``_build_container_view_entries``), which is
+    exactly the class the panel must surface.  This enumerates through the
+    manager's already-used Docker client handle (``manager.client`` -- the same
+    handle ``workspace_container_status`` reads) narrowed by the workspace
+    ownership label.  It is the single owner of the "workspace live set" fact.
+    """
+    try:
+        client = getattr(manager, "client", None)
+        if client is None:
+            return None
+        containers = client.containers.list(
+            all=True,
+            filters={
+                "label":
+                    f"{_CONTAINER_VIEW_WORKSPACE_LABEL}={workspace_id}",
+            },
+        )
+    except Exception:
+        return None
+    return list(containers or [])
+
+
+def _container_view_match_keys(container):
+    """Identity keys a live container can be matched to a record by.
+
+    Mirrors the identity the record store writes: the Docker container id, the
+    container name, and the record-owned ``RECORD_LABEL_KEY`` label.
+    """
+    from thoughtmachine.container_record import RECORD_LABEL_KEY
+
+    keys = set()
+    container_id = getattr(container, "id", None)
+    if container_id:
+        keys.add(("id", str(container_id)))
+    name = getattr(container, "name", None)
+    if name:
+        keys.add(("name", str(name).lstrip("/")))
+    labels = getattr(container, "labels", None)
+    if isinstance(labels, dict):
+        record_id = labels.get(RECORD_LABEL_KEY)
+        if record_id:
+            keys.add(("record", str(record_id)))
+    return keys
+
+
+def _record_view_match_keys(record):
+    """Identity keys a record can be matched to a live container by."""
+    keys = set()
+    docker_id = getattr(record, "docker_id", None)
+    if docker_id:
+        keys.add(("id", str(docker_id)))
+    record_id = getattr(record, "id", None)
+    if record_id:
+        keys.add(("record", str(record_id)))
+    name = getattr(record, "name", None)
+    if name:
+        keys.add(("name", str(name).lstrip("/")))
+    return keys
+
+
+def _recordless_view_entry(container, manager, workspace_id):
+    """Build a view entry for a LIVE container that has NO record.
+
+    ``kind`` comes from the canonical classifier (``manager.class_of``); every
+    entry key the record-derived shape carries is present, so the frontend
+    renders the row unchanged.  ``live`` is ``True`` (it *is* live);
+    ``unrecorded`` marks it as having no backing record (its ``id`` is the
+    Docker handle, not a record id -- the record-keyed action routes cannot
+    address it).
+    """
+    container_id = (getattr(container, "id", None)
+                    or getattr(container, "name", ""))
+    name = getattr(container, "name", "") or str(container_id)
+    try:
+        lifecycle = manager.class_of(container)
+    except Exception:
+        lifecycle = ""
+    kind = _CONTAINER_KIND_BY_LIFECYCLE.get(lifecycle, "persistent")
+    status = None
+    try:
+        status = manager.status(container_id)
+    except Exception:
+        status = None
+    return {
+        "id": container_id,
+        "name": name,
+        "kind": kind,
+        "state": _map_container_view_state(status, ""),
+        "intent_snapshot": None,
+        "permissions": None,
+        "permission_drift": None,
+        "shared": kind in ("persistent", "resource"),
+        "live": True,
+        "unrecorded": True,
+    }
+
+
+def _container_view_entry(record, manager, workspace_id, live=None):
     """Build one container-view entry dict from a record (+ its live status).
 
     Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
-    permission_drift, shared``. ``kind`` is one of ``ephemeral`` |
+    permission_drift, shared, live, unrecorded``.  ``live`` is ``True`` when the
+    record has a matching live container, ``False`` when it has none (the UI
+    renders it distinctly, it is never hidden), and ``None`` when the live set
+    could not be enumerated (unverified -- not rendered as missing).
+    ``unrecorded`` is always ``False`` on this record-derived shape.  ``kind``
+    is one of ``ephemeral`` |
     ``persistent`` | ``resource`` (PC5; see ``_CONTAINER_KIND_BY_LIFECYCLE``).
     ``shared`` = ``kind in ('persistent', 'resource')``.
     ``permission_drift`` is ``None`` when either side is unknown (an unwired /
@@ -3297,22 +3412,58 @@ def _container_view_entry(record, manager, workspace_id):
         "permissions": permissions,
         "permission_drift": permission_drift,
         "shared": kind in ("persistent", "resource"),
+        "live": live,
+        "unrecorded": False,
     }
 
 
 def _build_container_view_entries(manager, workspace_id):
     """Return the FLAT list of container-view entries for the GET (PC3).
 
-    Records come from the durable store (``api.list_records``).
-    ``ContainerManager.list_containers()`` hides resource containers, so it
-    cannot enumerate the full set.  Each entry carries the three-class ``kind``
+    LIVE containers are the primary set; records are attached to them as
+    metadata.  A record with a matching live container is emitted with
+    ``live=True``; a record with none is still emitted, marked ``live=False``
+    (visibly distinct, never hidden silently).  A live container with no record
+    is emitted with ``unrecorded=True`` (and ``live=True``).
+
+    Records come from the durable store (``api.list_records``); the live set
+    comes from ``_list_workspace_live_containers`` (``None`` = unverified, in
+    which case no liveness marker is asserted).  ``ContainerManager.
+    list_containers()`` hides resource containers, so it cannot enumerate the
+    full set.  Each entry carries the three-class ``kind``
     (``ephemeral``|``persistent``|``resource``); the UI splits them.
     """
     from thoughtmachine.container_record import api as _cr_api
 
     records = _cr_api.list_records(workspace_id) or []
-    return [_container_view_entry(record, manager, workspace_id)
-            for record in records]
+    live_containers = _list_workspace_live_containers(manager, workspace_id)
+
+    record_keys = [(record, _record_view_match_keys(record))
+                   for record in records]
+    record_key_union = set()
+    for _, keys in record_keys:
+        record_key_union |= keys
+    live_key_union = set()
+    if live_containers is not None:
+        for container in live_containers:
+            live_key_union |= _container_view_match_keys(container)
+
+    entries = []
+    for record, keys in record_keys:
+        if live_containers is None:
+            live_marker = None
+        else:
+            live_marker = bool(keys & live_key_union)
+        entries.append(
+            _container_view_entry(record, manager, workspace_id, live=live_marker))
+
+    if live_containers is not None:
+        for container in live_containers:
+            if _container_view_match_keys(container) & record_key_union:
+                continue  # already represented by its record
+            entries.append(
+                _recordless_view_entry(container, manager, workspace_id))
+    return entries
 
 
 def _view_action_container_id(manager, record):
@@ -3342,7 +3493,12 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
             f"workspace '{workspace_id}' not found or path unresolvable",
             status_code=404)
     try:
-        # ``containers_in_use`` / ``containers_available`` stay manager-derived.
+        # ``containers_in_use`` / ``containers_available`` stay manager-derived
+        # and are DEFINED over the session/agent-visible set only:
+        # ``ContainerManager.list_containers()`` deliberately hides resource
+        # containers, so these two numbers are NOT the panel's row count.  The
+        # separate entries-derived ``containers_listed`` (in the return below)
+        # is the count of the reconciled entries the panel actually renders.
         live = manager.list_containers() or []
         containers_in_use = len(live)
         # Session container cap: ContainerManager.max_containers (workspace
@@ -3364,6 +3520,11 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
             containers = []
         return {
             "containers": containers,
+            # Entries-derived: how many rows the panel renders (record-derived
+            # entries + recordless live containers).  Distinct from the
+            # manager-derived pair above; the two intentionally differ whenever
+            # a resource container (hidden by ``list_containers()``) is listed.
+            "containers_listed": len(containers),
             "containers_in_use": containers_in_use,
             "containers_available": max(0, cap - containers_in_use),
         }

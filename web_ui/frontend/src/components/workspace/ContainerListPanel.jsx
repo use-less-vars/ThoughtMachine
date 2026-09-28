@@ -66,7 +66,11 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
   if (entry.kind === 'ephemeral') actions.push('remove')
 
   return (
-    <div className="container-row" data-testid={`container-row-${id}`}>
+    <div
+      className={entry.live === false ? 'container-row container-row--missing' : 'container-row'}
+      data-testid={`container-row-${id}`}
+      style={entry.live === false ? { opacity: 0.5 } : undefined}
+    >
       <div className="container-row-main">
         <span className="container-row-name" title={entry.name}>{entry.name}</span>
 
@@ -76,6 +80,16 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
         >
           {state}
         </span>
+
+        {entry.live === false ? (
+          <span
+            className="container-missing-badge"
+            data-testid={`container-missing-${id}`}
+            title="No live container for this record — it is not running."
+          >
+            no live container
+          </span>
+        ) : null}
 
         {entry.shared ? (
           <span
