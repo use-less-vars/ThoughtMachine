@@ -475,13 +475,57 @@ _CONTAINER_SWEEP_INTERVAL_S = float(
 )
 
 
+def _periodic_registry_has_workspaces() -> bool:
+    """Re-read the workspace registry for a periodic tick. NEVER raises.
+
+    Returns ``True`` only when the registry holds at least one workspace.
+    Any read fault (docker-less host, corrupt store, ...) or an empty result
+    returns ``False`` so the caller SKIPS the destructive orphan-resource
+    sweep for this tick.  Unlike the one-shot *startup* pass — which can
+    trust a non-empty registry because the project root is auto-registered
+    immediately before it runs — a periodic tick fires arbitrarily later, so
+    it must re-validate the registry every time before delegating.
+
+    The guard is deliberately FAIL-CLOSED: an empty/faulting read must never
+    be mistaken for "no workspaces are registered", because
+    ``sweep_stale_resource_containers`` force-removes every resource container
+    whose workspace id is ``not in`` the (possibly empty) registered set.  The
+    registry is re-read on the NEXT tick, so a transiently empty read only
+    defers the sweep — it never wipes live containers.
+    """
+    try:
+        registry = WorkspaceRegistry.get_default()
+        return bool(registry.list_workspaces())
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Periodic sweep: could not list registered workspaces: {exc}; '
+            f'treating registry as empty for this tick')
+        return False
+
+
 def _run_container_sweeps():
-    """Run both container sweeps once. Best-effort; NEVER raises."""
-    for _label, _fn in (
-        ('exited-workspace', _sweep_exited_workspace_containers),
-        ('orphan-resource', _sweep_orphan_resource_containers),
-        ('orphan-records', _sweep_orphan_container_records),
+    """Run both container sweeps once. Best-effort; NEVER raises.
+
+    Each entry is ``(label, guard, fn)``.  When ``guard`` is set and returns
+    falsy the step is skipped for this tick with a WARNING (the guard already
+    logged the reason); the label names the skipped sweep so the skip is
+    observable.  ``guard=None`` means run unconditionally.
+    """
+    for _label, _guard, _fn in (
+        ('exited-workspace', None, _sweep_exited_workspace_containers),
+        ('orphan-resource', _periodic_registry_has_workspaces,
+         _sweep_orphan_resource_containers),
+        ('orphan-records', None, _sweep_orphan_container_records),
     ):
+        if _guard is not None and not _guard():
+            # Re-read the registry EVERY tick before the destructive
+            # orphan-resource sweep: a transiently empty/faulting read must not
+            # be treated as "no workspaces registered".  Non-fatal; the next
+            # tick re-reads and resumes the sweep once workspaces reappear.
+            log('WARNING', 'server',
+                f'Periodic container sweep ({_label}) skipped: '
+                f'no registered workspaces')
+            continue
         try:
             _fn()
         except Exception as exc:
