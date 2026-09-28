@@ -215,6 +215,15 @@ _EXEC_DRIFT_ACTOR = "infra.container_manager.exec"
 _EXEC_DRIFT_AUDIT = "CONTAINER_EXEC_DRIFT"
 _EXEC_DRIFT_EXIT_CODE = 126  # distinct from -2 (timeout) and -1 (generic error)
 
+# OOM observability: a command that exits 137 (128 + SIGKILL) is the OOM
+# signature.  This emits a DISTINCT record event -- deliberately NOT folded
+# into the exec-drift signal (``drift.exec_on_drifted_container``) nor the
+# start-path ``drift.container_absent`` -- so an OOM kill is greppable on its
+# own and never mistaken for an isolation refusal.
+_EXEC_OOM_EXIT_CODE = 137  # 128 + SIGKILL: the OOM-kill signature
+_EXEC_OOM_EVENT = "container.command_oom_killed"
+_EXEC_OOM_ACTOR = "infra.container_manager.exec"
+
 # Start-path drift admission (mirrors the exec-path memo above): ``start()`` no
 # longer MUTATES a drifted container (no remove/recreate).  A container whose
 # live isolation differs from the resolved policy but is NOT more permissive is
@@ -854,6 +863,98 @@ class ContainerManager:
             except Exception:
                 labels = None
         return self._record_id_from_labels(labels)
+
+    def _emit_oom_event(self, container, *, exit_code=_EXEC_OOM_EXIT_CODE,
+                        require_oom_killed=False):
+        """Best-effort record event when a command exits 137 (OOM signature).
+
+        Uses a DISTINCT event type (``_EXEC_OOM_EVENT``) so an OOM kill is
+        never mistaken for the drift signals; the payload carries the exit
+        code, the container's lifecycle class, the DECLARED ``mem_limit``
+        budget, and ``OOMKilled`` when readable from the daemon. Never raises
+        and never affects the exec result.
+
+        ``exit_code`` defaults to the exit-137 OOM signature; the whole-
+        container death path passes the daemon-reported ``State.ExitCode``
+        when obtainable. When ``require_oom_killed`` is set the event is
+        emitted ONLY if the daemon confirms ``State.OOMKilled`` is True (a
+        whole-container death is an OOM only when the flag is set). A failure
+        to write the record event is logged at WARNING and swallowed; it must
+        never mask the original error.
+        """
+        try:
+            record_id = self._record_id_for(container)
+            if not record_id or not getattr(self, "workspace_id", None):
+                return
+            oom_killed = self._container_oom_killed(container)
+            if require_oom_killed and oom_killed is not True:
+                return
+            payload = {
+                "exit_code": exit_code,
+                "lifecycle_class": self.class_of(container),
+                "mem_limit": getattr(self, "mem_limit", None),
+            }
+            if oom_killed is not None:
+                payload["oom_killed"] = oom_killed
+            from thoughtmachine.container_record import append_event
+
+            append_event(
+                self.workspace_id, str(record_id),
+                _EXEC_OOM_EVENT, _EXEC_OOM_ACTOR, **payload,
+            )
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to record OOM event for container "
+                f"{getattr(container, 'id', '?')!r}: {type(e).__name__}: {e}")
+
+    @staticmethod
+    def _container_oom_killed(container):
+        """Best-effort OOMKilled flag from a container's live attrs, or None.
+
+        Reloads the container so a fresh ``State`` snapshot is read, then
+        returns ``State.OOMKilled`` when it is a bool. A structurally absent
+        key, a non-dict State, or an unreadable/reloading container yields
+        ``None`` (the caller then simply omits the field). Never raises.
+        """
+        try:
+            reload = getattr(container, "reload", None)
+            if callable(reload):
+                reload()
+            attrs = getattr(container, "attrs", None)
+            if not isinstance(attrs, dict):
+                return None
+            state = attrs.get("State")
+            if not isinstance(state, dict) or "OOMKilled" not in state:
+                return None
+            value = state.get("OOMKilled")
+            return bool(value) if isinstance(value, bool) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _container_exit_code(container):
+        """Best-effort ``State.ExitCode`` from a container's live attrs, or None.
+
+        Reads the container's current ``State.ExitCode`` when it is an int
+        (used by the whole-container death path to report the exit code where
+        obtainable). A structurally absent key, a non-dict State, or an
+        unreadable container yields ``None`` (the caller then falls back to the
+        137 OOM signature). Never raises.
+        """
+        try:
+            reload = getattr(container, "reload", None)
+            if callable(reload):
+                reload()
+            attrs = getattr(container, "attrs", None)
+            if not isinstance(attrs, dict):
+                return None
+            state = attrs.get("State")
+            if not isinstance(state, dict):
+                return None
+            value = state.get("ExitCode")
+            return value if isinstance(value, int) else None
+        except Exception:
+            return None
 
     def _record_id_for_name(self, name):
         """Resolve a record id for a container *name* via the docker client.
@@ -1774,7 +1875,10 @@ class ContainerManager:
             log_container_event("started", container_id=container.id,
                                 session_id=self.session_id or "",
                                 data={"image": image, "name": name,
-                                      "status": "created"})
+                                      "status": "created",
+                                      "mem_limit": self.mem_limit,
+                                      "oom_score_adj": 1000,
+                                      "lifecycle_class": lifecycle_class})
             return {"id": container.id, "name": name, "status": "created",
                     "note": note or ""}
 
@@ -1798,7 +1902,10 @@ class ContainerManager:
             self._write_note(self._record_id_for(container), note)
         log_container_event("started", container_id=container.id,
                             session_id=self.session_id or "",
-                            data={"image": image, "name": name, "status": "created"})
+                            data={"image": image, "name": name, "status": "created",
+                                  "mem_limit": self.mem_limit,
+                                  "oom_score_adj": 1000,
+                                  "lifecycle_class": lifecycle_class})
         return {"id": container.id, "name": name, "status": "created",
                 "note": note or ""}
 
@@ -1883,12 +1990,32 @@ class ContainerManager:
         except queue.Empty:
             raise RuntimeError("Execution thread finished but no result")
         if error is not None:
+            if isinstance(error, APIError):
+                # Whole-container death: the daemon raises APIError (e.g. the
+                # container was OOM-killed and is no longer running). Emit the
+                # SAME distinct OOM event as the exit-137 path, but ONLY when
+                # the daemon confirms the container was OOM-killed, then
+                # re-raise so the exec contract is unaffected.
+                _state_exit = self._container_exit_code(container)
+                self._emit_oom_event(
+                    container,
+                    exit_code=(_state_exit if _state_exit is not None
+                               else _EXEC_OOM_EXIT_CODE),
+                    require_oom_killed=True,
+                )
             raise error
 
         stdout = output[0].decode(errors="replace") if output and output[0] else ""
         stderr = output[1].decode(errors="replace") if output and output[1] else ""
         # Phase 6: persistent usage log (best-effort; never affects the result).
         self._append_usage_log(container_id, command)
+        # A2 observability: a command exiting 137 (128 + SIGKILL) is the OOM
+        # signature. Emit a DISTINCT record event (never folded into
+        # drift.container_absent) carrying the exit code, the container's
+        # lifecycle class and the DECLARED memory budget, plus OOMKilled when
+        # the daemon reports it. Best-effort: this must never affect the result.
+        if exit_code == _EXEC_OOM_EXIT_CODE:
+            self._emit_oom_event(container)
         result = {
             "stdout": _truncate_output(stdout),
             "stderr": _truncate_output(stderr),
