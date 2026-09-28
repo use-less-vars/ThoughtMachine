@@ -353,9 +353,17 @@ def _sweep_orphan_resource_containers():
             registry = WorkspaceRegistry.get_default()
             ids = [e.id for e in registry.list_workspaces()]
         except Exception as exc:
+            # FAIL-CLOSED: a registry read fault must never be mistaken for
+            # "no workspaces are registered".  An empty id list makes
+            # sweep_stale_resource_containers treat EVERY resource container as
+            # an orphan and force-remove it (its `not in registered` test is
+            # always True against the empty set).  Mirror the sibling sweeps
+            # (_sweep_exited_workspace_containers / _sweep_orphan_container_records)
+            # by never orphan-wiping on a bad registry read.
             log('WARNING', 'server',
-                f'Startup sweep: could not list registered workspaces: {exc}')
-            ids = []
+                f'Startup sweep: could not list registered workspaces: {exc}; '
+                f'skipping orphan resource sweep')
+            return
 
         result = sweep_stale_resource_containers(ids)
         detail = result.get("detail") or ""
