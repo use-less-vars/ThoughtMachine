@@ -28,7 +28,13 @@ import pytest
 
 import infra.container_manager as container_manager
 from infra.container_manager import ContainerManager
-from thoughtmachine.container_record import LIFECYCLE_PERSISTENT, RECORD_LABEL_KEY
+from thoughtmachine.container_record import (
+    LIFECYCLE_PERSISTENT,
+    OWNER_WORKSPACE,
+    RECORD_LABEL_KEY,
+    create_record,
+    read_event_log,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -343,3 +349,120 @@ def test_exec_exit_137_without_record_emits_no_event(events):
 
     assert result["exit_code"] == 137
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# ADDENDUM — whole-container OOM death (APIError branch + silent-drop removal)
+# ---------------------------------------------------------------------------
+
+
+class _RaisingExecContainer(_ExecFakeContainer):
+    """Exec-path fake whose ``exec_run`` raises (whole-container death)."""
+
+    def __init__(self, exc, **kwargs):
+        super().__init__(**kwargs)
+        self._exc = exc
+
+    def exec_run(self, **kwargs):
+        self.exec_calls.append(kwargs)
+        raise self._exc
+
+
+def test_exec_api_error_on_oom_killed_container_emits_event_and_reraises(
+    monkeypatch, tmp_path
+):
+    """Whole-container death: an ``APIError`` raised by ``exec_run`` on a
+    container the daemon reports as ``State.OOMKilled`` must emit the SAME
+    distinct OOM record event (exit code where obtainable, lifecycle class,
+    declared mem_limit, OOMKilled:true) AND still re-raise the ``APIError``
+    (the error is never swallowed).
+
+    Uses the REAL ``append_event``/``read_event_log`` end-to-end against an
+    isolated vault (``THOUGHTMACHINE_VAULT_ROOT``), so no permissive fake is
+    involved.
+    """
+    from docker.errors import APIError
+
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+    create_record("w1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, id="rec-1")
+
+    attrs = _exec_attrs(oom_killed=True)
+    attrs["State"]["ExitCode"] = 137
+    ctr = _RaisingExecContainer(
+        APIError("container is not running"),
+        labels={RECORD_LABEL_KEY: "rec-1"},
+        attrs=attrs,
+    )
+    cm = _make_exec_cm(_ExecFakeDockerClient([ctr]))
+
+    with pytest.raises(APIError):
+        cm.exec("c1", "kill -9 $$")
+
+    entries = read_event_log("w1", "rec-1")
+    oom = [e for e in entries
+           if e.get("event_type") == "container.command_oom_killed"]
+    assert len(oom) == 1, f"expected exactly one OOM event; got {entries!r}"
+    assert oom[0]["actor"] == "infra.container_manager.exec"
+    payload = oom[0]["payload"]
+    assert payload["exit_code"] == 137
+    assert payload["mem_limit"] == "512m"
+    assert payload["oom_killed"] is True
+    assert "lifecycle_class" in payload
+
+
+def test_exec_api_error_without_oom_killed_emits_no_event(monkeypatch, tmp_path):
+    """An ``APIError`` on a container the daemon does NOT report as
+    ``OOMKilled`` must NOT emit a spurious OOM event (the flag gates the
+    death path), and must still re-raise."""
+    from docker.errors import APIError
+
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+    create_record("w1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, id="rec-1")
+
+    ctr = _RaisingExecContainer(
+        APIError("container is not running"),
+        labels={RECORD_LABEL_KEY: "rec-1"},
+        attrs=_exec_attrs(oom_killed=False),
+    )
+    cm = _make_exec_cm(_ExecFakeDockerClient([ctr]))
+
+    with pytest.raises(APIError):
+        cm.exec("c1", "kill -9 $$")
+
+    entries = read_event_log("w1", "rec-1")
+    assert [e for e in entries
+            if e.get("event_type") == "container.command_oom_killed"] == []
+
+
+def test_emit_oom_event_logs_warning_on_record_write_failure(
+    monkeypatch, tmp_path
+):
+    """A failure while writing the OOM record event is logged at WARNING (with
+    the exception) and never propagates — the silent ``except: pass`` is gone."""
+    import thoughtmachine.container_record as cr
+
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+    calls = []
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("vault write failed")
+
+    def _spy_log(level, tag, message, data=None, event_type=None,
+                 truncate_hint=None):
+        calls.append({"level": level, "tag": tag, "message": message})
+
+    monkeypatch.setattr(cr, "append_event", _boom)
+    monkeypatch.setattr(container_manager, "log", _spy_log)
+
+    ctr = _ExecFakeContainer(labels={RECORD_LABEL_KEY: "rec-1"})
+    cm = _make_exec_cm(_ExecFakeDockerClient([ctr]))
+
+    cm._emit_oom_event(ctr)  # must NOT raise
+
+    warnings = [
+        c for c in calls
+        if c["level"] == "WARNING"
+        and c["tag"] == "docker.container_manager"
+        and "Failed to record OOM event" in c["message"]
+    ]
+    assert warnings, f"expected a WARNING about the dropped OOM event; got {calls!r}"

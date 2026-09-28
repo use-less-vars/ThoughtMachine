@@ -864,7 +864,8 @@ class ContainerManager:
                 labels = None
         return self._record_id_from_labels(labels)
 
-    def _emit_oom_event(self, container):
+    def _emit_oom_event(self, container, *, exit_code=_EXEC_OOM_EXIT_CODE,
+                        require_oom_killed=False):
         """Best-effort record event when a command exits 137 (OOM signature).
 
         Uses a DISTINCT event type (``_EXEC_OOM_EVENT``) so an OOM kill is
@@ -872,17 +873,27 @@ class ContainerManager:
         code, the container's lifecycle class, the DECLARED ``mem_limit``
         budget, and ``OOMKilled`` when readable from the daemon. Never raises
         and never affects the exec result.
+
+        ``exit_code`` defaults to the exit-137 OOM signature; the whole-
+        container death path passes the daemon-reported ``State.ExitCode``
+        when obtainable. When ``require_oom_killed`` is set the event is
+        emitted ONLY if the daemon confirms ``State.OOMKilled`` is True (a
+        whole-container death is an OOM only when the flag is set). A failure
+        to write the record event is logged at WARNING and swallowed; it must
+        never mask the original error.
         """
         try:
             record_id = self._record_id_for(container)
             if not record_id or not getattr(self, "workspace_id", None):
                 return
+            oom_killed = self._container_oom_killed(container)
+            if require_oom_killed and oom_killed is not True:
+                return
             payload = {
-                "exit_code": _EXEC_OOM_EXIT_CODE,
+                "exit_code": exit_code,
                 "lifecycle_class": self.class_of(container),
                 "mem_limit": getattr(self, "mem_limit", None),
             }
-            oom_killed = self._container_oom_killed(container)
             if oom_killed is not None:
                 payload["oom_killed"] = oom_killed
             from thoughtmachine.container_record import append_event
@@ -891,8 +902,10 @@ class ContainerManager:
                 self.workspace_id, str(record_id),
                 _EXEC_OOM_EVENT, _EXEC_OOM_ACTOR, **payload,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to record OOM event for container "
+                f"{getattr(container, 'id', '?')!r}: {type(e).__name__}: {e}")
 
     @staticmethod
     def _container_oom_killed(container):
@@ -915,6 +928,31 @@ class ContainerManager:
                 return None
             value = state.get("OOMKilled")
             return bool(value) if isinstance(value, bool) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _container_exit_code(container):
+        """Best-effort ``State.ExitCode`` from a container's live attrs, or None.
+
+        Reads the container's current ``State.ExitCode`` when it is an int
+        (used by the whole-container death path to report the exit code where
+        obtainable). A structurally absent key, a non-dict State, or an
+        unreadable container yields ``None`` (the caller then falls back to the
+        137 OOM signature). Never raises.
+        """
+        try:
+            reload = getattr(container, "reload", None)
+            if callable(reload):
+                reload()
+            attrs = getattr(container, "attrs", None)
+            if not isinstance(attrs, dict):
+                return None
+            state = attrs.get("State")
+            if not isinstance(state, dict):
+                return None
+            value = state.get("ExitCode")
+            return value if isinstance(value, int) else None
         except Exception:
             return None
 
@@ -1952,6 +1990,19 @@ class ContainerManager:
         except queue.Empty:
             raise RuntimeError("Execution thread finished but no result")
         if error is not None:
+            if isinstance(error, APIError):
+                # Whole-container death: the daemon raises APIError (e.g. the
+                # container was OOM-killed and is no longer running). Emit the
+                # SAME distinct OOM event as the exit-137 path, but ONLY when
+                # the daemon confirms the container was OOM-killed, then
+                # re-raise so the exec contract is unaffected.
+                _state_exit = self._container_exit_code(container)
+                self._emit_oom_event(
+                    container,
+                    exit_code=(_state_exit if _state_exit is not None
+                               else _EXEC_OOM_EXIT_CODE),
+                    require_oom_killed=True,
+                )
             raise error
 
         stdout = output[0].decode(errors="replace") if output and output[0] else ""
