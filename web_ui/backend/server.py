@@ -484,7 +484,10 @@ def _periodic_registry_has_workspaces() -> bool:
     sweep for this tick.  Unlike the one-shot *startup* pass — which can
     trust a non-empty registry because the project root is auto-registered
     immediately before it runs — a periodic tick fires arbitrarily later, so
-    it must re-validate the registry every time before delegating.
+    it must re-validate the registry every time before delegating.  (That
+    startup assumption was in fact unsafe: auto-registration is best-effort,
+    so the startup pass re-validates too — see
+    :func:`_startup_registry_has_workspaces`.)
 
     The guard is deliberately FAIL-CLOSED: an empty/faulting read must never
     be mistaken for "no workspaces are registered", because
@@ -500,6 +503,33 @@ def _periodic_registry_has_workspaces() -> bool:
         log('WARNING', 'server',
             f'Periodic sweep: could not list registered workspaces: {exc}; '
             f'treating registry as empty for this tick')
+        return False
+
+
+def _startup_registry_has_workspaces() -> bool:
+    """Re-read the workspace registry before the startup resource sweep.
+
+    NEVER raises.  Returns ``True`` only when the registry holds at least one
+    workspace.  Any read fault (docker-less host, corrupt store, ...) or an
+    empty result returns ``False`` so the caller SKIPS the destructive
+    orphan-resource sweep for the boot pass.
+
+    The startup pass cannot simply trust a non-empty registry: the project
+    root's auto-registration a few lines earlier is best-effort (its failure is
+    logged and startup continues), so when it fails the registry read can
+    legitimately come back empty.  ``sweep_stale_resource_containers``
+    force-removes every resource container whose workspace id is ``not in`` the
+    (possibly empty) registered set, so an empty read must never be mistaken
+    for "no workspaces are registered".  Mirrors the periodic guard
+    (:func:`_periodic_registry_has_workspaces`).
+    """
+    try:
+        registry = WorkspaceRegistry.get_default()
+        return bool(registry.list_workspaces())
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Startup sweep: could not list registered workspaces: {exc}; '
+            f'skipping orphan resource sweep')
         return False
 
 
@@ -781,7 +811,19 @@ async def lifespan(app: FastAPI):
     # whose workspace is no longer registered, then prune the shared resource
     # image once no resource container remains anywhere. Best-effort: a
     # failing sweep must never break startup.
-    _sweep_orphan_resource_containers()
+    #
+    # FAIL-CLOSED: the project-root auto-registration above is best-effort and
+    # may have failed non-fatally, in which case the registry read can
+    # legitimately come back EMPTY.  An empty id list makes the destructive
+    # callee force-remove EVERY resource container, so re-validate the registry
+    # here (exactly as the periodic tick does) and skip the sweep when it is
+    # empty or faulting.
+    if _startup_registry_has_workspaces():
+        _sweep_orphan_resource_containers()
+    else:
+        log('WARNING', 'server',
+            'Startup container sweep (orphan-resource) skipped: '
+            'no registered workspaces')
 
     # ── Startup exited-workspace-container sweep ────────────────────────
     # Remove EXITED generic workspace containers (thoughtmachine.workspace_id
