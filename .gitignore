@@ -133,6 +133,13 @@ docs/*
 !docs/logging.md
 !docs/decisions/
 !docs/decisions/logging-architecture.md
+# Public architecture docs ship with the repo (operator ruling 2026-09-24).
+# Both lines are required: `docs/*` excludes the `docs/architecture/`
+# DIRECTORY itself, and git cannot re-include files beneath an excluded
+# directory. The directory negation lets git descend; `**` re-includes the
+# contents.
+!docs/architecture/
+!docs/architecture/**
 !docs/audit_resource_container_isolation_2026_08_13.md
 !docs/container_registry_design.md
 !docs/container_record_design.md
