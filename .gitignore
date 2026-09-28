@@ -196,7 +196,7 @@ venv*
 .thoughtmachine/knowledge_backups/
 .thoughtmachine/readme_recon.md
 .thoughtmachine/knowledge/manifest.yaml
-.thoughtmachine/knowledge/project/*.md
+.thoughtmachine/knowledge/project/**/*.md
 
 .thoughtmachine/knowledge/archive/
 .thoughtmachine/gate_log.txt
