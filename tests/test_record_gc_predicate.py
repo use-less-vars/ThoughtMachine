@@ -153,18 +153,32 @@ def test_registered_workspace_live_container_is_retained():
 
 
 # ---------------------------------------------------------------------------
-# (d) own-lifecycle classes stay exempt even in a registered workspace
+# (d) own-lifecycle SERVICE records stay exempt even in a registered
+#     workspace.  Resource RECORDS are no longer exempt from the record
+#     sweeper (bug/resource-record-reaper): an orphaned resource record is
+#     reaped even from a registered workspace.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("lifecycle_class", [LIFECYCLE_RESOURCE, LIFECYCLE_SERVICE])
-def test_registered_workspace_own_lifecycle_is_exempt(lifecycle_class):
-    path = _mint(_REG_WS, "rec-1", lifecycle_class=lifecycle_class, age_days=10)
+def test_registered_workspace_own_lifecycle_service_is_exempt():
+    path = _mint(_REG_WS, "rec-1", lifecycle_class=LIFECYCLE_SERVICE,
+                 age_days=10)
     result = _sweep(registered_workspace_ids=[_REG_WS])
     assert result["removed"] == 0
     assert result["skipped"] == 1
     assert "lifecycle_own" in result["detail"]
     assert path.is_file()
+
+
+def test_registered_workspace_orphaned_resource_record_is_reaped():
+    # A resource record whose bound container is gone is reaped even from a
+    # registered workspace (registration is not a reap condition).
+    path = _mint(_REG_WS, "rec-1", lifecycle_class=LIFECYCLE_RESOURCE,
+                 age_days=10)
+    result = _sweep(registered_workspace_ids=[_REG_WS])
+    assert result["removed"] == 1
+    assert result["removed_records"] == ["rec-1"]
+    assert not path.is_file()
 
 
 # ---------------------------------------------------------------------------

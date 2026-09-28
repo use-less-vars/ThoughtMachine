@@ -4008,15 +4008,17 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
     return result
 
 
-# ``default_max_age_s`` is now a DORMANT FALLBACK — every lifecycle class that reaches this age gate carries an explicit ``workspace_gc_max_age_s``, and ``own_lifecycle=True`` classes skip the gate entirely, so per-class policy is authoritative (see the precedence docstring in ``thoughtmachine/container_record/lifecycle_policy.py``).
+# ``default_max_age_s`` is a FALLBACK — every lifecycle class that reaches this age gate normally carries an explicit ``workspace_gc_max_age_s``, and ``own_lifecycle=True`` classes skip the gate entirely, so per-class policy is authoritative (see the precedence docstring in ``thoughtmachine/container_record/lifecycle_policy.py``).  Exception: resource-class RECORDS are no longer skipped by the record sweeper (they own their container lifecycle, not their record), and their policy carries no ``workspace_gc_max_age_s``, so an orphaned resource record falls back to ``default_max_age_s`` here.
 def sweep_orphan_container_records(*, registered_workspace_ids=None,
                                    default_max_age_s=86400, dry_run=False,
                                    docker_client=None) -> dict:
     """Sweep orphaned container RECORDS whose bound container is gone.
 
     A record is reaped when ALL of the following hold:
-    - its lifecycle class policy does NOT own its lifecycle (resource /
-      service containers manage themselves and are exempt);
+    - its lifecycle class policy does NOT own its lifecycle, or it is a
+      resource-class record (``LIFECYCLE_RESOURCE``): resource containers
+      manage their own CONTAINER lifecycle, but an orphaned resource RECORD
+      is still reaped; service records remain exempt;
     - its ``docker_id`` is empty or names no LIVE container;
     - its age (from ``updated_at`` else ``created_at``) is past its retention
       window (``retention_days`` when set, else ``default_max_age_s``).
@@ -4122,7 +4124,13 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
             except UnknownLifecycleClass:
                 _note_skip("unknown_class")
                 continue
-            if policy.own_lifecycle:
+            # Resource-class records own their CONTAINER's lifecycle, but a
+            # resource RECORD whose bound container is gone is still an orphan
+            # and must be reaped (bug/resource-record-reaper).  Every other
+            # own-lifecycle class (service) stays exempt.  The carve-out is
+            # scoped to this record sweeper only; ``own_lifecycle`` remains the
+            # gate for container stop / workspace GC / auto-heal.
+            if policy.own_lifecycle and record.lifecycle_class != LIFECYCLE_RESOURCE:
                 _note_skip("lifecycle_own")
                 continue
 
