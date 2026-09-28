@@ -369,6 +369,28 @@ describe('SessionTab — event handling', () => {
     expect(screen.getByText('Hi!')).toBeInTheDocument();
   });
 
+  it('status_message renders the server notice (query is not silently dropped)', async () => {
+    // The backend CASE-3 cold-start path emits a status_message that echoes
+    // the operator's query back to the client so the text is preserved in
+    // the transcript rather than dropped. This asserts the frontend renders
+    // that frame as a visible system notice (it does not swallow it).
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'status_message',
+        text:
+          '\u26a0 No active session \u2014 your message was not sent. ' +
+          'Start a session, then resend:\nhello from the cold start',
+      })
+    );
+    expect(
+      await screen.findByText(/No active session \u2014 your message was not sent/)
+    ).toBeInTheDocument();
+    // The echoed query text must survive into the rendered notice.
+    expect(screen.getByText(/hello from the cold start/)).toBeInTheDocument();
+  });
+
   it('tokens_updated updates the token counter', async () => {
     renderTab();
     const ws = await connectWs();
