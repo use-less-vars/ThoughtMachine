@@ -18,9 +18,34 @@ def _load_server():
     return server
 
 
+class _FakeEntry:
+    def __init__(self, workspace_id):
+        self.id = workspace_id
+
+
+def _fake_non_empty_registry(server, monkeypatch):
+    """Make the periodic registry re-check see one registered workspace.
+
+    ``_run_container_sweeps`` now re-reads the workspace registry on every
+    tick and skips the destructive orphan-resource sweep when that read is
+    empty (see ``_periodic_registry_has_workspaces``).  These loop tests
+    exercise the loop *wiring*, so they give the real guard a non-empty
+    registry instead of stubbing the guard out.
+    """
+    registry = server.WorkspaceRegistry.__new__(server.WorkspaceRegistry)
+    entry = _FakeEntry("ws-1")
+    monkeypatch.setattr(
+        server.WorkspaceRegistry, "get_default", staticmethod(lambda: registry)
+    )
+    monkeypatch.setattr(
+        server.WorkspaceRegistry, "list_workspaces", staticmethod(lambda: [entry])
+    )
+
+
 def test_periodic_sweep_loop_runs_both_sweeps_and_cancels(monkeypatch):
     """The loop re-invokes BOTH sweeps repeatedly and honours cancellation."""
     server = _load_server()
+    _fake_non_empty_registry(server, monkeypatch)
 
     lock = threading.Lock()
     counts = {"exited": 0, "orphan": 0, "records": 0}
@@ -68,6 +93,7 @@ def test_periodic_sweep_loop_runs_both_sweeps_and_cancels(monkeypatch):
 def test_periodic_sweep_loop_swallows_sweep_errors(monkeypatch):
     """A raising sweep must not kill the loop (best-effort, never fatal)."""
     server = _load_server()
+    _fake_non_empty_registry(server, monkeypatch)
 
     lock = threading.Lock()
     counts = {"exited": 0, "orphan": 0, "records": 0}
