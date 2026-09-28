@@ -15,6 +15,7 @@ import pytest
 from thoughtmachine.workspace_registry import (
     WorkspaceRegistry,
     WorkspaceRegistryEntry,
+    WorkspaceRegistryUnavailable,
     generate_human_id,
 )
 
@@ -293,20 +294,18 @@ class TestWorkspaceRegistryPersistence:
                 reg = WorkspaceRegistry()
                 assert reg.list_workspaces() == []
 
-    def test_corrupt_json_handling(self, temp_registry, caplog):
-        """A corrupt JSON file logs a warning and loads as empty."""
-        import logging
+    def test_corrupt_json_handling(self, temp_registry):
+        """A corrupt JSON file raises WorkspaceRegistryUnavailable.
 
-        caplog.set_level(logging.WARNING)
-
-        # Write corrupt JSON
+        Corruption is now distinguishable from the legitimate empty state:
+        ``list_workspaces`` raises instead of silently swallowing the fault.
+        """
         reg_path = temp_registry._path
         reg_path.parent.mkdir(parents=True, exist_ok=True)
         reg_path.write_text("not valid json{{{", encoding="utf-8")
 
-        lst = temp_registry.list_workspaces()
-        assert lst == []
-        assert any("Failed to load registry" in r.message for r in caplog.records)
+        with pytest.raises(WorkspaceRegistryUnavailable):
+            temp_registry.list_workspaces()
 
     def test_atomic_write_preserves_original_on_crash(self, temp_registry):
         """If writing the .tmp file fails, the original is left intact."""

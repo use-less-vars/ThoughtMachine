@@ -439,7 +439,7 @@ def test_09_read_only_apis_create_no_files(vault_path, monkeypatch):
     )
 
     registry_file = vault_path / "state" / "workspace_registry.json"
-    _write_json(registry_file, [])
+    _write_json(registry_file, {})
 
     before = _fs_paths(tmp_path_root := vault_path.parent)
 
