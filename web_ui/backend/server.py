@@ -1083,13 +1083,24 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             })
                         continue
 
-                    # Case 3: Nothing to continue
+                    # Case 3: Nothing to continue (e.g. a cold start where the
+                    # session was not created yet).  Do NOT silently drop the
+                    # query: surface an explicit, actionable notice that echoes
+                    # the operator's text back so it is preserved (the frontend
+                    # clears the input box on send) and can be resent.
                     log('WARNING', 'server.ws',
                         f'continue_session: CASE 3 - no active session! | '
                         f'bridge={bridge is not None} | '
                         f'_loaded_session={bridge._loaded_session.session_id if bridge and bridge._loaded_session else None} | '
                         f'agent_is_running={bridge.agent_is_running if bridge else False}')
-                    await ws.send_json({"type": "status_message", "text": "No active session — start a new one."})
+                    await ws.send_json({
+                        "type": "status_message",
+                        "text": (
+                            "⚠ No active session — your message was not sent. "
+                            "Start a session, then resend:\n"
+                            f"{query}"
+                        ),
+                    })
 
                 elif command == "pause_session":
                     if bridge is not None:
