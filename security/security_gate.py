@@ -978,16 +978,17 @@ def get_effective_permissions(
     # hard, absolute gate on the ``host_bash`` resource: a missing key, an
     # absent / null / false value, or a missing/unreadable workspace config
     # denies host execution regardless of what the session grant or worker
-    # footprint says, while ANY truthy value enables it -- the reader returns
-    # ``bool(data.get("allow_host_resources", False))``, so e.g. the string
-    # "yes" or the number 1 also enable host resources.  See
+    # footprint says, while ONLY the JSON boolean ``true`` enables it -- the
+    # reader is strict (``.get("allow_host_resources") is True``), so e.g.
+    # the string "yes" or the number 1 do NOT enable host resources.  See
     # tools.host_resource_policy.workspace_allows_host_resources, the single
     # source of truth for the exact type semantics.  It is enforced HERE, in
     # the resolution layer, so every consumer of the effective dict sees the
     # denial -- the in-tool check in tools/host_bash_tool.py is skipped
     # whenever no workspace id is attached, and resolving it here closes that
-    # gap without duplicating policy.  The reader is fail-closed; any reader
-    # error therefore denies.  The override
+    # gap without duplicating policy.  The reader is fail-closed and never
+    # raises for any id; the sole reachable failure here is an import error
+    # (the policy module unavailable), which also denies.  The override
     # is applied AFTER the ceiling annotation so a host_bash ban is never
     # misattributed to the workspace *permissions* ceiling.
     try:
@@ -996,7 +997,7 @@ def get_effective_permissions(
         _workspace_allows_host_resources = workspace_allows_host_resources(
             workspace_id
         )
-    except Exception:
+    except ImportError:
         _workspace_allows_host_resources = False
     if not _workspace_allows_host_resources:
         result["host_bash"] = "banned"
@@ -1125,8 +1126,11 @@ def resolve_container_config(
         # in-memory ``session`` normalised above is ignored.  A store read
         # failure is observable (WARNING naming the ids) and FALLS BACK to the
         # caller-supplied ``session`` mirror rather than failing closed, so a
-        # store that cannot express the caller's ids (e.g. a uuid.UUID session
-        # id) does not override an already-correct mirror.  Every other
+        # genuine store read failure does not override an already-correct
+        # mirror.  (Ids are coerced for the disk paths via the ``_coerce_id``
+        # idiom in ``thoughtmachine.permission_store``, so a ``uuid.UUID`` id
+        # is expressible and resolves on disk rather than tripping a read
+        # failure.)  Every other
         # combination uses the legacy 2-arg in-memory merge BYTE-FOR-BYTE.
         if use_disk and session_id is not None and workspace_id is not None:
             try:

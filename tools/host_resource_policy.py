@@ -25,6 +25,8 @@ def load_workspace_config(workspace_id: str) -> dict:
     Single source of truth for reading a workspace ``config.json``. Fail-closed
     on any lookup error (missing/empty workspace id, missing file, invalid JSON,
     non-dict body) by returning an empty dict -- this function never raises.
+    Non-``str`` ids (e.g. a ``uuid.UUID``) are coerced via ``str`` for the path
+    join.
     """
     if not workspace_id:
         return {}
@@ -33,7 +35,20 @@ def load_workspace_config(workspace_id: str) -> dict:
 
     from thoughtmachine.vault import vault_root
 
-    cfg_path = Path(vault_root()) / "workspaces" / workspace_id / "config.json"
+    # ``workspace_id`` is declared ``str`` but callers may hand us a non-str
+    # identifier (e.g. a ``uuid.UUID``); pathlib cannot join a raw UUID onto a
+    # ``Path`` (``TypeError: unsupported operand type(s) for /``), which would
+    # break this reader's "never raises" contract.  Coerce through ``str``
+    # before the join -- the same idiom as
+    # ``thoughtmachine.permission_store._coerce_id`` -- kept local to avoid a
+    # new cross-module dependency.  ``str()`` on a ``str`` is a no-op, so
+    # plain-str behaviour is unchanged.
+    cfg_path = (
+        Path(vault_root())
+        / "workspaces"
+        / str(workspace_id)
+        / "config.json"
+    )
     try:
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
