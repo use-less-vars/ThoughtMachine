@@ -1217,7 +1217,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
                     permissions = config_manager.resolve_effective_permissions(
                         bridge._session_config,
-                        bridge._session_id,
+                        bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
                         bridge._session_config.workspace_id or bridge._workspace_id,
                     ) if bridge._session_config else {}
                     await ws.send_json({
@@ -1507,7 +1507,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
                                 permissions = config_manager.resolve_effective_permissions(
                                     bridge._session_config,
-                                    bridge._session_id,
+                                    bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
                                     bridge._session_config.workspace_id or bridge._workspace_id,
                                 ) if bridge._session_config else {}
                                 await ws.send_json({
@@ -2146,7 +2146,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
                         permissions = config_manager.resolve_effective_permissions(
                             bridge._session_config,
-                            bridge._session_id,
+                            bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
                             bridge._session_config.workspace_id or bridge._workspace_id,
                         ) if bridge._session_config else {}
                         await ws.send_json({
@@ -2507,7 +2507,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
                     permissions = config_manager.resolve_effective_permissions(
                         bridge._session_config,
-                        bridge._session_id,
+                        bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
                         bridge._session_config.workspace_id or bridge._workspace_id,
                     ) if bridge._session_config else {}
                     await ws.send_json({
@@ -2653,7 +2653,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
                     permissions = config_manager.resolve_effective_permissions(
                         bridge._session_config,
-                        bridge._session_id,
+                        bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
                         bridge._session_config.workspace_id or bridge._workspace_id,
                     ) if bridge._session_config else {}
                     await ws.send_json({

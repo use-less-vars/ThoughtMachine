@@ -1542,7 +1542,7 @@ class WebAgentBridge:
         settings = self._config_manager.extract_settings(frontend_result)
         permissions = self._config_manager.resolve_effective_permissions(
             self._session_config,
-            self._session_id,
+            self._session_id or (self._loaded_session.session_id if self._loaded_session else None),
             self._session_config.workspace_id or self._workspace_id,
         )
 
