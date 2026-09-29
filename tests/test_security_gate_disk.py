@@ -221,12 +221,12 @@ def test_disk_mode_equals_legacy_explicit_args(hermetic_vault):
     assert legacy["container"] is True
 
 
-def test_explicit_workspace_permissions_win_over_disk_ids(hermetic_vault):
-    """(g) Precedence rule: an explicit in-memory workspace_permissions dict
-    always wins — disk state (grants + ceiling) is ignored entirely when it
-    is supplied alongside the ids."""
+def test_disk_ids_win_over_explicit_workspace_permissions(hermetic_vault):
+    """(g) Precedence rule (Edge 2 Change 4): when BOTH ids are supplied the
+    disk read is authoritative — an explicit in-memory ``workspace_permissions``
+    dict no longer wins; the stored grant profile + ceiling are used instead."""
     ws_id, sid = "ws-g", "sess-1"
-    # Disk state that WOULD allow write if it were consulted.
+    # Disk state that allows write (grant + ceiling both write).
     write_session_permissions(
         hermetic_vault, ws_id, sid,
         {"filesystem": "write", "git": "write"},
@@ -236,25 +236,28 @@ def test_explicit_workspace_permissions_win_over_disk_ids(hermetic_vault):
         {"filesystem": "write", "git": "write"},
     )
 
+    # A DIVERGENT explicit ceiling (read) supplied ALONGSIDE both ids: before
+    # Edge 2 Change 4 this won; now the disk read governs -> write.
     eff = get_effective_permissions(
         SessionPermissions(filesystem="write", git="write"),
         _FULL_CAPS,
-        {"filesystem": "read", "git": "read"},  # explicit ceiling
+        {"filesystem": "read", "git": "read"},  # explicit ceiling — ignored
         session_id=sid,
         workspace_id=ws_id,
     )
-    assert eff["filesystem"] == "read"  # explicit ceiling applied
-    assert eff["git"] == "read"
+    assert eff["filesystem"] == "write"  # disk wins, NOT the explicit "read"
+    assert eff["git"] == "write"
     assert eff["container"] is False
 
-    # Control: same ids, workspace_permissions=None -> disk mode says write.
-    disk = get_effective_permissions(
-        SessionPermissions(),
+    # Control: with NO ids the in-memory path still governs, so the explicit
+    # read ceiling applies as before.
+    legacy = get_effective_permissions(
+        SessionPermissions(filesystem="write", git="write"),
         _FULL_CAPS,
-        session_id=sid,
-        workspace_id=ws_id,
+        {"filesystem": "read", "git": "read"},
     )
-    assert disk["filesystem"] == "write"
+    assert legacy["filesystem"] == "read"
+    assert legacy["git"] == "read"
 
 
 def test_disk_mode_schema_invalid_ceiling_fails_closed(hermetic_vault, monkeypatch):
