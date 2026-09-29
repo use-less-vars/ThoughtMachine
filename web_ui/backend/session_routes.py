@@ -26,7 +26,6 @@ from thoughtmachine.permission_store import (
     PermissionStoreError,
     read_session_permissions,
     session_grants_path,
-    workspace_ceiling,
     write_session_permissions,
 )
 from thoughtmachine.security import (
@@ -356,18 +355,19 @@ def _load_permission_session(session_id: str):
 
 
 def _compute_effective_session_permissions(
-    vault, workspace_id: str, session_id: str, raw_perms: Dict[str, Any]
+    workspace_id: str, session_id: str
 ) -> Dict[str, Any]:
     """Compute effective session permissions enforced at runtime.
 
     Pipeline (mirrors GET /api/workspace/{ws_id}/effective_permissions):
-    coerce raw grants to the full 10-key session profile (safe defaults when
-    empty) -> build SessionPermissions -> apply the workspace ceiling from
-    config.json['permissions'] (via the permission store) -> merge with
-    workspace capabilities in the security gate.  A corrupt/missing workspace
-    config is treated as "no ceiling" ({}) so a broken ceiling never nukes the
-    session permission read.  The gate import is lazy (import precedent:
-    workspace_routes.py effective_permissions handler).
+    the security gate's disk mode is the single source of truth for both the
+    session grant profile and the workspace permission ceiling.  Both are read
+    from the vault permission store (session sidecar / legacy session record and
+    config.json['permissions'] respectively) and then merged with the workspace
+    capabilities in the security gate.  Because the store is authoritative, a
+    missing or corrupt grant/config source fails CLOSED (the deny-all profile)
+    rather than falling back to permissive defaults.  The gate import is lazy
+    (import precedent: workspace_routes.py effective_permissions handler).
     """
     from security.security_gate import get_effective_permissions as _gate_effective
 
@@ -375,16 +375,12 @@ def _compute_effective_session_permissions(
     if caps is None:
         caps = WorkspaceCapabilities.default()
 
-    raw = coerce_session_permissions(raw_perms) if raw_perms else {}
-    session_obj = SessionPermissions(**raw) if raw else SessionPermissions()
-
-    try:
-        ceiling = workspace_ceiling(vault, workspace_id)
-    except PermissionStoreError:
-        # Unreadable/missing workspace ceiling must not fail the session read;
-        # no ceiling == raw session grants pass through capability merge.
-        ceiling = {}
-    return _gate_effective(session_obj, caps, ceiling)
+    # Disk mode engages when session_id and workspace_id are supplied and the
+    # in-memory ceiling is None (the default); the passed session profile is
+    # ignored and replaced by the store read inside the gate.
+    return _gate_effective(
+        SessionPermissions(), caps, session_id=session_id, workspace_id=workspace_id
+    )
 
 
 def _ceiling_provenance(effective: Dict[str, Any]) -> Dict[str, Any]:
@@ -441,9 +437,7 @@ async def get_session_permissions(session_id: str) -> Dict[str, Any]:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"permission store read failed: {exc}",
             )
-        effective = _compute_effective_session_permissions(
-            vault, ws_id, session_id, raw
-        )
+        effective = _compute_effective_session_permissions(ws_id, session_id)
         return {
             "raw": raw,
             "effective": effective,
@@ -509,9 +503,7 @@ async def put_session_permissions(
             ) from None
         normalized = coerce_session_permissions(body)
         write_session_permissions(vault, ws_id, session_id, normalized)
-        effective = _compute_effective_session_permissions(
-            vault, ws_id, session_id, normalized
-        )
+        effective = _compute_effective_session_permissions(ws_id, session_id)
         return {
             "raw": normalized,
             "effective": effective,
