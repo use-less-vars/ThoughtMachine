@@ -1540,7 +1540,11 @@ class WebAgentBridge:
 
         # Step 6: Build enhanced result with settings, permissions, and merged_config
         settings = self._config_manager.extract_settings(frontend_result)
-        permissions = self._config_manager.resolve_effective_permissions(self._session_config)
+        permissions = self._config_manager.resolve_effective_permissions(
+            self._session_config,
+            self._session_id,
+            self._session_config.workspace_id or self._workspace_id,
+        )
 
         result = {
             "config": frontend_result,
