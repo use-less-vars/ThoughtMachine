@@ -16,6 +16,10 @@ Git Bash, or Cygwin required.
 - **Agent & Engineer modes.** Engineer mode orchestrates worker sub-agents, each
   in its own thread/context, returning a structured status/confidence envelope.
 
+ThoughtMachine is a capability management platform. An operator grants an AI agent controlled access to computer capabilities. The security layer is the product - grants are enforced structurally, in code, not by prompt. The state layer is what makes the security layer legible - every container, every permission, every state change is visible and reconcilable. A machine that is safe but opaque is a machine you cannot use. A machine that is visible but unsafe is a machine you should not. ThoughtMachine is both.
+
+V2 was the era where the security layer was the product. That layer is built and tested. This is the era where the state layer stops lying - every subsystem that holds state now reconciles, or reports that it cannot. The machine is safe; the machine is now also honest.
+
 ## Platform support
 
 | Capability | Linux | macOS | Windows |
@@ -27,18 +31,19 @@ Git Bash, or Cygwin required.
 The web UI is the supported frontend on every platform. On Windows the Docker
 sandbox is unavailable by design — the tool reports this and the rest of the
 agent keeps working; see
-[docs/windows_stability_contract.md](docs/windows_stability_contract.md).
+[docs/windows_stability_contract.md](docs/windows_stability_contract.md). On
+some Windows hosts, virtualization must first be enabled in BIOS (VT-x / AMD-V)
+for Docker to function.
 
 ## Quick Start — Linux / macOS
 
 ```bash
-# 1. Prerequisite checks + venv + Python deps (Python >= 3.11, Docker, Node >= 18)
+# 1. Install prerequisites first: Python 3.11+, Node.js 18+ (with npm), and Docker.
+#    Then run the installer: it creates the venv, installs Python deps, and
+#    installs the Web UI dependencies itself (npm ci, or npm install).
 ./install.sh
 
-# 2. Web UI dependencies (install.sh does NOT run npm install)
-cd web_ui/frontend && npm install && cd ../..
-
-# 3. Launch: backend on :8000 + Vite dev server on :5173
+# 2. Launch: backend on :8000 + Vite dev server on :5173
 ./start_thoughtmachine.sh
 ```
 
@@ -101,7 +106,7 @@ Keep keys out of the repository — see [SECURITY.md](SECURITY.md).
 |---|---|---|
 | Python | 3.11 | `requires-python = ">=3.11"`; tested on 3.14 |
 | Node.js | 18 | Required for the Web UI frontend |
-| Docker | a recent engine | Required for the sandbox; optional on Windows |
+| Docker | a recent engine | Required for the primary execution path; on Windows without Docker, containerized tools degrade gracefully |
 
 ## Development & Testing
 
