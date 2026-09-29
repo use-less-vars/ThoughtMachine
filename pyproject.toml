@@ -7,7 +7,7 @@ name = "thoughtmachine"
 dynamic = ["version"]
 description = "ThoughtMachine — AI agent framework"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "BSL-1.1" }
 authors = [
     { name = "ThoughtMachine Contributors" },
 ]
