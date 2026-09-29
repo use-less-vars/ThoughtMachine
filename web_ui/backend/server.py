@@ -1215,7 +1215,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # frontend_config_from_bridge handles bridge=None and cfg=None gracefully
                     fe_config = config_manager.get_frontend_config(bridge)
                     settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
-                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
+                    permissions = config_manager.resolve_effective_permissions(
+                        bridge._session_config,
+                        bridge._session_id,
+                        bridge._session_config.workspace_id or bridge._workspace_id,
+                    ) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
                         "config": fe_config,
@@ -1501,7 +1505,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 # with stale state or wrong workspace_path.
                                 fe_config = config_manager.get_frontend_config(bridge)
                                 settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
-                                permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
+                                permissions = config_manager.resolve_effective_permissions(
+                                    bridge._session_config,
+                                    bridge._session_id,
+                                    bridge._session_config.workspace_id or bridge._workspace_id,
+                                ) if bridge._session_config else {}
                                 await ws.send_json({
                                     "type": "config_changed",
                                     "config": fe_config,
@@ -2136,7 +2144,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # Send config_changed so the frontend shows the session's actual config
                         # (fe_config computed above — Fix 4a)
                         settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
-                        permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
+                        permissions = config_manager.resolve_effective_permissions(
+                            bridge._session_config,
+                            bridge._session_id,
+                            bridge._session_config.workspace_id or bridge._workspace_id,
+                        ) if bridge._session_config else {}
                         await ws.send_json({
                             "type": "config_changed",
                             "config": fe_config,
@@ -2493,7 +2505,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Send config from bridge so frontend gets workspace path etc.
                     fe_config = config_manager.get_frontend_config(bridge)
                     settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
-                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
+                    permissions = config_manager.resolve_effective_permissions(
+                        bridge._session_config,
+                        bridge._session_id,
+                        bridge._session_config.workspace_id or bridge._workspace_id,
+                    ) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
                         "config": fe_config,
@@ -2635,7 +2651,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     })
                     fe_config = config_manager.get_frontend_config(bridge)
                     settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
-                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
+                    permissions = config_manager.resolve_effective_permissions(
+                        bridge._session_config,
+                        bridge._session_id,
+                        bridge._session_config.workspace_id or bridge._workspace_id,
+                    ) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
                         "config": fe_config,
