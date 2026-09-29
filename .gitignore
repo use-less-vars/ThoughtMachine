@@ -200,3 +200,5 @@ venv*
 
 .thoughtmachine/knowledge/archive/
 .thoughtmachine/gate_log.txt
+web_ui/frontend/.npmrc
+web_ui/frontend/.npmrc
