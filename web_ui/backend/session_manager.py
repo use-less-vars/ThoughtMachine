@@ -367,10 +367,31 @@ class SessionManager:
         session record, and only the REST permissions endpoint otherwise writes
         it.  The mirrored value is read from the very same
         ``metadata['session_config']['session_permissions']`` the store persists,
-        so the sidecar and record never disagree.  Never raises.
+        so an absent/empty sidecar is filled to match the record; an existing
+        non-empty sidecar takes precedence and is left untouched (see below).
+        Never raises.
+
+        P1 (the sidecar) is REST-owned and authoritative once it holds grants:
+        a save must never mirror a stale P2 over an existing P1.  We therefore
+        read P1 first and skip the mirror when it already holds a non-empty
+        grant dict.  Failure policy: if the P1 read RAISES, skip the mirror
+        (fail closed in the safe direction) -- mirroring onto an unreadable P1
+        is exactly the clobber this guards against.
         """
         ws_id = getattr(session, "workspace_id", None)
         if not ws_id:
+            return
+        # P1-existence guard: never let a stale P2 clobber an existing P1.
+        try:
+            import thoughtmachine.vault as _vault_module
+            from thoughtmachine.permission_store import read_session_permissions
+
+            existing_p1 = read_session_permissions(
+                _vault_module.vault_root(), ws_id, session.session_id
+            )
+        except Exception:  # noqa: BLE001 - unreadable P1: fail closed, do not mirror
+            return
+        if existing_p1:
             return
         metadata = getattr(session, "metadata", None)
         sc = metadata.get("session_config") if isinstance(metadata, dict) else None
