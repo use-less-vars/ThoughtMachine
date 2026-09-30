@@ -2,8 +2,6 @@ import React from 'react';
 import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
 import WorkerManagementPanel from './WorkerManagementPanel';
 import WorkerBlueprintPanel from './WorkerBlueprintPanel';
-import DockerfileEditor from './DockerfileEditor';
-import DomainAllowlistEditor from './DomainAllowlistEditor';
 import ContainerListPanel from './workspace/ContainerListPanel';
 import { getPill } from '../data/permissionVocab';
 
@@ -172,21 +170,6 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
 
   return (
     <div>
-      {/* Dockerfile */}
-      <div style={sectionStyle}>
-        <label style={labelStyle}><strong>Dockerfile</strong></label>
-        <DockerfileEditor workspaceId={workspaceId} />
-      </div>
-
-      {/* Domain Allowlist */}
-      <div style={sectionStyle}>
-        <label style={labelStyle}><strong>Domain Allowlist</strong></label>
-        <small style={{ color: '#6c7086', fontSize: '0.75rem', display: 'block', marginBottom: '0.3rem' }}>
-          One domain per line. Wildcards supported (e.g. *.example.com).
-        </small>
-        <DomainAllowlistEditor workspaceId={workspaceId} />
-      </div>
-
       {/* Workers */}
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Workers</strong></label>
