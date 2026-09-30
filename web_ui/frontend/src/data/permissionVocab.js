@@ -3,8 +3,8 @@
 // UI displays. Mirrors the backend session permission vocabulary
 // (thoughtmachine/security.py PERMISSION_SCHEMA / SessionPermissions —
 //  and security/security_gate.py _LEVEL_MAP).
-// Consumers: ConfigPanel (permission <option> sets), WorkspacePanel and
-// WorkerManagementPanel (effective-permission pills).
+// Consumers: ConfigPanel (permission <option> sets), SessionWorkspaceTab
+// and WorkerManagementPanel (effective-permission pills).
 
 // Session resources are the ONLY keys a session may store / the ConfigPanel may
 // PUT: git, filesystem, container, network, mcp, host_bash (mirrors the backend

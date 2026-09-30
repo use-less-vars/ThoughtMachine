@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 
-// ── Reusable inline styles (matching WorkspacePanel's Catppuccin palette) ──
+// ── Reusable inline styles (matching the shared Catppuccin palette) ──
 const inputStyle = {
   background: '#1e1e2e',
   color: '#cdd6f4',

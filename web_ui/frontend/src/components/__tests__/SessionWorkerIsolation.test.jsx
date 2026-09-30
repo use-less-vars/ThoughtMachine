@@ -17,7 +17,7 @@
  *       worker events.
  *
  * Worker selection is driven through the real UI: WorkerManagementPanel (inside
- * ConfigPanel → WorkspacePanel, mounted by every SessionTab) fetches
+ * ConfigPanel → SessionWorkspaceTab, mounted by every SessionTab) fetches
  * `/api/workspace/{id}/workers` and renders clickable worker rows; clicking a
  * row calls onSelectWorker(workerName, workspaceId), which is the ONLY way
  * App's workerPanelState gets populated (preseeding localStorage does NOT work:

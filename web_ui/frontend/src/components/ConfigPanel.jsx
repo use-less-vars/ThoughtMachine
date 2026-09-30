@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
-import WorkspacePanel from './WorkspacePanel';
+import SessionWorkspaceTab from './SessionWorkspaceTab';
 import PromptLibrary from './PromptLibrary';
 import useStore from '../store/useStore';
 import { apiUrl } from '../apiBase';
@@ -624,7 +624,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             </div>
           </div>
 
-          <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} effectivePermissions={sessionPerms?.effective ?? null} />
+          <SessionWorkspaceTab workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} effectivePermissions={sessionPerms?.effective ?? null} />
         </div>
       )}
 
