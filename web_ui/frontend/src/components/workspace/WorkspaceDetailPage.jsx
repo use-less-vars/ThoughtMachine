@@ -15,6 +15,8 @@ import ContainerLogsViewer from './ContainerLogsViewer'
 import ContainerListPanel from './ContainerListPanel'
 import RecordContainerPanel from '../RecordContainerPanel'
 import WorkerBlueprintPanel from '../WorkerBlueprintPanel'
+import DockerfileEditor from '../DockerfileEditor'
+import DomainAllowlistEditor from '../DomainAllowlistEditor'
 import './WorkspaceDetailPage.css'
 
 const TABS = [
@@ -148,6 +150,7 @@ function PermissionsResourcesTab({
   applySuccess,
   dirty,
 }) {
+  const workspaceId = summary.workspace_id
   const catalog = Array.isArray(summary.resource_catalog) ? summary.resource_catalog : []
   const catalogByName = new Map(catalog.map((entry) => [entry.name, entry]))
 
@@ -278,6 +281,11 @@ function PermissionsResourcesTab({
 
   return (
     <div className="wdp-tab-content">
+      <div className="wdp-card">
+        <div className="wdp-card-label">Domain Allowlist</div>
+        <DomainAllowlistEditor workspaceId={workspaceId} />
+      </div>
+
       <div className="wdp-section-title">Resource permissions</div>
       {ceilingCards}
       {informationalCards}
@@ -329,6 +337,11 @@ function ContainersTab({ summary }) {
             ? 'Dockerfile content available'
             : 'No Dockerfile content recorded'}
         </div>
+      </div>
+
+      <div className="wdp-card">
+        <div className="wdp-card-label">Dockerfile content</div>
+        <DockerfileEditor workspaceId={workspaceId} />
       </div>
 
       <div className="wdp-card">
