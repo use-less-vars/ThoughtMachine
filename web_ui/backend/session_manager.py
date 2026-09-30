@@ -109,6 +109,7 @@ class SessionManager:
         audit_source: str = 'user',
         provider_id: Optional[str] = None,
         model: Optional[str] = None,
+        workspace_id: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Create a new empty ``Session``, build a matching ``SessionConfig``,
@@ -171,6 +172,19 @@ class SessionManager:
             new_session, workspace_id=new_session.workspace_id
         )
         self._session_store.add_open_session(new_session.session_id)
+
+        # Seed the session permission sidecar for the workspace.  The record
+        # above is written to the legacy sessions dir (workspace_id is layered
+        # onto the session only later by the caller), so a disk-mode permission
+        # read at the new-session handshake -- which runs before the first
+        # save_session -- would otherwise find no grants source in the
+        # workspace-scoped sessions dir and fail CLOSED.
+        if workspace_id:
+            self._seed_permissions_sidecar(
+                workspace_id,
+                new_session.session_id,
+                session_config.session_permissions,
+            )
 
         frontend_config = self._config_manager.session_config_to_frontend(
             session_config, workspace_path=workspace_path
@@ -309,6 +323,61 @@ class SessionManager:
         self._session_store.save_session(
             session, workspace_id=session.workspace_id
         )
+        self._sync_session_permissions_sidecar(session)
+
+    # ── Permissions sidecar ───────────────────────────────────────────────────
+
+    def _seed_permissions_sidecar(
+        self,
+        workspace_id: str,
+        session_id: str,
+        permissions: Any,
+    ) -> None:
+        """Best-effort write of a session's permission sidecar.
+
+        The sidecar (``<vault>/workspaces/<ws>/sessions/<sid>/permissions.json``)
+        is the first source ``read_session_permissions`` consults.  Seeding it at
+        session-create time keeps a disk-mode ``get_effective_permissions`` from
+        failing CLOSED when the session record still lives in the legacy sessions
+        dir.  ``permissions`` may be a raw dict or a ``SessionPermissions``
+        instance.  Never raises.
+        """
+        try:
+            import thoughtmachine.vault as _vault_module
+            from thoughtmachine.permission_store import write_session_permissions
+
+            write_session_permissions(
+                _vault_module.vault_root(),
+                workspace_id,
+                session_id,
+                permissions if permissions is not None else {},
+            )
+        except Exception as e:  # noqa: BLE001 - seeding must never break session lifecycle
+            log(
+                "WARNING",
+                "session_manager",
+                f"permissions sidecar seed failed for session {session_id}: {e}",
+            )
+
+    def _sync_session_permissions_sidecar(self, session: Session) -> None:
+        """Mirror the session's persisted grants into its permission sidecar.
+
+        Without this, a sidecar seeded at create would SHADOW a later grant
+        change -- ``read_session_permissions`` consults the sidecar before the
+        session record, and only the REST permissions endpoint otherwise writes
+        it.  The mirrored value is read from the very same
+        ``metadata['session_config']['session_permissions']`` the store persists,
+        so the sidecar and record never disagree.  Never raises.
+        """
+        ws_id = getattr(session, "workspace_id", None)
+        if not ws_id:
+            return
+        metadata = getattr(session, "metadata", None)
+        sc = metadata.get("session_config") if isinstance(metadata, dict) else None
+        perms = sc.get("session_permissions") if isinstance(sc, dict) else None
+        if not isinstance(perms, dict):
+            perms = {}
+        self._seed_permissions_sidecar(ws_id, session.session_id, perms)
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
@@ -341,6 +410,7 @@ class SessionManager:
         self._session_store.save_session(
             session, workspace_id=session.workspace_id
         )
+        self._sync_session_permissions_sidecar(session)
         return session
 
     # ── Delete ────────────────────────────────────────────────────────────────

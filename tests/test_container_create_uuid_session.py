@@ -1,21 +1,20 @@
 """RED-first test: a container create path for a UUID workspace_id / session_id
-with NO vault sidecar must fall back to the caller-supplied in-memory session
-mirror, NOT fail closed to ``"none"``.
+with NO vault sidecar must FAIL CLOSED to ``network_mode="none"``.
 
 Bug: ``bug/container-create-uuid-ids-fail-closed``.
 
 The create path threads UUID ids into
-``security.security_gate.resolve_container_config``.  Its disk read
-path-joins the raw id into the vault path
-(``thoughtmachine.permission_store.session_grants_path``), which raises
-``TypeError`` for a ``uuid.UUID`` (``PosixPath / UUID`` is unsupported).  The
-pre-fix resolver treated that error as an unreadable store and failed CLOSED,
-overriding the caller's already-correct mirror and locking the container down
-to ``network_mode="none"`` / read-only.
+``security.security_gate.resolve_container_config`` with ``use_disk=True``.
+Its disk read path-joins the raw id into the vault path
+(``thoughtmachine.permission_store``), which now coerces the id to ``str``
+(``_coerce_id``); with NO sidecar and no matching session record the store
+raises ``PermissionStoreError`` (unknown session: deny, do not default).
 
-The disk read is now caller-gated (``use_disk=True`` opt-in): a store read
-error is observable (a WARNING naming the ids) and the resolver FALLS BACK to
-the caller's mirror.
+The resolver treats any store read failure as fail-CLOSED: it substitutes the
+deny-all session + deny-all ceiling, so the caller's in-memory mirror is NOT
+used and the container is locked down to ``network_mode="none"`` / read-only
+(``workspace_mode="ro"``).  A store read error stays observable (a WARNING
+naming the ids).
 
 Run:  pytest tests/test_container_create_uuid_session.py -q
 """
@@ -46,11 +45,9 @@ def permissive_caps(monkeypatch):
     )
 
 
-def test_uuid_ids_without_sidecar_falls_back_to_mirror(
-    permissive_caps, hermetic_vault
-):
-    # UUID ids that the vault store path cannot express as a path component;
-    # NO sidecar is written for them, so the disk read raises TypeError.
+def test_uuid_ids_without_sidecar_fail_closed(permissive_caps, hermetic_vault):
+    # UUID ids the vault store has no sidecar (nor matching session record)
+    # for, so the disk read raises PermissionStoreError (unknown session).
     workspace_id = uuid.uuid4()
     session_id = uuid.uuid4()
 
@@ -60,7 +57,7 @@ def test_uuid_ids_without_sidecar_falls_back_to_mirror(
         session_id=session_id,
     )
 
-    # The caller's mirror must win on a store-read failure.
-    # Pre-fix: the resolver failed CLOSED over the mirror -> "none" (RED).
-    # Post-fix: it falls back to the mirror -> "bridge" (GREEN).
-    assert mode == "bridge"
+    # A store-read failure must FAIL CLOSED -- the caller's mirror is ignored.
+    # Pre-fix: the resolver fell back to the mirror -> "bridge" (RED).
+    # Post-fix: it fails closed to the deny-all profile -> "none" (GREEN).
+    assert mode == "none"

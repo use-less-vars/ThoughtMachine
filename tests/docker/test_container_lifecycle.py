@@ -149,18 +149,44 @@ class TestContainerLifecycle:
             session_permissions=session_permissions,
             image=self.image_tag,
         )
-        # NOTE: the security gate (security_gate.get_workspace_capabilities)
-        # fail-closes to network=none / workspace=ro when a workspace has NO
-        # registered capabilities record; production bootstraps a permissive
-        # record per workspace. These tests use throwaway workspace ids, so
-        # register a permissive record before start (only needed when
-        # session_permissions are passed — with None the gate is skipped).
+        # NOTE: when BOTH a workspace_id and a session_id are supplied, the
+        # security gate (security_gate.resolve_container_config) makes the
+        # vault permission store the source of truth (use_disk=True) and
+        # FAILS CLOSED to network=none / workspace=ro whenever that store
+        # cannot be read (permission_store.PermissionStoreError). In production
+        # the store is bootstrapped per workspace/session; these tests use
+        # throwaway ids with NO vault state, so seed the equivalent disk state
+        # before start() (only needed when session_permissions are passed —
+        # with None the gate has no ids to read). The workspace capabilities
+        # record is seeded whenever a workspace_id + session_permissions are
+        # present, INDEPENDENT of session_id: the gate reads
+        # get_workspace_capabilities(workspace_id) and fails closed without it.
+        # The session-grants sidecar is only written when a session_id exists.
         if workspace_id is not None and session_permissions is not None:
-            from thoughtmachine.workspace_capabilities import (  # lazy, matches file convention
-                WorkspaceCapabilities,
-                save_workspace_capabilities,
+            # Writes to the real vault root (as the store itself does):
+            #   * workspaces/<ws>/config.json            -- the workspace
+            #     ceiling source ({} = no cap); a MISSING file raises in
+            #     permission_store.workspace_ceiling and the gate fails closed.
+            #   * workspaces/<ws>/capabilities.json      -- a permissive record;
+            #     a missing one makes get_workspace_capabilities fail closed
+            #     (this is independent of session_id).
+            #   * workspaces/<ws>/sessions/<sid>/permissions.json -- the
+            #     session-grants sidecar the disk read actually consults
+            #     (only when a session_id is supplied).
+            from thoughtmachine.vault import vault_root as _vault_root  # lazy
+            from thoughtmachine.workspace_capabilities import (  # lazy
+                ensure_workspace_dirs,
             )
-            save_workspace_capabilities(str(workspace_id), WorkspaceCapabilities())
+            from thoughtmachine.permission_store import (  # lazy
+                write_session_permissions,
+            )
+
+            _root = _vault_root()
+            ensure_workspace_dirs(str(workspace_id))
+            if session_id is not None:
+                write_session_permissions(
+                    _root, str(workspace_id), str(session_id), session_permissions
+                )
         result = manager.start()
         # Give the container a moment to settle (mirrors test_persistence).
         time.sleep(1)

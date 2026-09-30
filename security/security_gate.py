@@ -773,8 +773,9 @@ def _read_disk_permission_sources(
     * :func:`get_effective_permissions` (disk mode) substitutes the deny-all
       session + deny-all ceiling so a disk-mode caller never receives default
       grants.
-    * :func:`resolve_container_config` (``use_disk=True``) falls back to the
-      caller-supplied in-memory session.
+    * :func:`resolve_container_config` (``use_disk=True``) substitutes the same
+      deny-all session + deny-all ceiling (fail closed): the caller-supplied
+      in-memory session is never used as a fallback.
 
     Imports are lazy so the in-memory path never depends on
     ``thoughtmachine.permission_store`` / ``thoughtmachine.vault``.
@@ -1063,8 +1064,9 @@ def resolve_container_config(
       supplied, the session grants and workspace ceiling are read from the vault
       permission store (``thoughtmachine.permission_store``) — the disk is then
       the source of truth and the in-memory ``permissions`` argument is ignored.
-      A store read failure is observable (a WARNING naming the ids) and falls
-      back to the caller-supplied in-memory session rather than denying.
+      A store read failure is observable (a WARNING naming the ids) and fails
+      closed (the deny-all session + deny-all ceiling) rather than using the
+      caller-supplied in-memory session.
     * **Total** — it never raises; every input maps to exactly one
       :class:`ContainerConfig` or :class:`ContainerConfigError` value.
     * **Fail-closed** — any ambiguity (unknown lifecycle class, missing
@@ -1088,7 +1090,8 @@ def resolve_container_config(
             store.  The disk read engages ONLY when ``use_disk`` is ``True``
             AND both ``session_id`` and ``workspace_id`` are supplied; any
             other combination stays pure.  On a store read failure the resolver
-            logs a WARNING and falls back to the in-memory ``permissions``.
+            logs a WARNING and fails closed (the deny-all session + deny-all
+            ceiling).
 
     Returns:
         A :class:`ContainerConfig` on success, otherwise a
@@ -1129,14 +1132,11 @@ def resolve_container_config(
         # supplied is the vault permission store the source of truth.  The
         # session grants + workspace ceiling are read from disk and the
         # in-memory ``session`` normalised above is ignored.  A store read
-        # failure is observable (WARNING naming the ids) and FALLS BACK to the
-        # caller-supplied ``session`` mirror rather than failing closed, so a
-        # genuine store read failure does not override an already-correct
-        # mirror.  (Ids are coerced for the disk paths via the ``_coerce_id``
-        # idiom in ``thoughtmachine.permission_store``, so a ``uuid.UUID`` id
-        # is expressible and resolves on disk rather than tripping a read
-        # failure.)  Every other
-        # combination uses the legacy 2-arg in-memory merge BYTE-FOR-BYTE.
+        # failure is observable (WARNING naming the ids) and FAILS CLOSED: the
+        # deny-all session + deny-all ceiling are substituted, so the caller's
+        # in-memory ``session`` mirror can never override a store that cannot
+        # express its ids.  Every other combination uses the legacy 2-arg
+        # in-memory merge BYTE-FOR-BYTE.
         if use_disk and session_id is not None and workspace_id is not None:
             try:
                 disk_grants, disk_ceiling = _read_disk_permission_sources(
@@ -1148,13 +1148,17 @@ def resolve_container_config(
             except Exception as exc:
                 logger.warning(
                     "resolve_container_config: vault permission read failed "
-                    "(workspace_id=%s session_id=%s): %s; falling back to "
-                    "caller-supplied session",
+                    "(workspace_id=%s session_id=%s): %s; failing closed to "
+                    "the deny-all profile",
                     workspace_id,
                     session_id,
                     type(exc).__name__,
                 )
-                eff = get_effective_permissions(session, capabilities)
+                eff = get_effective_permissions(
+                    _DISK_FAIL_CLOSED_SESSION,
+                    capabilities,
+                    _DISK_FAIL_CLOSED_CEILING,
+                )
             else:
                 eff = get_effective_permissions(
                     loaded, capabilities, disk_ceiling
