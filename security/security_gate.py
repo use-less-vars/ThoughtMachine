@@ -979,25 +979,31 @@ def get_effective_permissions(
     # hard, absolute gate on the ``host_bash`` resource: a missing key, an
     # absent / null / false value, or a missing/unreadable workspace config
     # denies host execution regardless of what the session grant or worker
-    # footprint says, while ANY truthy value enables it -- the reader returns
-    # ``bool(data.get("allow_host_resources", False))``, so e.g. the string
-    # "yes" or the number 1 also enable host resources.  See
+    # footprint says, while ONLY the JSON boolean ``true`` enables it -- the
+    # reader is strict (``.get("allow_host_resources") is True``), so e.g.
+    # the string "yes" or the number 1 do NOT enable host resources.  See
     # tools.host_resource_policy.workspace_allows_host_resources, the single
     # source of truth for the exact type semantics.  It is enforced HERE, in
     # the resolution layer, so every consumer of the effective dict sees the
     # denial -- the in-tool check in tools/host_bash_tool.py is skipped
     # whenever no workspace id is attached, and resolving it here closes that
-    # gap without duplicating policy.  The reader is fail-closed; any reader
-    # error therefore denies.  The override
-    # is applied AFTER the ceiling annotation so a host_bash ban is never
-    # misattributed to the workspace *permissions* ceiling.
+    # gap without duplicating policy.  The reader is fail-closed and never
+    # raises for any id; the import failing (the policy module unavailable)
+    # denies, and an unresolvable vault root can also raise ``RuntimeError``
+    # out of the reader (``load_workspace_config`` calls ``vault_root()``
+    # outside its fail-closed guard), which the handlers below deny too.  The
+    # override is applied AFTER the ceiling annotation so a host_bash ban is
+    # never misattributed to the workspace *permissions* ceiling.
     try:
         from tools.host_resource_policy import workspace_allows_host_resources
 
         _workspace_allows_host_resources = workspace_allows_host_resources(
             workspace_id
         )
-    except Exception:
+    except ImportError:
+        _workspace_allows_host_resources = False
+    except RuntimeError as e:
+        logger.warning("host-resource policy: vault_root unresolvable: %s", e)
         _workspace_allows_host_resources = False
     if not _workspace_allows_host_resources:
         result["host_bash"] = "banned"
