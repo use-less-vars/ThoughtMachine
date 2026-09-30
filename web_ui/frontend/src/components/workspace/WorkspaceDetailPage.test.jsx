@@ -74,7 +74,7 @@ function stubFetchByUrl(routes, defaultResponse = DEFAULT_FALLBACK) {
 
 // Realistic summary fixture matching the backend GET /api/workspace/{id}/summary
 // shape: {workspace_id, label, root_path, allow_host_resources, permissions,
-// capabilities, dockerfile, worker_templates, active_workers, active_sessions,
+// capabilities, dockerfile, active_workers, active_sessions,
 // active_containers, tools, resource_catalog}.
 function makeSummary(overrides = {}) {
   return {
@@ -95,13 +95,6 @@ function makeSummary(overrides = {}) {
       path: '/home/jojo/workspaces/research/Dockerfile',
       content: 'FROM python:3.11\n',
     },
-    worker_templates: [
-      {
-        name: 'default-worker',
-        description: 'Default worker template',
-        tool_classes: ['file_editor', 'docker_code_runner'],
-      },
-    ],
     active_workers: [
       { worker_name: 'worker-1', instance_id: 7, status: 'running', elapsed: 125.4 },
     ],
@@ -424,18 +417,19 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.queryByText('Unsaved changes')).toBeNull()
   })
 
-  it('renders worker templates and active workers in separated sections', async () => {
+  it('renders worker blueprints and active workers in separated sections', async () => {
     stubFetchByUrl(routesFor(makeSummary()))
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
     await screen.findByText('Research Sandbox')
     fireEvent.click(screen.getByRole('tab', { name: 'Workers' }))
 
-    expect(screen.getByText('Worker Templates')).toBeInTheDocument()
+    // The retired read-only "Worker Templates" card was superseded by the
+    // editable WorkerBlueprintPanel (feature C.2). The fixture stubs no
+    // blueprints route, so the panel settles into its empty state.
+    expect(screen.getByText('Worker Blueprints')).toBeInTheDocument()
     expect(screen.getByText('Active Workers')).toBeInTheDocument()
-
-    expect(screen.getByText('default-worker')).toBeInTheDocument()
-    expect(screen.getByText('Default worker template')).toBeInTheDocument()
-    expect(screen.getByText('file_editor, docker_code_runner')).toBeInTheDocument()
+    expect(await screen.findByTestId('worker-blueprint-panel')).toBeInTheDocument()
+    expect(await screen.findByTestId('blueprint-empty')).toBeInTheDocument()
 
     expect(screen.getByText('worker-1')).toBeInTheDocument()
     expect(screen.getByText('#7')).toBeInTheDocument()

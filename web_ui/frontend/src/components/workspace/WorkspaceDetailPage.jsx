@@ -13,6 +13,7 @@ import VaultHealthBanner from '../VaultHealthBanner'
 import NewSessionModal from './modals/NewSessionModal'
 import ContainerLogsViewer from './ContainerLogsViewer'
 import RecordContainerPanel from '../RecordContainerPanel'
+import WorkerBlueprintPanel from '../WorkerBlueprintPanel'
 import './WorkspaceDetailPage.css'
 
 const TABS = [
@@ -413,19 +414,6 @@ function ContainersTab({ summary }) {
 
 // ---- Workers tab -------------------------------------------------------------
 
-function normalizeWorkerTemplates(raw) {
-  if (Array.isArray(raw)) return raw
-  if (raw && typeof raw === 'object') {
-    // Defensive: a dict keyed by worker name.
-    return Object.keys(raw).map((key) => {
-      const value = raw[key]
-      if (value && typeof value === 'object') return { name: key, ...value }
-      return { name: key }
-    })
-  }
-  return []
-}
-
 function formatElapsed(elapsed) {
   if (elapsed == null || Number.isNaN(Number(elapsed))) return '—'
   const total = Math.max(0, Math.floor(Number(elapsed)))
@@ -433,34 +421,17 @@ function formatElapsed(elapsed) {
   return Math.floor(total / 60) + 'm ' + (total % 60) + 's'
 }
 
-function WorkersTab({ summary }) {
-  const templates = normalizeWorkerTemplates(summary.worker_templates)
+function WorkersTab({ summary, workspaceId }) {
   const activeWorkers = Array.isArray(summary.active_workers) ? summary.active_workers : []
 
   return (
     <div className="wdp-tab-content">
+      {/* Editable blueprints (feature C.2) supersede the former read-only
+          "Worker Templates" card: both projected the workspace's workers.json,
+          but the blueprint panel is the one that can edit it. */}
       <div className="wdp-card">
-        <div className="wdp-card-label">Worker Templates</div>
-        {templates.length === 0 ? (
-          <div className="wdp-empty">No worker templates defined.</div>
-        ) : (
-          <div className="wdp-worker-list">
-            {templates.map((template, index) => (
-              <div className="wdp-worker-template" key={template.name || index}>
-                <div className="wdp-worker-name">{template.name || 'unnamed template'}</div>
-                {template.description && (
-                  <div className="wdp-worker-desc">{template.description}</div>
-                )}
-                {Array.isArray(template.tool_classes) && template.tool_classes.length > 0 && (
-                  <div className="wdp-tools-list">
-                    <span className="wdp-tools-label">Tool classes:</span>
-                    {template.tool_classes.join(', ')}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
+        <div className="wdp-card-label">Worker Blueprints</div>
+        <WorkerBlueprintPanel workspaceId={workspaceId} />
       </div>
 
       <div className="wdp-card">
@@ -834,7 +805,7 @@ export default function WorkspaceDetailPage({ workspaceId }) {
         ) : activeTab === 'Records' ? (
           <RecordContainerPanel workspaceId={summary.workspace_id} />
         ) : activeTab === 'Workers' ? (
-          <WorkersTab summary={summary} />
+          <WorkersTab summary={summary} workspaceId={workspaceId} />
         ) : activeTab === 'Tools' ? (
           <ToolsTab />
         ) : (
