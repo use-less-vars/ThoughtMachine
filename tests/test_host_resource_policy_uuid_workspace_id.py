@@ -17,7 +17,12 @@ behaviour change -- the only changed outcome is a UUID id moving from a raised
 """
 
 import json
+import logging
 import uuid
+
+import security.security_gate as security_gate
+from thoughtmachine.security import SessionPermissions
+from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 from tools.host_resource_policy import (
     load_workspace_config,
@@ -78,3 +83,79 @@ def test_load_workspace_config_uuid_returns_dict(tmp_path, monkeypatch):
     ws_uuid = uuid.uuid4()
     _seed(tmp_path, monkeypatch, ws_uuid, json.dumps({"allow_host_resources": True}))
     assert load_workspace_config(ws_uuid) == {"allow_host_resources": True}
+
+
+def test_vault_root_runtime_error_is_caught_and_fails_closed(
+    tmp_path, monkeypatch, caplog
+):
+    """A ``RuntimeError`` escaping the host-resource read must NOT propagate
+    out of the gate: it is caught, logged, and fails CLOSED to a host_bash
+    ban -- even when the session otherwise grants host_bash.
+
+    ``load_workspace_config`` calls ``vault_root()`` OUTSIDE its
+    ``except (OSError, ValueError)`` guard, so an unresolvable vault root (a
+    ``RuntimeError``) escapes ``workspace_allows_host_resources``.
+    """
+    ws_id = str(uuid.uuid4())
+
+    def _raising_vault_root():
+        raise RuntimeError("vault root unresolvable")
+
+    monkeypatch.setattr("thoughtmachine.vault.vault_root", _raising_vault_root)
+
+    with caplog.at_level(logging.WARNING, logger="security.security_gate"):
+        eff = security_gate.get_effective_permissions(
+            SessionPermissions(host_bash="allow"),
+            WorkspaceCapabilities(),
+            workspace_id=ws_id,
+        )
+
+    # (3) fail-closed deny, despite the host_bash="allow" session grant.
+    assert eff["host_bash"] == "banned"
+    # (2) a WARNING naming the unresolvable vault root is emitted.
+    assert any(
+        "vault_root unresolvable" in rec.getMessage() for rec in caplog.records
+    ), caplog.text
+
+
+def test_policy_runtime_error_is_caught_and_fails_closed(monkeypatch, caplog):
+    """A ``RuntimeError`` raised directly by the policy reader is likewise
+    caught (does not propagate), logged, and fails CLOSED."""
+    def _raising_policy(workspace_id):
+        raise RuntimeError("host-resource policy read blew up")
+
+    monkeypatch.setattr(
+        "tools.host_resource_policy.workspace_allows_host_resources",
+        _raising_policy,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="security.security_gate"):
+        eff = security_gate.get_effective_permissions(
+            SessionPermissions(host_bash="allow"),
+            WorkspaceCapabilities(),
+            workspace_id=str(uuid.uuid4()),
+        )
+
+    assert eff["host_bash"] == "banned"
+    assert any(
+        "vault_root unresolvable" in rec.getMessage() for rec in caplog.records
+    ), caplog.text
+
+
+def test_host_resource_allow_control(monkeypatch):
+    """Control: when the policy reader ALLOWS host resources, the session's
+    ``host_bash="allow"`` survives -- proving the fail-closed deny above is
+    meaningful (the session grant would otherwise be honoured)."""
+    monkeypatch.setattr(
+        "tools.host_resource_policy.workspace_allows_host_resources",
+        lambda workspace_id: True,
+    )
+
+    eff = security_gate.get_effective_permissions(
+        SessionPermissions(host_bash="allow"),
+        WorkspaceCapabilities(),
+        workspace_id=str(uuid.uuid4()),
+    )
+
+    assert eff["host_bash"] == "allow"
+

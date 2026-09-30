@@ -987,10 +987,12 @@ def get_effective_permissions(
     # denial -- the in-tool check in tools/host_bash_tool.py is skipped
     # whenever no workspace id is attached, and resolving it here closes that
     # gap without duplicating policy.  The reader is fail-closed and never
-    # raises for any id; the sole reachable failure here is an import error
-    # (the policy module unavailable), which also denies.  The override
-    # is applied AFTER the ceiling annotation so a host_bash ban is never
-    # misattributed to the workspace *permissions* ceiling.
+    # raises for any id; the import failing (the policy module unavailable)
+    # denies, and an unresolvable vault root can also raise ``RuntimeError``
+    # out of the reader (``load_workspace_config`` calls ``vault_root()``
+    # outside its fail-closed guard), which the handlers below deny too.  The
+    # override is applied AFTER the ceiling annotation so a host_bash ban is
+    # never misattributed to the workspace *permissions* ceiling.
     try:
         from tools.host_resource_policy import workspace_allows_host_resources
 
@@ -998,6 +1000,9 @@ def get_effective_permissions(
             workspace_id
         )
     except ImportError:
+        _workspace_allows_host_resources = False
+    except RuntimeError as e:
+        logger.warning("host-resource policy: vault_root unresolvable: %s", e)
         _workspace_allows_host_resources = False
     if not _workspace_allows_host_resources:
         result["host_bash"] = "banned"
