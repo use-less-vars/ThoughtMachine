@@ -492,7 +492,7 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getByText('Research Sandbox')).toBeInTheDocument()
   })
 
-  it('renders active container rows and the dockerfile path', async () => {
+  it('renders the dockerfile card and mounts the container list panel', async () => {
     stubFetchByUrl(routesFor(makeSummary()))
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
     await screen.findByText('Research Sandbox')
@@ -500,14 +500,14 @@ describe('WorkspaceDetailPage', () => {
 
     expect(screen.getByText('/home/jojo/workspaces/research/Dockerfile')).toBeInTheDocument()
     expect(screen.getByText('Dockerfile content available')).toBeInTheDocument()
+    // The tab's container list is now the shared C.1 panel.
+    expect(await screen.findByTestId('container-group-ephemeral')).toBeInTheDocument()
+    // The minimal logs element still lists the summary container name.
     expect(screen.getByText('research-runner')).toBeInTheDocument()
-    expect(screen.getByText('resource')).toBeInTheDocument()
-    expect(screen.getByText('running')).toBeInTheDocument()
-    expect(screen.getByText('abc123')).toBeInTheDocument()
-    expect(screen.getAllByText(WORKSPACE_ID).length).toBeGreaterThanOrEqual(2)
+    expect(screen.getByRole('button', { name: 'Logs' })).toBeInTheDocument()
   })
 
-  it('shows the empty containers state and the null-dockerfile note', async () => {
+  it('shows the empty panel state and the null-dockerfile note', async () => {
     stubFetchByUrl(
       routesFor(
         makeSummary({
@@ -520,7 +520,9 @@ describe('WorkspaceDetailPage', () => {
     await screen.findByText('Research Sandbox')
     fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
 
-    expect(screen.getByText('No active containers.')).toBeInTheDocument()
+    // The shared panel owns the empty state; the retired summary table is gone.
+    expect(await screen.findByText('No ephemeral containers.')).toBeInTheDocument()
+    expect(screen.queryByText('No active containers.')).toBeNull()
     expect(screen.getByText('No Dockerfile content recorded')).toBeInTheDocument()
     expect(screen.queryByText('Dockerfile content available')).toBeNull()
   })
@@ -635,33 +637,44 @@ describe('WorkspaceDetailPage', () => {
     expect(createBodies.length).toBe(0)
   })
 
-  // --- Containers tab: live read-only status view -------------------------
-  // The tab must present the summary's live container state as a read-only
-  // table, reveal a detail region on row selection, and lazily fetch
-  // container logs from the read-only logs route. No lifecycle controls.
+  // --- Containers tab: shared panel + minimal logs element -----------------
+  // The tab mounts the shared C.1 ContainerListPanel (the single UI container
+  // list, reading GET /containers) and keeps a minimal read-only logs element
+  // over the summary container names. The former read-only summary table that
+  // projected the agent set is retired.
 
-  it('renders a read-only container status table with column headers', async () => {
+  it('mounts the container list panel with its three kind groups', async () => {
     stubFetchByUrl(routesFor(makeSummary()))
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
     await screen.findByText('Research Sandbox')
     fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
 
-    expect(screen.getByRole('columnheader', { name: 'Name' })).toBeInTheDocument()
-    expect(screen.getByRole('columnheader', { name: 'State' })).toBeInTheDocument()
-    expect(screen.getByRole('columnheader', { name: 'Type' })).toBeInTheDocument()
-    expect(screen.getByRole('columnheader', { name: 'ID' })).toBeInTheDocument()
+    expect(await screen.findByTestId('container-group-ephemeral')).toBeInTheDocument()
+    expect(screen.getByTestId('container-group-persistent')).toBeInTheDocument()
+    expect(screen.getByTestId('container-group-resource')).toBeInTheDocument()
+    // The retired read-only summary table no longer renders.
+    expect(screen.queryByRole('columnheader', { name: 'Name' })).toBeNull()
   })
 
-  it('reveals a container detail region when a row is selected', async () => {
-    stubFetchByUrl(routesFor(makeSummary()))
+  it('renders a resource container from the live /containers route in the panel', async () => {
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/workspace/ws-1/containers': jsonOk({
+          containers: [
+            { id: 'ctr-res', name: 'research-runner', kind: 'resource', state: 'running' },
+          ],
+        }),
+      })
+    )
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
     await screen.findByText('Research Sandbox')
     fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
 
+    // The panel reads the UI set (GET /containers), which includes resource
+    // containers -- the retired summary table projected the agent set instead.
+    const row = await screen.findByTestId('container-row-ctr-res')
+    expect(row).toHaveTextContent('research-runner')
     expect(screen.queryByText('Container detail')).toBeNull()
-    fireEvent.click(screen.getByText('research-runner'))
-    expect(screen.getByText('Container detail')).toBeInTheDocument()
-    expect(screen.getByText('Workspace ID')).toBeInTheDocument()
   })
 
   it('loads container logs on demand into a pre element with the read-only route', async () => {
@@ -704,16 +717,17 @@ describe('WorkspaceDetailPage', () => {
     expect(await screen.findByText(/Failed to load logs/)).toBeInTheDocument()
   })
 
-  it('exposes no container lifecycle controls in the read-only tab', async () => {
+  it('mounts the container list panel and keeps the read-only logs toggle', async () => {
     stubFetchByUrl(routesFor(makeSummary()))
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
     await screen.findByText('Research Sandbox')
     fireEvent.click(screen.getByRole('tab', { name: 'Containers' }))
 
-    expect(
-      screen.queryByRole('button', { name: /start|stop|remove|restart|delete|kill|recreate/i })
-    ).toBeNull()
-    // The only control in the tab is the read-only logs viewer toggle.
+    // The tab now hosts the shared C.1 panel; with an unstubbed /containers
+    // route it settles into three empty groups (no lifecycle controls render
+    // until the route returns containers).
+    expect(await screen.findByTestId('container-group-ephemeral')).toBeInTheDocument()
+    // The minimal logs element keeps the read-only logs affordance.
     expect(screen.getByRole('button', { name: 'Logs' })).toBeInTheDocument()
   })
 })
