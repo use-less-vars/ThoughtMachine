@@ -419,7 +419,7 @@ class TestConfigChangedMessageStructure:
         frontend_config = {
             "mode": "custom",
             "temperature": 0.5,
-            "session_permissions": {"filesystem": "full"},
+            "session_permissions": {"filesystem": "write"},
         }
 
         output = simulate_apply_config(bridge, frontend_config)
@@ -436,7 +436,7 @@ class TestConfigChangedMessageStructure:
         assert event["settings"]["temperature"] == 0.5
 
         # Permissions should reflect the applied permission overrides
-        assert event["permissions"]["filesystem"] == "full"
+        assert event["permissions"]["filesystem"] == "write"
 
         # merged_config should equal config
         assert event["merged_config"] == event["config"]
