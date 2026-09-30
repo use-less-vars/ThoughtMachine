@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { getPill } from '../data/permissionVocab';
 
-// ── Inline Catppuccin palette (matching WorkspacePanel) ────────────────────
+// ── Inline Catppuccin palette (matching the shared config palette) ──────────
 const inputStyle = {
   background: '#1e1e2e',
   color: '#cdd6f4',

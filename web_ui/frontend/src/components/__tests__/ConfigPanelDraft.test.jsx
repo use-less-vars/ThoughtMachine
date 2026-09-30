@@ -34,9 +34,9 @@ const DEFAULT_FALLBACK = {
   text: async () => '',
 }
 
-// Routes needed by ConfigPanel's mount fetch (/api/tools), the WorkspacePanel
-// it mounts by default (workers/containers/effective_permissions) and the
-// workspace list.
+// Routes needed by ConfigPanel's mount fetch (/api/tools), the session
+// workspace section it mounts by default (workers/effective_permissions) and
+// the workspace list.
 const DEFAULT_ROUTES = {
   '/api/tools': jsonOk({ tools: [] }),
   '/api/health/containers': jsonOk({ docker: 'reachable' }),
