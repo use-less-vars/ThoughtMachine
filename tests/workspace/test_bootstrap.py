@@ -47,9 +47,10 @@ class TestEnsureWorkspaceDirs:
         """No subdirectories (sessions, state, knowledge) are created inside the workspace config dir."""
         ensure_workspace_dirs("test-ws")
         base = _user_dir() / "workspaces" / "test-ws"
-        # Only the five expected files should exist — no subdirectories
+        # Only the six expected files should exist — no subdirectories
         expected_files = {
             "capabilities.json",
+            "config.json",
             "Dockerfile",
             "domain_allowlist.json",
             "workers.json",

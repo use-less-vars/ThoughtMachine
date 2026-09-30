@@ -59,6 +59,27 @@ def _patch_ceiling(monkeypatch, fake):
     monkeypatch.setattr(config_manager, "_load_workspace_permission_ceiling", fake)
 
 
+def _provision_workspace(workspace_id):
+    """Bootstrap the synthetic workspace on disk so the REAL disk-authoritative
+    permission path can read its ceiling.
+
+    ``apply_config`` -> ``resolve_effective_permissions`` resolves the effective
+    grants through the security gate in disk mode, which reads the workspace
+    ceiling from ``<vault>/workspaces/<ws>/config.json``.  A MISSING config makes
+    ``permission_store.workspace_ceiling`` raise and the gate fail CLOSED, so the
+    synthetic workspace must actually exist on disk.  ``ensure_workspace_dirs``
+    seeds ``config.json`` as ``{}`` (a present-but-empty ceiling that reads as
+    "no workspace-level cap") and a fully-permissive ``capabilities.json``, so
+    the stored session grants pass through un-capped.
+    """
+    from thoughtmachine import vault as _vault
+    from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+    ensure_workspace_dirs(workspace_id)
+    config_path = _vault.vault_root() / "workspaces" / workspace_id / "config.json"
+    assert config_path.is_file(), f"workspace config.json not provisioned: {config_path}"
+
+
 def _disk_permissions(temp_store, session_id):
     """Return the session_permissions dict stored in the session file metadata."""
     path = temp_store._find_session_path(session_id)
@@ -115,6 +136,7 @@ class TestSessionSwitchPreservesGrants:
             return dict(ceiling)
 
         _patch_ceiling(monkeypatch, fake_ceiling)
+        _provision_workspace("ws-switch-away-repro")
 
         session_id = self._save_full_session(
             temp_store, "ws-switch-away-repro"
@@ -151,6 +173,7 @@ class TestSessionSwitchPreservesGrants:
             return dict(ceiling)
 
         _patch_ceiling(monkeypatch, fake_ceiling)
+        _provision_workspace("ws-switch-cycle-repro")
 
         session_id = self._save_full_session(
             temp_store, "ws-switch-cycle-repro"

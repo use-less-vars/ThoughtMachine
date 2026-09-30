@@ -1043,30 +1043,76 @@ class ConfigManager:
     @staticmethod
     def resolve_effective_permissions(
         session_config,
+        session_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Resolve effective session permissions from a ``SessionConfig``.
+        Resolve the EFFECTIVE session permissions — ALWAYS gate-computed.
 
-        Returns a normalized permissions dict with defaults applied for any
-        missing categories.  This merges the raw ``session_permissions``
-        dict from the config with the system defaults so the frontend always
-        sees a complete permissions profile.
+        The vault permission store is the single source of truth (Edge 2): the
+        profile is computed by the security gate
+        (``security.security_gate.get_effective_permissions``) in every case.
+        There is NO in-memory projection of
+        ``session_config.session_permissions`` any more.
+
+        * When a ``session_id`` AND a ``workspace_id`` are both available the
+          gate runs in disk-authoritative mode — it re-reads the session grants
+          (``read_session_permissions``) and the workspace ceiling
+          (``workspace_ceiling``) from the vault, merges them with the
+          workspace capabilities, and fails CLOSED to a deny-all profile if the
+          store cannot be read;
+        * when *either* identifier is missing the vault store cannot be
+          consulted and there is NO in-memory projection to fall back to, so
+          the profile ALSO fails CLOSED — the gate's canonical deny-all session
+          plus deny-all ceiling are merged and yield the all-banned 6-key shape.
+
+        ``session_config`` is accepted for call-site compatibility only; it is
+        deliberately NOT consulted (neither its ``session_permissions`` nor its
+        ``workspace_id``), because the vault store — never the in-memory dict —
+        decides the profile, and the two identifiers must be supplied by the
+        caller.
+
+        Returns a flat dict keyed by the six canonical permission categories
+        (``container`` / ``filesystem`` / ``git`` / ``host_bash`` / ``mcp`` /
+        ``network``); each value is a string level or a bool.
         """
+        from security.security_gate import (
+            get_effective_permissions as _gate_effective,
+        )
         from thoughtmachine.security import SessionPermissions
+        from thoughtmachine.workspace_capabilities import (
+            WorkspaceCapabilities,
+            load_workspace_capabilities,
+        )
 
-        raw_perms = getattr(session_config, "session_permissions", None) or {}
-        try:
-            perms_obj = SessionPermissions(**raw_perms)
-            return perms_obj.model_dump()
-        except Exception:
-            return {
-                "container": False,
-                "network": "banned",
-                "filesystem": "read",
-                "git": "read",
-                "mcp": "banned",
-                "host_bash": "banned",
-            }
+        # Disk-authoritative resolution (mirrors the session REST effective
+        # computation): grants + ceiling come from the vault permission store;
+        # any store error fails closed to a deny-all profile inside the gate.
+        if session_id and workspace_id:
+            caps = load_workspace_capabilities(workspace_id)
+            if caps is None:
+                caps = WorkspaceCapabilities.default()
+            return _gate_effective(
+                SessionPermissions(),
+                caps,
+                session_id=session_id,
+                workspace_id=workspace_id,
+            )
+
+        # No (or only a partial) identifier: the vault store is unreachable and
+        # there is no in-memory projection to fall back to -> FAIL CLOSED.
+        # Reuse the gate's canonical deny-all sentinels so the fail-closed shape
+        # cannot drift from the gate's own disk-failure profile.
+        from security.security_gate import (
+            _DISK_FAIL_CLOSED_CEILING as _deny_all_ceiling,
+            _DISK_FAIL_CLOSED_SESSION as _deny_all_session,
+        )
+
+        return _gate_effective(
+            _deny_all_session,
+            WorkspaceCapabilities.default(),
+            _deny_all_ceiling,
+        )
 
     @staticmethod
     def extract_settings(frontend_config: Dict[str, Any]) -> Dict[str, Any]:

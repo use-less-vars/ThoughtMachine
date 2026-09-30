@@ -448,6 +448,61 @@ def test_case1_permissions_change(contract_server, workspace_type):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Fix regression A — fresh workspace: apply_config NEW perms survive the vault
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_fresh_workspace_apply_new_permissions(contract_server, workspace_type):
+    """A FRESH workspace (provisioned by ``ensure_workspace_dirs`` with a
+    seeded ``config.json``) must let ``apply_config``'s NEW
+    ``session_permissions`` survive the gate's vault read instead of failing
+    closed to deny-all (missing ``workspaces/<id>/config.json`` made
+    ``permission_store.workspace_ceiling`` raise, so every category resolved
+    to ``banned``)."""
+    app, _ = contract_server
+    label = f"fixed-a-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            _new_session(ws, label)
+            cfg = _variant_config("fixed-a", workspace_type,
+                                  session_permissions=_NEW_PERMISSIONS)
+            evt, _ = _apply_config(ws, cfg, label)
+            assert evt["permissions"]["filesystem"] == "write"
+            assert evt["permissions"]["git"] == "write"
+            assert evt["permissions"]["network"] == "outbound"
+            assert evt["config"]["session_permissions"]["filesystem"] == "write"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fix regression B — new_session handshake reflects DEFAULT perms (not deny-all)
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_new_session_handshake_default_permissions(contract_server, workspace_type):
+    """The ``new_session`` handshake ``config_changed`` must reflect the DEFAULT
+    session permissions for a brand-new session -- filesystem ``read``, git
+    ``read``, network ``banned`` (``container`` False) -- NOT the all-banned
+    deny-all produced when the vault session-grant read fails closed.
+
+    A brand-new session has no saved record yet, so the grant read depends on
+    the sidecar seeded at session creation; a missing config.json / failed read
+    must not collapse the handshake to deny-all."""
+    app, _ = contract_server
+    label = f"handshake-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            _loaded, events = _new_session(ws, label)
+            cc = next(e for e in events if e.get("type") == "config_changed")
+            perms = cc["permissions"]
+            assert perms["filesystem"] == "read"
+            assert perms["git"] == "read"
+            assert perms["network"] == "banned"
+            assert perms["container"] is False
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Case 2 — session exists, change provider/model
 # ════════════════════════════════════════════════════════════════════════════
 

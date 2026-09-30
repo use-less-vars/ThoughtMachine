@@ -831,22 +831,24 @@ def get_effective_permissions(
             exceed the workspace's declared ceiling for this workspace.
         session_id / workspace_id:
             Keyword-only arguments enabling **disk mode**.  When BOTH are
-            supplied AND *workspace_permissions* is None, the session grant
-            profile and the workspace permission ceiling are loaded from the
-            vault permission store (``thoughtmachine.permission_store``)
+            supplied, the session grant profile and the workspace permission
+            ceiling are loaded from the vault permission store
+            (``thoughtmachine.permission_store``)
             under ``<vault>/workspaces/<workspace_id>/sessions/<session_id>``
             and ``<vault>/workspaces/<workspace_id>/config.json``
             respectively, instead of being taken from the *session* and
             *workspace_permissions* arguments.  The stored grants replace the
             *session* argument; the stored ceiling replaces
-            *workspace_permissions*; the *workspace* capabilities argument
+            *workspace_permissions* (any supplied ``workspace_permissions`` is
+            ignored); the *workspace* capabilities argument
             is still merged below.
 
     Precedence rule:
-        An explicit in-memory ``workspace_permissions`` dict always wins.
-        Disk mode engages ONLY when both ``session_id`` and ``workspace_id``
-        are supplied AND ``workspace_permissions`` is None; supplying just
-        one of the ids keeps the legacy behaviour unchanged.
+        When both ``session_id`` and ``workspace_id`` are supplied the disk
+        read is authoritative: the stored grant profile and ceiling are used
+        and any supplied ``workspace_permissions`` is ignored.  When the ids
+        are not both supplied, a supplied ``workspace_permissions`` governs
+        as before (legacy behaviour unchanged).
 
     Fail-closed contract:
         Disk mode never fabricates permissive defaults.  If the store is
@@ -866,12 +868,12 @@ def get_effective_permissions(
         regression, which is why the full default-filled profile is kept.
     """
     # ── Disk-mode dispatch ──────────────────────────────────────────────────────────────────────────────────────────────────
-    # Both ids supplied and no explicit in-memory ceiling: the grant profile
+    # Both ids supplied (the disk read is authoritative): the grant profile
     # and the ceiling come from the vault permission store.  Imports are
     # lazy so the legacy in-memory path never depends on permission_store /
     # vault.  Any store error fails CLOSED (deny-all session + deny-all
     # ceiling); the merged result below can then only be restrictive.
-    if workspace_permissions is None and session_id is not None and workspace_id is not None:
+    if session_id is not None and workspace_id is not None:
         try:
             disk_grants, disk_ceiling = _read_disk_permission_sources(
                 workspace_id, session_id
