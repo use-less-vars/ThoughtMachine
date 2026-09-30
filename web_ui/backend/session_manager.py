@@ -375,8 +375,10 @@ class SessionManager:
         metadata = getattr(session, "metadata", None)
         sc = metadata.get("session_config") if isinstance(metadata, dict) else None
         perms = sc.get("session_permissions") if isinstance(sc, dict) else None
-        if not isinstance(perms, dict):
-            perms = {}
+        # Mirror ONLY a non-empty source dict: an absent/partial session_config
+        # must never clobber an existing (possibly REST-written) sidecar with {}.
+        if not isinstance(perms, dict) or not perms:
+            return
         self._seed_permissions_sidecar(ws_id, session.session_id, perms)
 
     # ── Save ──────────────────────────────────────────────────────────────────
