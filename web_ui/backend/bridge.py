@@ -1853,7 +1853,7 @@ class WebAgentBridge:
         if workspace_id is not None:
             _validate_workspace_id(workspace_id)
         session_id, frontend_config = self._session_manager.create_session(
-            mode=mode, workspace_path=self._workspace_path
+            mode=mode, workspace_path=self._workspace_path, workspace_id=workspace_id
         )
         # Load session into in-memory state (no broadcast)
         session = self._session_manager.load_session(session_id, workspace_id=self._workspace_id)
