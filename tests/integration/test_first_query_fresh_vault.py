@@ -34,6 +34,29 @@ from tests.integration.test_ws_config_roundtrip import (
 
 
 # ---------------------------------------------------------------------------
+# Helper: provision a synthetic workspace on disk
+# ---------------------------------------------------------------------------
+
+def _provision_workspace(workspace_id: str) -> None:
+    """Bootstrap a synthetic workspace on disk so the disk-authoritative
+    permission gate can read it instead of failing CLOSED.
+
+    ``bridge.apply_config`` -> ``resolve_effective_permissions`` resolves the
+    effective grants through the security gate in disk mode, which reads the
+    workspace ceiling from ``<vault>/workspaces/<ws>/config.json`` and the
+    session grants from the session permission sidecar.  A MISSING workspace
+    config makes ``permission_store.workspace_ceiling`` raise and the gate fail
+    CLOSED (all-banned), so the synthetic workspace must actually exist on
+    disk.  ``ensure_workspace_dirs`` seeds ``config.json`` as ``{}`` (a
+    present-but-empty ceiling that caps nothing) plus a fully-permissive
+    ``capabilities.json``.
+    """
+    from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+    ensure_workspace_dirs(workspace_id)
+
+
+# ---------------------------------------------------------------------------
 # Test 1: resolve_config_defaults handles missing workspace defaults (2A)
 # ---------------------------------------------------------------------------
 
@@ -286,6 +309,12 @@ class TestConfigChangedMessageStructure:
             base_url="https://api.openai.com/v1",
         )
 
+        # Provision the synthetic workspace on disk so the disk-authoritative
+        # permission gate can read a permissive ceiling + the session sidecar
+        # instead of failing CLOSED (all-banned).
+        _provision_workspace("test-ws-perms-merged")
+        bridge._workspace_id = "test-ws-perms-merged"
+
         frontend_config = {
             "mode": "custom",
             "temperature": 0.3,
@@ -380,6 +409,12 @@ class TestConfigChangedMessageStructure:
             model="gpt-4",
             base_url="https://api.openai.com/v1",
         )
+
+        # Provision the synthetic workspace on disk so the disk-authoritative
+        # permission gate can read a permissive ceiling + the session sidecar
+        # instead of failing CLOSED (all-banned).
+        _provision_workspace("test-ws-perms-event")
+        bridge._workspace_id = "test-ws-perms-event"
 
         frontend_config = {
             "mode": "custom",
