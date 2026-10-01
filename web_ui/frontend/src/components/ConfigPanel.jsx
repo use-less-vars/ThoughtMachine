@@ -125,7 +125,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     tool_output_token_limit: cfg?.tool_output_token_limit ?? 10000,
   });
 
-  const [activeTab, setActiveTab] = useState('workspace');
+  const [activeTab, setActiveTab] = useState('live_view');
   // Draft persistence: the draft lives in the Zustand store (sessionDrafts)
   // while sessionId is known, so unsaved edits survive tab switches that
   // unmount this panel. localDraft is a fallback for the brief window where
@@ -488,8 +488,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const effectiveMode = mode || config?.mode || null;
   const isModeLocked = effectiveMode && effectiveMode !== 'custom'
 
-  const TAB_KEYS = ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];
-  const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
+  const TAB_KEYS = ['live_view', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];
+  const TAB_LABELS = { live_view: 'Live View', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
 
   const modeBadge = effectiveMode === 'agent' ? 'Agent' : effectiveMode === 'engineer' ? 'Engineer' : effectiveMode === 'custom' ? 'Custom' : null
   const modeBadgeColor = effectiveMode === 'agent' ? '#89b4fa' : effectiveMode === 'engineer' ? '#a6e3a1' : effectiveMode === 'custom' ? '#f9e2af' : '#6c7086'
@@ -516,7 +516,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         </div>
       )}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
-        <h3 style={{ margin: 0 }}>Config</h3>
+        <h3 style={{ margin: 0 }}>Session Panel</h3>
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <button
             className="btn btn-accent"
@@ -602,8 +602,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         ))}
       </div>
 
-      {/* ── Workspace Tab ── */}
-      {activeTab === 'workspace' && (
+      {/* ── Live View Tab ── */}
+      {activeTab === 'live_view' && (
         <div>
           {/* ── Workspace Path (read-only) ── */}
           <div style={{ marginBottom: '1rem' }}>
