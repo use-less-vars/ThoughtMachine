@@ -452,7 +452,7 @@ describe('SessionTab — event handling', () => {
         config: { mode: 'custom', provider: 'openai', model: 'gpt-4o' },
       })
     );
-    expect(await screen.findByText('Config')).toBeInTheDocument();
+    expect(await screen.findByText('Session Panel')).toBeInTheDocument();
     expect(screen.queryByText('Loading config...')).not.toBeInTheDocument();
   });
 

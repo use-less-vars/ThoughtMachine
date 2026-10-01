@@ -101,13 +101,13 @@ describe('loading placeholder', () => {
 describe('header', () => {
   it('renders the Config heading and Save as Default button', () => {
     renderPanel();
-    expect(screen.getByRole('heading', { name: 'Config' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Session Panel' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Save as Default' })).toBeInTheDocument();
   }, 20000);
 
   it('renders all 8 tab buttons', () => {
     renderPanel();
-    const labels = ['Workspace', 'Permissions', 'Prompt', 'General', 'Model', 'Tools', 'Container', 'Advanced'];
+    const labels = ['Live View', 'Permissions', 'Prompt', 'General', 'Model', 'Tools', 'Container', 'Advanced'];
     for (const label of labels) {
       expect(screen.getByRole('button', { name: label })).toBeInTheDocument();
     }

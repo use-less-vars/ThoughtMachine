@@ -1,6 +1,7 @@
 import React from 'react';
 import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
 import WorkerManagementPanel from './WorkerManagementPanel';
+import ContainerListPanel from './workspace/ContainerListPanel';
 import { getPill } from '../data/permissionVocab';
 
 // ── Catppuccin palette matching ConfigPanel ──────────────────────────────
@@ -77,9 +78,10 @@ function EffectivePermissionsSection({ sessionId, effectivePermissions }) {
 // Session-scoped survivors of the retired WorkspacePanel: the session worker
 // control (WorkerManagementPanel) and the resolved effective-permission pills
 // (a (session_id, workspace_id) session-scope resolution). The read-only
-// "Workspace Path" field stays in ConfigPanel. Workspace-scoped editors
-// (blueprints, containers, dockerfile, domain allowlist) now live on the
-// /workspace/:id page (WorkspaceDetailPage), not in the session view.
+// "Workspace Path" field stays in ConfigPanel. The container list is mounted
+// here (Live View tab). The remaining workspace-scoped editors (blueprints,
+// dockerfile, domain allowlist) live on the /workspace/:id page
+// (WorkspaceDetailPage).
 export default function SessionWorkspaceTab({ workspaceId, sessionId, onSelectWorker, selectedWorker, isActive, effectivePermissions }) {
   if (!workspaceId) {
     return (
@@ -95,6 +97,12 @@ export default function SessionWorkspaceTab({ workspaceId, sessionId, onSelectWo
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Workers</strong></label>
         <WorkerManagementPanel workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} sessionId={sessionId} isActive={isActive} />
+      </div>
+
+      {/* Containers */}
+      <div style={sectionStyle}>
+        <label style={labelStyle}><strong>Containers</strong></label>
+        <ContainerListPanel workspaceId={workspaceId} />
       </div>
 
       {/* Effective Permissions */}
