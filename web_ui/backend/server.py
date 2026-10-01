@@ -1988,7 +1988,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     #     the fallback below sends session_loaded to THIS websocket.
                     _bridge_loaded_session = False
 
-                    if existing is None or existing._controller is None:
+                    # Cold load = no cached bridge to re-attach to. Only a cold load
+                    # emits the one-shot "Session … loaded" banner below; re-attaching
+                    # to a cached bridge (tab switch / WS reconnect / repeat
+                    # load_session) must not re-append it to the transcript.
+                    _cold_load = existing is None or existing._controller is None
+                    if _cold_load:
                         # Create fresh controller and bridge
                         from agent.controller import AgentController
                         controller = AgentController()
@@ -2161,7 +2166,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 workspace_path=bridge._workspace_path if bridge else None,
                             ),
                         })
-                        await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
+                        # One-shot banner: cold loads only (see _cold_load above).
+                        if _cold_load:
+                            await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
                         # Register/update in global session registry
                         registry = SessionRegistry.get_default()
                         registry.register(
