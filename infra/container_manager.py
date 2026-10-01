@@ -1298,6 +1298,13 @@ class ContainerManager:
         explicit_image = image
         image = image or self.image
 
+        # Hidden resource containers (tm-res-*) are never addressable through
+        # the generic container manager. Reject a CALLER-supplied resource name
+        # BEFORE any workspace_path/config access so the refusal is cheap and
+        # side-effect free (the builder below never emits a tm-res- name).
+        if name is not None and str(name).startswith(RESOURCE_NAME_PREFIX):
+            return {"error": "Resource container access denied"}
+
         # Desired isolation (all paths). Computed BEFORE the name so the
         # resolved envelope can be folded into the container name below.
         computed = self._compute_config(
