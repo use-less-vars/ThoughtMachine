@@ -260,11 +260,18 @@ describe('fetchContainers', () => {
     expect(st.error).toBe('')
   })
 
-  it('returns early without fetching when the workspace has no root', async () => {
+  it('still fetches (with no workspace_path) when the workspace has no root', async () => {
     useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', root: '' }] })
-    const fetchMock = stubFetchByUrl({})
+    const fetchMock = stubFetchByUrl({
+      '/api/workspace/ws-1/containers': jsonOk({ containers: [{ name: 'c1', state: 'running' }] }),
+    })
     await useWorkspaceStore.getState().fetchContainers('ws-1')
-    expect(fetchMock).not.toHaveBeenCalled()
+    const containerCalls = fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes('/api/workspace/ws-1/containers')
+    )
+    expect(containerCalls.length).toBe(1)
+    expect(String(containerCalls[0][0])).toBe('/api/workspace/ws-1/containers')
+    expect(String(containerCalls[0][0])).not.toContain('workspace_path')
   })
 })
 

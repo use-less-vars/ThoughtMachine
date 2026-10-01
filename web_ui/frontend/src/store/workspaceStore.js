@@ -326,9 +326,7 @@ const useWorkspaceStore = create((set, get) => ({
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/effective_permissions`),
         tryGet(`${API_BASE}/api/health/containers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/workers`),
-        fallbackEntry && fallbackEntry.root
-          ? tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers?workspace_path=${encodeURIComponent(fallbackEntry.root)}`)
-          : Promise.resolve(null),
+        tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers`),
         tryGet(`${API_BASE}/api/session/list?workspace_id=${encodeURIComponent(id)}`),
       ])
 
@@ -579,14 +577,11 @@ const useWorkspaceStore = create((set, get) => ({
     return data
   },
 
-  // GET /api/workspace/{ws_id}/containers?workspace_path=<root>
+  // GET /api/workspace/{ws_id}/containers
   fetchContainers: async (id) => {
-    const workspace = get().workspaceList.find((w) => w.id === id) || get().currentWorkspace
-    const root = workspace && (workspace.root || workspace.path)
-    if (!root) return
     try {
       const res = await fetch(
-        `${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers?workspace_path=${encodeURIComponent(root)}`
+        `${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers`
       )
       if (!res.ok) throw new Error(await parseError(res))
       const data = await res.json()
