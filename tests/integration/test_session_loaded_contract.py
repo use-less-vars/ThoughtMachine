@@ -598,3 +598,100 @@ def test_apply_config_different_workspace_path_still_switches_session(contract_s
         f"(got event types: {[e.get('type') for e in sw_events]})"
     )
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression: the "Session … loaded" banner must not accumulate
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _drain_events(ws, quiet_timeout: float = 3.0, max_events: int = 60):
+    """Receive every frame the server sends until it goes quiet.
+
+    Order-agnostic, unlike the drain-until-target helpers above: it simply
+    collects frames until no frame arrives for ``quiet_timeout`` seconds (the
+    ``load_session`` tail — tokens_updated / context_updated / config_changed /
+    the status banner — is sent after ``session_loaded``, and the bridge's own
+    broadcasts are loop-scheduled via ``run_coroutine_threadsafe``, so event
+    order is NOT a stable contract).  Hang-proof via the same thread + queue
+    pattern as the other helpers.
+    """
+    events = []
+    while len(events) < max_events:
+        _box = queue.Queue(maxsize=1)
+
+        def _receive_one(_box=_box):
+            try:
+                _box.put(("ok", ws.receive_json()))
+            except Exception as exc:  # pragma: no cover — defensive
+                _box.put(("exc", exc))
+
+        threading.Thread(target=_receive_one, daemon=True).start()
+        try:
+            _kind, _val = _box.get(timeout=quiet_timeout)
+        except queue.Empty:
+            break  # server done sending — quiet
+        if _kind == "exc":
+            raise _val
+        events.append(_val)
+    return events
+
+
+def _loaded_banners(events, session_id: str):
+    """Return the status_message frames carrying the 'Session … loaded' banner."""
+    banner_text = f"Session {session_id} loaded. Click Run to continue."
+    return [
+        e for e in events
+        if e.get("type") == "status_message" and e.get("text") == banner_text
+    ]
+
+
+def test_reload_does_not_reemit_session_loaded_banner(contract_server):
+    """A re-load of an already-loaded session must NOT re-append the banner.
+
+    The banner is a ONE-SHOT cold-load notification.  The backend's
+    ``load_session`` handler distinguishes a cold load (no cached bridge) from a
+    re-attach to a cached bridge (``_cold_load`` in web_ui/backend/server.py);
+    only the cold load may emit the banner.  Behaviour under test:
+      * 1st ``load_session`` on a WS -> cold load -> banner emitted exactly once;
+      * 2nd ``load_session`` on the SAME ws (== tab switch / WS reconnect /
+        repeat load command, all of which reuse the cached bridge) -> the
+        transcript must NOT gain a second banner.
+
+    Regression guard: before the ``_cold_load`` gate the cached-bridge path also
+    emitted the banner, so the frontend store appended a second client-only
+    system bubble on every re-attach -> unbounded accumulation.
+    """
+    app, _ = contract_server
+
+    with TestClient(app) as client:
+        resp = client.post("/api/session/create", json={"mode": "custom"})
+        assert resp.status_code == 200, f"create failed: {resp.status_code} {resp.text}"
+        session_id = resp.json()["session_id"]
+
+        with client.websocket_connect("/ws") as ws:
+            # 1st load — cold path (fresh bridge): banner is legitimate here.
+            ws.send_json({"command": "load_session", "session_id": session_id})
+            cold_events = _drain_events(ws)
+
+            # 2nd load — same ws, same session: cached-bridge re-attach path.
+            ws.send_json({"command": "load_session", "session_id": session_id})
+            reattach_events = _drain_events(ws)
+
+    # Sanity: both loads completed (session_loaded on each), so the second one
+    # really did exercise the re-attach path rather than a fresh cold load.
+    assert any(e.get("type") == "session_loaded" for e in cold_events), (
+        f"cold load should emit session_loaded; got "
+        f"{[e.get('type') for e in cold_events]}"
+    )
+    assert any(e.get("type") == "session_loaded" for e in reattach_events), (
+        f"re-attach should still emit session_loaded; got "
+        f"{[e.get('type') for e in reattach_events]}"
+    )
+
+    banners = _loaded_banners(cold_events, session_id) + _loaded_banners(
+        reattach_events, session_id
+    )
+    assert len(banners) == 1, (
+        f"the one-shot 'loaded' banner must appear exactly once per session "
+        f"across a cold load + re-attach; got {len(banners)}: {banners}"
+    )
+
