@@ -1297,9 +1297,28 @@ class ContainerManager:
         # honesty can tell an explicit request from the manager default.
         explicit_image = image
         image = image or self.image
+
+        # Desired isolation (all paths). Computed BEFORE the name so the
+        # resolved envelope can be folded into the container name below.
+        computed = self._compute_config(
+            self.workspace_path,
+            self.workspace_id,
+            self.session_permissions,
+            lifecycle_class,
+        )
+        want_network, want_workspace = computed
+        want_effective = getattr(computed, "effective", None)
+
+        # Name is keyed by lifecycle class and (for ephemeral) session; the envelope (network_mode, workspace_mode) is part of the name via env_hash, not consulted separately at reuse time.
         if name is None:
-            ws_hash = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
-            name = f"agent-exec-{ws_hash}-{_safe_session_tag(self.session_id)}"
+            dex = _load_docker_executor()
+            name = dex.build_container_name(
+                self.workspace_path,
+                lifecycle_class,
+                session_id=self.session_id,
+                network_mode=want_network,
+                workspace_mode=want_workspace,
+            )
 
         # Hidden resource containers (tm-res-*) are never addressable through
         # the generic container manager — they are owned by the resource
@@ -1312,17 +1331,6 @@ class ContainerManager:
         # (never counted against the limit); otherwise the active (non-terminal)
         # container count for THIS workspace decides whether a new one may be
         # created.
-        # Desired isolation (all paths). Computed here so the workspace-label
-        # reuse path can honour a newly-granted network/workspace mode instead
-        # of silently reusing a drifted container.
-        computed = self._compute_config(
-            self.workspace_path,
-            self.workspace_id,
-            self.session_permissions,
-            lifecycle_class,
-        )
-        want_network, want_workspace = computed
-        want_effective = getattr(computed, "effective", None)
 
         # ── Record-first identity ladder (schema v3) ─────────────────────────
         # The container RECORD is the source of truth for identity: a name
