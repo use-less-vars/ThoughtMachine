@@ -22,6 +22,7 @@ name: Cross-Platform Smoke
 
 on:
   push:
+    branches: [dev, master]
   pull_request:
 
 concurrency:
