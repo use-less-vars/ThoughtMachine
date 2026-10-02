@@ -183,13 +183,14 @@ class _Env:
 
 
 class TestStartEnvelopeRoundTrip:
-    def _bare_manager(self, envelope):
+    def _bare_manager(self, envelope, session_id="sess-envelope", registry=None,
+                      fresh=None):
         from infra.container_manager import ContainerManager
 
         mgr = object.__new__(ContainerManager)
         mgr.workspace_path = WS
         mgr.workspace_id = "ws-envelope-test"
-        mgr.session_id = "sess-envelope"
+        mgr.session_id = session_id
         mgr.session_permissions = {}
         mgr.image = "agent-executor"
         mgr._containers = {}
@@ -198,8 +199,13 @@ class TestStartEnvelopeRoundTrip:
         mgr.max_containers = 10
 
         state = {"envelope": envelope}
-        registry = []  # durable "workspace label" view of existing containers
-        fresh = []
+        # ``registry`` is the durable "workspace label" view of existing
+        # containers; passing an existing one in lets two managers SHARE it
+        # (i.e. see each other's containers), as the real daemon would.
+        if registry is None:
+            registry = []
+        if fresh is None:
+            fresh = []
 
         def _fresh_start(**kwargs):
             fresh.append(kwargs["name"])
@@ -250,6 +256,35 @@ class TestStartEnvelopeRoundTrip:
         assert name_b != name_a
         assert r3.get("status") == "created"
         assert fresh == [name_a, name_b]
+
+    def test_same_envelope_different_session_reuses(self, monkeypatch):
+        """(a) same envelope + same workspace + DIFFERENT session -> reuse.
+
+        The persistent pool key is workspace-scoped (lifecycle + workspace +
+        envelope); it does NOT carry the session, so a second SESSION of the
+        same workspace resolves to the SAME name and REUSES the container the
+        first session created (no second create).
+        """
+        from infra import container_manager
+
+        monkeypatch.setattr(container_manager, "_host_ids", lambda: (1000, 1000))
+
+        mgr1, _state1, registry, fresh = self._bare_manager(
+            ("none", "ro"), session_id="sess-A"
+        )
+        r1 = mgr1.start(lifecycle_class=LIFECYCLE_PERSISTENT)
+        assert r1["status"] == "created", f"expected created, got {r1!r}"
+        name_a = r1["name"]
+
+        # A DIFFERENT session, same workspace + same envelope: same pool key.
+        mgr2, _state2, _registry2, _fresh2 = self._bare_manager(
+            ("none", "ro"), session_id="sess-B",
+            registry=registry, fresh=fresh,
+        )
+        r2 = mgr2.start(lifecycle_class=LIFECYCLE_PERSISTENT)
+        assert r2["name"] == name_a, f"expected same pool key, got {r2!r}"
+        assert r2.get("status") == "reused", f"expected reuse, got {r2!r}"
+        assert fresh == [name_a], f"expected no second create, got {fresh!r}"
 
     def test_changed_workspace_mode_also_changes_key(self, monkeypatch):
         from infra import container_manager
