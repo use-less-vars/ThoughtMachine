@@ -24,6 +24,7 @@ integrity checks and container creation/recreation.
 """
 
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL, LIFECYCLE_PERSISTENT
 from agent.logging import log
 from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL, host_user, _host_ids
 from infra.container_create import (
@@ -36,6 +37,7 @@ import docker
 import docker.types
 import hashlib
 import os
+import re
 import time
 import threading
 import queue
@@ -177,6 +179,59 @@ def _resolve_workspace_id(workspace_path: str):
         return resolve_workspace_id(workspace_path)
     except Exception:
         return None
+
+
+def normalize_workspace_path(workspace_path: str) -> str:
+    """Canonical workspace-path normalisation for container naming.
+
+    Absolute path with any trailing slash removed, so two spellings of the
+    same workspace always hash to the same container name. This is the single
+    normalisation used by :func:`build_container_name`.
+    """
+    return os.path.abspath(workspace_path).rstrip("/")
+
+
+def _safe_session_tag(session_id):
+    """Return a docker-safe short tag for a session id (container names).
+
+    Strips unsafe characters (keeps [a-zA-Z0-9_.-], max 16 chars); falls back
+    to a sha256 prefix when nothing safe remains; 'anon' for None.
+    """
+    if session_id is None:
+        return "anon"
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "", str(session_id))[:16]
+    if cleaned:
+        return cleaned
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:8]
+
+
+def build_container_name(
+    workspace_path,
+    lifecycle_class,
+    session_id=None,
+    network_mode="none",
+    workspace_mode="ro",
+):
+    """Return the canonical Docker container name (the pool key) for a container.
+
+    The name encodes the lifecycle class, the normalised workspace, and the
+    isolation envelope ``(network_mode, workspace_mode)`` (via ``env_hash``), so
+    a container built under one grant is never reused under another. Ephemeral
+    containers additionally key on ``session_id``.
+
+    ``persistent`` -> ``agent-exec-persistent-{ws_hash}-{env_hash}``
+    ``ephemeral``  -> ``agent-exec-ephemeral-{ws_hash}-{session_tag}-{env_hash}``
+    """
+    ws_hash = hashlib.sha256(
+        normalize_workspace_path(workspace_path).encode()
+    ).hexdigest()[:12]
+    env_hash = hashlib.sha256(
+        f"{network_mode}:{workspace_mode}".encode()
+    ).hexdigest()[:8]
+    if lifecycle_class == LIFECYCLE_EPHEMERAL:
+        tag = _safe_session_tag(session_id)
+        return f"agent-exec-ephemeral-{ws_hash}-{tag}-{env_hash}"
+    return f"agent-exec-persistent-{ws_hash}-{env_hash}"
 
 
 def _resolve_container_config_via_gate(workspace_id, session_permissions):
@@ -335,12 +390,7 @@ def verify_container_integrity(
             - action_taken (str): "none", "removed", or "error"
             - mismatch_reason (str | None)
     """
-    import hashlib
-    import os
-
-    workspace_path = os.path.abspath(workspace_path).rstrip("/")
-    safe_name = hashlib.sha256(workspace_path.encode()).hexdigest()[:12]
-    container_name = f"agent-exec-{safe_name}"
+    workspace_path = normalize_workspace_path(workspace_path)
 
     # Resolve workspace_id for config computation
     workspace_id = _resolve_workspace_id(workspace_path)
@@ -350,6 +400,15 @@ def verify_container_integrity(
     # shared with ``DockerExecutor._compute_container_config``.
     desired_network, desired_mode = _resolve_container_config_via_gate(
         workspace_id, session_permissions
+    )
+
+    # Canonical, envelope-keyed persistent name — the LEGACY fallback lookup
+    # used only when the record store has no matching container.
+    container_name = build_container_name(
+        workspace_path,
+        LIFECYCLE_PERSISTENT,
+        network_mode=desired_network,
+        workspace_mode=desired_mode,
     )
     audit_event(
         "NETWORK_DECISION",
@@ -585,9 +644,13 @@ class DockerExecutor:
         # ── Always compute desired config via unified gate ──
         network_mode, workspace_mode = self._compute_container_config()
 
-        # ── Deterministic container name based on workspace path ──
-        safe_name = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
-        container_name = f"agent-exec-{safe_name}"
+        # ── Canonical envelope-keyed container name (the pool key) ──
+        container_name = build_container_name(
+            self.workspace_path,
+            LIFECYCLE_PERSISTENT,
+            network_mode=network_mode,
+            workspace_mode=workspace_mode,
+        )
 
         # ── Try to find existing container by name ──
         existing = None
@@ -753,10 +816,7 @@ class DockerExecutor:
             Transform,
             admit,
         )
-        from thoughtmachine.container_record import (
-            LIFECYCLE_PERSISTENT,
-            docker_restart_policy,
-        )
+        from thoughtmachine.container_record import docker_restart_policy
 
         _admission_wsid = str(self.workspace_id) if self.workspace_id is not None else "default"
         _admission = admit(

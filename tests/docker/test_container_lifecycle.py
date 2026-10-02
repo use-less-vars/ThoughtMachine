@@ -443,13 +443,17 @@ class TestContainerLifecycle:
             "expected HostConfig /workspace mount ReadOnly=True"
         )
 
-    def test_host_changes_visible_to_new_container(self):
-        """A host workspace change is visible to a later container.
+    def test_host_changes_visible_to_reused_persistent_container(self):
+        """A host workspace change is visible to the REUSED persistent container.
 
         Phase-2 bind-mounts the host directory directly: no named volume, no
-        manifest/sha tracking. A file added on the host while the first
-        container runs is immediately visible to a SECOND container started
-        for the same workspace path (the bind reflects the live host tree).
+        manifest/sha tracking. The persistent container is workspace-scoped —
+        its name is keyed on the isolation envelope, NOT the session — so a
+        SECOND manager started for the same workspace path with a DIFFERENT
+        session REUSES the first container. A file added on the host while the
+        first container runs is still immediately visible through the live
+        bind mount of the reused container (the bind reflects the live host
+        tree).
         """
         workspace_id = uuid.uuid4()
         session_id_1 = uuid.uuid4()
@@ -463,13 +467,17 @@ class TestContainerLifecycle:
         probe_text = f"refreshed-{uuid.uuid4()}"
         (self.workspace_dir / "refresh-probe.txt").write_text(probe_text)
 
-        # Second container, same workspace path, new session: the bind mount
-        # reflects the live host tree, so the new file is visible immediately.
+        # Second manager, same workspace path, DIFFERENT session: the
+        # persistent container is workspace-scoped, so it is REUSED (not a
+        # fresh create), and the live bind mount reflects the new file.
         session_id_2 = uuid.uuid4()
         manager2, res2 = self._start_manager(
             workspace_id=workspace_id, session_id=session_id_2
         )
-        assert res2["status"] == "created", f"expected fresh container, got {res2!r}"
+        assert res2["status"] == "reused", f"expected reuse, got {res2!r}"
+        assert res2["id"] == res1["id"], (
+            f"expected same container, got {res1!r} vs {res2!r}"
+        )
 
         result = self._exec_ok(manager2, res2["id"], "cat /workspace/refresh-probe.txt")
         assert result["stdout"].strip() == probe_text
@@ -478,7 +486,13 @@ class TestContainerLifecycle:
         assert result["stdout"].strip() == self.hello_text
 
     def test_no_workspace_volume_created(self):
-        """Phase-2 creates NO named workspace volume (host dir is bind-mounted)."""
+        """Phase-2 creates NO named workspace volume (host dir is bind-mounted).
+
+        The persistent container is workspace-scoped, so a second manager for
+        the same workspace path with a DIFFERENT session REUSES it (no fresh
+        create, no workspace population step); the files stay visible through
+        the live bind mount.
+        """
         workspace_id = uuid.uuid4()
         session_id_1 = uuid.uuid4()
         manager1, res1 = self._start_manager(
@@ -491,13 +505,18 @@ class TestContainerLifecycle:
         with pytest.raises(docker.errors.NotFound):
             self.client.volumes.get(f"tm-workspace-{workspace_id}")
 
-        # Second container, same workspace path: still created fresh, and the
-        # workspace files are visible via the bind mount (no population step).
+        # Second manager, same workspace path, DIFFERENT session: the
+        # persistent container is workspace-scoped, so it is REUSED (not a
+        # fresh create), and the workspace files are still visible via the
+        # bind mount (no population step).
         session_id_2 = uuid.uuid4()
         manager2, res2 = self._start_manager(
             workspace_id=workspace_id, session_id=session_id_2
         )
-        assert res2["status"] == "created", f"expected fresh container, got {res2!r}"
+        assert res2["status"] == "reused", f"expected reuse, got {res2!r}"
+        assert res2["id"] == res1["id"], (
+            f"expected same container, got {res1!r} vs {res2!r}"
+        )
         result = self._exec_ok(manager2, res2["id"], "cat /workspace/hello.txt")
         assert result["stdout"].strip() == self.hello_text
 
