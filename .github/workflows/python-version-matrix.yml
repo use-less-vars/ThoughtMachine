@@ -27,6 +27,7 @@ name: Python Version Matrix
 
 on:
   push:
+    branches: [dev, master]
   pull_request:
 
 concurrency:
