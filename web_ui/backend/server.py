@@ -1988,10 +1988,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     #     the fallback below sends session_loaded to THIS websocket.
                     _bridge_loaded_session = False
 
-                    # Cold load = no cached bridge to re-attach to. Only a cold load
-                    # emits the one-shot "Session … loaded" banner below; re-attaching
+                    # Cold load = no cached bridge/controller to re-attach to: create
+                    # a fresh controller + bridge below and load from disk. Re-attaching
                     # to a cached bridge (tab switch / WS reconnect / repeat
-                    # load_session) must not re-append it to the transcript.
+                    # load_session) reuses it and only replays live state to the new WS.
                     _cold_load = existing is None or existing._controller is None
                     if _cold_load:
                         # Create fresh controller and bridge
