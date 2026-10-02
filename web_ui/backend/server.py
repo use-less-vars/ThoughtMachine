@@ -2166,9 +2166,6 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 workspace_path=bridge._workspace_path if bridge else None,
                             ),
                         })
-                        # One-shot banner: cold loads only (see _cold_load above).
-                        if _cold_load:
-                            await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
                         # Register/update in global session registry
                         registry = SessionRegistry.get_default()
                         registry.register(
