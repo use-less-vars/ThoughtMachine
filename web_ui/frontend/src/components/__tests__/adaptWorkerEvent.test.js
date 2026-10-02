@@ -343,6 +343,64 @@ describe('tool_call', () => {
 });
 
 // ==========================================================================
+// 5b. tool_call_start (pending tool call — mirrors tool_call)
+// ==========================================================================
+describe('tool_call_start', () => {
+  it('returns tool_call msg with JSON content', () => {
+    const evt = makeEvent({
+      event: 'tool_call_start',
+      request: { tool: 'read_file', args: { path: '/tmp/test.txt' }, status: 'running' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result._id).toBe(eventId(evt));
+    expect(result.role).toBe('tool_call');
+    expect(JSON.parse(result.content)).toEqual({
+      name: 'read_file',
+      arguments: { path: '/tmp/test.txt' },
+    });
+  });
+
+  it('defaults tool name to unknown when missing', () => {
+    const evt = makeEvent({
+      event: 'tool_call_start',
+      request: { args: { x: 1 }, status: 'running' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(JSON.parse(result.content).name).toBe('unknown');
+  });
+
+  it('defaults args to empty object when missing', () => {
+    const evt = makeEvent({
+      event: 'tool_call_start',
+      request: { tool: 'find', status: 'running' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(JSON.parse(result.content).arguments).toEqual({});
+  });
+
+  it('handles missing request object', () => {
+    const evt = makeEvent({ event: 'tool_call_start' });
+    delete evt.request;
+    const result = adaptWorkerEvent(evt);
+    expect(JSON.parse(result.content).name).toBe('unknown');
+    expect(JSON.parse(result.content).arguments).toEqual({});
+  });
+
+  it('produces a distinct _id from tool_call', () => {
+    const start = makeEvent({
+      event: 'tool_call_start',
+      request: { tool: 'read_file', args: {} },
+    });
+    const call = makeEvent({
+      event: 'tool_call',
+      request: { tool: 'read_file', args: {} },
+    });
+    expect(adaptWorkerEvent(start)._id).not.toBe(adaptWorkerEvent(call)._id);
+    expect(adaptWorkerEvent(start)._id.endsWith('tool_call_start')).toBe(true);
+  });
+});
+
+// ==========================================================================
 // 6. tool_result
 // ==========================================================================
 describe('tool_result', () => {

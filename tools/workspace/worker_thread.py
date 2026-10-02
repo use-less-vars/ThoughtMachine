@@ -426,6 +426,19 @@ class WorkerBusAdapter:
                 "response_type": response_type,
             })
 
+        elif event_type == "tool_call_start":
+            # Pending tool-call notification: emitted by the agent BEFORE the tool
+            # executes so the worker panel can render an *in-progress* row. The
+            # later "tool_call"/"tool_result" events provide the outcome.
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: tool_call_start "
+                f"[worker={self.worker_name}] tool={event.get('tool_name', '?')}")
+            self._publish("tool_call_start", {
+                "tool_name": event.get("tool_name", ""),
+                "arguments": event.get("arguments", ""),
+                "tool_call_id": event.get("tool_call_id", ""),
+            })
+
         elif event_type == "tool_call":
             log('DEBUG', 'pipeline.worker_bus',
                 f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: tool_call "

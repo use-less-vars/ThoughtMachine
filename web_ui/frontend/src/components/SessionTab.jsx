@@ -908,6 +908,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       // ── Worker lifecycle events + per-worker bus events (real-time from bridge) ──
+      case 'worker:tool_call_start':
       case 'worker:tool_call':
       case 'worker:tool_result':
       // worker:token_warning/turn_warning/time_warning now come via per-worker bus (not global bus)

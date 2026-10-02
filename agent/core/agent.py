@@ -1303,6 +1303,23 @@ class Agent:
                 self._add_conversation_data_to_event(turn_event)
                 yield turn_event
                 if tool_calls:
+                    # Emit a START event for each tool call BEFORE executing it, so
+                    # consumers (e.g. the worker panel) can render a pending
+                    # "running" tool-call row. The post-completion tool_call /
+                    # tool_result events below remain the source of truth for the
+                    # outcome. Emitted before execute_tool_calls() so the pending
+                    # row appears while the tool is still running.
+                    for _tc in tool_calls:
+                        _fn = _tc.get('function', {}) if isinstance(_tc, dict) else {}
+                        start_event = {
+                            'type': 'tool_call_start',
+                            'tool_name': _fn.get('name', '') if isinstance(_fn, dict) else '',
+                            'arguments': _fn.get('arguments', '') if isinstance(_fn, dict) else '',
+                            'tool_call_id': _tc.get('id', '') if isinstance(_tc, dict) else '',
+                            'turn': self._display_turn,
+                        }
+                        self._add_conversation_data_to_event(start_event)
+                        yield start_event
                     executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, workspace_id=getattr(getattr(self, '_session', None), 'workspace_id', None) or "", turn_transaction=turn_transaction)
                     processed_tools = []
                     for tool_info in executed_tools:
