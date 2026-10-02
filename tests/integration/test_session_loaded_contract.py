@@ -364,10 +364,11 @@ def test_load_session_missing_session_reports_load_error(contract_server):
     load_error session_loaded, not a success-looking status.
 
     The pre-fix server's silent store-miss path (bridge.load_session returning
-    False) emitted only the success-looking status_message ("Session ... loaded.
-    Click Run to continue.") with NO session_loaded at all — the frontend then
-    rendered a phantom loaded session. The fallback now sends session_loaded
-    with load_error: True (same session_id the tab requested) plus a ⚠ status.
+    False) emitted only the success-looking status_message (the one-shot
+    "Session ... loaded" banner, since removed in PR #55) with NO session_loaded
+    at all — the frontend then rendered a phantom loaded session. The fallback
+    now sends session_loaded with load_error: True (same session_id the tab
+    requested) plus a ⚠ status.
     """
     app, _ = contract_server
     missing_id = str(uuid.uuid4())
