@@ -645,20 +645,24 @@ def _loaded_banners(events, session_id: str):
 
 
 def test_reload_does_not_reemit_session_loaded_banner(contract_server):
-    """A re-load of an already-loaded session must NOT re-append the banner.
+    """A load must NOT emit the (now-removed) session-loaded banner at all.
 
-    The banner is a ONE-SHOT cold-load notification.  The backend's
-    ``load_session`` handler distinguishes a cold load (no cached bridge) from a
-    re-attach to a cached bridge (``_cold_load`` in web_ui/backend/server.py);
-    only the cold load may emit the banner.  Behaviour under test:
-      * 1st ``load_session`` on a WS -> cold load -> banner emitted exactly once;
+    The banner was a one-shot cold-load notification rendered in the
+    system-notification color; the operator ruled it retired because it misled
+    the operator into reading a UI confirmation as a core internal message.
+    The backend's ``load_session`` handler no longer emits it on either path —
+    neither the cold load (no cached bridge) nor the re-attach to a cached
+    bridge.  Behaviour under test:
+      * 1st ``load_session`` on a WS -> cold load -> NO banner;
       * 2nd ``load_session`` on the SAME ws (== tab switch / WS reconnect /
-        repeat load command, all of which reuse the cached bridge) -> the
-        transcript must NOT gain a second banner.
+        repeat load command, all of which reuse the cached bridge) -> NO banner
+        either.
 
-    Regression guard: before the ``_cold_load`` gate the cached-bridge path also
-    emitted the banner, so the frontend store appended a second client-only
-    system bubble on every re-attach -> unbounded accumulation.
+    Regression guard: this assertion used to require the banner exactly once
+    across a cold load + re-attach.  If the emission is ever re-introduced on
+    the cached-bridge path (the pre-``_cold_load``-gate behaviour) the frontend
+    store appended a second client-only system bubble on every re-attach ->
+    unbounded accumulation.
     """
     app, _ = contract_server
 
@@ -668,7 +672,7 @@ def test_reload_does_not_reemit_session_loaded_banner(contract_server):
         session_id = resp.json()["session_id"]
 
         with client.websocket_connect("/ws") as ws:
-            # 1st load — cold path (fresh bridge): banner is legitimate here.
+            # 1st load — cold path (fresh bridge): no banner is emitted.
             ws.send_json({"command": "load_session", "session_id": session_id})
             cold_events = _drain_events(ws)
 
@@ -690,8 +694,8 @@ def test_reload_does_not_reemit_session_loaded_banner(contract_server):
     banners = _loaded_banners(cold_events, session_id) + _loaded_banners(
         reattach_events, session_id
     )
-    assert len(banners) == 1, (
-        f"the one-shot 'loaded' banner must appear exactly once per session "
-        f"across a cold load + re-attach; got {len(banners)}: {banners}"
+    assert len(banners) == 0, (
+        f"the 'loaded' banner was removed entirely - it must NOT appear on a "
+        f"cold load nor on a re-attach; got {len(banners)}: {banners}"
     )
 
