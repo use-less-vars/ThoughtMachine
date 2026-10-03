@@ -203,6 +203,8 @@ class Record:
     # ``record.state`` anywhere else.
     state: str = ""
     created_at: str = ""
+    # MUTATION-ONLY: updated_at advances on real mutation; never on inspection
+    # or serialization.
     updated_at: str = ""
     restart_policy: str | None = None
     #: Workspace-scoped container identity ("" = unset).
