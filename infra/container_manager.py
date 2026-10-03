@@ -128,6 +128,7 @@ from thoughtmachine.container_record import (
     load_record,
     normalise_restart_policy,
     policy_for,
+    rebuild_config_from_snapshot,
     record_label,
     snapshot_from_attrs,
     snapshot_has_evidence,
@@ -1411,7 +1412,8 @@ class ContainerManager:
                 if heal_missing and self._heal_eligible(record, docker_id):
                     healed = self._heal_missing(
                         name=name, record_id=record_id, stale_docker_id=docker_id,
-                        image=image, note=note, lifecycle_class=lifecycle_class)
+                        image=image, note=note, lifecycle_class=lifecycle_class,
+                        record=record)
                     if healed is not None:
                         return healed
                 self._emit_stale_docker_id_drift_once(
@@ -2520,17 +2522,20 @@ class ContainerManager:
         return True
 
     def _heal_missing(self, *, name, record_id, stale_docker_id, image, note,
-                      lifecycle_class):
-        """Attempt ONE policy-current rebuild of a record whose container is gone.
+                      lifecycle_class, record):
+        """Attempt ONE snapshot-sourced rebuild of a record whose container is gone.
 
         Agent-facing counterpart to the operator-only ``allow_fresh`` recreate:
         the record names a ``docker_id`` that has no live container, so the
-        container is rebuilt for the EXISTING record (``reuse_record_id``) — the
-        same argument-for-argument call the operator path makes.
+        container is rebuilt for the EXISTING record (``reuse_record_id``).
 
-        DOCUMENTED DEVIATION: the rebuild is computed from the CURRENT policy
-        (``_compute_config``); the record's stored ``intent_snapshot`` is NOT
-        read as a rebuild source (it is a recovery artefact, not authoritative).
+        The rebuild source is the record's STORED ``intent_snapshot`` (design
+        §1.1: the frozen creation intent), NEVER the current policy: only the
+        snapshot records the network/workspace isolation the container was
+        created with, so a rebuild restores exactly that intent.  When the
+        record carries no evidence-bearing snapshot the heal invents nothing —
+        it emits an ``intent_snapshot_missing`` drift finding and refuses (no
+        fresh container), falling through to the ordinary refusal.
 
         Memo semantics (load-bearing): the ``(record_id, stale_docker_id)``
         signature is recorded as ATTEMPTED here — at the moment of the attempt,
@@ -2544,20 +2549,41 @@ class ContainerManager:
             while len(_HEAL_ATTEMPTED) > _HEAL_MEMO_MAX:
                 _HEAL_ATTEMPTED.popitem(last=False)
 
-        try:
-            computed = self._compute_config(
-                self.workspace_path, self.workspace_id,
-                self.session_permissions, lifecycle_class)
-            network_mode, workspace_mode = computed
-            effective = getattr(computed, "effective", None)
-        except Exception:
-            # Config uncomputable -> invent nothing; refuse via the heal signal
-            # (start() then produces the ordinary refusal payload).
+        # Rebuild source = the record's STORED intent snapshot (never policy).
+        # The ONE evidence rule lives in the shared ``snapshot_has_evidence``
+        # helper; ``rebuild_config_from_snapshot`` is a total projection of the
+        # snapshot and is only read once the gate below has passed.
+        snapshot = getattr(record, "intent_snapshot", None)
+        if not snapshot_has_evidence(snapshot):
+            # No evidence-bearing snapshot -> invent nothing: report the absent
+            # intent as DRIFT, then refuse via the heal signal (start() then
+            # produces the byte-identical ordinary refusal payload).
+            try:
+                if getattr(self, "workspace_id", None):
+                    from thoughtmachine.container_record import append_event
+                    _expected = {"intent_snapshot": "evidence-bearing"}
+                    _actual = snapshot
+                    append_event(
+                        self.workspace_id, str(record_id),
+                        drift.EVENT_INTENT_SNAPSHOT_MISSING,
+                        drift.ACTOR,
+                        **{
+                            "class": drift.CLASS_INTENT,
+                            "expected": _expected,
+                            "actual": _actual,
+                            "signature": drift.signature_for(
+                                drift.EVENT_INTENT_SNAPSHOT_MISSING,
+                                _expected, _actual),
+                            "detected_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+            except Exception:
+                pass
             try:
                 _audit(_HEAL_AUDIT_REFUSED,
                        f"name={name} record_id={record_id} "
                        f"stale_docker_id={stale_docker_id} "
-                       f"detail=config_uncomputable workspace_id={self.workspace_id}")
+                       f"detail=snapshot_missing workspace_id={self.workspace_id}")
             except Exception:
                 pass
             try:
@@ -2569,19 +2595,21 @@ class ContainerManager:
                         _HEAL_ACTOR,
                         reason=_HEAL_REASON,
                         old_docker_id=stale_docker_id,
-                        detail="config_uncomputable",
+                        detail="snapshot_missing",
                         detected_at=datetime.now(timezone.utc).isoformat(),
                     )
             except Exception:
                 pass
             return None
 
+        rebuild = rebuild_config_from_snapshot(snapshot)
         try:
             result = self._fresh_start(
                 image=image, name=name, note=note, worker_name=None,
-                lifecycle_class=lifecycle_class, network_mode=network_mode,
-                workspace_mode=workspace_mode, reuse_record_id=record_id,
-                permissions=effective)
+                lifecycle_class=lifecycle_class,
+                network_mode=rebuild["network_mode"],
+                workspace_mode=rebuild["workspace_mode"],
+                reuse_record_id=record_id)
         except Exception:
             return None
 

@@ -78,6 +78,7 @@ CLASS_IMAGE = "image"
 CLASS_HARDENING = "hardening"
 CLASS_RESTART_POLICY = "restart_policy"
 CLASS_PERMISSION = "permission"
+CLASS_INTENT = "intent"
 
 #: Drift event types.
 EVENT_IDENTITY_CHANGED = "drift.identity_changed"
@@ -88,6 +89,7 @@ EVENT_IMAGE_CHANGED = "drift.image_changed"
 EVENT_HARDENING_LOST = "drift.hardening_lost"
 EVENT_RESTART_POLICY_MISMATCH = "drift.restart_policy_mismatch"
 EVENT_PERMISSION_CHANGED = "drift.permission_changed"
+EVENT_INTENT_SNAPSHOT_MISSING = "drift.intent_snapshot_missing"
 
 #: Auto-heal lifecycle events.  Deliberate DEVIATION from the ``drift.*``
 #: convention above: these are emitted by the container MANAGER
@@ -535,6 +537,7 @@ __all__ = [
     "CLASS_HARDENING",
     "CLASS_RESTART_POLICY",
     "CLASS_PERMISSION",
+    "CLASS_INTENT",
     "EVENT_IDENTITY_CHANGED",
     "EVENT_CONTAINER_ABSENT",
     "EVENT_POLICY_CONFIG_CHANGED",
@@ -543,6 +546,7 @@ __all__ = [
     "EVENT_HARDENING_LOST",
     "EVENT_RESTART_POLICY_MISMATCH",
     "EVENT_PERMISSION_CHANGED",
+    "EVENT_INTENT_SNAPSHOT_MISSING",
     "DriftFinding",
     "signature_for",
     "classify_drift",
