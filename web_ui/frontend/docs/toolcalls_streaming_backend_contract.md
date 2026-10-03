@@ -1,25 +1,30 @@
 # Tool-call "streaming": backend contract for live tool-call START events
 
-Status: **Investigation document — no UI streaming feature built (decision 3)**
-Date: task6 investigation
-Scope: web_ui/frontend team. Backend untouched.
+Status: **Implemented (PR #TBD) — the tool_call_start event was added by this PR.**
+Date: task6 (implemented, PR #TBD)
+Scope: web_ui/frontend team. Backend modified (PR #TBD).
 
 ## TL;DR
 
-There is **no backend event that fires when a tool call STARTS** on any path
-(main agent, worker, tool executor). The existing `tool_call` events are
+There is now a **backend event that fires when a tool call STARTS** —
+`tool_call_start`, emitted **pre-execution** by the agent turn loop
+(`agent/core/agent.py`, before `execute_tool_calls`), forwarded by
+`WorkerBusAdapter.forward_agent_event` (`tools/workspace/worker_thread.py`),
+subscribed by the bridge (`web_ui/backend/bridge.py`), and rendered by the
+frontend as a pending tool-call row (`WorkerOutputPanel.jsx`, `status:'running'`);
+see PR #TBD. The existing `tool_call` events are
 emitted **back-to-back with `tool_result`, strictly AFTER the tool has
 finished executing**. The frontend therefore already has complete rendering
-vocabulary for tool calls, but nothing can trigger a *live/streaming* tool-call
-row during execution. Per decision rule (3): do NOT build untriggerable UI;
-this document records the missing event contract, the suggested backend
-emission point (file/function level only — no backend edits made), the
-frontend consumption plan, and the full evidence trail.
+vocabulary for tool calls, and can now trigger a *live/streaming* tool-call
+row during execution. This document records the implemented event contract
+(PR #TBD): the backend emission point, the frontend consumption plan, and the
+full evidence trail.
 
-The only pre-completion visibility that exists today is a **history snapshot**
+Pre-completion visibility now includes both a live **`tool_call_start`** row
+(PR #TBD) and the **history snapshot**
 (assistant message containing `tool_calls`, no result yet) which reaches the
 main chat because the assistant message is committed to `user_history` before
-execution begins. Worker panels see nothing until the completed
+execution begins. Worker panels render a pending `tool_call_start` row before the completed
 `tool_call`+`tool_result` pair is published.
 
 ## 1. Current emission timing (the core finding)
@@ -61,17 +66,20 @@ finished. Note the emitted `tool_call` event does **not** carry `tool_call_id`
 279     executed_tools.append({'name', 'arguments', 'result'})
 ```
 
-- No event is published **before/during** execution. `self._event_bus` is
-  stored (`__init__` :141) but never emitted to anywhere in this flow.
+- No event is published **by the executor before/during** execution; the
+  pre-execution `tool_call_start` is emitted upstream by the agent turn loop
+  (§1.1, PR #TBD). `self._event_bus` is stored (`__init__` :141) but never
+  emitted to anywhere in this flow.
 - `executed_tools` entries (the raw material for the later `tool_call` yields)
   only gain `container_id`/`exec_id`/`tool_call_id`-style fields **after** the
-  tool runs and its processed result is returned — there is no pre-execution
-  bus event that could serve as a START signal.
+  tool runs and its processed result is returned — the executor emits no
+  pre-execution bus event; the START signal is the agent-side `tool_call_start`
+  (§1.1, PR #TBD).
 
 ### 1.3 Worker path — `tools/workspace/worker_thread.py`
 
-Workers consume the **same** post-completion stream, so per-worker bus events
-are post-completion too:
+Workers consume the **same** stream, and now forward the pre-execution
+`tool_call_start` (PR #TBD) alongside the post-completion events:
 
 ```
 1750  for event in self._agent.process_query(query):
@@ -97,7 +105,7 @@ receives):
 
 ### 1.4 WebSocket payloads today — `web_ui/backend/bridge.py`
 
-Per-worker bus subscription list includes `'tool_call', 'tool_result'`
+Per-worker bus subscription list includes `'tool_call_start', 'tool_call', 'tool_result'`
 (:709-715). The `_make_bus_handler` has no dedicated branch for them — they
 fall through the **generic** else branch (:790-802):
 
@@ -140,19 +148,19 @@ time those yields happen the session is already committed.
 - `MessageBubble` renders roles `tool_call`/`tool_result`; WorkspacePanel
   `EVENT_BADGE_COLORS` includes `tool_call` (WorkspacePanel.jsx:63-69).
 
-## 3. The gap (why no streaming UI was built)
+## 3. The former gap (why no streaming UI was built before PR #TBD)
 
 | Path | Pre-execution signal exists? |
 |---|---|
-| Main-agent raw stream | No — first tool visibility is the history snapshot from the `turn` yield (commit_assistant_only at agent.py:1295), which renders as a pending tool_calls bubble only if the chat normalizes assistant messages with `tool_calls`; the dedicated `tool_call` event is post-completion |
+| Main-agent raw stream | Yes — the turn loop yields `tool_call_start` pre-execution (PR #TBD); first tool visibility was the history snapshot from the `turn` yield (commit_assistant_only at agent.py:1295), which renders as a pending tool_calls bubble only if the chat normalizes assistant messages with `tool_calls`; the dedicated `tool_call` event is post-completion |
 | Tool executor | No — no event_bus emission anywhere in `execute_tool_calls` |
-| Worker bus / WS | No — purely derived from the same post-completion yields |
-| Frontend worker panel | Shows the `tool_call` row only when the (completed) `tool_call`+`tool_result` pair arrives |
+| Worker bus / WS | Yes — now forwards the pre-execution `tool_call_start` in addition to the post-completion yields (PR #TBD) |
+| Frontend worker panel | Shows a pending `tool_call_start` row before the (completed) `tool_call`+`tool_result` pair arrives (PR #TBD) |
 
-Building UI "streaming support" (adaptWorkerEvent/routing/dedup/vitest) now
-would produce code that can never fire. Hence decision (3).
+Building UI "streaming support" (adaptWorkerEvent/routing/dedup/vitest) is now
+backed by the live `tool_call_start` event, so it fires (PR #TBD).
 
-## 4. Proposed backend contract (NOT implemented)
+## 4. Backend contract (implemented — PR #TBD)
 
 For when real-time tool-call visibility is wanted, the minimal contract is one
 new START event emitted **before** `execute_tool_calls` runs.
@@ -209,7 +217,7 @@ elif event_type == "tool_call_start":
 ```
 event                data (WS, under .data)                          timing
 worker:tool_call     {tool_name, arguments}                          post-completion (today)
-worker:tool_call_start  {tool_name, arguments, tool_call_id?}        pre-execution (proposed)
+worker:tool_call_start  {tool_name, arguments, tool_call_id?}        pre-execution (implemented, PR #TBD)
 worker:tool_result   {tool_name, success, error, result[:1000]}      post-completion (today)
 ```
 
@@ -218,7 +226,7 @@ snapshot to render pending bubbles (already available via the committed
 history at agent.py:1295), or a main-agent-side start broadcast — out of scope
 here.
 
-## 5. Frontend consumption plan (when the backend contract lands)
+## 5. Frontend consumption plan (backend contract landed, PR #TBD)
 
 1. `WorkerOutputPanel.jsx` transform switch (:339+): add
    `case 'tool_call_start'` mirroring `tool_call` (:340-350) — build
@@ -265,7 +273,9 @@ here.
 
 ## 7. Recommendation
 
-Keep the UI as-is. When tool-call streaming is actually wanted, implement the
-backend START event first (section 4), then apply the small frontend plan
-(section 5). No backend files were modified by this investigation; this doc is
-the deliverable for the "no start event exists" decision branch.
+The "keep the UI as-is" stance is superseded: tool-call streaming is now wanted,
+so the backend START event is implemented (section 4) and the small frontend plan
+(section 5) applied, in PR #TBD. This PR modifies the backend files
+tools/workspace/worker_thread.py, web_ui/backend/bridge.py, agent/core/agent.py
+and agent/events.py; this doc is the deliverable for the "start event now exists"
+decision branch.

@@ -706,7 +706,7 @@ class WebAgentBridge:
             return
 
         # DIAG: Log what event types we plan to subscribe to
-        subscribed_types = ['tool_call', 'tool_result',
+        subscribed_types = ['tool_call', 'tool_call_start', 'tool_result',
                             'worker_message', 'assistant_message',
                             'context_updated', 'context_cleared', 'context_summarized',
                             'token_recovery', 'token_warning', 'turn_warning', 'time_warning',

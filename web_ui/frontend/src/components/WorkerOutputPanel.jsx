@@ -337,6 +337,19 @@ function WorkerOutputPanel({
         let response = e.response || {}
 
         switch (eventType) {
+          case 'tool_call_start': {
+            // Pending tool call — render an in-progress row before the tool
+            // finishes. Mirrors 'tool_call' but tags status:'running'.
+            const data = e.data || {}
+            let args = {}
+            try {
+              if (data.arguments) {
+                args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
+              }
+            } catch (_) { /* ignore parse errors */ }
+            request = { tool: data.tool_name || 'unknown', args, status: 'running' }
+            break
+          }
           case 'tool_call': {
             const data = e.data || {}
             let args = {}

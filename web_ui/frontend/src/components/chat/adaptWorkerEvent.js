@@ -170,6 +170,20 @@ export default function adaptWorkerEvent(evt) {
       }
     }
 
+    // ── Tool call (pending / started) ───────────────────────
+    case 'tool_call_start': {
+      const req = evt.request || {}
+      const jsonContent = JSON.stringify({
+        name: req.tool || 'unknown',
+        arguments: req.args || {},
+      })
+      return {
+        _id: eventId(evt),
+        role: 'tool_call',
+        content: jsonContent,
+      }
+    }
+
     // ── Tool result ───────────────────────────────────────────────
     case 'tool_result': {
       const req = evt.request || {}

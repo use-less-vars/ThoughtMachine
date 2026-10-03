@@ -28,6 +28,7 @@ class EventType(enum.Enum):
     LLM_RESPONSE = 'llm_response'
     RAW_RESPONSE = 'raw_response'
     TOOL_CALL = 'tool_call'
+    TOOL_CALL_START = 'tool_call_start'
     TOOL_RESULT = 'tool_result'
     CONVERSATION_UPDATE = 'conversation_update'
     CONVERSATION_PRUNE = 'conversation_prune'
