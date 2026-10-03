@@ -152,14 +152,22 @@ def _make_cm(container, want, name="agent-x", workspace_id="w1"):
 _VAULT = {}
 
 
-def _mint_record(workspace_id, name, docker_id):
-    """Mint a container RECORD binding *name* to the live container's id."""
+def _mint_record(workspace_id, name, docker_id, intent_snapshot=None):
+    """Mint a container RECORD binding *name* to the live container's id.
+
+    *intent_snapshot*, when supplied, seeds the record's STORED creation intent
+    -- the heal's ONLY rebuild source: an evidence-bearing snapshot is required
+    for the heal to proceed (never the current policy).
+    """
     vault = _VAULT["root"]
     create_record(
         workspace_id, LIFECYCLE_PERSISTENT, OWNER_WORKSPACE,
         id="rec-1", name=name, vault_root=vault,
     )
     update_record(workspace_id, "rec-1", vault_root=vault, docker_id=docker_id)
+    if intent_snapshot is not None:
+        update_record(workspace_id, "rec-1", vault_root=vault,
+                      intent_snapshot=intent_snapshot)
 
 
 def _arrange(cm, container, name, site):
@@ -538,6 +546,10 @@ _HEAL_AUDIT_OK = container_manager._HEAL_AUDIT_RECREATED
 _HEAL_AUDIT_FAIL = container_manager._HEAL_AUDIT_REFUSED
 _HEAL_NEW_ID = "e" * 16
 _HEAL_STALE = "d" * 16
+#: Evidence-bearing intent snapshot the heal rebuilds FROM.  Design §1.1: the
+#: heal sources isolation from the record's STORED intent snapshot -- never the
+#: current policy -- so the record must carry this before a heal can proceed.
+_HEAL_SNAPSHOT = {"network_mode": "none", "workspace_mode": "ro"}
 
 
 def _missing_cm(workspace_id="w1"):
@@ -553,14 +565,14 @@ def _missing_cm(workspace_id="w1"):
 def test_missing_heal_recreates_for_existing_record(events, audits):
     """heal_missing=True: a stale docker_id is rebuilt ONCE for the SAME record."""
     cm = _missing_cm()
-    _mint_record("w1", "agent-x", _HEAL_STALE)
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=_HEAL_SNAPSHOT)
 
     result = cm.start(name="agent-x", heal_missing=True)
 
     assert result.get("error") is None
     assert result["id"] == _HEAL_NEW_ID
     assert result["status"] == "created"
-    # Exactly ONE rebuild, bound to the EXISTING record, from the CURRENT policy.
+    # Exactly ONE rebuild, bound to the EXISTING record, from the STORED snapshot.
     assert cm._fresh_start.call_count == 1
     _args, kwargs = cm._fresh_start.call_args
     assert kwargs["reuse_record_id"] == "rec-1"
@@ -601,7 +613,7 @@ def test_missing_heal_is_attempted_once_only_when_it_fails(events, audits):
     """A REFUSED rebuild is terminal: the memo stops a second attempt."""
     cm = _missing_cm()
     cm._fresh_start = MagicMock(return_value={"error": "admission denied"})
-    _mint_record("w1", "agent-x", _HEAL_STALE)
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=_HEAL_SNAPSHOT)
 
     r1 = cm.start(name="agent-x", heal_missing=True)
     r2 = cm.start(name="agent-x", heal_missing=True)
@@ -617,32 +629,29 @@ def test_missing_heal_is_attempted_once_only_when_it_fails(events, audits):
                 if a["event"] == "CONTAINER_START_STALE_DOCKER_ID"]) == 1
 
 
-def test_missing_heal_refuses_when_policy_uncomputable(events, audits):
-    """An uncomputable policy invents nothing: refuse via the heal signal."""
+def test_missing_heal_refuses_when_snapshot_absent(events, audits):
+    """A record with NO evidence-bearing snapshot invents nothing: refuse.
+
+    The heal's ONLY rebuild source is the record's STORED intent snapshot, so an
+    absent (or all-empty) snapshot is a hard refusal -- it never falls back to
+    the current policy to fabricate isolation.
+    """
     cm = _missing_cm()
-    calls = {"n": 0}
-
-    def _boom(*a, **k):
-        calls["n"] += 1
-        if calls["n"] > 1:  # start()'s own compute succeeds; the HEAL recompute fails
-            raise RuntimeError("no policy")
-        return ("none", "ro")
-
-    cm._compute_config = _boom
+    # No intent_snapshot seeded -> snapshot_has_evidence(None) is False.
     _mint_record("w1", "agent-x", _HEAL_STALE)
 
     result = cm.start(name="agent-x", heal_missing=True)
 
     assert result["code"] == "container_record_container_missing"
-    assert cm._fresh_start.call_count == 0  # never built an un-policied container
+    assert cm._fresh_start.call_count == 0  # never built from an absent snapshot
     refused = [e for e in events if e["event_type"] == _HEAL_REFUSED_EVENT]
     assert len(refused) == 1
     assert refused[0]["payload"]["reason"] == "container_missing"
-    assert refused[0]["payload"]["detail"] == "config_uncomputable"
+    assert refused[0]["payload"]["detail"] == "snapshot_missing"
     assert refused[0]["payload"]["old_docker_id"] == _HEAL_STALE
     failed = [a for a in audits if a["event"] == _HEAL_AUDIT_FAIL]
     assert len(failed) == 1
-    assert "detail=config_uncomputable" in failed[0]["data"]
+    assert "detail=snapshot_missing" in failed[0]["data"]
 
 
 def test_missing_heal_refused_for_own_lifecycle_class(events, audits):
@@ -677,14 +686,14 @@ def test_drift_still_refuses_even_with_heal_flag(events, audits):
     assert [e for e in events if e["event_type"] == _HEAL_EVENT] == []
 
 
-def test_missing_heal_rebuilds_from_current_policy_then_reuses_clean(events):
-    """The rebuild uses the CURRENT policy; the rebound container then reuses clean."""
+def test_missing_heal_rebuilds_from_stored_snapshot_then_reuses_clean(events):
+    """The rebuild uses the STORED snapshot; the rebound container then reuses clean."""
     cm = _missing_cm()
-    _mint_record("w1", "agent-x", _HEAL_STALE)
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=_HEAL_SNAPSHOT)
 
     def _fake_fresh(**kwargs):
         # Mirror _fresh_start's real side effect: rebind the EXISTING record to the
-        # fresh container, and publish it live with CURRENT-policy isolation.
+        # fresh container, and publish it live with the snapshot's isolation.
         update_record("w1", "rec-1", vault_root=_VAULT["root"],
                       docker_id=_HEAL_NEW_ID)
         cm.client.containers.containers = [
@@ -711,7 +720,7 @@ def test_missing_heal_rebuilds_from_current_policy_then_reuses_clean(events):
 def test_missing_heal_memo_prevents_second_heal(events, audits):
     """After ONE heal the ``(record_id, stale_docker_id)`` memo is spent."""
     cm = _missing_cm()
-    _mint_record("w1", "agent-x", _HEAL_STALE)
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=_HEAL_SNAPSHOT)
 
     r1 = cm.start(name="agent-x", heal_missing=True)
     assert r1["id"] == _HEAL_NEW_ID
@@ -730,7 +739,8 @@ def test_missing_heal_fires_even_when_record_state_is_creating(events):
     create_record("w1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, id="rec-1",
                   name="agent-x", vault_root=_VAULT["root"])
     update_record("w1", "rec-1", vault_root=_VAULT["root"],
-                  docker_id=_HEAL_STALE, state="creating")
+                  docker_id=_HEAL_STALE, state="creating",
+                  intent_snapshot=_HEAL_SNAPSHOT)
 
     result = cm.start(name="agent-x", heal_missing=True)
 
@@ -816,7 +826,9 @@ def test_missing_heal_refresh_snapshot_on_rebuild(monkeypatch):
     """
     attrs = _attrs("none", False)  # network_mode/workspace_mode -> real evidence
     cm = _real_heal_cm(attrs)
-    _mint_record("w1", "agent-x", _HEAL_STALE)
+    # Seed the record's STORED snapshot so the heal proceeds (its rebuild source);
+    # guardrail 7 then refreshes it from the live attrs.
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=_HEAL_SNAPSHOT)
 
     spy = MagicMock(wraps=container_manager.attach_container)
     monkeypatch.setattr(container_manager, "attach_container", spy)

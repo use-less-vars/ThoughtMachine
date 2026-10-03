@@ -196,8 +196,15 @@ class Record:
     event_log: list = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION_LEGACY
     inferred: bool = False
+    # FREEZE(record.state): the SOLE reader of this field is
+    # ``thoughtmachine.container_record.state.resolve_container_state``; the
+    # workspace container-view display path routes through it via
+    # ``web_ui.backend.server._map_container_view_state``. Do not read
+    # ``record.state`` anywhere else.
     state: str = ""
     created_at: str = ""
+    # MUTATION-ONLY: updated_at advances on real mutation; never on inspection
+    # or serialization.
     updated_at: str = ""
     restart_policy: str | None = None
     #: Workspace-scoped container identity ("" = unset).

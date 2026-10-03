@@ -64,6 +64,7 @@ from .lifecycle_policy import (
 )
 from .snapshot import (
     HARDENING_KEYS,
+    rebuild_config_from_snapshot,
     snapshot_from_attrs,
 )
 from .hook import snapshot_has_evidence
@@ -94,6 +95,7 @@ __all__ = [
     # snapshot extraction (§1.1 / §4)
     "snapshot_from_attrs",
     "snapshot_has_evidence",
+    "rebuild_config_from_snapshot",
     "HARDENING_KEYS",
     # api (§3 / §7)
     "RECORD_LABEL_KEY",

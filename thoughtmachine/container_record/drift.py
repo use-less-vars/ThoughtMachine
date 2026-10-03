@@ -78,6 +78,10 @@ CLASS_IMAGE = "image"
 CLASS_HARDENING = "hardening"
 CLASS_RESTART_POLICY = "restart_policy"
 CLASS_PERMISSION = "permission"
+CLASS_INTENT = "intent"
+#: Lifecycle drift: a record's recorded lifecycle state no longer matches
+#: reality (e.g. it is stuck in ``creating``).  Built by ``state.py``.
+CLASS_LIFECYCLE = "lifecycle"
 
 #: Drift event types.
 EVENT_IDENTITY_CHANGED = "drift.identity_changed"
@@ -88,6 +92,8 @@ EVENT_IMAGE_CHANGED = "drift.image_changed"
 EVENT_HARDENING_LOST = "drift.hardening_lost"
 EVENT_RESTART_POLICY_MISMATCH = "drift.restart_policy_mismatch"
 EVENT_PERMISSION_CHANGED = "drift.permission_changed"
+EVENT_INTENT_SNAPSHOT_MISSING = "drift.intent_snapshot_missing"
+EVENT_CONTAINER_STUCK_CREATING = "drift.container_stuck_creating"
 
 #: Auto-heal lifecycle events.  Deliberate DEVIATION from the ``drift.*``
 #: convention above: these are emitted by the container MANAGER
@@ -125,6 +131,12 @@ class DriftFinding:
     ``expected`` is the recorded/policy intent; ``actual`` is the live (or
     absent) value.  ``signature`` is a stable digest of ``(event_type,
     expected, actual)`` used to deduplicate repeated findings.
+
+    ``fresh`` is the freshness verdict of the record's ``state`` reading for a
+    LIFECYCLE finding (``True``/``False``); it is ``None`` -- the default,
+    meaning "freshness not applicable" -- for every other drift class.  It is
+    the LAST field and carries a default so the original five-field positional
+    construction of a finding still works.
     """
 
     drift_class: str
@@ -132,6 +144,7 @@ class DriftFinding:
     expected: Any
     actual: Any
     signature: str
+    fresh: bool | None = None
 
 
 def signature_for(event_type: str, expected: Any, actual: Any) -> str:
@@ -139,6 +152,11 @@ def signature_for(event_type: str, expected: Any, actual: Any) -> str:
 
     ``expected``/``actual`` are JSON-serialised with ``sort_keys=True`` and
     ``default=str`` so unusual values (ints, nested dicts, ...) never raise.
+
+    :attr:`DriftFinding.fresh` is deliberately NOT part of the digest: the
+    digest is the dedup key over ``(event_type, expected, actual)`` and the two
+    lifecycle causes are already distinguished by ``actual`` (``""`` for the
+    absent cause vs the live state for the contradiction cause).
     """
     blob = json.dumps(
         {"event_type": event_type, "expected": expected, "actual": actual},
@@ -362,6 +380,41 @@ def _matches_record(record: Any, container: Any) -> bool:
     return False
 
 
+def live_state_for_record(
+    record: Any, containers: Any, *, state_key: str = "status"
+) -> str | None:
+    """Return the live Docker state of *record*'s container, or ``None``.
+
+    Read-only and never-raising.  Locates the container attached to *record*
+    using the same :func:`_matches_record` rule the detector uses, then reports
+    its Docker state: ``attrs["State"]["Status"]`` when readable, else
+    ``getattr(container, state_key, None)`` (default ``"status"``), else ``""``
+    -- an existing container whose state could not be read (the resolver
+    normalises ``""`` to its own unknown sentinel).  ``None`` is returned ONLY
+    when no container matches the record.  Nothing is mutated.
+    """
+    try:
+        listed = containers.list(all=True)
+    except Exception:
+        logger.warning("container listing failed; reporting no live container")
+        return None
+    for candidate in listed or []:
+        if not _matches_record(record, candidate):
+            continue
+        attrs = getattr(candidate, "attrs", None)
+        if isinstance(attrs, dict):
+            state = attrs.get("State")
+            if isinstance(state, dict):
+                value = state.get("Status")
+                if isinstance(value, str) and value:
+                    return value
+        value = getattr(candidate, state_key, None)
+        if isinstance(value, str) and value:
+            return value
+        return ""
+    return None
+
+
 def detect_record_drift(
     record: Any,
     containers: Any,
@@ -457,7 +510,9 @@ def emit_drift_findings(
     entries.
 
     The appended event payload contains exactly: ``class``, ``expected``,
-    ``actual``, ``signature`` and ``detected_at``.
+    ``actual``, ``signature`` and ``detected_at``.  A finding whose ``fresh``
+    verdict is set (non-``None`` -- lifecycle findings) additionally carries a
+    ``fresh`` key; every other finding keeps the five-key legacy payload.
     """
     if getattr(record, "inferred", False):
         return []
@@ -489,19 +544,24 @@ def emit_drift_findings(
             ):
                 continue
 
+        payload = {
+            "class": finding.drift_class,
+            "expected": finding.expected,
+            "actual": finding.actual,
+            "signature": finding.signature,
+            "detected_at": iso_now(),
+        }
+        # ``fresh`` is carried ONLY when the finding has a freshness verdict
+        # (lifecycle findings); legacy findings keep the five-key payload.
+        if finding.fresh is not None:
+            payload["fresh"] = finding.fresh
         append_event(
             workspace_id,
             record_id,
             finding.event_type,
             ACTOR,
             vault_root=vault_root,
-            **{
-                "class": finding.drift_class,
-                "expected": finding.expected,
-                "actual": finding.actual,
-                "signature": finding.signature,
-                "detected_at": iso_now(),
-            },
+            **payload,
         )
         emitted.append(finding)
     return emitted
@@ -535,6 +595,8 @@ __all__ = [
     "CLASS_HARDENING",
     "CLASS_RESTART_POLICY",
     "CLASS_PERMISSION",
+    "CLASS_INTENT",
+    "CLASS_LIFECYCLE",
     "EVENT_IDENTITY_CHANGED",
     "EVENT_CONTAINER_ABSENT",
     "EVENT_POLICY_CONFIG_CHANGED",
@@ -543,10 +605,13 @@ __all__ = [
     "EVENT_HARDENING_LOST",
     "EVENT_RESTART_POLICY_MISMATCH",
     "EVENT_PERMISSION_CHANGED",
+    "EVENT_INTENT_SNAPSHOT_MISSING",
+    "EVENT_CONTAINER_STUCK_CREATING",
     "DriftFinding",
     "signature_for",
     "classify_drift",
     "detect_record_drift",
+    "live_state_for_record",
     "emit_drift_findings",
     "scan_record",
 ]

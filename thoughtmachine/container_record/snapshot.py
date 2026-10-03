@@ -145,3 +145,27 @@ def snapshot_from_attrs(attrs: Any) -> dict:
         ) if _restart_raw else "no"
 
     return snapshot
+
+
+def rebuild_config_from_snapshot(snapshot: Any) -> dict:
+    """Return the rebuild config recoverable from a STORED intent snapshot.
+
+    The rebuild source is the record's PERSISTED ``intent_snapshot`` -- the
+    frozen creation intent -- never the current policy.  Only the two isolation
+    modes the snapshot records are needed to restore the container exactly as
+    it was created: ``network_mode`` and ``workspace_mode`` (each ``""`` when
+    unrecorded).
+
+    Total: any input yields ``{"network_mode": <str>, "workspace_mode":
+    <str>}`` (a non-mapping -- including ``None`` -- and an all-empty mapping
+    both yield ``""`` for each).  This function deliberately does NOT judge
+    whether the snapshot is evidence-bearing: that single rule lives in
+    :func:`thoughtmachine.container_record.hook.snapshot_has_evidence`, which
+    the caller applies before treating the result as a valid rebuild source
+    (rather than duplicating the predicate here).
+    """
+    snap = _mapping(snapshot)
+    return {
+        "network_mode": str(snap.get("network_mode") or ""),
+        "workspace_mode": str(snap.get("workspace_mode") or ""),
+    }
