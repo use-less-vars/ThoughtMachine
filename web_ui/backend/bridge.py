@@ -1751,7 +1751,7 @@ class WebAgentBridge:
             # ── structured tool_calls array (current format) ──
             if role == "assistant" and msg.get("tool_calls"):
                 assistant_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
-                if assistant_msg.get("content"):
+                if assistant_msg.get("content") or msg.get("tool_calls"):
                     normalized.append(assistant_msg)
                 for tc in msg["tool_calls"]:
                     # 🟢 FIX 1: extract from nested function object
