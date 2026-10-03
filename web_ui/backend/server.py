@@ -737,7 +737,12 @@ async def lifespan(app: FastAPI):
         from thoughtmachine.container_record import RECORD_LABEL_KEY
         from thoughtmachine.container_record import api as _cr_api
         from thoughtmachine.container_record import storage as _cr_storage
-        from thoughtmachine.container_record.drift import scan_record
+        from thoughtmachine.container_record.drift import (
+            detect_record_drift,
+            emit_drift_findings,
+            live_state_for_record,
+        )
+        from thoughtmachine.container_record.state import creating_drift_finding
         from thoughtmachine.workspace_capabilities import (
             WorkspaceCapabilities,
             load_workspace_capabilities,
@@ -785,13 +790,28 @@ async def lifespan(app: FastAPI):
                 )
             caps = caps_cache[ws]
             # permissions={} -> framework-default SessionPermissions; no ambient SessionConfig at this site (real per-workspace grants are a separate design question)
-            scan_record(
+            findings = detect_record_drift(
                 record,
                 containers,
-                workspace_id=ws,
                 permissions={},
                 capabilities=caps,
             )
+            # The caller -- NOT detect_record_drift -- owns both the lifecycle
+            # (stuck-creating) axis and the emission gate, so the detector stays
+            # free of emission policy.  A lifecycle finding is appended only
+            # when the record is genuinely stale in ``creating`` (past its
+            # expiry window with no live container, or contradicted by a live
+            # one); its dedup signature differs from the absent-cause digest.
+            # ``live_state_for_record`` serves from the same in-memory container
+            # shim, so this adds NO extra docker-daemon round-trip.
+            lifecycle = creating_drift_finding(
+                record,
+                live_state=live_state_for_record(record, containers),
+                now=None,
+            )
+            if lifecycle is not None:
+                findings.append(lifecycle)
+            emit_drift_findings(ws, record, findings)
             inspected += 1
 
         skipped = len(pending) - inspected
@@ -3363,10 +3383,10 @@ def _map_container_view_state(status, record_state):
     vocabulary: an unset/unknown record state (``""``) renders as the
     fail-safe ``stopped``.
     """
+    raw = status.get("status") if isinstance(status, dict) else None
     if isinstance(status, dict):
         if status.get("oom_killed"):
             return "oom"
-        raw = status.get("status")
         if raw in _CONTAINER_VIEW_RAW_STATE:
             return _CONTAINER_VIEW_RAW_STATE[raw]
     # No usable live status: the record-state decision belongs to the pure
@@ -3374,17 +3394,26 @@ def _map_container_view_state(status, record_state):
     # passes ONLY the state string (``getattr(record, "state", "")``), so the
     # carrier below deliberately has no ``created_at``: this render is
     # age-independent BY CONSTRUCTION.  A stuck-``creating`` record still
-    # renders ``creating`` here -- this path is NOT a staleness detector (that
-    # is ``stuck_creating_finding``, which has no production caller yet).  The
-    # two local imports match this module's deliberately lazy
+    # renders ``creating`` here -- this path is NOT a staleness detector (the
+    # freshness verdict is carried by ``creating_drift_finding``; this display
+    # path reads only the resolved state and ignores freshness).  The two local
+    # imports match this module's deliberately lazy
     # ``thoughtmachine.container_record`` import style (see the startup scans).
     from types import SimpleNamespace
 
     from thoughtmachine.container_record import state as _cr_state
 
+    # A present live container is reported by its raw Docker state; an empty /
+    # unreadable one becomes the resolver's unknown sentinel, and only a wholly
+    # absent status (``None``) signals no live container.
+    live_state = (
+        raw
+        if isinstance(raw, str) and raw
+        else (_cr_state.LIVE_STATE_UNKNOWN if isinstance(status, dict) else None)
+    )
     resolved, _fresh = _cr_state.resolve_container_state(
         SimpleNamespace(state=record_state, created_at=""),
-        live_present=isinstance(status, dict),
+        live_state=live_state,
         now=None,
     )
     # The resolver yields the record's own vocabulary; render an unset/unknown

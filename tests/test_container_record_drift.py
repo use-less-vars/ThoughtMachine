@@ -240,6 +240,53 @@ def test_signature_for_varies_with_inputs():
     assert drift.signature_for("evt", "a", "c") != base
 
 
+def test_drift_finding_fresh_defaults_to_none():
+    # The new field is LAST with a default, so 5-arg positional construction
+    # (as used by ``_finding``) still works and yields fresh=None.
+    finding = _finding(drift.CLASS_IDENTITY, drift.EVENT_IDENTITY_CHANGED, "a", "b")
+    assert finding.fresh is None
+
+
+# ── live_state_for_record (read-only helper) ───────────────────────────────
+
+
+def test_live_state_for_record_none_when_absent():
+    rec = SimpleNamespace(id="rec-1", docker_id="cid-1")
+    assert drift.live_state_for_record(rec, FakeContainers([])) is None
+
+
+def test_live_state_for_record_prefers_attrs_state_status():
+    rec = SimpleNamespace(id="rec-1", docker_id="cid-1")
+    container = FakeContainer("cid-1", {"State": {"Status": "running"}})
+    assert drift.live_state_for_record(rec, FakeContainers([container])) == "running"
+
+
+def test_live_state_for_record_falls_back_to_status_attribute():
+    rec = SimpleNamespace(id="rec-1", docker_id="cid-1")
+    container = SimpleNamespace(id="cid-1", attrs={}, status="paused", labels={})
+    assert drift.live_state_for_record(rec, FakeContainers([container])) == "paused"
+
+
+def test_live_state_for_record_matches_by_record_label():
+    rec = SimpleNamespace(id="rec-1", docker_id="")
+    container = FakeContainer(
+        "cid-x", {"State": {"Status": "exited"}}, labels={drift.RECORD_LABEL_KEY: "rec-1"}
+    )
+    assert drift.live_state_for_record(rec, FakeContainers([container])) == "exited"
+
+
+def test_live_state_for_record_unreadable_returns_empty_string():
+    rec = SimpleNamespace(id="rec-1", docker_id="cid-1")
+    container = FakeContainer("cid-1", {})
+    assert drift.live_state_for_record(rec, FakeContainers([container])) == ""
+
+
+def test_live_state_for_record_listing_error_is_none():
+    rec = SimpleNamespace(id="rec-1", docker_id="cid-1")
+    client = FakeContainers(list_error=RuntimeError("boom"))
+    assert drift.live_state_for_record(rec, client) is None
+
+
 def test_drift_finding_is_frozen():
     finding = _finding(drift.CLASS_IDENTITY, drift.EVENT_IDENTITY_CHANGED, "a", "b")
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -624,6 +671,38 @@ def test_emit_appends_event_with_exact_payload(vault):
     assert entry["payload"]["actual"] == "b"
     assert entry["payload"]["signature"] == finding.signature
     assert entry["payload"]["detected_at"]
+
+
+def test_emit_lifecycle_finding_payload_carries_fresh(vault):
+    rec = api.create_record(WS, "ephemeral", "workspace-owned", vault_root=vault)
+    finding = drift.DriftFinding(
+        drift_class=drift.CLASS_LIFECYCLE,
+        event_type=drift.EVENT_CONTAINER_STUCK_CREATING,
+        expected="creating",
+        actual="running",
+        signature=drift.signature_for(
+            drift.EVENT_CONTAINER_STUCK_CREATING, "creating", "running"
+        ),
+        fresh=False,
+    )
+
+    out = drift.emit_drift_findings(WS, rec, [finding], vault_root=vault)
+
+    assert out == [finding]
+    log = api.read_event_log(WS, rec.id, vault_root=vault)
+    assert len(log) == 1
+    payload = log[0]["payload"]
+    assert set(payload) == {
+        "class",
+        "expected",
+        "actual",
+        "signature",
+        "detected_at",
+        "fresh",
+    }
+    assert payload["class"] == drift.CLASS_LIFECYCLE
+    assert payload["actual"] == "running"
+    assert payload["fresh"] is False
 
 
 def test_emit_dedupes_identical_finding(vault):

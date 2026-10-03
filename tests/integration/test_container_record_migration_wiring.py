@@ -22,6 +22,7 @@ import asyncio
 import json
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -522,14 +523,16 @@ def test_migration_rematerialises_write_on_create_record_after_crash(
 #
 # The lifespan must, immediately after the container-record migration, compare
 # every container-bearing record against its live container (read-only) using
-# the sanctioned ``drift.scan_record`` helper.  The step is bounded by
-# ``server._BOOT_DRIFT_SCAN_LIMIT`` and must never abort startup.
+# the sanctioned ``drift.detect_record_drift`` detector, then append the
+# ``state.creating_drift_finding`` lifecycle axis for stuck-``creating``
+# records.  The step is bounded by ``server._BOOT_DRIFT_SCAN_LIMIT`` and must
+# never abort startup.
 
 
 def test_lifespan_boot_drift_scan_inspects_each_container_record(
     monkeypatch, vault
 ):
-    """scan_record runs once per container-bearing record (skips id-less ones)."""
+    """detect_record_drift runs once per container-bearing record."""
     server = _load_server()
     ws = "ws-drift"
     rec_a = _make_container_record(ws, "cid-a", vault)
@@ -544,15 +547,15 @@ def test_lifespan_boot_drift_scan_inspects_each_container_record(
 
     scanned = []
 
-    def fake_scan(record, containers, *, workspace_id, **kwargs):
-        scanned.append((workspace_id, record.id))
+    def fake_detect(record, containers, *, permissions=None, capabilities=None):
+        scanned.append(record.id)
+        return []
 
-    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+    monkeypatch.setattr(drift_module, "detect_record_drift", fake_detect)
 
     _run_lifespan(server)
 
-    assert {rid for _ws, rid in scanned} == {rec_a.id, rec_b.id}
-    assert all(ws_id == ws for ws_id, _rid in scanned)
+    assert set(scanned) == {rec_a.id, rec_b.id}
 
     info = [e for e in events if "Startup container drift scan" in e[2]]
     assert info, events
@@ -576,10 +579,11 @@ def test_lifespan_boot_drift_scan_is_capped(monkeypatch, vault):
 
     scanned = []
 
-    def fake_scan(record, containers, *, workspace_id, **kwargs):
+    def fake_detect(record, containers, *, permissions=None, capabilities=None):
         scanned.append(record.id)
+        return []
 
-    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+    monkeypatch.setattr(drift_module, "detect_record_drift", fake_detect)
 
     _run_lifespan(server)
 
@@ -603,10 +607,10 @@ def test_boot_drift_scan_exception_does_not_break_startup(monkeypatch, vault):
 
     from thoughtmachine.container_record import drift as drift_module
 
-    def boom(record, containers, *, workspace_id, **kwargs):
+    def boom(record, containers, *, permissions=None, capabilities=None):
         raise RuntimeError("drift detector exploded")
 
-    monkeypatch.setattr(drift_module, "scan_record", boom)
+    monkeypatch.setattr(drift_module, "detect_record_drift", boom)
 
     _run_lifespan(server)  # must not raise
 
@@ -629,7 +633,7 @@ def test_lifespan_boot_drift_scan_threads_capabilities_and_permissions(
     / ``bad_permissions``) and the policy axis of drift detection is silently
     suppressed.  The scan must therefore thread the live workspace
     capabilities (never ``None``) and a ``permissions`` mapping through to
-    ``scan_record``.
+    ``detect_record_drift``.
     """
     server = _load_server()
     ws = "ws-drift-axes"
@@ -644,16 +648,23 @@ def test_lifespan_boot_drift_scan_threads_capabilities_and_permissions(
 
     calls = []
 
-    def fake_scan(record, containers, *, workspace_id, **kwargs):
-        calls.append((workspace_id, record.id, kwargs))
+    def fake_detect(record, containers, *, permissions=None, capabilities=None):
+        calls.append(
+            {
+                "record": record.id,
+                "permissions": permissions,
+                "capabilities": capabilities,
+            }
+        )
+        return []
 
-    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+    monkeypatch.setattr(drift_module, "detect_record_drift", fake_detect)
 
     _run_lifespan(server)
 
-    assert calls, "the boot scan never invoked scan_record"
-    assert all(kw.get("capabilities") is not None for _ws, _rid, kw in calls)
-    assert all(kw.get("permissions") is not None for _ws, _rid, kw in calls)
+    assert calls, "the boot scan never invoked detect_record_drift"
+    assert all(c["capabilities"] is not None for c in calls)
+    assert all(c["permissions"] is not None for c in calls)
 
 
 def test_boot_drift_scan_loads_capabilities_once_per_workspace(
@@ -686,10 +697,11 @@ def test_boot_drift_scan_loads_capabilities_once_per_workspace(
 
     scanned = []
 
-    def fake_scan(record, containers, *, workspace_id, **kwargs):
-        scanned.append((workspace_id, record.id))
+    def fake_detect(record, containers, *, permissions=None, capabilities=None):
+        scanned.append(record.id)
+        return []
 
-    monkeypatch.setattr(drift_module, "scan_record", fake_scan)
+    monkeypatch.setattr(drift_module, "detect_record_drift", fake_detect)
 
     _run_lifespan(server)
 
@@ -700,3 +712,165 @@ def test_boot_drift_scan_loads_capabilities_once_per_workspace(
     assert load_calls.count(ws_a) == 1, load_calls
     assert load_calls.count(ws_b) == 1, load_calls
 
+
+# ── Boot-scan lifecycle (stuck-``creating``) emission ───────────────────────
+#
+# After the two in-memory container listings (the detector's and the
+# lifecycle's, both served by the one startup shim), the boot scan appends the
+# ``drift.container_stuck_creating`` finding for any record stuck in
+# ``creating``.  These tests drive the REAL lifespan and read the emitted
+# event back out of the record's own log.
+#
+# ``detect_record_drift`` is stubbed to ``[]`` so ONLY the lifecycle axis can
+# emit; ``live_state_for_record`` is stubbed to pin the live report the boot
+# scan feeds ``creating_drift_finding``.
+
+
+def _no_findings(record, containers, *, permissions=None, capabilities=None):
+    """Detector stub: the boot scan's non-lifecycle axes come back empty."""
+    return []
+
+
+def _make_stated_record(ws, docker_id, vault, state):
+    """A record whose recorded ``state`` is set explicitly (creating/running)."""
+    rec = cr_api.begin_record(
+        ws, "persistent", "workspace-owned", vault_root=str(vault)
+    )
+    return cr_api.update_record(
+        ws, rec.id, vault_root=vault, docker_id=docker_id, state=state
+    )
+
+
+def _backdate_created_at(ws, record_id, vault, seconds_ago):
+    """Rewrite ``created_at`` on disk (``update_record`` forbids changing it)."""
+    path = storage.record_path(ws, record_id, vault)
+    data = storage.read_record_file(path)
+    data["created_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    ).isoformat()
+    storage.write_record_file(path, data)
+
+
+def _stuck_creating_events(ws, record_id, vault, drift_module):
+    return [
+        e
+        for e in cr_api.read_event_log(ws, record_id, vault_root=vault)
+        if e.get("event_type") == drift_module.EVENT_CONTAINER_STUCK_CREATING
+    ]
+
+
+def test_boot_scan_emits_stuck_creating_when_live_contradicts(monkeypatch, vault):
+    """A ``creating`` record with a live non-creating container is stuck.
+
+    The boot scan must append exactly one ``drift.container_stuck_creating``
+    event whose payload records the lifecycle class, ``expected="creating"``,
+    the normalised live state as ``actual`` and ``fresh=False``.
+    """
+    server = _load_server()
+    ws = "ws-lifecycle-running"
+    rec = _make_stated_record(ws, "cid-live", vault, "creating")
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    _record_log(monkeypatch, server)
+
+    from thoughtmachine.container_record import drift as drift_module
+
+    monkeypatch.setattr(drift_module, "detect_record_drift", _no_findings)
+    monkeypatch.setattr(
+        drift_module,
+        "live_state_for_record",
+        lambda record, containers, **kw: "running",
+    )
+
+    _run_lifespan(server)
+
+    stuck = _stuck_creating_events(ws, rec.id, vault, drift_module)
+    assert len(stuck) == 1, stuck
+    payload = stuck[0]["payload"]
+    assert payload["class"] == drift_module.CLASS_LIFECYCLE
+    assert payload["expected"] == "creating"
+    assert payload["actual"] == "running"
+    assert payload["fresh"] is False
+    assert payload["signature"] == drift_module.signature_for(
+        drift_module.EVENT_CONTAINER_STUCK_CREATING, "creating", "running"
+    )
+    # The contradiction cause must NOT collide with the absent cause's digest,
+    # or the two would silently suppress one another in the dedup gate.
+    assert payload["signature"] != drift_module.signature_for(
+        drift_module.EVENT_CONTAINER_STUCK_CREATING, "creating", ""
+    )
+
+
+def test_boot_scan_emits_stuck_creating_when_absent_past_expiry(monkeypatch, vault):
+    """A ``creating`` record past its window with no container is stuck.
+
+    ``actual`` is the empty string for the absent cause (distinct from the
+    contradiction cause) and ``fresh`` is ``False``.
+    """
+    server = _load_server()
+    ws = "ws-lifecycle-absent"
+    rec = _make_stated_record(ws, "cid-gone", vault, "creating")
+    _backdate_created_at(ws, rec.id, vault, 960)  # > CREATING_EXPIRY_SECONDS
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    _record_log(monkeypatch, server)
+
+    from thoughtmachine.container_record import drift as drift_module
+
+    monkeypatch.setattr(drift_module, "detect_record_drift", _no_findings)
+    monkeypatch.setattr(
+        drift_module,
+        "live_state_for_record",
+        lambda record, containers, **kw: None,
+    )
+
+    _run_lifespan(server)
+
+    stuck = _stuck_creating_events(ws, rec.id, vault, drift_module)
+    assert len(stuck) == 1, stuck
+    payload = stuck[0]["payload"]
+    assert payload["class"] == drift_module.CLASS_LIFECYCLE
+    assert payload["expected"] == "creating"
+    assert payload["actual"] == ""
+    assert payload["fresh"] is False
+    assert payload["signature"] == drift_module.signature_for(
+        drift_module.EVENT_CONTAINER_STUCK_CREATING, "creating", ""
+    )
+
+
+@pytest.mark.parametrize(
+    "recorded_state, live_state, backdate_seconds",
+    [
+        ("creating", "created", 0),  # live container still creating → fresh
+        ("creating", None, 0),  # absent but inside the window → fresh
+        ("running", None, 960),  # resolves to running, not a lifecycle case
+    ],
+)
+def test_boot_scan_emits_no_lifecycle_finding_when_not_stale(
+    monkeypatch, vault, recorded_state, live_state, backdate_seconds
+):
+    """No false positives: a fresh (or non-``creating``) record emits nothing."""
+    server = _load_server()
+    ws = "ws-lifecycle-fresh"
+    rec = _make_stated_record(ws, "cid-x", vault, recorded_state)
+    if backdate_seconds:
+        _backdate_created_at(ws, rec.id, vault, backdate_seconds)
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    _record_log(monkeypatch, server)
+
+    from thoughtmachine.container_record import drift as drift_module
+
+    monkeypatch.setattr(drift_module, "detect_record_drift", _no_findings)
+    monkeypatch.setattr(
+        drift_module,
+        "live_state_for_record",
+        lambda record, containers, **kw: live_state,
+    )
+
+    _run_lifespan(server)
+
+    assert _stuck_creating_events(ws, rec.id, vault, drift_module) == []

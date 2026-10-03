@@ -5,6 +5,12 @@ record state) input.  It is a characterisation guard: it MUST pass both on the
 pre-routing code (an inline record-state lookup) and after the display consumer
 is routed through the pure ``state.resolve_container_state`` resolver --
 byte-identical output for every input.
+
+The resolver is now fed a ``live_state`` keyword: ``None`` when no live status
+dict is present, the raw Docker ``status`` string when it is a non-empty
+string, else the unknown sentinel ``"unknown"``.  This is a DISPLAY path that
+reads only the resolved state and ignores the freshness flag, so the rendered
+values are unchanged by that routing -- the rows below pin them.
 """
 
 from __future__ import annotations
@@ -33,6 +39,11 @@ _RECORD_STATE_CASES = [
     # (d) known raw status wins over record state
     ({"status": "exited"}, "creating", "exited"),
     ({"status": "running"}, "stopped", "running"),
+    # (e) present-but-empty raw status -> unknown sentinel (still a live
+    # container); display still renders the record's own state vocabulary
+    ({"status": ""}, "creating", "creating"),
+    ({"status": ""}, "running", "running"),
+    ({"status": ""}, "", "stopped"),
 ]
 
 # Full raw-state table, with no record state.
