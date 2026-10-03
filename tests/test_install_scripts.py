@@ -161,6 +161,7 @@ if args and args[0].endswith("doctor_checks.py"):
             },
             "docker_present": False,
             "docker_hint": "apt-get install docker.io",
+            "advisory": {"package_manager": {"present": True, "name": "apt-get", "hint": "sudo apt-get install <pkg>"}},
         })
     elif flag == "--ensure-venv":
         _emit({"ok": True, "changed": False, "broken_reason": "", "detail": "up to date"})

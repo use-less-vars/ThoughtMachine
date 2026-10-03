@@ -34,6 +34,32 @@ d = json.load(sys.stdin)
 print(d.get(sys.argv[1], "") if isinstance(d, dict) else "")' "$1" 2>/dev/null || true
 }
 
+# Print the first package manager found on PATH, or empty if none. Probes a
+# fixed candidate order so the result is deterministic. Capability-based and
+# distribution-agnostic: the distribution identity is never inspected.
+detect_package_manager() {
+    for _pm in apt-get dnf pacman zypper apk; do
+        if command -v "$_pm" >/dev/null 2>&1; then
+            printf '%s' "$_pm"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Print the shell command that installs Docker for the given package manager.
+# The argument must come from detect_package_manager().
+package_manager_docker_install() {
+    case "$1" in
+        apt-get) printf '%s' "sudo apt-get update && sudo apt-get install -y docker.io" ;;
+        dnf)     printf '%s' "sudo dnf install -y docker" ;;
+        pacman)  printf '%s' "sudo pacman -S --noconfirm docker" ;;
+        zypper)  printf '%s' "sudo zypper --non-interactive install docker" ;;
+        apk)     printf '%s' "sudo apk add docker" ;;
+        *)       printf '%s' "" ;;
+    esac
+}
+
 DONE_OK=()
 DONE_SKIP=()
 
@@ -104,23 +130,16 @@ if [ "$IS_DARWIN" -eq 1 ]; then
     unset _dd
 fi
 
-# The architecture and distribution gates are Linux-only; macOS is accepted
-# as-is (Apple Silicon arm64 included).
+# The architecture gate is Linux-only; macOS is accepted as-is (Apple Silicon
+# arm64 included). The distribution is deliberately NOT gated: the installer is
+# distribution-agnostic and relies on capability detection (see
+# detect_package_manager) rather than reading the distribution identity.
 if [ "$IS_DARWIN" -eq 0 ]; then
     UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
     case "$UNAME_M" in
         x86_64|amd64) ;;
         *)
             echo "ERROR: unsupported architecture: $UNAME_M (expected x86_64/amd64)."
-            exit 1
-            ;;
-    esac
-
-    DISTRO_ID="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n1)"
-    case "$DISTRO_ID" in
-        debian|ubuntu) ;;
-        *)
-            echo "ERROR: unsupported distribution: ${DISTRO_ID:-unknown} (expected debian or ubuntu)."
             exit 1
             ;;
     esac
@@ -167,27 +186,40 @@ if [ "$DOCKER_RC" -ne 0 ]; then
                 echo ""
                 echo "  Installation aborted."
                 exit 1
-            elif sudo -n true 2>/dev/null; then
-                echo "      docker CLI not found - installing docker.io via apt-get (may take a moment)..."
-                sudo apt-get update && sudo apt-get install -y docker.io 2>&1 | sed 's/^/      /' || true
-                DOCKER_OUT="$(doctor --check-docker 2>&1)"
-                DOCKER_RC=$?
-                if [ "$DOCKER_RC" -ne 0 ]; then
-                    DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
-                    echo "      FAILED: Docker still not usable after installation."
-                    [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
-                    echo "      Start it with:  sudo systemctl enable --now docker"
+            else
+                PM_NAME="$(detect_package_manager)"
+                if [ -z "$PM_NAME" ]; then
+                    echo "      FAILED: Docker is not installed and no supported package manager was found."
+                    echo "      Looked for these package managers: apt-get, dnf, pacman, zypper, apk."
+                    echo "      Install Docker manually (https://docs.docker.com/engine/install/), then re-run ./install.sh"
                     echo ""
                     echo "  Installation aborted."
                     exit 1
                 fi
-            else
-                echo "      FAILED: Docker is not installed and this installer needs sudo to install it."
-                echo "      Run this yourself, then re-run ./install.sh:"
-                echo "      sudo apt-get update && sudo apt-get install -y docker.io"
-                echo ""
-                echo "  Installation aborted."
-                exit 1
+                DOCKER_INSTALL_CMD="$(package_manager_docker_install "$PM_NAME")"
+                if sudo -n true 2>/dev/null; then
+                    echo "      docker CLI not found - installing docker via ${PM_NAME} (may take a moment)..."
+                    echo "      ($DOCKER_INSTALL_CMD)"
+                    eval "$DOCKER_INSTALL_CMD" 2>&1 | sed 's/^/      /' || true
+                    DOCKER_OUT="$(doctor --check-docker 2>&1)"
+                    DOCKER_RC=$?
+                    if [ "$DOCKER_RC" -ne 0 ]; then
+                        DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
+                        echo "      FAILED: Docker still not usable after installation."
+                        [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                        echo "      Start it with:  sudo systemctl enable --now docker"
+                        echo ""
+                        echo "  Installation aborted."
+                        exit 1
+                    fi
+                else
+                    echo "      FAILED: Docker is not installed and this installer needs sudo to install it."
+                    echo "      Run this yourself, then re-run ./install.sh:"
+                    echo "      $DOCKER_INSTALL_CMD"
+                    echo ""
+                    echo "  Installation aborted."
+                    exit 1
+                fi
             fi
             ;;
         daemon_down)

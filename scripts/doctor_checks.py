@@ -365,6 +365,38 @@ def check_dot_thoughtmachine_writable(path: Optional[str] = None) -> Dict[str, A
     return {"ok": True, "hint": None, "detail": "%s exists and is writable" % target}
 
 
+# Package managers are probed in this fixed order; the FIRST one found on PATH
+# is reported. The package manager is ADVISORY (never critical): its presence
+# must not affect ``check_tools``'s ``ok`` / ``critical_missing``.
+_PACKAGE_MANAGERS = ("apt-get", "dnf", "pacman", "zypper", "apk")
+
+_PACKAGE_MANAGER_HINTS = {
+    "apt-get": "sudo apt-get install <pkg>",
+    "dnf": "sudo dnf install <pkg>",
+    "pacman": "sudo pacman -S --noconfirm <pkg>",
+    "zypper": "sudo zypper --non-interactive install <pkg>",
+    "apk": "sudo apk add <pkg>",
+}
+
+_NO_PACKAGE_MANAGER_HINT = (
+    "no package manager detected (looked for: %s); install the required "
+    "tools with your system's own tooling" % ", ".join(_PACKAGE_MANAGERS)
+)
+
+
+def detect_package_manager() -> Optional[str]:
+    """Return the first package manager on PATH, or None.
+
+    Probes the fixed candidate order in ``_PACKAGE_MANAGERS`` so the result is
+    deterministic when several managers are installed. Distribution-agnostic:
+    nothing here inspects ``/etc/os-release``.
+    """
+    for name in _PACKAGE_MANAGERS:
+        if shutil.which(name) is not None:
+            return name
+    return None
+
+
 def check_tools() -> Dict[str, Any]:
     """Check the tools required to run ThoughtMachine are on PATH.
 
@@ -373,10 +405,14 @@ def check_tools() -> Dict[str, Any]:
       * ``critical_missing`` -- list of missing CRITICAL tool names
       * ``docker_present`` / ``docker_hint`` -- convenience keys for the
         launcher's warn-only docker note
+      * ``advisory`` -- non-critical, additive diagnostics; currently
+        ``{"package_manager": {"present": bool, "name": str|None, "hint": str}}``
 
-    Critical tools: python3, node, npm, ss, sg, apt-get. Docker is
-    NON-critical: the project supports a docker-less degraded mode, so a
-    missing docker CLI never fails the check (warn-only).
+    Critical tools: python3, node, npm, ss, sg. Docker is NON-critical: the
+    project supports a docker-less degraded mode, so a missing docker CLI
+    never fails the check (warn-only). The system package manager is likewise
+    ADVISORY only -- it is reported under ``advisory`` and never makes the
+    check fail (distribution-agnostic hosts are supported).
     """
     critical = {
         "python3": "sudo apt-get install python3",
@@ -384,7 +420,6 @@ def check_tools() -> Dict[str, Any]:
         "npm": "install Node.js >= 18 (includes npm)",
         "ss": "sudo apt-get install iproute2",
         "sg": "sudo apt-get install util-linux",
-        "apt-get": "sudo apt-get update",
     }
     docker_hint = "sudo apt-get install docker.io (or install docker-ce: https://docs.docker.com/engine/install/)"
     tools: Dict[str, Any] = {}
@@ -396,6 +431,14 @@ def check_tools() -> Dict[str, Any]:
             critical_missing.append(name)
     docker_present = shutil.which("docker") is not None
     tools["docker"] = {"present": docker_present, "critical": False, "hint": docker_hint}
+    pm_name = detect_package_manager()
+    advisory = {
+        "package_manager": {
+            "present": pm_name is not None,
+            "name": pm_name,
+            "hint": _PACKAGE_MANAGER_HINTS[pm_name] if pm_name else _NO_PACKAGE_MANAGER_HINT,
+        }
+    }
     ok = not critical_missing
     detail = "all required tools are present" if ok else "missing critical tools: %s" % ", ".join(critical_missing)
     return {
@@ -405,6 +448,7 @@ def check_tools() -> Dict[str, Any]:
         "critical_missing": critical_missing,
         "docker_present": docker_present,
         "docker_hint": docker_hint,
+        "advisory": advisory,
     }
 
 
@@ -694,7 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-dotthoughtmachine", action="store_true", dest="check_dotthoughtmachine",
                         help="check ~/.thoughtmachine exists and is writable")
     parser.add_argument("--check-tools", action="store_true", dest="check_tools",
-                        help="check required tools (python3, node, npm, ss, sg, apt-get) are on PATH; "
+                        help="check required tools (python3, node, npm, ss, sg) are on PATH; "
                              "docker is warn-only (degraded mode is supported)")
     parser.add_argument("--ensure-venv", action="store_true", dest="ensure_venv",
                         help="create the venv if missing and install requirements.txt idempotently")
