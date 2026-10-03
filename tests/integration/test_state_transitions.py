@@ -206,9 +206,10 @@ def _receive_until(ws, target_type: str, path_label: str, max_events: int = 25, 
       * On an ``error`` event: if the target IS ``error``, return it; otherwise
         fail fast (an unexpected error means the trigger command failed).
       * On ``status_message``: fail fast ONLY on failure-looking texts
-        ("⚠", "failed", "internal error").  The load_session tail status
-        "Session ... loaded. Click Run to continue." (server.py:1458) is
-        legitimately SKIPPED when draining for a later target.
+        ("⚠", "failed", "internal error").  The load_session tail success
+        status was the one-shot "Session ... loaded" banner; it was removed in
+        PR #55, so there is no longer a success status to skip when draining
+        for a later target.
 
     Returns ``(target_event, events)`` where ``events`` is everything drained
     including the target event.

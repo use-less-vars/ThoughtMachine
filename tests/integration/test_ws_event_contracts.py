@@ -15,10 +15,10 @@ DELTAS vs the session-loaded template (all verified against current code):
     ``target_type`` instead of ``session_loaded``.  It still fails fast on
     ``error`` events (unless the target IS ``error``) and on failure-looking
     status_message texts (⚠/failed/internal error), but it does NOT fail on
-    "loaded"/"not found" — the load_session tail status_message
-    "Session ... loaded. Click Run to continue." (server.py:1458) legitimately
-    arrives after the bridge broadcasts and must be skipped when the target is
-    a later event (e.g. ``config_changed``, ``providers_list``).
+    "loaded"/"not found".  The load_session tail status was the one-shot
+    "Session ... loaded" banner, removed in PR #55, so nothing extra
+    legitimately arrives to be skipped when the target is a later event (e.g.
+    ``config_changed``, ``providers_list``).
 
   * ``providers_list`` (server.py:1057-1097) — real payload keys per provider:
     id/label/provider_type/base_url/api_key/default_model/models/timeout (NOT
@@ -198,9 +198,9 @@ def _receive_until(ws, target_type: str, path_label: str, max_events: int = 25, 
       * On an ``error`` event: if the target IS ``error``, return it; otherwise
         fail fast (an unexpected error means the trigger command failed).
       * On ``status_message``: fail fast ONLY on failure-looking texts
-        ("⚠", "failed", "internal error").  The load_session tail status
-        "Session ... loaded. Click Run to continue." (server.py:1458) is
-        legitimately SKIPPED when draining for a later target, and the
+        ("⚠", "failed", "internal error").  The load_session tail status was
+        the one-shot "Session ... loaded" banner, removed in PR #55, so it no
+        longer arrives to be skipped when draining for a later target, and the
         apply_config success status "✅ Switched to project: ..."
         (server.py:948-951) is skipped too.
 
