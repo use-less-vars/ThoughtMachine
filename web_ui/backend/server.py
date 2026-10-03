@@ -3351,20 +3351,17 @@ _CONTAINER_VIEW_RAW_STATE = {
     "error": "stopped",
 }
 
-#: Record ``state`` (fallback when no live status can be read) -> entry state.
-_CONTAINER_VIEW_RECORD_STATE = {
-    "running": "running",
-    "creating": "creating",
-    "": "stopped",
-}
-
-
 def _map_container_view_state(status, record_state):
     """Map (raw status dict-or-None, record.state) -> entry ``state`` value.
 
     OOMKilled True overrides everything -> ``oom``; otherwise the raw Docker
     status is mapped; when no usable live status exists the record's last
-    observed state is mapped instead (fail-safe default ``stopped``).
+    observed state is decided by the pure container-record resolver
+    (``thoughtmachine.container_record.state.resolve_container_state``), which
+    returns the record's OWN effective state (``running`` / ``creating`` /
+    ``""`` for unset/unknown).  This DISPLAY layer then renders that
+    vocabulary: an unset/unknown record state (``""``) renders as the
+    fail-safe ``stopped``.
     """
     if isinstance(status, dict):
         if status.get("oom_killed"):
@@ -3372,7 +3369,27 @@ def _map_container_view_state(status, record_state):
         raw = status.get("status")
         if raw in _CONTAINER_VIEW_RAW_STATE:
             return _CONTAINER_VIEW_RAW_STATE[raw]
-    return _CONTAINER_VIEW_RECORD_STATE.get(record_state or "", "stopped")
+    # No usable live status: the record-state decision belongs to the pure
+    # resolver -- the sole reader of the record's ``state`` field.  The caller
+    # passes ONLY the state string (``getattr(record, "state", "")``), so the
+    # carrier below deliberately has no ``created_at``: this render is
+    # age-independent BY CONSTRUCTION.  A stuck-``creating`` record still
+    # renders ``creating`` here -- this path is NOT a staleness detector (that
+    # is ``stuck_creating_finding``, which has no production caller yet).  The
+    # two local imports match this module's deliberately lazy
+    # ``thoughtmachine.container_record`` import style (see the startup scans).
+    from types import SimpleNamespace
+
+    from thoughtmachine.container_record import state as _cr_state
+
+    resolved, _fresh = _cr_state.resolve_container_state(
+        SimpleNamespace(state=record_state, created_at=""),
+        live_present=isinstance(status, dict),
+        now=None,
+    )
+    # The resolver yields the record's own vocabulary; render an unset/unknown
+    # (``""``) record state as the fail-safe ``stopped`` for the view.
+    return resolved or "stopped"
 
 
 # PC4/PC5: lifecycle_class -> view ``kind``. The retired ``runtime`` kind is

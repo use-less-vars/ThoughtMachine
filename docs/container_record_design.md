@@ -46,7 +46,7 @@ per container** (target arch §10). The authoritative field list is:
 | `event_log` | array | yes | `[]` | Append-only lifecycle + drift events (target arch §2, §3 move6). Entry shape below. |
 | `schema_version` | int | yes | `0` | `0` for records synthesised from live legacy state (target arch §2, §5). |
 | `inferred` | bool | yes | `false` | `true` when the record was synthesised from live Docker state rather than authored (target arch §2, §5). |
-| `state` | string | yes | `""` | Last observed container state; read by boot-drift (target arch §6). |
+| `state` | string | yes | `""` | Last observed container state; read by the pure resolver `resolve_container_state` (`thoughtmachine/container_record/state.py`); the display path reaches it via `web_ui.backend.server._map_container_view_state`. |
 | `created_at` | string (ISO-8601) | yes | now | Record creation time; read by UI ordering in `list_records()` (§1.3). |
 | `updated_at` | string (ISO-8601) | yes | now | Last mutation time; read by staleness display in drift events (§1.3). |
 
@@ -102,7 +102,7 @@ reads does not exist" are satisfied:
 | `event_log` | UI, audit |
 | `schema_version` | migration, integrity |
 | `inferred` | integrity (provenance), migration |
-| `state` | boot-drift (target arch §6) |
+| `state` | container-view display via `resolve_container_state` (`state.py`) |
 | `created_at` | UI ordering (`list_records`) |
 | `updated_at` | UI staleness (drift events) |
 
@@ -408,7 +408,8 @@ for history.
    (§2.2); the Docker container id lives in the separate `docker_id` field (§1). See §1.3 /
    §2.2.
 2. **`state` field** — **RESOLVED: keep `state`.** It is in the §1 field list; its reader is
-   boot-drift (target arch §6). See §1.3.
+   the pure resolver `resolve_container_state` (`thoughtmachine/container_record/state.py`).
+   See §1.3.
 3. **`migrated` / `created_at` / `updated_at`** — **RESOLVED: drop `migrated`; keep
    `created_at` and `updated_at`.** `migrated` was redundant with `schema_version >= 1` +
    `inferred`; `created_at` is read by UI ordering in `list_records()` and `updated_at` by
