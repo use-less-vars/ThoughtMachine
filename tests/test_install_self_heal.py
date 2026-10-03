@@ -224,6 +224,10 @@ def test_check_tools_docker_missing_is_warn_only(monkeypatch):
     assert result["tools"]["docker"]["present"] is False
     assert result["tools"]["docker"]["critical"] is False
     assert result["docker_present"] is False
+    # NEW CONTRACT (distro-agnostic): the package manager is NOT a critical
+    # tool -- even when present it is absent from tools / critical_missing.
+    assert "apt-get" not in result["tools"]
+    assert "apt-get" not in result["critical_missing"]
 
 
 # ---------------------------------------------------------------------------
