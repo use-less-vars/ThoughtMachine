@@ -4,11 +4,15 @@ Disk-pure session permission store (sidecar-first, additive).
 This module is the storage half of the permission-simplification effort
 (see ``.thoughtmachine/working_docs/impl_plan_permission_simplification.md``).
 It makes the **disk** the source of truth for raw, uncapped per-session
-permission grants.  Nothing else reads or writes it yet -- the tool gate is
-refactored in a later phase; this module only *adds* the store plus its
-hermetic unit tests (constraint: no modifications to security_gate.py,
-tool_executor.py, session/store.py, container launch code, routes, or the
-frontend in this round).
+permission grants.  The sidecar (P1) has exactly ONE grants writer: the REST
+endpoint ``web_ui/backend/session_routes.py::put_session_permissions``.  The
+store is also seeded once at session creation with an empty ``{}`` grant set
+by ``SessionManager._seed_permissions_sidecar`` (create-time only).  The
+former persistence-layer mirror ``SessionManager._sync_session_permissions_sidecar``
+and the ``merge_session_permissions`` helper have been REMOVED -- the session
+metadata (P2) is no longer a grants holder; it is stripped of
+``session_permissions`` before every write.  The gate reads grants through
+:func:`read_session_permissions`.
 
 Canonical on-disk layout (pinned by the Phase-1 RED test
 ``tests/test_permission_disk_staleness.py`` and blueprint section 3.1)::
@@ -36,8 +40,11 @@ A read that cannot positively establish grants must never silently grant:
 * no sidecar **and** no matching session record -> raises
   :class:`PermissionStoreError` (unknown session: deny, do not default);
 * a session record that exists but records no ``session_permissions`` ->
-  returns ``{}`` (no grants recorded; the gate applies defaults afterwards
-  -- an empty grant set is neutral, it grants nothing).
+  returns ``{}``.  This is a *present-but-empty* grant set (the record-source
+  equivalent of an empty sidecar): the gate then builds
+  ``SessionPermissions(**{})`` from it, i.e. the DEFAULT grants capped by the
+  workspace ceiling.  It is NOT the all-banned deny posture -- that is
+  reserved for an *absent* source (which raises, see the bullet above).
 
 Canonical session-grant shape
 -----------------------------

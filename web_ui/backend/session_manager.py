@@ -46,40 +46,6 @@ _DEFAULT_PROVIDER_ID = "v4_flash"
 _DEFAULT_MODEL = "deepseek-v4-flash"
 
 
-def merge_session_permissions(stored_raw: Any, new_dump: Dict[str, Any]) -> Dict[str, Any]:
-    """Fold stored ``session_permissions`` under a new config dump.
-
-    Persistence-layer defense against permission collapse: a config dump
-    (``SessionConfig.model_dump``) may carry only a partial
-    ``session_permissions`` dict (e.g. the grains the frontend renders), so
-    writing it verbatim would silently drop stored keys that were granted
-    elsewhere (operator-granted grains, workspace-ceiling survivors, legacy
-    migrations).
-
-    ``stored_raw`` is the previously persisted ``session_config`` metadata
-    dict (or ``None``/non-dict when there is nothing stored).  Returns a new
-    dump with ``session_permissions`` = stored keys merged under the new
-    keys (explicit new values win).  When the stored raw has no dict
-    ``session_permissions`` the new dump is returned unchanged; when the new
-    dump omits ``session_permissions`` entirely but stored keys exist, the
-    stored dict is preserved verbatim.
-    """
-    if not isinstance(stored_raw, dict):
-        return new_dump
-    stored_sp = stored_raw.get("session_permissions")
-    if not isinstance(stored_sp, dict):
-        return new_dump
-    new_sp = new_dump.get("session_permissions")
-    result = dict(new_dump)
-    if isinstance(new_sp, dict):
-        merged_sp = dict(stored_sp)
-        merged_sp.update(new_sp)
-        result["session_permissions"] = merged_sp
-    else:
-        result["session_permissions"] = dict(stored_sp)
-    return result
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # SessionManager
 # ══════════════════════════════════════════════════════════════════════════════
@@ -134,7 +100,6 @@ class SessionManager:
         session_config = SessionConfig(
             mode=mode,
             max_turns=100,
-            session_permissions={},
             enabled_tools=tools,
             provider_id="",
             model="",
@@ -183,7 +148,7 @@ class SessionManager:
             self._seed_permissions_sidecar(
                 workspace_id,
                 new_session.session_id,
-                session_config.session_permissions,
+                {},
             )
 
         frontend_config = self._config_manager.session_config_to_frontend(
@@ -312,18 +277,16 @@ class SessionManager:
             dump = session_config.model_dump(
                 exclude={"api_key"}, exclude_none=True
             )
-        # Never let a partial session_permissions dict clobber a fuller
-        # stored one (see merge_session_permissions).
-        dump = merge_session_permissions(
-            session.metadata.get("session_config"), dump
-        )
+        # session_permissions is NOT a persistence-layer grant source: the
+        # canonical, REST-owned store is the permission sidecar (P1).  Strip
+        # the key so a config dump can never act as a shadow grants writer.
+        dump.pop("session_permissions", None)
         session.metadata["session_config"] = dump
         if "agent_config" in session.metadata:
             del session.metadata["agent_config"]
         self._session_store.save_session(
             session, workspace_id=session.workspace_id
         )
-        self._sync_session_permissions_sidecar(session)
 
     # ── Permissions sidecar ───────────────────────────────────────────────────
 
@@ -359,49 +322,6 @@ class SessionManager:
                 f"permissions sidecar seed failed for session {session_id}: {e}",
             )
 
-    def _sync_session_permissions_sidecar(self, session: Session) -> None:
-        """Mirror the session's persisted grants into its permission sidecar.
-
-        Without this, a sidecar seeded at create would SHADOW a later grant
-        change -- ``read_session_permissions`` consults the sidecar before the
-        session record, and only the REST permissions endpoint otherwise writes
-        it.  The mirrored value is read from the very same
-        ``metadata['session_config']['session_permissions']`` the store persists,
-        so an absent/empty sidecar is filled to match the record; an existing
-        non-empty sidecar takes precedence and is left untouched (see below).
-        Never raises.
-
-        P1 (the sidecar) is REST-owned and authoritative once it holds grants:
-        a save must never mirror a stale P2 over an existing P1.  We therefore
-        read P1 first and skip the mirror when it already holds a non-empty
-        grant dict.  Failure policy: if the P1 read RAISES, skip the mirror
-        (fail closed in the safe direction) -- mirroring onto an unreadable P1
-        is exactly the clobber this guards against.
-        """
-        ws_id = getattr(session, "workspace_id", None)
-        if not ws_id:
-            return
-        # P1-existence guard: never let a stale P2 clobber an existing P1.
-        try:
-            import thoughtmachine.vault as _vault_module
-            from thoughtmachine.permission_store import read_session_permissions
-
-            existing_p1 = read_session_permissions(
-                _vault_module.vault_root(), ws_id, session.session_id
-            )
-        except Exception:  # noqa: BLE001 - unreadable P1: fail closed, do not mirror
-            return
-        if existing_p1:
-            return
-        metadata = getattr(session, "metadata", None)
-        sc = metadata.get("session_config") if isinstance(metadata, dict) else None
-        perms = sc.get("session_permissions") if isinstance(sc, dict) else None
-        # Mirror ONLY a non-empty source dict: an absent/partial session_config
-        # must never clobber an existing (possibly REST-written) sidecar with {}.
-        if not isinstance(perms, dict) or not perms:
-            return
-        self._seed_permissions_sidecar(ws_id, session.session_id, perms)
-
     # ── Save ──────────────────────────────────────────────────────────────────
 
     def save_session(
@@ -420,11 +340,10 @@ class SessionManager:
             dump = session_config.model_dump(
                 exclude={"api_key"}, exclude_none=True
             )
-            # Never let a partial session_permissions dict clobber a fuller
-            # stored one (see merge_session_permissions).
-            dump = merge_session_permissions(
-                session.metadata.get("session_config"), dump
-            )
+            # session_permissions is NOT a persistence-layer grant source: the
+            # canonical, REST-owned store is the permission sidecar (P1).  Strip
+            # the key so a config dump can never act as a shadow grants writer.
+            dump.pop("session_permissions", None)
             session.metadata["session_config"] = dump
         session.metadata.setdefault("source", "web_ui")
         if name:
@@ -433,7 +352,6 @@ class SessionManager:
         self._session_store.save_session(
             session, workspace_id=session.workspace_id
         )
-        self._sync_session_permissions_sidecar(session)
         return session
 
     # ── Delete ────────────────────────────────────────────────────────────────

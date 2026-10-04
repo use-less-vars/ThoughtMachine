@@ -139,7 +139,6 @@ from web_ui.backend.event_forwarder import EventForwarder, _active_tab_bridges
 from web_ui.backend.config_manager import ConfigManager
 from web_ui.backend.session_manager import (
     SessionManager,
-    merge_session_permissions,
 )
 
 # ── Workspace ID cache ──────────────────────────────────────────────────────
@@ -356,11 +355,10 @@ class WebAgentBridge:
         # Uncapped persistence snapshot of the session config.  load_session()
         # caps the LIVE config through the workspace permission ceiling, and
         # persisting that capped dump would permanently collapse stored full
-        # grants on the next switch-away / shutdown save (see save_session and
-        # merge_session_permissions: explicit new values win, so a capped dump
-        # overrides stored write/true/ask grants with read/false/banned).  This
-        # snapshot keeps the uncapped operator view for STORAGE only; the live
-        # capped config is never touched.
+        # grants on the next switch-away / shutdown save.  This snapshot keeps
+        # the uncapped operator view for STORAGE only; the live capped config
+        # is never touched.  (session_permissions is stripped before storage --
+        # the REST-owned permission sidecar is the canonical grant store.)
         self._session_config_persist_dump: Optional[Dict[str, Any]] = None
 
         # Persisted worker contexts loaded from workspace on session load
@@ -1677,11 +1675,8 @@ class WebAgentBridge:
                     workspace_id=self._workspace_id,
                     metadata={
                         'session_config': (
-                            merge_session_permissions(
-                                self._loaded_session.metadata.get('session_config')
-                                if self._loaded_session else None,
-                                persist_dump,
-                            )
+                            {k: v for k, v in persist_dump.items()
+                             if k != 'session_permissions'}
                             if persist_dump
                             else {}
                         ),
@@ -1692,15 +1687,14 @@ class WebAgentBridge:
                 # Update existing session metadata
                 session.metadata.setdefault('session_config', {})
                 if persist_dump:
-                    # Fold stored session_permissions under the new dump so a
-                    # partial frontend payload can never collapse the stored
-                    # permission set (see merge_session_permissions).  The dump
-                    # is the uncapped snapshot, so explicit operator grants are
-                    # preserved and the in-memory ceiling cap is never written.
-                    session.metadata['session_config'] = merge_session_permissions(
-                        session.metadata.get('session_config'),
-                        persist_dump,
-                    )
+                    # session_permissions is NOT a persistence-layer grant
+                    # source: the canonical, REST-owned store is the permission
+                    # sidecar (P1).  Strip the key so this uncapped dump can
+                    # never act as a shadow grants writer.
+                    session.metadata['session_config'] = {
+                        k: v for k, v in persist_dump.items()
+                        if k != 'session_permissions'
+                    }
                 session.metadata.setdefault('source', 'web_ui')
 
             # Apply name: explicit arg > existing loaded session name > generated
