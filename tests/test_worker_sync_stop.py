@@ -20,9 +20,12 @@ import queue
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import tools.workspace.worker_container as worker_container
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL, RECORD_LABEL_KEY
 from tools.workspace import worker as worker_module
 from tools.workspace.worker import (
     Worker,
@@ -137,7 +140,11 @@ def _spawn_worker(tmp_path, monkeypatch, name, session_id, container_manager=Non
 
 
 def _owned_container(cid, name, owner):
-    return _FakeContainer(cid, name, {_WORKER_CONTAINER_LABEL: owner})
+    return _FakeContainer(
+        cid,
+        name,
+        {_WORKER_CONTAINER_LABEL: owner, RECORD_LABEL_KEY: "rec-" + cid},
+    )
 
 
 def _resource_container(cid, name):
@@ -215,6 +222,17 @@ def test_sync_worker_docker_blocked_stop_waits_for_exit(tmp_path, monkeypatch):
     thread is still alive. A worker stuck in a DockerCodeRunner call times
     out; the timeout branch stops it, reclaims its containers, and waits for
     the thread to actually exit before returning the envelope."""
+    # fail-CLOSED migration: owned fakes carry RECORD_LABEL_KEY (see
+    # _owned_container), so route their record lookup through the module-global
+    # seam as EPHEMERAL. Only record-labelled containers trigger the lookup;
+    # the resource container never resolves as reclaimed regardless.
+    monkeypatch.setattr(
+        worker_container,
+        "find_by_docker_label",
+        lambda record_id, vault_root=None: SimpleNamespace(
+            lifecycle_class=LIFECYCLE_EPHEMERAL,
+        ),
+    )
     owner = "sess-s1:w1"
     cm = _FakeContainerManager(
         [
@@ -312,6 +330,17 @@ def test_sync_worker_normal_completion_no_early_return(tmp_path, monkeypatch):
 def test_sync_worker_stop_does_not_touch_resource_containers(tmp_path, monkeypatch):
     """Through the full timeout+wait flow, resource containers are never
     stopped or removed — only the worker's own containers are reclaimed."""
+    # fail-CLOSED migration: owned fakes carry RECORD_LABEL_KEY (see
+    # _owned_container), so route their record lookup through the module-global
+    # seam as EPHEMERAL. Only record-labelled containers trigger the lookup;
+    # the resource containers never resolve as reclaimed regardless.
+    monkeypatch.setattr(
+        worker_container,
+        "find_by_docker_label",
+        lambda record_id, vault_root=None: SimpleNamespace(
+            lifecycle_class=LIFECYCLE_EPHEMERAL,
+        ),
+    )
     owner = "sess-s3:w3"
     cm = _FakeContainerManager(
         [

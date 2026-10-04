@@ -359,6 +359,9 @@ from types import SimpleNamespace
 from tools.workspace.job_registry import WorkerJobRegistry
 from tools.workspace.worker import WorkerThread
 
+import tools.workspace.worker_container as worker_container
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL, RECORD_LABEL_KEY
+
 
 def _join_thread(status: str = "ready") -> MagicMock:
     """Live thread fake with the join-path attributes (real stop event)."""
@@ -851,7 +854,10 @@ class TestWorkerPauseResumeSemantics(_OpSemBase):
         owned = {
             "container_id": "c1",
             "name": "w1box",
-            "labels": {"thoughtmachine.worker": "sess-op-semantics:w1"},
+            "labels": {
+                "thoughtmachine.worker": "sess-op-semantics:w1",
+                RECORD_LABEL_KEY: "rec-owned-c1",
+            },
         }
         resource_label = {
             "container_id": "c2",
@@ -871,7 +877,11 @@ class TestWorkerPauseResumeSemantics(_OpSemBase):
         }
         no_labels = {"container_id": "c6", "name": "x"}
         owned_obj = SimpleNamespace(
-            name="w1obj", labels={"thoughtmachine.worker": "sess-op-semantics:w1"}
+            name="w1obj",
+            labels={
+                "thoughtmachine.worker": "sess-op-semantics:w1",
+                RECORD_LABEL_KEY: "rec-owned-obj",
+            },
         )
         sibling_obj = SimpleNamespace(
             name="w2obj", labels={"thoughtmachine.worker": "sess-op-semantics:w2"}
@@ -894,6 +904,19 @@ class TestWorkerPauseResumeSemantics(_OpSemBase):
         fake._is_worker_owned_container = (
             WorkerThread._is_worker_owned_container.__get__(fake, WorkerThread)
         )
+
+        # Fail-closed teardown reclaims a container only when its canonical
+        # record resolves to the ephemeral class. Patch the seam the green
+        # teardown tests use so the OWNED fakes (c1 dict + owned_obj) reclaim.
+        _finder = mock.patch.object(
+            worker_container,
+            "find_by_docker_label",
+            lambda record_id, vault_root=None: SimpleNamespace(
+                lifecycle_class=LIFECYCLE_EPHEMERAL
+            ),
+        )
+        _finder.start()
+        self.addCleanup(_finder.stop)
 
         WorkerThread._cleanup_worker_containers(fake)
 

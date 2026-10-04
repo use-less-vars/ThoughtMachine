@@ -40,6 +40,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.workspace.worker import WorkerThread  # noqa: E402
+import tools.workspace.worker_container as worker_container  # noqa: E402
+from thoughtmachine.container_record import (  # noqa: E402
+    LIFECYCLE_EPHEMERAL,
+    RECORD_LABEL_KEY,
+)
 
 SYS_PROMPT = "You are a helpful worker assistant."
 
@@ -92,6 +97,13 @@ class _RunSafetyPatches(unittest.TestCase):
             mock.patch("tools.workspace.worker.unregister_worker_event_bus",
                        new=lambda *a, **k: None),
             mock.patch("tools.workspace.worker.global_event_bus", new=None),
+            mock.patch.object(
+                worker_container,
+                "find_by_docker_label",
+                new=lambda record_id, vault_root=None: SimpleNamespace(
+                    lifecycle_class=LIFECYCLE_EPHEMERAL,
+                ),
+            ),
         ]
         for p in patchers:
             p.start()
@@ -108,7 +120,7 @@ class _RunSafetyPatches(unittest.TestCase):
 WORKER_CONTAINER = SimpleNamespace(
     id="c-w1",
     name="tm-worker-w-test",
-    labels={"thoughtmachine.worker": "s1:w-test"},
+    labels={"thoughtmachine.worker": "s1:w-test", RECORD_LABEL_KEY: "rec-worker-cleanup"},
 )
 RESOURCE_CONTAINER = SimpleNamespace(
     id="c-res",
@@ -287,7 +299,7 @@ class TestCrossWorkerIsolation(_RunSafetyPatches):
         worker_a = SimpleNamespace(
             id="c-wa",
             name="tm-worker-w-a",
-            labels={"thoughtmachine.worker": "s1:w-a"},
+            labels={"thoughtmachine.worker": "s1:w-a", RECORD_LABEL_KEY: "rec-worker-a"},
         )
         worker_b = SimpleNamespace(
             id="c-wb",

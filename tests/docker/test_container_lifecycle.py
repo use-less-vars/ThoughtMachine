@@ -800,6 +800,33 @@ class TestContainerWorkerLabel:
         return manager
 
     def test_worker_label_stamped_on_fresh_create(self):
+        from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
+
+        vault_root = tempfile.mkdtemp(prefix="tm-worker-label-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            r = manager.start(
+                name="worker-owned",
+                worker_name="w1",
+                lifecycle_class=LIFECYCLE_EPHEMERAL,
+            )
+            assert r["status"] == "created"
+            container = fake.get(r["id"])
+            assert container.labels["thoughtmachine.worker"] == "w1"
+            assert container.labels["thoughtmachine.workspace_id"] == workspace_id
+            assert container.labels["thoughtmachine.container_name"] == "worker-owned"
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
+
+    def test_worker_label_absent_on_persistent_create(self):
+        """A PERSISTENT create WITH worker_name must NOT stamp the label.
+
+        The worker label is a TEARDOWN-OWNERSHIP marker only; persistent/
+        service/resource containers are long-lived and must never be reaped by
+        worker teardown, so the class gate keeps the label off them.
+        """
         vault_root = tempfile.mkdtemp(prefix="tm-worker-label-")
         try:
             workspace_id = str(uuid.uuid4())
@@ -808,9 +835,8 @@ class TestContainerWorkerLabel:
             r = manager.start(name="worker-owned", worker_name="w1")
             assert r["status"] == "created"
             container = fake.get(r["id"])
-            assert container.labels["thoughtmachine.worker"] == "w1"
+            assert "thoughtmachine.worker" not in container.labels
             assert container.labels["thoughtmachine.workspace_id"] == workspace_id
-            assert container.labels["thoughtmachine.container_name"] == "worker-owned"
         finally:
             shutil.rmtree(vault_root, ignore_errors=True)
 
@@ -829,12 +855,18 @@ class TestContainerWorkerLabel:
             shutil.rmtree(vault_root, ignore_errors=True)
 
     def test_worker_label_not_added_on_reuse(self):
+        from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
+
         vault_root = tempfile.mkdtemp(prefix="tm-worker-label-")
         try:
             workspace_id = str(uuid.uuid4())
             fake = FakeContainers()
             manager = self._make_manager(fake, workspace_id, vault_root)
-            r1 = manager.start(name="shared", worker_name="w1")
+            r1 = manager.start(
+                name="shared",
+                worker_name="w1",
+                lifecycle_class=LIFECYCLE_EPHEMERAL,
+            )
             assert r1["status"] == "created"
             r2 = manager.start(name="shared", worker_name="w2")
             assert r2["status"] == "reused"

@@ -15,11 +15,14 @@ Covers:
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from tools.workspace import worker as worker_module
 from tools.workspace.worker import Worker
+import tools.workspace.worker_container as worker_container
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
 
 from tests.test_worker_sync_query_timeout_containment import (
     _FakeContainerManager,
@@ -147,6 +150,19 @@ def test_reset_does_not_touch_other_workers_or_resources(tmp_path, monkeypatch):
     )
     w2 = _spawn_worker(
         tmp_path, monkeypatch, name="w2", session_id=SID, container_manager=cm
+    )
+
+    # fail-CLOSED migration: the owned fakes already carry RECORD_LABEL_KEY
+    # (via the imported _owned_container helper), so route their record lookup
+    # through the module-global seam as EPHEMERAL. Only record-labelled
+    # containers trigger the lookup; the sibling owner (w2) and the resource
+    # container never resolve as reclaimed regardless.
+    monkeypatch.setattr(
+        worker_container,
+        "find_by_docker_label",
+        lambda record_id, vault_root=None: SimpleNamespace(
+            lifecycle_class=LIFECYCLE_EPHEMERAL,
+        ),
     )
 
     result = Worker(action="reset", worker_name="w1", session_id=SID)._action_reset(
