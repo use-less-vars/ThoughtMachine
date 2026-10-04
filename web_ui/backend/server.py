@@ -3508,6 +3508,41 @@ def _record_view_match_keys(record):
     return keys
 
 
+def _live_envelope_from_container(container):
+    """Derive the LIVE permission envelope from a running container's attrs.
+
+    Returns a *partial* ``{network, filesystem, mem_limit}`` mapping carrying
+    ONLY the axes the live inspect payload can witness, or ``None`` when none
+    can be read (no attrs / unreadable payload).  ``network`` is a bool
+    (``True`` unless the live network mode is ``"none"``), ``filesystem`` is
+    ``"write"`` / ``"read"`` (from the ``/workspace`` mount's ``RW`` flag), and
+    ``mem_limit`` is the raw byte string.  The field names mirror the record's
+    ``permissions`` dict closely enough for the badge text, but the values are
+    sourced from the CONTAINER ITSELF (live), never from the record's frozen
+    creation intent -- which is the whole point of the panel.
+    """
+    from thoughtmachine.container_record.snapshot import snapshot_from_attrs
+
+    try:
+        snapshot = snapshot_from_attrs(getattr(container, "attrs", None))
+    except Exception:
+        return None
+
+    envelope = {}
+    network_mode = snapshot.get("network_mode")
+    if isinstance(network_mode, str) and network_mode:
+        envelope["network"] = network_mode != "none"
+    workspace_mode = snapshot.get("workspace_mode")
+    if workspace_mode == "rw":
+        envelope["filesystem"] = "write"
+    elif workspace_mode == "ro":
+        envelope["filesystem"] = "read"
+    mem_limit = snapshot.get("mem_limit")
+    if isinstance(mem_limit, str) and mem_limit:
+        envelope["mem_limit"] = mem_limit
+    return envelope or None
+
+
 def _recordless_view_entry(container, manager, workspace_id):
     """Build a view entry for a LIVE container that has NO record.
 
@@ -3542,14 +3577,15 @@ def _recordless_view_entry(container, manager, workspace_id):
         "shared": kind in ("persistent", "resource"),
         "live": True,
         "unrecorded": True,
+        "live_envelope": _live_envelope_from_container(container),
     }
 
 
-def _container_view_entry(record, manager, workspace_id, live=None):
+def _container_view_entry(record, manager, workspace_id, live=None, live_envelope=None):
     """Build one container-view entry dict from a record (+ its live status).
 
     Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
-    permission_drift, shared, live, unrecorded``.  ``live`` is ``True`` when the
+    permission_drift, shared, live, unrecorded, live_envelope``.  ``live`` is ``True`` when the
     record has a matching live container, ``False`` when it has none (the UI
     renders it distinctly, it is never hidden), and ``None`` when the live set
     could not be enumerated (unverified -- not rendered as missing).
@@ -3560,6 +3596,9 @@ def _container_view_entry(record, manager, workspace_id, live=None):
     ``permission_drift`` is ``None`` when either side is unknown (an unwired /
     pre-v5 record has no ``permissions``) -- the underlying drift helper is
     already fail-safe and returns ``None`` when Docker is unavailable.
+    ``live_envelope`` is the live permission envelope derived from the matching
+    running container (``None`` when there is none / it is unreadable); it is
+    declared here so the record shape and the recordless shape agree.
     """
     lifecycle = getattr(record, "lifecycle_class", "") or ""
     kind = _CONTAINER_KIND_BY_LIFECYCLE.get(lifecycle, "persistent")
@@ -3590,6 +3629,7 @@ def _container_view_entry(record, manager, workspace_id, live=None):
         "shared": kind in ("persistent", "resource"),
         "live": live,
         "unrecorded": False,
+        "live_envelope": live_envelope,
     }
 
 
@@ -3620,18 +3660,30 @@ def _build_container_view_entries(manager, workspace_id):
     for _, keys in record_keys:
         record_key_union |= keys
     live_key_union = set()
+    live_by_key = {}
     if live_containers is not None:
         for container in live_containers:
-            live_key_union |= _container_view_match_keys(container)
+            for key in _container_view_match_keys(container):
+                live_key_union.add(key)
+                live_by_key.setdefault(key, container)
 
     entries = []
     for record, keys in record_keys:
+        matched_container = None
         if live_containers is None:
             live_marker = None
         else:
             live_marker = bool(keys & live_key_union)
+            for key in keys:
+                if key in live_by_key:
+                    matched_container = live_by_key[key]
+                    break
+        live_envelope = (
+            _live_envelope_from_container(matched_container)
+            if matched_container is not None else None)
         entries.append(
-            _container_view_entry(record, manager, workspace_id, live=live_marker))
+            _container_view_entry(record, manager, workspace_id,
+                                  live=live_marker, live_envelope=live_envelope))
 
     if live_containers is not None:
         for container in live_containers:

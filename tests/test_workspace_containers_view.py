@@ -16,7 +16,8 @@ Pinned contract (from the C.1 brief + recon, dev=bf7fb9f):
   stay derived from ``ContainerManager.list_containers()`` /
   ``max_containers``.
 * Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
-  permission_drift, shared, live, unrecorded``.  ``kind`` is ``ephemeral``|
+  permission_drift, shared, live, unrecorded, live_envelope``.  ``kind`` is
+  ``ephemeral``|
   ``persistent``|``resource`` (PC5).  ``ephemeral`` lifecycle -> ``ephemeral``;
   ``persistent`` and ``service`` -> ``persistent`` (PC4: ``service`` is a
   persistent-class container in intent; it has no producers today, so it
@@ -78,6 +79,11 @@ ENTRY_KEYS = {
     # them here makes the ``ENTRY_KEYS <= set(...)`` assertions bind them.
     "live",
     "unrecorded",
+    # Live permission envelope (Fix A): derived from the RUNNING container's
+    # inspect attrs (network / filesystem / mem_limit) so the badge shows live
+    # state, not the record's frozen creation envelope.  Present (possibly
+    # ``None``) on EVERY entry, so pinning the key here binds it.
+    "live_envelope",
 }
 
 
@@ -767,6 +773,79 @@ def test_live_container_without_record_appears(vault, monkeypatch):
     assert entry["unrecorded"] is True
     assert ENTRY_KEYS <= set(entry)
 
+
+# ── Fix A: the LIVE permission envelope (running container, not the record) ──
+
+#: Full Docker inspect-shaped attrs: network "none", /workspace mounted RO, and
+#: a 512 MiB memory limit.  ``snapshot_from_attrs`` reads these to
+#: ``network_mode="none"`` / ``workspace_mode="ro"`` / ``mem_limit="536870912"``.
+_LIVE_ATTRS = {
+    "HostConfig": {
+        "NetworkMode": "none",
+        "Memory": 536870912,
+        "CpuQuota": 50000,
+        "OomScoreAdj": 0,
+        "RestartPolicy": {"Name": ""},
+    },
+    "Config": {"Image": "sha256:ctr-image"},
+    "Image": "sha256:deadbeef",
+    "Mounts": [{"Destination": "/workspace", "RW": False}],
+}
+
+
+class _LiveContainerWithAttrs:
+    """A live container object carrying a FULL inspect ``attrs`` payload.
+
+    ``_FakeClientContainer`` only exposes ``attrs["State"]``; the live-envelope
+    derivation also needs ``HostConfig`` / ``Mounts``.  These tests inject the
+    live set through ``_list_workspace_live_containers`` with this object.
+    """
+
+    def __init__(self, container_id, name, attrs):
+        self.id = container_id
+        self.name = name
+        self.labels = {}
+        self.attrs = attrs
+
+
+def _install_live_set(monkeypatch, containers):
+    monkeypatch.setattr(
+        server_module, "_list_workspace_live_containers",
+        lambda manager, workspace_id: list(containers))
+
+
+def test_entry_live_envelope_derived_from_running_container(vault, monkeypatch):
+    """Fix A: a record's entry carries ``live_envelope`` from the LIVE attrs.
+
+    Currently FAILS: the entry has no ``live_envelope`` key, so the badge can
+    only ever show the record's frozen creation envelope.
+    """
+    _seed(vault, record_id="rec-env", name="c-env", docker_id="docker-env",
+          lifecycle_class="persistent")
+    _install_manager(monkeypatch, FakeManager(
+        statuses={"docker-env": {"status": "running"}},
+        names={"docker-env": "c-env"}))
+    _install_live_set(
+        monkeypatch, [_LiveContainerWithAttrs("docker-env", "c-env", _LIVE_ATTRS)])
+
+    entry = _find_entry(_list().json()["containers"], "rec-env")
+    assert entry["live"] is True
+    assert entry["live_envelope"] == {
+        "network": False, "filesystem": "read", "mem_limit": "536870912"}
+
+
+def test_recordless_live_container_carries_live_envelope(vault, monkeypatch):
+    """Fix A: an unrecorded live container also carries ``live_envelope``."""
+    _install_manager(monkeypatch, FakeManager(
+        statuses={"tm-res-env": {"status": "running"}},
+        names={"tm-res-env": "tm-res-env-git"}))
+    _install_live_set(monkeypatch, [
+        _LiveContainerWithAttrs("tm-res-env", "tm-res-env-git", _LIVE_ATTRS)])
+
+    entry = _find_entry_by_name(_list().json()["containers"], "tm-res-env-git")
+    assert entry["unrecorded"] is True
+    assert entry["live_envelope"] == {
+        "network": False, "filesystem": "read", "mem_limit": "536870912"}
 
 
 # ── EXTENSION 2: entries-derived count + key pinning ────────────────────────

@@ -363,4 +363,45 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     // revealed dead row keeps its existing "no live container" badge
     expect(screen.getByTestId('container-missing-eph-dead')).toBeInTheDocument()
   })
+
+  // ── Fix A: the permission badge describes the RUNNING container ─────────────
+  // When the entry carries `live_envelope` (derived server-side from the live
+  // Docker inspect), it WINS over the record's frozen creation `permissions`.
+  it('badge reflects live_envelope (live) over the recorded permissions', async () => {
+    stubFetch(
+      payload({
+        ephemeral: [
+          ephemeralEntry({
+            id: 'eph-live-env',
+            // the record's frozen envelope says network on / rw ...
+            permissions: { network: true, filesystem: 'rw', mem_limit: '512m' },
+            // ... but the RUNNING container is network-off / read-only.
+            live_envelope: { network: false, filesystem: 'read' },
+          }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const badge = await screen.findByTestId('permission-badge-eph-live-env')
+    expect(badge).toHaveTextContent('net off · fs read')
+    expect(badge).not.toHaveTextContent('fs rw')
+  })
+
+  it('badge falls back to the recorded permissions when no live_envelope is present', async () => {
+    stubFetch(
+      payload({
+        ephemeral: [
+          ephemeralEntry({
+            id: 'eph-no-env',
+            permissions: { network: true, filesystem: 'rw', mem_limit: '512m' },
+          }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const badge = await screen.findByTestId('permission-badge-eph-no-env')
+    expect(badge).toHaveTextContent('net on · fs rw · mem 512m')
+  })
 })
