@@ -2359,6 +2359,51 @@ class WebAgentBridge:
 
         self._map_and_emit(event)
 
+    def _core_persisted_error_notice(self, raw_event: Dict[str, Any]) -> bool:
+        """Return True iff the bridge should SUPPRESS its transient ``⚠ Error``
+        ``status_message`` for this error event because the core already
+        persisted a corresponding notice.
+
+        Suppression requires BOTH:
+
+        1. **Session state** — ``self._session`` is set, its ``user_history`` is
+           non-empty, and its LAST message is a ``[SYSTEM NOTIFICATION]`` whose
+           ``content`` embeds ``raw_event['message']`` (correspondence prevents
+           suppressing an *unrelated* trailing notice, e.g. a token warning).
+           This is the only viable signal: the duplicate producers and the
+           bridge-only ones can emit byte-identical event dicts (P5 and P7 both
+           emit ``AGENT_CREATION_ERROR`` + ``message=str(e)`` + ``traceback``),
+           so no event field distinguishes them.
+
+        2. **Producer exclusion** — ``raw_event['error_type']`` must NOT be
+           ``'AGENT_CREATION_ERROR'`` (P5 agent-start failure / P7 restart
+           failure) nor ``'invalid_config'`` (P1 config-change failure). Those
+           own a first-class UI surface and MUST always keep the bubble; P7
+           additionally has no matching notice. Only P2 (LLMError), P3
+           (ProviderError) and P4 (unexpected Exception) are suppressible.
+
+        Only the ``status_message`` broadcast is guarded; the
+        ``conversation_changed`` re-sync is unchanged.
+        """
+        if raw_event.get('error_type') in ('AGENT_CREATION_ERROR', 'invalid_config'):
+            return False
+        if self._session is None:
+            return False
+        raw_message = raw_event.get('message')
+        if not raw_message:
+            return False
+        history = self._session.user_history
+        if not history:
+            return False
+        last = history[-1]
+        try:
+            content = last.get('content', '') if hasattr(last, 'get') else ''
+        except Exception:
+            return False
+        if not isinstance(content, str) or not content.startswith('[SYSTEM NOTIFICATION]'):
+            return False
+        return raw_message in content
+
     def _map_and_emit(self, raw_event: Dict[str, Any]) -> None:
         """
         Dual-stream event mapping: tick state and conversation changes
@@ -2477,11 +2522,17 @@ class WebAgentBridge:
                 })
 
         elif event_type == "error":
-            msg_text = raw_event.get('message', 'unknown')
             error_type = raw_event.get('error_type', 'PROVIDER_ERROR')
-            self._forwarder.broadcast(self._session_id, "status_message", {
-                "text": f"⚠ Error: {msg_text}",
-            })
+            # Emit the transient ⚠ bubble UNLESS the core already persisted a
+            # matching [SYSTEM NOTIFICATION] notice AND the producer is not an
+            # excluded one (invalid_config / AGENT_CREATION_ERROR always emit;
+            # see _core_persisted_error_notice). The status_message channel
+            # itself is otherwise unchanged.
+            if not self._core_persisted_error_notice(raw_event):
+                msg_text = raw_event.get('message', 'unknown')
+                self._forwarder.broadcast(self._session_id, "status_message", {
+                    "text": f"⚠ Error: {msg_text}",
+                })
             # Error may have added a system notification to session; sync it
             if self._session is not None:
                 self._history_version = self._session.conversation_version
