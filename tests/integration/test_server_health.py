@@ -291,6 +291,55 @@ def test_list_containers_manager_failure(contract_server):
     assert resp.json() == {"error": "boom"}
 
 
+def test_list_containers_registry_corrupt_returns_503(contract_server):
+    """Corrupt registry (unreadable registry FILE) -> 503 naming the registry
+    fault, NOT a misleading 404 'not found or path unresolvable'.
+
+    With no explicit workspace_path the registry lookup must let
+    WorkspaceRegistryUnavailable propagate so the route reports the
+    server-side fault instead of swallowing it into ``None``.
+    """
+    from thoughtmachine.workspace_registry import WorkspaceRegistry
+
+    app, _ = contract_server
+    reg = WorkspaceRegistry.get_default()
+    reg_path = reg._path
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    reg_path.write_text("not valid json{{{", encoding="utf-8")
+    try:
+        with TestClient(app) as client:
+            resp = client.get("/api/workspace/ws-1/containers")
+    finally:
+        reg_path.unlink(missing_ok=True)
+    assert resp.status_code == 503
+    assert "registry" in resp.json()["error"].lower()
+
+
+def test_list_containers_registry_corrupt_with_path_returns_503(contract_server):
+    """Corrupt registry + explicit workspace_path -> 503 (NOT a bogus 400
+    'not registered'): explicit-path validation must not swallow the fault."""
+    from thoughtmachine.workspace_registry import WorkspaceRegistry
+
+    app, tmp_home = contract_server
+    ws_path = os.path.join(tmp_home, "ws-registry-corrupt")
+    os.makedirs(ws_path, exist_ok=True)
+    reg = WorkspaceRegistry.get_default()
+    reg_path = reg._path
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    reg_path.write_text("not valid json{{{", encoding="utf-8")
+    try:
+        with TestClient(app) as client:
+            resp = client.get(
+                "/api/workspace/ws-1/containers",
+                params={"workspace_path": ws_path},
+            )
+    finally:
+        reg_path.unlink(missing_ok=True)
+        shutil.rmtree(ws_path, ignore_errors=True)
+    assert resp.status_code == 503
+    assert "registry" in resp.json()["error"].lower()
+
+
 # -- GET /api/workspace/{workspace_id}/containers/{name}/status ----------------
 
 def test_status_endpoint(contract_server):

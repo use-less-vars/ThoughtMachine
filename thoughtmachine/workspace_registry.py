@@ -9,8 +9,10 @@ Public API
 ----------
 - ``WorkspaceRegistryEntry`` — dataclass for a single workspace entry.
 - ``WorkspaceRegistry`` — manages the JSON registry file.
-- ``WorkspaceRegistryUnavailable`` — raised by ``list_workspaces`` when the
-  registry file is corrupt (distinguishing corruption from an empty registry).
+- ``WorkspaceRegistryUnavailable`` — raised by the registry's default
+  (fail-closed) reads when the registry file is corrupt, distinguishing
+  corruption from an empty registry.  Callers may opt in to lenient reads via
+  ``_load(allow_corrupt=True)``.
 """
 
 from __future__ import annotations
@@ -203,42 +205,20 @@ class WorkspaceRegistry:
 
     # ── Internal I/O ────────────────────────────────────────────────
 
-    def _load(self) -> Dict[str, Any]:
+    def _load(self, *, allow_corrupt: bool = False) -> Dict[str, Any]:
         """Load the raw registry data from disk.
 
-        Returns an empty dict if the file does not exist or is corrupt
-        (a warning is logged for corrupt files).
-        """
-        if not self._path.exists():
-            logger.info(
-                "Workspace registry %s does not exist; treating as empty.",
-                self._path,
-            )
-            return {}
+        The single canonical loader.  Its **default is fail-closed**:
 
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                logger.warning(
-                    "Registry file %s is not a JSON object; resetting.",
-                    self._path,
-                )
-                return {}
-            return raw
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(
-                "Failed to load registry %s: %s; resetting.",
-                self._path,
-                exc,
-            )
-            return {}
+        * a *missing* file is the legitimate "no workspaces registered yet"
+          state and returns ``{}``;
+        * malformed JSON, an ``OSError`` on read, or valid JSON whose top level
+          is not an object *raise* :class:`WorkspaceRegistryUnavailable`.
 
-    def _load_strict(self) -> Dict[str, Any]:
-        """Load the registry, raising on corruption (unlike :meth:`_load`).
-
-        A missing file is a legitimate empty registry (returns ``{}``).
-        Malformed JSON, an ``OSError``, or valid JSON that is not an object
-        raise :class:`WorkspaceRegistryUnavailable`.
+        ``allow_corrupt=True`` is an explicit, named opt-in to the legacy
+        *lenient* behaviour: every one of those faults collapses to ``{}`` and
+        a warning is logged instead of raising.  It is deliberately NOT the
+        default, so a caller must name it at the call site.
         """
         if not self._path.exists():
             logger.info(
@@ -247,16 +227,32 @@ class WorkspaceRegistry:
                 self._path,
             )
             return {}
+
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
+            if allow_corrupt:
+                logger.warning(
+                    "Failed to load registry %s: %s; resetting.",
+                    self._path,
+                    exc,
+                )
+                return {}
             raise WorkspaceRegistryUnavailable(
                 f"Workspace registry {self._path} could not be read: {exc}"
             ) from exc
+
         if not isinstance(raw, dict):
+            if allow_corrupt:
+                logger.warning(
+                    "Registry file %s is not a JSON object; resetting.",
+                    self._path,
+                )
+                return {}
             raise WorkspaceRegistryUnavailable(
                 f"Workspace registry {self._path} is not a JSON object."
             )
+
         return raw
 
     def _save(self, data: Dict[str, Any]) -> None:
@@ -282,7 +278,7 @@ class WorkspaceRegistry:
             registry file is a legitimate empty registry and returns ``[]``.
         """
         with self._lock:
-            raw = self._load_strict()
+            raw = self._load()
             entries = [
                 WorkspaceRegistryEntry.from_dict(v)
                 for v in raw.values()

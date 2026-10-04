@@ -130,7 +130,10 @@ from session.session_registry import SessionRegistry
 from agent.config.presets import get_tools_for_mode
 from agent.config.session_config import SessionConfig
 from agent.config.config_manager import save_config_defaults, _user_defaults_path
-from thoughtmachine.workspace_registry import WorkspaceRegistry
+from thoughtmachine.workspace_registry import (
+    WorkspaceRegistry,
+    WorkspaceRegistryUnavailable,
+)
 import thoughtmachine.vault as _vault
 
 # ── Shared session store singleton ────────────────────────────────────────────
@@ -3254,6 +3257,10 @@ def _validate_workspace_path(workspace_path: str, workspace_id: str) -> str:
     # container cannot bind-mount arbitrary (even in-home) directories.
     try:
         entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+    except WorkspaceRegistryUnavailable:
+        # Registry file corrupt/unreadable -> server-side fault: propagate so
+        # the route answers 503, not a bogus "'<id>' is not registered" 400.
+        raise
     except Exception as exc:
         raise WorkspacePathError(
             f"workspace '{workspace_id}' is not registered"
@@ -3282,9 +3289,14 @@ def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
         return _validate_workspace_path(workspace_path, workspace_id)
     try:
         entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
-        return entry.root_path if entry is not None else None
-    except Exception:
-        return None
+    except WorkspaceRegistryUnavailable:
+        # The registry FILE is corrupt/unreadable: a server-side
+        # "registry unavailable" fault, NOT a missing workspace.  Re-raise so
+        # the route handler answers 503 (naming the registry fault) rather than
+        # swallowing the fault into the misleading 404
+        # "workspace '<id>' not found or path unresolvable".
+        raise
+    return entry.root_path if entry is not None else None
 
 
 def _make_container_manager(workspace_id: str, workspace_path: str = ""):

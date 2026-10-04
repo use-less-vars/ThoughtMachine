@@ -93,7 +93,8 @@ def test_missing_file_emits_log_record(tmp_path, caplog):
     """A missing registry file returns ``[]`` AND emits a log record.
 
     Regression guard for the observability gap: ``list_workspaces`` now calls
-    ``_load_strict``, so the missing-file branch there must log — otherwise an
+    the unified (default-strict) ``_load``, so the missing-file branch there
+    must log — otherwise an
     absent file flowing through ``list_workspaces`` is silent and a reader
     cannot tell that ``[]`` means "the file was absent".
     """
@@ -172,3 +173,116 @@ def test_corrupt_registry_real_sweep_skips_sweep(tmp_path, monkeypatch):
     assert sweep_calls == [], f"sweep called on corrupt registry: {sweep_calls}"
     assert prune_calls == [], f"prune called on corrupt registry: {prune_calls}"
     assert any(level == "WARNING" for level, _, _ in events), events
+
+
+# ── Commit 1: unified loader — strict DEFAULT, explicit lenient opt-in ───────
+#
+# ``_load`` and ``_load_strict`` were consolidated into a single ``_load``
+# whose DEFAULT is fail-closed; lenient behaviour is now an explicit, named
+# opt-in (``allow_corrupt=True``) that must be written at the call site.
+
+
+def _write_registry_file(tmp_path, content: str):
+    """Write *content* to a fresh registry path and return that path."""
+    reg_path = tmp_path / "state" / "workspace_registry.json"
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    reg_path.write_text(content, encoding="utf-8")
+    return reg_path
+
+
+def _write_unreadable_registry(tmp_path):
+    """Return a registry path that exists but raises ``OSError`` on read."""
+    reg_path = tmp_path / "state" / "workspace_registry.json"
+    reg_path.mkdir(parents=True, exist_ok=True)  # a directory, not a file
+    return reg_path
+
+
+# ── Default loader is STRICT on all three corruption faults ──────────────────
+
+
+def test_default_loader_raises_on_malformed_json(tmp_path):
+    reg_path = _write_registry_file(tmp_path, "not valid json{{{")
+    reg = WorkspaceRegistry(path=reg_path)
+    with pytest.raises(WorkspaceRegistryUnavailable):
+        reg._load()
+
+
+def test_default_loader_raises_on_oserror(tmp_path):
+    reg_path = _write_unreadable_registry(tmp_path)
+    reg = WorkspaceRegistry(path=reg_path)
+    with pytest.raises(WorkspaceRegistryUnavailable):
+        reg._load()
+
+
+def test_default_loader_raises_on_non_object_json(tmp_path):
+    reg_path = _write_registry_file(tmp_path, "[]")
+    reg = WorkspaceRegistry(path=reg_path)
+    with pytest.raises(WorkspaceRegistryUnavailable):
+        reg._load()
+
+
+def test_default_loader_missing_file_is_empty(tmp_path):
+    reg_path = tmp_path / "state" / "workspace_registry.json"
+    assert not reg_path.exists()
+    reg = WorkspaceRegistry(path=reg_path)
+    assert reg._load() == {}
+
+
+# ── Explicit lenient opt-in collapses all four faults to {} + logs ────────────
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        lambda p: _write_registry_file(p, "not valid json{{{"),
+        lambda p: _write_unreadable_registry(p),
+        lambda p: _write_registry_file(p, "[]"),
+    ],
+    ids=["malformed-json", "oserror", "non-object-json"],
+)
+def test_lenient_opt_in_returns_empty_and_logs_on_corruption(tmp_path, caplog, writer):
+    reg_path = writer(tmp_path)
+    reg = WorkspaceRegistry(path=reg_path)
+    with caplog.at_level(logging.WARNING, logger="thoughtmachine.workspace_registry"):
+        assert reg._load(allow_corrupt=True) == {}
+    assert any(
+        rec.name == "thoughtmachine.workspace_registry" for rec in caplog.records
+    ), "lenient opt-in must emit a log record for a corrupt registry"
+
+
+def test_lenient_opt_in_missing_file_returns_empty(tmp_path, caplog):
+    reg_path = tmp_path / "state" / "workspace_registry.json"
+    assert not reg_path.exists()
+    reg = WorkspaceRegistry(path=reg_path)
+    with caplog.at_level(logging.INFO, logger="thoughtmachine.workspace_registry"):
+        assert reg._load(allow_corrupt=True) == {}
+    assert any(
+        rec.name == "thoughtmachine.workspace_registry" for rec in caplog.records
+    ), "lenient opt-in must still log that the registry file was absent"
+
+
+# ── Consumer sweep: every consumer is fail-closed on corruption ──────────────
+#
+# This closes the gap named by the read report: corruption was previously only
+# asserted through ``list_workspaces``.  Each consumer must now RAISE (never a
+# silent ``None``/``{}``/``False``).
+
+
+_CONSUMERS = [
+    ("get_workspace", lambda reg: reg.get_workspace("ws-1")),
+    ("resolve_by_root", lambda reg: reg.resolve_by_root("/tmp/project")),
+    ("register_workspace", lambda reg: reg.register_workspace("ws-1", "/tmp/project")),
+    ("unregister_workspace", lambda reg: reg.unregister_workspace("ws-1")),
+    ("update_workspace", lambda reg: reg.update_workspace("ws-1", label="renamed")),
+]
+
+
+@pytest.mark.parametrize(
+    "name, call", _CONSUMERS, ids=[case[0] for case in _CONSUMERS]
+)
+def test_consumer_fails_closed_on_corruption(tmp_path, name, call):
+    reg_path = _write_registry_file(tmp_path, "not valid json{{{")
+    reg = WorkspaceRegistry(path=reg_path)
+    with pytest.raises(WorkspaceRegistryUnavailable):
+        call(reg)
+
