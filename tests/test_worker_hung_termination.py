@@ -26,6 +26,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +34,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agent.events import EventType, create_event  # noqa: E402
+import tools.workspace.worker_container as worker_container  # noqa: E402
+from thoughtmachine.container_record import (  # noqa: E402
+    LIFECYCLE_EPHEMERAL,
+    RECORD_LABEL_KEY,
+)
 from tools.workspace.worker_lifecycle import (  # noqa: E402
     WorkerLifecycleObserver,
     HEARTBEAT_INTERVAL_S,
@@ -128,11 +134,19 @@ class TestExecutionTrackerTermination(unittest.TestCase):
         # label matches the worker) so the minimal kill is admissible.
         cm = FakeContainerManager(containers=[
             {"container_id": "c1", "name": "agent-exec-x",
-             "labels": {"thoughtmachine.worker": "w1"}},
+             "labels": {"thoughtmachine.worker": "w1",
+                        RECORD_LABEL_KEY: "rec-c1"}},
         ])
         tracker = ExecutionTracker()
         tracker.add("e1", {"type": "container_exec", "container_id": "c1", "pid": 4242})
-        tracker.terminate_all("w1", cm, None, session_id="s1")
+        with mock.patch.object(
+            worker_container,
+            "find_by_docker_label",
+            lambda record_id, vault_root=None: SimpleNamespace(
+                lifecycle_class=LIFECYCLE_EPHEMERAL,
+            ),
+        ):
+            tracker.terminate_all("w1", cm, None, session_id="s1")
         # Minimal touch: exec_run kill <pid>, never stop the container.
         self.assertEqual(cm.exec_run_calls, [("c1", ["kill", "4242"])])
         self.assertEqual(cm.stopped, [])
@@ -211,11 +225,19 @@ class TestExecutionTrackerTermination(unittest.TestCase):
         for owner in ("w1", "s1:w1"):
             cm = FakeContainerManager(containers=[
                 {"container_id": "c2", "name": "agent-exec-x",
-                 "labels": {"thoughtmachine.worker": owner}},
+                 "labels": {"thoughtmachine.worker": owner,
+                            RECORD_LABEL_KEY: "rec-c2"}},
             ])
             tracker = ExecutionTracker()
             tracker.add("e1", {"type": "container_exec", "container_id": "c2"})
-            tracker.terminate_all("w1", cm, None, session_id="s1")
+            with mock.patch.object(
+                worker_container,
+                "find_by_docker_label",
+                lambda record_id, vault_root=None: SimpleNamespace(
+                    lifecycle_class=LIFECYCLE_EPHEMERAL,
+                ),
+            ):
+                tracker.terminate_all("w1", cm, None, session_id="s1")
             self.assertEqual(cm.stopped, ["c2"])
             self.assertEqual(cm.exec_run_calls, [])
 

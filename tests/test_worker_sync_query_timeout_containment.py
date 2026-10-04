@@ -19,6 +19,7 @@ import queue
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,6 +30,8 @@ from tools.workspace.worker import (
     _RESOURCE_CONTAINER_LABEL,
     _WORKER_CONTAINER_LABEL,
 )
+import tools.workspace.worker_container as worker_container
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL, RECORD_LABEL_KEY
 
 from llm_providers.base import LLMProvider, ProviderConfig, LLMResponse
 from llm_providers.factory import ProviderFactory
@@ -125,7 +128,7 @@ def _owned_container_dict(cid, name, owner):
         "uptime_seconds": 5,
         "workspace_id": "sess-d",
         "note": "",
-        "labels": {_WORKER_CONTAINER_LABEL: owner},
+        "labels": {_WORKER_CONTAINER_LABEL: owner, RECORD_LABEL_KEY: "rec-" + cid},
     }
 
 
@@ -188,7 +191,26 @@ def _spawn_worker(tmp_path, monkeypatch, name, session_id, container_manager=Non
 
 
 def _owned_container(cid, name, owner):
-    return _FakeContainer(cid, name, {_WORKER_CONTAINER_LABEL: owner})
+    return _FakeContainer(
+        cid,
+        name,
+        {_WORKER_CONTAINER_LABEL: owner, RECORD_LABEL_KEY: "rec-" + cid},
+    )
+
+
+@pytest.fixture(autouse=True)
+def _ephemeral_records(monkeypatch):
+    """Force the container-record seam to classify every looked-up record as
+    ephemeral, so worker-owned containers stay reclaimable in these tests.
+    Only containers carrying RECORD_LABEL_KEY trigger the lookup; negatives
+    (resource / unlabeled / foreign) never call it."""
+    monkeypatch.setattr(
+        worker_container,
+        "find_by_docker_label",
+        lambda record_id, vault_root=None: SimpleNamespace(
+            lifecycle_class=LIFECYCLE_EPHEMERAL,
+        ),
+    )
 
 
 def _resource_container(cid, name):

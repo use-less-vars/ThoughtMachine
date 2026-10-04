@@ -1785,7 +1785,13 @@ class ContainerManager:
             # ("<session_id or 'unknown'>:<worker_name>") stamped VERBATIM;
             # teardown compares the label value EXACTLY (mismatched/stale
             # values are ignored).
-            labels["thoughtmachine.worker"] = worker_name
+            #
+            # Class-gated: the worker label is a TEARDOWN-OWNERSHIP marker
+            # only. Non-ephemeral creates (persistent/service/resource) are
+            # long-lived and must NOT be reaped by worker teardown, so they
+            # never carry it. Ephemeral creates are byte-for-byte unchanged.
+            if lifecycle_class == LIFECYCLE_EPHEMERAL:
+                labels["thoughtmachine.worker"] = worker_name
             # Self-heal: a crashed/hung worker session may have left stale
             # containers behind (same owner identity, created/exited/dead).
             # Remove them BEFORE the fresh create so a name collision can

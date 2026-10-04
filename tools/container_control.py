@@ -206,9 +206,11 @@ class ContainerStartTool(_ContainerControlBase):
         description=(
             "[internal] Owner identity of the worker sub-agent that created this "
             "container (injected by ToolExecutor from the worker context var as "
-            "'<session_id or unknown>:<worker_name>'; stamped VERBATIM as the "
-            "``thoughtmachine.worker`` docker label on fresh creates so worker "
-            "teardown can reclaim it by exact label match)."
+            "'<session_id or unknown>:<worker_name>'). The "
+            "``thoughtmachine.worker`` docker label is stamped only for EPHEMERAL "
+            "creates; this tool starts a persistent agent container (default "
+            "lifecycle class), which is never labelled and therefore never reaped "
+            "by worker teardown."
         ),
     )
 

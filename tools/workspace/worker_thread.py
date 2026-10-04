@@ -90,6 +90,7 @@ from tools.workspace.worker_container import (
     cleanup_worker_containers,
     is_resource_container,
     is_worker_owned_container,
+    is_worker_teardown_excluded_container,
     worker_owner_label,
 )
 from tools.workspace.worker_timeout import (
@@ -2020,13 +2021,21 @@ class WorkerThread(threading.Thread):
         identity (``<session_id or 'unknown'>:<worker_name>`` — see module
         docstring). Stale/mismatched values (sibling workers, bare names,
         previous sessions) are ignored.
+
+        The lifecycle-class exclusion is folded into this predicate (rather
+        than living in the teardown loop) so the ownership gate and the
+        teardown sweep share ONE seam: ownership is True only when the
+        container is worker-labelled AND resolves to an ephemeral class.
+        FAIL-OPEN on an unresolvable class (recordless container).
         """
         labels = getattr(container, "labels", None)
         if labels is None and isinstance(container, dict):
             labels = container.get("labels")
         if not labels:
             return False
-        return labels.get(_WORKER_CONTAINER_LABEL) == self.owner_identity
+        if labels.get(_WORKER_CONTAINER_LABEL) != self.owner_identity:
+            return False
+        return not is_worker_teardown_excluded_container(container)
 
     def _cleanup_worker_containers(self) -> None:
         """Stop and remove containers owned by this worker.

@@ -44,6 +44,18 @@ try:
 except ImportError:  # pragma: no cover - defensive
     RESOURCE_IMAGE_TAG = "tm-resource-git"
 
+# Lifecycle-class exclusion for teardown. The ``thoughtmachine.worker`` label
+# is a TEARDOWN-OWNERSHIP marker only: worker teardown must SKIP a
+# worker-labelled container whose canonical record lifecycle class is not
+# ephemeral, so long-lived (persistent/service/resource) containers are never
+# reaped. Folded in at the CALL SITES of ``_terminate_container_exec`` (not
+# inside ``_is_worker_owned_container``) to leave that predicate's equality
+# semantics untouched. FAIL-OPEN on an unresolvable class (recordless
+# container) -- see ``tools.workspace.worker_container``.
+from tools.workspace.worker_container import (
+    is_worker_teardown_excluded_container,
+)
+
 # Resource container name convention (see ResourceContainerManager.container_name).
 _RESOURCE_NAME_PREFIX = "tm-res-"
 _RESOURCE_NAME_SUFFIX = "-git"
@@ -320,6 +332,12 @@ class ExecutionTracker:
                      f"container {container_id} is not worker-owned — skipping "
                      f"(never touch resource/shared containers)")
                 return
+            if is_worker_teardown_excluded_container(info):
+                _log("WARNING", "workspace.lifecycle",
+                     f"terminate_all: container_exec {execution_id} pid={pid} "
+                     f"container {container_id} is worker-owned but not "
+                     f"ephemeral — skipping (never reap long-lived containers)")
+                return
             self._docker_exec_kill(execution_id, container_id, int(pid), container_manager)
             return
         if not container_id:
@@ -333,7 +351,7 @@ class ExecutionTracker:
                  f"no container_manager — skipping (cannot verify ownership)")
             return
         info = _container_info(container_manager, container_id)
-        if _is_worker_owned_container(info, worker_id, session_id):
+        if _is_worker_owned_container(info, worker_id, session_id) and not is_worker_teardown_excluded_container(info):
             _log("INFO", "workspace.lifecycle",
                  f"terminate_all: container_exec {execution_id} — no pid, "
                  f"worker-owned container {container_id} — stop({container_id})")
@@ -341,8 +359,8 @@ class ExecutionTracker:
         else:
             _log("WARNING", "workspace.lifecycle",
                  f"terminate_all: container_exec {execution_id} has no pid and "
-                 f"container {container_id} is not worker-owned — skipping "
-                 f"(never touch resource/shared containers)")
+                 f"container {container_id} is not worker-owned (or is not "
+                 f"ephemeral) — skipping (never touch resource/shared containers)")
 
     def _docker_exec_kill(self, execution_id, container_id, pid, container_manager) -> None:
         """Minimal in-container kill: ``docker exec <container> kill <pid>``.
