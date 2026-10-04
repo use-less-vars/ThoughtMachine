@@ -165,6 +165,7 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
 
 export default function ContainerListPanel({ workspaceId }) {
   const [entries, setEntries] = useState([])
+  const [showArchived, setShowArchived] = useState(false)
   const [error, setError] = useState(null)
   const [pending, setPending] = useState(null) // { entry, action, value }
   const [memEdits, setMemEdits] = useState({})
@@ -257,9 +258,14 @@ export default function ContainerListPanel({ workspaceId }) {
 
   const confirmCancel = () => setPending(null)
 
-  const ephemeral = entries.filter((e) => e.kind === 'ephemeral')
-  const persistent = entries.filter((e) => e.kind === 'persistent')
-  const resource = entries.filter((e) => e.kind === 'resource')
+  // Dead records (no live Docker container) are hidden from the live view by
+  // default; the "Show archived" toggle reveals them. This is display-only —
+  // nothing here sweeps or deletes a record.
+  const visible = (e) => showArchived || e.live !== false
+
+  const ephemeral = entries.filter((e) => e.kind === 'ephemeral' && visible(e))
+  const persistent = entries.filter((e) => e.kind === 'persistent' && visible(e))
+  const resource = entries.filter((e) => e.kind === 'resource' && visible(e))
 
   const renderGroup = (kind, testid, title, list, emptyCopy) => (
     <div className={`container-group container-group--${kind}`} data-testid={testid}>
@@ -296,6 +302,18 @@ export default function ContainerListPanel({ workspaceId }) {
           {error}
         </div>
       ) : null}
+
+      <div className="container-list-toolbar">
+        <label className="container-show-archived">
+          <input
+            type="checkbox"
+            data-testid="container-show-archived"
+            checked={showArchived}
+            onChange={(e) => setShowArchived(e.target.checked)}
+          />
+          <span>Show archived</span>
+        </label>
+      </div>
 
       {renderGroup('ephemeral', 'container-group-ephemeral', 'Ephemeral containers', ephemeral, EPHEMERAL_EMPTY)}
       {renderGroup('persistent', 'container-group-persistent', 'Persistent containers', persistent, PERSISTENT_EMPTY)}
