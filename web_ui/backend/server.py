@@ -436,8 +436,9 @@ def _sweep_exited_workspace_containers():
 def _sweep_orphan_container_records():
     """Startup/periodic sweep: reap orphaned container RECORDS.
 
-    A container record whose workspace is no longer registered and whose
-    Docker container is gone is reaped once past its retention window.
+    A container record whose bound Docker container is gone is reaped once
+    past its retention window.  The record's workspace registration is NOT a
+    reap condition.
     Best-effort and NEVER raising.  If the workspace registry cannot be read
     the sweep degrades to a NO-OP (``ids=None``) so a failing/empty registry
     can never trigger a record wipe.
@@ -853,9 +854,9 @@ async def lifespan(app: FastAPI):
     _sweep_exited_workspace_containers()
 
     # ── Startup orphan container-RECORD sweep ───────────────────────────
-    # Reap records whose workspace is no longer registered and whose Docker
-    # container is gone, once past their retention window.  Best-effort: a
-    # failing sweep must never break startup.
+    # Reap container records whose bound Docker container is gone, once past
+    # their retention window.  The record's workspace registration is NOT a
+    # reap condition.  Best-effort: a failing sweep must never break startup.
     _sweep_orphan_container_records()
 
     # ── Background periodic container sweep (Phase 1.1) ─────────────────────

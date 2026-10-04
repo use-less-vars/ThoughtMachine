@@ -320,4 +320,47 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     expect(runChip).toHaveTextContent(/^running$/)
     expect(runChip).not.toHaveClass('container-state-chip--oom')
   })
+
+  // ── T14 ─────────────────────────────────────────────────────────────────
+  // Live-view hides dead records (no live container) by default; the "Show
+  // archived" toggle reveals them. Display-only: nothing is swept or deleted.
+  it('T14 hides dead records by default and offers a Show archived toggle', async () => {
+    stubFetch(
+      payload({
+        ephemeral: [
+          ephemeralEntry({ id: 'eph-live' }),
+          ephemeralEntry({ id: 'eph-dead', live: false }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    expect(await screen.findByTestId('container-row-eph-live')).toBeInTheDocument()
+    // the dead record must NOT be visible while the toggle is off
+    expect(screen.queryByTestId('container-row-eph-dead')).toBeNull()
+    // the toggle itself is present
+    expect(screen.getByTestId('container-show-archived')).toBeInTheDocument()
+  })
+
+  it('T14 Show archived reveals the dead record, which renders as today (with its no-live-container badge)', async () => {
+    stubFetch(
+      payload({
+        ephemeral: [
+          ephemeralEntry({ id: 'eph-live' }),
+          ephemeralEntry({ id: 'eph-dead', live: false }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    // dead row hidden until the toggle is flipped
+    await screen.findByTestId('container-row-eph-live')
+    expect(screen.queryByTestId('container-row-eph-dead')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('container-show-archived'))
+
+    expect(await screen.findByTestId('container-row-eph-dead')).toBeInTheDocument()
+    // revealed dead row keeps its existing "no live container" badge
+    expect(screen.getByTestId('container-missing-eph-dead')).toBeInTheDocument()
+  })
 })
