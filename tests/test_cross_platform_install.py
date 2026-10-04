@@ -213,10 +213,15 @@ def test_install_sh_rejects_unsupported_arch(exec_tmp):
     assert "unsupported architecture" in result.stdout
 
 
-def test_install_sh_rejects_unsupported_distro(exec_tmp):
+def test_install_sh_accepts_non_debian_distro_via_capability(exec_tmp):
+    # NEW CONTRACT (distro-agnostic): install.sh no longer gates on the
+    # distribution. An otherwise-supported Linux/x86_64 host whose
+    # /etc/os-release reads "archlinux" is accepted and runs to completion; the
+    # package manager is chosen later by capability, never by distro id.
     result = _run_installer_platform(exec_tmp, "Linux", "x86_64", "archlinux")
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "unsupported distribution" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "unsupported distribution" not in result.stdout
+    assert "Next step: ./start_thoughtmachine.sh" in result.stdout
 
 
 START_SHIM_TEMPLATE = """\
@@ -239,6 +244,7 @@ if args and args[0].endswith("doctor_checks.py"):
             "tools": {"docker": {"present": True, "critical": False, "hint": "sudo apt-get install docker.io"}},
             "docker_present": True,
             "docker_hint": "sudo apt-get install docker.io",
+            "advisory": {"package_manager": {"present": True, "name": "apt-get", "hint": "sudo apt-get install <pkg>"}},
         })
     elif flag == "--ensure-venv":
         _emit({"ok": True, "changed": False, "broken_reason": "", "detail": "up to date"})
