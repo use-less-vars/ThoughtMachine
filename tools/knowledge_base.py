@@ -822,6 +822,39 @@ class KnowledgeBaseTool(ToolBase):
 
         return sections
 
+    def _find_section(self, content: str, rel_path: str) -> Optional[Tuple[str, int, int]]:
+        """Locate a ``##`` section by name using read-mode matching semantics.
+
+        Matching is case-insensitive and tolerates a leading ``#`` in the
+        requested section name. When several headings match, the one spanning
+        the most content wins (first such heading on ties).
+
+        Returns ``(heading_text, start_line, end_line)`` where ``start_line`` is
+        1-indexed and ``end_line`` is an exclusive slice index (as produced by
+        ``_build_section_index``), or ``None`` if no section matches.
+        """
+        if not self.section:
+            return None
+
+        clean_section = self.section.lstrip("#").strip()
+        match_heading = None
+        match_start = None
+        match_end = None
+        match_size = 0
+        for candidate_heading, sline, eline, _ in self._build_section_index(content, rel_path):
+            candidate_clean = candidate_heading.lstrip("#").strip()
+            if candidate_clean == clean_section or candidate_clean.lower() == clean_section.lower():
+                size = eline - sline
+                if size > match_size:
+                    match_heading = candidate_heading
+                    match_start = sline
+                    match_end = eline
+                    match_size = size
+
+        if match_heading is None or match_start is None or match_end is None:
+            return None
+        return (match_heading, match_start, match_end)
+
     def _mode_read(self, kb_root: Path) -> str:
         """Return content of the specified domain file.
 
@@ -855,23 +888,8 @@ class KnowledgeBaseTool(ToolBase):
 
         # --- Step 1: Handle section extraction (if section is provided) ---
         if self.section:
-            clean_section = self.section.lstrip("#").strip()
-            # Try exact match first, then case-insensitive match
-            # Prefer the match with the most content (handles duplicate section headings)
-            match_heading = None
-            match_start = None
-            match_size = 0
-            for candidate_heading, sline, eline, _ in self._build_section_index(content, rel_path):
-                candidate_clean = candidate_heading.lstrip("#").strip()
-                if candidate_clean == clean_section or candidate_clean.lower() == clean_section.lower():
-                    size = eline - sline
-                    if size > match_size:
-                        match_heading = candidate_heading
-                        match_start = sline - 1  # convert to 0-indexed
-                        match_end = eline
-                        match_size = size
-
-            if match_heading is None or match_start is None:
+            found_section = self._find_section(content, rel_path)
+            if found_section is None:
                 # Section not found — build and show available sections
                 available = self._build_section_index(content, rel_path)
                 avail_lines = [f"Section \"{self.section}\" not found in **{domain_name}**. Available sections:\n"]
@@ -879,9 +897,11 @@ class KnowledgeBaseTool(ToolBase):
                     avail_lines.append(f"- {h} (lines {sl}–{el}, ~{tok} tokens)")
                 return "\n".join(avail_lines)
 
+            match_heading, match_start_line, match_end_line = found_section
+
             # Extract section content (heading line inclusive)
             lines = content.split("\n")
-            section_content = "\n".join(lines[match_start:match_end])
+            section_content = "\n".join(lines[match_start_line - 1:match_end_line])
 
             # If max_tokens is also set, apply truncation after section extraction
             if self.max_tokens is not None:
@@ -1078,7 +1098,14 @@ class KnowledgeBaseTool(ToolBase):
         return result
 
     def _mode_update(self, kb_root: Path) -> str:
-        """Replace a section's content in a domain file."""
+        """Replace a section's content in a domain file.
+
+        Section lookup uses the same (case-insensitive) semantics as read mode,
+        so any section ``read`` can locate, ``update`` can also replace in place.
+        When the section cannot be found, no write is performed and the file is
+        left byte-identical — previously a missing match appended a duplicate
+        ``## <section>`` block (see bug/knowledgebase-tool-update-duplicates-section).
+        """
         if not self.domain:
             return "Error: `domain` parameter is required for update mode."
         if not self.section:
@@ -1106,31 +1133,45 @@ class KnowledgeBaseTool(ToolBase):
                 self._log_tool_error(f"Error reading {file_path} for update: {e}")
                 return f"Error reading '{rel_path}': {e}"
 
-            # Normalize section name: strip leading '#' and whitespace
+            # Locate the section with the SAME matcher used by read mode, so a
+            # section that read() resolves is never silently missed by update().
+            found_section = self._find_section(content, rel_path)
+
+            if found_section is None:
+                # Genuinely not found — DO NOT write. (Previously this appended a
+                # duplicate "## <section>" block and corrupted the file.)
+                available = self._build_section_index(content, rel_path)
+                avail_lines = [
+                    f"Section \"{self.section}\" not found in **{domain_name}**. "
+                    f"No changes were made. Available sections:\n"
+                ]
+                for h, sl, el, tok in available:
+                    avail_lines.append(f"- {h} (lines {sl}–{el}, ~{tok} tokens)")
+                self._log_debug(f"Section '{self.section}' not found in {rel_path}; no write performed")
+                return "\n".join(avail_lines)
+
+            match_heading, match_start_line, match_end_line = found_section
+            # Normalize the replacement header the same way as before.
             clean_section = self.section.lstrip('#').strip()
 
-            # Locate the section header using regex anchored to line start
-            section_header_re = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
-            match = section_header_re.search(content)
+            # Replace the section in place: keep everything before the heading,
+            # write the new heading + content, then keep everything from the next
+            # section heading (or EOF) onward.
+            lines = content.split("\n")
 
-            if not match:
-                # Section not found — append it at the end
-                section_header = f"## {clean_section}"
-                updated_content = content.rstrip() + f"\n\n{section_header}\n{self.new_content}\n"
-                self._log_debug(f"Section '{clean_section}' not found, appending to end of {rel_path}")
-                found = False
+            def _line_start(idx: int) -> int:
+                return sum(len(line) + 1 for line in lines[:idx])
+
+            section_start = _line_start(match_start_line - 1)
+            if match_end_line < len(lines):
+                next_section = _line_start(match_end_line) - 1
+                updated_content = (
+                    content[:section_start]
+                    + f"## {clean_section}\n{self.new_content}\n"
+                    + content[next_section:]
+                )
             else:
-                # Section found — delete from header to next "## " or EOF, then insert new header + content
-                section_start = match.start()
-                # Find the next "## " header after the current one
-                next_section = content.find("\n## ", match.end())
-                if next_section == -1:
-                    # No next section, delete until EOF
-                    updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n"
-                else:
-                    # Delete until next section
-                    updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n" + content[next_section:]
-                found = True
+                updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n"
 
             try:
                 file_path.write_text(updated_content, encoding="utf-8")
@@ -1141,12 +1182,8 @@ class KnowledgeBaseTool(ToolBase):
                 self._log_tool_error(f"Error writing {file_path} for update: {e}")
                 return f"Error writing to '{rel_path}': {e}"
 
-        if found:
-            self._log_debug(f"Updated section '{self.section}' in {rel_path}")
-            return f"✅ Section **{self.section}** updated in **{domain_name}** (`{rel_path}`)."
-        else:
-            self._log_debug(f"Created new section '{self.section}' in {rel_path}")
-            return f"✅ Section **{self.section}** created (appended to end) in **{domain_name}** (`{rel_path}`)."
+        self._log_debug(f"Updated section '{self.section}' in {rel_path}")
+        return f"✅ Section **{self.section}** updated in **{domain_name}** (`{rel_path}`)."
 
     def _mode_status(self, kb_root: Path) -> str:
         """Return the 'Current Status' section from task_tracker plus the 5 most recent
