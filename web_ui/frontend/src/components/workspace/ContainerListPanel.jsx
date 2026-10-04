@@ -34,6 +34,17 @@ function permissionsOf(entry) {
   return null
 }
 
+// The permission BADGE must describe the RUNNING container, not the record's
+// frozen creation envelope. The backend attaches `live_envelope` (derived from
+// the live Docker inspect) to every entry; when present it wins. Records that
+// predate that wiring, or live containers we could not inspect, fall back to
+// the record envelope via `permissionsOf`.
+function badgeSourceOf(entry) {
+  const live = entry.live_envelope
+  if (live && typeof live === 'object') return live
+  return permissionsOf(entry)
+}
+
 function badgeText(perms) {
   if (!perms) return ''
   const parts = []
@@ -57,7 +68,7 @@ function driftState(entry) {
 function ContainerRow({ entry, memValue, onMemChange, onAction }) {
   const id = entry.id
   const state = entry.state
-  const perms = permissionsOf(entry)
+  const perms = badgeSourceOf(entry)
   const drift = driftState(entry)
   const isOom = state === 'oom'
 
