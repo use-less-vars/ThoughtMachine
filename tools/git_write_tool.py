@@ -8,7 +8,6 @@ from pathlib import Path
 from pydantic import Field
 from .git_info_tool import GitReadTool, resolve_git_execution_mode
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
-from thoughtmachine.security import coerce_session_permissions
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +30,14 @@ class GitWriteTool(GitReadTool):
     """
     Git write operations tool (commit, init, clone, branch_create, checkout,
     stage, unstage).
-    Every write is gated (fail closed) on the session git permission
-    (``session_permissions['git']`` / the effective ``git`` grain) being
-    write-capable (``write``, ``full`` or ``write_on_feature_branch``) or
-    ``ask`` (the outer ask gate having run), and on the agent's
-    ask policy enforced by the ToolExecutor / security gate. The
+    Every write is gated (fail closed) on the effective session git
+    permission (the effective ``git`` grain, session x workspace, injected by
+    the ToolExecutor) being write-capable (``write``, ``full`` or
+    ``write_on_feature_branch``) or ``ask`` (the outer ask gate having run),
+    and on the agent's ask policy enforced by the ToolExecutor / security
+    gate. The gate is governed SOLELY by ``effective_permissions``; the
+    legacy ``agent_config['session_permissions']`` field is NEVER consulted
+    as a grant source. The
     read surface (status, diff, diff_cached, log, branch, branch_list, show,
     remote, blame, config) lives in ``GitReadTool`` (tools/git_info_tool.py);
     this subclass inherits the hardened execution backends, path validation,
@@ -138,14 +140,16 @@ class GitWriteTool(GitReadTool):
     def _git_write_allowed(self) -> bool:
         """Fail-closed check that this write call may proceed.
 
-        True when any of the following hold:
+        True when either of the following holds:
         - the effective permissions carry a ``git`` level of ``write``,
           ``full`` or ``write_on_feature_branch``;
         - the effective ``git`` level is ``ask`` (the outer ToolExecutor
-          gate already prompted and approved this call);
-        - the session_permissions dict explicitly sets ``git`` to ``write``,
-          ``full`` or ``write_on_feature_branch`` (direct-call
-          defense-in-depth).
+          gate already prompted and approved this call).
+
+        The gate is governed SOLELY by ``effective_permissions`` (session x
+        workspace, injected by the ToolExecutor); the legacy
+        ``agent_config['session_permissions']`` field is NEVER consulted. An
+        absent effective grant fails closed with the existing denial text.
 
         A ``write_on_feature_branch`` grant passes this gate (the outer
         category gate admits it too); the feature-branch-only restriction
@@ -159,17 +163,16 @@ class GitWriteTool(GitReadTool):
                 return True
             if gw == "ask":
                 return True
-        sp = coerce_session_permissions(
-            (getattr(self, "agent_config", None) or {}).get("session_permissions")
-        )
-        if sp.get("git") in ("write", "full", "write_on_feature_branch"):
-            return True
         return False
 
     def _git_write_restricted_to_feature_branch(self) -> bool:
         """True when this write call is governed by the
-        ``write_on_feature_branch`` grant (the effective ``git`` level when
-        present, else the session_permissions dict for direct callers).
+        ``write_on_feature_branch`` effective grant.
+
+        The gate is governed SOLELY by ``effective_permissions`` (session x
+        workspace, injected by the ToolExecutor); the legacy
+        ``agent_config['session_permissions']`` field is NEVER consulted. An
+        absent effective grant fails closed (returns False).
 
         ``write`` / ``full`` / ``ask`` grants are never branch-restricted by
         this tool: an effective ``git`` level that is present but not
@@ -182,10 +185,7 @@ class GitWriteTool(GitReadTool):
                 return True
             if gw is not None:
                 return False
-        sp = coerce_session_permissions(
-            (getattr(self, "agent_config", None) or {}).get("session_permissions")
-        )
-        return sp.get("git") == "write_on_feature_branch"
+        return False
 
     def execute(self) -> str:
         # Reset per-call runtime state (tool instances may be reused).
@@ -196,7 +196,9 @@ class GitWriteTool(GitReadTool):
         self._last_failure_reason = None
 
         # git permission gate (fail closed): every write requires a
-        # write-capable session git permission (effective or session_permissions).
+        # write-capable effective session git permission (the effective git
+        # grain injected by the ToolExecutor; the legacy
+        # agent_config['session_permissions'] field is never consulted).
         # Also enforced at the top of each _git_* write method as
         # defense-in-depth for direct callers.
         if not self._git_write_allowed():

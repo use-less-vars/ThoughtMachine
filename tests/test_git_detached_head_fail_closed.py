@@ -56,11 +56,11 @@ import pytest
 from tools.git_write_tool import GitWriteTool
 
 # A full-write session (NOT write_on_feature_branch): the plain commit path.
-_WRITE_GRANT = {"session_permissions": {"git": "write"}}
+_WRITE_GRANT = {"git": "write"}
 
 
 def _tool(**overrides):
-    params = {"agent_config": _WRITE_GRANT}
+    params = {"effective_permissions": _WRITE_GRANT}
     params.update(overrides)
     return GitWriteTool(**params)
 

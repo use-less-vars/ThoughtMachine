@@ -65,7 +65,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 # A full-write session (NOT write_on_feature_branch): the PLAIN commit path.
-_WRITE_GRANT = {"session_permissions": {"git": "write"}}
+_WRITE_GRANT = {"git": "write"}
 # Throwaway vault workspace id the tool is bound to.
 _WORKSPACE_ID = "wstest"
 
@@ -115,8 +115,7 @@ def _tool(workspace_id: str, repo: Path, **overrides) -> GitWriteTool:
         "workspace_id": workspace_id,
         "session_id": "sess-contract",
         "workspace_path": str(repo),
-        "session_permissions": {"git": "write"},
-        "agent_config": _WRITE_GRANT,
+        "effective_permissions": _WRITE_GRANT,
     }
     params.update(overrides)
     return GitWriteTool(**params)

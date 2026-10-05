@@ -37,15 +37,13 @@ _FULL_CAPS = WorkspaceCapabilities()
 
 def _commit_tool(**params):
     """A GitWriteTool instance pre-wired for a commit operation with a
-    write_on_feature_branch session grant (the established direct-call
-    agent_config convention used across the git permission tests)."""
+    write_on_feature_branch effective grant (the effective-permissions
+    convention injected by the ToolExecutor)."""
     defaults = {
         "operation": "commit",
         "message": "agent commit",
         "file_path": ["note.txt"],
-        "agent_config": {
-            "session_permissions": {"git": "write_on_feature_branch"}
-        },
+        "effective_permissions": {"git": "write_on_feature_branch"},
     }
     defaults.update(params)
     return GitWriteTool(**defaults)
@@ -131,12 +129,12 @@ def test_wofb_commit_allowed_on_feature_branch(tmp_path):
 
 def test_full_write_grant_commit_allowed_on_protected_branch(tmp_path):
     """write/full grants are NOT branch-restricted by this tool: a commit on
-    a protected branch proceeds via both the session_permissions direct-call
-    path and the effective-permissions (ToolExecutor) path."""
+    a protected branch proceeds via the effective-permissions (ToolExecutor)
+    path."""
     repo = tmp_path / "repo"
     repo.mkdir()
     tool_sp = _commit_tool(
-        agent_config={"session_permissions": {"git": "write"}}
+        effective_permissions={"git": "write"}
     )
     with mock.patch.object(
         tool_sp, "_run_git", return_value="committed"

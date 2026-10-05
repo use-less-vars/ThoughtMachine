@@ -62,9 +62,10 @@ def _allow_host_resources_gate(tmp_path, monkeypatch):
 # Canonical fail-closed gate denial returned by GitWriteTool for direct calls
 # when the session git permission is not write-capable (byte-identical to
 # test_git_info_tool_operations.FLAG_ERROR and to the tool's
-# _flag_gate_error(); the in-tool gate reads ``agent_config['session_permissions']
-# ['git']`` / the effective ``git`` grain -- the legacy ``git_write`` agent key
-# is no longer consulted).
+# _flag_gate_error(); the in-tool gate is governed SOLELY by the effective
+# ``git`` grain in ``effective_permissions`` -- the legacy
+# ``agent_config['session_permissions']`` field and the ``git_write`` agent
+# key are never consulted).
 FLAG_ERROR = 'Error: git:write denied: session git_write permission is not "write"'
 
 
@@ -122,8 +123,8 @@ def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
         working_dir=str(repo),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
-        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
-        agent_config={"session_permissions": {"git": "write"}},
+        session_permissions={"git": "write"},  # explicit perms: required for the host sandbox guard (an unresolved session fails closed)
+        effective_permissions={"git": "write"},  # effective grant: the git gate is governed solely by effective_permissions
     )
 
 
@@ -166,7 +167,7 @@ def test_container_path_commit_runs_githooks_only(tmp_path):
     tool = GitWriteTool(
         operation="commit",
         message="x",
-        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+        session_permissions={"git": "write"},
         effective_permissions={"git": "write"},  # container path enforces the atomic git:write category
     )
     object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
@@ -284,7 +285,7 @@ def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file
         workspace_path=str(workspace),
         workspace_id=ws_id,
         session_permissions=dict(FULL_PERMISSIONS),
-        agent_config={"session_permissions": {"git": "write"}},
+        effective_permissions=dict(FULL_PERMISSIONS),
     )
 
 
@@ -433,7 +434,7 @@ def test_commit_denied_without_git_write_permission(hardened_repo):
         file_path="hello.txt",
         working_dir=str(repo),
         workspace_path=str(workspace),
-        agent_config={"session_permissions": {"git": "read"}},
+        effective_permissions={"git": "read"},
     )
     result = tool.execute()
     assert result == FLAG_ERROR

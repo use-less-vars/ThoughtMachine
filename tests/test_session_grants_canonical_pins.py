@@ -15,8 +15,17 @@ B3  ``WebAgentBridge.save_session`` strips ``session_permissions`` from the
 B4  The disk-mode security gate fails CLOSED when the grant-store read raises
     (``read_session_permissions`` patched to raise -> all-banned).
 B5  ``migrate_session_permissions`` is idempotent and additive.
+B6  The presenter metadata dump is NOT a grants holder: no
+    ``session_permissions`` is surfaced from it as grants.
+B7  The legacy ``agent_config['session_permissions']`` field is NOT a grant
+    source: the git-write gate is governed SOLELY by ``effective_permissions``.
+B8  ``security_config['session_policy']`` (written by ``_update_security_config``,
+    thoughtmachine/security.py:980) never carries and is never read for a
+    ``session_permissions`` (grants) key -- the retired third grants location
+    stays UNPOPULATED and UNREAD.
 """
 
+import ast
 import json
 import logging
 import sys
@@ -40,6 +49,7 @@ from thoughtmachine.permission_store import (
 )
 from thoughtmachine.security import SessionPermissions
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+from tools.git_write_tool import GitWriteTool
 from web_ui.backend.bridge import WebAgentBridge
 from web_ui.backend.config_manager import ConfigManager
 from web_ui.backend.session_manager import SessionManager
@@ -688,12 +698,14 @@ class TestPresenterMetadataStripsGrant:
         assert disk_ac.get("temperature") == 0.42
 
 
-# ── B7: direct-call git-write grant is coerced before the gate reads it ─────
+# ── B7: legacy agent_config['session_permissions'] is NOT a grant ──────────
 
-class TestGitWriteDirectCallCoercesGrant:
-    """A direct caller's ``agent_config['session_permissions']`` is coerced
-    through the canonical coercer before the git-write gate reads it, so an
-    invalid / non-canonical value fails CLOSED instead of being trusted."""
+class TestGitWriteDirectCallLegacyFieldIsNotAGrant:
+    """The git-write gate is governed SOLELY by ``effective_permissions``
+    (session x workspace, injected by the ToolExecutor). The legacy
+    ``agent_config['session_permissions']`` field is NEVER consulted as a
+    grant source, so a direct caller that supplies it ALONE fails CLOSED --
+    regardless of how canonical the value looks."""
 
     FLAG = 'Error: git:write denied: session git_write permission is not "write"'
 
@@ -708,36 +720,170 @@ class TestGitWriteDirectCallCoercesGrant:
         )
 
     @pytest.mark.parametrize(
-        "raw, allowed, restricted",
-        [
-            ({"git": "write"}, True, False),
-            ({"git": "write_on_feature_branch"}, True, True),
-        ],
-    )
-    def test_canonical_grants_are_accepted(self, raw, allowed, restricted):
-        t = self._tool(raw)
-        assert t._git_write_allowed() is allowed
-        assert t._git_write_restricted_to_feature_branch() is restricted
-
-    @pytest.mark.parametrize(
         "raw",
         [
-            {"git": "full"},      # non-canonical level the gate must NOT trust
-            {"git": "root"},      # unknown level
-            {"git": 123},         # wrong type
-            {"filesystem": "write"},  # partial map -> git defaults to "read"
-            "nope",               # non-dict
-            42,                   # non-dict
-            None,                 # non-dict
+            {"git": "write"},        # canonical-looking legacy value: ignored
+            {"git": "full"},         # non-canonical level: ignored
+            {"git": "write_on_feature_branch"},  # ignored too
+            {"git": "root"},        # unknown level
+            {"git": 123},           # wrong type
+            {"filesystem": "write"},  # partial map
+            "nope",                 # non-dict
+            42,                     # non-dict
+            None,                   # non-dict
         ],
     )
-    def test_non_canonical_or_partial_grant_fails_closed(self, raw):
+    def test_legacy_agent_config_field_is_never_a_grant(self, raw):
+        # No effective grant supplied -> fail closed, even for a canonical
+        # legacy value.
         t = self._tool(raw)
         assert t._git_write_allowed() is False
         assert t._git_write_restricted_to_feature_branch() is False
         # execute() short-circuits on the gate for a non-writable grant.
         assert t.execute() == self.FLAG
 
+    @pytest.mark.parametrize(
+        "effective, allowed, restricted",
+        [
+            ({"git": "write"}, True, False),
+            ({"git": "write_on_feature_branch"}, True, True),
+        ],
+    )
+    def test_effective_permissions_are_the_sole_grant_source(
+        self, effective, allowed, restricted
+    ):
+        # Positive control: the SAME grants supplied as effective_permissions
+        # (session x workspace, injected by the ToolExecutor) DO authorise the
+        # write.
+        t = GitWriteTool(
+            operation="commit",
+            message="agent commit",
+            effective_permissions=effective,
+        )
+        assert t._git_write_allowed() is allowed
+        assert t._git_write_restricted_to_feature_branch() is restricted
+
+
+# ── B8: session_policy never carries (or reads) a session_permissions grant ──
+
+
+class TestSessionPolicyCarriesNoSessionGrants:
+    """The retired THIRD grants location stays UNPOPULATED and UNREAD.
+
+    ``security_config['session_policy']`` -- the ask/override policy bag written
+    by ``_update_security_config`` (thoughtmachine/security.py:980, whose only
+    keys are ``tool_overrides`` [security.py:983] and
+    ``capability_requirements`` [security.py:986]) -- must NEVER carry a
+    ``session_permissions`` (grants) key, and no source may consult such a key:
+    otherwise the retired third grants source could shadow the canonical
+    on-disk sidecar.  This pin exists so that location can never silently come
+    back.
+    """
+
+    # Non-test source roots, resolved from this file's repo root.  ``tests/`` is
+    # deliberately EXCLUDED, so the synthetic snippets compiled in-memory by the
+    # self-test below can never trip the real repository scan.
+    _ROOTS = ("thoughtmachine", "security", "agent", "tools", "web_ui/backend")
+    _KEY = "session_permissions"
+    _HOST = "session_policy"
+
+    # ── (i) POSITIVE shape pin: the REAL writer's output ─────────────────────
+    def test_writer_output_shape_has_no_session_permissions_key(self):
+        """``_update_security_config`` (thoughtmachine/security.py:980) writes
+        ``session_policy`` with exactly the two keys ``tool_overrides`` and
+        ``capability_requirements``; adding a ``session_permissions`` key (or
+        any other extra key) makes this RED."""
+        from thoughtmachine.security import _update_security_config
+
+        cfg: dict = {}
+        _update_security_config(cfg, "tool_override", "run_bash", True)
+        _update_security_config(cfg, "capability", "fs:write", False)
+        policy = cfg["session_policy"]
+
+        assert self._KEY not in policy
+        assert set(policy) == {"tool_overrides", "capability_requirements"}, policy
+
+    # ── (ii) NON-VACUOUS static reader guard ─────────────────────────────────
+    def _scan_source(self, source, filename):
+        """Return every ``session_permissions`` access under a ``session_policy``
+        expression in *source*: a subscript (``X['session_permissions']``),
+        ``X.get('session_permissions')``, or a ``session_permissions`` key inside
+        a dict literal that mentions ``session_policy``."""
+        found = set()
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:  # pragma: no cover - only malformed synthetic input
+            return found
+
+        parents: dict = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[id(child)] = parent
+
+        def _host_in(node):
+            return self._HOST in (ast.get_source_segment(source, node) or "")
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+                if node.slice.value == self._KEY and _host_in(node.value):
+                    found.add((filename, node.lineno, node.col_offset))
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == self._KEY
+                and _host_in(node.func.value)
+            ):
+                found.add((filename, node.lineno, node.col_offset))
+            if isinstance(node, ast.Dict):
+                keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
+                if self._KEY in keys:
+                    cur = node
+                    while isinstance(cur, ast.Dict):
+                        if _host_in(cur):
+                            found.add((filename, node.lineno, node.col_offset))
+                            break
+                        cur = parents.get(id(cur))
+        return found
+
+    def test_no_source_reads_a_session_permissions_key_in_session_policy(self):
+        root = Path(__file__).resolve().parents[1]
+        violations = set()
+        for base in self._ROOTS:
+            for py in (root / base).rglob("*.py"):
+                if ".git" in py.parts:
+                    continue
+                try:
+                    src = py.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                violations |= self._scan_source(src, str(py.relative_to(root)))
+        assert violations == set(), (
+            "session_policy must not carry/read a session_permissions grant; "
+            f"offending sites: {sorted(violations)}"
+        )
+
+        # SELF-TEST (makes the guard non-vacuous): synthetic, in-memory only --
+        # ``tests/`` is excluded from the real scan above, so these never hit disk.
+        must_flag = {
+            "<sub>": 'cfg["session_policy"]["session_permissions"] = {"git": "write"}',
+            "<get>": 'x = cfg["session_policy"].get("session_permissions", {})',
+            "<lit>": 'c = {"session_policy": {"session_permissions": {"git": "write"}}}',
+        }
+        for label, snippet in must_flag.items():
+            assert self._scan_source(snippet, label), (
+                f"scanner is VACUOUS: failed to flag a violation in {label}: {snippet}"
+            )
+        must_not_flag = {
+            "<clean-sub>": 'cfg["session_policy"]["tool_overrides"] = {}',
+            "<clean-get>": 'x = cfg["session_policy"].get("capability_requirements", {})',
+        }
+        for label, snippet in must_not_flag.items():
+            assert not self._scan_source(snippet, label), (
+                f"scanner false-positived on a clean snippet {label}: {snippet}"
+            )
 
 
 # ── Fail-closed surfacing: the deny NAMES the outcome (no silent deny) ─────

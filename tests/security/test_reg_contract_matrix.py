@@ -174,7 +174,7 @@ def test_post_commit_hook_never_executes(tmp_path):
         working_dir=str(repo),
         workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
-        agent_config={"session_permissions": {"git": "write"}},
+        effective_permissions=FULL_PERMISSIONS,
     )
     result = tool.execute()
     assert "Git command failed" not in result
@@ -260,7 +260,6 @@ def test_clone_ext_transport_rejected(tmp_path):
         working_dir=str(workspace),
         session_permissions=FULL_PERMISSIONS,
         effective_permissions=FULL_PERMISSIONS,
-        agent_config={"session_permissions": {"git": "write"}},
     )
     result = tool.execute()
     assert isinstance(result, str)
@@ -289,7 +288,7 @@ def test_host_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
         working_dir=str(repo),
         workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
-        agent_config={"session_permissions": {"git": "write"}},
+        effective_permissions=FULL_PERMISSIONS,
     )
     result = tool.execute()
     assert "Git command failed" not in result
@@ -360,7 +359,7 @@ def test_git_add_status_diff_log_work(tmp_path):
         working_dir=str(repo),
         workspace_id=HOST_TEST_WS,
         session_permissions=FULL_PERMISSIONS,
-        agent_config={"session_permissions": {"git": "write"}},
+        effective_permissions=FULL_PERMISSIONS,
     )
     result = tool.execute()
     assert "Git command failed" not in result
