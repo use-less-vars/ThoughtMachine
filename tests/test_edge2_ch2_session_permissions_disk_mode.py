@@ -15,8 +15,10 @@ Differential (confirmed against the pre-migration helper):
 
 * readable ``config.json`` (with or without a ``permissions`` key) -- hybrid and
   disk agree exactly (same grants, same ceiling);
-* readable legacy session record (no sidecar) -- hybrid and disk agree exactly;
-* ONLY divergence: a MISSING or CORRUPT ``config.json`` -- hybrid returned the
+* a legacy session record with NO sidecar is no longer a grant source: the
+  sidecar-only store read fails, so the helper fails CLOSED to the all-banned
+  profile (the retired metadata fallback is never consulted);
+* the other divergence: a MISSING or CORRUPT ``config.json`` -- hybrid returned the
   stored grants (filesystem/git ``write`` pass through), disk fails CLOSED to the
   all-banned profile.
 
@@ -141,9 +143,11 @@ def test_config_without_permissions_key_passes_grants(tmp_path, monkeypatch):
     }
 
 
-def test_legacy_record_grants_used_when_no_sidecar(tmp_path, monkeypatch):
-    """Grants come from the legacy session record when no sidecar exists; the
-    readable ceiling still caps them."""
+def test_legacy_record_without_sidecar_fails_closed(tmp_path, monkeypatch):
+    """A legacy session record that carries grants but has NO sidecar is no
+    longer a grant source for reads: the sidecar-only store read fails, so the
+    helper fails CLOSED to the all-banned profile -- even though a readable
+    ceiling is present."""
     vault = _vault(tmp_path, monkeypatch)
     _write_config(vault, permissions={"filesystem": "read", "git": "read"})
     sessions = Path(vault) / "workspaces" / WS_ID / "sessions"
@@ -166,14 +170,7 @@ def test_legacy_record_grants_used_when_no_sidecar(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    assert dict(_effective(WS_ID, SESSION_ID)) == {
-        "filesystem": "read",
-        "network": "banned",
-        "container": False,
-        "git": "read",
-        "mcp": "banned",
-        "host_bash": "banned",
-    }
+    assert dict(_effective(WS_ID, SESSION_ID)) == FAIL_CLOSED
 
 
 # ---------------------------------------------------------------------------
