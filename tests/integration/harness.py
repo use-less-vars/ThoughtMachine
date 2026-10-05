@@ -86,6 +86,70 @@ def _restore_provider_registry(snapshot) -> None:
     providers.update(snapshot)
 
 
+# Module-level holder for the pre-purge ``sys.modules`` snapshot (see
+# ``_snapshot_module_state`` / ``_restore_module_state``).  ``None`` means no
+# snapshot is currently held.
+_MODULE_STATE = None
+
+
+def _snapshot_module_state() -> None:
+    """Snapshot the pre-purge app-module state (idempotent guard).
+
+    Captures the ``_PURGE_PREFIXES``-matched ``sys.modules`` entries plus the
+    parent-package attributes that ``_purge_modules()`` deletes and the
+    re-imports rebind, so ``_restore_module_state()`` can put the ORIGINAL
+    singletons back (mirrors the bb608a5 harness).  Guards against clobbering:
+    if a snapshot is already held (e.g. a second ``start_backend()`` in the same
+    process, or ``restart()`` in flight) this is a silent no-op, so the pristine
+    baseline is never overwritten.
+    """
+    global _MODULE_STATE
+    if _MODULE_STATE is not None:
+        return
+    absent = object()
+    matched = [n for n in list(sys.modules) if n.startswith(_PURGE_PREFIXES)]
+    saved_modules = {n: sys.modules[n] for n in matched}
+    saved_attrs: dict = {}
+    for n in saved_modules:
+        parent_name, _, child = n.rpartition(".")
+        if not parent_name or parent_name in saved_modules:
+            continue
+        parent_mod = sys.modules.get(parent_name)
+        if parent_mod is not None:
+            saved_attrs.setdefault(parent_name, {})[child] = parent_mod.__dict__.get(
+                child, absent
+            )
+    _MODULE_STATE = (saved_modules, saved_attrs, absent)
+
+
+def _restore_module_state() -> None:
+    """Restore the snapshot taken by ``_snapshot_module_state()`` (no-op if none).
+
+    Drops the currently-matched modules, reinstates the saved originals, then
+    re-points the parent-package attributes that the re-imports had rebound to
+    the fresh duplicates (popping attributes that did not exist before).
+    Clears the holder so a later ``start_backend()`` can snapshot again.  A
+    silent no-op when nothing was ever snapshotted.
+    """
+    global _MODULE_STATE
+    if _MODULE_STATE is None:
+        return
+    saved_modules, saved_attrs, absent = _MODULE_STATE
+    _MODULE_STATE = None
+    for name in [m for m in sys.modules if m.startswith(_PURGE_PREFIXES)]:
+        del sys.modules[name]
+    sys.modules.update(saved_modules)
+    for parent_name, attrs in saved_attrs.items():
+        parent_mod = sys.modules.get(parent_name)
+        if parent_mod is None:
+            continue
+        for child, value in attrs.items():
+            if value is absent:
+                parent_mod.__dict__.pop(child, None)
+            else:
+                parent_mod.__dict__[child] = value
+
+
 def start_backend(tmp_home=None):
     """Start an isolated backend.
 
@@ -105,6 +169,7 @@ def start_backend(tmp_home=None):
     }
     patcher = patch.object(pathlib.Path, "home", return_value=Path(tmp_home))
     patcher.start()
+    _snapshot_module_state()
     _purge_modules()
     server_mod = importlib.import_module("web_ui.backend.server")
     app = server_mod.app
@@ -128,6 +193,7 @@ def start_backend(tmp_home=None):
                 else:
                     os.environ[key] = value
             _restore_provider_registry(provider_snapshot)
+            _restore_module_state()
             state["env_restored"] = True
         if rmtree:
             shutil.rmtree(tmp_home, ignore_errors=True)
