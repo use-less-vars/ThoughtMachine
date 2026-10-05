@@ -11,8 +11,10 @@ The canonical permission model is the six resources
 ``git_read``/``git_write`` grains and ``system``/``execution`` resources no
 longer exist.  These tests lock the collapse fixes on the canonical set:
 
-- Fix A: ``ConfigManager.apply_config`` MERGES a partial frontend payload over
-  the stored permission set instead of wholesale replacing it.
+- Fix A: ``ConfigManager.apply_config`` IGNORES/STRIPS any ``session_permissions``
+  carried by a frontend payload -- the payload grant is dropped (and logged)
+  rather than merged over or replacing the stored set; grants are written only
+  through the canonical session-permission sidecar (P1).
 - Fix C: the persistence layer (``save_config_to_session`` /
   ``save_session`` / ``bridge.save_session``) is no longer a grants holder --
   it STRIPS ``session_permissions`` from the persisted ``session_config``
@@ -24,6 +26,7 @@ longer exist.  These tests lock the collapse fixes on the canonical set:
   ``'write'`` (other values are dropped, never invented).
 """
 
+import logging
 import sys
 import uuid
 from pathlib import Path
@@ -72,35 +75,46 @@ def _make_session(metadata_extra=None):
     )
 
 
-# ── Fix A: apply_config merges partial payloads ────────────────────────
+# ── Fix A: apply_config IGNORES (strips) payload session_permissions ───
+#
+# The vault permission SIDECAR (P1) is the single canonical grant store;
+# grants are written ONLY through PUT /api/session/{id}/permissions.  A
+# ``session_permissions`` key on the apply_config payload is therefore
+# stripped (never merged) — the stored set is left byte-identical.
 
 class TestApplyConfigMerge:
-    def test_partial_payload_preserves_stored_keys(self):
+    def test_partial_payload_ignored_stored_untouched(self, caplog):
         current = SessionConfig(mode="agent", session_permissions=dict(FULL_PERMS))
-        _, updated = ConfigManager.apply_config(
-            {"session_permissions": {"network": "banned"}},
-            current,
-        )
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            _, updated = ConfigManager.apply_config(
+                {"session_permissions": {"network": "banned"}},
+                current,
+            )
         assert updated is not None
         sp = updated.session_permissions
-        assert sp["network"] == "banned"          # explicit payload value wins
-        assert sp["filesystem"] == "write"         # stored key preserved
-        assert sp["git"] == "read"                 # stored key preserved
-        assert sp["mcp"] == "banned"               # stored key preserved
-        assert sp["host_bash"] == "banned"         # stored key preserved
+        # P1: the payload is IGNORED — the stored set is unchanged (the payload
+        # cannot grant, even partially).
+        assert sp == FULL_PERMS
+        assert sp["network"] == "ask"              # payload value NOT applied
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
-    def test_full_payload_still_overrides_every_key(self):
+    def test_full_payload_ignored_stored_untouched(self, caplog):
         current = SessionConfig(mode="agent", session_permissions=dict(FULL_PERMS))
         new_set = {"network": "banned", "git": "write"}
-        _, updated = ConfigManager.apply_config(
-            {"session_permissions": dict(new_set)},
-            current,
-        )
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            _, updated = ConfigManager.apply_config(
+                {"session_permissions": dict(new_set)},
+                current,
+            )
         sp = updated.session_permissions
-        assert sp["network"] == "banned"
-        assert sp["git"] == "write"
-        # keys not in the payload remain stored
-        assert sp["filesystem"] == "write"
+        # A non-empty payload is stripped wholesale; the stored set is unchanged.
+        assert sp == FULL_PERMS
+        assert sp["git"] == "read"                 # payload value NOT applied
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
     def test_payload_none_leaves_stored_untouched(self):
         current = SessionConfig(mode="agent", session_permissions=dict(FULL_PERMS))

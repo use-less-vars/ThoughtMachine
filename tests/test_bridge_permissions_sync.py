@@ -2,14 +2,17 @@
 Integration tests: session_permissions roundtrip via WebAgentBridge.
 
 Validates:
-1.  ``apply_config`` with non‑default ``session_permissions`` is accepted
-2.  ``save_session()`` → ``load_session()`` roundtrip preserves the permissions
+1.  ``apply_config`` IGNORES a non‑default ``session_permissions`` payload (the
+    payload grant is dropped, never stored on the bridge -- sidecar owns grants)
+2.  ``save_session()`` → ``load_session()`` roundtrip does NOT persist or
+    resurrect ``session_permissions`` (the session record is not a grants holder)
 3.  ``ToolExecutor`` enforces the restored permissions:
       - ``FilePreviewTool`` (``filesystem:read``) is *denied* when ``filesystem=banned``
       - and allowed after updating to ``filesystem=read``
 """
 
 import json
+import logging
 import sys
 import uuid
 from pathlib import Path
@@ -56,24 +59,27 @@ class TestBridgePermissionsRoundtrip:
         )
 
     # ------------------------------------------------------------------
-    # 1a) apply_config stores the permission on the bridge
+    # 1a) apply_config IGNORES the payload permission (P1 — sidecar owns grants)
     # ------------------------------------------------------------------
 
-    def test_apply_config_accepts_custom_permissions(self, temp_store):
-        """apply_config with filesystem=banned stores it on self._config."""
+    def test_apply_config_ignores_custom_permissions(self, temp_store, caplog):
+        """apply_config payload session_permissions is IGNORED (P1)."""
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
 
-        result = bridge.apply_config({
-            "session_permissions": {"filesystem": "banned"},
-        })
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            result = bridge.apply_config({
+                "session_permissions": {"filesystem": "banned"},
+            })
         # apply_config now returns an enriched dict, not {"success": True}
         assert "config" in result and "merged_config" in result, f"apply_config failed: {result}"
-        assert result["permissions"]["filesystem"] == "banned", (
-            f"Expected permissions.filesystem=banned, got {result['permissions']}"
-        )
+        # P1: the payload cannot grant — the canonical grant store is the
+        # session permission sidecar, so 'banned' never lands on the bridge.
         config = bridge.get_config()
         assert config is not None
-        assert config["session_permissions"]["filesystem"] == "banned"
+        assert (config.get("session_permissions") or {}).get("filesystem") != "banned", config
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
     # ------------------------------------------------------------------
     # 1b) roundtrip: save → load ⇒ permissions preserved

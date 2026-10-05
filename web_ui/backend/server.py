@@ -70,7 +70,7 @@ Server → Client (JSON):
     session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "...", "workspace_path": "...", "config": {...} }
     session_deleted     { "type": "session_deleted",     "session_id": "..." }
     session_renamed     { "type": "session_renamed",     "session_id": "...", "new_name": "..." }
-    open_sessions_list  { "type": "open_sessions_list",  "session_ids": ["..."] }
+    open_sessions       { "type": "open_sessions",       "session_ids": ["..."] }
     session_closed      { "type": "session_closed",      "session_id": "..." }
     session_cleared     { "type": "session_cleared" }
     providers_list      { "type": "providers_list",      "providers": [...] }
