@@ -663,8 +663,14 @@ class TestToolExecutorEnforcement:
         )
 
     def test_permissive_allows_write(self):
+        """RISK-3 (new contract): an id-less executor MUST NOT grant from the
+        in-memory ``session_permissions`` mirror.  A permissive mirror
+        (filesystem='write') is no longer authoritative -> the write is DENIED.
+        (Canonical disk-mode grant: tests/test_worker_disk_mode_inheritance.py.)"""
         executor = self._executor([FileWriteTool], SessionPermissions(filesystem="write"))
-        assert self._run(executor, FileWriteTool)["result"] == "Write OK"
+        result = self._run(executor, FileWriteTool)["result"]
+        assert "Permission denied" in result, result
+        assert "filesystem:write" in result, result
 
     def test_restrictive_denies_write(self):
         executor = self._executor([FileWriteTool], SessionPermissions(filesystem="read"))
@@ -673,16 +679,24 @@ class TestToolExecutorEnforcement:
         assert "filesystem:write" in result
 
     def test_multi_requirement_denied_if_one_missing(self):
+        """RISK-3 (new contract): id-less -> fail-closed session, so the
+        multi-requirement tool is denied on the FIRST category (container:true)
+        rather than the mirror's missing 'network'.  (Disk-mode
+        ceiling/missing-category contract: tests/test_security_gate_disk.py.)"""
         executor = self._executor(
             [MultiRequirementTool],
             SessionPermissions(container=True, network=False, filesystem="write"),
         )
         result = self._run(executor, MultiRequirementTool)["result"]
         assert "Permission denied" in result
-        assert "network" in result
+        assert "container:true" in result
 
     def test_hot_swap_banned_to_read(self):
-        """Replacing session_permissions at runtime changes the gate outcome."""
+        """RISK-3 (new contract): an id-less executor reads NO canonical grant
+        source, so hot-swapping ``config.session_permissions`` ('banned' ->
+        'read') can never change the outcome -- the fail-closed denial holds
+        before AND after the swap.  (The disk-mode revocation/hot-swap contract
+        is pinned in tests/test_worker_disk_mode_inheritance.py.)"""
         cfg = AgentConfig(session_permissions=SessionPermissions(filesystem="banned"))
         executor = ToolExecutor(
             tool_classes=[FilePreviewTool], config=cfg, state=AgentState(config=cfg)
@@ -698,11 +712,72 @@ class TestToolExecutorEnforcement:
             FilePreviewTool, {"filename": "/nonexistent/file.txt"}, "FilePreviewTool", 0,
             lambda: False, lambda: "", lambda: 0,
         )
-        assert "Permission denied" not in r2.get("result", "")
-        assert any(
-            msg in r2.get("result", "")
-            for msg in ("No such file", "not found", "not a file", "not exist")
+        # id-less: the widened mirror is NOT honoured -- still denied.
+        assert "Permission denied" in r2.get("result", "")
+        assert "filesystem:read" in r2.get("result", "")
+
+
+class TestIdlessFailClosed:
+    """RISK-3 pin: an id-less executor MUST NOT grant from the in-memory mirror.
+
+    ``_execute_single_tool`` called WITHOUT a session_id/workspace_id has no
+    on-disk authority to read, so the effective profile is the deny-all
+    ``_DISK_FAIL_CLOSED_SESSION`` merged with the workspace capabilities.  An
+    over-broad ``config.session_permissions`` mirror (container/network/full
+    filesystem/git/mcp + host_bash allow) can therefore NEVER widen access.
+
+    Reverting the id-less branch to the historical 2-arg merge
+    ``get_effective_permissions(session_perms_obj, caps)`` makes this test RED:
+    the mirror's ``container=True`` / ``filesystem='full'`` / ``git='full'``
+    would grant both tools again.
+    """
+
+    def _executor(self, tool_classes, permissions):
+        cfg = AgentConfig(session_permissions=permissions)
+        return ToolExecutor(
+            tool_classes=tool_classes,
+            config=cfg,
+            state=AgentState(config=cfg),
+            logger=None,
+            security_available=False,
+            agent=None,
         )
+
+    @staticmethod
+    def _run(executor, tool_cls):
+        return executor._execute_single_tool(
+            tool_cls, {}, tool_cls.__name__, 0,
+            lambda: False, lambda: None, lambda: 0,
+        )
+
+    def test_idless_overbroad_mirror_cannot_grant(self):
+        """An all-permissive mirror is IGNORED: both tools are denied."""
+        executor = self._executor(
+            [FileWriteTool, GitReadTool],
+            SessionPermissions(
+                container=True, network=True, filesystem="full",
+                mcp="full", git="full", host_bash="allow",
+            ),
+        )
+        r_write = self._run(executor, FileWriteTool)["result"]
+        assert "Permission denied" in r_write, r_write
+        assert "filesystem:write" in r_write, r_write
+        r_git = self._run(executor, GitReadTool)["result"]
+        assert "Permission denied" in r_git, r_git
+        assert "git:read" in r_git, r_git
+
+    def test_idless_deny_is_fail_closed_all_banned(self):
+        """Diagnostic: the id-less floor is the all-banned deny-all profile."""
+        import agent.core.tool_executor as _te
+
+        fc = _te._DISK_FAIL_CLOSED_SESSION
+        assert fc is not None, "_DISK_FAIL_CLOSED_SESSION not imported"
+        assert fc.container is False
+        assert fc.network == "banned"
+        assert fc.filesystem == "banned"
+        assert fc.git == "banned"
+        assert fc.mcp == "banned"
+        assert fc.host_bash == "banned"
 
 
 # =========================================================================
@@ -744,64 +819,48 @@ class TestAskPermissionFlow:
         )
 
     def test_ask_approve_runs(self, clean_prompts):
+        """RISK-3 (new contract): an id-less executor has no on-disk
+        authority to read, so it never reaches the interactive ask flow --
+        the deny-all floor denies the git:write tool synchronously and leaves
+        NO pending prompt to approve.  (Canonical disk-mode ask coverage now
+        lives in tests/test_worker_disk_mode_inheritance.py
+        ::test_main_agent_ask_prompts_via_event_bus.)"""
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitWriteTool], permissions=perms)
-        result_container = []
-
-        def run_executor():
-            result_container.append(executor._execute_single_tool(
-                GitWriteTool, {}, "GitWriteTool", 0,
-                lambda: False, lambda: None, lambda: 0,
-            ))
-
-        t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
-        time.sleep(0.2)
-
+        result = executor._execute_single_tool(
+            GitWriteTool, {}, "GitWriteTool", 0,
+            lambda: False, lambda: None, lambda: 0,
+        )
+        assert "Permission denied" in result["result"], result
         with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-        assert len(request_ids) > 0, "executor did not trigger the ask flow"
-        resolve_security_prompt(request_ids[0], approved=True)
-
-        t.join(timeout=5)
-        assert len(result_container) == 1
-        assert result_container[0]["result"] == "Git write OK"
-        assert result_container[0]["tool_type"] == "normal"
+            assert len(_pending_security_requests) == 0
 
     def test_ask_deny_blocks(self, clean_prompts):
+        """RISK-3 (new contract): id-less -> fail-closed denial, synchronously;
+        no prompt is ever registered (nothing to deny)."""
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitWriteTool], permissions=perms)
-        result_container = []
-
-        def run_executor():
-            result_container.append(executor._execute_single_tool(
-                GitWriteTool, {}, "GitWriteTool", 0,
-                lambda: False, lambda: None, lambda: 0,
-            ))
-
-        t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
-        time.sleep(0.2)
-
+        result = executor._execute_single_tool(
+            GitWriteTool, {}, "GitWriteTool", 0,
+            lambda: False, lambda: None, lambda: 0,
+        )
+        assert "Permission denied" in result["result"], result
         with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-        assert len(request_ids) > 0
-        resolve_security_prompt(request_ids[0], approved=False)
-
-        t.join(timeout=5)
-        assert len(result_container) == 1
-        assert "Permission denied" in result_container[0]["result"]
+            assert len(_pending_security_requests) == 0
 
     def test_ask_read_bypasses_prompt(self, clean_prompts):
+        """RISK-3 (new contract): id-less -> fail-closed denial even for a
+        git:read tool under a git='ask' mirror; no prompt is registered."""
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitReadTool], permissions=perms)
         result = executor._execute_single_tool(
             GitReadTool, {}, "GitReadTool", 0,
             lambda: False, lambda: None, lambda: 0,
         )
-        assert result["result"] == "Git read OK"
+        assert "Permission denied" in result["result"], result
+        assert "git:read" in result["result"], result
         with _pending_requests_lock:
-            assert len(list(_pending_security_requests.keys())) == 0
+            assert len(_pending_security_requests) == 0
 
     def test_resolve_places_response_on_queue(self, clean_prompts):
         q = queue.Queue()

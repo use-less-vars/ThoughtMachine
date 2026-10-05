@@ -44,6 +44,7 @@ try:
         get_effective_permissions,
         check_required_categories,
         check_requires_resource,
+        _DISK_FAIL_CLOSED_SESSION,
     )
     from thoughtmachine.workspace_capabilities import (
         WorkspaceCapabilities,
@@ -58,6 +59,7 @@ except ImportError:
     check_requires_resource = None
     WorkspaceCapabilities = None
     resolve_workspace_id = None
+    _DISK_FAIL_CLOSED_SESSION = None
 
 
 def _ensure_gate_imported() -> bool:
@@ -83,12 +85,14 @@ def _ensure_gate_imported() -> bool:
     global check_requires_resource  # noqa: PLW0603
     global WorkspaceCapabilities  # noqa: PLW0603
     global resolve_workspace_id  # noqa: PLW0603
+    global _DISK_FAIL_CLOSED_SESSION  # noqa: PLW0603
     try:
         from security.security_gate import (
             get_workspace_capabilities as _new_get_workspace_capabilities,
             get_effective_permissions as _new_get_effective_permissions,
             check_required_categories as _new_check_required_categories,
             check_requires_resource as _new_check_requires_resource,
+            _DISK_FAIL_CLOSED_SESSION as _new_DISK_FAIL_CLOSED_SESSION,
         )
         from thoughtmachine.workspace_capabilities import (
             WorkspaceCapabilities as _new_WorkspaceCapabilities,
@@ -106,6 +110,8 @@ def _ensure_gate_imported() -> bool:
             WorkspaceCapabilities = _new_WorkspaceCapabilities
         if resolve_workspace_id is None:
             resolve_workspace_id = _new_resolve_workspace_id
+        if _DISK_FAIL_CLOSED_SESSION is None:
+            _DISK_FAIL_CLOSED_SESSION = _new_DISK_FAIL_CLOSED_SESSION
         GATE_AVAILABLE = True
         return True
     except ImportError:
@@ -385,7 +391,16 @@ class ToolExecutor:
                         workspace_id=ws_id,
                     )
                 else:
-                    effective = get_effective_permissions(session_perms_obj, caps)
+                    # Fail-closed: an id-less executor (no session_id and/or
+                    # no resolvable workspace_id) has no on-disk authority to
+                    # read, so it must NOT inherit the in-memory mirror
+                    # (self.config.session_permissions), which can be
+                    # over-broad relative to the workspace ceiling / stored
+                    # record.  Merge against the deny-all profile so the
+                    # result can only ever restrict, never grant.
+                    effective = get_effective_permissions(
+                        _DISK_FAIL_CLOSED_SESSION, caps
+                    )
 
                 ok, error_msg = check_required_categories(
                     required_categories,

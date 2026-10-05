@@ -98,101 +98,66 @@ class TestToolExecutorAskPermission:
 
     def test_git_write_tool_goes_through_ask_flow(self):
         """
-        When SessionPermissions has git='ask', a tool requiring git:write
-        triggers the security prompt flow and can be approved.
+        RISK-3 (new contract): an id-less executor has no on-disk authority to
+        read, so a git='ask' mirror is IGNORED and the git:write tool is
+        DENIED synchronously -- no interactive prompt is registered.
+        (Canonical disk-mode ask coverage:
+        tests/test_worker_disk_mode_inheritance.py::test_main_agent_ask_prompts_via_event_bus.)
         """
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitWriteTool], permissions=perms)
 
-        result_container = []
-
-        def run_executor():
-            r = executor._execute_single_tool(
-                GitWriteTool, {}, "GitWriteTool", 0,
-                lambda: False, lambda: None, lambda: 0
-            )
-            result_container.append(r)
-
-        t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
-
-        import time
-        time.sleep(0.2)
+        result = executor._execute_single_tool(
+            GitWriteTool, {}, "GitWriteTool", 0,
+            lambda: False, lambda: None, lambda: 0
+        )
+        assert "Permission denied" in result["result"], result
+        assert result["tool_type"] == "normal"
 
         with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-
-        assert len(request_ids) > 0, (
-            "No pending security requests — the executor did not trigger the ask flow"
-        )
-
-        request_id = request_ids[0]
-        resolve_security_prompt(request_id, approved=True)
-
-        t.join(timeout=5)
-
-        assert len(result_container) == 1
-        assert result_container[0]["result"] == "Git write OK"
-        assert result_container[0]["tool_type"] == "normal"
+            assert len(_pending_security_requests) == 0
 
     def test_git_write_tool_ask_denied(self):
         """
-        When SessionPermissions has git='ask', the tool execution is denied
-        if the user denies the prompt.
+        RISK-3 (new contract): id-less -> fail-closed denial, synchronously;
+        no prompt is ever registered (so nothing to deny).
         """
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitWriteTool], permissions=perms)
 
-        result_container = []
-
-        def run_executor():
-            r = executor._execute_single_tool(
-                GitWriteTool, {}, "GitWriteTool", 0,
-                lambda: False, lambda: None, lambda: 0
-            )
-            result_container.append(r)
-
-        t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
-
-        import time
-        time.sleep(0.2)
+        result = executor._execute_single_tool(
+            GitWriteTool, {}, "GitWriteTool", 0,
+            lambda: False, lambda: None, lambda: 0
+        )
+        assert "Permission denied" in result["result"], result
+        assert result["tool_type"] == "normal"
 
         with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-
-        assert len(request_ids) > 0
-        request_id = request_ids[0]
-        resolve_security_prompt(request_id, approved=False)
-
-        t.join(timeout=5)
-
-        assert len(result_container) == 1
-        assert "Permission denied" in result_container[0]["result"]
-        assert result_container[0]["tool_type"] == "normal"
+            assert len(_pending_security_requests) == 0
 
     def test_git_read_tool_with_git_ask_bypasses_prompt(self):
         """
-        When session has git='ask', a tool requiring git:read executes
-        directly without triggering the security prompt (read is a no-op).
+        RISK-3 (new contract): id-less -> fail-closed denial even for a
+        git:read tool under a git='ask' mirror; no prompt is registered.
         """
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitReadTool], permissions=perms)
 
-        # Should execute immediately — no background thread needed
         result = executor._execute_single_tool(
             GitReadTool, {}, "GitReadTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Git read OK"
+        assert "Permission denied" in result["result"], result
+        assert "git:read" in result["result"], result
 
         # Verify no pending security requests were created
         with _pending_requests_lock:
-            assert len(list(_pending_security_requests.keys())) == 0
+            assert len(_pending_security_requests) == 0
 
     def test_git_full_bypasses_ask(self):
         """
-        When session has git='full' (not 'ask'), no prompt is triggered.
+        RISK-3 (new contract): git='full' in the mirror does not grant -- the
+        id-less executor denies the git:write tool fail-closed.
         """
         perms = SessionPermissions(git="full")
         executor = self._make_executor([GitWriteTool], permissions=perms)
@@ -201,11 +166,13 @@ class TestToolExecutorAskPermission:
             GitWriteTool, {}, "GitWriteTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Git write OK"
+        assert "Permission denied" in result["result"], result
+        assert "git:write" in result["result"], result
 
     def test_git_read_bypasses_ask_with_read(self):
         """
-        When session has git='read', no prompt is triggered for read.
+        RISK-3 (new contract): git='read' in the mirror does not grant -- the
+        id-less executor denies the git:read tool fail-closed.
         """
         perms = SessionPermissions(git="read")
         executor = self._make_executor([GitReadTool], permissions=perms)
@@ -214,7 +181,8 @@ class TestToolExecutorAskPermission:
             GitReadTool, {}, "GitReadTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Git read OK"
+        assert "Permission denied" in result["result"], result
+        assert "git:read" in result["result"], result
 
 
 # ---------------------------------------------------------------------------

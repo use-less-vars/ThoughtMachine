@@ -426,7 +426,10 @@ class TestToolExecutionAfterConfigCycle:
         )
 
     def test_permissive_config_allows_write_after_cycle(self, tmp_path):
-        """After save/load cycle with full permissions, file writes are allowed."""
+        """RISK-3 (new contract): after a save/load cycle a permissive mirror
+        (filesystem='full') is NOT honoured by the id-less executor -- the
+        write is denied fail-closed.  (Canonical disk-mode grant:
+        tests/test_worker_disk_mode_inheritance.py.)"""
         cfg1 = AgentConfig()
         cfg1.session_permissions = SessionPermissions(
             container=True,
@@ -448,7 +451,11 @@ class TestToolExecutionAfterConfigCycle:
             FileWriteTool, {}, "FileWriteTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Write OK"
+        # RISK-3 (new contract): the id-less executor reads NO canonical grant
+        # source, so even a permissive mirror (filesystem='full') is IGNORED
+        # and the write is DENIED fail-closed.
+        assert "Permission denied" in result["result"], result
+        assert "filesystem:write" in result["result"], result
 
     def test_restrictive_config_denies_after_cycle(self, tmp_path):
         """After save/load cycle with restrictive permissions, writes are denied."""
@@ -477,7 +484,8 @@ class TestToolExecutionAfterConfigCycle:
         assert "filesystem:write" in result["result"]
 
     def test_multi_requirement_tool_after_cycle(self, tmp_path):
-        """Multi-requirement tools are correctly gated after config cycle."""
+        """RISK-3 (new contract): the id-less executor denies the
+        multi-requirement tool fail-closed (container:true blocked first)."""
         cfg1 = AgentConfig()
         cfg1.session_permissions = SessionPermissions(
             container=True,
@@ -499,10 +507,13 @@ class TestToolExecutionAfterConfigCycle:
             MultiRequirementTool, {}, "MultiRequirementTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Multi OK"
+        # RISK-3 (new contract): fail-closed denial, not a grant.
+        assert "Permission denied" in result["result"], result
+        assert "container:true" in result["result"], result
 
     def test_multi_requirement_denied_if_one_missing_after_cycle(self, tmp_path):
-        """One missing permission blocks multi-requirement tool after cycle."""
+        """RISK-3 (new contract): the id-less executor is deny-all, so the
+        multi-requirement tool is denied on the FIRST category (container:true)."""
         cfg1 = AgentConfig()
         cfg1.session_permissions = SessionPermissions(
             container=True,
@@ -524,8 +535,10 @@ class TestToolExecutionAfterConfigCycle:
             MultiRequirementTool, {}, "MultiRequirementTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert "Permission denied" in result["result"]
-        assert "network" in result["result"]
+        # RISK-3 (new contract): id-less -> fail-closed, denied on the FIRST
+        # requirement (container:true) rather than the mirror's 'network'.
+        assert "Permission denied" in result["result"], result
+        assert "container:true" in result["result"], result
 
 
 # =========================================================================
@@ -538,8 +551,10 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
     This is by design — they are separate systems."""
 
     def test_session_config_is_independent_of_tool_permissions(self):
-        """Session.security_config can be set to 'deny' everything but
-        tool execution still uses AgentConfig.session_permissions."""
+        """Session.security_config is NOT bridged to tool execution: setting it
+        to 'deny' everything leaves the id-less ToolExecutor fail-closed
+        (RISK-3 new contract) -- and the AgentConfig.session_permissions mirror
+        is not an authority either (Session.security_config doesn't bridge)."""
         restrictive_session_config = {
             "version": 1,
             "session_policy": {
@@ -563,7 +578,7 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
         cfg = AgentConfig()
         cfg.session_permissions = SessionPermissions(filesystem="full")
 
-        # Even though Session says deny, ToolExecutor says full → allowed
+        # Session says deny; the id-less executor is fail-closed regardless.
         executor = ToolExecutor(
             tool_classes=[FileWriteTool],
             config=cfg,
@@ -576,7 +591,10 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
             FileWriteTool, {}, "FileWriteTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Write OK"
+        # RISK-3 (new contract): the id-less executor does NOT bridge the
+        # AgentConfig.session_permissions mirror -- the write is denied.
+        assert "Permission denied" in result["result"], result
+        assert "filesystem:write" in result["result"], result
 
     def test_session_config_can_be_independently_modified(self):
         """Modifying Session.security_config has zero effect on AgentConfig."""

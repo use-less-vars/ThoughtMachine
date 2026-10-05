@@ -243,14 +243,19 @@ class TestToolExecutorCustomPermissions:
         )
 
     def test_container_tool_allowed_with_custom_config(self):
-        """Container tool runs when config has container=True."""
+        """RISK-3 (new contract): an id-less executor (no session_id /
+        workspace_id) MUST NOT grant from the in-memory mirror.  A permissive
+        mirror (container=True) is no longer authoritative -> the container
+        tool is DENIED.  (Canonical disk-mode grant lives in
+        tests/test_worker_disk_mode_inheritance.py.)"""
         perms = SessionPermissions(container=True)
         executor = self._make_executor([ContainerTool], permissions=perms)
         result = executor._execute_single_tool(
             ContainerTool, {}, "ContainerTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Container OK"
+        assert "Permission denied" in result["result"], result
+        assert "container:true" in result["result"], result
 
     def test_container_tool_denied_with_explicit_false(self):
         """Container tool denied when config has container=False."""
@@ -275,7 +280,9 @@ class TestToolExecutorCustomPermissions:
         assert "Permission denied" in result["result"]
 
     def test_all_categories_allowed(self):
-        """Everything allowed when SessionPermissions is maximally permissive."""
+        """RISK-3 (new contract): a maximally permissive id-less mirror is
+        IGNORED -- the deny-all floor denies the network:true requirement.
+        (Disk-mode ceiling/missing-category contract: tests/test_security_gate_disk.py.)"""
         perms = SessionPermissions(
             container=True, network=True,
             filesystem="full", system="full", execution="full"
@@ -285,12 +292,14 @@ class TestToolExecutorCustomPermissions:
             NetworkAndFilesystemTool, {}, "NetworkAndFilesystemTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Network + FS OK"
+        assert "Permission denied" in result["result"], result
 
     def test_permissive_default_profile_allows_tools(self):
-        """Tools are ALLOWED under the permissive default profile
-        (resources/default_config.json: container=true, network=true -> 'write',
-        filesystem='write') — Docker Phase 2 deliberate refactor."""
+        """RISK-3 (new contract): an id-less executor DOES NOT inherit the
+        permissive default profile from the in-memory mirror -- both the
+        container tool and the network+filesystem tool are DENIED fail-closed.
+        (The disk-mode profile grant is pinned in
+        tests/test_worker_disk_mode_inheritance.py.)"""
         perms = SessionPermissions(
             container=True,
             network=True,  # coerces to 'write'
@@ -304,12 +313,12 @@ class TestToolExecutorCustomPermissions:
             ContainerTool, {}, "ContainerTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert r1["result"] == "Container OK"
+        assert "Permission denied" in r1["result"], r1
         r2 = executor._execute_single_tool(
             NetworkAndFilesystemTool, {}, "NetworkAndFilesystemTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert r2["result"] == "Network + FS OK"
+        assert "Permission denied" in r2["result"], r2
 
     def test_none_permissions_falls_back_to_default(self):
         """When session_permissions is None, the executor falls back to the
