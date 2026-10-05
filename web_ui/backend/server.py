@@ -1505,6 +1505,30 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 pass
                             continue
 
+                        # 5b. Seed the permission sidecar (ABSENT-ONLY) for the
+                        #     session now bound to the NEW workspace.  The session
+                        #     record was just re-saved under the new workspace, but
+                        #     no grants sidecar exists there yet, so the gate's disk
+                        #     read would fail CLOSED (all-banned).  Seeding an empty
+                        #     sidecar yields the fail-closed DEFAULTS capped by the
+                        #     new workspace's ceiling.  Absent-only: switching BACK
+                        #     to a workspace that already holds this session's grants
+                        #     must preserve them.  Best-effort: a seed failure must
+                        #     NOT break the switch (the old bridge is already gone).
+                        try:
+                            _switch_sid = bridge._session_id or (
+                                bridge._loaded_session.session_id
+                                if bridge._loaded_session else None
+                            )
+                            if workspace_id and _switch_sid:
+                                bridge._session_manager._seed_permissions_sidecar(
+                                    workspace_id, _switch_sid, {},
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            log('WARNING', 'server',
+                                f"apply_config: permission sidecar seed failed "
+                                f"for workspace {workspace_id}: {exc}")
+
                         try:
                             # 6. Now apply the config to the NEW bridge
                             config = config_manager.translate_frontend_config(config)
@@ -1552,9 +1576,26 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     "text": f"⚠ Config apply had issues: {err_msg}",
                                 })
 
+                            # Machine-readable permission-context reset signal
+                            # carried on the EXISTING ``status_message`` channel
+                            # (no new WS event type; no ``session_id`` so the
+                            # frontend's cross-session status filter cannot drop
+                            # it).  The frontend renders ``text``; the extra
+                            # fields let an operator/UI re-read this session's
+                            # effective (capped) permissions.
                             await ws.send_json({
                                 "type": "status_message",
-                                "text": f"✅ Switched to project: {_project_path}",
+                                "text": (
+                                    f"✅ Switched to project: {_project_path}\n"
+                                    f"You are now in workspace "
+                                    f"{workspace_id or _project_path}. "
+                                    f"Permission context reset to defaults for "
+                                    f"this workspace, capped by this workspace's "
+                                    f"ceiling."
+                                ),
+                                "permissions_reset": True,
+                                "workspace_id": workspace_id or "",
+                                "permission_context": "defaults_capped_by_ceiling",
                             })
                         except Exception as exc:
                             # Do NOT let a failed apply kill the WS handler — the old
@@ -2648,6 +2689,25 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     session_store.add_open_session(new_session.session_id)
                     _session_bridges[new_session.session_id] = bridge
 
+                    # 5b. Seed the permission sidecar (ABSENT-ONLY) for the newly
+                    #     created session now bound to the NEW workspace.  The record
+                    #     was just re-saved under the new workspace, but no grants
+                    #     sidecar exists there yet, so the gate's disk read would fail
+                    #     CLOSED (all-banned).  Seeding an empty sidecar yields the
+                    #     fail-closed DEFAULTS capped by the new workspace's ceiling.
+                    #     Absent-only: re-selecting a workspace that already holds
+                    #     this session's grants must preserve them.  Best-effort: a
+                    #     seed failure must NOT break the project switch.
+                    try:
+                        if workspace_id and new_session:
+                            bridge._session_manager._seed_permissions_sidecar(
+                                workspace_id, new_session.session_id, {},
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log('WARNING', 'server',
+                            f"set_project: permission sidecar seed failed "
+                            f"for workspace {workspace_id}: {exc}")
+
                     # 6. Send session_loaded and state messages
                     # Fix 4a: embed config (bridge._session_config is already set above, so
                     # get_frontend_config is canonical) so the chat UI renders immediately.
@@ -2696,9 +2756,22 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             workspace_path=bridge._workspace_path if bridge else None,
                         ),
                     })
+                    # Machine-readable permission-context reset signal carried
+                    # on the EXISTING ``status_message`` channel (parity with the
+                    # apply_config workspace-switch branch; no new WS event type).
                     await ws.send_json({
                         "type": "status_message",
-                        "text": f"✅ Switched to project: {_project_path}",
+                        "text": (
+                            f"✅ Switched to project: {_project_path}\n"
+                            f"You are now in workspace "
+                            f"{bridge._workspace_id or _project_path}. "
+                            f"Permission context reset to defaults for "
+                            f"this workspace, capped by this workspace's "
+                            f"ceiling."
+                        ),
+                        "permissions_reset": True,
+                        "workspace_id": bridge._workspace_id or "",
+                        "permission_context": "defaults_capped_by_ceiling",
                     })
 
                 elif command == "security_response":

@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import Field
 from .git_info_tool import GitReadTool, resolve_git_execution_mode
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
+from thoughtmachine.security import coerce_session_permissions
 
 logger = logging.getLogger(__name__)
 
@@ -158,10 +159,10 @@ class GitWriteTool(GitReadTool):
                 return True
             if gw == "ask":
                 return True
-        sp = (getattr(self, "agent_config", None) or {}).get("session_permissions") or {}
-        if isinstance(sp, dict) and sp.get("git") in (
-            "write", "full", "write_on_feature_branch",
-        ):
+        sp = coerce_session_permissions(
+            (getattr(self, "agent_config", None) or {}).get("session_permissions")
+        )
+        if sp.get("git") in ("write", "full", "write_on_feature_branch"):
             return True
         return False
 
@@ -181,10 +182,10 @@ class GitWriteTool(GitReadTool):
                 return True
             if gw is not None:
                 return False
-        sp = (getattr(self, "agent_config", None) or {}).get("session_permissions") or {}
-        if isinstance(sp, dict):
-            return sp.get("git") == "write_on_feature_branch"
-        return False
+        sp = coerce_session_permissions(
+            (getattr(self, "agent_config", None) or {}).get("session_permissions")
+        )
+        return sp.get("git") == "write_on_feature_branch"
 
     def execute(self) -> str:
         # Reset per-call runtime state (tool instances may be reused).

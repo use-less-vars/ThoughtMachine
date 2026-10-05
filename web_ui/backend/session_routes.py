@@ -22,9 +22,11 @@ from pydantic import BaseModel, ValidationError
 
 from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
+from agent.logging import log
 from thoughtmachine.permission_store import (
     PermissionStoreError,
     read_session_permissions,
+    seed_session_permissions_if_absent,
     session_grants_path,
     write_session_permissions,
 )
@@ -156,6 +158,25 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
         # Re-save so workspace_id + name + agent_config land on disk.
         # save_session moves the file to the workspace-scoped location.
         store.save_session(session, workspace_id=session.workspace_id)
+
+        # Seed the permission sidecar (ABSENT-ONLY) for the session now bound to
+        # a workspace.  The record was just re-saved under the workspace, but no
+        # grants sidecar exists there yet, so a disk-mode permission read would
+        # fail CLOSED (all-banned).  Seeding an empty sidecar yields the
+        # fail-closed DEFAULTS capped by the workspace's ceiling.  Reuses the
+        # SessionManager helper so this path shares one absent-only mechanism
+        # with the create and workspace-switch paths (switching back to a
+        # workspace that already holds grants preserves them).  Best-effort: a
+        # seed failure must NOT fail the create request.
+        if session.workspace_id:
+            try:
+                session_manager._seed_permissions_sidecar(
+                    session.workspace_id, session.session_id, {},
+                )
+            except Exception as exc:  # noqa: BLE001
+                log('WARNING', 'session_routes',
+                    f"permission sidecar seed failed for workspace "
+                    f"{session.workspace_id}: {exc}")
 
         # Register in global session registry
         registry = SessionRegistry.get_default()

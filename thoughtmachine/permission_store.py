@@ -94,6 +94,7 @@ __all__ = [
     "session_grants_path",
     "read_session_permissions",
     "write_session_permissions",
+    "seed_session_permissions_if_absent",
     "migrate_session_permissions",
     "workspace_ceiling",
 ]
@@ -252,11 +253,13 @@ def read_session_permissions(
 ) -> Dict[str, Any]:
     """Return the session grants in canonical resource-catalog shape.
 
-    Sidecar first; legacy ``metadata.session_config.session_permissions``
-    fallback when the sidecar is absent.  Both sources are normalised on the
-    way out (see :func:`_normalize_session_permissions`): legacy git grains
-    are migrated and unknown/invalid entries are dropped, so callers never
-    see pre-catalog junk.  Fail closed -- see module docstring.
+    The sidecar is the SOLE grants source.  The retired
+    ``metadata.session_config.session_permissions`` /
+    ``metadata.agent_config.session_permissions`` carrier keys are never
+    consulted.  Values are normalised on the way out (see
+    :func:`_normalize_session_permissions`): legacy git grains are migrated
+    and unknown/invalid entries are dropped, so callers never see
+    pre-catalog junk.  Fail closed -- see module docstring.
     """
     sidecar = session_grants_path(vault_root, workspace_id, session_id)
     if sidecar.exists():
@@ -264,29 +267,10 @@ def read_session_permissions(
             _read_json_strict(sidecar, "permissions sidecar")
         )
 
-    record = _session_record_path(vault_root, workspace_id, session_id)
-    if record is None:
-        raise PermissionStoreError(
-            f"no permission source for session {session_id!r} in workspace "
-            f"{workspace_id!r}: no sidecar at {sidecar} and no matching "
-            "session record"
-        )
-    data = _read_json_strict(record, "session record")
-    metadata = data.get("metadata")
-    if not isinstance(metadata, dict):
-        return {}
-    session_config = metadata.get("session_config")
-    if not isinstance(session_config, dict):
-        return {}
-    legacy = session_config.get("session_permissions")
-    if legacy is None:
-        return {}
-    if not isinstance(legacy, dict):
-        raise PermissionStoreError(
-            f"session record {record} has non-object "
-            "metadata.session_config.session_permissions"
-        )
-    return _normalize_session_permissions(legacy)
+    raise PermissionStoreError(
+        f"no permission source for session {session_id!r} in workspace "
+        f"{workspace_id!r}: no sidecar at {sidecar}"
+    )
 
 
 def workspace_ceiling(vault_root, workspace_id: str) -> Dict[str, Any]:
@@ -396,6 +380,43 @@ def write_session_permissions(
             except OSError:
                 pass
     return target
+
+
+def seed_session_permissions_if_absent(
+    vault_root,
+    workspace_id: str,
+    session_id: str,
+    permissions=None,
+) -> bool:
+    """Seed a session's permission sidecar ONLY IF it does not yet exist.
+
+    Absent-only seeding primitive shared by the create path
+    (``SessionManager._seed_permissions_sidecar``) and the workspace-switch
+    path (``server.py`` ``apply_config``).  Seeding an *empty* sidecar is what
+    makes :func:`read_session_permissions` return ``{}`` (fail-closed
+    DEFAULTS) instead of raising ``PermissionStoreError`` (gate fail CLOSED,
+    all-banned) when a session record has just been bound to a workspace that
+    has no grants file for it yet.
+
+    Unlike :func:`write_session_permissions` (which CLOBBERS), this helper is
+    strictly **absent-only**: if the sidecar already exists -- e.g. the user
+    switches BACK to a workspace that already holds this session's grants --
+    it is left untouched and ``False`` is returned.  Returns ``True`` when a
+    new sidecar was written.
+
+    Raises :class:`PermissionStoreError` only if the write itself fails (the
+    caller is expected to run this best-effort).
+    """
+    target = session_grants_path(vault_root, workspace_id, session_id)
+    if target.exists():
+        return False
+    write_session_permissions(
+        vault_root,
+        workspace_id,
+        session_id,
+        permissions if permissions is not None else {},
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -214,6 +214,13 @@ class SessionManager:
         if not session_config_raw or not isinstance(session_config_raw, dict):
             return None
 
+        # session_permissions is NOT a session-metadata grant source: the
+        # canonical store is the permission sidecar (P1).  Work on a copy and
+        # drop any legacy carrier key so the caller's metadata is never mutated
+        # and the retired grant source cannot resurface.
+        session_config_raw = dict(session_config_raw)
+        session_config_raw.pop("session_permissions", None)
+
         from agent.config.session_config import SessionConfig
 
         try:
@@ -296,7 +303,7 @@ class SessionManager:
         session_id: str,
         permissions: Any,
     ) -> None:
-        """Best-effort write of a session's permission sidecar.
+        """Best-effort, ABSENT-ONLY write of a session's permission sidecar.
 
         The sidecar (``<vault>/workspaces/<ws>/sessions/<sid>/permissions.json``)
         is the first source ``read_session_permissions`` consults.  Seeding it at
@@ -304,12 +311,19 @@ class SessionManager:
         failing CLOSED when the session record still lives in the legacy sessions
         dir.  ``permissions`` may be a raw dict or a ``SessionPermissions``
         instance.  Never raises.
+
+        Delegates to ``permission_store.seed_session_permissions_if_absent`` so
+        the create path and the workspace-switch path share one mechanism and
+        agree: an EXISTING sidecar is never overwritten (switching back to a
+        workspace that already holds this session's grants preserves them).
         """
         try:
             import thoughtmachine.vault as _vault_module
-            from thoughtmachine.permission_store import write_session_permissions
+            from thoughtmachine.permission_store import (
+                seed_session_permissions_if_absent,
+            )
 
-            write_session_permissions(
+            seed_session_permissions_if_absent(
                 _vault_module.vault_root(),
                 workspace_id,
                 session_id,

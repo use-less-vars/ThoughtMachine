@@ -856,11 +856,34 @@ def resolve_full_config(
                 raw = session.metadata.get("session_config") or session.metadata.get("agent_config")
                 if isinstance(raw, dict):
                     raw = dict(raw)
+                    # session_permissions is NOT a session-metadata grant source:
+                    # the canonical store is the permission sidecar (P1).  Drop
+                    # any legacy carrier key so it can never shadow P1.
+                    raw.pop("session_permissions", None)
                     if "mode" not in raw:
                         raw["mode"] = "agent"  # mirror repair_session legacy default
                     merged = deep_merge(merged, raw)
         except Exception as exc:
             log("WARNING", "server.config", f"Could not load session config: {exc}")
+
+    # ── Canonical session permission grants (P1 sidecar) ────────────────
+    # The session's raw grants live in the permission sidecar, not in the
+    # session record.  Read them so only the workspace ceiling below can
+    # further restrict them.  Fail-closed: an unreadable sidecar leaves the
+    # merged value untouched (defaults); never substitute a permissive set.
+    if session_id and workspace_id:
+        try:
+            from thoughtmachine.vault import vault_root
+            from thoughtmachine.permission_store import read_session_permissions
+
+            _p1_perms = read_session_permissions(
+                vault_root(), workspace_id, session_id
+            )
+            if isinstance(_p1_perms, dict):
+                merged["session_permissions"] = _p1_perms
+        except Exception as exc:
+            log("WARNING", "server.config",
+                f"Could not read session permission sidecar: {exc}")
 
     if worker_overrides and isinstance(worker_overrides, dict):
         merged = deep_merge(merged, worker_overrides)

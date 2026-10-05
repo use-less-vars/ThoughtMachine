@@ -342,32 +342,18 @@ def _atomic_write_text(data: str, file_path: Path, retries: int = 3) -> None:
 
             time.sleep(0.2 * attempt)
 
-def _load_session_permissions(session_id: str) -> Optional[Dict[str, Any]]:
-    """Load session permissions from a saved session's metadata.
+def _load_session_permissions(
+    session_id: str, workspace_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Load a session's raw permission grants from the canonical sidecar (P1).
 
-    Returns ``None`` if the session cannot be found or has no permissions
-    embedded.  The frontend is expected to pass ``session_id`` from the
-    currently active WebSocket connection.
+    Returns ``None`` when the grant store has no entry for the session.  The
+    retired ``metadata.session_config`` / ``metadata.agent_config`` lookup
+    loops are no longer consulted: ``read_session_permissions`` is the sole
+    grants source.
     """
     try:
-        from session.store import FileSystemSessionStore
-
-        store = FileSystemSessionStore()
-        session = store.load_session(session_id)
-        if session is None:
-            return None
-
-        # Check workspace_id against this session's workspace
-        #
-        # Session permissions are persisted under ``metadata["session_config"]``
-        # (written by SessionManager.save_config_to_session / Bridge.save_session),
-        # so read that key first.  Fall back to the legacy ``agent_config`` key
-        # for sessions saved by older versions of the backend.
-        for key in ("session_config", "agent_config"):
-            data = session.metadata.get(key)
-            if isinstance(data, dict) and data.get("session_permissions") is not None:
-                return data.get("session_permissions")
-        return None
+        return read_session_permissions(vault_root(), workspace_id, session_id)
     except Exception:
         return None
 
@@ -977,7 +963,7 @@ async def get_effective_permissions(
             # No sidecar / legacy record (or unreadable source) for this
             # session: fall back to the metadata-based loader.  The read-only
             # default below still applies if that finds nothing.
-            raw_perms = _load_session_permissions(session_id)
+            raw_perms = _load_session_permissions(session_id, ws_id)
         if raw_perms is not None and isinstance(raw_perms, dict):
             try:
                 session_perms = SessionPermissions(**raw_perms)

@@ -1706,6 +1706,7 @@ class WebAgentBridge:
 
             # Delegate save to SessionManager
             self._session_manager.save_session(session, session_config=None, name=None)
+
             self._loaded_session = session
 
             # ── Load persisted worker contexts for this workspace ──────────
@@ -1937,13 +1938,26 @@ class WebAgentBridge:
                         from web_ui.backend.config_manager import _load_workspace_permission_ceiling
 
                         ceiling = _load_workspace_permission_ceiling(self._workspace_id)
-                        stored_perms = getattr(sc, 'session_permissions', None)
-                        if ceiling and isinstance(stored_perms, dict):
-                            from security.security_gate import apply_workspace_ceiling
+                        # Raw grants now live in the canonical P1 sidecar, not
+                        # in the session record.
+                        try:
+                            from thoughtmachine.vault import vault_root
+                            from thoughtmachine.permission_store import read_session_permissions
 
-                            sc.session_permissions = apply_workspace_ceiling(
-                                ceiling, stored_perms
+                            stored_perms = read_session_permissions(
+                                vault_root(), self._workspace_id, session.session_id
                             )
+                        except Exception:
+                            stored_perms = None
+                        if isinstance(stored_perms, dict):
+                            if ceiling:
+                                from security.security_gate import apply_workspace_ceiling
+
+                                sc.session_permissions = apply_workspace_ceiling(
+                                    ceiling, stored_perms
+                                )
+                            else:
+                                sc.session_permissions = stored_perms
                     except Exception as exc:
                         log('WARNING', 'server.bridge',
                             f"Could not apply workspace permission ceiling to session config: {exc}")
