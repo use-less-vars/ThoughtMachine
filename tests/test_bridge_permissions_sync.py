@@ -35,6 +35,25 @@ from tools.file_preview_tool import FilePreviewTool
 from thoughtmachine.security import SessionPermissions
 
 
+_WS_ID = "bridge-ws-001"
+_SESSION_ID = "bridge-sess-001"
+
+
+def _seed_disk_grant(monkeypatch, tmp_path, filesystem):
+    """Point the vault root at ``tmp_path`` and write the canonical session
+    grant ``{"filesystem": filesystem}`` to the session sidecar, with a present
+    workspace config so the ceiling is an empty (non-capping) profile."""
+    from thoughtmachine import permission_store as ps
+    from thoughtmachine.vault import vault_root
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+    ws_dir = tmp_path / "workspaces" / _WS_ID
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    cfg = ws_dir / "config.json"
+    if not cfg.exists():
+        cfg.write_text(json.dumps({"permissions": {}}), encoding="utf-8")
+    ps.write_session_permissions(vault_root(), _WS_ID, _SESSION_ID, {"filesystem": filesystem})
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 1 — config roundtrip via bridge
 # ══════════════════════════════════════════════════════════════════════════════
@@ -130,12 +149,13 @@ class TestPermissionEnforcement:
     """Use the permissions that survived the roundtrip to gate actual tools."""
 
     @pytest.fixture
-    def executor_with_perms(self, tmp_path, request):
+    def executor_with_perms(self, tmp_path, monkeypatch):
         """
-        Build a ToolExecutor whose config has *filesystem=banned*.
-
-        The state is a minimal AgentState that allows all tools.
+        Build a ToolExecutor governed by the canonical disk grant
+        *filesystem=banned* (written to the session sidecar; vault_root ->
+        tmp_path).  The state is a minimal AgentState that allows all tools.
         """
+        _seed_disk_grant(monkeypatch, tmp_path, filesystem="banned")
         config = AgentConfig(
             session_permissions=SessionPermissions(filesystem="banned"),
         )
@@ -164,6 +184,8 @@ class TestPermissionEnforcement:
             lambda: False,
             lambda: "",
             lambda: 0,
+            session_id=_SESSION_ID,
+            workspace_id=_WS_ID,
         )
         assert "Permission denied" in result.get("result", ""), (
             f"Expected 'Permission denied', got: {result}"
@@ -173,12 +195,12 @@ class TestPermissionEnforcement:
     # 2b) Same tool allowed after updating to filesystem=read
     # ------------------------------------------------------------------
 
-    def test_file_preview_allowed_when_read(self, executor_with_perms):
-        """Same tool succeeds after permissions are updated to filesystem=read."""
+    def test_file_preview_allowed_when_read(self, executor_with_perms, tmp_path, monkeypatch):
+        """Same tool succeeds after the canonical grant is updated to filesystem=read."""
         config, state, executor = executor_with_perms
 
-        # Lift the restriction
-        config.session_permissions = SessionPermissions(filesystem="read")
+        # Lift the restriction by re-writing the canonical disk grant.
+        _seed_disk_grant(monkeypatch, tmp_path, filesystem="read")
 
         # Via ToolExecutor — note: filename points to a non‑existent file,
         # but the permission gate passes first; the tool will then attempt
@@ -192,6 +214,8 @@ class TestPermissionEnforcement:
             lambda: False,
             lambda: "",
             lambda: 0,
+            session_id=_SESSION_ID,
+            workspace_id=_WS_ID,
         )
         result_text = result.get("result", "")
         assert "Permission denied" not in result_text, (
@@ -211,8 +235,9 @@ class TestPermissionEnforcement:
 class TestPermissionsHotSwap:
     """Change session_permissions at runtime and verify enforcement changes."""
 
-    def test_hot_swap_banned_to_read(self, tmp_path):
-        """AgentConfig.session_permissions can be replaced at runtime."""
+    def test_hot_swap_banned_to_read(self, tmp_path, monkeypatch):
+        """The canonical disk grant can be replaced at runtime."""
+        _seed_disk_grant(monkeypatch, tmp_path, filesystem="banned")
         config = AgentConfig(
             session_permissions=SessionPermissions(filesystem="banned"),
         )
@@ -227,15 +252,17 @@ class TestPermissionsHotSwap:
         r1 = executor._execute_single_tool(
             FilePreviewTool, {"filename": "x.txt"}, "FilePreviewTool", 0,
             lambda: False, lambda: "", lambda: 0,
+            session_id=_SESSION_ID, workspace_id=_WS_ID,
         )
         assert "Permission denied" in r1.get("result", "")
 
-        # Hot-swap
-        config.session_permissions = SessionPermissions(filesystem="read")
+        # Hot-swap the canonical disk grant
+        _seed_disk_grant(monkeypatch, tmp_path, filesystem="read")
 
         # Should now pass the permission gate (file still absent → file error)
         r2 = executor._execute_single_tool(
             FilePreviewTool, {"filename": "/nonexistent/file.txt"}, "FilePreviewTool", 0,
             lambda: False, lambda: "", lambda: 0,
+            session_id=_SESSION_ID, workspace_id=_WS_ID,
         )
         assert "Permission denied" not in r2.get("result", "")
