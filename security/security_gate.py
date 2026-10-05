@@ -486,6 +486,41 @@ class _CeilingAnnotatedDict(dict):
         self._ceiling_annotations: Dict[str, Dict[str, Any]] = {}
 
 
+class _FailClosedReasonDict(dict):
+    """Plain ``dict`` carrying the fail-closed CAUSE that produced it.
+
+    Identical to a normal dict for equality, iteration, indexing, ``len``,
+    membership and JSON serialisation; it additionally carries a
+    ``_fail_closed_reason`` string naming WHY the effective permissions were
+    forced onto the deny-all fail-closed profile (e.g. the vault
+    permission-store read error, rendered ``"<ExcType>: <message>"`` -- the
+    same cause the gate already ``logger.warning``-s internally).
+
+    The attribute is read by the denial composers
+    (:func:`check_required_categories`, :func:`check_requires_resource`) so an
+    operator-facing denial can NAME the cause instead of only the internal
+    warning, and can distinguish "no sidecar / not found" from "corrupt
+    (invalid JSON)" from "unreadable".
+
+    A FRESH instance is built per resolution: the reason is NEVER written onto
+    the shared module-level sentinels (``_DISK_FAIL_CLOSED_SESSION`` /
+    ``_DISK_FAIL_CLOSED_CEILING``), which are shared across threads and
+    sessions, so one session's fail-closed cause can never leak into another's
+    denial text.
+    """
+
+    __slots__ = ("_fail_closed_reason",)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._fail_closed_reason: str = ""
+
+
+def _fail_closed_reason_of(effective: Dict[str, Any]) -> str:
+    """Return the fail-closed cause carried by *effective*, or ``""``."""
+    return getattr(effective, "_fail_closed_reason", "") or ""
+
+
 def _ceiling_level_label(value: Any) -> str:
     """Render a raw workspace ceiling value as a stable message label."""
     if isinstance(value, bool):
@@ -874,6 +909,7 @@ def get_effective_permissions(
     # lazy so the legacy in-memory path never depends on permission_store /
     # vault.  Any store error fails CLOSED (deny-all session + deny-all
     # ceiling); the merged result below can then only be restrictive.
+    fail_closed_reason: str = ""
     if session_id is not None and workspace_id is not None:
         try:
             disk_grants, disk_ceiling = _read_disk_permission_sources(
@@ -891,6 +927,11 @@ def get_effective_permissions(
                 session_id,
                 type(exc).__name__,
             )
+            # Capture the SAME cause for the operator-facing denial below:
+            # the exception type plus its message (the message carries the
+            # "not found" / "corrupt (invalid JSON)" / "unreadable"
+            # distinction the bare type name cannot).
+            fail_closed_reason = f"{type(exc).__name__}: {exc}"
             session = _DISK_FAIL_CLOSED_SESSION
             workspace_permissions = _DISK_FAIL_CLOSED_CEILING
         else:
@@ -904,9 +945,23 @@ def get_effective_permissions(
                 session = SessionPermissions(
                     **coerce_resource_permissions(disk_grants)
                 )
-            except Exception:
+            except Exception as exc:
                 # Unreadable grant record -> deny-all session; the disk
-                # ceiling still applies on top of it.
+                # ceiling still applies on top of it.  Never SILENT: name the
+                # cause on the log AND carry the SAME cause to the
+                # operator-facing denial below via ``fail_closed_reason``.
+                # This handler runs in the ``else`` of the disk read, so the
+                # outer handler did NOT fire and no reason is recorded yet.
+                logger.warning(
+                    "get_effective_permissions: session grant record "
+                    "unreadable (workspace_id=%s session_id=%s): %s: %s; "
+                    "failing CLOSED",
+                    workspace_id,
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                fail_closed_reason = f"{type(exc).__name__}: {exc}"
                 session = _DISK_FAIL_CLOSED_SESSION
             workspace_permissions = disk_ceiling
 
@@ -942,7 +997,23 @@ def get_effective_permissions(
                         "workspace ceiling produced non-catalog session entries"
                     )
                 session = SessionPermissions(**coerced)
-            except Exception:
+            except Exception as exc:
+                # The workspace ceiling is UNUSABLE (its clamp produced a
+                # profile the schema rejects AND the catalog retry could not
+                # reconcile) -> deny-all session, observable rather than
+                # silent.  Preserve an ALREADY-recorded cause (the unreadable
+                # record from the re-coercion above): that root cause must not
+                # be clobbered by this downstream ceiling failure.
+                logger.warning(
+                    "get_effective_permissions: workspace ceiling unusable "
+                    "(workspace_id=%s session_id=%s): %s: %s; failing CLOSED",
+                    workspace_id,
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                if not fail_closed_reason:
+                    fail_closed_reason = f"{type(exc).__name__}: {exc}"
                 session = _DISK_FAIL_CLOSED_SESSION
 
     # ── Capability merge over the (possibly ceiling-capped) session ───────
@@ -1007,6 +1078,25 @@ def get_effective_permissions(
         _workspace_allows_host_resources = False
     if not _workspace_allows_host_resources:
         result["host_bash"] = "banned"
+
+    # Surface the fail-closed cause on the RETURNED mapping so an
+    # operator-facing denial can name it (the warning above is internal-only).
+    # A FRESH carrier is built per call and the shared sentinels are never
+    # written to, so a fail-closed cause can never leak into another
+    # session/thread's resolution.  Wrapping the plain merged dict is lossless:
+    # a fail-closed store read never produces a ``_CeilingAnnotatedDict``.  Its
+    # ``workspace_permissions`` is the deny-all ``_DISK_FAIL_CLOSED_CEILING``,
+    # which cannot lower the already-maximally-restrictive
+    # ``_DISK_FAIL_CLOSED_SESSION``, so ``_annotate_ceiling_changes`` finds no
+    # category the ceiling restricted and returns None.  (The annotation block
+    # may still be entered -- the ceiling clamp reassigns ``session`` to a
+    # fresh, value-identical ``SessionPermissions``, defeating the
+    # ``session is not _DISK_FAIL_CLOSED_SESSION`` guard -- but it yields no
+    # annotation, leaving ``result`` the plain merged dict wrapped below.)
+    if fail_closed_reason:
+        fc_result = _FailClosedReasonDict(result)
+        fc_result._fail_closed_reason = fail_closed_reason
+        result = fc_result
 
     return result
 
@@ -1159,6 +1249,17 @@ def resolve_container_config(
                     capabilities,
                     _DISK_FAIL_CLOSED_CEILING,
                 )
+                # Carry the SAME store-failure cause onto a FRESH per-call
+                # carrier so the deny-all profile that flows onward NAMES the
+                # cause -- not only the internal WARNING above.  The
+                # conditional return below stores this SAME carrier object
+                # (``effective=eff`` with NO copy) when a fail-closed cause is
+                # present, so a downstream check_required_categories /
+                # check_requires_resource call over ``cfg.effective`` renders
+                # the ``(fail-closed: <ExcType>: <message>)`` suffix; a health
+                # path (no cause) still returns the plain ``dict(eff)`` copy.
+                eff = _FailClosedReasonDict(eff)
+                eff._fail_closed_reason = f"{type(exc).__name__}: {exc}"
             else:
                 eff = get_effective_permissions(
                     loaded, capabilities, disk_ceiling
@@ -1177,7 +1278,7 @@ def resolve_container_config(
         return ContainerConfig(
             network_mode=network_mode,
             workspace_mode=workspace_mode,
-            effective=dict(eff),
+            effective=(eff if _fail_closed_reason_of(eff) else dict(eff)),
             lifecycle_class=lifecycle_class,
         )
     except Exception as exc:  # 8. Any unexpected failure is fail-closed.
@@ -1288,6 +1389,13 @@ def check_requires_resource(
             # session grant alone would allow it) — name it so the denial
             # explains why a permissive-looking session profile still refuses.
             message += f" (workspace ceiling: {ceiling_level})"
+        fail_closed_reason = _fail_closed_reason_of(effective_permissions)
+        if fail_closed_reason:
+            # The effective profile was forced onto the deny-all fail-closed
+            # shape by a gate-internal error (e.g. an unreadable vault
+            # permission store): name that cause so the operator can tell it
+            # apart from an honest all-banned grant set.
+            message += f" (fail-closed: {fail_closed_reason})"
         return (False, message)
     return (True, "")
 
@@ -1408,6 +1516,14 @@ def check_required_categories(
                 # denial explains why a permissive-looking session profile
                 # still refuses.
                 message = f"{message} (workspace ceiling: {ceiling_level})"
+            fail_closed_reason = _fail_closed_reason_of(effective)
+            if fail_closed_reason:
+                # The effective profile was forced onto the deny-all
+                # fail-closed shape by a gate-internal error (e.g. an
+                # unreadable vault permission store): name that cause so the
+                # operator can tell it apart from an honest all-banned grant
+                # set.
+                message = f"{message} (fail-closed: {fail_closed_reason})"
             return False, message
 
         if result == "ASK":

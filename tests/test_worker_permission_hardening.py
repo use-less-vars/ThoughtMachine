@@ -796,8 +796,15 @@ class TestIdlessFailClosed:
         )
         executor.config.workspace_path = "/tmp/unresolvable-ws"
         result = self._run(executor, FileWriteTool)["result"]
+        # Explicit: the message NAMES its OWN cause (the unresolvable
+        # workspace_id) -- an exact-match pin so a generic or mis-attributed
+        # fail-closed reason cannot satisfy it.
         assert "could not resolve workspace_id" in result, result
         assert "fail-closed" in result, result
+        assert result == (
+            "DENIED: could not resolve workspace_id for workspace_path=/tmp/"
+            "unresolvable-ws; tool execution denied (fail-closed)."
+        ), result
 
     @staticmethod
     def _run_calls(executor, tool_cls, session_id="", workspace_id=""):

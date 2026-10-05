@@ -18,6 +18,7 @@ B5  ``migrate_session_permissions`` is idempotent and additive.
 """
 
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -229,11 +230,11 @@ class TestDiskModeGateFailsClosed:
         required category (``mcp:connect``) the fail-closed deny-all does not
         grant, the caller receives a non-empty denial -- never a silent allow.
 
-        Disclosed residual: the deny-all / fail-closed CAUSE (the unreadable
-        vault store) is internal-only -- it is surfaced only as a
-        ``logger.warning`` plus the deny-all sentinel inside
-        ``security/security_gate.py``; the operator-facing text does NOT name
-        it, only the resulting ``mcp:banned`` denial.
+        Finding B: the fail-closed CAUSE is now SURFACED into the
+        operator-facing denial -- the message names WHY the deny-all profile
+        was substituted (the patched store read raised) in addition to the
+        resulting ``mcp:banned`` denial.  The cause still also goes to the
+        internal ``logger.warning``.
         """
         from agent.config.models import AgentConfig
         from agent.core.state import AgentState
@@ -281,6 +282,294 @@ class TestDiskModeGateFailsClosed:
         assert result.startswith("Permission denied:")
         assert "mcp:connect" in result
         assert "mcp:banned" in result
+
+        # Finding B: the surfaced denial NAMES the fail-closed cause -- the
+        # ``fail-closed:`` token plus the captured store-read error (type +
+        # message), so the operator can tell an unreadable store apart from
+        # an honest all-banned grant set.
+        assert "fail-closed:" in result, result
+        assert "PermissionStoreError" in result, result
+        assert "simulated unreadable grant store" in result, result
+
+    def test_fail_closed_cause_does_not_leak_into_later_resolution(
+        self, hermetic_vault, monkeypatch
+    ):
+        """The fail-closed reason is PER-CALL and must never leak.
+
+        Finding B attaches the store-failure cause to a FRESH per-call
+        carrier.  Storing it instead on the shared module-level deny-all
+        sentinel (reused across sessions/threads, and by the id-less path)
+        would let a LATER healthy resolution inherit a stale cause.  This pin
+        drives a fail-closed store error, then a subsequent healthy
+        resolution, and asserts the later denial names NO cause.
+        """
+        import security.security_gate as sg
+        from security.security_gate import check_required_categories
+        from thoughtmachine.permission_store import read_session_permissions as _rsp
+
+        vault = hermetic_vault
+        ws_id = "ws-b4-leak"
+        _write_ceiling(vault, ws_id)
+        sid = "sess-b4-leak"
+
+        # 1. A store read error resolves fail-closed and carries the cause...
+        def _boom(*a, **k):
+            raise PermissionStoreError("simulated unreadable grant store")
+
+        monkeypatch.setattr(ps, "read_session_permissions", _boom)
+        eff_fc = _gate(sid, ws_id)
+        assert "simulated unreadable grant store" in getattr(
+            eff_fc, "_fail_closed_reason", ""
+        )
+        # ...while the SHARED module-level sentinels stay CLEAN (the reason is
+        # never stored on them).
+        assert getattr(sg._DISK_FAIL_CLOSED_SESSION, "_fail_closed_reason", "") == ""
+        assert "_fail_closed_reason" not in getattr(
+            sg._DISK_FAIL_CLOSED_CEILING, "__dict__", {}
+        )
+
+        # A healthy sidecar so the disk READ succeeds: the two remaining
+        # get_effective_permissions substitution sites (record re-coercion,
+        # unusable ceiling) can then be driven in turn.
+        monkeypatch.setattr(ps, "read_session_permissions", _rsp)
+        sidecar = session_grants_path(vault, ws_id, sid)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"filesystem": "read"}))
+
+        # 1b. Else-branch RE-COERCION failure (site 2) -> cause carried, and
+        #     the shared sentinels still stay CLEAN.
+        real_coerce = sg.coerce_resource_permissions
+
+        def _recoerce_boom(*a, **k):
+            raise RuntimeError("site2 unreadable record")
+
+        monkeypatch.setattr(sg, "coerce_resource_permissions", _recoerce_boom)
+        eff_s2 = _gate(sid, ws_id)
+        assert getattr(eff_s2, "_fail_closed_reason", "") == (
+            "RuntimeError: site2 unreadable record"
+        )
+        assert getattr(sg._DISK_FAIL_CLOSED_SESSION, "_fail_closed_reason", "") == ""
+        assert "_fail_closed_reason" not in getattr(
+            sg._DISK_FAIL_CLOSED_CEILING, "__dict__", {}
+        )
+        monkeypatch.setattr(sg, "coerce_resource_permissions", real_coerce)
+
+        # 1c. UNUSABLE-ceiling retry failure (site 3) -> cause carried, shared
+        #     sentinels still CLEAN.
+        real_ceiling = sg.apply_workspace_ceiling
+        monkeypatch.setattr(
+            sg, "apply_workspace_ceiling", lambda perms, raw: {"filesystem": "bananas"}
+        )
+        eff_s3 = _gate(sid, ws_id)
+        assert getattr(eff_s3, "_fail_closed_reason", "") == (
+            "ValueError: workspace ceiling produced non-catalog session entries"
+        )
+        assert getattr(sg._DISK_FAIL_CLOSED_SESSION, "_fail_closed_reason", "") == ""
+        assert "_fail_closed_reason" not in getattr(
+            sg._DISK_FAIL_CLOSED_CEILING, "__dict__", {}
+        )
+        monkeypatch.setattr(sg, "apply_workspace_ceiling", real_ceiling)
+
+        # 1d. resolve_container_config disk-read failure (site 4) -> the
+        #     deny-all profile that flows onward carries the cause, shared
+        #     sentinels still CLEAN.
+        real_disk = sg._read_disk_permission_sources
+
+        def _disk_boom(*a, **k):
+            raise RuntimeError("site4 resolve store failure")
+
+        monkeypatch.setattr(sg, "_read_disk_permission_sources", _disk_boom)
+        cfg = sg.resolve_container_config(
+            SessionPermissions(),
+            WorkspaceCapabilities(
+                git_available=True,
+                filesystem_write=True,
+                allow_docker=True,
+                allow_network=True,
+            ),
+            "persistent",
+            session_id=sid,
+            workspace_id=ws_id,
+            use_disk=True,
+        )
+        assert getattr(cfg.effective, "_fail_closed_reason", "") == (
+            "RuntimeError: site4 resolve store failure"
+        )
+        assert getattr(sg._DISK_FAIL_CLOSED_SESSION, "_fail_closed_reason", "") == ""
+        assert "_fail_closed_reason" not in getattr(
+            sg._DISK_FAIL_CLOSED_CEILING, "__dict__", {}
+        )
+        monkeypatch.setattr(sg, "_read_disk_permission_sources", real_disk)
+
+        # 2. A subsequent HEALTHY resolution must NOT inherit the stale cause.
+        eff_ok = _gate(sid, ws_id)
+        assert getattr(eff_ok, "_fail_closed_reason", "") == ""
+        ok, msg = check_required_categories(
+            ["mcp:connect"], eff_ok, tool_name="X", tool_args={}, description=""
+        )
+        assert ok is False, eff_ok
+        assert "fail-closed:" not in msg, msg
+
+
+# ── B4c: every deny-all substitution site NAMES its OWN cause ─────────────
+
+class TestFailClosedCausePerSubstitutionSite:
+    """Each gate-internal deny-all substitution surfaces ITS OWN cause.
+
+    Finding B wired the OUTER disk-read failure.  This closes the class: the
+    two remaining ``get_effective_permissions`` substitution sites (the
+    belt-and-braces record re-coercion and the unusable-ceiling retry) and the
+    ``resolve_container_config`` substitution now each attach a FRESH per-call
+    ``(fail-closed: <ExcType>: <message>)`` cause.  Each pin drives EXACTLY one
+    site and asserts the operator-facing denial NAMES that site's cause; the
+    re-coercion pin also asserts the NEW WARNING names the type AND message.
+    """
+
+    def _healthy_sidecar(self, vault, ws_id, sid):
+        _write_ceiling(vault, ws_id)
+        sidecar = session_grants_path(vault, ws_id, sid)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"filesystem": "read"}))
+
+    def test_record_recoercion_failure_names_cause(
+        self, hermetic_vault, monkeypatch, caplog
+    ):
+        """Site 2: the else-branch grant-record re-coercion raises."""
+        import security.security_gate as sg
+        from security.security_gate import check_required_categories
+
+        vault = hermetic_vault
+        ws_id = "ws-b4c-recoerce"
+        sid = "sess-b4c-recoerce"
+        self._healthy_sidecar(vault, ws_id, sid)
+
+        class _RecoerceBoom(RuntimeError):
+            pass
+
+        def _boom(_grants):
+            raise _RecoerceBoom("simulated re-coercion failure")
+
+        monkeypatch.setattr(sg, "coerce_resource_permissions", _boom)
+        caplog.set_level(logging.WARNING, logger="security.security_gate")
+
+        eff = _gate(sid, ws_id)
+        # Deny-all substituted AND the cause carried (type + message).
+        assert eff["mcp"] == "banned"
+        assert getattr(eff, "_fail_closed_reason", "") == (
+            "_RecoerceBoom: simulated re-coercion failure"
+        )
+
+        ok, msg = check_required_categories(
+            ["mcp:connect"], eff, tool_name="X", tool_args={}, description=""
+        )
+        assert ok is False, eff
+        assert "(fail-closed: _RecoerceBoom: simulated re-coercion failure)" in msg, msg
+
+        # The NEW warning fired, naming the type AND the message
+        # (workspace/session ids too) -- not only the exception type.
+        blob = " ".join(
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.name == "security.security_gate"
+            and rec.levelno == logging.WARNING
+        )
+        assert "_RecoerceBoom" in blob, blob
+        assert "simulated re-coercion failure" in blob, blob
+        assert ws_id in blob, blob
+        assert sid in blob, blob
+
+    def test_unusable_ceiling_failure_names_cause(
+        self, hermetic_vault, monkeypatch, caplog
+    ):
+        """Site 3: the workspace ceiling clamp is unusable (schema-rejected)."""
+        import security.security_gate as sg
+        from security.security_gate import check_required_categories
+
+        vault = hermetic_vault
+        ws_id = "ws-b4c-ceiling"
+        sid = "sess-b4c-ceiling"
+        self._healthy_sidecar(vault, ws_id, sid)
+
+        # A ceiling whose clamp emits a NON-catalog level: ``SessionPermissions``
+        # rejects it and the catalog retry cannot reconcile -> unusable.
+        monkeypatch.setattr(
+            sg,
+            "apply_workspace_ceiling",
+            lambda perms, raw: {"filesystem": "bananas"},
+        )
+        caplog.set_level(logging.WARNING, logger="security.security_gate")
+
+        eff = _gate(sid, ws_id)
+        assert eff["filesystem"] == "banned"
+        assert getattr(eff, "_fail_closed_reason", "") == (
+            "ValueError: workspace ceiling produced non-catalog session entries"
+        )
+
+        ok, msg = check_required_categories(
+            ["filesystem:write"], eff, tool_name="X", tool_args={}, description=""
+        )
+        assert ok is False, eff
+        assert (
+            "(fail-closed: ValueError: workspace ceiling produced non-catalog "
+            "session entries)" in msg
+        ), msg
+
+        blob = " ".join(
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.name == "security.security_gate"
+            and rec.levelno == logging.WARNING
+        )
+        assert "workspace ceiling unusable" in blob, blob
+        assert "workspace ceiling produced non-catalog session entries" in blob, blob
+
+    def test_resolve_container_config_failure_names_cause(self, hermetic_vault, monkeypatch):
+        """Site 4: ``resolve_container_config`` disk-read fails; the deny-all
+        profile that flows onward (``cfg.effective``) NAMES the cause."""
+        import security.security_gate as sg
+        from security.security_gate import ContainerConfig, check_required_categories
+
+        vault = hermetic_vault
+        ws_id = "ws-b4c-resolve"
+        sid = "sess-b4c-resolve"
+        _write_ceiling(vault, ws_id)
+
+        class _ResolveBoom(RuntimeError):
+            pass
+
+        def _boom(*a, **k):
+            raise _ResolveBoom("simulated resolve store failure")
+
+        monkeypatch.setattr(sg, "_read_disk_permission_sources", _boom)
+
+        cfg = sg.resolve_container_config(
+            SessionPermissions(),
+            WorkspaceCapabilities(
+                git_available=True,
+                filesystem_write=True,
+                allow_docker=True,
+                allow_network=True,
+            ),
+            "persistent",
+            session_id=sid,
+            workspace_id=ws_id,
+            use_disk=True,
+        )
+        assert isinstance(cfg, ContainerConfig)
+        # Fail-closed config...
+        assert cfg.network_mode == "none"
+        assert cfg.workspace_mode == "ro"
+        # ...whose deny-all profile that flows onward carries the SAME cause
+        # (no copy: a downstream composer call over cfg.effective names it).
+        assert getattr(cfg.effective, "_fail_closed_reason", "") == (
+            "_ResolveBoom: simulated resolve store failure"
+        )
+
+        ok, msg = check_required_categories(
+            ["mcp:connect"], cfg.effective, tool_name="X", tool_args={}, description=""
+        )
+        assert ok is False, cfg.effective
+        assert "(fail-closed: _ResolveBoom: simulated resolve store failure)" in msg, msg
 
 
 # ── B5: migrate_session_permissions is idempotent and additive ──────────────
@@ -494,9 +783,15 @@ class TestFailClosedSurfaceIsNamed:
             lambda: 0,
         )["result"]
 
-        # The operator sees the fail-closed outcome NAMED.
+        # The operator sees the fail-closed outcome NAMED with its OWN cause
+        # (gate unavailable) -- an exact-match pin so a generic or
+        # mis-attributed fail-closed reason cannot satisfy it.
         assert "fail-closed" in result, result
         assert "security gate unavailable" in result, result
+        assert result == (
+            "Permission denied: security gate unavailable; "
+            "tool execution denied (fail-closed)."
+        ), result
 
 
 # ── Q2-hop: workspace stored ceiling reaches the executor's config ──────────
