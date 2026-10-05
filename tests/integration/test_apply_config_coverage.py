@@ -471,10 +471,20 @@ def test_case1_permissions_change(contract_server, workspace_type):
                 assert probe["permissions"]["filesystem"] == "read"
             else:
                 assert probe["permissions"]["filesystem"] == "read"
-            assert not (probe["config"] or {}).get("session_permissions"), (
-                f"probe must not surface a session_permissions grant; got "
-                f"{probe['config'].get('session_permissions')!r}"
+            proj_sp = (probe["config"] or {}).get("session_permissions") or {}
+            # The REST probe's canonical projection must never surface the
+            # payload's requested grant and must equal the fail-closed
+            # canonical/defaults set (filesystem read, network banned, git read,
+            # container off).
+            assert proj_sp != _NEW_PERMISSIONS, (
+                f"probe must not surface the payload's requested grant; got {proj_sp!r}"
             )
+            assert (
+                proj_sp.get("filesystem") == "read"
+                and proj_sp.get("network") == "banned"
+                and proj_sp.get("git") == "read"
+                and proj_sp.get("container") is False
+            ), f"probe session_permissions must equal canonical/defaults; got {proj_sp!r}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -861,10 +871,20 @@ def test_case7_permission_only_apply_keeps_session(contract_server, workspace_ty
                 assert probe["permissions"]["filesystem"] == "read"
             else:
                 assert probe["permissions"]["filesystem"] == "read"
-            assert not (probe["config"] or {}).get("session_permissions"), (
-                f"probe must not surface a session_permissions grant; got "
-                f"{probe['config'].get('session_permissions')!r}"
+            proj_sp = (probe["config"] or {}).get("session_permissions") or {}
+            # The REST probe's canonical projection must never surface the
+            # payload's requested grant and must equal the fail-closed
+            # canonical/defaults set (filesystem read, network banned, git read,
+            # container off).
+            assert proj_sp != _NEW_PERMISSIONS, (
+                f"probe must not surface the payload's requested grant; got {proj_sp!r}"
             )
+            assert (
+                proj_sp.get("filesystem") == "read"
+                and proj_sp.get("network") == "banned"
+                and proj_sp.get("git") == "read"
+                and proj_sp.get("container") is False
+            ), f"probe session_permissions must equal canonical/defaults; got {proj_sp!r}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
