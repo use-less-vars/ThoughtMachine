@@ -265,6 +265,21 @@ def set_logger(logger: Optional[Any]) -> None:
     _logger = logger
 
 
+def _safe_log(level: str, message: str) -> None:
+    """Log *message* via the injected logger, tolerating partial logger interfaces.
+
+    ``set_logger`` accepts any object, and ``agent.core.agent`` injects the
+    agent's ``_AgentLogger``, which exposes ``log_*`` helpers but NOT the
+    stdlib ``info`` / ``warning`` / ``debug`` / ``error`` interface. Never
+    assume that interface here -- a logging statement must never raise.
+    """
+    if not _logger or not LOGGING_AVAILABLE:
+        return
+    fn = getattr(_logger, level, None)
+    if callable(fn):
+        fn(message)
+
+
 def _redact_sensitive_data(data: Any) -> Any:
     """
     Redact potentially sensitive data from log entries.
@@ -827,8 +842,7 @@ def _ensure_security_response_handler() -> None:
             q.put((approved, remember))
         else:
             # Log warning about orphaned response
-            if _logger and LOGGING_AVAILABLE:
-                _logger.warning(f"Received security response for unknown request: {request_id}")
+            _safe_log("warning", f"Received security response for unknown request: {request_id}")
     
     # Register handler
     global_event_bus.subscribe(_handle_security_response)
@@ -991,10 +1005,7 @@ def _update_security_config(
     # default policy is not stored per-target
     
     # Log the update
-    if _logger and LOGGING_AVAILABLE:
-        _logger.info(
-            f"Security configuration updated: {policy_type} {policy_target} = {policy_value}"
-        )
+    _safe_log("info", f"Security configuration updated: {policy_type} {policy_target} = {policy_value}")
 
 
 def is_allowed(
