@@ -414,8 +414,10 @@ def _variant_config(case_name: str, workspace_type: str, **fields) -> dict:
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case1_permissions_change(contract_server, workspace_type):
-    """apply_config with modified session_permissions → config_changed reflects
-    the new permissions, no error, session still alive."""
+    """apply_config of a NON-workspace change → config_changed reflects the
+    merged config; the payload's session_permissions is NOT a grant source, so
+    the emitted effective permissions stay at the fail-closed DEFAULT set
+    (filesystem 'read', git 'read', network 'banned'). No error, session alive."""
     app, _ = contract_server
     label = f"case1-{workspace_type}"
     with TestClient(app) as client:
@@ -424,27 +426,55 @@ def test_case1_permissions_change(contract_server, workspace_type):
             sid = loaded["session_id"]
             assert sid
 
-            cfg = _variant_config("case1", workspace_type,
-                                  session_permissions=_NEW_PERMISSIONS)
+            # Non-empty (non-workspace) payload: a model field keeps the normal
+            # branch. The retired session_permissions grant field is dropped
+            # from the payload — it is a no-op under the new permission model.
+            cfg = _variant_config("case1", workspace_type, model="roundk-c1")
             evt, events = _apply_config(ws, cfg, label)
-            assert evt["permissions"]["filesystem"] == "write"
-            assert evt["permissions"]["git"] == "write"
-            assert evt["permissions"]["network"] == "outbound"
-            assert evt["config"]["session_permissions"]["filesystem"] == "write"
+            assert evt["config"]["model"] == "roundk-c1"
+            # New model truth: a session's effective permissions come only from
+            # its grants sidecar (seeded EMPTY → fail-closed defaults). The
+            # payload's session_permissions is NOT a grant source.
+            # NOTE: the `custom` variant SWITCHES workspace; the switch now seeds
+            # an EMPTY grants sidecar for this reused session in the new
+            # workspace, so the gate serves the capped-by-ceiling DEFAULTS
+            # (filesystem/git 'read', network 'banned') -- still no grant.
+            if workspace_type == "custom":
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            else:
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            assert not (evt["config"] or {}).get("session_permissions"), (
+                f"apply_config payload must not surface a session_permissions "
+                f"grant; got {evt['config'].get('session_permissions')!r}"
+            )
 
             if workspace_type == "custom":
                 # workspace branch: empty session is reused (no session_loaded);
                 # the final status confirms the project switch.
                 final = _expect(ws, "status_message", label)
                 assert "✅ Switched to project" in final.get("text", "")
+                assert final.get("permissions_reset") is True
+                assert final.get("permission_context") == "defaults_capped_by_ceiling"
+                assert "Permission context reset" in final.get("text", "")
                 assert _ws_path("case1", workspace_type) in final.get("text", "")
             else:
                 # normal branch: config_changed is the ONLY reply.
                 _assert_quiet(ws, label)
 
-            # Session still alive and reflects the applied permissions.
+            # Session still alive; permissions unchanged (payload cannot grant).
             probe = _get_config(ws, label)
-            assert probe["config"]["session_permissions"]["filesystem"] == "write"
+            if workspace_type == "custom":
+                assert probe["permissions"]["filesystem"] == "read"
+            else:
+                assert probe["permissions"]["filesystem"] == "read"
+            assert not (probe["config"] or {}).get("session_permissions"), (
+                f"probe must not surface a session_permissions grant; got "
+                f"{probe['config'].get('session_permissions')!r}"
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -453,25 +483,39 @@ def test_case1_permissions_change(contract_server, workspace_type):
 
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
-def test_fresh_workspace_apply_new_permissions(contract_server, workspace_type):
+def test_fresh_workspace_apply_defaults_not_deny_all(contract_server, workspace_type):
     """A FRESH workspace (provisioned by ``ensure_workspace_dirs`` with a
-    seeded ``config.json``) must let ``apply_config``'s NEW
-    ``session_permissions`` survive the gate's vault read instead of failing
-    closed to deny-all (missing ``workspaces/<id>/config.json`` made
-    ``permission_store.workspace_ceiling`` raise, so every category resolved
-    to ``banned``)."""
+    seeded ``config.json``) must resolve to the fail-closed DEFAULT permission
+    set — filesystem 'read', git 'read', network 'banned' — NOT the all-banned
+    deny-all produced when the gate's vault ceiling read fails
+    (``permission_store.workspace_ceiling`` raising on a missing
+    ``workspaces/<id>/config.json`` used to collapse every category to
+    ``banned``). A fresh session's grants sidecar is empty, so the emitted
+    effective permissions are the defaults (the payload cannot grant)."""
     app, _ = contract_server
     label = f"fixed-a-{workspace_type}"
     with TestClient(app) as client:
         with client.websocket_connect("/ws") as ws:
             _new_session(ws, label)
-            cfg = _variant_config("fixed-a", workspace_type,
-                                  session_permissions=_NEW_PERMISSIONS)
+            cfg = _variant_config("fixed-a", workspace_type, model="roundk-fixed-a")
             evt, _ = _apply_config(ws, cfg, label)
-            assert evt["permissions"]["filesystem"] == "write"
-            assert evt["permissions"]["git"] == "write"
-            assert evt["permissions"]["network"] == "outbound"
-            assert evt["config"]["session_permissions"]["filesystem"] == "write"
+            assert evt["config"]["model"] == "roundk-fixed-a"
+            # New model: effective permissions come only from the session's grants
+            # sidecar (empty for a fresh session → fail-closed defaults). The
+            # `custom` variant switches workspace, which now seeds an EMPTY
+            # sidecar → the gate serves the capped-by-ceiling DEFAULTS.
+            if workspace_type == "custom":
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            else:
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            assert not (evt["config"] or {}).get("session_permissions"), (
+                f"apply_config payload must not surface a session_permissions "
+                f"grant; got {evt['config'].get('session_permissions')!r}"
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -729,9 +773,10 @@ def test_case6_rapid_consecutive_applies(contract_server, workspace_type):
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case7_permission_only_apply_keeps_session(contract_server, workspace_type):
-    """Permission-only apply_config on an established session → SAME session_id,
-    NO session_loaded, no status_message; config_changed carries the updated
-    permissions and (custom workspace) the workspace_path key."""
+    """Non-workspace apply_config on an established session → SAME session_id,
+    NO session_loaded, no status_message; config_changed carries the merged
+    config and (custom workspace) the workspace_path key. The payload cannot
+    change the emitted effective permissions (they stay at the defaults)."""
     app, _ = contract_server
     label = f"case7-{workspace_type}"
     with TestClient(app) as client:
@@ -754,6 +799,9 @@ def test_case7_permission_only_apply_keeps_session(contract_server, workspace_ty
                 )
                 final = _expect(ws, "status_message", label)
                 assert "✅ Switched to project" in final.get("text", "")
+                assert final.get("permissions_reset") is True
+                assert final.get("permission_context") == "defaults_capped_by_ceiling"
+                assert "Permission context reset" in final.get("text", "")
             else:
                 ws_path = None
                 _apply_config(ws, cfg_setup, label)
@@ -764,17 +812,31 @@ def test_case7_permission_only_apply_keeps_session(contract_server, workspace_ty
             session = bridge_before._loaded_session or bridge_before._session
             assert session is not None and session.session_id == sid
 
-            # The user's exact scenario: permission-only apply, no workspace_path.
-            evt, events = _apply_config(
-                ws, {"session_permissions": _NEW_PERMISSIONS}, label
-            )
+            # The user's exact scenario: a permission-only INTENT apply, no
+            # workspace_path. The payload's session_permissions is a no-op grant
+            # source under the new model, so a non-empty model field keeps the
+            # normal branch; the emitted effective permissions stay at the
+            # fail-closed defaults.
+            evt, events = _apply_config(ws, {"model": "roundk-c7"}, label)
             assert "session_loaded" not in [e.get("type") for e in events], (
                 f"permission-only apply must NOT replace the session; got: "
                 f"{[e.get('type') for e in events]}"
             )
-            assert evt["permissions"]["filesystem"] == "write"
-            assert evt["permissions"]["git"] == "write"
-            assert evt["config"]["session_permissions"]["filesystem"] == "write"
+            assert evt["config"]["model"] == "roundk-c7"
+            # Effective permissions come only from the session's grants sidecar.
+            # `custom` SWITCHED workspace during setup, which now seeds an EMPTY
+            # sidecar → the gate serves the capped-by-ceiling DEFAULTS; `default`
+            # stays at the same fail-closed defaults.
+            if workspace_type == "custom":
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+            else:
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+            assert not (evt["config"] or {}).get("session_permissions"), (
+                f"apply_config payload must not surface a session_permissions "
+                f"grant; got {evt['config'].get('session_permissions')!r}"
+            )
             if workspace_type == "custom":
                 # cbe5f72: config_changed carries the workspace_path key.
                 assert evt["config"]["workspace_path"] == ws_path, (
@@ -793,9 +855,16 @@ def test_case7_permission_only_apply_keeps_session(contract_server, workspace_ty
             session = bridge_after._loaded_session or bridge_after._session
             assert session is not None and session.session_id == sid
 
-            # Session is usable and persisted with the applied permissions.
+            # Session is usable; permissions unchanged (payload cannot grant).
             probe = _get_config(ws, label)
-            assert probe["config"]["session_permissions"]["filesystem"] == "write"
+            if workspace_type == "custom":
+                assert probe["permissions"]["filesystem"] == "read"
+            else:
+                assert probe["permissions"]["filesystem"] == "read"
+            assert not (probe["config"] or {}).get("session_permissions"), (
+                f"probe must not surface a session_permissions grant; got "
+                f"{probe['config'].get('session_permissions')!r}"
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -822,6 +891,9 @@ def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
             assert evt["config"]["model"] == "roundk-c8-setup"
             final = _expect(ws, "status_message", label)
             assert "✅ Switched to project" in final.get("text", "")
+            assert final.get("permissions_reset") is True
+            assert final.get("permission_context") == "defaults_capped_by_ceiling"
+            assert "Permission context reset" in final.get("text", "")
 
             bridge_before = _server_mod()._session_bridges.get(sid)
             assert bridge_before is not None
@@ -833,14 +905,19 @@ def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
             # user-visible stale-session banner bug).
             evt, events = _apply_config(
                 ws,
-                {"workspace_path": ws_path + "/", "session_permissions": _NEW_PERMISSIONS},
+                {"workspace_path": ws_path + "/", "model": "roundk-c8"},
                 label,
             )
             assert "session_loaded" not in [e.get("type") for e in events], (
                 f"same-dir trailing-slash workspace_path must NOT replace the "
                 f"session; got: {[e.get('type') for e in events]}"
             )
-            assert evt["permissions"]["filesystem"] == "write"
+            assert evt["config"]["model"] == "roundk-c8"
+            # Effective permissions come only from the session's grants sidecar.
+            # This test SWITCHED workspace during setup, which now seeds an EMPTY
+            # sidecar → the gate serves the capped-by-ceiling DEFAULTS (the
+            # payload still cannot grant).
+            assert evt["permissions"]["filesystem"] == "read"
             # config_changed reflects the NORMALIZED path, not the raw form.
             assert evt["config"]["workspace_path"] == ws_path, (
                 f"expected normalized workspace_path {ws_path!r}, got "
@@ -858,7 +935,8 @@ def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
             assert session is not None and session.session_id == sid
 
             probe = _get_config(ws, label)
-            assert probe["config"]["session_permissions"]["filesystem"] == "write"
+            # Workspace was switched during setup → no seeded sidecar → deny-all.
+            assert probe["permissions"]["filesystem"] == "read"
 
 
 
@@ -939,8 +1017,9 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
     """apply_config while the controller is BUSY (agent RUNNING) → the server
     ACKs with config_queued and applies NOTHING yet; once the controller becomes
     idle the queued config is applied on the SAME bridge/session and the
-    deferred config_changed is broadcast with the applied permissions and the
-    normalized workspace_path. No session_loaded anywhere."""
+    deferred config_changed is broadcast with the normalized workspace_path
+    (the payload cannot grant permissions, so the emitted effective set stays
+    at the fail-closed defaults). No session_loaded anywhere."""
     app, _ = contract_server
     label = "case10"
     with TestClient(app) as client:
@@ -957,6 +1036,9 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
             assert evt["config"]["model"] == "roundk-c10-setup"
             final = _expect(ws, "status_message", label)
             assert "✅ Switched to project" in final.get("text", "")
+            assert final.get("permissions_reset") is True
+            assert final.get("permission_context") == "defaults_capped_by_ceiling"
+            assert "Permission context reset" in final.get("text", "")
 
             bridge = _server_mod()._session_bridges.get(sid)
             assert bridge is not None
@@ -988,7 +1070,7 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
 
                 # ── Busy: config must be QUEUED, not applied ────────────────
                 ws.send_json({"command": "apply_config",
-                              "config": {"session_permissions": _NEW_PERMISSIONS}})
+                              "config": {"model": "roundk-c10-queued"}})
                 evt_q, events_q = _receive_until(
                     ws, "config_queued", f"{label} → busy apply"
                 )
@@ -1007,8 +1089,11 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
                 evt_d, events_d = _receive_until(
                     ws, "config_changed", f"{label} → deferred apply"
                 )
-                assert evt_d["permissions"]["filesystem"] == "write"
-                assert evt_d["permissions"]["git"] == "write"
+                assert evt_d["config"]["model"] == "roundk-c10-queued"
+                # This test SWITCHED workspace during setup, which now seeds an
+                # EMPTY sidecar → the gate serves the capped-by-ceiling DEFAULTS.
+                assert evt_d["permissions"]["filesystem"] == "read"
+                assert evt_d["permissions"]["git"] == "read"
                 assert evt_d["config"]["workspace_path"] == ws_path, (
                     f"deferred config_changed must carry the normalized "
                     f"workspace_path, got {evt_d['config'].get('workspace_path')!r}"
@@ -1198,8 +1283,9 @@ def test_config_change_guarantee_while_busy(contract_server):
     """A NON-workspace config change sent while the controller is RUNNING is
     GUARANTEED to be applied: the server ACKs it with config_queued within
     200ms (applying NOTHING yet), and once the controller goes idle the SAME
-    bridge/session applies it and broadcasts config_changed with the updated
-    permissions.  No session_loaded, no lost update, no premature apply."""
+    bridge/session applies it and broadcasts config_changed (the payload cannot
+    grant permissions, so the emitted effective set stays at the defaults).
+    No session_loaded, no lost update, no premature apply."""
     app, _ = contract_server
     label = "case-guard"
     with TestClient(app) as client:
@@ -1238,7 +1324,7 @@ def test_config_change_guarantee_while_busy(contract_server):
 
                 # ── Busy: the change is ACKed fast, applied NOTHING yet ────
                 ws.send_json({"command": "apply_config",
-                              "config": {"session_permissions": _NEW_PERMISSIONS}})
+                              "config": {"model": "roundk-guard-queued"}})
                 evt_q, events_q = _receive_until(
                     ws, "config_queued", f"{label} → busy apply", timeout=0.2
                 )
@@ -1260,11 +1346,16 @@ def test_config_change_guarantee_while_busy(contract_server):
                 evt_d, events_d = _receive_until(
                     ws, "config_changed", f"{label} → deferred apply"
                 )
-                # The updated permissions arrive in the deferred broadcast.
-                assert evt_d["permissions"]["filesystem"] == "write"
-                assert evt_d["permissions"]["git"] == "write"
-                assert evt_d["permissions"]["network"] == "outbound"
-                assert evt_d["config"]["session_permissions"]["filesystem"] == "write"
+                # The deferred broadcast reflects the fail-closed DEFAULT set:
+                # the payload's session_permissions is NOT a grant source.
+                assert evt_d["config"]["model"] == "roundk-guard-queued"
+                assert evt_d["permissions"]["filesystem"] == "read"
+                assert evt_d["permissions"]["git"] == "read"
+                assert evt_d["permissions"]["network"] == "banned"
+                assert not (evt_d["config"] or {}).get("session_permissions"), (
+                    f"apply_config payload must not surface a session_permissions "
+                    f"grant; got {evt_d['config'].get('session_permissions')!r}"
+                )
                 assert "session_loaded" not in [e.get("type") for e in events_d], (
                     f"guarantee: deferred apply must not replace the session; got: "
                     f"{[e.get('type') for e in events_d]}"
@@ -1280,9 +1371,9 @@ def test_config_change_guarantee_while_busy(contract_server):
                 assert session is not None and session.session_id == sid
                 _assert_quiet(ws, label)
 
-                # The applied change is visible to a later get_config too.
+                # The (unchanged) permissions are still visible to get_config.
                 probe = _get_config(ws, label)
-                assert probe["config"]["session_permissions"]["filesystem"] == "write"
+                assert probe["permissions"]["filesystem"] == "read"
             finally:
                 controller.agent = orig_agent
                 controller.thread = orig_thread
@@ -1458,4 +1549,79 @@ def test_case14_temperature_change_while_busy(contract_server):
             finally:
                 controller.agent = orig_agent
                 controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Invariant — an apply_config payload can NEVER write session grants
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_apply_config_payload_cannot_write_grants(contract_server):
+    """``session_permissions`` in an apply_config payload is NOT a grants writer.
+
+    The canonical grants store is the on-disk sidecar (``permission_store``),
+    written ONLY by the REST endpoint.  Applying a config that carries a
+    ``session_permissions`` field must therefore (i) leave the emitted effective
+    permissions at the fail-closed DEFAULTS (filesystem 'read', git 'read',
+    network 'banned') and (ii) leave the on-disk canonical store byte-for-byte
+    unchanged.  Any other outcome would let a config payload escalate
+    privileges."""
+    from thoughtmachine.vault import vault_root
+    from thoughtmachine.permission_store import read_session_permissions
+
+    app, _ = contract_server
+    label = "invariant-no-grant"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+            ws_id = loaded.get("workspace_id")
+            if not ws_id:
+                bridge = _server_mod()._session_bridges.get(sid)
+                assert bridge is not None, "session must have a live bridge"
+                ws_id = bridge.workspace_id
+
+            def _canonical():
+                """Read the canonical grants store; capture fail-closed raises."""
+                try:
+                    return read_session_permissions(vault_root(), ws_id, sid)
+                except Exception as exc:  # noqa: BLE001 — fail-closed read
+                    return ("__raises__", type(exc).__name__)
+
+            before = _canonical()
+
+            evt, _ = _apply_config(
+                ws,
+                {"model": "roundk-invariant",
+                 "session_permissions": dict(_NEW_PERMISSIONS)},
+                label,
+            )
+
+            # (i) the payload cannot grant: emitted effective perms stay DEFAULT.
+            assert evt["permissions"]["filesystem"] == "read", (
+                f"apply_config payload must not grant filesystem; got "
+                f"{evt['permissions'].get('filesystem')!r}"
+            )
+            assert evt["permissions"]["git"] == "read", (
+                f"apply_config payload must not grant git; got "
+                f"{evt['permissions'].get('git')!r}"
+            )
+            assert evt["permissions"]["network"] == "banned", (
+                f"apply_config payload must not grant network; got "
+                f"{evt['permissions'].get('network')!r}"
+            )
+            # NOTE: the payload's ``session_permissions`` block IS echoed back
+            # inside ``config_changed['config']`` as a SessionConfig REQUEST
+            # field (agent/config/session_config.py:200).  That echo is NOT a
+            # grant: the emitted EFFECTIVE permissions above stay at the
+            # fail-closed defaults, and the canonical store below is untouched.
+
+            # (ii) the payload did NOT write the canonical on-disk grants store.
+            after = _canonical()
+            assert after == before, (
+                f"apply_config payload mutated the canonical grants store: "
+                f"{before!r} -> {after!r}"
+            )
+
+            _assert_quiet(ws, label)
 

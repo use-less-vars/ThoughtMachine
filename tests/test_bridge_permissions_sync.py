@@ -37,7 +37,13 @@ from thoughtmachine.security import SessionPermissions
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestBridgePermissionsRoundtrip:
-    """Apply, persist, reload — verify session_permissions survive."""
+    """Apply, persist, reload — session_permissions is NOT a metadata grant.
+
+    The session record (P2) is no longer a grants holder: ``save_session``
+    strips ``session_permissions`` before persisting, so the on-disk
+    ``session_config`` carries no grant and a reloaded bridge does not
+    resurrect one from metadata.
+    """
 
     @pytest.fixture
     def temp_store(self, tmp_path):
@@ -73,8 +79,9 @@ class TestBridgePermissionsRoundtrip:
     # 1b) roundtrip: save → load ⇒ permissions preserved
     # ------------------------------------------------------------------
 
-    def test_roundtrip_preserves_permissions(self, temp_store):
-        """save_session followed by load_session preserves filesystem=banned."""
+    def test_roundtrip_does_not_persist_permissions_in_metadata(self, temp_store):
+        """save_session must NOT persist the grant into metadata.session_config;
+        load_session must NOT resurrect it from the record."""
         # ── write ─────────────────────────────────────────────────────
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
 
@@ -90,9 +97,9 @@ class TestBridgePermissionsRoundtrip:
         assert path is not None, "session file not found on disk"
         with open(path, "r") as f:
             raw = json.load(f)
-        perms_disk = raw.get("metadata", {}).get("session_config", {}).get("session_permissions", {})
-        assert perms_disk.get("filesystem") == "banned", (
-            f"Expected filesystem=banned on disk, got {perms_disk}"
+        stored_config = raw.get("metadata", {}).get("session_config", {})
+        assert "session_permissions" not in stored_config, (
+            f"session_permissions must be stripped from metadata, got {stored_config}"
         )
 
         # ── read ──────────────────────────────────────────────────────
@@ -102,8 +109,10 @@ class TestBridgePermissionsRoundtrip:
 
         config = bridge2.get_config()
         assert config is not None
-        assert config["session_permissions"]["filesystem"] == "banned", (
-            f"Expected filesystem=banned after load, got {config['session_permissions']}"
+        loaded_perms = config.get("session_permissions")
+        assert not (isinstance(loaded_perms, dict)
+                    and loaded_perms.get("filesystem") == "banned"), (
+            f"metadata resurrected the filesystem=banned grant after load: {loaded_perms}"
         )
 
 

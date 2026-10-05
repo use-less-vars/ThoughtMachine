@@ -17,8 +17,10 @@ permanently collapse them after a single restart).
 These tests cover the three relevant scenarios:
 1.  save with a permissive ceiling -> tighten ceiling -> load -> permissions capped
 2.  control: no ceiling -> load -> permissions preserved unchanged
-3.  control: no workspace -> load -> permissions preserved, ceiling loader never
-    invoked with a falsy workspace id
+3.  control: no workspace -> load -> grants are NOT persisted (the canonical
+    permission store is workspace-scoped), so the session falls back to the
+    read-only default; the ceiling loader is never invoked with a falsy
+    workspace id
 """
 
 import json
@@ -58,20 +60,26 @@ def _patch_ceiling(monkeypatch, fake):
     monkeypatch.setattr(config_manager, "_load_workspace_permission_ceiling", fake)
 
 
-def _disk_permissions(temp_store, session_id):
-    """Return the session_permissions dict stored in the session file metadata."""
-    path = temp_store._find_session_path(session_id)
-    assert path is not None, "session file not found on disk"
-    with open(path, "r") as f:
-        raw = json.load(f)
-    return raw.get("metadata", {}).get("session_config", {}).get("session_permissions", {})
+def _disk_permissions(session_id, workspace_id):
+    """Return the session's raw grants from the canonical permission sidecar (P1).
+
+    The session record is no longer a grants holder (its ``session_permissions``
+    metadata is stripped on every write); the canonical permission store
+    (``write_session_permissions`` / the REST
+    ``PUT /api/session/{id}/permissions`` path) is the source of truth.
+    """
+    from thoughtmachine.permission_store import read_session_permissions
+    from thoughtmachine.vault import vault_root
+
+    return read_session_permissions(vault_root(), workspace_id, session_id)
 
 
 class TestSessionLoadCeiling:
     """Loading a saved session re-caps stored permissions through the ceiling."""
 
-    def test_load_recaps_through_tightened_ceiling(self, temp_store, monkeypatch):
+    def test_load_recaps_through_tightened_ceiling(self, temp_store, tmp_path, monkeypatch):
         """Save filesystem=write, tighten the ceiling to banned, reload -> banned."""
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
         ceiling = {}
 
         def fake_ceiling(ws_id):
@@ -82,14 +90,19 @@ class TestSessionLoadCeiling:
         # ── save: workspace set, ceiling permissive -> write stored ──────────
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         bridge._workspace_id = "ws-ceiling-regression"
-        bridge.apply_config({"session_permissions": {"filesystem": "write"}})
         saved = bridge.save_session()
         assert saved is not None, "save_session returned None"
         session_id = saved.session_id
+        # Seed the grant through the canonical permission store (the REST-PUT path).
+        from thoughtmachine.permission_store import write_session_permissions
+        from thoughtmachine.vault import vault_root
+        write_session_permissions(
+            vault_root(), "ws-ceiling-regression", session_id, {"filesystem": "write"}
+        )
 
-        disk_perms = _disk_permissions(temp_store, session_id)
+        disk_perms = _disk_permissions(session_id, "ws-ceiling-regression")
         assert disk_perms.get("filesystem") == "write", (
-            f"expected filesystem=write on disk before load, got {disk_perms}"
+            f"expected filesystem=write in the sidecar before load, got {disk_perms}"
         )
 
         # ── the workspace ceiling tightens after the session was saved ───────
@@ -104,22 +117,28 @@ class TestSessionLoadCeiling:
             f"expected filesystem=banned after load, got {cfg['session_permissions']}"
         )
 
-        # the cap is in-memory only: the stored config keeps the full grant
-        disk_perms = _disk_permissions(temp_store, session_id)
+        # the cap is in-memory only: the sidecar keeps the full grant
+        disk_perms = _disk_permissions(session_id, "ws-ceiling-regression")
         assert disk_perms.get("filesystem") == "write", (
-            f"expected filesystem=write preserved on disk after a capped load, got {disk_perms}"
+            f"expected filesystem=write preserved in the sidecar after a capped load, got {disk_perms}"
         )
 
-    def test_load_without_ceiling_preserves_permissions(self, temp_store, monkeypatch):
+    def test_load_without_ceiling_preserves_permissions(self, temp_store, tmp_path, monkeypatch):
         """Control: no ceiling -> stored write survives the roundtrip unchanged."""
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
         _patch_ceiling(monkeypatch, lambda ws_id: {})
 
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         bridge._workspace_id = "ws-ceiling-control"
-        bridge.apply_config({"session_permissions": {"filesystem": "write"}})
         saved = bridge.save_session()
         assert saved is not None, "save_session returned None"
         session_id = saved.session_id
+        # Seed the grant through the canonical permission store (the REST-PUT path).
+        from thoughtmachine.permission_store import write_session_permissions
+        from thoughtmachine.vault import vault_root
+        write_session_permissions(
+            vault_root(), "ws-ceiling-control", session_id, {"filesystem": "write"}
+        )
 
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         assert bridge2.load_session(session_id), "load_session returned False"
@@ -130,7 +149,12 @@ class TestSessionLoadCeiling:
         )
 
     def test_load_without_workspace_preserves_permissions(self, temp_store, monkeypatch):
-        """Control: no workspace -> ceiling loader never called, perms preserved."""
+        """Control: no workspace -> ceiling loader never called; grants not persisted.
+
+        The canonical permission store is workspace-scoped, so a session with
+        no workspace has no grant store to write to; the restored session falls
+        back to the read-only default.
+        """
         calls = []
 
         def spy_ceiling(ws_id):
@@ -141,7 +165,6 @@ class TestSessionLoadCeiling:
 
         # bridge with no workspace id at all
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
-        bridge.apply_config({"session_permissions": {"filesystem": "write"}})
         saved = bridge.save_session()
         assert saved is not None, "save_session returned None"
         session_id = saved.session_id
@@ -150,8 +173,13 @@ class TestSessionLoadCeiling:
         assert bridge2.load_session(session_id), "load_session returned False"
         cfg = bridge2.get_config()
         assert cfg is not None
-        assert cfg["session_permissions"]["filesystem"] == "write", (
-            f"expected filesystem=write preserved, got {cfg['session_permissions']}"
+        # Without a workspace there is no grant store (P1 is workspace-scoped),
+        # so the session falls back to the safe default (the write grant must not
+        # survive).  ``get_config`` may omit the key entirely when the model
+        # default (None) is dropped by ``exclude_none=True``.
+        perms = cfg.get("session_permissions") or {}
+        assert perms.get("filesystem") != "write", (
+            f"without a workspace the write grant must not survive, got {perms}"
         )
         # the ceiling loader must never be invoked with a falsy workspace id
         assert all(calls), f"ceiling loader called with falsy workspace id: {calls}"

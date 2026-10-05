@@ -2,20 +2,34 @@
 Regression tests: a server restart must never collapse the FULL stored
 session permission grants down to the workspace ceiling.
 
-Bug being fixed: ``WebAgentBridge.load_session`` re-caps the stored
+Bug being fixed: ``WebAgentBridge.load_session`` re-capped the stored
 ``session_permissions`` through the current workspace permission ceiling
-(correct for the *effective* config) but then persists the CAPPED dump back
+(correct for the *effective* config) but then persisted the CAPPED dump back
 into the session metadata (``save_config_to_session``).  After exactly one
 restart the stored full grants (filesystem=write, container=true,
-git_write=write, network=ask, ...) are permanently replaced by the capped
-values (filesystem=read, container=false, network=banned, ...) — the grant
+git=write, network=ask, ...) were permanently replaced by the capped
+values (filesystem=read, container=false, network=banned, ...) -- the grant
 is lost even after the ceiling is later relaxed.
+
+P1 model (mirrored by this migrated test): session grants live in the
+vault permission-store sidecar
+(``<vault>/workspaces/<ws>/sessions/<sid>/permissions.json``, written by
+``permission_store.write_session_permissions``), NOT in the session metadata.
+The bridge never persists grants.  The *effective* profile is always
+gate-computed (``ConfigManager.resolve_effective_permissions``: sidecar grants
+capped by the workspace ceiling read from ``<vault>/workspaces/<ws>/config.json``).
 
 Fixed behavior:
 1.  effective permissions after load are still capped through the ceiling
     (security invariant, unchanged), and
-2.  the STORED session_config.session_permissions keeps the full grants
-    (restart-safe persistence).
+2.  the STORED session grants keep the full values (restart-safe persistence).
+
+Migration note: the retired P2 assertions read the stored grant from the
+session-file metadata (``metadata.session_config.session_permissions``) and the
+live effective from ``bridge.get_config()["session_permissions"]``.  Both are
+gone post-fix (the bridge no longer projects or persists grants), so the
+identical invariants are now asserted through the canonical P1 store and the
+gate-computed effective path.
 """
 
 import json
@@ -41,33 +55,67 @@ def temp_store(tmp_path):
     )
 
 
-def _patch_ceiling(monkeypatch, fake):
-    """Monkeypatch the workspace ceiling loader, binding the module at run time.
+WS = "ws-restart-repro"
 
-    Same idiom as tests/test_session_load_ceiling.py — WebAgentBridge.load_session
-    resolves the ceiling loader lazily via sys.modules at call time, so the
-    patch must target the module object that is current during the test.
+
+def _set_workspace_ceiling(workspace_id, ceiling):
+    """Provision the synthetic workspace on disk and write its ceiling.
+
+    P1: the workspace ceiling lives in ``<vault>/workspaces/<ws>/config.json``
+    (``"permissions"``), which the security gate reads directly.
+    ``ensure_workspace_dirs`` seeds a present-but-empty config (no workspace cap)
+    plus a fully-permissive ``capabilities.json``.
     """
-    import web_ui.backend.config_manager as config_manager
+    from thoughtmachine import vault as _vault
+    from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
 
-    monkeypatch.setattr(config_manager, "_load_workspace_permission_ceiling", fake)
+    ensure_workspace_dirs(workspace_id)
+    config_path = _vault.vault_root() / "workspaces" / workspace_id / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["permissions"] = dict(ceiling)
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+    assert config_path.is_file(), f"workspace config.json not provisioned: {config_path}"
 
 
-def _disk_permissions(temp_store, session_id):
-    """Return the session_permissions dict stored in the session file metadata."""
-    path = temp_store._find_session_path(session_id)
-    assert path is not None, "session file not found on disk"
-    with open(path, "r") as f:
-        raw = json.load(f)
-    return raw.get("metadata", {}).get("session_config", {}).get("session_permissions", {})
+def _write_full(workspace_id, session_id):
+    """Persist the FULL session grants via the canonical P1 permission store."""
+    from thoughtmachine import vault as _vault
+    from thoughtmachine.permission_store import write_session_permissions
+
+    write_session_permissions(
+        _vault.vault_root(), workspace_id, session_id, dict(FULL_PERMS)
+    )
 
 
+def _stored_permissions(workspace_id, session_id):
+    """Read the STORED session grants from the P1 permission-store sidecar."""
+    from thoughtmachine import vault as _vault
+    from thoughtmachine.permission_store import read_session_permissions
+
+    return read_session_permissions(_vault.vault_root(), workspace_id, session_id)
+
+
+def _effective_permissions(workspace_id, session_id):
+    """Gate-computed effective profile (sidecar grants capped by vault ceiling)."""
+    from web_ui.backend.config_manager import ConfigManager
+
+    return ConfigManager.resolve_effective_permissions(None, session_id, workspace_id)
+
+
+# Canonical resource-catalog shape (P1 store normalises legacy grains:
+# ``git_write`` collapses onto ``git``; ``system``/``execution`` are dropped).
 FULL_PERMS = {
     "filesystem": "write",
     "container": True,
-    "git_write": "write",
+    "git": "write",
     "network": "ask",
-    "system": "read",
 }
 
 TIGHTENED_CEILING = {
@@ -80,39 +128,31 @@ TIGHTENED_CEILING = {
 class TestSessionPermissionsRestartFix:
     """Loading a saved session caps the EFFECTIVE config but never the STORED one."""
 
-    def test_restart_keeps_stored_full_grants_while_effective_is_capped(self, temp_store, monkeypatch):
+    def test_restart_keeps_stored_full_grants_while_effective_is_capped(self, temp_store):
         """Save full grants, tighten the ceiling, restart -> effective capped, storage intact."""
-        ceiling = {}
-
-        def fake_ceiling(ws_id):
-            return dict(ceiling)
-
-        _patch_ceiling(monkeypatch, fake_ceiling)
-
         # ── save: workspace set, ceiling permissive -> full grants stored ──────
+        _set_workspace_ceiling(WS, {})
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
-        bridge._workspace_id = "ws-restart-repro"
-        bridge.apply_config({"session_permissions": dict(FULL_PERMS)})
+        bridge._workspace_id = WS
         saved = bridge.save_session()
         assert saved is not None, "save_session returned None"
         session_id = saved.session_id
 
-        disk_perms = _disk_permissions(temp_store, session_id)
+        _write_full(WS, session_id)
+        stored = _stored_permissions(WS, session_id)
         for key, value in FULL_PERMS.items():
-            assert disk_perms.get(key) == value, (
-                f"expected {key}={value!r} on disk before load, got {disk_perms}"
+            assert stored.get(key) == value, (
+                f"expected {key}={value!r} in store before load, got {stored}"
             )
 
         # ── the workspace ceiling tightens after the session was saved ─────────
-        ceiling.update(TIGHTENED_CEILING)
+        _set_workspace_ceiling(WS, TIGHTENED_CEILING)
 
-        # ── restart (new bridge, same store): effective capped, storage intact ──
+        # ── restart (new bridge, same store): effective capped, storage intact ─
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         assert bridge2.load_session(session_id), "load_session returned False"
-        cfg = bridge2.get_config()
-        assert cfg is not None
-        effective = cfg["session_permissions"]
         # security invariant: the effective config is capped
+        effective = _effective_permissions(WS, session_id)
         assert effective["filesystem"] == "read", (
             f"expected effective filesystem=read after load, got {effective}"
         )
@@ -123,30 +163,24 @@ class TestSessionPermissionsRestartFix:
             f"expected effective network=banned after load, got {effective}"
         )
         # restart-safety: the stored full grants survive the load
-        disk_perms = _disk_permissions(temp_store, session_id)
+        stored = _stored_permissions(WS, session_id)
         for key, value in FULL_PERMS.items():
-            assert disk_perms.get(key) == value, (
+            assert stored.get(key) == value, (
                 f"stored {key} must survive a restart (expected {value!r}); "
-                f"got {disk_perms}"
+                f"got {stored}"
             )
 
-    def test_repeated_restarts_keep_stored_full_grants(self, temp_store, monkeypatch):
+    def test_repeated_restarts_keep_stored_full_grants(self, temp_store):
         """Two consecutive restarts must not erode the stored grants either."""
-        ceiling = {}
-
-        def fake_ceiling(ws_id):
-            return dict(ceiling)
-
-        _patch_ceiling(monkeypatch, fake_ceiling)
-
+        _set_workspace_ceiling(WS, {})
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
-        bridge._workspace_id = "ws-restart-repro"
-        bridge.apply_config({"session_permissions": dict(FULL_PERMS)})
+        bridge._workspace_id = WS
         saved = bridge.save_session()
         assert saved is not None, "save_session returned None"
         session_id = saved.session_id
 
-        ceiling.update(TIGHTENED_CEILING)
+        _write_full(WS, session_id)
+        _set_workspace_ceiling(WS, TIGHTENED_CEILING)
 
         # restart 1
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
@@ -156,9 +190,9 @@ class TestSessionPermissionsRestartFix:
         bridge3 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         assert bridge3.load_session(session_id), "load_session returned False"
 
-        disk_perms = _disk_permissions(temp_store, session_id)
+        stored = _stored_permissions(WS, session_id)
         for key, value in FULL_PERMS.items():
-            assert disk_perms.get(key) == value, (
+            assert stored.get(key) == value, (
                 f"stored {key} must survive repeated restarts (expected {value!r}); "
-                f"got {disk_perms}"
+                f"got {stored}"
             )

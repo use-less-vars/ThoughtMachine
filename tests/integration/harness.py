@@ -191,6 +191,14 @@ def put_permissions(client, ws_id, permissions, allow_host_resources=None):
     return resp.json()
 
 
+def put_session_permissions(client, session_id, permissions):
+    resp = client.put(f"/api/session/{session_id}/permissions", json=permissions)
+    assert resp.status_code == 200, (
+        f"put session permissions failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
 def get_summary(client, ws_id):
     resp = client.get(f"/api/workspace/{ws_id}/summary")
     assert resp.status_code == 200, (

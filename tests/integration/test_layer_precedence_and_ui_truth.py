@@ -38,6 +38,9 @@ from pathlib import Path
 
 import pytest
 
+from thoughtmachine.permission_store import read_session_permissions
+from thoughtmachine.vault import vault_root
+
 try:
     from tests.integration import harness
 except ImportError:  # non-package layout: tests/integration on sys.path
@@ -63,17 +66,19 @@ def _restart(tmp_home, stop_fn):
     return harness.make_client(app2)
 
 
-def _apply_config_dict(ws_root, session_permissions):
-    return {
+def _apply_config_dict(ws_root, session_permissions=None):
+    config = {
         "workspace_path": ws_root,
         "mode": "custom",
         "provider": "mock",
         "model": "mock-model",
-        "session_permissions": session_permissions,
         "temperature": 0.2,
         "max_turns": 20,
         "enabled_tools": [],
     }
+    if session_permissions is not None:
+        config["session_permissions"] = session_permissions
+    return config
 
 
 def _load_session(wsock, sid):
@@ -225,9 +230,7 @@ def test_session_layer_then_worker_overrides(env):
             wsock.send_json(
                 {
                     "command": "apply_config",
-                    "config": _apply_config_dict(
-                        ws["root"], {"git": "read", "filesystem": "read"}
-                    ),
+                    "config": _apply_config_dict(ws["root"]),
                 }
             )
             harness.receive_until_type(wsock, "config_changed")
@@ -252,19 +255,20 @@ def test_session_layer_then_worker_overrides(env):
 # 6-10. UI truth
 # ---------------------------------------------------------------------------
 
-def test_config_changed_event_carries_raw_permission_grant(env):
+def test_config_changed_event_carries_effective_permission_from_canonical_store(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t6")
     sid = harness.create_session(client, workspace_path=ws["root"])
+    harness.put_session_permissions(
+        client, sid, {"git": "write", "filesystem": "write"}
+    )
 
     with harness.ws_connect(client) as wsock:
         _load_session(wsock, sid)
         wsock.send_json(
             {
                 "command": "apply_config",
-                "config": _apply_config_dict(
-                    ws["root"], {"git": "write", "filesystem": "write"}
-                ),
+                "config": _apply_config_dict(ws["root"]),
             }
         )
         evt, _ = harness.receive_until_type(wsock, "config_changed")
@@ -278,12 +282,9 @@ def test_config_changed_event_carries_raw_permission_grant(env):
         evt["permissions"]["git"] == evt["effective_config"]["session_permissions"]["git"]
     ), evt
 
-    server_mod = importlib.import_module("web_ui.backend.server")
-    session = server_mod._get_session_store().load_session(
-        sid, workspace_id=ws["workspace_id"]
-    )
-    assert session is not None, "session missing from store"
-    stored_perms = session.metadata["session_config"]["session_permissions"]
+    # The raw write grant must live in the canonical permission sidecar (P1),
+    # not in the session record's metadata carrier.
+    stored_perms = read_session_permissions(vault_root(), ws["workspace_id"], sid)
     assert stored_perms["git"] == "write", stored_perms
 
 
@@ -291,6 +292,9 @@ def test_restart_reapplies_workspace_permission_ceiling_on_session_load(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t7")
     sid = harness.create_session(client, workspace_path=ws["root"])
+    harness.put_session_permissions(
+        client, sid, {"git": "write", "filesystem": "write"}
+    )
 
     with harness.ws_connect(client) as wsock:
         evt = _load_session(wsock, sid)
@@ -300,19 +304,14 @@ def test_restart_reapplies_workspace_permission_ceiling_on_session_load(env):
         wsock.send_json(
             {
                 "command": "apply_config",
-                "config": _apply_config_dict(
-                    ws["root"], {"git": "write", "filesystem": "write"}
-                ),
+                "config": _apply_config_dict(ws["root"]),
             }
         )
         evt, _ = harness.receive_until_type(wsock, "config_changed")
 
-    server_mod = importlib.import_module("web_ui.backend.server")
-    session = server_mod._get_session_store().load_session(
-        sid, workspace_id=ws["workspace_id"]
-    )
-    assert session is not None, "session missing from store"
-    stored_perms = session.metadata["session_config"]["session_permissions"]
+    # The raw write grant must live in the canonical permission sidecar (P1),
+    # not in the session record's metadata carrier.
+    stored_perms = read_session_permissions(vault_root(), ws["workspace_id"], sid)
     assert stored_perms["git"] == "write", stored_perms
 
     client2 = _restart(tmp_home, stop_fn)
@@ -349,6 +348,11 @@ def test_rest_effective_permissions_serve_defaults_then_ceiled_grant(env):
             }
         )
         harness.receive_until_type(wsock, "config_changed")
+
+    # NEW model: an apply_config payload cannot grant.  Write the raw session
+    # grant through the canonical session-permissions sidecar endpoint instead
+    # (the workspace ceiling above then caps it).
+    harness.put_session_permissions(client, sid, {"git": "write", "filesystem": "write"})
 
     ep2 = harness.get_effective_permissions(client, ws["workspace_id"], session_id=sid)
     # The workspace ceiling (git=read, filesystem=write) now caps the raw
