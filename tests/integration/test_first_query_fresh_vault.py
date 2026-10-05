@@ -11,6 +11,7 @@ the "first-query silent failure" bug where:
 """
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Any
@@ -479,3 +480,264 @@ class TestConfigChangedMessageStructure:
 
         # merged_config should equal config
         assert event["merged_config"] == event["config"]
+
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Q1 -- caller identity plumbing is fail-CLOSED (regression pin)
+# ---------------------------------------------------------------------------
+#
+# Observable pinned here (the "Q1 signpost"): the tool executor emits
+#     logging.getLogger("agent.core.tool_executor").warning(
+#         "execute_tool_calls entered with NO session identity ...")
+# whenever it is entered with an EMPTY (session_id, workspace_id) pair, and a
+# category-gated tool (ProgressReport -> filesystem:write) is then DENIED by
+# the deny-all _DISK_FAIL_CLOSED_SESSION floor.
+#
+# The bridge has three start() flows and they plumb identity differently:
+#   FLOW B  controller branch, no loaded session  -> session_arg = None
+#           -> Agent(config, session=None) -> agent.session_id None / _session None
+#           -> EMPTY identity -> warning fires + tool DENIED  (PRIMARY pin)
+#   FLOW A  standalone, no loaded session         -> fresh Session() minted
+#           -> NON-empty identity -> warning must NOT fire
+#   FLOW C  standalone, resuming a loaded session -> identity == loaded.session_id
+#
+# The pins never run the LLM: FLOW B uses a stand-in controller that builds a
+# real Agent directly, and FLOW A/C neutralise the bridge's worker thread.
+# ---------------------------------------------------------------------------
+
+
+class _NoStartThread:
+    """Replacement for ``threading.Thread`` whose target is never run.
+
+    The bridge's standalone path spawns a worker that would drive the real
+    agent loop (and therefore a real LLM call).  Swapping in this no-op keeps
+    ``bridge.start`` synchronous and offline.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._target = kwargs.get("target")
+
+    def start(self):
+        return None
+
+    def join(self, *args, **kwargs):
+        return None
+
+    def is_alive(self):
+        return False
+
+
+class _RecordingController:
+    """Minimal stand-in for ``AgentController``.
+
+    Mirrors the identity-relevant slice of ``AgentController.start`` /
+    ``AgentController._run``: it records the ``session`` handed to ``start()``
+    and constructs a REAL ``Agent`` exactly the way ``AgentController._run``
+    does (``Agent(config, session=<that session>)``).
+    """
+
+    def __init__(self):
+        self.received_session = "UNSET"
+        self.agent = None
+        self.is_busy = False
+        self.is_running = False
+
+    def set_event_callback(self, cb):
+        self._event_callback = cb
+
+    def start(self, query, config=None, session=None, **kwargs):
+        from agent import Agent
+
+        self.received_session = session
+        self.agent = Agent(config, session=session)
+
+
+def _q1_warning_records(caplog):
+    """Q1 warning records emitted by the tool_executor's entry guard."""
+    return [
+        r for r in caplog.records
+        if r.name == "agent.core.tool_executor"
+        and "NO session identity" in r.getMessage()
+    ]
+
+
+def _agent_identity(agent):
+    """The (session_id, workspace_id) pair ``agent.py`` hands to
+    ``execute_tool_calls`` (mirrors the agent's own wire-up at agent.py)."""
+    return (
+        agent.session_id,
+        getattr(getattr(agent, "_session", None), "workspace_id", None) or "",
+    )
+
+
+def _run_gated_tool(agent):
+    """Invoke a category-gated tool through the agent's tool_executor using
+    the SAME identity kwargs the agent passes -- NOT the empty defaults, which
+    would spuriously fire the Q1 guard even for a healthy identity."""
+    tool_calls = [{
+        "id": "call_q1",
+        "type": "function",
+        "function": {
+            "name": "ProgressReport",
+            "arguments": json.dumps({"report_body": "q1-probe"}),
+        },
+    }]
+    session_id, workspace_id = _agent_identity(agent)
+    return agent.tool_executor.execute_tool_calls(
+        tool_calls,
+        add_to_conversation_func=lambda msg: None,
+        agent_id=0,
+        session_id=session_id,
+        workspace_id=workspace_id,
+    )
+
+
+_Q1_DENIAL = (
+    "Permission denied: Tool requires filesystem:write, "
+    "but session allows filesystem:banned"
+)
+
+
+def _q1_session_config():
+    return SessionConfig(
+        mode="custom",
+        max_turns=3,
+        session_permissions={},
+        enabled_tools=["ProgressReport"],
+        provider_id="openai",
+        model="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+    )
+
+
+class TestQ1SessionIdentityFailClosed:
+    """Pin the session-identity plumbing of the three ``bridge.start`` flows."""
+
+    def test_flow_b_missing_loaded_session_yields_empty_identity(
+        self, hermetic_vault, monkeypatch, caplog
+    ):
+        """FLOW B (controller branch, no loaded session): identity is EMPTY.
+
+        This is the regression that must never silently pass: the controller
+        branch forwards ``session_arg = self._loaded_session`` (None here), the
+        controller builds ``Agent(config, session=None)``, and the agent then
+        enters ``execute_tool_calls`` with no identity -- fail-CLOSED.
+        """
+        monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "dummy")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+        store_dir = tempfile.mkdtemp(prefix="test_q1_flow_b_")
+        bridge = WebAgentBridge(
+            session_store=FileSystemSessionStore(sessions_dir=store_dir)
+        )
+        config = _q1_session_config()
+        bridge._session_config = config
+
+        controller = _RecordingController()
+        bridge.set_controller(controller)
+        bridge._loaded_session = None
+
+        bridge.start("hello", config)
+
+        # The (absent) loaded session -- literally None -- is what the bridge
+        # forwards into the controller/agent constructor.
+        assert controller.received_session is None
+        agent = controller.agent
+        assert agent is not None, "controller should have built an Agent"
+
+        session_id, workspace_id = _agent_identity(agent)
+        assert not session_id, (
+            f"FLOW B agent.session_id should be empty, got {session_id!r}"
+        )
+        assert agent._session is None
+        assert not workspace_id
+
+        # The gated tool is present, the entry guard fires, and the call DENIES.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
+            result = _run_gated_tool(agent)
+
+        assert _q1_warning_records(caplog), (
+            "expected the tool_executor Q1 no-identity warning under FLOW B"
+        )
+        assert result[0][0]["result"] == _Q1_DENIAL
+
+    def test_flow_a_standalone_mints_non_empty_identity(
+        self, hermetic_vault, monkeypatch, caplog
+    ):
+        """FLOW A (standalone, no loaded session): a fresh Session is minted,
+        so the agent carries a NON-empty identity and the Q1 guard stays
+        silent."""
+        monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "dummy")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+        # Neutralise the worker thread so bridge.start never runs the LLM.
+        monkeypatch.setattr(
+            "web_ui.backend.bridge.threading.Thread", _NoStartThread
+        )
+
+        store_dir = tempfile.mkdtemp(prefix="test_q1_flow_a_")
+        bridge = WebAgentBridge(
+            session_store=FileSystemSessionStore(sessions_dir=store_dir)
+        )
+        config = _q1_session_config()
+        bridge._session_config = config
+        bridge._loaded_session = None
+
+        bridge.start("hello", config)
+
+        agent = bridge._agent
+        assert agent is not None
+        session_id, workspace_id = _agent_identity(agent)
+        assert session_id, (
+            "FLOW A should mint a fresh Session -> non-empty agent.session_id"
+        )
+        assert agent._session is not None
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
+            _run_gated_tool(agent)
+
+        assert _q1_warning_records(caplog) == [], (
+            "FLOW A has identity; the Q1 no-identity warning must NOT fire"
+        )
+
+    def test_flow_c_standalone_resume_keeps_loaded_identity(
+        self, hermetic_vault, monkeypatch, caplog
+    ):
+        """FLOW C (standalone, resuming a loaded session): identity is the
+        loaded session's id, and the Q1 guard stays silent."""
+        monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "dummy")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+        monkeypatch.setattr(
+            "web_ui.backend.bridge.threading.Thread", _NoStartThread
+        )
+
+        store_dir = tempfile.mkdtemp(prefix="test_q1_flow_c_")
+        bridge = WebAgentBridge(
+            session_store=FileSystemSessionStore(sessions_dir=store_dir)
+        )
+        config = _q1_session_config()
+        bridge._session_config = config
+
+        loaded = Session()
+        loaded.add_message("user", "resume me")
+        bridge._loaded_session = loaded
+
+        bridge.start("hello", config)
+
+        agent = bridge._agent
+        assert agent is not None
+        session_id, workspace_id = _agent_identity(agent)
+        assert session_id == loaded.session_id, (
+            "FLOW C should reuse the loaded session id "
+            f"({loaded.session_id!r}), got {session_id!r}"
+        )
+        assert bridge._session_id == loaded.session_id
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
+            _run_gated_tool(agent)
+
+        assert _q1_warning_records(caplog) == []
+
