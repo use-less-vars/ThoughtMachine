@@ -777,18 +777,44 @@ class TestGateDenialInstant:
 
     @pytest.fixture
     def ctx(self) -> WorkerContext:
-        return WorkerContext(session_id="transplant-gate-001")
+        return WorkerContext(
+            session_id="transplant-gate-001",
+            workspace_id="transplant-gate-ws-001",
+        )
 
     @pytest.fixture
-    def config(self) -> AgentConfig:
-        # Build a SessionPermissions with filesystem="ask" so that write
-        # operations require interactive approval — which the NullEventBus
-        # (or None event_bus) will deny instantly.
+    def config(self, tmp_path, monkeypatch) -> AgentConfig:
+        # Achieving an effective filesystem value of 'ask' takes BOTH sides:
+        # the disk sidecar records the session grant, but filesystem's session
+        # vocabulary is banned|read|write -- no 'ask' -- so the stored grant is
+        # coerced down and the disk-effective value resolves to the
+        # SessionPermissions default 'read'.  The spawn-time worker footprint
+        # (config.session_permissions = filesystem 'ask', attached only when
+        # worker_mode=True) then caps that via _min_permission, whose
+        # grant-level map ranks ask BELOW read -- so 'read' x 'ask' -> 'ask'.
+        # A write then requires interactive approval, which worker context
+        # (no interactive user) denies instantly.
         try:
             from thoughtmachine.security import SessionPermissions
             perms = SessionPermissions(filesystem="ask")
         except ImportError:
             pytest.skip("SessionPermissions not available — cannot test gate denial")
+        import json as _json
+        from thoughtmachine import permission_store as ps
+        from thoughtmachine.vault import vault_root
+        ws_id = "transplant-gate-ws-001"
+        sid = "transplant-gate-001"
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+        ws_dir = tmp_path / "workspaces" / ws_id
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        (ws_dir / "config.json").write_text(
+            _json.dumps({"permissions": {}}), encoding="utf-8"
+        )
+        (ws_dir / "capabilities.json").write_text(
+            _json.dumps({"filesystem_write": True, "git_available": True}),
+            encoding="utf-8"
+        )
+        ps.write_session_permissions(vault_root(), ws_id, sid, {"filesystem": "ask"})
 
         return AgentConfig(
             api_key="sk-test-scripted",
@@ -800,6 +826,7 @@ class TestGateDenialInstant:
             max_turns=2,
             enable_logging=False,
             session_permissions=perms,
+            worker_mode=True,
         )
 
     def test_gate_denial_instant(self, config: AgentConfig, ctx: WorkerContext):
