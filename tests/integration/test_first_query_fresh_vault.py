@@ -295,8 +295,17 @@ class TestConfigChangedMessageStructure:
     """Verify config_changed broadcasts include the new structured fields."""
 
     def test_apply_config_includes_settings_permissions_merged(self, hermetic_vault):
-        """bridge.apply_config() returns config, settings, permissions, merged_config."""
+        """bridge.apply_config() returns config, settings, permissions, merged_config.
+
+        The effective ``permissions`` block is GATE-COMPUTED from the canonical
+        on-disk session sidecar (P1) -- NOT from the ``session_permissions``
+        override carried in the frontend payload, which
+        ``ConfigManager.apply_config`` strips (with a WARNING).  The sidecar is
+        therefore seeded with the grants asserted below, while the payload
+        deliberately carries a DIFFERENT value to prove it is ignored.
+        """
         from tests.integration.test_ws_config_roundtrip import simulate_apply_config
+        from thoughtmachine.permission_store import write_session_permissions
 
         bridge = WebAgentBridge()
         bridge._session_config = SessionConfig(
@@ -315,12 +324,25 @@ class TestConfigChangedMessageStructure:
         _provision_workspace("test-ws-perms-merged")
         bridge._workspace_id = "test-ws-perms-merged"
 
+        # The canonical grants live in the on-disk session sidecar, addressed
+        # by (workspace_id, session_id).  Pin the session id so apply_config
+        # resolves exactly this sidecar (an unset id would fall back to the
+        # fresh save_session() uuid4, which has no sidecar -> fail CLOSED).
+        bridge._session_id = "sess-perms-merged"
+        write_session_permissions(
+            hermetic_vault,
+            "test-ws-perms-merged",
+            "sess-perms-merged",
+            {"filesystem": "write", "network": "banned"},
+        )
+
         frontend_config = {
             "mode": "custom",
             "temperature": 0.3,
+            # A DIFFERENT value than the sidecar: the payload grant is stripped
+            # and ignored, so the result must reflect the SIDECAR grants.
             "session_permissions": {
-                "filesystem": "write",
-                "network": "banned",
+                "filesystem": "banned",
             },
         }
 
@@ -396,8 +418,14 @@ class TestConfigChangedMessageStructure:
         assert perms.get("host_bash") is not None
 
     def test_apply_config_changed_event_has_settings_permissions(self, hermetic_vault):
-        """Config changed event sent to frontend has all new fields."""
+        """Config changed event sent to frontend has all new fields.
+
+        The event's ``permissions`` block is GATE-COMPUTED from the canonical
+        on-disk session sidecar (P1), not from the payload's (stripped)
+        ``session_permissions`` override.
+        """
         from tests.integration.test_ws_config_roundtrip import simulate_apply_config
+        from thoughtmachine.permission_store import write_session_permissions
 
         bridge = WebAgentBridge()
         bridge._session_config = SessionConfig(
@@ -415,11 +443,22 @@ class TestConfigChangedMessageStructure:
         # instead of failing CLOSED (all-banned).
         _provision_workspace("test-ws-perms-event")
         bridge._workspace_id = "test-ws-perms-event"
+        # Pin the session id + seed the canonical sidecar grant so the gate
+        # resolves a real grant set instead of failing CLOSED.
+        bridge._session_id = "sess-perms-event"
+        write_session_permissions(
+            hermetic_vault,
+            "test-ws-perms-event",
+            "sess-perms-event",
+            {"filesystem": "write"},
+        )
 
         frontend_config = {
             "mode": "custom",
             "temperature": 0.5,
-            "session_permissions": {"filesystem": "write"},
+            # A DIFFERENT value than the sidecar: the payload grant is stripped
+            # and ignored, so the event must reflect the SIDECAR grant.
+            "session_permissions": {"filesystem": "banned"},
         }
 
         output = simulate_apply_config(bridge, frontend_config)
@@ -435,7 +474,7 @@ class TestConfigChangedMessageStructure:
         assert event["settings"]["mode"] == "custom"
         assert event["settings"]["temperature"] == 0.5
 
-        # Permissions should reflect the applied permission overrides
+        # Permissions should reflect the gate-computed SIDECAR grant
         assert event["permissions"]["filesystem"] == "write"
 
         # merged_config should equal config

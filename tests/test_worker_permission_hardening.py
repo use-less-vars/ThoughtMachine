@@ -22,7 +22,9 @@ F. ToolExecutor enforces session permissions (deny / hot-swap).
 G. 'ask' permission flow defers to the outer gate (approve / deny / cancel).
 H. GitInfoTool routing: 'ask' defers, 'banned' denies (fail-closed), for both
    host and container paths.
-I. Bridge apply_config / save / load round-trips session_permissions.
+I. Bridge apply_config IGNORES a session_permissions payload (the sidecar is
+   the canonical grants holder); save / load never persists that payload into
+   session metadata, yet the round-trip PRESERVES the canonical sidecar grant.
 J. Global-defaults worker config allowlist (only the six known keys persist;
    absent keys fall back to constructor defaults).
 K. Per-session worker spawn cap (``max_workers``) safe default 3.
@@ -37,6 +39,7 @@ tests/test_permissions_roundtrip.py (cancel prompts), tests/test_global_defaults
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import tempfile
@@ -1053,7 +1056,7 @@ class TestPermissionRouting:
 # =========================================================================
 
 class TestBridgePermissionSync:
-    """WebAgentBridge persists session_permissions through save/load."""
+    """Bridge ignores payload grants; canonical sidecar grants survive save/load."""
 
     @pytest.fixture
     def temp_store(self, tmp_path):
@@ -1062,16 +1065,21 @@ class TestBridgePermissionSync:
             state_dir=str(tmp_path / "state"),
         )
 
-    def test_apply_config_accepts_custom_permissions(self, temp_store):
+    def test_apply_config_ignores_custom_permissions(self, temp_store, caplog):
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
-        result = bridge.apply_config({"session_permissions": {"filesystem": "banned"}})
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            result = bridge.apply_config({"session_permissions": {"filesystem": "banned"}})
         assert "config" in result and "merged_config" in result
-        assert result["permissions"]["filesystem"] == "banned"
+        # P1: the payload grant is IGNORED — the canonical grant store is the
+        # session permission sidecar, so 'banned' never lands on the bridge.
         config = bridge.get_config()
         assert config is not None
-        assert config["session_permissions"]["filesystem"] == "banned"
+        assert (config.get("session_permissions") or {}).get("filesystem") != "banned", config
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
-    def test_roundtrip_preserves_permissions(self, temp_store):
+    def test_payload_grant_is_not_persisted_into_session_metadata(self, temp_store):
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         bridge.apply_config({"session_permissions": {"filesystem": "banned"}})
         saved = bridge.save_session()
@@ -1082,18 +1090,54 @@ class TestBridgePermissionSync:
         assert path is not None, "session file not found on disk"
         with open(path, "r") as f:
             raw = json.load(f)
-        perms_disk = (
-            raw.get("metadata", {})
-            .get("session_config", {})
-            .get("session_permissions", {})
-        )
-        assert perms_disk.get("filesystem") == "banned"
+        cfg_disk = raw.get("metadata", {}).get("session_config", {})
+        # P2: the session record is not a grants holder — the payload grant was
+        # STRIPPED before persisting, so it never lands in the session metadata.
+        assert "session_permissions" not in cfg_disk, cfg_disk
+        assert cfg_disk.get("session_permissions") != {"filesystem": "banned"}
 
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         assert bridge2.load_session(session_id)
         config = bridge2.get_config()
         assert config is not None
-        assert config["session_permissions"]["filesystem"] == "banned"
+        # The reloaded bridge must not resurrect the ignored grant from metadata.
+        assert (config.get("session_permissions") or {}).get("filesystem") != "banned", config
+
+    def test_roundtrip_preserves_canonical_grant(self, temp_store, tmp_path, monkeypatch):
+        from web_ui.backend.config_manager import frontend_config_from_bridge
+        from thoughtmachine.permission_store import write_session_permissions
+        from thoughtmachine.vault import vault_root
+
+        # Explicit hermetic binding: pin the vault root to a per-test tmp dir so
+        # this round-trip never touches the real ~/.thoughtmachine vault and does
+        # not depend on an unrelated autouse fixture for isolation.
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "_d3_roundtrip_vault"))
+
+        ws = "ws-d3-roundtrip"
+        vroot = vault_root()
+        cfg_dir = vroot / "workspaces" / ws
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.json").write_text(
+            json.dumps({"permissions": {"filesystem": "write"}}), encoding="utf-8"
+        )
+
+        bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge._workspace_id = ws
+        saved = bridge.save_session()
+        assert saved is not None
+        session_id = saved.session_id
+
+        # The CANONICAL grants writer: the session permission sidecar (P1).
+        write_session_permissions(vroot, ws, session_id, {"filesystem": "write"})
+
+        bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        assert bridge2.load_session(session_id)
+        # The reloaded bridge's CANONICAL config projection (gate disk mode:
+        # sidecar grants capped by the workspace ceiling) reports the grant --
+        # the round-trip PRESERVES the canonical sidecar grant.
+        proj = frontend_config_from_bridge(bridge2)
+        perms = proj.get("session_permissions") or {}
+        assert perms.get("filesystem") == "write", proj
 
 
 # =========================================================================
