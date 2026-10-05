@@ -103,6 +103,9 @@ from starlette.testclient import TestClient
 
 pytestmark = pytest.mark.integration
 
+# Sentinel for "this parent-package attribute was absent before the re-import".
+_ABSENT = object()
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Hermetic full-server harness (EXACT mirror of test_ws_event_contracts.py)
@@ -128,9 +131,30 @@ def contract_server():
     # are built against the temp HOME, not the real one. "session" is purged
     # too (FileSystemSessionStore class-level singleton, see the F3 harness).
     mod_prefixes = ("web_ui.backend", "agent.config.provider_profile", "thoughtmachine.bootstrap", "session")
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
+
+    def _matched_modules():
+        return [
+            n for n in list(sys_mod.modules)
+            if any(n.startswith(p) for p in mod_prefixes)
+        ]
+
+    # Snapshot the exact pre-fixture sys.modules state (plus the parent-package
+    # attributes that re-importing these submodules rebinds) so teardown can put
+    # the ORIGINAL singletons back, exactly as the bb608a5 harness does.
+    saved_modules = {n: sys_mod.modules[n] for n in _matched_modules()}
+    saved_attrs: dict = {}
+    for n in saved_modules:
+        parent_name, _, child = n.rpartition(".")
+        if not parent_name or parent_name in saved_modules:
+            continue
+        parent_mod = sys_mod.modules.get(parent_name)
+        if parent_mod is not None:
+            saved_attrs.setdefault(parent_name, {})[child] = parent_mod.__dict__.get(
+                child, _ABSENT
+            )
+
+    for name in saved_modules:
+        del sys_mod.modules[name]
 
     server_mod = importlib.import_module("web_ui.backend.server")
     app = server_mod.app
@@ -146,6 +170,21 @@ def contract_server():
         if val is not None:
             os.environ[key] = val
     shutil.rmtree(tmp_home, ignore_errors=True)
+
+    # Restore the exact pre-fixture module state: drop the modules this fixture
+    # imported, reinstate the originals, then re-point the parent-package
+    # attributes that the re-imports had rebound to the fresh duplicates.
+    # (The fixture never mutates sys.path, so there is nothing to restore there.)
+    for name in _matched_modules():
+        del sys_mod.modules[name]
+    sys_mod.modules.update(saved_modules)
+    for parent_name, attrs in saved_attrs.items():
+        parent_mod = sys_mod.modules[parent_name]
+        for child, value in attrs.items():
+            if value is _ABSENT:
+                parent_mod.__dict__.pop(child, None)
+            else:
+                parent_mod.__dict__[child] = value
 
 
 def _server_mod():
