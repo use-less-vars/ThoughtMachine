@@ -4,6 +4,7 @@ Tool execution and dispatch logic.
 Extracted from agent.py to separate tool execution concerns.
 """
 import json
+import logging
 import threading
 from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
@@ -14,6 +15,9 @@ from fast_json_repair import loads as repair_loads
 from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
 from tools.summarize_tool import SummarizeTool
+
+# Module logger used for the fail-closed id-less entry observation below.
+logger = logging.getLogger(__name__)
 
 # Try to import event system for security prompts
 try:
@@ -167,6 +171,21 @@ class ToolExecutor:
             - summary_text: Summary text if SummarizeTool was called
             - summary_keep_recent_turns: Number of turns to keep for summarization
         """
+        # Fail-closed entry observation: entering with neither a session id
+        # nor a workspace id means the permission gate has NO on-disk
+        # authority to read, so its effective profile is the deny-all
+        # _DISK_FAIL_CLOSED_SESSION and any category-gated tool call is
+        # DENIED.  Warn (do NOT raise / change behaviour) so the missing
+        # identity is observable.
+        if not session_id and not workspace_id:
+            logger.warning(
+                "execute_tool_calls entered with NO session identity "
+                "(session_id=%r) and NO workspace identity (workspace_id=%r); "
+                "permission checks are fail-closed and category-gated tool "
+                "calls will be DENIED (deny-all _DISK_FAIL_CLOSED_SESSION).",
+                session_id,
+                workspace_id,
+            )
         # Resolve update_token_func: if not provided, use agent._update_tokens_after_tool
         if update_token_func is None:
             if self.agent is not None:

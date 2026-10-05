@@ -779,6 +779,76 @@ class TestIdlessFailClosed:
         assert fc.mcp == "banned"
         assert fc.host_bash == "banned"
 
+    def test_unresolved_workspace_id_message_names_fail_closed(self, monkeypatch):
+        """A configured-but-unresolvable workspace_path is NAMED fail-closed.
+
+        With a workspace_path set but no resolvable workspace id, a tool that
+        declares required categories is DENIED -- and the message the caller
+        receives NAMES the fail-closed outcome ("could not resolve
+        workspace_id" + "fail-closed") rather than silently falling back to
+        (permissive) default capabilities.  Dropping the wording -> RED.
+        """
+        import agent.core.tool_executor as _te
+
+        monkeypatch.setattr(_te, "resolve_workspace_id", lambda p: None)
+        executor = self._executor(
+            [FileWriteTool], SessionPermissions(filesystem="write")
+        )
+        executor.config.workspace_path = "/tmp/unresolvable-ws"
+        result = self._run(executor, FileWriteTool)["result"]
+        assert "could not resolve workspace_id" in result, result
+        assert "fail-closed" in result, result
+
+    @staticmethod
+    def _run_calls(executor, tool_cls, session_id="", workspace_id=""):
+        """Drive the PUBLIC entry point ``execute_tool_calls`` (where the
+        id-less entry observation lives) and return the first tool result."""
+        tool_calls = [
+            {"id": "tc-1", "function": {"name": tool_cls.__name__, "arguments": "{}"}}
+        ]
+        executed, _final, _respond, _summary, _keep = executor.execute_tool_calls(
+            tool_calls,
+            add_to_conversation_func=lambda _m: None,
+            session_id=session_id,
+            workspace_id=workspace_id,
+        )
+        return executed[0]["result"]
+
+    def test_idless_entry_trips_observation_and_stays_denied(self, caplog):
+        """Entering ``execute_tool_calls`` with NO session/workspace id emits a
+        WARNING (identity-missing + fail-closed consequence) AND the
+        category-gated call is still DENIED.  Removing the observation -> RED."""
+        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="full"))
+        with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
+            result = self._run_calls(executor, FileWriteTool)
+        warnings = [
+            r for r in caplog.records
+            if r.name == "agent.core.tool_executor" and r.levelno == logging.WARNING
+        ]
+        # (a) the observation fired, naming the missing-identity fact ...
+        assert warnings, caplog.text
+        assert any("NO session identity" in r.getMessage() for r in warnings), caplog.text
+        assert any("NO workspace identity" in r.getMessage() for r in warnings), caplog.text
+        # ... AND the fail-closed consequence.
+        assert any("fail-closed" in r.getMessage() for r in warnings), caplog.text
+        assert any("DENIED" in r.getMessage() for r in warnings), caplog.text
+        # (b) behaviour unchanged: the call is still denied fail-closed.
+        assert "Permission denied" in result, result
+        assert "filesystem:write" in result, result
+
+    def test_identified_entry_does_not_trip_observation(self, caplog):
+        """Entering with BOTH a session id and a workspace id does NOT warn.
+        Broadening the guard to fire always -> RED."""
+        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="full"))
+        with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
+            self._run_calls(
+                executor, FileWriteTool, session_id="sess-1", workspace_id="ws-1"
+            )
+        assert not [
+            r for r in caplog.records
+            if r.name == "agent.core.tool_executor" and r.levelno == logging.WARNING
+        ], caplog.text
+
 
 # =========================================================================
 # G. Ask permission flow (defer to the outer gate / cancel = deny)
