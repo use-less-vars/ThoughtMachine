@@ -222,6 +222,66 @@ class TestDiskModeGateFailsClosed:
         assert effective["host_bash"] == "banned"
         assert effective["container"] is False
 
+    def test_missing_grant_store_does_not_silently_allow(self, hermetic_vault, monkeypatch):
+        """An absent/unreadable permission store must NOT silently allow a tool.
+
+        Disk-mode gate reads fail CLOSED: driving a REAL tool execution whose
+        required category (``mcp:connect``) the fail-closed deny-all does not
+        grant, the caller receives a non-empty denial -- never a silent allow.
+
+        Disclosed residual: the deny-all / fail-closed CAUSE (the unreadable
+        vault store) is internal-only -- it is surfaced only as a
+        ``logger.warning`` plus the deny-all sentinel inside
+        ``security/security_gate.py``; the operator-facing text does NOT name
+        it, only the resulting ``mcp:banned`` denial.
+        """
+        from agent.config.models import AgentConfig
+        from agent.core.state import AgentState
+        from agent.core.tool_executor import ToolExecutor
+        from tools.mcp_server_connect import MCPServerConnect
+
+        vault = hermetic_vault
+        ws_id = "ws-b4"
+        _write_ceiling(vault, ws_id)
+        sid = "sess-b4"
+
+        def _boom(*a, **k):
+            raise PermissionStoreError("simulated unreadable grant store")
+
+        # Same idiom as the gate-only test above: the gate lazily imports the
+        # symbol at call time, so patch it on the module the lazy import
+        # resolves.  ws_id is passed explicitly so the executor reaches its
+        # disk-mode branch (session_id AND ws_id both non-empty).
+        monkeypatch.setattr(ps, "read_session_permissions", _boom)
+
+        cfg = AgentConfig(session_permissions=SessionPermissions())
+        executor = ToolExecutor(
+            tool_classes=[MCPServerConnect],
+            config=cfg,
+            state=AgentState(config=cfg),
+            logger=None,
+            security_available=True,
+            agent=None,
+        )
+        result = executor._execute_single_tool(
+            MCPServerConnect,
+            {"server_name": "x"},
+            "MCPServerConnect",
+            0,
+            lambda: False,
+            lambda: None,
+            lambda: 0,
+            session_id=sid,
+            workspace_id=ws_id,
+        )["result"]
+
+        # DENIED (no silent allow): a non-empty denial naming the required
+        # category and the fail-closed ``banned`` value it resolved to.
+        assert result  # never empty / never a silent success
+        assert result.startswith("Permission denied:")
+        assert "mcp:connect" in result
+        assert "mcp:banned" in result
+
 
 # ── B5: migrate_session_permissions is idempotent and additive ──────────────
 
@@ -388,4 +448,116 @@ class TestGitWriteDirectCallCoercesGrant:
         assert t._git_write_restricted_to_feature_branch() is False
         # execute() short-circuits on the gate for a non-writable grant.
         assert t.execute() == self.FLAG
+
+
+
+# ── Fail-closed surfacing: the deny NAMES the outcome (no silent deny) ─────
+
+class TestFailClosedSurfaceIsNamed:
+    """The executor's gate-unavailable fail-closed deny must NAME the outcome.
+
+    When the security gate cannot be resolved, ``ToolExecutor._execute_single_tool``
+    denies the tool AND the message the caller receives says so explicitly
+    (``fail-closed``) rather than silently denying.  Dropping the wording (or
+    reverting the branch to a bare/un-named deny) makes this test RED.
+    """
+
+    def test_tool_result_names_fail_closed_when_gate_unavailable(self, monkeypatch):
+        import agent.core.tool_executor as te
+        from agent.config.models import AgentConfig
+        from agent.core.state import AgentState
+        from agent.core.tool_executor import ToolExecutor
+        from tools.file_preview_tool import FilePreviewTool
+
+        # The gate genuinely cannot be (re)bound at first entry -> the executor
+        # must deny (fail CLOSED) instead of executing the tool ungated.
+        monkeypatch.setattr(te, "GATE_AVAILABLE", False)
+        monkeypatch.setattr(te, "_ensure_gate_imported", lambda: False)
+
+        cfg = AgentConfig(session_permissions=SessionPermissions())
+        executor = ToolExecutor(
+            tool_classes=[FilePreviewTool],
+            config=cfg,
+            state=AgentState(config=cfg),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+        # A REAL tool execution through the executor's gate entry.
+        result = executor._execute_single_tool(
+            FilePreviewTool,
+            {"filename": "x.txt"},
+            "FilePreviewTool",
+            0,
+            lambda: False,
+            lambda: None,
+            lambda: 0,
+        )["result"]
+
+        # The operator sees the fail-closed outcome NAMED.
+        assert "fail-closed" in result, result
+        assert "security gate unavailable" in result, result
+
+
+# ── Q2-hop: workspace stored ceiling reaches the executor's config ──────────
+
+
+class TestWorkspaceCeilingHopIntoExecutor:
+    """workspace config.json stored ceiling -> resolve_full_config
+    (apply_workspace_ceiling @ config_manager.py:973) -> session_config_from_merged
+    -> SessionConfig.to_agent_config -> AgentConfig -> ToolExecutor.config.
+
+    The executor consults ``self.config.session_permissions`` (tool_executor.py,
+    the read preceding the gate call).  Neutering the upstream cap call at
+    config_manager.py:973 leaves the executor reading the UNCAPPED grant -> RED.
+    """
+
+    def test_workspace_ceiling_reaches_executor_config(self, hermetic_vault):
+        from agent.config.models import AgentConfig
+        from agent.core.state import AgentState
+        from agent.core.tool_executor import ToolExecutor
+        from web_ui.backend.config_manager import (
+            resolve_full_config,
+            session_config_from_merged,
+        )
+
+        vault = hermetic_vault
+        ws_id = "ws-q2-hop"
+        sid = "sess-q2-hop"
+
+        # The workspace's OWN stored ceiling RESTRICTS git to read...
+        ws_dir = vault / "workspaces" / ws_id
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        (ws_dir / "config.json").write_text(
+            json.dumps({"purpose": "general", "permissions": {"git": "read"}})
+        )
+
+        # ...while the session's stored grant (P1 sidecar) asks for MORE.
+        sidecar = session_grants_path(vault, ws_id, sid)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"git": "write", "filesystem": "write"}))
+
+        # Upstream route: merge every layer + apply the workspace ceiling last.
+        merged = resolve_full_config(workspace_id=ws_id, session_id=sid)
+        assert merged["session_permissions"]["git"] == "read"
+
+        # The EXECUTOR's own config is built from that merged value.
+        agent_cfg = session_config_from_merged(merged).to_agent_config()
+        executor = ToolExecutor(
+            tool_classes=[],
+            config=agent_cfg,
+            state=AgentState(config=agent_cfg),
+            logger=None,
+            security_available=True,
+            agent=None,
+        )
+
+        # Exactly what the executor consults (tool_executor.py
+        # ``session_perms_obj = self.config.session_permissions``).
+        read = executor.config.session_permissions
+        if hasattr(read, "to_dict"):
+            read = read.to_dict()
+        elif hasattr(read, "model_dump"):
+            read = read.model_dump()
+        assert read["git"] == "read", read
 
