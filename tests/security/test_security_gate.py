@@ -36,6 +36,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from security.security_gate import (
+    apply_workspace_ceiling,
     check_required_categories,
     get_effective_permissions,
     get_workspace_capabilities,
@@ -487,3 +488,93 @@ class TestResolvePrompt:
         # check_required_categories owns the cleanup.
         # But we can test that the value was placed on the queue.
         assert not q.empty()
+
+
+# ===========================================================================
+#  apply_workspace_ceiling -- host_bash seam
+# ===========================================================================
+
+
+class TestApplyWorkspaceCeilingHostBash:
+    """The host_bash ceiling branch caps allow/ask/banned on its own scale.
+
+    host_bash ranks ``banned < ask < allow``, which is NOT the shared
+    ``WORKSPACE_CEILING_LEVELS`` table, so ``apply_workspace_ceiling``
+    intercepts it before the generic rank normalisation (else an 'allow'
+    ceiling would hit the unknown-level fail-open path).  The rule under
+    test: whenever the ceiling ranks strictly below the session grant the
+    result is forced to the below-ask tier ``banned`` -- an 'ask' ceiling
+    over an 'allow' grant must never emit 'ask' (prompts come only from
+    genuine session-level 'ask' grants).
+    """
+
+    def test_ask_ceiling_caps_allow_to_banned(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": "ask"}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "banned"}
+
+    def test_banned_ceiling_caps_allow_to_banned(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": "banned"}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "banned"}
+
+    def test_bool_false_ceiling_caps_allow_to_banned(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": False}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "banned"}
+
+    def test_allow_ceiling_keeps_allow_grant(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": "allow"}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "allow"}
+
+
+# ===========================================================================
+#  check_required_categories -- host_bash category gate
+# ===========================================================================
+
+
+class TestCheckRequiredCategoriesHostBash:
+    """The outer gate resolves a ``host_bash:allow`` requirement against the
+    effective host_bash grain.
+
+    The tool declares the VALUE form ``["host_bash:allow"]``
+    (tools/host_bash_tool.py) precisely because the gate's requirement loop
+    SKIPS any entry lacking ``":"`` (security_gate.py:1483-1485): a bare
+    ``["host_bash"]`` would gate nothing.  These pins exercise the value form
+    the gate actually evaluates, i.e. the value-satisfaction table for the
+    host_bash category.
+    """
+
+    def test_allow_grain_satisfies_allow_requirement(self):
+        eff = {"host_bash": "allow"}
+        ok, msg = check_required_categories(
+            ["host_bash:allow"], eff, "TestTool", {}, "", None
+        )
+        assert ok is True
+
+    def test_banned_grain_denies_allow_requirement(self):
+        eff = {"host_bash": "banned"}
+        ok, msg = check_required_categories(
+            ["host_bash:allow"], eff, "TestTool", {}, "", None
+        )
+        assert ok is False
+
+    def test_ask_grain_without_event_bus_denies_with_approval_hint(self):
+        eff = {"host_bash": "ask"}
+        ok, msg = check_required_categories(
+            ["host_bash:allow"], eff, "TestTool", {}, "", None
+        )
+        assert ok is False
+        assert "interactive approval" in msg
+
+    def test_bare_category_without_value_is_silently_skipped(self):
+        """A colon-less requirement entry is SKIPPED (no footprint): a bare ``["host_bash"]`` gates nothing."""
+        ok, msg = check_required_categories(["host_bash"], {"host_bash": "banned"}, "TestTool", {}, "", None)
+        assert ok is True
+        assert msg == ""
+

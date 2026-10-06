@@ -330,7 +330,7 @@ class TestHostBashFlagGate:
         assert result["success"] is False
         assert result["outcome"] == "denied"
         assert "not allowed (requires ask or allow)" in result["error"]
-        assert result["permission_level"] is None
+        assert result["permission_level"] == "banned"
         mock_subprocess.run.assert_not_called()
 
     def test_denied_when_grain_banned(self, tmp_path):
