@@ -591,7 +591,7 @@ class TestCheckSystemGitMode:
             },
         )
         tool = self._make({"git_execution_mode": "container"}, str(tmp_path))
-        object.__setattr__(tool, "session_permissions", {"container": True})
+        object.__setattr__(tool, "effective_permissions", {"container": True})
         tool._query_capabilities("ws-9", str(tmp_path))
         resource, kwargs = calls[0]
         assert resource == "git"
