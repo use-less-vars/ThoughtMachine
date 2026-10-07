@@ -82,11 +82,11 @@ _PERM_INTEREST = LEGACY_SET | SESSION_VOCAB_SET | {"system", "docker"}
 _GAW_KEY = "git_allow_worktree_commits"
 
 # Canonical git grain ranks (mirrors security/resource_catalog.py
-# GRANT_LEVEL_RANKS: banned < ask < read < write == write_on_feature_branch).
+# GRANT_LEVEL_RANKS: banned < read < ask < write == write_on_feature_branch).
 _GIT_MERGE_RANK = {
     "banned": 0,
-    "ask": 1,
-    "read": 2,
+    "read": 1,
+    "ask": 2,
     "write": 3,
     "write_on_feature_branch": 3,
     "full": 4,
@@ -840,12 +840,13 @@ def _collect_seeded_files(root: Path) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 # Broader = smaller number (mirrors security/resource_catalog.py
-# GRANT_LEVEL_RANKS: write is broader than write_on_feature_branch ...).
+# GRANT_LEVEL_RANKS: write is broader than write_on_feature_branch, which is
+# broader than ask, which is broader than read ...).
 _GIT_BREADTH = {
     "write": 0,
     "write_on_feature_branch": 1,
-    "read": 2,
-    "ask": 3,
+    "ask": 2,
+    "read": 3,
     "banned": 4,
 }
 

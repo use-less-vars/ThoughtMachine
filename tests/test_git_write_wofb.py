@@ -175,3 +175,31 @@ def test_worker_ask_git_write_auto_denied():
     )
     assert denied is False
     assert "ask requires interactive approval; not available in worker context" in deny_msg
+
+
+
+# ── vault_repair git-fold: ask ranks ABOVE read (canonical order) ─────────
+
+def test_merged_git_value_prefers_ask_over_read():
+    """``thoughtmachine.vault_repair._GIT_MERGE_RANK`` mirrors the canonical
+    ``security.resource_catalog.GRANT_LEVEL_RANKS`` order ``banned < read <
+    ask < write == write_on_feature_branch < full``.
+
+    Regression for the stale mirror that ranked ``ask`` BELOW ``read``: folding
+    a legacy ``git_read`` value of ``'ask'`` against an existing ``git`` of
+    ``'read'`` must resolve to the more permissive ``'ask'`` (in either key
+    order), never silently downgrade to ``'read'``.
+    """
+    from thoughtmachine.vault_repair import _GIT_MERGE_RANK, _merged_git_value
+
+    # Canonical ordering, mirroring GRANT_LEVEL_RANKS.
+    assert _GIT_MERGE_RANK["banned"] < _GIT_MERGE_RANK["read"]
+    assert _GIT_MERGE_RANK["read"] < _GIT_MERGE_RANK["ask"]
+    assert _GIT_MERGE_RANK["ask"] < _GIT_MERGE_RANK["write"]
+    assert _GIT_MERGE_RANK["write"] == _GIT_MERGE_RANK["write_on_feature_branch"]
+    assert _GIT_MERGE_RANK["write_on_feature_branch"] < _GIT_MERGE_RANK["full"]
+
+    # ask beats read regardless of which key carries which value.
+    assert _merged_git_value({"git": "read", "git_read": "ask"}) == "ask"
+    assert _merged_git_value({"git": "ask", "git_read": "read"}) == "ask"
+
