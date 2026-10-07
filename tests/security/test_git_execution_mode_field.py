@@ -31,19 +31,47 @@ def server_module():
     """Fresh import of web_ui.backend.server (temp HOME + prefix purge)."""
     import tempfile
 
+    prefixes = (
+        "web_ui.backend",
+        "agent.config.provider_profile",
+        "thoughtmachine.bootstrap",
+        "session",
+    )
+    _ABSENT = object()
+
+    def _matched():
+        return [
+            n for n in list(sys.modules)
+            if any(n == p or n.startswith(p + ".") for p in prefixes)
+        ]
+
     with tempfile.TemporaryDirectory() as tmp_home:
         old_home = os.environ.get("HOME")
         os.environ["HOME"] = tmp_home
+        # Snapshot the pre-purge state (matched sys.modules entries + the
+        # parent-package attributes the re-import rebinds) so teardown puts the
+        # ORIGINAL singletons back instead of leaving purged modules behind.
+        saved_modules = {n: sys.modules[n] for n in _matched()}
+        saved_attrs: dict = {}
+        for n in saved_modules:
+            parent_name, _, child = n.rpartition(".")
+            if not parent_name or parent_name in saved_modules:
+                continue
+            parent_mod = sys.modules.get(parent_name)
+            if parent_mod is not None:
+                saved_attrs.setdefault(parent_name, {})[child] = parent_mod.__dict__.get(
+                    child, _ABSENT
+                )
         try:
-            for prefix in (
-                "web_ui.backend",
-                "agent.config.provider_profile",
-                "thoughtmachine.bootstrap",
-                "session",
-            ):
-                for mod in list(sys.modules):
-                    if mod == prefix or mod.startswith(prefix + "."):
-                        del sys.modules[mod]
+            for name in saved_modules:
+                parent_name, _, leaf = name.rpartition(".")
+                parent_pkg = sys.modules.get(parent_name)
+                del sys.modules[name]
+                if parent_pkg is not None and leaf:
+                    try:
+                        delattr(parent_pkg, leaf)
+                    except AttributeError:
+                        pass
             import web_ui.backend.server as server_mod
 
             yield server_mod
@@ -52,6 +80,18 @@ def server_module():
                 os.environ.pop("HOME", None)
             else:
                 os.environ["HOME"] = old_home
+            for name in _matched():
+                del sys.modules[name]
+            sys.modules.update(saved_modules)
+            for parent_name, attrs in saved_attrs.items():
+                parent_mod = sys.modules.get(parent_name)
+                if parent_mod is None:
+                    continue
+                for child, value in attrs.items():
+                    if value is _ABSENT:
+                        parent_mod.__dict__.pop(child, None)
+                    else:
+                        parent_mod.__dict__[child] = value
 
 
 @pytest.fixture(scope="module")
