@@ -64,7 +64,7 @@ class TestGitWriteBranchProtection:
         defaults = {
             'operation': 'commit',
             'message': 'agent commit',
-            'agent_config': {'session_permissions': {'git': 'write'}},
+            'effective_permissions': {'git': 'write'},
         }
         defaults.update(params)
         return GitWriteTool(**defaults)
@@ -107,7 +107,7 @@ class TestGitWriteBranchProtection:
 
     def test_commit_gate_fails_closed_without_git_write_permission(self, tmp_path):
         repo = self._make_operator_managed_repo(tmp_path)
-        tool = self._tool(agent_config={'session_permissions': {}})
+        tool = self._tool(effective_permissions={})
         with mock.patch.object(tool, '_use_container_mode', return_value=True):
             result = tool._git_commit(repo)
         assert result == (

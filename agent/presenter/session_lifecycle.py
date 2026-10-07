@@ -120,7 +120,7 @@ class SessionLifecycle:
                     except Exception:
                         workspace_id = None
                     metadata['workspace_path'] = ws_path
-                metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
+                metadata['agent_config'] = agent_config.model_dump(exclude={'api_key', 'session_permissions'}, exclude_none=True)
                 new_session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata, workspace_id=workspace_id)
                 new_session.ensure_name()
                 self.state_bridge.bind_session(new_session)
@@ -163,7 +163,7 @@ class SessionLifecycle:
             except Exception:
                 workspace_id = None
             metadata['workspace_path'] = ws_path
-        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key', 'session_permissions'}, exclude_none=True)
         session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata, workspace_id=workspace_id)
         session.ensure_name()
         self.state_bridge.bind_session(session)
@@ -522,7 +522,7 @@ class SessionLifecycle:
                     metadata[k] = v
         if self.state_bridge.session_name:
             metadata['name'] = self.state_bridge.session_name
-        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key', 'session_permissions'}, exclude_none=True)
         session = Session(session_id=self.state_bridge.current_session_id or str(uuid.uuid4()), user_history=conversation, metadata=metadata)
         session.ensure_name()
         if self.state_bridge.total_input > 0:

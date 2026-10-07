@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uuid, hashlib, json, os, threading
 from typing import Any
-from thoughtmachine.security import merge_security_config, get_default_security_config, coerce_session_permissions
+from thoughtmachine.security import merge_security_config, get_default_security_config
 from agent.logging import log
 from agent.core.message import Message
 
@@ -343,13 +343,6 @@ class Session:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
 
-        # Coerce session_permissions on load to reject stale / tampered values
-        agent_cfg = metadata.get('agent_config', {})
-        if 'session_permissions' in agent_cfg:
-            agent_cfg['session_permissions'] = coerce_session_permissions(
-                agent_cfg['session_permissions'],
-            )
-
         # Derive runtime params from metadata.agent_config (sole source of truth)
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
@@ -378,13 +371,6 @@ class Session:
         containers = [ContainerMetadata.from_dict(c) for c in containers_data]
         security_config_data = data.get('security_config', {})
         security_config = merge_security_config(security_config_data)
-
-        # Coerce session_permissions embedded in security_config
-        session_policy = security_config.get('session_policy', {})
-        if 'session_permissions' in session_policy:
-            session_policy['session_permissions'] = coerce_session_permissions(
-                session_policy['session_permissions'],
-            )
 
         version = data.get('version', 1)
         # Backward compat: mode and last_active (legacy sessions may lack these)
@@ -404,12 +390,6 @@ class Session:
         if config_data and 'agent_config' not in metadata:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
-        # Coerce session_permissions on load to reject stale / tampered values
-        agent_cfg = metadata.get('agent_config', {})
-        if 'session_permissions' in agent_cfg:
-            agent_cfg['session_permissions'] = coerce_session_permissions(
-                agent_cfg['session_permissions'],
-            )
         # Derive runtime params from metadata.agent_config (sole source of truth)
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
@@ -438,13 +418,6 @@ class Session:
         containers = [ContainerMetadata.from_dict(c) for c in containers_data]
         security_config_data = data.get('security_config', {})
         security_config = merge_security_config(security_config_data)
-
-        # Coerce session_permissions embedded in security_config
-        session_policy = security_config.get('session_policy', {})
-        if 'session_permissions' in session_policy:
-            session_policy['session_permissions'] = coerce_session_permissions(
-                session_policy['session_permissions'],
-            )
 
         version = data.get('version', 1)
         self.mode = data.get('mode', self.mode)

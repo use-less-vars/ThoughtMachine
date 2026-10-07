@@ -13,9 +13,10 @@ The MockProvider:
 Tests:
 1. new_session emits lifecycle events
 2. continue_session without a usable provider emits an error (mock never used)
-3. apply_config overlays a partial session_permissions payload over the
-   currently granted set (merge semantics — prior grants survive)
-4. saving and loading session preserves config
+3. apply_config IGNORES a session_permissions payload (P1 — grants are
+   written only through the canonical session-permission sidecar)
+4. saving and loading session preserves config (but does NOT resurrect the
+   ignored session_permissions grant)
 5. model_override is ignored by apply_config
 6. api_key is stripped from the config dump
 7. ProviderFactory can instantiate the mock provider directly (unit-level)
@@ -23,6 +24,7 @@ Tests:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys as sys_mod
 import tempfile
@@ -305,12 +307,12 @@ class TestWebSocketWithMockProvider:
             f"{len(MockProvider._instances)} — the mock must not be used"
         )
 
-    def test_apply_config_permissions_merge_preserves_prior_grants(self, mock_server):
+    def test_apply_config_permissions_payload_is_ignored(self, mock_server, caplog):
         """
-        apply_config with partial session_permissions MERGES the payload over
-        the currently granted set (overlay semantics, not wholesale replace):
-        keys absent from the payload survive unchanged, explicit payload
-        values win.
+        apply_config does NOT carry grants (P1): a ``session_permissions`` key
+        on the payload is IGNORED — the canonical grant store is the session
+        permission sidecar.  The emitted set is the session default and is left
+        unchanged by both payloads; the payload value never lands.
         """
         app, _tmp_home = mock_server
         first_perms = {
@@ -321,52 +323,54 @@ class TestWebSocketWithMockProvider:
             "mcp": "banned",
             "host_bash": "banned",
         }
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws") as ws:
-                # Create session
-                new_session(ws)
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws") as ws:
+                    # Create session
+                    new_session(ws)
 
-                # First, apply a config with a full session_permissions set
-                # (canonical permission keys only).
-                ws.send_json({
-                    "command": "apply_config",
-                    "config": {
-                        "provider_type": "mock",
-                        "api_key": "mock-key",
-                        "model": "mock-model",
-                        "session_permissions": dict(first_perms),
-                    },
-                })
-                poll_for_type(ws, "config_changed", timeout=5.0)
-
-                # Now apply a partial update — only change one field
-                ws.send_json({
-                    "command": "apply_config",
-                    "config": {
-                        "session_permissions": {
-                            "filesystem": "write",
+                    # Payload #1 carries a full session_permissions set
+                    # (canonical permission keys only).
+                    ws.send_json({
+                        "command": "apply_config",
+                        "config": {
+                            "provider_type": "mock",
+                            "api_key": "mock-key",
+                            "model": "mock-model",
+                            "session_permissions": dict(first_perms),
                         },
-                    },
-                })
-                config_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
-                last_config = config_msgs[-1]["config"]
+                    })
+                    first_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
+                    first_emitted = (
+                        first_msgs[-1]["config"].get("session_permissions") or {}
+                    )
 
-        # session_permissions is merged (overlay), not replaced wholesale:
-        # the partial payload flips 'filesystem' but every previously granted
-        # key keeps its value.
-        perms = last_config.get("session_permissions", {})
-        assert perms.get("filesystem") == "write", (
-            f"Explicit payload value should win; got "
+                    # Payload #2 tries a partial update — a single field.
+                    ws.send_json({
+                        "command": "apply_config",
+                        "config": {
+                            "session_permissions": {
+                                "filesystem": "write",
+                            },
+                        },
+                    })
+                    config_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
+                    last_config = config_msgs[-1]["config"]
+
+        # P1: neither payload granted anything — the emitted session_permissions
+        # is the session default, unchanged between the two payloads.
+        perms = last_config.get("session_permissions") or {}
+        assert perms == first_emitted, (
+            f"apply_config payload changed the emitted permissions "
+            f"({first_emitted!r} -> {perms!r}); the payload must be ignored"
+        )
+        assert perms.get("filesystem") != "write", (
+            f"payload value must NOT land; got "
             f"filesystem={perms.get('filesystem')!r} in {perms}"
         )
-        for key, expected in first_perms.items():
-            if key == "filesystem":
-                continue
-            assert perms.get(key) == expected, (
-                f"apply_config must preserve previously granted "
-                f"'{key}'={expected!r} (merge, not replace); got "
-                f"{perms.get(key)!r} in {perms}"
-            )
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
     def test_model_override_ignored(self, mock_server):
         """
@@ -427,10 +431,10 @@ class TestWebSocketWithMockProvider:
         # api_key is never persisted, so api_key_configured is False
         assert last_config.get("api_key_configured") is False
 
-    def test_save_and_load_session_roundtrip(self, mock_server):
+    def test_save_and_load_session_roundtrip_strips_grants(self, mock_server):
         """
-        Saving a session and loading it back should preserve config fields
-        (including session_permissions).
+        Saving a session and loading it back preserves config fields but does
+        NOT resurrect the ignored session_permissions grant.
         """
         app, tmp_home = mock_server
         session_id = None
@@ -448,7 +452,7 @@ class TestWebSocketWithMockProvider:
                         "api_key": "mock-key",
                         "model": "mock-model",
                         "session_permissions": {
-                            "filesystem": "read",
+                            "filesystem": "write",
                             "network": "all",
                         },
                         "system_prompt": "You are a test agent.",
@@ -477,8 +481,11 @@ class TestWebSocketWithMockProvider:
         assert loaded_config.get("model") == "mock-model"
         assert loaded_config.get("system_prompt") == "You are a test agent."
         perms = loaded_config.get("session_permissions", {})
-        assert perms.get("filesystem") == "read"
-        assert perms.get("network") == "all"
+        # P1/P2: the apply_config payload grant was IGNORED and the session
+        # record does not persist it, so it is never resurrected on load.
+        # (Robust whether the projection emits {} or the gate's deny-all shape.)
+        assert perms.get("network") != "all"
+        assert perms.get("filesystem") != "write"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

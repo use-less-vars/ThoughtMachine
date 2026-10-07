@@ -24,6 +24,7 @@ The Docker SDK surface is fully mocked (NO real daemon).
 """
 
 import os
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -292,10 +293,30 @@ class TestToolExecutorResourceEnforcement:
         assert "Tool requires resource 'git'" in result["result"]
         assert "git:read" in result["result"]
 
-    def test_resource_bound_tool_allowed_with_git_read(self):
-        # SessionPermissions() defaults git='read'
+    def test_resource_bound_tool_allowed_with_git_read(self, tmp_path, monkeypatch):
+        # The disk-authoritative gate reads the canonical grant (session
+        # sidecar) plus the workspace capabilities/ceiling, so seed a hermetic
+        # vault: git:read on the session, an empty ceiling, and permissive
+        # capabilities (git is capped by workspace git_available).
+        from thoughtmachine import permission_store as ps
+        from thoughtmachine.vault import vault_root
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+        ws_id, sid = "ws-res-1", "sess-res-1"
+        ws_dir = tmp_path / "workspaces" / ws_id
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        (ws_dir / "config.json").write_text(
+            json.dumps({"permissions": {}}), encoding="utf-8"
+        )
+        (ws_dir / "capabilities.json").write_text(
+            json.dumps({"git_available": True}), encoding="utf-8"
+        )
+        ps.write_session_permissions(vault_root(), ws_id, sid, {"git": "read"})
         executor = self._make_executor([ResourceBoundTool])
-        result = self._run(executor, ResourceBoundTool, "ResourceBoundTool")
+        result = executor._execute_single_tool(
+            ResourceBoundTool, {}, "ResourceBoundTool", 0,
+            lambda: False, lambda: None, lambda: 0,
+            session_id=sid, workspace_id=ws_id,
+        )
         assert result["result"] == "RESOURCE OK"
         assert result["tool_type"] == "normal"
 

@@ -294,7 +294,7 @@ class TestCheckSystem:
         tool = CheckSystem(
             query="network_diagnostics",
             workspace_path="/tmp/test_ws",
-            session_permissions={"network": "write"},
+            effective_permissions={"network": "write"},
         )
         result = _parse_result(tool.execute())
         assert result["daemon"] is True

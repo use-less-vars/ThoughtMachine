@@ -22,7 +22,9 @@ F. ToolExecutor enforces session permissions (deny / hot-swap).
 G. 'ask' permission flow defers to the outer gate (approve / deny / cancel).
 H. GitInfoTool routing: 'ask' defers, 'banned' denies (fail-closed), for both
    host and container paths.
-I. Bridge apply_config / save / load round-trips session_permissions.
+I. Bridge apply_config IGNORES a session_permissions payload (the sidecar is
+   the canonical grants holder); save / load never persists that payload into
+   session metadata, yet the round-trip PRESERVES the canonical sidecar grant.
 J. Global-defaults worker config allowlist (only the six known keys persist;
    absent keys fall back to constructor defaults).
 K. Per-session worker spawn cap (``max_workers``) safe default 3.
@@ -37,6 +39,7 @@ tests/test_permissions_roundtrip.py (cancel prompts), tests/test_global_defaults
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import tempfile
@@ -660,8 +663,14 @@ class TestToolExecutorEnforcement:
         )
 
     def test_permissive_allows_write(self):
+        """RISK-3 (new contract): an id-less executor MUST NOT grant from the
+        in-memory ``session_permissions`` mirror.  A permissive mirror
+        (filesystem='write') is no longer authoritative -> the write is DENIED.
+        (Canonical disk-mode grant: tests/test_worker_disk_mode_inheritance.py.)"""
         executor = self._executor([FileWriteTool], SessionPermissions(filesystem="write"))
-        assert self._run(executor, FileWriteTool)["result"] == "Write OK"
+        result = self._run(executor, FileWriteTool)["result"]
+        assert "Permission denied" in result, result
+        assert "filesystem:write" in result, result
 
     def test_restrictive_denies_write(self):
         executor = self._executor([FileWriteTool], SessionPermissions(filesystem="read"))
@@ -670,16 +679,24 @@ class TestToolExecutorEnforcement:
         assert "filesystem:write" in result
 
     def test_multi_requirement_denied_if_one_missing(self):
+        """RISK-3 (new contract): id-less -> fail-closed session, so the
+        multi-requirement tool is denied on the FIRST category (container:true)
+        rather than the mirror's missing 'network'.  (Disk-mode
+        ceiling/missing-category contract: tests/test_security_gate_disk.py.)"""
         executor = self._executor(
             [MultiRequirementTool],
             SessionPermissions(container=True, network=False, filesystem="write"),
         )
         result = self._run(executor, MultiRequirementTool)["result"]
         assert "Permission denied" in result
-        assert "network" in result
+        assert "container:true" in result
 
     def test_hot_swap_banned_to_read(self):
-        """Replacing session_permissions at runtime changes the gate outcome."""
+        """RISK-3 (new contract): an id-less executor reads NO canonical grant
+        source, so hot-swapping ``config.session_permissions`` ('banned' ->
+        'read') can never change the outcome -- the fail-closed denial holds
+        before AND after the swap.  (The disk-mode revocation/hot-swap contract
+        is pinned in tests/test_worker_disk_mode_inheritance.py.)"""
         cfg = AgentConfig(session_permissions=SessionPermissions(filesystem="banned"))
         executor = ToolExecutor(
             tool_classes=[FilePreviewTool], config=cfg, state=AgentState(config=cfg)
@@ -695,11 +712,149 @@ class TestToolExecutorEnforcement:
             FilePreviewTool, {"filename": "/nonexistent/file.txt"}, "FilePreviewTool", 0,
             lambda: False, lambda: "", lambda: 0,
         )
-        assert "Permission denied" not in r2.get("result", "")
-        assert any(
-            msg in r2.get("result", "")
-            for msg in ("No such file", "not found", "not a file", "not exist")
+        # id-less: the widened mirror is NOT honoured -- still denied.
+        assert "Permission denied" in r2.get("result", "")
+        assert "filesystem:read" in r2.get("result", "")
+
+
+class TestIdlessFailClosed:
+    """RISK-3 pin: an id-less executor MUST NOT grant from the in-memory mirror.
+
+    ``_execute_single_tool`` called WITHOUT a session_id/workspace_id has no
+    on-disk authority to read, so the effective profile is the deny-all
+    ``_DISK_FAIL_CLOSED_SESSION`` merged with the workspace capabilities.  An
+    over-broad ``config.session_permissions`` mirror (container/network/full
+    filesystem/git/mcp + host_bash allow) can therefore NEVER widen access.
+
+    Reverting the id-less branch to the historical 2-arg merge
+    ``get_effective_permissions(session_perms_obj, caps)`` makes this test RED:
+    the mirror's ``container=True`` / ``filesystem='full'`` / ``git='full'``
+    would grant both tools again.
+    """
+
+    def _executor(self, tool_classes, permissions):
+        cfg = AgentConfig(session_permissions=permissions)
+        return ToolExecutor(
+            tool_classes=tool_classes,
+            config=cfg,
+            state=AgentState(config=cfg),
+            logger=None,
+            security_available=False,
+            agent=None,
         )
+
+    @staticmethod
+    def _run(executor, tool_cls):
+        return executor._execute_single_tool(
+            tool_cls, {}, tool_cls.__name__, 0,
+            lambda: False, lambda: None, lambda: 0,
+        )
+
+    def test_idless_overbroad_mirror_cannot_grant(self):
+        """An all-permissive mirror is IGNORED: both tools are denied."""
+        executor = self._executor(
+            [FileWriteTool, GitReadTool],
+            SessionPermissions(
+                container=True, network=True, filesystem="full",
+                mcp="full", git="full", host_bash="allow",
+            ),
+        )
+        r_write = self._run(executor, FileWriteTool)["result"]
+        assert "Permission denied" in r_write, r_write
+        assert "filesystem:write" in r_write, r_write
+        r_git = self._run(executor, GitReadTool)["result"]
+        assert "Permission denied" in r_git, r_git
+        assert "git:read" in r_git, r_git
+
+    def test_idless_deny_is_fail_closed_all_banned(self):
+        """Diagnostic: the id-less floor is the all-banned deny-all profile."""
+        import agent.core.tool_executor as _te
+
+        fc = _te._DISK_FAIL_CLOSED_SESSION
+        assert fc is not None, "_DISK_FAIL_CLOSED_SESSION not imported"
+        assert fc.container is False
+        assert fc.network == "banned"
+        assert fc.filesystem == "banned"
+        assert fc.git == "banned"
+        assert fc.mcp == "banned"
+        assert fc.host_bash == "banned"
+
+    def test_unresolved_workspace_id_message_names_fail_closed(self, monkeypatch):
+        """A configured-but-unresolvable workspace_path is NAMED fail-closed.
+
+        With a workspace_path set but no resolvable workspace id, a tool that
+        declares required categories is DENIED -- and the message the caller
+        receives NAMES the fail-closed outcome ("could not resolve
+        workspace_id" + "fail-closed") rather than silently falling back to
+        (permissive) default capabilities.  Dropping the wording -> RED.
+        """
+        import agent.core.tool_executor as _te
+
+        monkeypatch.setattr(_te, "resolve_workspace_id", lambda p: None)
+        executor = self._executor(
+            [FileWriteTool], SessionPermissions(filesystem="write")
+        )
+        executor.config.workspace_path = "/tmp/unresolvable-ws"
+        result = self._run(executor, FileWriteTool)["result"]
+        # Explicit: the message NAMES its OWN cause (the unresolvable
+        # workspace_id) -- an exact-match pin so a generic or mis-attributed
+        # fail-closed reason cannot satisfy it.
+        assert "could not resolve workspace_id" in result, result
+        assert "fail-closed" in result, result
+        assert result == (
+            "DENIED: could not resolve workspace_id for workspace_path=/tmp/"
+            "unresolvable-ws; tool execution denied (fail-closed)."
+        ), result
+
+    @staticmethod
+    def _run_calls(executor, tool_cls, session_id="", workspace_id=""):
+        """Drive the PUBLIC entry point ``execute_tool_calls`` (where the
+        id-less entry observation lives) and return the first tool result."""
+        tool_calls = [
+            {"id": "tc-1", "function": {"name": tool_cls.__name__, "arguments": "{}"}}
+        ]
+        executed, _final, _respond, _summary, _keep = executor.execute_tool_calls(
+            tool_calls,
+            add_to_conversation_func=lambda _m: None,
+            session_id=session_id,
+            workspace_id=workspace_id,
+        )
+        return executed[0]["result"]
+
+    def test_idless_entry_trips_observation_and_stays_denied(self, caplog):
+        """Entering ``execute_tool_calls`` with NO session/workspace id emits a
+        WARNING (identity-missing + fail-closed consequence) AND the
+        category-gated call is still DENIED.  Removing the observation -> RED."""
+        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="full"))
+        with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
+            result = self._run_calls(executor, FileWriteTool)
+        warnings = [
+            r for r in caplog.records
+            if r.name == "agent.core.tool_executor" and r.levelno == logging.WARNING
+        ]
+        # (a) the observation fired, naming the missing-identity fact ...
+        assert warnings, caplog.text
+        assert any("NO session identity" in r.getMessage() for r in warnings), caplog.text
+        assert any("NO workspace identity" in r.getMessage() for r in warnings), caplog.text
+        # ... AND the fail-closed consequence.
+        assert any("fail-closed" in r.getMessage() for r in warnings), caplog.text
+        assert any("DENIED" in r.getMessage() for r in warnings), caplog.text
+        # (b) behaviour unchanged: the call is still denied fail-closed.
+        assert "Permission denied" in result, result
+        assert "filesystem:write" in result, result
+
+    def test_identified_entry_does_not_trip_observation(self, caplog):
+        """Entering with BOTH a session id and a workspace id does NOT warn.
+        Broadening the guard to fire always -> RED."""
+        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="full"))
+        with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
+            self._run_calls(
+                executor, FileWriteTool, session_id="sess-1", workspace_id="ws-1"
+            )
+        assert not [
+            r for r in caplog.records
+            if r.name == "agent.core.tool_executor" and r.levelno == logging.WARNING
+        ], caplog.text
 
 
 # =========================================================================
@@ -741,64 +896,48 @@ class TestAskPermissionFlow:
         )
 
     def test_ask_approve_runs(self, clean_prompts):
+        """RISK-3 (new contract): an id-less executor has no on-disk
+        authority to read, so it never reaches the interactive ask flow --
+        the deny-all floor denies the git:write tool synchronously and leaves
+        NO pending prompt to approve.  (Canonical disk-mode ask coverage now
+        lives in tests/test_worker_disk_mode_inheritance.py
+        ::test_main_agent_ask_prompts_via_event_bus.)"""
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitWriteTool], permissions=perms)
-        result_container = []
-
-        def run_executor():
-            result_container.append(executor._execute_single_tool(
-                GitWriteTool, {}, "GitWriteTool", 0,
-                lambda: False, lambda: None, lambda: 0,
-            ))
-
-        t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
-        time.sleep(0.2)
-
+        result = executor._execute_single_tool(
+            GitWriteTool, {}, "GitWriteTool", 0,
+            lambda: False, lambda: None, lambda: 0,
+        )
+        assert "Permission denied" in result["result"], result
         with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-        assert len(request_ids) > 0, "executor did not trigger the ask flow"
-        resolve_security_prompt(request_ids[0], approved=True)
-
-        t.join(timeout=5)
-        assert len(result_container) == 1
-        assert result_container[0]["result"] == "Git write OK"
-        assert result_container[0]["tool_type"] == "normal"
+            assert len(_pending_security_requests) == 0
 
     def test_ask_deny_blocks(self, clean_prompts):
+        """RISK-3 (new contract): id-less -> fail-closed denial, synchronously;
+        no prompt is ever registered (nothing to deny)."""
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitWriteTool], permissions=perms)
-        result_container = []
-
-        def run_executor():
-            result_container.append(executor._execute_single_tool(
-                GitWriteTool, {}, "GitWriteTool", 0,
-                lambda: False, lambda: None, lambda: 0,
-            ))
-
-        t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
-        time.sleep(0.2)
-
+        result = executor._execute_single_tool(
+            GitWriteTool, {}, "GitWriteTool", 0,
+            lambda: False, lambda: None, lambda: 0,
+        )
+        assert "Permission denied" in result["result"], result
         with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-        assert len(request_ids) > 0
-        resolve_security_prompt(request_ids[0], approved=False)
-
-        t.join(timeout=5)
-        assert len(result_container) == 1
-        assert "Permission denied" in result_container[0]["result"]
+            assert len(_pending_security_requests) == 0
 
     def test_ask_read_bypasses_prompt(self, clean_prompts):
+        """RISK-3 (new contract): id-less -> fail-closed denial even for a
+        git:read tool under a git='ask' mirror; no prompt is registered."""
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitReadTool], permissions=perms)
         result = executor._execute_single_tool(
             GitReadTool, {}, "GitReadTool", 0,
             lambda: False, lambda: None, lambda: 0,
         )
-        assert result["result"] == "Git read OK"
+        assert "Permission denied" in result["result"], result
+        assert "git:read" in result["result"], result
         with _pending_requests_lock:
-            assert len(list(_pending_security_requests.keys())) == 0
+            assert len(_pending_security_requests) == 0
 
     def test_resolve_places_response_on_queue(self, clean_prompts):
         q = queue.Queue()
@@ -1053,7 +1192,7 @@ class TestPermissionRouting:
 # =========================================================================
 
 class TestBridgePermissionSync:
-    """WebAgentBridge persists session_permissions through save/load."""
+    """Bridge ignores payload grants; canonical sidecar grants survive save/load."""
 
     @pytest.fixture
     def temp_store(self, tmp_path):
@@ -1062,16 +1201,21 @@ class TestBridgePermissionSync:
             state_dir=str(tmp_path / "state"),
         )
 
-    def test_apply_config_accepts_custom_permissions(self, temp_store):
+    def test_apply_config_ignores_custom_permissions(self, temp_store, caplog):
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
-        result = bridge.apply_config({"session_permissions": {"filesystem": "banned"}})
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            result = bridge.apply_config({"session_permissions": {"filesystem": "banned"}})
         assert "config" in result and "merged_config" in result
-        assert result["permissions"]["filesystem"] == "banned"
+        # P1: the payload grant is IGNORED — the canonical grant store is the
+        # session permission sidecar, so 'banned' never lands on the bridge.
         config = bridge.get_config()
         assert config is not None
-        assert config["session_permissions"]["filesystem"] == "banned"
+        assert (config.get("session_permissions") or {}).get("filesystem") != "banned", config
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
-    def test_roundtrip_preserves_permissions(self, temp_store):
+    def test_payload_grant_is_not_persisted_into_session_metadata(self, temp_store):
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         bridge.apply_config({"session_permissions": {"filesystem": "banned"}})
         saved = bridge.save_session()
@@ -1082,18 +1226,54 @@ class TestBridgePermissionSync:
         assert path is not None, "session file not found on disk"
         with open(path, "r") as f:
             raw = json.load(f)
-        perms_disk = (
-            raw.get("metadata", {})
-            .get("session_config", {})
-            .get("session_permissions", {})
-        )
-        assert perms_disk.get("filesystem") == "banned"
+        cfg_disk = raw.get("metadata", {}).get("session_config", {})
+        # P2: the session record is not a grants holder — the payload grant was
+        # STRIPPED before persisting, so it never lands in the session metadata.
+        assert "session_permissions" not in cfg_disk, cfg_disk
+        assert cfg_disk.get("session_permissions") != {"filesystem": "banned"}
 
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         assert bridge2.load_session(session_id)
         config = bridge2.get_config()
         assert config is not None
-        assert config["session_permissions"]["filesystem"] == "banned"
+        # The reloaded bridge must not resurrect the ignored grant from metadata.
+        assert (config.get("session_permissions") or {}).get("filesystem") != "banned", config
+
+    def test_roundtrip_preserves_canonical_grant(self, temp_store, tmp_path, monkeypatch):
+        from web_ui.backend.config_manager import frontend_config_from_bridge
+        from thoughtmachine.permission_store import write_session_permissions
+        from thoughtmachine.vault import vault_root
+
+        # Explicit hermetic binding: pin the vault root to a per-test tmp dir so
+        # this round-trip never touches the real ~/.thoughtmachine vault and does
+        # not depend on an unrelated autouse fixture for isolation.
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "_d3_roundtrip_vault"))
+
+        ws = "ws-d3-roundtrip"
+        vroot = vault_root()
+        cfg_dir = vroot / "workspaces" / ws
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.json").write_text(
+            json.dumps({"permissions": {"filesystem": "write"}}), encoding="utf-8"
+        )
+
+        bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge._workspace_id = ws
+        saved = bridge.save_session()
+        assert saved is not None
+        session_id = saved.session_id
+
+        # The CANONICAL grants writer: the session permission sidecar (P1).
+        write_session_permissions(vroot, ws, session_id, {"filesystem": "write"})
+
+        bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        assert bridge2.load_session(session_id)
+        # The reloaded bridge's CANONICAL config projection (gate disk mode:
+        # sidecar grants capped by the workspace ceiling) reports the grant --
+        # the round-trip PRESERVES the canonical sidecar grant.
+        proj = frontend_config_from_bridge(bridge2)
+        perms = proj.get("session_permissions") or {}
+        assert perms.get("filesystem") == "write", proj
 
 
 # =========================================================================

@@ -4,11 +4,15 @@ Disk-pure session permission store (sidecar-first, additive).
 This module is the storage half of the permission-simplification effort
 (see ``.thoughtmachine/working_docs/impl_plan_permission_simplification.md``).
 It makes the **disk** the source of truth for raw, uncapped per-session
-permission grants.  Nothing else reads or writes it yet -- the tool gate is
-refactored in a later phase; this module only *adds* the store plus its
-hermetic unit tests (constraint: no modifications to security_gate.py,
-tool_executor.py, session/store.py, container launch code, routes, or the
-frontend in this round).
+permission grants.  The sidecar (P1) has exactly ONE grants writer: the REST
+endpoint ``web_ui/backend/session_routes.py::put_session_permissions``.  The
+store is also seeded once at session creation with an empty ``{}`` grant set
+by ``SessionManager._seed_permissions_sidecar`` (create-time only).  The
+former persistence-layer mirror ``SessionManager._sync_session_permissions_sidecar``
+and the ``merge_session_permissions`` helper have been REMOVED -- the session
+metadata (P2) is no longer a grants holder; it is stripped of
+``session_permissions`` before every write.  The gate reads grants through
+:func:`read_session_permissions`.
 
 Canonical on-disk layout (pinned by the Phase-1 RED test
 ``tests/test_permission_disk_staleness.py`` and blueprint section 3.1)::
@@ -36,8 +40,11 @@ A read that cannot positively establish grants must never silently grant:
 * no sidecar **and** no matching session record -> raises
   :class:`PermissionStoreError` (unknown session: deny, do not default);
 * a session record that exists but records no ``session_permissions`` ->
-  returns ``{}`` (no grants recorded; the gate applies defaults afterwards
-  -- an empty grant set is neutral, it grants nothing).
+  returns ``{}``.  This is a *present-but-empty* grant set (the record-source
+  equivalent of an empty sidecar): the gate then builds
+  ``SessionPermissions(**{})`` from it, i.e. the DEFAULT grants capped by the
+  workspace ceiling.  It is NOT the all-banned deny posture -- that is
+  reserved for an *absent* source (which raises, see the bullet above).
 
 Canonical session-grant shape
 -----------------------------
@@ -87,8 +94,11 @@ __all__ = [
     "session_grants_path",
     "read_session_permissions",
     "write_session_permissions",
+    "seed_session_permissions_if_absent",
     "migrate_session_permissions",
     "workspace_ceiling",
+    "read_grants_or_deny_all",
+    "deny_all_grants",
 ]
 
 logger = logging.getLogger(__name__)
@@ -245,11 +255,13 @@ def read_session_permissions(
 ) -> Dict[str, Any]:
     """Return the session grants in canonical resource-catalog shape.
 
-    Sidecar first; legacy ``metadata.session_config.session_permissions``
-    fallback when the sidecar is absent.  Both sources are normalised on the
-    way out (see :func:`_normalize_session_permissions`): legacy git grains
-    are migrated and unknown/invalid entries are dropped, so callers never
-    see pre-catalog junk.  Fail closed -- see module docstring.
+    The sidecar is the SOLE grants source.  The retired
+    ``metadata.session_config.session_permissions`` /
+    ``metadata.agent_config.session_permissions`` carrier keys are never
+    consulted.  Values are normalised on the way out (see
+    :func:`_normalize_session_permissions`): legacy git grains are migrated
+    and unknown/invalid entries are dropped, so callers never see
+    pre-catalog junk.  Fail closed -- see module docstring.
     """
     sidecar = session_grants_path(vault_root, workspace_id, session_id)
     if sidecar.exists():
@@ -257,29 +269,10 @@ def read_session_permissions(
             _read_json_strict(sidecar, "permissions sidecar")
         )
 
-    record = _session_record_path(vault_root, workspace_id, session_id)
-    if record is None:
-        raise PermissionStoreError(
-            f"no permission source for session {session_id!r} in workspace "
-            f"{workspace_id!r}: no sidecar at {sidecar} and no matching "
-            "session record"
-        )
-    data = _read_json_strict(record, "session record")
-    metadata = data.get("metadata")
-    if not isinstance(metadata, dict):
-        return {}
-    session_config = metadata.get("session_config")
-    if not isinstance(session_config, dict):
-        return {}
-    legacy = session_config.get("session_permissions")
-    if legacy is None:
-        return {}
-    if not isinstance(legacy, dict):
-        raise PermissionStoreError(
-            f"session record {record} has non-object "
-            "metadata.session_config.session_permissions"
-        )
-    return _normalize_session_permissions(legacy)
+    raise PermissionStoreError(
+        f"no permission source for session {session_id!r} in workspace "
+        f"{workspace_id!r}: no sidecar at {sidecar}"
+    )
 
 
 def workspace_ceiling(vault_root, workspace_id: str) -> Dict[str, Any]:
@@ -305,6 +298,52 @@ def workspace_ceiling(vault_root, workspace_id: str) -> Dict[str, Any]:
             f"workspace config {config_path} has non-object 'permissions'"
         )
     return dict(permissions)
+
+
+def deny_all_grants() -> Dict[str, Any]:
+    """Return the deny-all grants sentinel (all six categories banned).
+
+    Single source of truth for the fail-closed grant value, so an unreadable
+    grants path can never diverge per call site.
+    """
+    from security.security_gate import _DISK_FAIL_CLOSED_SESSION
+
+    return _DISK_FAIL_CLOSED_SESSION.model_dump()
+
+
+def read_grants_or_deny_all(
+    session_id: Any, workspace_id: Any
+) -> Dict[str, Any]:
+    """Return a session's grants, the designed default, or the deny-all sentinel.
+
+    Contract (D1=A narrow) -- *id-less is not the same as unreadable*:
+
+    * A grants path exists only when BOTH a ``session_id`` and a
+      ``workspace_id`` are present (the sidecar lives at
+      ``<vault_root>/workspaces/<workspace_id>/sessions/<session_id>/permissions.json``).
+      With either id absent there is no path to be unreadable, so a truly
+      id-less call returns the designed Pydantic default
+      (``SessionPermissions().model_dump()``) -- never the sentinel.
+    * With BOTH ids present, *any* failure of the read -- a
+      :class:`PermissionStoreError` (missing or corrupt sidecar), an
+      ``OSError``, a wrong shape, or a non-dict value -- yields the deny-all
+      sentinel (all six categories banned), so an unreadable grants path
+      never produces a permissive value.
+    """
+    from thoughtmachine.vault import vault_root
+
+    if not session_id or not workspace_id:
+        # No workspace-scoped grant store to read: the designed default, NOT
+        # the sentinel -- a missing id is a valid transitional state, not an
+        # unreadable store.
+        return SessionPermissions().model_dump()
+    try:
+        grants = read_session_permissions(vault_root(), workspace_id, session_id)
+    except Exception:
+        return deny_all_grants()
+    if not isinstance(grants, dict):
+        return deny_all_grants()
+    return grants
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +428,43 @@ def write_session_permissions(
             except OSError:
                 pass
     return target
+
+
+def seed_session_permissions_if_absent(
+    vault_root,
+    workspace_id: str,
+    session_id: str,
+    permissions=None,
+) -> bool:
+    """Seed a session's permission sidecar ONLY IF it does not yet exist.
+
+    Absent-only seeding primitive shared by the create path
+    (``SessionManager._seed_permissions_sidecar``) and the workspace-switch
+    path (``server.py`` ``apply_config``).  Seeding an *empty* sidecar is what
+    makes :func:`read_session_permissions` return ``{}`` (fail-closed
+    DEFAULTS) instead of raising ``PermissionStoreError`` (gate fail CLOSED,
+    all-banned) when a session record has just been bound to a workspace that
+    has no grants file for it yet.
+
+    Unlike :func:`write_session_permissions` (which CLOBBERS), this helper is
+    strictly **absent-only**: if the sidecar already exists -- e.g. the user
+    switches BACK to a workspace that already holds this session's grants --
+    it is left untouched and ``False`` is returned.  Returns ``True`` when a
+    new sidecar was written.
+
+    Raises :class:`PermissionStoreError` only if the write itself fails (the
+    caller is expected to run this best-effort).
+    """
+    target = session_grants_path(vault_root, workspace_id, session_id)
+    if target.exists():
+        return False
+    write_session_permissions(
+        vault_root,
+        workspace_id,
+        session_id,
+        permissions if permissions is not None else {},
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -173,7 +173,7 @@ def test_host_bash_workspace_flag_wins_over_banned_grain(tmp_path, monkeypatch):
             result = json.loads(tool.execute())
         assert result["success"] is False
         assert result["outcome"] == "denied"
-        assert result["permission_level"] == grain
+        assert result["permission_level"] == (grain or "banned")
         assert msg in result["error"]
         mock_subprocess.run.assert_not_called()
     records = read_audit(tmp_path)
@@ -205,7 +205,7 @@ def test_host_bash_denied_when_permission_banned(tmp_path, monkeypatch):
         assert result["outcome"] == "denied"
         assert "not allowed (requires ask or allow)" in result["error"]
         assert "allow_host_resources" not in result["error"]
-        assert result["permission_level"] == grain
+        assert result["permission_level"] == (grain or "banned")
     records = read_audit(tmp_path)
     assert len(records) == 2
     assert all(r["outcome"] == "deny" for r in records)
@@ -436,3 +436,53 @@ def test_host_bash_subprocess_timeout_audits_timeout(tmp_path, monkeypatch):
     records = read_audit(tmp_path)
     assert records[0]["outcome"] == "timeout"
     assert records[0]["reason"] == "subprocess timeout after 120s"
+
+
+# ---------------------------------------------------------------------------
+# Effective-grain source (disk-authoritative effective_permissions only)
+# ---------------------------------------------------------------------------
+
+def test_host_bash_effective_grain_ignores_session_mirror():
+    """_effective_grain reads ONLY effective_permissions, never the session mirror.
+
+    The session-start mirror in ``session_permissions`` is never consulted,
+    so a stale session ``host_bash: allow`` mirror cannot re-open host
+    execution when the effective grain is absent/banned.  The declared outer
+    gate category is the value form ``["host_bash:allow"]`` (a bare category is
+    skipped by the gate, hence the value form).
+    """
+    # Stale session mirror says allow, but effective_permissions is absent
+    # (None) -> fail closed to banned.
+    tool_none = HostBashTool(
+        command="echo hi",
+        effective_permissions=None,
+        session_permissions={"host_bash": "allow"},
+    )
+    assert tool_none._effective_grain() == "banned"
+
+    # Empty effective_permissions behaves like absent -> banned.
+    tool_empty = HostBashTool(
+        command="echo hi",
+        effective_permissions={},
+        session_permissions={"host_bash": "allow"},
+    )
+    assert tool_empty._effective_grain() == "banned"
+
+    # The effective grain is the sole authority: allow survives even with a
+    # None session mirror.
+    tool_allow = HostBashTool(
+        command="echo hi",
+        effective_permissions={"host_bash": "allow"},
+        session_permissions=None,
+    )
+    assert tool_allow._effective_grain() == "allow"
+
+    assert HostBashTool.required_categories == ["host_bash:allow"]
+
+
+def test_host_bash_required_categories_use_value_form():
+    """The declared gate category must carry a ``:value`` -- a bare category is skipped by the gate."""
+    reqs = HostBashTool.required_categories
+    assert reqs == ["host_bash:allow"]
+    assert all(":" in c for c in reqs)
+

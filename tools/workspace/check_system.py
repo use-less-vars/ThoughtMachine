@@ -438,7 +438,7 @@ class CheckSystem(ToolBase):
             return {"containers": [], "count": 0, "reason": "No workspace path",
                     "status": "unavailable"}
 
-        sp = self.session_permissions or {}
+        sp = self.effective_permissions or {}
         if not sp.get("container"):
             return {"containers": [], "count": 0,
                     "reason": "no container permission", "status": "unavailable"}
@@ -613,7 +613,7 @@ class CheckSystem(ToolBase):
         try:
             manager = _ContainerManager(
                 workspace_path=ws_path,
-                session_permissions=self.session_permissions or {},
+                session_permissions=self.effective_permissions or {},
                 session_id=getattr(self, "session_id", None),
             )
             # Daemon reachability + image presence in one API call. No pull:
@@ -808,7 +808,7 @@ class CheckSystem(ToolBase):
                 probe = resource_status(
                     "git",
                     workspace_id=ws_id,
-                    session_permissions=getattr(self, "session_permissions", None),
+                    session_permissions=getattr(self, "effective_permissions", None),
                 )
             except Exception:
                 probe = None

@@ -75,21 +75,34 @@ class HostBashTool(ToolBase):
         description="Explicit JSONL audit file path (overrides default vault log root; tests inject tmp_path).",
     )
 
-    # No outer-gate categories: ``get_effective_permissions`` only knows the
-    # seven standard categories (filesystem/network/container/git/system/mcp/
-    # execution), so a ``host_bash`` grain never reaches the gate.  All
-    # permission checks therefore happen inside this tool.
-    required_categories: ClassVar[List[str]] = []
+    # Outer-gate categories: the security gate resolves a ``host_bash``
+    # requirement against the effective host_bash grain.  The value part is
+    # mandatory: ``check_required_categories`` SKIPS any entry lacking ``":"``
+    # (security_gate.py:1483-1485), so a bare ``["host_bash"]`` would gate
+    # nothing.  ``host_bash`` is absent from the shared rank tables
+    # (``GRANT_LEVEL_RANKS``, ``WORKSPACE_CEILING_LEVELS_RANKS``), so the value
+    # must be the literal ``"allow"``: required ``"allow"`` resolves via the
+    # gate's exact-string-match fallback -- banned denies, ask prompts, allow
+    # passes.  See ``TestCheckRequiredCategoriesHostBash`` in
+    # tests/security/test_security_gate.py.
+    required_categories: ClassVar[List[str]] = ["host_bash:allow"]
 
     # -- helpers -----------------------------------------------------------
 
     def _effective_grain(self) -> Optional[str]:
-        """Return the effective host_bash permission grain, if any."""
+        """Return the effective host_bash permission grain (fail closed).
+
+        Reads ONLY the executor-injected ``effective_permissions`` (the
+        per-call disk-authoritative merge); the session-start mirror in
+        ``session_permissions`` is never consulted, so a stale session
+        mirror can never re-open host execution.  Absent / missing
+        ``host_bash`` resolves to ``"banned"``.
+        """
         perms = self.effective_permissions or {}
-        if "host_bash" in perms:
-            return perms.get("host_bash")
-        session_perms = self.session_permissions or {}
-        return session_perms.get("host_bash")
+        grain = perms.get("host_bash")
+        if grain is None:
+            return "banned"
+        return grain
 
     def _workspace_id(self) -> str:
         """Best-effort workspace id for audit/flag context ('' when unknown).

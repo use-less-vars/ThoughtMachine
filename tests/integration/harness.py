@@ -42,25 +42,121 @@ _PURGE_PREFIXES = (
 )
 
 
+# Sentinel for "the sys.modules entry / parent-package attribute was absent in
+# the snapshot" -- distinct from any real module object or None.
+_ABSENT = object()
+
+
+def _module_parent(name):
+    """Return ``(parent_package_name, leaf)`` for a dotted module name."""
+    parent_name, _, leaf = name.rpartition(".")
+    if not parent_name or not leaf:
+        return "", ""
+    return parent_name, leaf
+
+
+class SysModulesSnapshot:
+    """Snapshot/purge/restore of ``sys.modules`` entries AND parent attrs.
+
+    A purge that removes a sys.modules entry must also remove the parent-package
+    attribute that holds the stale reference, or a later reload/import will fail.
+
+    A bare ``del sys.modules[name]`` leaves ``package.submodule`` bound on the
+    parent package; a re-import rebinds that attribute to a fresh object while a
+    naive restore puts the OLD object back into ``sys.modules``.  The parent
+    attribute and the ``sys.modules`` entry then disagree in IDENTITY, so
+    ``importlib.reload`` fails its ``sys.modules.get(name) is module`` check with
+    ``ImportError: module ... not in sys.modules``.  This helper keeps the two in
+    lockstep.  Usable as a context manager or via explicit ``snapshot()`` /
+    ``purge()`` / ``restore()`` calls.
+    """
+
+    def __init__(self, prefixes):
+        self._prefixes = tuple(prefixes)
+        self._saved_modules: dict = {}
+        self._saved_attrs: dict = {}
+        self._active = False
+
+    def _matched(self):
+        prefixes = self._prefixes
+        return [
+            n
+            for n in list(sys.modules)
+            if any(n == p or n.startswith(p + ".") for p in prefixes)
+        ]
+
+    def snapshot(self):
+        """Record the matched ``sys.modules`` entries + parent-package attrs."""
+        self._saved_modules = {n: sys.modules[n] for n in self._matched()}
+        self._saved_attrs = {}
+        for n in self._saved_modules:
+            parent_name, child = _module_parent(n)
+            if not parent_name or parent_name in self._saved_modules:
+                continue
+            parent_mod = sys.modules.get(parent_name)
+            if parent_mod is not None:
+                self._saved_attrs.setdefault(parent_name, {})[child] = (
+                    parent_mod.__dict__.get(child, _ABSENT)
+                )
+        self._active = True
+        return self
+
+    def purge(self):
+        """Drop matched modules AND their parent-package attributes."""
+        for name in self._matched():
+            parent_name, leaf = _module_parent(name)
+            parent_pkg = sys.modules.get(parent_name)
+            del sys.modules[name]
+            if parent_pkg is not None and leaf:
+                try:
+                    delattr(parent_pkg, leaf)
+                except AttributeError:
+                    pass
+        return self
+
+    def restore(self):
+        """Drop current matches, reinstate saved modules, re-point parent attrs."""
+        if not self._active:
+            return self
+        for name in self._matched():
+            del sys.modules[name]
+        sys.modules.update(self._saved_modules)
+        for parent_name, attrs in self._saved_attrs.items():
+            parent_mod = sys.modules.get(parent_name)
+            if parent_mod is None:
+                continue
+            for child, value in attrs.items():
+                if value is _ABSENT:
+                    parent_mod.__dict__.pop(child, None)
+                else:
+                    parent_mod.__dict__[child] = value
+        self._active = False
+        return self
+
+    def __enter__(self):
+        return self.snapshot().purge()
+
+    def __exit__(self, *exc):
+        self.restore()
+        return False
+
+
+def purged_sys_modules(prefixes):
+    """Context manager: snapshot+purge matched modules, restore on exit."""
+    return SysModulesSnapshot(prefixes)
+
+
 def _purge_modules() -> None:
     """Drop every app module so the next import is a cold start.
 
-    Deleting a submodule from ``sys.modules`` alone leaves a stale attribute on
-    its parent package: ``from package import submodule`` keeps binding that
-    stale object, so a later ``importlib.reload(<stale submodule>)`` raises
-    ``ImportError: module <submodule> not in sys.modules``.  Drop the parent
-    package attribute too so the next ``import`` re-imports the submodule
-    cleanly.
+    Delegates to :class:`SysModulesSnapshot` so the parent-package attributes
+    stay in lockstep with ``sys.modules``: a bare ``del sys.modules[name]``
+    leaves a stale parent attribute, and ``from package import submodule`` then
+    keeps binding that stale object, so a later
+    ``importlib.reload(<stale submodule>)`` raises
+    ``ImportError: module <submodule> not in sys.modules``.
     """
-    for name in [m for m in sys.modules if m.startswith(_PURGE_PREFIXES)]:
-        del sys.modules[name]
-        parent_name, _, leaf = name.rpartition(".")
-        parent = sys.modules.get(parent_name)
-        if parent is not None and leaf:
-            try:
-                delattr(parent, leaf)
-            except AttributeError:
-                pass
+    SysModulesSnapshot(_PURGE_PREFIXES).purge()
 
 
 def _snapshot_provider_registry():
@@ -86,6 +182,46 @@ def _restore_provider_registry(snapshot) -> None:
     providers.update(snapshot)
 
 
+# Module-level holder for the pre-purge ``sys.modules`` snapshot (see
+# ``_snapshot_module_state`` / ``_restore_module_state``).  ``None`` means no
+# snapshot is currently held.
+_MODULE_STATE = None
+
+
+def _snapshot_module_state() -> None:
+    """Snapshot the pre-purge app-module state (idempotent guard).
+
+    Captures the ``_PURGE_PREFIXES``-matched ``sys.modules`` entries plus the
+    parent-package attributes that ``_purge_modules()`` deletes and the
+    re-imports rebind, so ``_restore_module_state()`` can put the ORIGINAL
+    singletons back (mirrors the bb608a5 harness).  Guards against clobbering:
+    if a snapshot is already held (e.g. a second ``start_backend()`` in the same
+    process, or ``restart()`` in flight) this is a silent no-op, so the pristine
+    baseline is never overwritten.
+    """
+    global _MODULE_STATE
+    if _MODULE_STATE is not None:
+        return
+    _MODULE_STATE = SysModulesSnapshot(_PURGE_PREFIXES).snapshot()
+
+
+def _restore_module_state() -> None:
+    """Restore the snapshot taken by ``_snapshot_module_state()`` (no-op if none).
+
+    Drops the currently-matched modules, reinstates the saved originals, then
+    re-points the parent-package attributes that the re-imports had rebound to
+    the fresh duplicates (popping attributes that did not exist before).
+    Clears the holder so a later ``start_backend()`` can snapshot again.  A
+    silent no-op when nothing was ever snapshotted.
+    """
+    global _MODULE_STATE
+    if _MODULE_STATE is None:
+        return
+    snapshot = _MODULE_STATE
+    _MODULE_STATE = None
+    snapshot.restore()
+
+
 def start_backend(tmp_home=None):
     """Start an isolated backend.
 
@@ -105,6 +241,7 @@ def start_backend(tmp_home=None):
     }
     patcher = patch.object(pathlib.Path, "home", return_value=Path(tmp_home))
     patcher.start()
+    _snapshot_module_state()
     _purge_modules()
     server_mod = importlib.import_module("web_ui.backend.server")
     app = server_mod.app
@@ -128,6 +265,7 @@ def start_backend(tmp_home=None):
                 else:
                     os.environ[key] = value
             _restore_provider_registry(provider_snapshot)
+            _restore_module_state()
             state["env_restored"] = True
         if rmtree:
             shutil.rmtree(tmp_home, ignore_errors=True)
@@ -187,6 +325,14 @@ def put_permissions(client, ws_id, permissions, allow_host_resources=None):
     resp = client.put(f"/api/workspace/{ws_id}/permissions", json=payload)
     assert resp.status_code == 200, (
         f"put permissions failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+def put_session_permissions(client, session_id, permissions):
+    resp = client.put(f"/api/session/{session_id}/permissions", json=permissions)
+    assert resp.status_code == 200, (
+        f"put session permissions failed: {resp.status_code} {resp.text}"
     )
     return resp.json()
 

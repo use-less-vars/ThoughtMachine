@@ -4,6 +4,7 @@ Tool execution and dispatch logic.
 Extracted from agent.py to separate tool execution concerns.
 """
 import json
+import logging
 import threading
 from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
@@ -14,6 +15,9 @@ from fast_json_repair import loads as repair_loads
 from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
 from tools.summarize_tool import SummarizeTool
+
+# Module logger used for the fail-closed id-less entry observation below.
+logger = logging.getLogger(__name__)
 
 # Try to import event system for security prompts
 try:
@@ -44,6 +48,7 @@ try:
         get_effective_permissions,
         check_required_categories,
         check_requires_resource,
+        _DISK_FAIL_CLOSED_SESSION,
     )
     from thoughtmachine.workspace_capabilities import (
         WorkspaceCapabilities,
@@ -58,6 +63,7 @@ except ImportError:
     check_requires_resource = None
     WorkspaceCapabilities = None
     resolve_workspace_id = None
+    _DISK_FAIL_CLOSED_SESSION = None
 
 
 def _ensure_gate_imported() -> bool:
@@ -83,12 +89,14 @@ def _ensure_gate_imported() -> bool:
     global check_requires_resource  # noqa: PLW0603
     global WorkspaceCapabilities  # noqa: PLW0603
     global resolve_workspace_id  # noqa: PLW0603
+    global _DISK_FAIL_CLOSED_SESSION  # noqa: PLW0603
     try:
         from security.security_gate import (
             get_workspace_capabilities as _new_get_workspace_capabilities,
             get_effective_permissions as _new_get_effective_permissions,
             check_required_categories as _new_check_required_categories,
             check_requires_resource as _new_check_requires_resource,
+            _DISK_FAIL_CLOSED_SESSION as _new_DISK_FAIL_CLOSED_SESSION,
         )
         from thoughtmachine.workspace_capabilities import (
             WorkspaceCapabilities as _new_WorkspaceCapabilities,
@@ -106,6 +114,8 @@ def _ensure_gate_imported() -> bool:
             WorkspaceCapabilities = _new_WorkspaceCapabilities
         if resolve_workspace_id is None:
             resolve_workspace_id = _new_resolve_workspace_id
+        if _DISK_FAIL_CLOSED_SESSION is None:
+            _DISK_FAIL_CLOSED_SESSION = _new_DISK_FAIL_CLOSED_SESSION
         GATE_AVAILABLE = True
         return True
     except ImportError:
@@ -161,6 +171,21 @@ class ToolExecutor:
             - summary_text: Summary text if SummarizeTool was called
             - summary_keep_recent_turns: Number of turns to keep for summarization
         """
+        # Fail-closed entry observation: entering with neither a session id
+        # nor a workspace id means the permission gate has NO on-disk
+        # authority to read, so its effective profile is the deny-all
+        # _DISK_FAIL_CLOSED_SESSION and any category-gated tool call is
+        # DENIED.  Warn (do NOT raise / change behaviour) so the missing
+        # identity is observable.
+        if not session_id and not workspace_id:
+            logger.warning(
+                "execute_tool_calls entered with NO session identity "
+                "(session_id=%r) and NO workspace identity (workspace_id=%r); "
+                "permission checks are fail-closed and category-gated tool "
+                "calls will be DENIED (deny-all _DISK_FAIL_CLOSED_SESSION).",
+                session_id,
+                workspace_id,
+            )
         # Resolve update_token_func: if not provided, use agent._update_tokens_after_tool
         if update_token_func is None:
             if self.agent is not None:
@@ -385,7 +410,16 @@ class ToolExecutor:
                         workspace_id=ws_id,
                     )
                 else:
-                    effective = get_effective_permissions(session_perms_obj, caps)
+                    # Fail-closed: an id-less executor (no session_id and/or
+                    # no resolvable workspace_id) has no on-disk authority to
+                    # read, so it must NOT inherit the in-memory mirror
+                    # (self.config.session_permissions), which can be
+                    # over-broad relative to the workspace ceiling / stored
+                    # record.  Merge against the deny-all profile so the
+                    # result can only ever restrict, never grant.
+                    effective = get_effective_permissions(
+                        _DISK_FAIL_CLOSED_SESSION, caps
+                    )
 
                 ok, error_msg = check_required_categories(
                     required_categories,

@@ -726,3 +726,28 @@ def test_host_resources_non_bool_never_auto_applied(tmp_path):
     assert _vault_json(tmp_path, "workspaces/ws1/config.json")["allow_host_resources"] == "true"
     assert any(i["category"] == "host_resources_type" for i in report["issues"])
 
+
+
+def test_apply_sidecar_permissions_reaches_canonical_shape(tmp_path):
+    """B6: repair folds legacy git grains in a P1 sidecar and drops non-catalog
+    keys, leaving the sidecar in the canonical resource-catalog shape."""
+    _clean_vault(tmp_path)
+    _write_vault_files(tmp_path, {
+        "workspaces/ws1/sessions/s1/permissions.json": {
+            "git_write": True, "filesystem": "write", "root_shell": "read",
+        },
+    })
+    report = run_repair(tmp_path, apply=True)
+    assert report["summary"]["total_issues"] == 0
+    performed = report["repair"]["performed"]
+    assert all(p["status"] == "applied" for p in performed)
+    assert {p["category"] for p in performed} == {
+        "legacy_permission_key", "unknown_nested_key",
+    }
+
+    doc = _vault_json(tmp_path, "workspaces/ws1/sessions/s1/permissions.json")
+    # legacy grain folded to the canonical git grain (never downgraded) and the
+    # non-catalog key dropped: only catalog keys survive.
+    assert doc == {"git": "write", "filesystem": "write"}
+    assert "git_write" not in doc and "root_shell" not in doc
+

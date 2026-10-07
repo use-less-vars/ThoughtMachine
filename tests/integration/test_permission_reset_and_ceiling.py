@@ -180,30 +180,32 @@ def test_same_process_ws_reconnect_live_state_is_ceiled(env):
     )
     sid = harness.create_session(client, workspace_path=ws["root"])
 
-    with harness.ws_connect(client) as wsock:
-        evt1 = _load_session(wsock, sid)
-        wsock.send_json(
-            {
-                "command": "apply_config",
-                "config": _apply_config_dict(
-                    ws["root"], {"filesystem": "write", "git": "write"}
-                ),
-            }
-        )
-        cevt, _ = harness.receive_until_type(wsock, "config_changed")
+    # Operator's raw (uncapped) session grant, recorded through the canonical
+    # P1 permission store (REST PUT /api/session/{sid}/permissions).  The WS
+    # ``load_session`` payload no longer carries ``session_permissions`` at all
+    # (grants are REST/store-owned); the live effective state is therefore read
+    # from the canonical effective endpoint after the reconnect.
+    put = client.put(
+        f"/api/session/{sid}/permissions",
+        json={"filesystem": "write", "git": "write"},
+    )
+    assert put.status_code == 200, (
+        f"put session permissions failed: {put.status_code} {put.text}"
+    )
+    raw_grant = put.json()["raw"]
+    assert raw_grant.get("filesystem") == "write", raw_grant
 
     # Same backend instance, same client, same session: second websocket.
     with harness.ws_connect(client) as wsock2:
-        evt2 = _load_session(wsock2, sid)
+        _load_session(wsock2, sid)
 
-    perms1 = evt1["config"]["session_permissions"]
-    perms2 = evt2["config"]["session_permissions"]
-    actual = perms2.get("filesystem")
+    eff = harness.get_effective_permissions(client, ws["workspace_id"], session_id=sid)
+    effective = eff["effective_permissions"]
+    actual = effective.get("filesystem")
     assert actual == "banned", (
-        f"reconnect session_permissions NOT ceiled (filesystem='banned' "
-        f"expected); actual filesystem={actual!r}; perms2={perms2}; "
-        f"first-connection filesystem={perms1.get('filesystem')!r}; "
-        f"config_changed perms={cevt.get('permissions')!r}; evt2={evt2}"
+        f"reconnect session permissions NOT ceiled (filesystem='banned' "
+        f"expected); actual filesystem={actual!r}; effective={effective}; "
+        f"raw grant filesystem={raw_grant.get('filesystem')!r}; evt={eff}"
     )
 
 

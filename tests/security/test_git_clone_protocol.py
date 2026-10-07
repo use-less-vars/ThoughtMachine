@@ -86,7 +86,6 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
                 "git": "write",
                 "network": network_level,
             },
-            agent_config={"session_permissions": {"git": "write"}},
         )
 
     @pytest.mark.parametrize(

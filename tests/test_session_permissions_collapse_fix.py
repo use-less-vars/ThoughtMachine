@@ -11,11 +11,14 @@ The canonical permission model is the six resources
 ``git_read``/``git_write`` grains and ``system``/``execution`` resources no
 longer exist.  These tests lock the collapse fixes on the canonical set:
 
-- Fix A: ``ConfigManager.apply_config`` MERGES a partial frontend payload over
-  the stored permission set instead of wholesale replacing it.
-- Fix C: the persistence layer (``merge_session_permissions``, used by
-  ``save_config_to_session`` / ``save_session`` / ``bridge.save_session``)
-  folds stored keys under any new dump before writing.
+- Fix A: ``ConfigManager.apply_config`` IGNORES/STRIPS any ``session_permissions``
+  carried by a frontend payload -- the payload grant is dropped (and logged)
+  rather than merged over or replacing the stored set; grants are written only
+  through the canonical session-permission sidecar (P1).
+- Fix C: the persistence layer (``save_config_to_session`` /
+  ``save_session`` / ``bridge.save_session``) is no longer a grants holder --
+  it STRIPS ``session_permissions`` from the persisted ``session_config``
+  before writing (the sidecar, not the session record, owns grants).
 - Round-trip: ``extract_session_config`` + workspace-ceiling cap preserve the
   full stored set (a capped dump must not drop un-capped keys).
 - Locked semantics: ``to_agent_config`` folds a top-level legacy ``git_write``
@@ -23,6 +26,7 @@ longer exist.  These tests lock the collapse fixes on the canonical set:
   ``'write'`` (other values are dropped, never invented).
 """
 
+import logging
 import sys
 import uuid
 from pathlib import Path
@@ -37,10 +41,7 @@ from session.models import Session
 from session.store import FileSystemSessionStore
 
 from web_ui.backend.config_manager import ConfigManager
-from web_ui.backend.session_manager import (
-    SessionManager,
-    merge_session_permissions,
-)
+from web_ui.backend.session_manager import SessionManager
 
 FULL_PERMS = {
     "container": False,
@@ -74,35 +75,46 @@ def _make_session(metadata_extra=None):
     )
 
 
-# ── Fix A: apply_config merges partial payloads ────────────────────────
+# ── Fix A: apply_config IGNORES (strips) payload session_permissions ───
+#
+# The vault permission SIDECAR (P1) is the single canonical grant store;
+# grants are written ONLY through PUT /api/session/{id}/permissions.  A
+# ``session_permissions`` key on the apply_config payload is therefore
+# stripped (never merged) — the stored set is left byte-identical.
 
 class TestApplyConfigMerge:
-    def test_partial_payload_preserves_stored_keys(self):
+    def test_partial_payload_ignored_stored_untouched(self, caplog):
         current = SessionConfig(mode="agent", session_permissions=dict(FULL_PERMS))
-        _, updated = ConfigManager.apply_config(
-            {"session_permissions": {"network": "banned"}},
-            current,
-        )
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            _, updated = ConfigManager.apply_config(
+                {"session_permissions": {"network": "banned"}},
+                current,
+            )
         assert updated is not None
         sp = updated.session_permissions
-        assert sp["network"] == "banned"          # explicit payload value wins
-        assert sp["filesystem"] == "write"         # stored key preserved
-        assert sp["git"] == "read"                 # stored key preserved
-        assert sp["mcp"] == "banned"               # stored key preserved
-        assert sp["host_bash"] == "banned"         # stored key preserved
+        # P1: the payload is IGNORED — the stored set is unchanged (the payload
+        # cannot grant, even partially).
+        assert sp == FULL_PERMS
+        assert sp["network"] == "ask"              # payload value NOT applied
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
-    def test_full_payload_still_overrides_every_key(self):
+    def test_full_payload_ignored_stored_untouched(self, caplog):
         current = SessionConfig(mode="agent", session_permissions=dict(FULL_PERMS))
         new_set = {"network": "banned", "git": "write"}
-        _, updated = ConfigManager.apply_config(
-            {"session_permissions": dict(new_set)},
-            current,
-        )
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            _, updated = ConfigManager.apply_config(
+                {"session_permissions": dict(new_set)},
+                current,
+            )
         sp = updated.session_permissions
-        assert sp["network"] == "banned"
-        assert sp["git"] == "write"
-        # keys not in the payload remain stored
-        assert sp["filesystem"] == "write"
+        # A non-empty payload is stripped wholesale; the stored set is unchanged.
+        assert sp == FULL_PERMS
+        assert sp["git"] == "read"                 # payload value NOT applied
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
     def test_payload_none_leaves_stored_untouched(self):
         current = SessionConfig(mode="agent", session_permissions=dict(FULL_PERMS))
@@ -113,38 +125,11 @@ class TestApplyConfigMerge:
         assert updated.session_permissions == FULL_PERMS
 
 
-# ── Fix C: persistence-layer merge helper ──────────────────────────────
 
-class TestMergeSessionPermissions:
-    def test_stored_keys_preserved_under_partial_new_dump(self):
-        stored = {"session_permissions": dict(FULL_PERMS)}
-        new_dump = {"mode": "agent", "session_permissions": {"network": "banned"}}
-        out = merge_session_permissions(stored, new_dump)
-        assert out["session_permissions"]["network"] == "banned"
-        assert out["session_permissions"]["git"] == "read"
-        assert out["session_permissions"]["filesystem"] == "write"
-        assert out["session_permissions"]["host_bash"] == "banned"
-        assert out["mode"] == "agent"
-
-    def test_new_dump_without_permissions_preserves_stored_verbatim(self):
-        stored = {"session_permissions": dict(FULL_PERMS)}
-        out = merge_session_permissions(stored, {"mode": "agent"})
-        assert out["session_permissions"] == FULL_PERMS
-
-    def test_no_stored_permissions_passes_new_dump_through(self):
-        out = merge_session_permissions({"mode": "agent"}, {"mode": "agent"})
-        assert out == {"mode": "agent"}
-
-    def test_non_dict_stored_raw_passes_through(self):
-        new_dump = {"mode": "agent", "session_permissions": {"network": "ask"}}
-        assert merge_session_permissions(None, new_dump) == new_dump
-        assert merge_session_permissions("junk", new_dump) == new_dump
-
-
-# ── Fix C: save_config_to_session / save_session write merged dumps ─────
+# ── Fix C: save_config_to_session / save_session strip grants ──────────
 
 class TestPersistenceWriteSites:
-    def test_save_config_to_session_merges_stored_permissions(self, temp_store):
+    def test_save_config_to_session_strips_session_permissions(self, temp_store):
         mgr = SessionManager(temp_store, ConfigManager())
         session = _make_session(
             {"session_config": {"mode": "agent", "session_permissions": dict(FULL_PERMS)}}
@@ -154,13 +139,14 @@ class TestPersistenceWriteSites:
 
         reloaded = temp_store.load_session(session.session_id)
         assert reloaded is not None
-        stored = reloaded.metadata["session_config"]["session_permissions"]
-        assert stored["network"] == "banned"       # new value wins
-        assert stored["git"] == "read"             # stored key preserved
-        assert stored["filesystem"] == "write"     # stored key preserved
+        stored = reloaded.metadata["session_config"]
+        # The session record is not a grants holder: the grant is stripped.
+        assert "session_permissions" not in stored
+        # Non-permission config still persists.
+        assert stored["mode"] == "agent"
         assert "agent_config" not in reloaded.metadata
 
-    def test_save_session_merges_stored_permissions(self, temp_store):
+    def test_save_session_strips_session_permissions(self, temp_store):
         mgr = SessionManager(temp_store, ConfigManager())
         session = _make_session(
             {"session_config": {"mode": "agent", "session_permissions": dict(FULL_PERMS)}}
@@ -169,24 +155,38 @@ class TestPersistenceWriteSites:
         mgr.save_session(session, session_config=new_cfg)
 
         reloaded = temp_store.load_session(session.session_id)
-        stored = reloaded.metadata["session_config"]["session_permissions"]
-        assert stored["git"] == "write"            # new value wins
-        assert stored["network"] == "ask"          # stored key preserved
-        assert stored["filesystem"] == "write"     # stored key preserved
-        assert stored["host_bash"] == "banned"     # stored key preserved
+        stored = reloaded.metadata["session_config"]
+        assert "session_permissions" not in stored
+        assert stored["mode"] == "agent"
 
 
 # ── Round-trip: extract + ceiling cap preserve the full set ────────────
 
 class TestRoundTrip:
-    def test_extract_session_config_preserves_full_permissions(self, temp_store):
+    def test_extract_session_config_ignores_metadata_grant_carrier(
+        self, temp_store, hermetic_vault
+    ):
+        from thoughtmachine.permission_store import (
+            PermissionStoreError,
+            read_session_permissions,
+        )
+
         mgr = SessionManager(temp_store, ConfigManager())
         session = _make_session(
             {"session_config": {"mode": "agent", "session_permissions": dict(FULL_PERMS)}}
         )
         sc = mgr.extract_session_config(session)
         assert sc is not None
-        assert sc.session_permissions == FULL_PERMS
+        # (i) the retired metadata carrier no longer seeds the returned config:
+        # extract pops the carrier key, so its write grant cannot re-enter.
+        assert (sc.session_permissions or {}).get("filesystem") != "write"
+        # (iii) non-permission config still survives the pop.
+        assert sc.mode == "agent"
+        # (ii) the canonical grants are unaffected by the metadata carrier:
+        # with no sidecar the canonical read fails CLOSED rather than surfacing
+        # the retired carrier grants.
+        with pytest.raises(PermissionStoreError):
+            read_session_permissions(hermetic_vault, "ws-t5", session.session_id)
 
     def test_ceiling_cap_lowers_keys_without_dropping_them(self):
         from security.security_gate import apply_workspace_ceiling

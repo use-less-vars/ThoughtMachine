@@ -39,6 +39,8 @@ import pytest
 from starlette.testclient import TestClient
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 
+from tests.integration.harness import SysModulesSnapshot
+
 
 @pytest.fixture(scope="module")
 def clean_home():
@@ -64,9 +66,9 @@ def clean_home():
     # ── 5. Remove affected modules from cache & re-import ───────────────────────
     mod_prefixes = ("web_ui.backend", "agent.config.provider_profile",
                     "thoughtmachine.bootstrap")
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
+    snapshot = SysModulesSnapshot(mod_prefixes)
+    snapshot.snapshot()
+    snapshot.purge()
 
     # Ensure the project root is on sys.path so web_ui can be found
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +91,7 @@ def clean_home():
             os.environ[key] = val
 
     shutil.rmtree(tmp_home, ignore_errors=True)
+    snapshot.restore()
 
 
 @pytest.fixture

@@ -64,8 +64,11 @@ pytestmark = pytest.mark.skipif(
     reason="git binary not available in CI sandbox",
 )
 
-# A full-write session (NOT write_on_feature_branch): the PLAIN commit path.
-_WRITE_GRANT = {"session_permissions": {"git": "write"}}
+# A full-write grant (NOT write_on_feature_branch): the PLAIN commit path.
+# Seeded into BOTH ``session_permissions`` and ``effective_permissions`` (see
+# ``_tool()``) because the ToolExecutor injects BOTH -- the raw session profile
+# AND the session x ceiling view -- as distinct objects on every real call.
+_WRITE_GRANT = {"git": "write"}
 # Throwaway vault workspace id the tool is bound to.
 _WORKSPACE_ID = "wstest"
 
@@ -115,11 +118,29 @@ def _tool(workspace_id: str, repo: Path, **overrides) -> GitWriteTool:
         "workspace_id": workspace_id,
         "session_id": "sess-contract",
         "workspace_path": str(repo),
-        "session_permissions": {"git": "write"},
-        "agent_config": _WRITE_GRANT,
+        # BOTH permission attributes: the ToolExecutor injects
+        # ``session_permissions`` (the raw session profile) AND
+        # ``effective_permissions`` (session x ceiling) as distinct objects.
+        "session_permissions": _WRITE_GRANT,
+        "effective_permissions": _WRITE_GRANT,
     }
     params.update(overrides)
-    return GitWriteTool(**params)
+    tool = GitWriteTool(**params)
+    # P2 fixture pin: a tool seeded with only ONE of the two attributes diverges
+    # from the ToolExecutor contract.  On a directly-constructed tool a missing
+    # ``session_permissions`` is None, and GitReadTool's host-side gate refuses
+    # fail-closed with ``session_permissions_unresolved`` -- exactly the failure
+    # that reddened the four nodes below before this seeding.
+    assert tool.session_permissions is not None, (
+        "_tool() must seed session_permissions (the raw session profile); the "
+        "ToolExecutor always injects it, and a None value is refused by the "
+        "host-side git gate with 'session_permissions_unresolved'."
+    )
+    assert tool.effective_permissions is not None, (
+        "_tool() must seed effective_permissions (session x ceiling); the "
+        "ToolExecutor always injects it."
+    )
+    return tool
 
 
 @pytest.fixture
@@ -296,4 +317,38 @@ def test_out_of_workspace_path_refused_before_any_git(
     # No branch was created and no linked worktree directory appeared.
     assert _git(attached_repo, "branch", "--list", "feat/new").strip() == ""
     assert not (attached_repo / "wt-new").exists()
+
+
+def test_probe_guard_raises_on_unresolved_session(host_git_backend, tmp_path):
+    """P1: an UNRESOLVED session is refused fail-closed at the host-side gate.
+
+    The four probe/refusal nodes above build their tool through ``_tool()``,
+    which (post-fix) seeds BOTH ``session_permissions`` and
+    ``effective_permissions``.  This pin exercises the OTHER side of the
+    two-attribute contract: a tool whose ``session_permissions`` is unresolved
+    (``None``) -- the pre-fix ``_tool()`` shape -- must be REFUSED by the
+    host-side permission gate with ``session_permissions_unresolved`` instead of
+    silently spawning git.
+
+    The RAISING frame is pinned directly: ``_is_detached_head`` calls
+    ``_run_git`` and *swallows* ``RuntimeError``/``PermissionError`` (returning
+    ``False``), so asserting through it would be vacuous.  ``_run_git`` is the
+    frame the gate probe actually uses, and it re-raises ``RuntimeError``
+    unchanged, so a ``pytest.raises`` on it observes the real gate.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tool = GitWriteTool(
+        workspace_id=host_git_backend,
+        session_id="sess-contract",
+        workspace_path=str(repo),
+        operation="commit",
+        effective_permissions=_WRITE_GRANT,
+        # session_permissions deliberately UNSET (None): the pre-fix shape.
+    )
+    assert tool.session_permissions is None, (
+        "this pin must build a tool with an UNRESOLVED session"
+    )
+    with pytest.raises(RuntimeError, match="session_permissions_unresolved"):
+        tool._run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
 

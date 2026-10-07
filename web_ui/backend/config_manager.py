@@ -26,6 +26,7 @@ Exported names (all public — no leading underscore):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -45,6 +46,8 @@ from agent.config.deep_merge import deep_merge
 from agent.config.service import create_agent_config_service
 
 from tools.host_resource_policy import load_workspace_config
+
+logger = logging.getLogger(__name__)
 
 # ── Project-root discovery (same logic as server.py) ──────────────────────
 _project_root: str = os.path.dirname(
@@ -243,8 +246,63 @@ def translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
 #  frontend_config_from_bridge (was _frontend_config_from_bridge in server.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _canonical_session_permissions(bridge) -> Dict[str, Any]:
+    """Best-effort CEILED CANONICAL session permissions for *bridge* (D5/V3).
+
+    ``frontend_config_from_bridge`` is a *display* projection and the nested
+    ``session_permissions`` it emits is NOT an enforcement input and NOT a grant
+    carrier.  Rather than echo the stale-able in-memory
+    ``SessionConfig.session_permissions`` session *mirror*, resolve the bridge's
+    session id + workspace id and ask the disk-authoritative gate
+    (``ConfigManager.resolve_effective_permissions``) for the ceiled effective
+    profile.
+
+    Fail-SOFT and fail-CLOSED-to-empty: returns ``{}`` when either identifier is
+    missing or any resolution error occurs.  ``{}`` signals "not resolvable in
+    this projection — consult the authoritative REST endpoint
+    ``GET /api/session/{id}/permissions``" (the gate itself still fails closed
+    to the all-banned 6-key shape when it *is* invoked without an id).
+    """
+    try:
+        sid = getattr(bridge, "_session_id", None)
+        loaded = getattr(bridge, "_loaded_session", None)
+        if not sid and loaded is not None:
+            sid = getattr(loaded, "session_id", None)
+        session_config = getattr(bridge, "_session_config", None)
+        wid = (
+            getattr(session_config, "workspace_id", None)
+            if session_config is not None
+            else None
+        ) or getattr(bridge, "_workspace_id", None)
+        if not sid or not wid:
+            return {}
+        return ConfigManager.resolve_effective_permissions(session_config, sid, wid)
+    except Exception:
+        return {}
+
+
 def frontend_config_from_bridge(bridge) -> Dict[str, Any]:
-    """Convert bridge's ``SessionConfig`` back to frontend config format."""
+    """Convert bridge's ``SessionConfig`` back to frontend config format.
+
+    ``session_permissions`` honesty (D5/V3)
+    --------------------------------------
+    This projection is DISPLAY-ONLY.  The nested ``session_permissions`` key was
+    historically echoed from the in-memory ``SessionConfig.session_permissions``
+    (via ``backend_to_frontend_config``) — a stale-able session *mirror*.  The
+    ceiled canonical grant truth lives in the vault permission SIDECAR (P1) and
+    is served authoritatively by REST
+    (``GET``/``PUT /api/session/{id}/permissions``); consumers such as
+    ``ConfigPanel.jsx`` treat this nested value only as a fallback (``permsRaw``).
+
+    When this layer can resolve BOTH the session id and the workspace id the
+    emitted ``session_permissions`` is overwritten with the CEILED CANONICAL
+    profile computed by ``ConfigManager.resolve_effective_permissions``
+    (disk-authoritative, fail-closed).  Otherwise it is emitted as ``{}`` to
+    signal "unknown here, consult the REST endpoint".  This is best-effort:
+    any resolution error degrades to ``{}`` and never breaks the projection.
+    ``backend_to_frontend_config`` keeps its own ``{}`` guarantee for id-less
+    callers (``session_config_to_frontend``).
+    """
     if bridge is None:
         return default_frontend_config()
 
@@ -260,6 +318,8 @@ def frontend_config_from_bridge(bridge) -> Dict[str, Any]:
             or os.getenv("OPENAI_COMPATIBLE_API_KEY")
             or ""
         ) or result.get('api_key_configured', False)
+        # Canonical (ceiled) permissions or {} when unresolvable.
+        result['session_permissions'] = _canonical_session_permissions(bridge)
         return result
 
     # Check if API key is configured before stripping it
@@ -281,6 +341,9 @@ def frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     result["api_key_configured"] = api_key_configured
     if bridge._workspace_path:
         result["workspace_path"] = bridge._workspace_path
+    # Overwrite the nested mirror with the CEILED CANONICAL profile (or {} when
+    # this layer cannot resolve session_id + workspace_id).  Display-only.
+    result["session_permissions"] = _canonical_session_permissions(bridge)
     return result
 
 
@@ -358,6 +421,15 @@ def backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
             or cls.tool_name() in mode_tool_names
             or cls.__name__ in mode_tool_names
         ]
+
+    # The canonical six-resource permission set is ALWAYS exposed in the
+    # frontend config (the on-disk sidecar, not the payload, is the grants
+    # source). Guarantee the key is present even when the backend config
+    # carries no grants, so the frontend config shape is stable (the
+    # presence-only contract the session_loaded / config_changed consumers
+    # rely on). An EMPTY dict is emitted when no grants are known.
+    if not isinstance(cfg.get("session_permissions"), dict):
+        cfg["session_permissions"] = {}
 
     # Ensure workspace_path is always present
     cfg.setdefault("workspace_path", None)
@@ -843,6 +915,14 @@ def resolve_full_config(
         except Exception as exc:
             log("WARNING", "server.config",
                 f"Could not load workspace permission ceiling: {exc}")
+            # D2 clamp: an unreadable workspace ceiling must not silently
+            # disappear from the restriction dimension.  Clamp with the
+            # deny-all ceiling instead of {} (a legitimately absent ceiling
+            # -- the else branch -- stays {}, so the two states remain
+            # distinguishable by content).
+            from security.security_gate import _DISK_FAIL_CLOSED_CEILING
+
+            _workspace_ceiling = dict(_DISK_FAIL_CLOSED_CEILING)
     else:
         _workspace_ceiling = {}
 
@@ -856,11 +936,32 @@ def resolve_full_config(
                 raw = session.metadata.get("session_config") or session.metadata.get("agent_config")
                 if isinstance(raw, dict):
                     raw = dict(raw)
+                    # session_permissions is NOT a session-metadata grant source:
+                    # the canonical store is the permission sidecar (P1).  Drop
+                    # any legacy carrier key so it can never shadow P1.
+                    raw.pop("session_permissions", None)
                     if "mode" not in raw:
                         raw["mode"] = "agent"  # mirror repair_session legacy default
                     merged = deep_merge(merged, raw)
         except Exception as exc:
             log("WARNING", "server.config", f"Could not load session config: {exc}")
+
+    # ── Canonical session permission grants (P1 sidecar) ────────────────
+    # The session's raw grants live in the permission sidecar, not in the
+    # session record.  Read them so only the workspace ceiling below can
+    # further restrict them.  Fail-closed: an unreadable sidecar leaves the
+    # merged value untouched (defaults); never substitute a permissive set.
+    if session_id:
+        # Ruled semantics (D1=A narrow): an unreadable workspace-scoped store
+        # (BOTH ids present, read fails) -> the deny-all sentinel; a missing id
+        # -> the designed Pydantic default, because id-less is not the same as
+        # unreadable (see the no-workspace ticket).  Only the workspace ceiling
+        # below (guarded by ``workspace_id``) may further restrict it.
+        from thoughtmachine.permission_store import read_grants_or_deny_all
+
+        merged["session_permissions"] = read_grants_or_deny_all(
+            session_id, workspace_id
+        )
 
     if worker_overrides and isinstance(worker_overrides, dict):
         merged = deep_merge(merged, worker_overrides)
@@ -1212,20 +1313,25 @@ class ConfigManager:
             if field in config_dict:
                 setattr(session_config, field, config_dict[field])
 
-        # Session permissions (always mutable)
+        # Session permissions — the apply_config payload is NOT a grant carrier.
+        #
+        # The vault permission SIDECAR (P1) is the single canonical grant store;
+        # grants are written ONLY through the canonical REST writer
+        # ``PUT /api/session/{id}/permissions``.  A ``session_permissions`` key
+        # arriving on the config payload is therefore IGNORED (stripped) so no
+        # config carrier can resurrect a grant — the shipped frontend already
+        # strips the key before sending (ConfigPanel.jsx).  A WARNING names the
+        # dropped field so a misdirected write is visible rather than silent.
         if "session_permissions" in config_dict:
-            sp = config_dict["session_permissions"]
-            if sp is not None and isinstance(sp, dict):
-                # Merge, don't replace: the frontend payload may carry only a
-                # partial set (e.g. grains it renders), so a wholesale replace
-                # would collapse the stored permission set and drop keys that
-                # were granted elsewhere (operator-granted grains, workspace
-                # ceiling survivors). Stored keys not present in the payload
-                # are preserved; explicit payload values still win.
-                existing = session_config.session_permissions
-                merged_sp = dict(existing) if isinstance(existing, dict) else {}
-                merged_sp.update(sp)
-                session_config.session_permissions = merged_sp
+            config_dict = {
+                k: v for k, v in config_dict.items() if k != "session_permissions"
+            }
+            logger.warning(
+                "apply_config: ignoring %r in config payload — the canonical "
+                "grant store is the session permission sidecar; use "
+                "PUT /api/session/{id}/permissions to change grants",
+                "session_permissions",
+            )
 
         # If provider_id changed, resolve provider credentials
         if "provider_id" in config_dict and config_dict["provider_id"]:

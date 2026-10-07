@@ -57,7 +57,7 @@ class TestCheckSystemContainers:
             tool = CheckSystem(
                 query="containers",
                 workspace_path="/tmp/test_ws",
-                session_permissions={"container": True},
+                effective_permissions={"container": True},
             )
             result = _parse_result(tool.execute())
         assert result["status"] == "ok"
@@ -77,7 +77,7 @@ class TestCheckSystemContainers:
             tool = CheckSystem(
                 query="containers",
                 workspace_path="/tmp/test_ws",
-                session_permissions={},
+                effective_permissions={},
             )
             result = _parse_result(tool.execute())
         assert result["status"] == "unavailable"
@@ -94,7 +94,7 @@ class TestCheckSystemContainers:
             tool = CheckSystem(
                 query="containers",
                 workspace_path="/tmp/test_ws",
-                session_permissions={"container": True},
+                effective_permissions={"container": True},
             )
             result = _parse_result(tool.execute())
         assert result["status"] == "unavailable"
@@ -130,7 +130,7 @@ class TestCheckSystemContainers:
             tool = CheckSystem(
                 query="containers",
                 workspace_path="/tmp/test_ws",
-                session_permissions={"container": True},
+                effective_permissions={"container": True},
             )
             result = _parse_result(tool.execute())
         assert result["status"] == "ok"

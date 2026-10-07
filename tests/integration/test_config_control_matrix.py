@@ -16,6 +16,9 @@ from pathlib import Path
 
 import pytest
 
+from thoughtmachine.permission_store import read_session_permissions
+from thoughtmachine.vault import vault_root
+
 try:
     from tests.integration import harness
 except ImportError:  # non-package layout: tests/integration on sys.path
@@ -41,17 +44,19 @@ def _restart(tmp_home, stop_fn):
     return harness.make_client(app2)
 
 
-def _apply_config_dict(ws_root, session_permissions):
-    return {
+def _apply_config_dict(ws_root, session_permissions=None):
+    config = {
         "workspace_path": ws_root,
         "mode": "custom",
         "provider": "mock",
         "model": "mock-model",
-        "session_permissions": session_permissions,
         "temperature": 0.2,
         "max_turns": 20,
         "enabled_tools": [],
     }
+    if session_permissions is not None:
+        config["session_permissions"] = session_permissions
+    return config
 
 
 def _load_session(wsock, sid):
@@ -120,6 +125,9 @@ def test_persistence_session_permission_grants_survive_restart_capped_by_ceiling
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t2")
     sid = harness.create_session(client, workspace_path=ws["root"])
+    harness.put_session_permissions(
+        client, sid, {"git": "write", "filesystem": "write"}
+    )
 
     with harness.ws_connect(client) as wsock:
         evt = _load_session(wsock, sid)
@@ -127,33 +135,22 @@ def test_persistence_session_permission_grants_survive_restart_capped_by_ceiling
         wsock.send_json(
             {
                 "command": "apply_config",
-                "config": _apply_config_dict(
-                    ws["root"], {"git": "write", "filesystem": "write"}
-                ),
+                "config": _apply_config_dict(ws["root"]),
             }
         )
         evt, _ = harness.receive_until_type(wsock, "config_changed")
 
-    # (i) Persistence: the grant survives restart at the store level.
-    server_mod = importlib.import_module("web_ui.backend.server")
-    session = server_mod._get_session_store().load_session(
-        sid, workspace_id=ws["workspace_id"]
-    )
-    assert session is not None, "session missing from store"
-    stored_perms = session.metadata["session_config"]["session_permissions"]
+    # (i) Persistence: the grant survives restart in the canonical permission
+    # sidecar (P1), not in the session record's metadata carrier.
+    stored_perms = read_session_permissions(vault_root(), ws["workspace_id"], sid)
     assert stored_perms["git"] == "write", stored_perms
     assert stored_perms["filesystem"] == "write", stored_perms
 
     # Restart and reload over the wire.
     client2 = _restart(tmp_home, stop_fn)
 
-    # Store-level metadata still carries the original write/write grant.
-    server_mod2 = importlib.import_module("web_ui.backend.server")
-    session2 = server_mod2._get_session_store().load_session(
-        sid, workspace_id=ws["workspace_id"]
-    )
-    assert session2 is not None, "session missing from store after restart"
-    stored2 = session2.metadata["session_config"]["session_permissions"]
+    # The sidecar still carries the original write/write grant.
+    stored2 = read_session_permissions(vault_root(), ws["workspace_id"], sid)
     assert stored2["git"] == "write", stored2
     assert stored2["filesystem"] == "write", stored2
 
@@ -332,25 +329,15 @@ def test_workspace_ceiling_caps_session_effective_permission(env):
     ws = harness.create_workspace(client, tmp_home, name="t8")
     harness.put_permissions(client, ws["workspace_id"], {"git": "read"})
     sid = harness.create_session(client, workspace_path=ws["root"])
+    harness.put_session_permissions(client, sid, {"git": "write"})
 
     with harness.ws_connect(client) as wsock:
         evt = _load_session(wsock, sid)
         assert evt["config"]["workspace_path"] == ws["root"], evt
-        wsock.send_json(
-            {
-                "command": "apply_config",
-                "config": _apply_config_dict(ws["root"], {"git": "write"}),
-            }
-        )
-        evt, _ = harness.receive_until_type(wsock, "config_changed")
 
-    # Real stored grant (persisted by the WS flow above).
-    server_mod = importlib.import_module("web_ui.backend.server")
-    session = server_mod._get_session_store().load_session(
-        sid, workspace_id=ws["workspace_id"]
-    )
-    assert session is not None, "session missing from store"
-    stored_perms = session.metadata["session_config"]["session_permissions"]
+    # Real stored grant (persisted by the WS flow above) lives in the
+    # canonical permission sidecar (P1).
+    stored_perms = read_session_permissions(vault_root(), ws["workspace_id"], sid)
     assert stored_perms["git"] == "write", stored_perms
 
     # The same recap code path bridge.load_session uses:

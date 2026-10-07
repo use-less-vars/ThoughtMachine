@@ -140,27 +140,36 @@ def test_invalid_permissions_type_rejected(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_fallback_without_sidecar(tmp_path):
-    """No sidecar -> legacy metadata.session_config.session_permissions."""
+def test_no_sidecar_with_legacy_record_raises(tmp_path):
+    """The retired metadata fallback is never consulted for reads: a session
+    record carrying legacy grants but NO sidecar has no permission source, so
+    the read RAISES PermissionStoreError (fail closed) rather than returning
+    the legacy grants."""
     vault = tmp_path / "vault"
     legacy = {"filesystem": "read", "git": "write"}
     _write_session_record(vault, "ws-a", "sess-1", legacy=legacy)
 
     assert not session_grants_path(vault, "ws-a", "sess-1").exists()
-    assert read_session_permissions(vault, "ws-a", "sess-1") == legacy
+    with pytest.raises(PermissionStoreError):
+        read_session_permissions(vault, "ws-a", "sess-1")
 
 
-def test_record_without_legacy_grants_returns_empty(tmp_path):
-    """A matching session record with no recorded grants reads as {} (neutral:
-    grants nothing; the gate applies defaults afterwards)."""
+def test_no_sidecar_with_grantless_record_raises(tmp_path):
+    """The sidecar is the sole grants source: a matching session record with
+    no recorded grants (and no sidecar) is still NO permission source, so the
+    read RAISES PermissionStoreError -- it no longer returns {} (the retired
+    record-source 'present-but-empty' path)."""
     vault = tmp_path / "vault"
     record = _write_session_record(vault, "ws-a", "sess-1", legacy=None)
-    assert read_session_permissions(vault, "ws-a", "sess-1") == {}
+    assert not session_grants_path(vault, "ws-a", "sess-1").exists()
+    with pytest.raises(PermissionStoreError):
+        read_session_permissions(vault, "ws-a", "sess-1")
 
-    # Record without any metadata at all -> also {}.
+    # A bare record with no metadata at all -> also raises (no sidecar).
     bare = _sessions_dir(vault, "ws-a") / "bare_000001.json"
     bare.write_text(json.dumps({"session_id": "sess-2", "name": "bare"}), encoding="utf-8")
-    assert read_session_permissions(vault, "ws-a", "sess-2") == {}
+    with pytest.raises(PermissionStoreError):
+        read_session_permissions(vault, "ws-a", "sess-2")
 
 
 # ---------------------------------------------------------------------------
@@ -298,18 +307,20 @@ def test_write_drops_invalid_host_bash_value(tmp_path):
 
 
 def test_read_never_surfaces_legacy_junk(tmp_path):
-    """The legacy fallback read path normalises too: record junk keys
-    (legacy git grains, non-bool container) never reach the caller, while
-    network -- now a valid session grant -- survives."""
+    """Junk keys (legacy git grains, non-bool container) never reach the
+    caller, while network -- now a valid session grant -- survives.  The
+    canonical sidecar is written via write_session_permissions, whose
+    normalisation scrubs the payload; the read returns the clean canonical
+    shape."""
     vault = tmp_path / "vault"
-    legacy = {
+    junk = {
         "git": "read",
         "git_read": "write",
         "git_write": "write",
         "network": "write",
         "container": "ask",
     }
-    _write_session_record(vault, "ws-a", "sess-1", legacy=legacy)
+    write_session_permissions(vault, "ws-a", "sess-1", junk)
     assert read_session_permissions(vault, "ws-a", "sess-1") == {
         "git": "read", "network": "write",
     }

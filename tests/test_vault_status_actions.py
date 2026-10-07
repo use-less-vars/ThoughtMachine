@@ -24,27 +24,28 @@ def server_module():
     import os
     import tempfile
 
+    from tests.integration.harness import purged_sys_modules
+
+    prefixes = (
+        "web_ui.backend",
+        "agent.config.provider_profile",
+        "thoughtmachine.bootstrap",
+        "session",
+    )
+
     with tempfile.TemporaryDirectory() as tmp_home:
         old_home = os.environ.get("HOME")
         os.environ["HOME"] = tmp_home
-        try:
-            for prefix in (
-                "web_ui.backend",
-                "agent.config.provider_profile",
-                "thoughtmachine.bootstrap",
-                "session",
-            ):
-                for mod in list(sys.modules):
-                    if mod == prefix or mod.startswith(prefix + "."):
-                        del sys.modules[mod]
-            import web_ui.backend.server as server_mod
+        with purged_sys_modules(prefixes):
+            try:
+                import web_ui.backend.server as server_mod
 
-            yield server_mod
-        finally:
-            if old_home is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = old_home
+                yield server_mod
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
 
 
 @pytest.fixture(scope="module")
