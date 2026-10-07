@@ -199,12 +199,18 @@ class TestWorkerDiskPureGate:
         )
         assert result["result"] == "FS OK", result["result"]
 
-    def test_worker_ask_denied_without_prompt(
+    def test_worker_filesystem_ask_coerced_to_read_denied_without_prompt(
         self, gate_env, tmp_path, monkeypatch
     ):
-        """Worker + vault record filesystem:ask: the ask path must NOT publish
-        a SecurityPromptEvent (no interactive user) -- the gate short-circuits
-        BEFORE the prompt publish with the worker-approval denial."""
+        """Worker + vault record filesystem:ask (dropped -> read): the request
+        must NOT publish a SecurityPromptEvent (no interactive user) -- the
+        write is denied before any prompt publish.
+
+        filesystem's session vocabulary is banned|read|write, so both the
+        stored 'ask' and the worker 'ask' footprint resolve to read (read x ask
+        still mints read after the A2 read<ask re-rank).  The genuine
+        filesystem-ask denial becomes constructible only after the filesystem
+        vocabulary unification (A9) adds 'ask' to filesystem's vocab."""
         _seed_vault(monkeypatch, tmp_path, WORKSPACE, SESSION, "ask")
         bus = RecordingBus()
         perms = SessionPermissions(filesystem="ask")
@@ -215,7 +221,8 @@ class TestWorkerDiskPureGate:
             workspace_id=WORKSPACE,
         )
         assert result["result"] != "FS OK"
-        assert "ask requires interactive approval; not available in worker context" in result["result"], result["result"]
+        assert "Permission denied" in result["result"], result["result"]
+        assert "filesystem:write" in result["result"], result["result"]
         assert bus.published == [], "worker ask must never publish a prompt event"
 
     def test_worker_disk_read_caps_write_tool(

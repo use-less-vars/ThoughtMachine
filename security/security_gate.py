@@ -174,7 +174,7 @@ def _min_permission(
 # value ``write_on_feature_branch`` ranks between ask and write (2.5): it
 # caps a session ``write`` grant down to branch-restricted write -- never
 # unlimited.  Note this ordering is NOT the same as ``_min_permission``'s
-# grant-level map (where ask < read); ceiling comparisons follow the
+# grant-level map (where read < ask); ceiling comparisons follow the
 # workspace contract above.  Which ceiling levels may apply to which session
 # key is additionally whitelisted by WORKSPACE_CEILING_VOCAB.
 _WORKSPACE_CEILING_LEVELS = WORKSPACE_CEILING_LEVELS_RANKS

@@ -180,11 +180,31 @@ def test_workspace_permissions_validation_container_rejects_all_string_forms():
         ), (value, errors)
 
 
+from security.resource_catalog import GRANT_LEVEL_RANKS
 from security.security_gate import apply_workspace_ceiling, get_effective_permissions
 from thoughtmachine.security import SessionPermissions
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 from web_ui.backend import config_manager
+
+
+def test_grant_level_ranks_orders_read_strictly_below_ask():
+    """A2: on the shared grant-level scale ``read`` is STRICTLY LESS
+    PERMISSIVE than ``ask`` -- an ``ask`` grant opens an interactive-approval
+    path that ``read`` does not -- so its rank must be strictly lower."""
+    assert GRANT_LEVEL_RANKS["read"] < GRANT_LEVEL_RANKS["ask"]
+    # Anchor the surrounding corrected order so a bad re-rank is caught too.
+    assert (
+        GRANT_LEVEL_RANKS["banned"]
+        < GRANT_LEVEL_RANKS["read"]
+        < GRANT_LEVEL_RANKS["ask"]
+        < GRANT_LEVEL_RANKS["write"]
+    )
+    assert (
+        GRANT_LEVEL_RANKS["write"]
+        == GRANT_LEVEL_RANKS["write_on_feature_branch"]
+    )
+    assert GRANT_LEVEL_RANKS["outbound"] < GRANT_LEVEL_RANKS["full"]
 
 
 class TestNormalizeLegacyWorkspaceCeiling:

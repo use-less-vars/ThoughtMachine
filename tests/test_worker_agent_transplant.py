@@ -784,16 +784,18 @@ class TestGateDenialInstant:
 
     @pytest.fixture
     def config(self, tmp_path, monkeypatch) -> AgentConfig:
-        # Achieving an effective filesystem value of 'ask' takes BOTH sides:
-        # the disk sidecar records the session grant, but filesystem's session
-        # vocabulary is banned|read|write -- no 'ask' -- so the stored grant is
-        # coerced down and the disk-effective value resolves to the
-        # SessionPermissions default 'read'.  The spawn-time worker footprint
+        # The stored grant is filesystem 'ask', but filesystem's session
+        # vocabulary is banned|read|write -- no 'ask' -- so the sidecar value is
+        # dropped and the disk-effective value resolves to the SessionPermissions
+        # default 'read'.  The spawn-time worker footprint
         # (config.session_permissions = filesystem 'ask', attached only when
-        # worker_mode=True) then caps that via _min_permission, whose
-        # grant-level map ranks ask BELOW read -- so 'read' x 'ask' -> 'ask'.
-        # A write then requires interactive approval, which worker context
-        # (no interactive user) denies instantly.
+        # worker_mode=True) can no longer raise that to 'ask': on the A2
+        # grant-level map read STRICTLY BELOW ask, so the worker ask footprint
+        # collapses to the more restrictive 'read' ('read' x 'ask' -> 'read').
+        # A filesystem:write then needs more than the effective 'read', which
+        # worker context (no interactive user) denies instantly.  (The genuine
+        # filesystem-ask denial becomes constructible only after the filesystem
+        # vocabulary unification (A9) adds 'ask' to filesystem's vocab.)
         try:
             from thoughtmachine.security import SessionPermissions
             perms = SessionPermissions(filesystem="ask")
@@ -830,7 +832,10 @@ class TestGateDenialInstant:
         )
 
     def test_gate_denial_instant(self, config: AgentConfig, ctx: WorkerContext):
-        """When effective permission is 'ask', gate denies via NullEventBus instantly."""
+        """Effective filesystem 'read' (the worker 'ask' footprint collapses to
+        'read' now that read ranks strictly below ask): the gate denies the
+        write instantly via the NullEventBus -- no interactive user -- and the
+        agent continues."""
         # Script: call FileEditor with write operation (requires filesystem:write)
         # Patch global_event_bus to None to simulate worker context with no interactive user
         # NullEventBus = BOTH module-level bindings must be None:
@@ -888,7 +893,7 @@ class TestGateDenialInstant:
             # no-event-bus branch. The gate denies BEFORE the tool runs, so the
             # in-tool atomic message ('Atomic permission check failed: ...') never
             # appears on this path.
-            assert "Permission denied: filesystem:write required by 'FileEditor'" in result_content, (
+            assert "Permission denied: Tool requires filesystem:write, but session allows filesystem:read" in result_content, (
                 f"Expected gate denial message in tool result, got: {result_content}"
             )
 

@@ -60,9 +60,12 @@ because each answers a different question:
   ``_value_satisfies`` / ``_min_permission`` ("does grant A satisfy a
   request requiring grant B?"):
 
-      banned(0) < ask(1) < read(2) < write(3) == write_on_feature_branch(3)
+      banned(0) < read(1) < ask(2) < write(3) == write_on_feature_branch(3)
           < outbound(3.5) < full(4)
 
+  ``read`` ranks strictly BELOW ``ask`` because read is a strict subset of
+  ask: a read grant performs read-only work silently, while ask additionally
+  authorises interactive approval for the write tier.
   ``write_on_feature_branch`` is a session git level ranking AT the write
   tier (the branch-only restriction is enforced tool-side at commit time);
   ``outbound`` (network outbound-only connectivity) ranks above plain
@@ -125,16 +128,20 @@ canonical_resource_keys = set(RESOURCE_CATALOG)
 #: Session-grant level ranks (single flat order used by the comparison
 #: helpers in ``security.gate_helpers`` / ``security.security_gate``).
 #:
-#:     banned(0) < ask(1) < read(2) < write(3) == write_on_feature_branch(3)
+#:     banned(0) < read(1) < ask(2) < write(3) == write_on_feature_branch(3)
 #:         < outbound(3.5) < full(4)
 #:
-#: ``write_on_feature_branch`` ranks AT the write tier (branch restriction is
-#: enforced tool-side at commit time); ``outbound`` ranks above plain
-#: ``write`` because it is a strict superset grant on network's scale.
+#: ``read`` ranks strictly BELOW ``ask`` because read is a strict subset of
+#: ask (read-only work needs no prompt; ask additionally authorises the write
+#: tier interactively).  ``write_on_feature_branch`` ranks AT the write tier
+#: (branch restriction is enforced tool-side at commit time); ``outbound``
+#: ranks above plain ``write`` because it is a strict superset grant on
+#: network's scale.
 GRANT_LEVEL_RANKS: Dict[str, float] = {
     "banned": 0,
-    "ask": 1,
-    "read": 2,
+    "read": 1,
+    "ask": 2,
+    # TODO(edge3.1): connect rank pending Main
     "connect": 3,
     "write": 3,
     "write_on_feature_branch": 3,
@@ -157,6 +164,7 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
 WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
     "banned": 0.0,
     "read": 1.0,
+    # TODO(edge3.1): connect rank pending Main
     "connect": 1.0,  # session-side mcp level (below ask/2.0)
     "none": 1.0,  # alias used by some purpose presets
     "ask": 2.0,
