@@ -97,6 +97,8 @@ __all__ = [
     "seed_session_permissions_if_absent",
     "migrate_session_permissions",
     "workspace_ceiling",
+    "read_grants_or_deny_all",
+    "deny_all_grants",
 ]
 
 logger = logging.getLogger(__name__)
@@ -296,6 +298,52 @@ def workspace_ceiling(vault_root, workspace_id: str) -> Dict[str, Any]:
             f"workspace config {config_path} has non-object 'permissions'"
         )
     return dict(permissions)
+
+
+def deny_all_grants() -> Dict[str, Any]:
+    """Return the deny-all grants sentinel (all six categories banned).
+
+    Single source of truth for the fail-closed grant value, so an unreadable
+    grants path can never diverge per call site.
+    """
+    from security.security_gate import _DISK_FAIL_CLOSED_SESSION
+
+    return _DISK_FAIL_CLOSED_SESSION.model_dump()
+
+
+def read_grants_or_deny_all(
+    session_id: Any, workspace_id: Any
+) -> Dict[str, Any]:
+    """Return a session's grants, the designed default, or the deny-all sentinel.
+
+    Contract (D1=A narrow) -- *id-less is not the same as unreadable*:
+
+    * A grants path exists only when BOTH a ``session_id`` and a
+      ``workspace_id`` are present (the sidecar lives at
+      ``<vault_root>/workspaces/<workspace_id>/sessions/<session_id>/permissions.json``).
+      With either id absent there is no path to be unreadable, so a truly
+      id-less call returns the designed Pydantic default
+      (``SessionPermissions().model_dump()``) -- never the sentinel.
+    * With BOTH ids present, *any* failure of the read -- a
+      :class:`PermissionStoreError` (missing or corrupt sidecar), an
+      ``OSError``, a wrong shape, or a non-dict value -- yields the deny-all
+      sentinel (all six categories banned), so an unreadable grants path
+      never produces a permissive value.
+    """
+    from thoughtmachine.vault import vault_root
+
+    if not session_id or not workspace_id:
+        # No workspace-scoped grant store to read: the designed default, NOT
+        # the sentinel -- a missing id is a valid transitional state, not an
+        # unreadable store.
+        return SessionPermissions().model_dump()
+    try:
+        grants = read_session_permissions(vault_root(), workspace_id, session_id)
+    except Exception:
+        return deny_all_grants()
+    if not isinstance(grants, dict):
+        return deny_all_grants()
+    return grants
 
 
 # ---------------------------------------------------------------------------

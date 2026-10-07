@@ -915,6 +915,14 @@ def resolve_full_config(
         except Exception as exc:
             log("WARNING", "server.config",
                 f"Could not load workspace permission ceiling: {exc}")
+            # D2 clamp: an unreadable workspace ceiling must not silently
+            # disappear from the restriction dimension.  Clamp with the
+            # deny-all ceiling instead of {} (a legitimately absent ceiling
+            # -- the else branch -- stays {}, so the two states remain
+            # distinguishable by content).
+            from security.security_gate import _DISK_FAIL_CLOSED_CEILING
+
+            _workspace_ceiling = dict(_DISK_FAIL_CLOSED_CEILING)
     else:
         _workspace_ceiling = {}
 
@@ -943,19 +951,17 @@ def resolve_full_config(
     # session record.  Read them so only the workspace ceiling below can
     # further restrict them.  Fail-closed: an unreadable sidecar leaves the
     # merged value untouched (defaults); never substitute a permissive set.
-    if session_id and workspace_id:
-        try:
-            from thoughtmachine.vault import vault_root
-            from thoughtmachine.permission_store import read_session_permissions
+    if session_id:
+        # Ruled semantics (D1=A narrow): an unreadable workspace-scoped store
+        # (BOTH ids present, read fails) -> the deny-all sentinel; a missing id
+        # -> the designed Pydantic default, because id-less is not the same as
+        # unreadable (see the no-workspace ticket).  Only the workspace ceiling
+        # below (guarded by ``workspace_id``) may further restrict it.
+        from thoughtmachine.permission_store import read_grants_or_deny_all
 
-            _p1_perms = read_session_permissions(
-                vault_root(), workspace_id, session_id
-            )
-            if isinstance(_p1_perms, dict):
-                merged["session_permissions"] = _p1_perms
-        except Exception as exc:
-            log("WARNING", "server.config",
-                f"Could not read session permission sidecar: {exc}")
+        merged["session_permissions"] = read_grants_or_deny_all(
+            session_id, workspace_id
+        )
 
     if worker_overrides and isinstance(worker_overrides, dict):
         merged = deep_merge(merged, worker_overrides)

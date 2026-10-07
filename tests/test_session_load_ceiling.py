@@ -183,3 +183,73 @@ class TestSessionLoadCeiling:
         )
         # the ceiling loader must never be invoked with a falsy workspace id
         assert all(calls), f"ceiling loader called with falsy workspace id: {calls}"
+
+    def test_b28_unreadable_sidecar_yields_deny_all_sentinel(
+        self, temp_store, tmp_path, monkeypatch
+    ):
+        """P1 (B-28): an unreadable sidecar must yield the deny-all sentinel.
+
+        BEFORE the fix an unreadable grants read left ``sc.session_permissions``
+        at the permissive Pydantic default (``filesystem='read'``); AFTER it is
+        the deny-all sentinel (``filesystem='banned'``).
+        """
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+        import thoughtmachine.permission_store as ps
+
+        def _raise(*_args, **_kwargs):
+            raise ps.PermissionStoreError("forced unreadable sidecar")
+
+        monkeypatch.setattr(ps, "read_session_permissions", _raise)
+
+        bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge._workspace_id = "ws-p1-deny"
+        saved = bridge.save_session()
+        assert saved is not None
+        session_id = saved.session_id
+
+        bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        assert bridge2.load_session(session_id), "load_session returned False"
+        cfg = bridge2.get_config()
+        assert cfg is not None
+        perms = cfg["session_permissions"]
+        assert perms["filesystem"] == "banned", perms
+        assert perms["git"] == "banned", perms
+        assert perms["network"] == "banned", perms
+        assert perms["container"] is False, perms
+
+    def test_no_workspace_yields_designed_default_not_sentinel(self, temp_store):
+        """P2 (CONTRACT REVISION, D1=A): a truly id-less session gets the
+        designed pydantic default, NOT the deny-all sentinel.
+
+        D1=A narrows the helper's id-less branch: the deny-all sentinel is for
+        an *unreadable* workspace-scoped store (both ids present, read fails),
+        not for the absence of a store.  A session with no workspace has no
+        grants path to be unreadable -- id-less is not the same as unreadable
+        -- so the designed default applies.  This test previously pinned the
+        deny-all sentinel for the id-less case; that was the pre-D1 semantics
+        and this is a mandate-driven CONTRACT REVISION.
+        """
+        from thoughtmachine.permission_store import read_grants_or_deny_all
+        from thoughtmachine.security import SessionPermissions
+
+        default = SessionPermissions().model_dump()
+        # helper-level: either id absent -> designed default, never sentinel
+        assert read_grants_or_deny_all(None, None) == default
+        assert read_grants_or_deny_all("some-session", None) == default
+        assert read_grants_or_deny_all(None, "some-ws") == default
+        assert read_grants_or_deny_all(None, None).get("filesystem") != "banned"
+        assert read_grants_or_deny_all("some-session", None).get("git") != "banned"
+
+        # bridge-level: a workspace-less session resolves to the designed default
+        bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        saved = bridge.save_session()
+        assert saved is not None
+        session_id = saved.session_id
+
+        bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        assert bridge2.load_session(session_id), "load_session returned False"
+        cfg = bridge2.get_config()
+        assert cfg is not None
+        perms = cfg.get("session_permissions") or {}
+        assert perms.get("filesystem") == "read", perms
+        assert perms.get("git") == "read", perms

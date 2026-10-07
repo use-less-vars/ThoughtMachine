@@ -1933,34 +1933,30 @@ class WebAgentBridge:
                 # apply (see config_manager.resolve_full_config) — so a
                 # restored session can never exceed the workspace ceiling
                 # until the next config change.
+                # Raw grants now live in the canonical P1 sidecar, not in the
+                # session record.  Fail-closed: an unreadable grants path (or
+                # a session with no workspace) yields the deny-all sentinel,
+                # never the permissive Pydantic default and never ``None``.
+                from thoughtmachine.permission_store import read_grants_or_deny_all
+
+                stored_perms = read_grants_or_deny_all(
+                    session.session_id, self._workspace_id
+                )
                 if self._workspace_id:
                     try:
                         from web_ui.backend.config_manager import _load_workspace_permission_ceiling
 
                         ceiling = _load_workspace_permission_ceiling(self._workspace_id)
-                        # Raw grants now live in the canonical P1 sidecar, not
-                        # in the session record.
-                        try:
-                            from thoughtmachine.vault import vault_root
-                            from thoughtmachine.permission_store import read_session_permissions
+                        if ceiling:
+                            from security.security_gate import apply_workspace_ceiling
 
-                            stored_perms = read_session_permissions(
-                                vault_root(), self._workspace_id, session.session_id
+                            stored_perms = apply_workspace_ceiling(
+                                ceiling, stored_perms
                             )
-                        except Exception:
-                            stored_perms = None
-                        if isinstance(stored_perms, dict):
-                            if ceiling:
-                                from security.security_gate import apply_workspace_ceiling
-
-                                sc.session_permissions = apply_workspace_ceiling(
-                                    ceiling, stored_perms
-                                )
-                            else:
-                                sc.session_permissions = stored_perms
                     except Exception as exc:
                         log('WARNING', 'server.bridge',
                             f"Could not apply workspace permission ceiling to session config: {exc}")
+                    sc.session_permissions = stored_perms
                 self._session_config = sc
                 # Migrate saved config to new format (exclude api_key).
                 # Only write when something actually changed (stored raw vs
