@@ -80,6 +80,8 @@ from unittest.mock import patch
 import pytest
 from starlette.testclient import TestClient
 
+from tests.integration.harness import SysModulesSnapshot
+
 pytestmark = pytest.mark.integration
 
 
@@ -114,9 +116,9 @@ def contract_server():
     # teardown); a stale singleton would make REST create write to the old HOME while
     # the WS load_session path scans the current one, so the lookup would miss.
     mod_prefixes = ("web_ui.backend", "agent.config.provider_profile", "thoughtmachine.bootstrap", "session")
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
+    snapshot = SysModulesSnapshot(mod_prefixes)
+    snapshot.snapshot()
+    snapshot.purge()
 
     server_mod = importlib.import_module("web_ui.backend.server")
     app = server_mod.app
@@ -132,6 +134,7 @@ def contract_server():
         if val is not None:
             os.environ[key] = val
     shutil.rmtree(tmp_home, ignore_errors=True)
+    snapshot.restore()
 
 
 # ══════════════════════════════════════════════════════════════════════════
