@@ -325,6 +325,15 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "write"})
         assert result == {"filesystem": "read"}
 
+    def test_ask_ceiling_caps_write_to_ask(self):
+        # A1 RED: once _ASK_CEILING_READ_TIER_KEYS is deleted, an ask ceiling
+        # caps a more-permissive session value to the ceiling level itself --
+        # 'ask' -- by ordering (write rank 3.0 -> ask rank 2.0), rather than a
+        # fabricated below-ask 'read' tier. Fails at HEAD; the pinned test
+        # above still asserts the old 'read' outcome (A7 flips it).
+        result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "write"})
+        assert result == {"filesystem": "ask"}
+
     def test_write_keeps_write(self):
         result = apply_workspace_ceiling({"filesystem": "write"}, {"filesystem": "write"})
         assert result == {"filesystem": "write"}
