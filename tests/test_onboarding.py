@@ -19,6 +19,8 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.integration.harness import SysModulesSnapshot
+
 
 @pytest.fixture(scope="module")
 def clean_home():
@@ -45,9 +47,9 @@ def clean_home():
         "thoughtmachine.bootstrap",
         "thoughtmachine.workspace_registry",
     )
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
+    snapshot = SysModulesSnapshot(mod_prefixes)
+    snapshot.snapshot()
+    snapshot.purge()
 
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _project_root not in sys_mod.path:
@@ -67,6 +69,7 @@ def clean_home():
         if val is not None:
             os.environ[key] = val
     shutil.rmtree(tmp_home, ignore_errors=True)
+    snapshot.restore()
 
 
 @pytest.fixture
