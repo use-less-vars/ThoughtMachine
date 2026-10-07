@@ -20,6 +20,19 @@ from __future__ import annotations
 
 from security.resource_catalog import GRANT_LEVEL_RANKS
 
+#: Highest required-grant rank an ``'ask'`` allowed value satisfies SILENTLY
+#: (no interactive prompt): the set ``{banned, read, ask}``.  Derived from the
+#: shared grant-level rank table (``security.resource_catalog.GRANT_LEVEL_RANKS``)
+#: rather than a hand-copied literal, so the boundary tracks the table.  Under
+#: the canonical order ``banned(0) < read(1) < ask(2) < ...`` this is 2; under
+#: the legacy order (``banned(0) < ask(1) < read(2)``) the same set spans
+#: ``{0, 1, 2}``, so the boundary is identical either way.
+_ASK_SILENT_MAX_RANK = max(
+    GRANT_LEVEL_RANKS["banned"],
+    GRANT_LEVEL_RANKS["read"],
+    GRANT_LEVEL_RANKS["ask"],
+)
+
 
 def _value_satisfies(required: str, allowed: object) -> bool | str:
     """
@@ -69,7 +82,7 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
     if allowed_str == "ask":
         if required_level is None:
             return sentinel_ask
-        if required_level <= 2:  # banned/read
+        if required_level <= _ASK_SILENT_MAX_RANK:  # banned/read/ask
             return True
         return sentinel_ask
 

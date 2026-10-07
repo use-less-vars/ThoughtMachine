@@ -92,3 +92,89 @@ def test_sandboxed_execution_importable_after_security_gate():
     result = _run_script(script)
     _assert_clean(result)
     assert "sandboxed_execution=OK" in result.stdout
+
+
+def test_value_satisfies_truth_table_pinned():
+    """Pin the COMPLETE ``_value_satisfies`` truth table across the known
+    grant levels plus the boolean allowed side.
+
+    ``security.gate_helpers._ASK_SILENT_MAX_RANK`` (the ``'ask'``-boundary
+    constant) is derived from ``GRANT_LEVEL_RANKS`` instead of the former magic
+    literal ``2``.  This matrix proves that refactor is a behavioural NO-OP:
+    every cell matches the pre-refactor table exactly.  Rows are the ``allowed``
+    side, columns the ``required`` side (order below).
+    """
+    from security.gate_helpers import _ASK_SILENT_MAX_RANK, _value_satisfies
+    from security.resource_catalog import GRANT_LEVEL_RANKS
+
+    # The boundary constant is the max rank over the {banned, read, ask} set.
+    assert _ASK_SILENT_MAX_RANK == max(
+        GRANT_LEVEL_RANKS["banned"],
+        GRANT_LEVEL_RANKS["read"],
+        GRANT_LEVEL_RANKS["ask"],
+    )
+    assert _ASK_SILENT_MAX_RANK == 2
+
+    required_cols = (
+        "banned",
+        "read",
+        "ask",
+        "write",
+        "write_on_feature_branch",
+        "outbound",
+        "full",
+        "connect",
+    )
+    ASK = "ASK"
+    expected: dict = {
+        # allowed -> {required: expected result}
+        "banned": {c: False for c in required_cols},
+        "read": {c: False for c in required_cols},
+        "ask": {c: False for c in required_cols},
+        "write": {c: False for c in required_cols},
+        "write_on_feature_branch": {c: False for c in required_cols},
+        "outbound": {c: False for c in required_cols},
+        "full": {c: False for c in required_cols},
+        "connect": {c: False for c in required_cols},
+    }
+    for allowed in expected:
+        expected[allowed]["banned"] = True  # every grant satisfies 'banned'
+    # read tier: banned < read.
+    for allowed in ("read", "ask", "write", "write_on_feature_branch",
+                    "outbound", "full", "connect"):
+        expected[allowed]["read"] = True
+    # ask tier.
+    for allowed in ("ask", "write", "write_on_feature_branch", "outbound",
+                    "full", "connect"):
+        expected[allowed]["ask"] = True
+    # write tier: write == write_on_feature_branch == connect (rank 3).
+    for allowed in ("write", "write_on_feature_branch", "outbound", "full",
+                    "connect"):
+        expected[allowed]["write"] = True
+        expected[allowed]["write_on_feature_branch"] = True
+        expected[allowed]["connect"] = True
+    # outbound (3.5): satisfied by outbound/full only above write tier.
+    for allowed in ("outbound", "full"):
+        expected[allowed]["outbound"] = True
+    # full (4): satisfied by 'full' only.
+    expected["full"]["full"] = True
+    # The 'ask' allowed side returns the ASK sentinel (not True) for every
+    # requirement strictly above the silent boundary.
+    expected["ask"]["write"] = ASK
+    expected["ask"]["write_on_feature_branch"] = ASK
+    expected["ask"]["outbound"] = ASK
+    expected["ask"]["full"] = ASK
+    expected["ask"]["connect"] = ASK
+
+    for allowed, row in expected.items():
+        for required in required_cols:
+            got = _value_satisfies(required, allowed)
+            assert got == row[required], (
+                f"_value_satisfies({required!r}, {allowed!r}) == {got!r}, "
+                f"expected {row[required]!r}"
+            )
+
+    # Boolean allowed side: True satisfies everything, False satisfies nothing.
+    for required in required_cols:
+        assert _value_satisfies(required, True) is True
+        assert _value_satisfies(required, False) is False
