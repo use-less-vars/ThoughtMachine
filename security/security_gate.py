@@ -149,7 +149,11 @@ def _min_permission(
     _LEVEL_MAP: dict[str, float] = {
         level: float(rank) for level, rank in GRANT_LEVEL_RANKS.items()
     }
-    _LEVEL_MAP["none"] = 1.0
+    # 'none' is a legacy preset alias ranking WITH read on this scale; the
+    # canonical rank lives in security/resource_catalog.py
+    # WORKSPACE_CEILING_LEVELS_RANKS['none'] (== the read tier). GRANT_LEVEL_RANKS
+    # omits it, so it is added here.
+    _LEVEL_MAP["none"] = WORKSPACE_CEILING_LEVELS_RANKS["none"]
 
     def _level(v: Any) -> float:
         if isinstance(v, bool):
