@@ -58,7 +58,6 @@ import json
 import os
 import pathlib
 import shutil
-import sys as sys_mod
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +70,8 @@ from starlette.testclient import TestClient
 
 from llm_providers.base import LLMProvider, ProviderConfig, LLMResponse
 from llm_providers.factory import ProviderFactory
+
+from tests.integration.harness import SysModulesSnapshot
 
 # Same singleton instances the bridges use (agent.events and
 # tools.workspace.worker_registry are NOT purged by the fixture, so the
@@ -166,13 +167,19 @@ def mock_server():
     prev_mock_cls = ProviderFactory._get_providers().get("mock")
     _register_mock_provider()
 
-    # Clear cached modules so re-import picks up the mock
+    # Clear cached modules so re-import picks up the mock.  Use the shared
+    # SysModulesSnapshot helper (rather than a bare ``del sys.modules[name]``)
+    # so the matching parent-package attributes are purged too and, crucially,
+    # the original state is RESTORED on teardown.  A bare delete leaves the
+    # purged names gone from ``sys.modules`` and stale parent attrs behind,
+    # which later breaks ``importlib.reload`` with
+    # ``ImportError: module ... not in sys.modules`` and pollutes other tests.
     mod_prefixes = (
         "web_ui.backend", "agent.config.provider_profile", "thoughtmachine.bootstrap"
     )
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
+    snapshot = SysModulesSnapshot(mod_prefixes)
+    snapshot.snapshot()
+    snapshot.purge()
 
     server_mod = importlib.import_module("web_ui.backend.server")
     app = server_mod.app
@@ -196,6 +203,9 @@ def mock_server():
         providers.pop("mock", None)
     else:
         providers["mock"] = prev_mock_cls
+    # Reinstate the sys.modules entries (and parent-package attributes) that we
+    # purged above, so the process is left exactly as we found it.
+    snapshot.restore()
 
 
 @pytest.fixture(autouse=True)
