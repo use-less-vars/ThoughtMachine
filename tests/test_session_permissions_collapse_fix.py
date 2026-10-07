@@ -201,9 +201,9 @@ class TestRoundTrip:
         }
         capped = apply_workspace_ceiling(ceiling, dict(FULL_PERMS))
         assert capped["network"] == "banned"
-        # An ask ceiling over the write grant caps to the below-ask tier
-        # ('read'), never fabricating an effective 'ask'.
-        assert capped["filesystem"] == "read"
+        # An ask ceiling over the write grant caps to the ceiling level
+        # itself ('ask').
+        assert capped["filesystem"] == "ask"
         assert capped["git"] == "read"
         assert capped["container"] is False
         # Every stored key survives the cap (no partial collapse), and no

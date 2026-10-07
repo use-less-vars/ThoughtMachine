@@ -6,9 +6,9 @@ session grant BELOW the session level, but a ceiling may never CREATE an
 effective ``ask`` value: interactive prompting is reserved for genuine
 session-level ``ask`` grants, which rank at the ceiling and pass through
 unchanged.  An ``ask`` ceiling over a more-permissive session grant caps to
-the most permissive tier below ask (``read`` where a read tier exists, else
-``banned``) -- ``host_bash`` (no read tier) always caps to ``banned``, never
-``ask``.
+the ceiling level itself (``ask``) on the shared scale -- while the
+``host_bash`` scale (no tier between ``banned`` and ``ask``) still caps to
+``banned``, never ``ask``.
 
 Mechanism under test: ``apply_workspace_ceiling`` (ceiling × session merge)
 and ``check_required_categories`` with a ``NullEventBus`` (worker context) --
@@ -185,25 +185,25 @@ class TestBannedCeilingDeniesWithoutPrompt:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 4. An ask ceiling over a more-permissive grant never fabricates 'ask'
-#    (interactive prompting stays reserved for genuine session-level ask).
+# 4. An ask ceiling caps a more-permissive grant: 'ask' on the shared scale,
+#    'banned' on the host_bash scale (no tier between banned and ask).
 # ──────────────────────────────────────────────────────────────────────────
-class TestAskCeilingNeverFabricatesPrompt:
+class TestAskCeilingCapsMorePermissionGrant:
     def test_host_bash_ask_ceiling_caps_allow_grant_to_banned(self):
-        # host_bash has no read tier: an ask ceiling over an allow grant
-        # must cap to 'banned' -- never emit 'ask' (which would route every
-        # host_bash call into the interactive prompt flow and effectively
-        # RAISE the operator's ceiling).
+        # host_bash has no tier between banned and ask: an ask ceiling over
+        # an allow grant caps to 'banned' -- never emit 'ask' (which would
+        # route every host_bash call into the interactive prompt flow and
+        # effectively RAISE the operator's ceiling).
         assert apply_workspace_ceiling(
             {"host_bash": "ask"}, {"host_bash": "allow"}
         ) == {"host_bash": "banned"}
 
-    def test_network_ask_ceiling_caps_write_grant_to_banned(self):
-        # Generic-scale analog: network has no read tier either, so an ask
-        # ceiling over a write grant caps to 'banned'.
+    def test_network_ask_ceiling_caps_write_grant_to_ask(self):
+        # On the shared scale the ceiling level itself becomes the effective
+        # value: an ask ceiling over a write grant caps to 'ask'.
         assert apply_workspace_ceiling(
             {"network": "ask"}, {"network": "write"}
-        ) == {"network": "banned"}
+        ) == {"network": "ask"}
 
     def test_capped_allow_annotates_ask_ceiling_but_stays_banned(self):
         eff = get_effective_permissions(
@@ -232,21 +232,27 @@ class TestAskCeilingNeverFabricatesPrompt:
 # ──────────────────────────────────────────────────────────────────────────
 class TestCeilingDenialMessageCarriesSuffix:
     def test_network_ceiling_caused_denial_names_ceiling(self):
+        # A network ceiling that HARD-DENIES the session grant (``banned``)
+        # produces a ceiling-caused denial whose text NAMES the ceiling level.
+        # (An ``ask`` ceiling no longer fabricates a below-ask hard-deny tier:
+        # it caps the write grant to ``ask`` itself, which routes to the
+        # prompt/ask flow -- so only a hard-denying ceiling still yields the
+        # ceiling-named hard denial this class pins.)
         eff = get_effective_permissions(
             SessionPermissions(network="write"),
             _PERMISSIVE_CAPS,
-            {"network": "ask"},
+            {"network": "banned"},
         )
         assert eff["network"] == "banned"
         assert getattr(eff, "_ceiling_annotations", {}).get("network") == {
             "pre": "write",
-            "level": "ask",
+            "level": "banned",
         }
 
         ok, msg = _run_gate(["network:write"], eff)
         assert ok is False
         assert (
             "Session permission for network is write, but workspace ceiling "
-            "is ask." in msg
+            "is banned." in msg
         )
         assert json.loads(json.dumps(msg)) == msg  # JSON-safe string

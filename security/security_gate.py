@@ -208,18 +208,6 @@ _WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
     "docker",
 }
 
-#: Session-permission keys whose level scale has a ``read`` tier BELOW
-#: ``ask``.  A workspace ceiling of ``ask`` caps a more-permissive session
-#: grant to ``read`` for these keys; session scales without a read tier
-#: (``network``) cap to ``banned``.  Either way an ask ceiling never
-#: fabricates an effective ``ask`` grant -- interactive prompting stays
-#: reserved for genuine session-level ``ask``.
-_ASK_CEILING_READ_TIER_KEYS = frozenset({
-    "filesystem",
-    "git",
-})
-
-
 def apply_workspace_ceiling(
     workspace_permissions: Dict[str, Any],
     session_permissions: Dict[str, Any],
@@ -257,12 +245,10 @@ def apply_workspace_ceiling(
           ceiling is write-level or unlimited; any stricter ceiling forces
           ``False``.  The ``container`` key is always emitted as a boolean.
         * A workspace ceiling of ``ask`` caps a more-permissive session
-          value to the most permissive tier BELOW ask: ``read`` for
-          resources whose session scale has a read tier (filesystem, git),
-          else ``banned`` (network).  An ask ceiling
-          therefore NEVER yields an effective ``ask`` grant -- interactive
-          prompting stays reserved for genuine session-level ``ask``
-          grants, which rank at the ceiling and pass through unchanged.
+          value to the ceiling level itself -- ``ask``.  Genuine
+          session-level ``ask``/``read`` grants that already rank at or
+          below the ceiling pass through unchanged, so an ask ceiling
+          yields an effective ``ask`` grant for any session value above it.
         * ``host_bash`` is capped on its own scale -- ``banned < ask <
           allow`` -- so a workspace ceiling of ``banned``/``ask``/``allow``
           (or a boolean, ``True`` ~ ``allow``, ``False`` ~ ``banned``) caps
@@ -398,21 +384,11 @@ def apply_workspace_ceiling(
         if session_rank is None:
             continue
         if ceiling_rank < session_rank:
-            # A workspace 'ask' ceiling (rank 2.0) must never fabricate an
-            # effective 'ask' grant: cap to the most permissive tier BELOW
-            # ask -- 'read' where the session scale has one, else 'banned'.
-            # Genuine session-level 'ask' grants rank equal to the ceiling
-            # and pass through unchanged above (prompt flow preserved).
-            if ceiling_rank == 2.0:
-                result[key] = (
-                    "read" if key in _ASK_CEILING_READ_TIER_KEYS else "banned"
-                )
-            else:
-                result[key] = (
-                    ceiling
-                    if isinstance(ceiling, bool)
-                    else str(ceiling).lower()
-                )
+            result[key] = (
+                ceiling
+                if isinstance(ceiling, bool)
+                else str(ceiling).lower()
+            )
     return result
 
 

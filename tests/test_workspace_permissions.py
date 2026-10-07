@@ -318,19 +318,9 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"filesystem": "read"}, {"filesystem": "write"})
         assert result == {"filesystem": "read"}
 
-    def test_ask_ceiling_caps_write_to_below_ask_tier(self):
-        # An ask ceiling must never fabricate an effective ask grant: it caps
-        # a more-permissive session value to the most permissive tier below
-        # ask -- 'read' on scales that have one.
-        result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "write"})
-        assert result == {"filesystem": "read"}
-
     def test_ask_ceiling_caps_write_to_ask(self):
-        # A1 RED: once _ASK_CEILING_READ_TIER_KEYS is deleted, an ask ceiling
-        # caps a more-permissive session value to the ceiling level itself --
-        # 'ask' -- by ordering (write rank 3.0 -> ask rank 2.0), rather than a
-        # fabricated below-ask 'read' tier. Fails at HEAD; the pinned test
-        # above still asserts the old 'read' outcome (A7 flips it).
+        # An ask ceiling caps a more-permissive session value to the ceiling
+        # level itself -- 'ask' -- by ordering (write rank 3.0 -> ask rank 2.0).
         result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "write"})
         assert result == {"filesystem": "ask"}
 
@@ -409,9 +399,9 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"not_a_resource": "banned"}, {"filesystem": "write"})
         assert result == {"filesystem": "write"}
 
-    def test_git_ask_ceiling_caps_write_to_read(self):
+    def test_git_ask_ceiling_caps_write_to_ask(self):
         result = apply_workspace_ceiling({"git": "ask"}, {"git": "write"})
-        assert result == {"git": "read"}
+        assert result == {"git": "ask"}
 
     def test_ask_ceiling_over_session_ask_stands(self):
         # A genuine session-level ask grant ranks AT the ask ceiling and
@@ -424,15 +414,15 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "read"})
         assert result == {"filesystem": "read"}
 
-    def test_network_ask_ceiling_caps_write_to_banned(self):
-        # network's scale (banned|ask|write|outbound) has no read tier below
-        # ask, so an ask ceiling over a write grant caps to banned.
+    def test_network_ask_ceiling_caps_write_to_ask(self):
+        # An ask ceiling caps a more-permissive network grant to the ceiling
+        # level itself -- 'ask' -- by ordering (write rank 3.0 -> ask rank 2.0).
         result = apply_workspace_ceiling({"network": "ask"}, {"network": "write"})
-        assert result == {"network": "banned"}
+        assert result == {"network": "ask"}
 
-    def test_network_ask_ceiling_caps_outbound_to_banned(self):
+    def test_network_ask_ceiling_caps_outbound_to_ask(self):
         result = apply_workspace_ceiling({"network": "ask"}, {"network": "outbound"})
-        assert result == {"network": "banned"}
+        assert result == {"network": "ask"}
 
     def test_host_bash_ask_ceiling_caps_allow_to_banned(self):
         # host_bash has no tier between banned and ask, so an ask ceiling
@@ -552,25 +542,24 @@ class TestEffectivePermissionsCeilingWiring:
         assert eff["git"] == "read"
         assert "git_read" not in eff and "git_write" not in eff
 
-    def test_git_ceiling_ask_read_splits_never_ask(self):
-        # An ask ceiling over a session write grant caps git to read -- no
-        # effective value is ever ask.
+    def test_git_ceiling_ask_splits_to_ask(self):
+        # An ask ceiling over a session write grant caps git to the ceiling
+        # level itself -- 'ask'.
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(self._session(), workspace, {"git": "ask"})
-        assert eff["git"] == "read"
-        assert "ask" not in [str(v) for v in eff.values()]
+        assert eff["git"] == "ask"
 
-    def test_filesystem_ceiling_ask_caps_write_to_read(self):
+    def test_filesystem_ceiling_ask_caps_write_to_ask(self):
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(self._session(), workspace, {"filesystem": "ask"})
-        assert eff["filesystem"] == "read"
+        assert eff["filesystem"] == "ask"
 
-    def test_network_ceiling_ask_caps_write_to_banned(self):
-        # network has no read tier below ask, so the ask ceiling over the
-        # write grant caps straight to banned.
+    def test_network_ceiling_ask_caps_write_to_ask(self):
+        # The ask ceiling over the write grant caps network to the ceiling
+        # level itself -- 'ask'.
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(self._session(), workspace, {"network": "ask"})
-        assert eff["network"] == "banned"
+        assert eff["network"] == "ask"
 
     def test_genuine_session_ask_git_preserved(self):
         # A session-level git ask grant ranks AT the ask ceiling and passes
@@ -617,6 +606,8 @@ class TestEffectivePermissionsCeilingWiring:
         assert eff["git"] == "read"
 
     def test_git_ask_ceiling_caps_wofb_grant_wiring(self):
+        # The ask ceiling (rank 2.0) caps the wofb grant (rank 2.5) to the
+        # ceiling level itself -- 'ask'.
         workspace = WorkspaceCapabilities()
         session = SessionPermissions(
             filesystem="write",
@@ -625,7 +616,7 @@ class TestEffectivePermissionsCeilingWiring:
             git="write_on_feature_branch",
         )
         eff = get_effective_permissions(session, workspace, {"git": "ask"})
-        assert eff["git"] == "read"
+        assert eff["git"] == "ask"
 
     def test_network_write_ceiling_caps_outbound_grant_wiring(self):
         workspace = WorkspaceCapabilities()
@@ -832,7 +823,6 @@ class TestResolveFullConfigCeiling:
         perms = merged["session_permissions"]
         assert perms["container"] is False
         # coding preset's network 'ask' ceiling caps the factory network
-        # 'write' grant; network has no read tier below ask, so the cap
-        # lands on 'banned' (an ask ceiling never yields an effective ask).
-        assert perms["network"] == "banned"
+        # 'write' grant to the ceiling level itself -- 'ask'.
+        assert perms["network"] == "ask"
 
