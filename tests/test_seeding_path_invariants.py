@@ -76,49 +76,30 @@ def seed_server():
         "session",
     )
 
-    # Exact save/restore: snapshot EVERY module object under our prefixes plus
-    # the interpreter's sys.path BEFORE the harness mutates interpreter state,
-    # so teardown can put the process back byte-for-byte (no half-restored
-    # module objects left for later tests / other importers to trip over).
-    saved_modules = {
-        name: mod
-        for name, mod in sys_mod.modules.items()
-        if any(name.startswith(p) for p in mod_prefixes)
-    }
+    from tests.integration.harness import purged_sys_modules
+
     saved_sys_path = list(sys_mod.path)
 
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
+    try:
+        with purged_sys_modules(mod_prefixes):
+            server_mod = importlib.import_module("web_ui.backend.server")
+            app = server_mod.app
 
-    server_mod = importlib.import_module("web_ui.backend.server")
-    app = server_mod.app
+            vault_path = fake_home_path / ".thoughtmachine"
 
-    vault_path = fake_home_path / ".thoughtmachine"
+            yield app, vault_path
 
-    yield app, vault_path
-
-    # ── Exact restoration ────────────────────────────────────────────────
-    # 1. Drop every prefixes-module the harness (or its imports) added, so no
-    #    freshly-imported module object leaks past the fixture.
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
-    # 2. Re-insert the EXACT module objects that were live before the harness,
-    #    giving later importers the same identities they saw before.
-    sys_mod.modules.update(saved_modules)
-    # 3. Restore sys.path verbatim.
-    sys_mod.path[:] = saved_sys_path
-
-    patcher.stop()
-    if old_home_env is not None:
-        os.environ["HOME"] = old_home_env
-    else:
-        os.environ.pop("HOME", None)
-    for key, val in saved_env.items():
-        if val is not None:
-            os.environ[key] = val
-    shutil.rmtree(tmp_home, ignore_errors=True)
+    finally:
+        sys_mod.path[:] = saved_sys_path
+        patcher.stop()
+        if old_home_env is not None:
+            os.environ["HOME"] = old_home_env
+        else:
+            os.environ.pop("HOME", None)
+        for key, val in saved_env.items():
+            if val is not None:
+                os.environ[key] = val
+        shutil.rmtree(tmp_home, ignore_errors=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
