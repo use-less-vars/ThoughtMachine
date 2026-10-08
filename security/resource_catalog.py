@@ -108,7 +108,7 @@ ceiling applied).
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -260,3 +260,175 @@ def coerce_resource_permissions(raw: dict) -> dict:
             continue
         clean[key] = value
     return clean
+
+
+#: Legacy ``container``/``docker`` ceiling strings and their canonical
+#: boolean ceiling (mirrors the workspace-permission loader's string fold).
+_LEGACY_CONTAINER_CEILING_BOOL: Dict[str, bool] = {
+    "True": True,
+    "False": False,
+    "banned": False,
+    "read": False,
+    "ask": False,
+    "write": True,
+    "full": True,
+}
+
+#: Ceiling-permissiveness ranking used only to fold the removed legacy git
+#: grains (``git_read`` / ``git_write``) onto the single canonical ``git``
+#: ceiling.  DERIVED from :data:`WORKSPACE_CEILING_LEVELS_RANKS` (restricted to
+#: the git ceiling vocabulary: banned < read < ask < write_on_feature_branch
+#: < write) so the fold order can never drift from the ceiling scale.
+_GIT_FOLD_RANKS: Dict[str, float] = {
+    level: WORKSPACE_CEILING_LEVELS_RANKS[level]
+    for level in (
+        "banned",
+        "read",
+        "ask",
+        "write_on_feature_branch",
+        "write",
+    )
+}
+
+
+def fold_legacy_workspace_ceiling(raw: dict) -> dict:
+    """Map legacy stored workspace ceiling values to canonical catalog values.
+
+    Single source of truth for the legacy->canonical workspace-ceiling fold,
+    shared by the read-time loader
+    (``web_ui.backend.config_manager.normalize_legacy_workspace_ceiling``,
+    which delegates here).  Old workspace ``config.json`` ``permissions``
+    maps were written with pre-catalog vocabulary: ``container``/``docker``
+    ceilings as strings or under the legacy ``docker`` alias key, ``full``
+    where ``write`` is canonical, and per-grain values that predate the
+    canonical level vocabulary.  This helper rewrites them to the canonical
+    values the PUT validator (``validate_workspace_permissions``) and
+    ``apply_workspace_ceiling`` understand.  The removed legacy ceiling
+    grains (``git_read``/``git_write``/``system``/``execution``) never appear
+    in the result:
+
+    - container & docker (docker is the legacy alias of container and is
+      emitted under the canonical ``container`` key, mirroring the PUT
+      validator): real bool passes through; 'True'/'False' -> bool;
+      'banned'|'read'|'ask' -> False; 'write'|'full' -> True; anything
+      else is left untouched.  The container ceiling is NEVER stringified.
+    - network: 'read' -> 'ask'
+    - mcp: 'read'|'ask' -> 'banned'; 'write' -> 'full'
+    - filesystem: 'full' -> 'write'
+    - git: 'full' -> 'write'; 'write_feature_branches' ->
+      'write_on_feature_branch'
+    - git_read / git_write (removed ceiling grains): folded onto the
+      single canonical ``git`` ceiling -- the folded level is the strongest
+      (most permissive) across every present git/git_read/git_write entry,
+      ranked on the workspace-ceiling scale (banned < read < ask <
+      write_on_feature_branch < write; mirrors
+      :data:`WORKSPACE_CEILING_LEVELS_RANKS`), so stored legacy intent
+      survives (e.g. {git_read: read, git_write: ask} -> git: ask;
+      {git_read: read, git_write: banned} -> git: read).  A git-grain value
+      outside {banned, ask, read, write} is dropped.
+    - system / execution (removed ceiling grains): always dropped --
+      system inspection is unconditionally available and execution is not
+      a user-configurable ceiling.
+    - host_bash: kept iff the value is in {banned, ask, allow}, else left
+      untouched
+    - unknown keys and values: left untouched, EXCEPT the four removed
+      legacy grains above which are always folded or dropped (the runtime
+      gate treats unknown keys as fail-open with a WARN, so they degrade
+      safely)
+
+    Returns a NEW dict (the input is never mutated).  Idempotent: canonical
+    input round-trips unchanged.  Logs a WARNING naming the resource, the
+    old value and the new value on every actual rewrite/fold/drop.
+    """
+
+    def _git_rank(level: Any) -> Optional[float]:
+        if isinstance(level, bool):
+            return 3.0 if level else 0.0
+        return _GIT_FOLD_RANKS.get(str(level).lower())
+
+    def _fold_git_ceiling(level: Any) -> None:
+        """Merge a canonical git ceiling level into *result* (strongest wins)."""
+        rank = _git_rank(level)
+        if rank is None:
+            return
+        current = result.get("git")
+        current_rank = _git_rank(current) if current is not None else None
+        if current is None or current_rank is None or rank > current_rank:
+            result["git"] = level
+
+    result: Dict[str, Any] = {}
+    for k, v in raw.items():
+        key = str(k)
+        if key in ("git_read", "git_write"):
+            # Removed ceiling grain: fold onto the single ``git`` ceiling.
+            # Only canonical git ceiling levels fold; anything else
+            # (legacy 'full', 'write_feature_branches', ...) could never
+            # cap a session grant canonically, so the grain is dropped.
+            if isinstance(v, str) and v in _GIT_FOLD_RANKS:
+                _fold_git_ceiling(v)
+                logger.warning(
+                    "legacy workspace ceiling %r: %r -> folded onto "
+                    "'git' (removed grain)", key, v,
+                )
+            else:
+                logger.warning(
+                    "legacy workspace ceiling %r: %r -> dropped "
+                    "(removed grain; git ceiling governed by 'git')", key, v,
+                )
+            continue
+        if key in ("system", "execution"):
+            # Removed ceiling grain: always dropped -- system inspection is
+            # unconditionally available and execution is not a
+            # user-configurable ceiling.
+            logger.warning(
+                "legacy workspace ceiling %r: %r -> dropped "
+                "(removed grain)", key, v,
+            )
+            continue
+        out_key = key
+        new_v = v
+        if key in ("container", "docker"):
+            # docker is the legacy alias of container; like the PUT
+            # validator, emit the result under 'container' only so the
+            # gate never sees a non-canonical docker key with a bool value.
+            out_key = "container"
+            if isinstance(v, bool):
+                new_v = v
+            elif isinstance(v, str):
+                new_v = _LEGACY_CONTAINER_CEILING_BOOL.get(v, v)
+            else:
+                new_v = v
+        elif key == "network" and v == "read":
+            new_v = "ask"
+        elif key == "mcp":
+            if v in ("read", "ask"):
+                new_v = "banned"
+            elif v == "write":
+                new_v = "full"
+        elif key == "filesystem" and v == "full":
+            new_v = "write"
+        elif key == "git":
+            if v == "full":
+                new_v = "write"
+            elif v == "write_feature_branches":
+                new_v = "write_on_feature_branch"
+            # A raw 'git' entry may follow (or precede) folded git grains;
+            # merge so the strongest canonical git ceiling wins and the
+            # result never carries a weaker overwrite.
+            current = result.get("git")
+            if current is not None:
+                current_rank = _git_rank(current)
+                new_rank = _git_rank(new_v)
+                if current_rank is not None and (
+                    new_rank is None or current_rank >= new_rank
+                ):
+                    continue  # existing (folded/raw) level is no weaker
+        elif key == "host_bash":
+            if v not in ("banned", "ask", "allow"):
+                new_v = v
+        if new_v is not v:
+            logger.warning(
+                "legacy workspace ceiling %r: %r -> %r", key, v, new_v,
+            )
+        result[out_key] = new_v
+    return result

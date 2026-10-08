@@ -45,6 +45,7 @@ from agent.config.config_manager import (
 from agent.config.deep_merge import deep_merge
 from agent.config.service import create_agent_config_service
 
+from security.resource_catalog import fold_legacy_workspace_ceiling
 from tools.host_resource_policy import load_workspace_config
 
 logger = logging.getLogger(__name__)
@@ -713,120 +714,7 @@ def normalize_legacy_workspace_ceiling(raw: dict) -> dict:
     input round-trips unchanged.  Logs a WARNING naming the resource, the
     old value and the new value on every actual rewrite/fold/drop.
     """
-    #: Ceiling-permissiveness ranking used to fold the removed legacy git
-    #: grains (git_read / git_write) onto the single canonical ``git``
-    #: ceiling.  Mirrors ``security.resource_catalog``
-    #: WORKSPACE_CEILING_LEVELS_RANKS (banned < read < ask <
-    #: write_on_feature_branch < write): the fold keeps the strongest
-    #: (most permissive) git ceiling level present so stored legacy intent
-    #: survives the migration (legacy coding-preset {git_read: read,
-    #: git_write: ask} folds to git: ask -- reads and prompted writes keep
-    #: working; research-preset {git_read: read, git_write: banned} folds
-    #: to git: read -- read-only).
-    _GIT_FOLD_RANKS = {
-        "banned": 0.0,
-        "read": 1.0,
-        "ask": 2.0,
-        "write_on_feature_branch": 2.5,
-        "write": 3.0,
-    }
-
-    def _git_rank(level: Any) -> Optional[float]:
-        if isinstance(level, bool):
-            return 3.0 if level else 0.0
-        return _GIT_FOLD_RANKS.get(str(level).lower())
-
-    def _fold_git_ceiling(level: Any) -> None:
-        """Merge a canonical git ceiling level into *result* (strongest wins)."""
-        rank = _git_rank(level)
-        if rank is None:
-            return
-        current = result.get("git")
-        current_rank = _git_rank(current) if current is not None else None
-        if current is None or current_rank is None or rank > current_rank:
-            result["git"] = level
-
-    result: Dict[str, Any] = {}
-    for k, v in raw.items():
-        key = str(k)
-        if key in ("git_read", "git_write"):
-            # Removed ceiling grain: fold onto the single ``git`` ceiling.
-            # Only canonical git ceiling levels fold; anything else
-            # (legacy 'full', 'write_feature_branches', ...) could never
-            # cap a session grant canonically, so the grain is dropped.
-            if isinstance(v, str) and v in _GIT_FOLD_RANKS:
-                _fold_git_ceiling(v)
-                log("WARNING", "server.config",
-                    f"legacy workspace ceiling '{key}': {v!r} -> folded onto "
-                    f"'git' (removed grain)")
-            else:
-                log("WARNING", "server.config",
-                    f"legacy workspace ceiling '{key}': {v!r} -> dropped "
-                    f"(removed grain; git ceiling governed by 'git')")
-            continue
-        if key in ("system", "execution"):
-            # Removed ceiling grain: always dropped -- system inspection is
-            # unconditionally available and execution is not a
-            # user-configurable ceiling.
-            log("WARNING", "server.config",
-                f"legacy workspace ceiling '{key}': {v!r} -> dropped "
-                f"(removed grain)")
-            continue
-        out_key = key
-        new_v = v
-        if key in ("container", "docker"):
-            # docker is the legacy alias of container; like the PUT
-            # validator, emit the result under 'container' only so the
-            # gate never sees a non-canonical docker key with a bool value.
-            out_key = "container"
-            if isinstance(v, bool):
-                new_v = v
-            elif isinstance(v, str):
-                if v == "True":
-                    new_v = True
-                elif v == "False":
-                    new_v = False
-                elif v in ("banned", "read", "ask"):
-                    new_v = False
-                elif v in ("write", "full"):
-                    new_v = True
-                else:
-                    new_v = v
-            else:
-                new_v = v
-        elif key == "network" and v == "read":
-            new_v = "ask"
-        elif key == "mcp":
-            if v in ("read", "ask"):
-                new_v = "banned"
-            elif v == "write":
-                new_v = "full"
-        elif key == "filesystem" and v == "full":
-            new_v = "write"
-        elif key == "git":
-            if v == "full":
-                new_v = "write"
-            elif v == "write_feature_branches":
-                new_v = "write_on_feature_branch"
-            # A raw 'git' entry may follow (or precede) folded git grains;
-            # merge so the strongest canonical git ceiling wins and the
-            # result never carries a weaker overwrite.
-            current = result.get("git")
-            if current is not None:
-                current_rank = _git_rank(current)
-                new_rank = _git_rank(new_v)
-                if current_rank is not None and (
-                    new_rank is None or current_rank >= new_rank
-                ):
-                    continue  # existing (folded/raw) level is no weaker
-        elif key == "host_bash":
-            if v not in ("banned", "ask", "allow"):
-                new_v = v
-        if new_v is not v:
-            log("WARNING", "server.config",
-                f"legacy workspace ceiling '{key}': {v!r} -> {new_v!r}")
-        result[out_key] = new_v
-    return result
+    return fold_legacy_workspace_ceiling(raw)
 
 
 def _load_workspace_permission_ceiling(workspace_id: str) -> Dict[str, Any]:

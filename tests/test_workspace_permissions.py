@@ -327,6 +327,81 @@ class TestNormalizeLegacyWorkspaceCeiling:
         }
 
 
+def test_canonical_fold_equivalence_to_config_manager():
+    """The read-time ``normalize_legacy_workspace_ceiling`` is a thin
+    delegation to ``security.resource_catalog.fold_legacy_workspace_ceiling``:
+    the two must agree on every input (and neither may mutate its argument),
+    so extracting the fold into the canonical module is behaviour-preserving.
+    """
+    from security.resource_catalog import fold_legacy_workspace_ceiling
+
+    cases = [
+        {},
+        {"container": "ask"},
+        {"container": "read"},
+        {"container": "banned"},
+        {"container": "write"},
+        {"container": "full"},
+        {"container": "True"},
+        {"container": "False"},
+        {"container": True},
+        {"container": False},
+        {"container": "bogus"},
+        {"docker": "write"},
+        {"docker": "full"},
+        {"docker": "read"},
+        {"docker": "ask"},
+        {"docker": "banned"},
+        {"docker": "False"},
+        {"network": "read"},
+        {"network": "outbound"},
+        {"network": "ask"},
+        {"mcp": "read"},
+        {"mcp": "ask"},
+        {"mcp": "write"},
+        {"mcp": "connect"},
+        {"filesystem": "full"},
+        {"filesystem": "write"},
+        {"git": "full"},
+        {"git": "write"},
+        {"git": "read"},
+        {"git": "write_feature_branches"},
+        {"git": "write_on_feature_branch"},
+        {"system": "full"},
+        {"system": "read"},
+        {"execution": "full"},
+        {"git_read": "full"},
+        {"git_read": "read"},
+        {"git_write": "ask"},
+        {"git_write": "banned"},
+        {"git_read": "read", "git_write": "ask"},
+        {"git_write": "banned", "git": "read"},
+        {"git": "write", "git_read": "read"},
+        {"git_read": "ask", "git_write": "write"},
+        {"unknown_key": "whatever", "host_bash": "read"},
+        {"host_bash": "allow"},
+        {"host_bash": "banned"},
+        {"host_bash": "ask"},
+        {
+            "docker": "write",
+            "git": "write_feature_branches",
+            "network": "read",
+            "mcp": "write",
+            "filesystem": "full",
+            "system": "full",
+            "container": "ask",
+            "execution": "full",
+        },
+    ]
+    for raw in cases:
+        snapshot = dict(raw)
+        canonical = fold_legacy_workspace_ceiling(dict(raw))
+        delegating = config_manager.normalize_legacy_workspace_ceiling(dict(raw))
+        assert canonical == delegating, raw
+        # neither path may mutate its input
+        assert raw == snapshot, raw
+
+
 class TestApplyWorkspaceCeiling:
     """Unit tests for apply_workspace_ceiling (pure dict reduction)."""
 
