@@ -135,6 +135,17 @@ describe('createWorkspace', () => {
     expect(useWorkspaceStore.getState().workspaceList.length).toBe(before)
     expect(useWorkspaceStore.getState().currentWorkspace).toBeNull()
   })
+
+  it('marks the container ceiling as the boolean true, not the string "enabled"', () => {
+    // container is the one boolean resource in the canonical backend catalog
+    // (security/resource_catalog.py: RESOURCE_CATALOG.container === [True, False]),
+    // so its ceiling is a boolean, never the display string 'enabled'.
+    useWorkspaceStore.getState().createWorkspace('hardware-hacking')
+    const st = useWorkspaceStore.getState()
+    const perm = st.currentWorkspace.permissions.find((p) => p.name === 'container')
+    expect(perm).toBeTruthy()
+    expect(perm.ceiling).toBe(true)
+  })
 })
 
 // ==========================================================================
@@ -154,8 +165,8 @@ describe('fetchWorkspaceConfig', () => {
       'git', 'filesystem', 'container', 'network', 'mcp', 'host_bash',
     ])
     const containerPerm = st.currentWorkspace.permissions.find((p) => p.name === 'container')
-    expect(containerPerm.ceiling).toBe('enabled') // backend bool -> 'enabled'
-    expect(containerPerm.effective).toBe('enabled')
+    expect(containerPerm.ceiling).toBe(true)
+    expect(containerPerm.effective).toBe(true)
     expect(st.currentWorkspace.workers).toEqual([
       expect.objectContaining({ name: 'w1', runtimeStatus: 'ready', systemPrompt: 'p' }),
     ])

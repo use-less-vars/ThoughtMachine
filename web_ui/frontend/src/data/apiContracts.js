@@ -197,7 +197,7 @@ export const API_ENDPOINTS = {
  * @property {string}   risk        — 'Low' | 'Medium' | 'High' | 'Critical'
  * @property {string}   purposeId   — purpose definition id (e.g. 'code-development')
  * @property {string}   createdAt   — ISO timestamp
- * @property {Array<Resource>}    resources     — granted resources (git/filesystem/network/container/serial)
+ * @property {Array<Resource>}    resources     — granted resources (git/filesystem/network/container)
  * @property {Array<Permission>}  permissions   — name/ceiling/effective triples
  * @property {Array<Tool>}        tools         — enabled tool definitions
  * @property {Array<Credential>}  credentials   — stored credentials (local overlay)
@@ -210,7 +210,7 @@ export const API_ENDPOINTS = {
 /**
  * Resource object.
  * @typedef {Object} Resource
- * @property {string}  name        — 'git' | 'filesystem' | 'network' | 'container' | 'serial'
+ * @property {string}  name        — 'git' | 'filesystem' | 'network' | 'container'
  * @property {string}  icon        — emoji icon
  * @property {string}  description — human description
  * @property {boolean} containerized — derived from purposeDefinitions requiresDocker
@@ -221,8 +221,8 @@ export const API_ENDPOINTS = {
 /**
  * Permission object.
  * @typedef {Object} Permission
- * @property {string} name      — 'git' | 'filesystem' | 'network' | 'container' | 'serial'
- * @property {string} ceiling   — max allowed value ('write' | 'enabled' | ...)
+ * @property {string} name      — 'git' | 'filesystem' | 'network' | 'container'
+ * @property {string|boolean} ceiling   — max allowed value (e.g. 'write'; container is boolean true/false)
  * @property {string} effective — current effective value
  */
 

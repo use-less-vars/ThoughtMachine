@@ -13,6 +13,11 @@ const WORKER_STATUS_COLORS = {
 
 const isRunningStatus = (status) => /^(running|active|up|started)$/i.test(status || '')
 
+// container is the one boolean session resource; render its raw boolean as a
+// display label. Component-local on purpose — the store keeps booleans.
+const renderPermissionValue = (value) =>
+  typeof value === 'boolean' ? (value ? 'Enabled' : 'Disabled') : (value ?? '—')
+
 /**
  * Slide-out session details panel (toggled from the SessionTab header).
  * Four read-only/action sections:
@@ -154,8 +159,8 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
                 {permissions.map((p) => (
                   <tr key={p.name}>
                     <td>{p.name}</td>
-                    <td>{p.ceiling ?? '—'}</td>
-                    <td>{p.effective ?? '—'}</td>
+                    <td>{renderPermissionValue(p.ceiling)}</td>
+                    <td>{renderPermissionValue(p.effective)}</td>
                   </tr>
                 ))}
               </tbody>

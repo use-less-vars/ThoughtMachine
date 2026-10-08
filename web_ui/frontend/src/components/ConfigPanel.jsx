@@ -3,7 +3,7 @@ import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
 import SessionWorkspaceTab from './SessionWorkspaceTab';
 import PromptLibrary from './PromptLibrary';
-import useStore from '../store/useStore';
+import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
 import { apiUrl } from '../apiBase';
 
 // Canonical-only option lists, permissive-first; no rank map needed — some
@@ -16,17 +16,9 @@ const SESSION_PERMISSION_OPTION_ORDER = {
   mcp: ['full', 'connect', 'banned'],
   host_bash: ['allow', 'ask', 'banned'],
 }
-// Mirrors backend SAFE_DEFAULTS for the canonical session resources. useStore's
-// PERMISSION_DEFAULTS carries the same six canonical keys, so either may seed
-// the session-permissions tab.
-const CANONICAL_PERMISSION_DEFAULTS = {
-  git: 'read',
-  filesystem: 'read',
-  container: false,
-  network: 'banned',
-  mcp: 'banned',
-  host_bash: 'banned',
-}
+// Mirrors backend SAFE_DEFAULTS for the canonical session resources; sourced
+// from useStore's PERMISSION_DEFAULTS so the two cannot drift.
+const CANONICAL_PERMISSION_DEFAULTS = PERMISSION_DEFAULTS
 // Only these keys may be PUT to /api/session/{id}/permissions (mirrors the
 // backend session-permission store schema).
 const CANONICAL_SESSION_PERMISSION_KEYS = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash']

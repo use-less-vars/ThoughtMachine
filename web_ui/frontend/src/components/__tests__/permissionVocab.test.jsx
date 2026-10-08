@@ -117,13 +117,25 @@ describe('PERMISSION_RANK_ORDER (frontend mirror of backend)', () => {
     expect(PERMISSION_RANK_ORDER).toEqual({
       banned: 0,
       none: 1,
-      ask: 1.5,
-      read: 2,
-      outbound: 2.5,
+      ask: 2,
+      read: 1,
+      connect: 1,
+      outbound: 3.5,
       write: 3,
       write_on_feature_branch: 3,
       full: 4,
     });
+  });
+
+  it('ranks read below ask and carries connect (canonical ordering)', () => {
+    // Canonical source: security/resource_catalog.py::GRANT_LEVEL_RANKS
+    // (banned 0, read 1, ask 2, connect 1, ... outbound 3.5, full 4).
+    // At HEAD this mirror carries {ask: 1.5, read: 2, outbound: 2.5} and has
+    // no `connect` key at all.
+    expect(PERMISSION_RANK_ORDER.read).toBe(1);
+    expect(PERMISSION_RANK_ORDER.ask).toBe(2);
+    expect(PERMISSION_RANK_ORDER.outbound).toBe(3.5);
+    expect(PERMISSION_RANK_ORDER.connect).toBe(1);
   });
 });
 
