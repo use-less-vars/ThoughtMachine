@@ -141,8 +141,7 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
     "banned": 0,
     "read": 1,
     "ask": 2,
-    # TODO(edge3.1): connect rank pending Main
-    "connect": 3,
+    "connect": 1,
     "write": 3,
     "write_on_feature_branch": 3,
     "outbound": 3.5,
@@ -164,7 +163,6 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
 WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
     "banned": 0.0,
     "read": 1.0,
-    # TODO(edge3.1): connect rank pending Main
     "connect": 1.0,  # session-side mcp level (below ask/2.0)
     "none": 1.0,  # alias used by some purpose presets
     "ask": 2.0,

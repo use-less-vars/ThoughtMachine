@@ -207,6 +207,16 @@ def test_grant_level_ranks_orders_read_strictly_below_ask():
     assert GRANT_LEVEL_RANKS["outbound"] < GRANT_LEVEL_RANKS["full"]
 
 
+def test_grant_level_ranks_connect_aligns_with_read_tier():
+    """Edge 3.1: the mcp ``connect`` grant level ranks AT the read tier on the
+    shared grant-level scale -- matching ``WORKSPACE_CEILING_LEVELS_RANKS``
+    (where ``connect`` == ``read`` == 1.0) -- and therefore strictly BELOW
+    ``ask``.  A bare ``connect`` grant authorises read-equivalent mcp access,
+    not the interactive ``ask`` tier nor the ``write`` tier."""
+    assert GRANT_LEVEL_RANKS["connect"] == GRANT_LEVEL_RANKS["read"]
+    assert GRANT_LEVEL_RANKS["connect"] < GRANT_LEVEL_RANKS["ask"]
+
+
 class TestNormalizeLegacyWorkspaceCeiling:
     """normalize_legacy_workspace_ceiling rewrites pre-catalog stored ceilings to
     the canonical vocabulary the PUT validator and the security gate understand.

@@ -139,20 +139,24 @@ def test_value_satisfies_truth_table_pinned():
     }
     for allowed in expected:
         expected[allowed]["banned"] = True  # every grant satisfies 'banned'
-    # read tier: banned < read.
+    # read tier: banned < read == connect (rank 1).
     for allowed in ("read", "ask", "write", "write_on_feature_branch",
                     "outbound", "full", "connect"):
         expected[allowed]["read"] = True
-    # ask tier.
+    # ask tier (strictly above read; excludes connect).
     for allowed in ("ask", "write", "write_on_feature_branch", "outbound",
-                    "full", "connect"):
+                    "full"):
         expected[allowed]["ask"] = True
-    # write tier: write == write_on_feature_branch == connect (rank 3).
-    for allowed in ("write", "write_on_feature_branch", "outbound", "full",
-                    "connect"):
+    # write tier: write == write_on_feature_branch (rank 3); connect is
+    # read-tier (rank 1).
+    for allowed in ("write", "write_on_feature_branch", "outbound", "full"):
         expected[allowed]["write"] = True
         expected[allowed]["write_on_feature_branch"] = True
         expected[allowed]["connect"] = True
+    # connect (rank 1) shares the read tier: it satisfies the 'connect'
+    # requirement, and read / any higher allowance satisfies 'connect' too.
+    expected["read"]["connect"] = True
+    expected["connect"]["connect"] = True
     # outbound (3.5): satisfied by outbound/full only above write tier.
     for allowed in ("outbound", "full"):
         expected[allowed]["outbound"] = True
@@ -164,7 +168,7 @@ def test_value_satisfies_truth_table_pinned():
     expected["ask"]["write_on_feature_branch"] = ASK
     expected["ask"]["outbound"] = ASK
     expected["ask"]["full"] = ASK
-    expected["ask"]["connect"] = ASK
+    expected["ask"]["connect"] = True
 
     for allowed, row in expected.items():
         for required in required_cols:
