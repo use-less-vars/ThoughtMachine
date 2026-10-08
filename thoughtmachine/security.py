@@ -19,6 +19,8 @@ import uuid
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
+from security.resource_catalog import RESOURCE_CATALOG
+
 # Try to import the logging facade and types
 try:
     from agent.logging import log, LogEventType, LogLevel
@@ -114,8 +116,8 @@ class SessionPermissions(BaseModel):
 
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
-    - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask' | 'write_on_feature_branch'``
+    - **filesystem**: ``'banned' | 'read' | 'write' | 'ask'``
+    - **git**:        ``'banned' | 'read' | 'write' | 'ask' | 'write_on_feature_branch'``
     - **mcp**:        ``'banned' | 'connect' | 'full'``
     - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
 
@@ -133,12 +135,12 @@ class SessionPermissions(BaseModel):
         default='banned',
         description='Network access level for the session.',
     )
-    filesystem: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    filesystem: Literal['banned', 'read', 'write', 'ask'] = Field(
         default='read',
         description='Filesystem access level for the session.',
     )
     git: Literal[
-        'banned', 'read', 'write', 'full', 'ask', 'write_on_feature_branch',
+        'banned', 'read', 'write', 'ask', 'write_on_feature_branch',
     ] = Field(
         default='read',
         description='Git operations access level for the session.',
@@ -176,25 +178,25 @@ class SessionPermissions(BaseModel):
 # Coerce raw permission dicts into safe values, rejecting invalid keys
 # and levels.  Used at session load and config translation boundaries.
 
-VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
-# "full" is intentionally excluded — it is not a valid mode for
-# the Docker security gate and should not be settable from the UI.
-# ``write_on_feature_branch`` is a git-only level ("commit only on feature
-# branches"; the security gate maps it to a write-restricted git grant). It
-# must NOT leak into the other VALID_PERMISSION_LEVELS consumers
-# (filesystem/network), so ``git`` gets its own dedicated tuple below.
-GIT_PERMISSION_LEVELS = VALID_PERMISSION_LEVELS + ("write_on_feature_branch",)
+# The canonical session-grant vocabulary lives in ``security.resource_catalog``
+# (``RESOURCE_CATALOG``); the constants below are thin derived views of it, so
+# the session-permission surface can never drift from the catalog.
+#
+# ``VALID_PERMISSION_LEVELS`` mirrors the ``filesystem`` scale; "full" is
+# intentionally excluded — it is not a valid mode for the Docker security gate
+# and should not be settable from the UI.  ``write_on_feature_branch`` is a
+# git-only level ("commit only on feature branches"; the security gate maps it
+# to a write-restricted git grant).  It must NOT leak into the other
+# VALID_PERMISSION_LEVELS consumers (filesystem/network), so ``git`` uses the
+# full canonical git tuple below.
+VALID_PERMISSION_LEVELS = tuple(RESOURCE_CATALOG["filesystem"])
+GIT_PERMISSION_LEVELS = tuple(RESOURCE_CATALOG["git"])
 # Canonical permission categories: exactly the six session resources
 # (container, network, filesystem, git, mcp, host_bash). The legacy
 # ``system``/``execution`` categories and the split ``git_read``/``git_write``
 # grains no longer exist as permission resources.
 PERMISSION_SCHEMA: Dict[str, tuple] = {
-    "network":   ("banned", "ask", "write", "outbound"),
-    "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
-    "container":  (True, False),
-    "git":        GIT_PERMISSION_LEVELS,   # + write_on_feature_branch (git-only)
-    "mcp":        ("banned", "connect", "full"),
-    "host_bash":  ("banned", "ask", "allow"),
+    key: tuple(levels) for key, levels in RESOURCE_CATALOG.items()
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
     "container": False,

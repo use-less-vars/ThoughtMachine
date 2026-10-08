@@ -302,3 +302,61 @@ def test_disk_mode_schema_invalid_ceiling_fails_closed(hermetic_vault, monkeypat
     # NOT carry the _ceiling_annotations provenance attribute.
     assert getattr(eff, "_ceiling_annotations", None) in (None, {})
 
+
+# ── B5: the fail-closed CEILING must deny ``mcp`` too ────────────────────────
+def test_disk_fail_closed_ceiling_bans_mcp():
+    """The paired fail-closed sentinels must cover the SAME six resources.
+
+    ``_DISK_FAIL_CLOSED_CEILING`` must ban ``mcp`` exactly like
+    ``_DISK_FAIL_CLOSED_SESSION`` does, so a fail-closed ceiling is genuinely
+    deny-all: applied over a permissive ``mcp`` grant it must cap ``mcp`` to
+    ``banned`` (an unreadable ceiling denies ``mcp`` rather than leaving it
+    uncapped).  RED before ``mcp`` is added to the ceiling.
+    """
+    from security import security_gate as sg
+    from security.security_gate import apply_workspace_ceiling
+
+    # (1) Structural: the ceiling covers the same resources as the session.
+    session_keys = set(sg._DISK_FAIL_CLOSED_SESSION.model_dump())
+    assert set(sg._DISK_FAIL_CLOSED_CEILING) == session_keys
+    assert sg._DISK_FAIL_CLOSED_CEILING["mcp"] == "banned"
+
+    # (2) Behavioural: used as a ceiling over a permissive ``mcp`` grant, the
+    # fail-closed ceiling caps ``mcp`` to ``banned`` (an absent key = fail-open,
+    # the grant would survive).
+    capped = apply_workspace_ceiling(sg._DISK_FAIL_CLOSED_CEILING, {"mcp": "full"})
+    assert capped["mcp"] == "banned"
+
+
+# ── B4: the module fail-policy has two directions ────────────────────────────
+def test_fail_policy_unknown_io_is_fail_closed(hermetic_vault):
+    """The *I/O* direction of the module fail-policy.
+
+    Contrast the *value* direction, which is fail-OPEN.
+
+    An unreadable/missing on-disk configuration (here: NO ``config.json``, so
+    no ceiling is readable) must resolve to the most-restrictive sentinel --
+    fail-CLOSED -- even though the session GRANT sidecar is perfectly
+    readable.  The unreadable I/O is what forces the deny-all shape; a mere
+    unknown ceiling *value* never would.
+    """
+    ws_id, sid = "ws-b4io", "sess-1"
+    # A readable GRANT sidecar only -- the ceiling/config I/O is what fails.
+    write_session_permissions(
+        hermetic_vault, ws_id, sid,
+        {"filesystem": "write", "git": "write", "network": "write"},
+    )
+    eff = get_effective_permissions(
+        SessionPermissions(),  # ignored in disk mode
+        _FULL_CAPS,
+        session_id=sid,
+        workspace_id=ws_id,
+    )
+    # Most-restrictive sentinel: the deny-all six-key shape, never a grant,
+    # despite the permissive grant sidecar above.
+    assert eff == ALL_BANNED
+    # Distinct from the existing pins: the fail-closed result NAMES its I/O
+    # cause, proving the deny-all came from the unreadable I/O path (not from a
+    # legitimate ceiling reduction) -- this is the fail-CLOSED half of the
+    # policy that fail-OPENS for an unknown ceiling *value*.
+    assert getattr(eff, "_fail_closed_reason", "") != ""

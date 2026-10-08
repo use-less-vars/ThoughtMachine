@@ -12,6 +12,7 @@ import threading
 from typing import ClassVar, List
 
 import pytest
+from pydantic import ValidationError
 
 from agent.core.tool_executor import (
     DEFAULT_SESSION_PERMISSIONS,
@@ -154,20 +155,15 @@ class TestToolExecutorAskPermission:
         with _pending_requests_lock:
             assert len(_pending_security_requests) == 0
 
-    def test_git_full_bypasses_ask(self):
+    def test_git_full_is_rejected_fail_closed(self):
         """
-        RISK-3 (new contract): git='full' in the mirror does not grant -- the
-        id-less executor denies the git:write tool fail-closed.
+        RISK-3 (new contract): git='full' is NOT a canonical git level
+        (RESOURCE_CATALOG['git'] / GIT_PERMISSION_LEVELS omit it), so the
+        SessionPermissions mirror now REJECTS it fail-closed (ValidationError)
+        instead of accepting an over-broad level the id-less executor ignores.
         """
-        perms = SessionPermissions(git="full")
-        executor = self._make_executor([GitWriteTool], permissions=perms)
-
-        result = executor._execute_single_tool(
-            GitWriteTool, {}, "GitWriteTool", 0,
-            lambda: False, lambda: None, lambda: 0
-        )
-        assert "Permission denied" in result["result"], result
-        assert "git:write" in result["result"], result
+        with pytest.raises(ValidationError):
+            SessionPermissions(git="full")
 
     def test_git_read_bypasses_ask_with_read(self):
         """

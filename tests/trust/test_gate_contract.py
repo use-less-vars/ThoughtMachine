@@ -6,9 +6,10 @@ additional trust assertions that verify the gate behaves correctly for
 edge values not covered in the original parametrized matrix:
 
 Gaps filled here:
-  - filesystem="full"  → "rw"   (original only tests write/read/banned)
   - filesystem="ask"   → "ro"   (ask is treated restrictively at config level)
   - Container config with invalid session values → safe defaults
+  - filesystem="full"  → REJECTED (removed from the SessionPermissions
+                                 vocabulary; no longer an admitted grant)
 
 Also tests ``resolve_container_config()`` as the canonical reference for
 container config derivation.
@@ -17,6 +18,7 @@ container config derivation.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from security.security_gate import (
     ContainerConfigError,
@@ -82,21 +84,24 @@ class TestEffectivePermissionsEdgeValues:
     """Cover values missing from the original parametrized matrix."""
 
     def test_filesystem_full(self):
-        """filesystem='full' passes through unchanged (highest level)."""
-        session = _make_session(filesystem="full")
-        workspace = _make_workspace(filesystem_write=True)
-        eff = get_effective_permissions(session, workspace)
-        assert eff["filesystem"] == "full"
+        """filesystem='full' is rejected at construction (token removed).
+
+        'full' was removed from the SessionPermissions vocabulary; 'write'
+        is now the maximum filesystem grant.  The former "full passes
+        through unchanged (highest level)" premise is dead and is replaced
+        by a fail-closed rejection check."""
+        with pytest.raises(ValidationError):
+            _make_session(filesystem="full")
 
     def test_filesystem_full_workspace_denies_write_no_downgrade(self):
-        """filesystem='full' is NOT downgraded by workspace write deny
-        (only 'write' is downgraded, not 'full')."""
-        session = _make_session(filesystem="full")
-        workspace = _make_workspace(filesystem_write=False)
-        eff = get_effective_permissions(session, workspace)
-        assert eff["filesystem"] == "full", (
-            f"full should not be downgraded by ws deny, got {eff['filesystem']!r}"
-        )
+        """filesystem='full' is rejected before any workspace merge.
+
+        The former "full is NOT downgraded by workspace write deny" premise
+        died with the removal of the 'full' token (and 'write', the new max
+        level, *is* downgraded to 'read' by a workspace write deny).  The
+        token is now rejected at construction, so no merge is reached."""
+        with pytest.raises(ValidationError):
+            _make_session(filesystem="full")
 
     def test_filesystem_ask(self):
         """filesystem='ask' passes through unchanged."""
@@ -125,9 +130,11 @@ class TestContainerConfigEdgeValues:
         "session_fs, ws_fs_write, expected_mode",
         [
             # Original covers: write→rw, write+deny→ro, read→ro, banned→ro
-            # Gaps: full  → rw (full is write-level), ask → ro
-            ("full", True, "rw"),
-            ("full", False, "rw"),  # full not downgraded by workspace
+            # Gaps: ask → ro  (ask is treated restrictively at config level)
+            # ('full' was removed from the filesystem vocabulary; the former
+            #  "full→rw" / "full not downgraded" rows are gone.)
+            ("write", True, "rw"),
+            ("write", False, "ro"),  # write IS downgraded by workspace deny
             ("ask", True, "ro"),
             ("ask", False, "ro"),
         ],
@@ -138,7 +145,7 @@ class TestContainerConfigEdgeValues:
         ws_fs_write: bool,
         expected_mode: str,
     ):
-        """filesystem='full' produces 'rw'; 'ask' produces 'ro'."""
+        """filesystem='write' produces 'rw' (unless downgraded); 'ask' → 'ro'."""
         session = _make_session(filesystem=session_fs)
         workspace = _make_workspace(filesystem_write=ws_fs_write)
         eff = get_effective_permissions(session, workspace)
@@ -192,15 +199,18 @@ class TestResolveContainerConfigSlice:
         assert result.workspace_mode == "rw"
 
     def test_full_filesystem(self):
-        """full filesystem → rw."""
+        """full filesystem → ContainerConfigError (token removed).
+
+        'full' was removed from the SessionPermissions vocabulary, so the
+        resolver fails closed instead of admitting it.  (The former
+        "full → rw" premise is dead.)"""
         result = resolve_container_config(
             {"network": "write", "filesystem": "full", "container": True},
             WorkspaceCapabilities.default(),
             LIFECYCLE_PERSISTENT,
         )
-        assert result.network_mode == "bridge"
-        assert result.workspace_mode == "rw"
-        assert result.effective["filesystem"] == "full"
+        assert isinstance(result, ContainerConfigError)
+        assert result.code == "bad_permissions"
 
     def test_ask_filesystem(self):
         """ask filesystem → ro (ask is not write-level)."""
@@ -223,15 +233,20 @@ class TestResolveContainerConfigSlice:
         assert result.workspace_mode == "rw"
 
     def test_full_filesystem_not_downgraded_by_workspace(self):
-        """full filesystem stays rw even when workspace denies write."""
+        """full filesystem → ContainerConfigError regardless of workspace.
+
+        The former "full stays rw even when workspace denies write" premise
+        died with the removal of the 'full' token (and 'write', the new max,
+        *is* downgraded to 'read'/'ro' by a deny).  The resolver now fails
+        closed on the removed token, so a workspace deny is moot."""
         ws = _make_workspace(filesystem_write=False)
         result = resolve_container_config(
             {"network": "write", "filesystem": "full", "container": True},
             ws,
             LIFECYCLE_PERSISTENT,
         )
-        assert result.workspace_mode == "rw"
-        assert result.effective["filesystem"] == "full"
+        assert isinstance(result, ContainerConfigError)
+        assert result.code == "bad_permissions"
 
     def test_workspace_denies_network(self):
         """Workspace network deny overrides session write."""
@@ -269,7 +284,7 @@ class TestResolveContainerConfigSlice:
         test_cases = [
             ({"network": "write", "filesystem": "write", "container": True}, "bridge", "rw"),
             ({"network": "banned", "filesystem": "read", "container": True}, "none", "ro"),
-            ({"network": "ask", "filesystem": "full", "container": True}, "none", "rw"),
+            ({"network": "ask", "filesystem": "write", "container": True}, "none", "rw"),
             ({"network": "write", "filesystem": "ask", "container": True}, "bridge", "ro"),
         ]
         for sp, exp_net, exp_fs in test_cases:
@@ -398,19 +413,15 @@ class TestResolveContainerConfigFromPermissions:
         assert mode == "ro"
 
     def test_gate_full_filesystem(self, monkeypatch):
-        """full filesystem → rw."""
+        """full filesystem → fail-closed none + ro (token removed)."""
         import security.security_gate as sg
         monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
-        monkeypatch.setattr(
-            sg, "get_effective_permissions",
-            lambda s, w: {"network": "write", "filesystem": "full", "container": True},
-        )
         from docker_executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "write", "filesystem": "full"},
         )
-        assert net == "bridge"
-        assert mode == "rw"
+        assert net == "none"
+        assert mode == "ro"
 
     def test_gate_banned_network(self, monkeypatch):
         """banned network → none."""

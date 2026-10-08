@@ -42,7 +42,7 @@ def test_catalog_expected_shape():
     assert RESOURCE_CATALOG["git"] == [
         "banned", "ask", "read", "write", "write_on_feature_branch",
     ]
-    assert RESOURCE_CATALOG["filesystem"] == ["banned", "read", "write"]
+    assert RESOURCE_CATALOG["filesystem"] == ["banned", "ask", "read", "write"]
     assert RESOURCE_CATALOG["container"] == [True, False]
     assert RESOURCE_CATALOG["network"] == ["banned", "ask", "write", "outbound"]
     assert RESOURCE_CATALOG["mcp"] == ["banned", "connect", "full"]

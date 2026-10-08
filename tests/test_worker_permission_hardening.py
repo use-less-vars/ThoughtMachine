@@ -562,13 +562,13 @@ class TestPermissionDefaultsAndRoundTrip:
     def test_custom_permissions_round_trip(self):
         cfg = AgentConfig()
         cfg.session_permissions = SessionPermissions(
-            container=True, network=True, filesystem="full",
+            container=True, network=True, filesystem="write",
             mcp="connect", git="read", host_bash="ask",
         )
         sp2 = AgentConfig(**cfg.model_dump()).session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coerces to 'write'
-        assert sp2.filesystem == "full"
+        assert sp2.filesystem == "write"
         assert sp2.mcp == "connect"
         assert sp2.git == "read"
         assert sp2.host_bash == "ask"
@@ -596,14 +596,14 @@ class TestPermissionDefaultsAndRoundTrip:
 
     def test_exclude_api_key_keeps_permissions(self):
         cfg = AgentConfig()
-        cfg.session_permissions = SessionPermissions(filesystem="full")
+        cfg.session_permissions = SessionPermissions(filesystem="write")
         d = cfg.model_dump(exclude={"api_key"})
-        assert d["session_permissions"]["filesystem"] == "full"
+        assert d["session_permissions"]["filesystem"] == "write"
 
     def test_file_io_round_trip(self, tmp_path):
         cfg = AgentConfig()
         cfg.session_permissions = SessionPermissions(
-            container=True, network=True, filesystem="full",
+            container=True, network=True, filesystem="write",
             mcp="connect", git="read", host_bash="ask",
         )
         path = str(tmp_path / "config.json")
@@ -612,7 +612,7 @@ class TestPermissionDefaultsAndRoundTrip:
         sp = cfg2.session_permissions
         assert sp.container is True
         assert sp.network == "write"
-        assert sp.filesystem == "full"
+        assert sp.filesystem == "write"
         assert sp.mcp == "connect"
         assert sp.git == "read"
         assert sp.host_bash == "ask"
@@ -728,7 +728,7 @@ class TestIdlessFailClosed:
 
     Reverting the id-less branch to the historical 2-arg merge
     ``get_effective_permissions(session_perms_obj, caps)`` makes this test RED:
-    the mirror's ``container=True`` / ``filesystem='full'`` / ``git='full'``
+    the mirror's ``container=True`` / ``filesystem='write'`` / ``git='write_on_feature_branch'``
     would grant both tools again.
     """
 
@@ -755,8 +755,8 @@ class TestIdlessFailClosed:
         executor = self._executor(
             [FileWriteTool, GitReadTool],
             SessionPermissions(
-                container=True, network=True, filesystem="full",
-                mcp="full", git="full", host_bash="allow",
+                container=True, network=True, filesystem="write",
+                mcp="full", git="write_on_feature_branch", host_bash="allow",
             ),
         )
         r_write = self._run(executor, FileWriteTool)["result"]
@@ -825,7 +825,7 @@ class TestIdlessFailClosed:
         """Entering ``execute_tool_calls`` with NO session/workspace id emits a
         WARNING (identity-missing + fail-closed consequence) AND the
         category-gated call is still DENIED.  Removing the observation -> RED."""
-        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="full"))
+        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="write"))
         with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
             result = self._run_calls(executor, FileWriteTool)
         warnings = [
@@ -846,7 +846,7 @@ class TestIdlessFailClosed:
     def test_identified_entry_does_not_trip_observation(self, caplog):
         """Entering with BOTH a session id and a workspace id does NOT warn.
         Broadening the guard to fire always -> RED."""
-        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="full"))
+        executor = self._executor([FileWriteTool], SessionPermissions(filesystem="write"))
         with caplog.at_level(logging.WARNING, logger="agent.core.tool_executor"):
             self._run_calls(
                 executor, FileWriteTool, session_id="sess-1", workspace_id="ws-1"

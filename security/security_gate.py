@@ -92,6 +92,7 @@ _DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
     "host_bash": "banned",
     "git": "banned",
     "network": "banned",
+    "mcp": "banned",
 }
 
 
@@ -101,6 +102,11 @@ def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
 
     Returns a fail-closed (restrictive) ``WorkspaceCapabilities`` when the
     file does not exist or cannot be parsed.
+
+    Fail-policy: this is the unknown-*I/O* direction — a missing or unparsable
+    config is treated as the most restrictive profile (fail-closed).  It is the
+    counterpart of the fail-OPEN rule for an unknown ceiling *value* (see
+    :func:`apply_workspace_ceiling`).
     """
     caps = load_workspace_capabilities(workspace_id)
     if caps is None:
@@ -149,7 +155,11 @@ def _min_permission(
     _LEVEL_MAP: dict[str, float] = {
         level: float(rank) for level, rank in GRANT_LEVEL_RANKS.items()
     }
-    _LEVEL_MAP["none"] = 1.0
+    # 'none' is a legacy preset alias ranking WITH read on this scale; the
+    # canonical rank lives in security/resource_catalog.py
+    # WORKSPACE_CEILING_LEVELS_RANKS['none'] (== the read tier). GRANT_LEVEL_RANKS
+    # omits it, so it is added here.
+    _LEVEL_MAP["none"] = WORKSPACE_CEILING_LEVELS_RANKS["none"]
 
     def _level(v: Any) -> float:
         if isinstance(v, bool):
@@ -174,7 +184,7 @@ def _min_permission(
 # value ``write_on_feature_branch`` ranks between ask and write (2.5): it
 # caps a session ``write`` grant down to branch-restricted write -- never
 # unlimited.  Note this ordering is NOT the same as ``_min_permission``'s
-# grant-level map (where ask < read); ceiling comparisons follow the
+# grant-level map (where read < ask); ceiling comparisons follow the
 # workspace contract above.  Which ceiling levels may apply to which session
 # key is additionally whitelisted by WORKSPACE_CEILING_VOCAB.
 _WORKSPACE_CEILING_LEVELS = WORKSPACE_CEILING_LEVELS_RANKS
@@ -208,24 +218,19 @@ _WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
     "docker",
 }
 
-#: Session-permission keys whose level scale has a ``read`` tier BELOW
-#: ``ask``.  A workspace ceiling of ``ask`` caps a more-permissive session
-#: grant to ``read`` for these keys; session scales without a read tier
-#: (``network``) cap to ``banned``.  Either way an ask ceiling never
-#: fabricates an effective ``ask`` grant -- interactive prompting stays
-#: reserved for genuine session-level ``ask``.
-_ASK_CEILING_READ_TIER_KEYS = frozenset({
-    "filesystem",
-    "git",
-})
-
-
 def apply_workspace_ceiling(
     workspace_permissions: Dict[str, Any],
     session_permissions: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
     Cap session permission levels at the workspace permission ceiling.
+
+    Fail-policy: an unknown ceiling *value* (a resource token outside the
+    catalog, or a level token not valid for its resource) is fail-OPEN — it is
+    logged and the session value stands.  An unreadable or missing on-disk
+    configuration is fail-CLOSED — it resolves to the most restrictive profile
+    (handled by the disk read in :func:`get_effective_permissions`).  This
+    function implements only the *value* side of that policy.
 
     Returns a NEW dict; ``session_permissions`` is not mutated.  For every
     resource present in ``workspace_permissions`` the result is the more
@@ -243,10 +248,11 @@ def apply_workspace_ceiling(
           ``write`` grant down to branch-restricted write — never unlimited.
           Ceilings at rank 4.0 (``outbound``/``full``) are unlimited — the
           session value stands.
-        * An unknown ceiling level is treated as no ceiling (fail-open), so
+        * An unknown ceiling *value* -- a level not in this resource's
+          vocabulary -- is treated as no ceiling (fail-open), so
           forward-compatible workspace maps never break session resolution.
-        * An unknown ceiling resource (outside ``RESOURCE_CATALOG`` and the
-          legacy workspace alias ``docker``) is logged and ignored
+        * An unknown ceiling *value* -- a resource outside ``RESOURCE_CATALOG``
+          and the legacy workspace alias ``docker`` -- is logged and ignored
           (fail-open) -- the session value stands.
         * ``docker`` is a legacy alias for ``container``: it is normalised
           onto ``container`` by ``_WORKSPACE_RESOURCE_MAP`` before ranking,
@@ -257,12 +263,10 @@ def apply_workspace_ceiling(
           ceiling is write-level or unlimited; any stricter ceiling forces
           ``False``.  The ``container`` key is always emitted as a boolean.
         * A workspace ceiling of ``ask`` caps a more-permissive session
-          value to the most permissive tier BELOW ask: ``read`` for
-          resources whose session scale has a read tier (filesystem, git),
-          else ``banned`` (network).  An ask ceiling
-          therefore NEVER yields an effective ``ask`` grant -- interactive
-          prompting stays reserved for genuine session-level ``ask``
-          grants, which rank at the ceiling and pass through unchanged.
+          value to the ceiling level itself -- ``ask``.  Genuine
+          session-level ``ask``/``read`` grants that already rank at or
+          below the ceiling pass through unchanged, so an ask ceiling
+          yields an effective ``ask`` grant for any session value above it.
         * ``host_bash`` is capped on its own scale -- ``banned < ask <
           allow`` -- so a workspace ceiling of ``banned``/``ask``/``allow``
           (or a boolean, ``True`` ~ ``allow``, ``False`` ~ ``banned``) caps
@@ -398,21 +402,11 @@ def apply_workspace_ceiling(
         if session_rank is None:
             continue
         if ceiling_rank < session_rank:
-            # A workspace 'ask' ceiling (rank 2.0) must never fabricate an
-            # effective 'ask' grant: cap to the most permissive tier BELOW
-            # ask -- 'read' where the session scale has one, else 'banned'.
-            # Genuine session-level 'ask' grants rank equal to the ceiling
-            # and pass through unchanged above (prompt flow preserved).
-            if ceiling_rank == 2.0:
-                result[key] = (
-                    "read" if key in _ASK_CEILING_READ_TIER_KEYS else "banned"
-                )
-            else:
-                result[key] = (
-                    ceiling
-                    if isinstance(ceiling, bool)
-                    else str(ceiling).lower()
-                )
+            result[key] = (
+                ceiling
+                if isinstance(ceiling, bool)
+                else str(ceiling).lower()
+            )
     return result
 
 
@@ -802,8 +796,9 @@ def _read_disk_permission_sources(
     """Read ``(session_grants, workspace_ceiling)`` from the vault permission store.
 
     RAISES on ANY failure (missing/corrupt sidecar or config, I/O error,
-    unexpected exception) — it never swallows.  Callers choose the fail-closed
-    policy that suits them:
+    unexpected exception) — it never swallows.  This is the unknown-*I/O*
+    direction of the module fail-policy: callers choose a fail-CLOSED response
+    (most restrictive) that suits them:
 
     * :func:`get_effective_permissions` (disk mode) substitutes the deny-all
       session + deny-all ceiling so a disk-mode caller never receives default
@@ -886,12 +881,14 @@ def get_effective_permissions(
         are not both supplied, a supplied ``workspace_permissions`` governs
         as before (legacy behaviour unchanged).
 
-    Fail-closed contract:
+    Fail-closed contract (unknown *I/O*):
         Disk mode never fabricates permissive defaults.  If the store is
-        missing, corrupt, or raises for any reason, the session resolves to
-        a deny-all profile (every category ``banned`` / ``False``) and the
-        ceiling to a deny-all ceiling, so the merged result is the
-        all-denied shape rather than an accidental grant.
+        missing, corrupt, or raises for any reason -- the unknown-*I/O*
+        direction of the module fail-policy -- the session resolves to a
+        deny-all profile (every category ``banned`` / ``False``) and the
+        ceiling to a deny-all ceiling, so the merged result is the all-denied
+        shape rather than an accidental grant.  (Contrast an unknown ceiling
+        *value*, which is fail-OPEN; see :func:`apply_workspace_ceiling`.)
 
     Absent-grant rule:
         ``SessionPermissions`` carries safe pydantic defaults (filesystem

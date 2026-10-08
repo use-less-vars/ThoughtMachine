@@ -130,9 +130,10 @@ def test_ids_with_none_workspace_permissions_use_disk(hermetic_vault):
 
 
 def test_fail_closed_sentinels_intact_and_still_imported():
-    """(4) The module-level fail-closed sentinels survive the change unchanged,
-    and ``web_ui.backend.config_manager`` still imports both of them from the
-    gate (the shared fail-closed shape must not drift)."""
+    """(4) The module-level fail-closed sentinels survive the change unchanged in
+    shape (now including the ``mcp`` ban added by the B5 consistency fix), and
+    ``web_ui.backend.config_manager`` still imports both of them from the gate
+    (the shared fail-closed shape must not drift)."""
     import security.security_gate as gate
 
     assert isinstance(gate._DISK_FAIL_CLOSED_SESSION, SessionPermissions)
@@ -143,6 +144,7 @@ def test_fail_closed_sentinels_intact_and_still_imported():
         "host_bash": "banned",
         "git": "banned",
         "network": "banned",
+        "mcp": "banned",
     }
 
     # config_manager must still import both sentinels from security.security_gate

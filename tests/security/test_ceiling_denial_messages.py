@@ -113,17 +113,37 @@ class TestCeilingCausedFilesystemDenial:
             }
         ]
 
-    def test_ask_ceiling_caps_to_read_but_labels_ask(self):
+    def test_ask_ceiling_caps_to_ask_and_labels_ask(self):
+        # Under the unified permission scale an ``ask`` ceiling is a real
+        # level, not a read-tier special case: it caps the value to ``ask``
+        # (not ``read``) and the annotation labels it ``ask`` uniformly.
+        # Because the effective value is now ``ask``, the gate routes to the
+        # interactive-approval denial rather than the ceiling-named message.
         eff = get_effective_permissions(
             SessionPermissions(filesystem="write"),
             _PERMISSIVE_CAPS,
             {"filesystem": "ask"},
         )
-        assert eff["filesystem"] == "read"
+        assert eff["filesystem"] == "ask"
+        assert getattr(eff, "_ceiling_annotations", {}).get("filesystem") == {
+            "pre": "write",
+            "level": "ask",
+        }
+        # The structured provenance still reports the ask ceiling as the
+        # cause, even though the message is the ask-approval one.
+        assert ceiling_contradictions(eff) == [
+            {
+                "resource": "filesystem",
+                "session_value": "write",
+                "workspace_value": "ask",
+                "reason": "session_exceeds_workspace_ceiling",
+                "guidance": "Correct either the workspace ceiling or the session grant.",
+            }
+        ]
         msg = _deny(["filesystem:write"], eff)
         assert (
-            "Session permission for filesystem is write, but workspace ceiling "
-            "is ask. The session exceeds the ceiling." in msg
+            "ask requires interactive approval; not available in worker context"
+            in msg
         )
 
 

@@ -66,9 +66,9 @@ class TestEffectivePermissionsGitSplit:
         eff = self._eff("banned")
         assert eff["git"] == "banned"
 
-    def test_full_passthrough(self):
-        eff = self._eff("full")
-        assert eff["git"] == "full"
+    def test_write_on_feature_branch_passthrough(self):
+        eff = self._eff("write_on_feature_branch")
+        assert eff["git"] == "write_on_feature_branch"
 
     def test_workspace_git_unavailable_fail_closed(self):
         eff = get_effective_permissions(
