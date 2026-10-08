@@ -338,3 +338,48 @@ def test_filesystem_junk_value_still_dropped(caplog):
 def test_session_permissions_model_accepts_filesystem_ask():
     perms = SessionPermissions(filesystem="ask")
     assert perms.filesystem == "ask"
+
+
+# --------------------------------------------------------------------------
+# A10: the session-grant Literals must match the canonical catalogs by token.
+#      The model Literals currently admit a superset token ``full`` that the
+#      canonical catalogs omit for ``git`` and ``filesystem``; after the
+#      A9b+A10 fold the model must reject it fail-closed.  ``mcp`` legitimately
+#      keeps ``full`` (RESOURCE_CATALOG['mcp'] includes it).
+# --------------------------------------------------------------------------
+
+from pydantic import ValidationError  # noqa: E402  (append-only block)
+
+
+def test_session_permissions_git_rejects_full():
+    # 'full' is NOT a canonical git level (RESOURCE_CATALOG['git'] /
+    # GIT_PERMISSION_LEVELS / PERMISSION_SCHEMA['git'] omit it) -- the model
+    # must reject it fail-closed rather than accept a superset token.
+    with pytest.raises(ValidationError):
+        SessionPermissions(git="full")
+
+
+@pytest.mark.parametrize(
+    "level", ["banned", "ask", "read", "write", "write_on_feature_branch"]
+)
+def test_session_permissions_git_accepts_every_canonical_level(level):
+    assert SessionPermissions(git=level).git == level
+
+
+def test_session_permissions_filesystem_rejects_full():
+    # 'full' is NOT a canonical filesystem level (RESOURCE_CATALOG['filesystem']
+    # / VALID_PERMISSION_LEVELS / PERMISSION_SCHEMA['filesystem'] omit it) --
+    # the model must reject it fail-closed.
+    with pytest.raises(ValidationError):
+        SessionPermissions(filesystem="full")
+
+
+@pytest.mark.parametrize("level", ["banned", "read", "ask", "write"])
+def test_session_permissions_filesystem_accepts_every_canonical_level(level):
+    assert SessionPermissions(filesystem=level).filesystem == level
+
+
+def test_session_permissions_mcp_still_accepts_full():
+    # 'full' IS a canonical mcp level (RESOURCE_CATALOG['mcp'] includes it):
+    # removing the git/filesystem ``full`` superset must NOT touch mcp.
+    assert SessionPermissions(mcp="full").mcp == "full"

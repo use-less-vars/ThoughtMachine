@@ -114,8 +114,8 @@ class SessionPermissions(BaseModel):
 
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
-    - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask' | 'write_on_feature_branch'``
+    - **filesystem**: ``'banned' | 'read' | 'write' | 'ask'``
+    - **git**:        ``'banned' | 'read' | 'write' | 'ask' | 'write_on_feature_branch'``
     - **mcp**:        ``'banned' | 'connect' | 'full'``
     - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
 
@@ -133,12 +133,12 @@ class SessionPermissions(BaseModel):
         default='banned',
         description='Network access level for the session.',
     )
-    filesystem: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    filesystem: Literal['banned', 'read', 'write', 'ask'] = Field(
         default='read',
         description='Filesystem access level for the session.',
     )
     git: Literal[
-        'banned', 'read', 'write', 'full', 'ask', 'write_on_feature_branch',
+        'banned', 'read', 'write', 'ask', 'write_on_feature_branch',
     ] = Field(
         default='read',
         description='Git operations access level for the session.',

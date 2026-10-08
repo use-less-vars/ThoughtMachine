@@ -102,7 +102,7 @@ class TestSessionPermissionsRoundTrip:
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
+            filesystem="write",
             git="read",
             mcp="connect",
             host_bash="allow",
@@ -113,7 +113,7 @@ class TestSessionPermissionsRoundTrip:
         sp2 = cfg2.session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
-        assert sp2.filesystem == "full"
+        assert sp2.filesystem == "write"
         assert sp2.git == "read"
         assert sp2.mcp == "connect"
         assert sp2.host_bash == "allow"
@@ -124,8 +124,8 @@ class TestSessionPermissionsRoundTrip:
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
-            git="full",
+            filesystem="write",
+            git="write_on_feature_branch",
             mcp="full",
             host_bash="allow",
         )
@@ -135,8 +135,8 @@ class TestSessionPermissionsRoundTrip:
         sp2 = cfg2.session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
-        assert sp2.filesystem == "full"
-        assert sp2.git == "full"
+        assert sp2.filesystem == "write"
+        assert sp2.git == "write_on_feature_branch"
         assert sp2.mcp == "full"
         assert sp2.host_bash == "allow"
 
@@ -169,7 +169,7 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=False,
             filesystem="write",
-            git="full",
+            git="write_on_feature_branch",
             mcp="banned",
             host_bash="banned",
         )
@@ -184,10 +184,10 @@ class TestSessionPermissionsRoundTrip:
     def test_exclude_api_key_keeps_permissions(self):
         """Excluding api_key from serialization must NOT drop session_permissions."""
         cfg = AgentConfig()
-        cfg.session_permissions = SessionPermissions(filesystem="full")
+        cfg.session_permissions = SessionPermissions(filesystem="write")
         d = cfg.model_dump(exclude={"api_key"})
         assert "session_permissions" in d
-        assert d["session_permissions"]["filesystem"] == "full"
+        assert d["session_permissions"]["filesystem"] == "write"
 
 
 # =========================================================================
@@ -234,7 +234,7 @@ class TestConfigFileRoundTrip:
         cfg.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
+            filesystem="write",
             git="read",
             mcp="connect",
             host_bash="allow",
@@ -248,7 +248,7 @@ class TestConfigFileRoundTrip:
         sp2 = cfg2.session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
-        assert sp2.filesystem == "full"
+        assert sp2.filesystem == "write"
         assert sp2.git == "read"
         assert sp2.mcp == "connect"
         assert sp2.host_bash == "allow"
@@ -427,16 +427,16 @@ class TestToolExecutionAfterConfigCycle:
 
     def test_permissive_config_allows_write_after_cycle(self, tmp_path):
         """RISK-3 (new contract): after a save/load cycle a permissive mirror
-        (filesystem='full') is NOT honoured by the id-less executor -- the
+        (filesystem='write') is NOT honoured by the id-less executor -- the
         write is denied fail-closed.  (Canonical disk-mode grant:
         tests/test_worker_disk_mode_inheritance.py.)"""
         cfg1 = AgentConfig()
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
+            filesystem="write",
             system="full",
-            git="full",
+            git="write_on_feature_branch",
             execution="full",
         )
         config_path = os.path.join(tmp_path, "test_config.json")
@@ -452,7 +452,7 @@ class TestToolExecutionAfterConfigCycle:
             lambda: False, lambda: None, lambda: 0
         )
         # RISK-3 (new contract): the id-less executor reads NO canonical grant
-        # source, so even a permissive mirror (filesystem='full') is IGNORED
+        # source, so even a permissive mirror (filesystem='write') is IGNORED
         # and the write is DENIED fail-closed.
         assert "Permission denied" in result["result"], result
         assert "filesystem:write" in result["result"], result
@@ -490,9 +490,9 @@ class TestToolExecutionAfterConfigCycle:
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
+            filesystem="write",
             system="full",
-            git="full",
+            git="write_on_feature_branch",
             execution="full",
         )
         config_path = os.path.join(tmp_path, "test_config_multi.json")
@@ -518,9 +518,9 @@ class TestToolExecutionAfterConfigCycle:
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=False,  # <--- missing
-            filesystem="full",
+            filesystem="write",
             system="full",
-            git="full",
+            git="write_on_feature_branch",
             execution="full",
         )
         config_path = os.path.join(tmp_path, "test_config_deny_multi.json")
@@ -576,7 +576,7 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
 
         # Now verify ToolExecutor doesn't use this — it uses AgentConfig
         cfg = AgentConfig()
-        cfg.session_permissions = SessionPermissions(filesystem="full")
+        cfg.session_permissions = SessionPermissions(filesystem="write")
 
         # Session says deny; the id-less executor is fail-closed regardless.
         executor = ToolExecutor(

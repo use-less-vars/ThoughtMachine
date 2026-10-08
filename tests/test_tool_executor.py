@@ -285,7 +285,7 @@ class TestToolExecutorCustomPermissions:
         (Disk-mode ceiling/missing-category contract: tests/test_security_gate_disk.py.)"""
         perms = SessionPermissions(
             container=True, network=True,
-            filesystem="full", system="full", execution="full"
+            filesystem="write", system="full", execution="full"
         )
         executor = self._make_executor([NetworkAndFilesystemTool], permissions=perms)
         result = executor._execute_single_tool(

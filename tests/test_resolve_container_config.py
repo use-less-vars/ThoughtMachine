@@ -267,7 +267,6 @@ def test_network_mode_through_resolver(network, expected):
     "filesystem,expected",
     [
         ("write", "rw"),
-        ("full", "rw"),
         ("read", "ro"),
         ("banned", "ro"),
         (None, "ro"),
