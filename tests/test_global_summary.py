@@ -137,8 +137,13 @@ def _patch_summary_deps(
     monkeypatch.setattr(global_routes, "vault_root", lambda: vault)
     monkeypatch.setattr(
         global_routes,
-        "_collect_active_containers",
+        "_collect_containers",
         lambda entries: (list(containers), container_warning),
+    )
+    monkeypatch.setattr(
+        global_routes,
+        "_containers_listed_for_workspace",
+        lambda entry: 0,
     )
     return vault
 
@@ -173,7 +178,10 @@ def test_global_summary_working_and_idle_statuses(
 
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body.keys()) == {"workspaces", "active_sessions", "active_containers", "providers"}
+    assert set(body.keys()) == {
+        "workspaces", "active_sessions", "containers_in_use",
+        "containers_listed", "providers",
+    }
     assert "warning" not in body
 
     by_id = {w["id"]: w for w in body["workspaces"]}
@@ -190,7 +198,7 @@ def test_global_summary_working_and_idle_statuses(
     assert [s["session_id"] for s in body["active_sessions"]] == ["s1"]
     assert body["active_sessions"][0]["workspace_id"] == "ws-a"
     assert body["active_sessions"][0]["worker_count"] == 1
-    assert len(body["active_containers"]) == 1
+    assert len(body["containers_in_use"]) == 1
 
 
 def test_global_summary_degrades_with_warning(client, monkeypatch, tmp_path):
@@ -212,7 +220,8 @@ def test_global_summary_degrades_with_warning(client, monkeypatch, tmp_path):
     body = resp.json()
     assert body["workspaces"] == []
     assert body["active_sessions"] == []
-    assert body["active_containers"] == []
+    assert body["containers_in_use"] == []
+    assert body["containers_listed"] == 0
     assert "warning" in body
     assert "workspaces unavailable" in body["warning"]
     assert "workers unavailable" in body["warning"]
@@ -231,10 +240,14 @@ def test_global_summary_build_summary_never_raises(monkeypatch, tmp_path):
 
     body = global_routes._build_summary()
 
-    assert set(body.keys()) == {"workspaces", "active_sessions", "active_containers", "providers"}
+    assert set(body.keys()) == {
+        "workspaces", "active_sessions", "containers_in_use",
+        "containers_listed", "providers",
+    }
     assert body["workspaces"][0]["status"] == "idle"
     assert body["active_sessions"] == []
-    assert body["active_containers"] == []
+    assert body["containers_in_use"] == []
+    assert body["containers_listed"] == 0
 
 
 def test_build_summary_includes_providers(monkeypatch, tmp_path):

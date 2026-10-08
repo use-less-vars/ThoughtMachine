@@ -26,6 +26,7 @@ written with mode ``0o600`` and never returned by the API (GET
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +39,8 @@ from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 from tools.host_resource_policy import workspace_allows_host_resources
 from agent.config.provider_profile import ProviderManager
+
+logger = logging.getLogger(__name__)
 
 # Module-level reference for monkeypatchability in tests; the import is
 # guarded so a failing worker module can never break router import.
@@ -140,7 +143,52 @@ def _containers_for_workspace(entry) -> Optional[List[Dict[str, Any]]]:
     return handles
 
 
-def _collect_active_containers(
+def _containers_listed_for_workspace(entry) -> int:
+    """Count of the workspace's UI container enumeration (the FULL live set).
+
+    Mirrors ``workspace_routes._containers_listed_for_workspace``: every live
+    container for the workspace, *including* resource containers, which the
+    agent-facing ``_containers_for_workspace()`` deliberately hides.  It reuses
+    the single owner of the "workspace live set" fact
+    (``server._list_workspace_live_containers``) rather than inventing a second
+    enumeration.  Returns 0 when enumeration is unavailable (no docker client /
+    daemon), matching the summary's degrade-to-empty contract.
+    """
+    if not _workspace_root_mountable(entry):
+        return 0
+    try:
+        from infra.container_manager import ContainerManager
+
+        manager = ContainerManager(
+            workspace_path=entry.root_path,
+            workspace_id=entry.id,
+            session_id=None,
+            session_permissions=None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "_containers_listed_for_workspace: ContainerManager construction "
+            "failed for workspace %s: %s",
+            entry.id,
+            exc,
+        )
+        return 0
+    try:
+        from web_ui.backend.server import _list_workspace_live_containers
+
+        live = _list_workspace_live_containers(manager, entry.id)
+    except Exception as exc:
+        logger.warning(
+            "_containers_listed_for_workspace: live container enumeration "
+            "failed for workspace %s: %s",
+            entry.id,
+            exc,
+        )
+        return 0
+    return len(live or [])
+
+
+def _collect_containers(
     workspace_entries,
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """Per-workspace Docker listing; degrades to [] + warning when unavailable."""
@@ -248,14 +296,22 @@ def _build_summary() -> Dict[str, Any]:
         for s in open_sessions
     ]
 
-    containers, container_warning = _collect_active_containers(workspace_entries)
+    containers_in_use, container_warning = _collect_containers(workspace_entries)
     if container_warning:
         warnings.append(container_warning)
+
+    # UI enumeration count: the full live set across workspaces, resource
+    # containers included.  Derived from the single owner of that fact.
+    containers_listed = sum(
+        _containers_listed_for_workspace(entry)
+        for entry in (workspace_entries or [])
+    )
 
     result: Dict[str, Any] = {
         "workspaces": workspaces_out,
         "active_sessions": active_sessions_out,
-        "active_containers": containers,
+        "containers_in_use": containers_in_use,
+        "containers_listed": containers_listed,
         "providers": providers_out,
     }
     if warnings:

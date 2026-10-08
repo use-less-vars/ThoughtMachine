@@ -21,6 +21,20 @@ from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 from web_ui.backend import workspace_routes
 
 
+# Live-container fixtures for the summary producers.  ``_containers_for_workspace``
+# hides free-use/resource internals and returns only session-owned containers
+# (AGENT_CONTAINERS); ``_containers_listed_for_workspace`` counts every live
+# container including resources (hence ``len(UI_CONTAINERS)``).
+AGENT_CONTAINERS = [
+    {"id": "c1", "name": "session-runner", "type": "free_use",
+     "workspace_id": "ws-1", "status": "running"},
+]
+UI_CONTAINERS = AGENT_CONTAINERS + [
+    {"id": "r1", "name": "tm-res-4f9c2ab1e3d7-git", "type": "resource",
+     "workspace_id": "ws-1", "status": "running"},
+]
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -84,8 +98,12 @@ def _patch_summary_deps(monkeypatch, tmp_path):
     monkeypatch.setattr(
         workspace_routes,
         "_containers_for_workspace",
-        lambda entry: [{"id": "c1", "name": "tm-res-x", "type": "resource",
-                        "workspace_id": "ws-1", "status": "running"}],
+        lambda entry: list(AGENT_CONTAINERS),
+    )
+    monkeypatch.setattr(
+        workspace_routes,
+        "_containers_listed_for_workspace",
+        lambda entry: len(UI_CONTAINERS),
     )
 
     import session.tool_presets as tool_presets
@@ -132,7 +150,8 @@ def test_summary_full_payload(tmp_path, monkeypatch):
     assert set(result.keys()) == {
         "workspace_id", "label", "root_path", "allow_host_resources",
         "permissions", "capabilities", "dockerfile", "worker_templates",
-        "active_workers", "active_sessions", "active_containers",
+        "active_workers", "active_sessions", "containers_in_use",
+        "containers_listed",
         "tools", "resource_catalog",
     }, result.keys()
 
@@ -154,10 +173,8 @@ def test_summary_full_payload(tmp_path, monkeypatch):
         "session_id": "s1", "workspace_id": "ws-1", "name": "n1", "mode": "m1",
         "started_at": "2024-01-01T00:00:00Z",
     }]
-    assert result["active_containers"] == [
-        {"id": "c1", "name": "tm-res-x", "type": "resource",
-         "workspace_id": "ws-1", "status": "running"}
-    ]
+    assert result["containers_in_use"] == AGENT_CONTAINERS
+    assert result["containers_listed"] == len(UI_CONTAINERS)
     assert result["tools"] == ["alpha", "file_read", "shell_exec"]
     assert result["resource_catalog"] == [{"name": "fs", "kind": "mount"}]
 
@@ -185,6 +202,8 @@ def test_summary_missing_assets_and_empty_sections(tmp_path, monkeypatch):
                         lambda ws_id: [])
     monkeypatch.setattr(workspace_routes, "_containers_for_workspace",
                         lambda entry: None)
+    monkeypatch.setattr(workspace_routes, "_containers_listed_for_workspace",
+                        lambda entry: 0)
     import session.tool_presets as tool_presets
 
     monkeypatch.setattr(tool_presets, "_ALL_TOOLS", ["shell_exec"])
@@ -205,7 +224,8 @@ def test_summary_missing_assets_and_empty_sections(tmp_path, monkeypatch):
     assert result["worker_templates"] == []
     assert result["active_workers"] == []
     assert result["active_sessions"] == []
-    assert result["active_containers"] == []
+    assert result["containers_in_use"] == []
+    assert result["containers_listed"] == 0
     assert result["tools"] == ["shell_exec"]
     assert result["resource_catalog"] == []
 

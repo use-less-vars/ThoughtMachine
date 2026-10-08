@@ -101,7 +101,7 @@ const ENTRY2_STORE = { id: ENTRY2.id, name: ENTRY2.label, path: ENTRY2.root, roo
 const SUMMARY = {
   workspace_id: ENTRY.id, label: ENTRY.label, root_path: ENTRY.root,
   allow_host_resources: false, permissions: {}, resource_catalog: [],
-  active_sessions: [], active_workers: [], active_containers: [],
+  active_sessions: [], active_workers: [], containers_in_use: [], containers_listed: 0,
   dockerfile: null, worker_templates: [], tools: [],
 }
 
@@ -116,7 +116,7 @@ function stubBackend() {
         { id: ENTRY.id, label: ENTRY.label, root: ENTRY.root },
         { id: ENTRY2.id, label: ENTRY2.label, root: ENTRY2.root },
       ],
-      active_sessions: [], active_containers: [], providers: [],
+      active_sessions: [], containers_in_use: [], containers_listed: 0, providers: [],
     }),
   })
 }

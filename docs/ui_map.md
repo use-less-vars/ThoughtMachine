@@ -652,7 +652,7 @@ No interactive controls. Root path `:722`, Security posture string `:732` (exact
 
 ## Group B4 — Containers tab (`ContainersTab`, :297-343)
 Read-only. Dockerfile path/note `:305-312` and active-container rows `:320-339` render
-`summary.dockerfile` / `summary.active_containers` verbatim. **No start/stop controls, no handlers.
+`summary.dockerfile` / `summary.containers_in_use` verbatim. **No start/stop controls, no handlers.
 0 rows** (informational only).
 
 ## Group B5 — Workers tab (`WorkersTab`, :367-423)
@@ -1786,7 +1786,7 @@ And the `providers` prop source (L78):
 ```jsx
 78:  const providers = Array.isArray(summaryData.providers) ? summaryData.providers : []
 ```
-`summaryData` = `GET /api/global/summary`. But `global_routes.py:_build_summary()` (L234-238) returns **only** `workspaces`, `active_sessions`, `active_containers` — **no `providers` key**. So on the landing page:
+`summaryData` = `GET /api/global/summary`. But `global_routes.py:_build_summary()` (L234-238) returns **only** `workspaces`, `active_sessions`, `containers_in_use`, `containers_listed` — **no `providers` key**. So on the landing page:
 - `providers` is always `[]` → the modal always shows "No providers configured yet".
 - `sendCommand` is a no-op → Add/Edit/Delete silently do nothing.
 
