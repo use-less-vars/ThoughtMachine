@@ -302,3 +302,28 @@ def test_disk_mode_schema_invalid_ceiling_fails_closed(hermetic_vault, monkeypat
     # NOT carry the _ceiling_annotations provenance attribute.
     assert getattr(eff, "_ceiling_annotations", None) in (None, {})
 
+
+# ── B5: the fail-closed CEILING must deny ``mcp`` too ────────────────────────
+def test_disk_fail_closed_ceiling_bans_mcp():
+    """The paired fail-closed sentinels must cover the SAME six resources.
+
+    ``_DISK_FAIL_CLOSED_CEILING`` must ban ``mcp`` exactly like
+    ``_DISK_FAIL_CLOSED_SESSION`` does, so a fail-closed ceiling is genuinely
+    deny-all: applied over a permissive ``mcp`` grant it must cap ``mcp`` to
+    ``banned`` (an unreadable ceiling denies ``mcp`` rather than leaving it
+    uncapped).  RED before ``mcp`` is added to the ceiling.
+    """
+    from security import security_gate as sg
+    from security.security_gate import apply_workspace_ceiling
+
+    # (1) Structural: the ceiling covers the same resources as the session.
+    session_keys = set(sg._DISK_FAIL_CLOSED_SESSION.model_dump())
+    assert set(sg._DISK_FAIL_CLOSED_CEILING) == session_keys
+    assert sg._DISK_FAIL_CLOSED_CEILING["mcp"] == "banned"
+
+    # (2) Behavioural: used as a ceiling over a permissive ``mcp`` grant, the
+    # fail-closed ceiling caps ``mcp`` to ``banned`` (an absent key = fail-open,
+    # the grant would survive).
+    capped = apply_workspace_ceiling(sg._DISK_FAIL_CLOSED_CEILING, {"mcp": "full"})
+    assert capped["mcp"] == "banned"
+

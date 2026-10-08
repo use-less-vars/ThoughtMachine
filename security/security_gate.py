@@ -92,6 +92,7 @@ _DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
     "host_bash": "banned",
     "git": "banned",
     "network": "banned",
+    "mcp": "banned",
 }
 
 
