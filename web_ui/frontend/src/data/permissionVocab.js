@@ -22,9 +22,10 @@ export const SESSION_RESOURCE_VOCAB = {
 export const PERMISSION_RANK_ORDER = {
   banned: 0,
   none: 1,
-  ask: 1.5,
-  read: 2,
-  outbound: 2.5,
+  ask: 2,
+  read: 1,
+  connect: 1,
+  outbound: 3.5,
   write: 3,
   // Same write tier as the security-gate rank — not a separate level.
   write_on_feature_branch: 3,
