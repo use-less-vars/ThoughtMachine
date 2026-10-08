@@ -494,6 +494,22 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"not_a_resource": "banned"}, {"filesystem": "write"})
         assert result == {"filesystem": "write"}
 
+    def test_fail_policy_unknown_ceiling_value_is_fail_open(self):
+        # B4 fail-policy, *value* direction: an unknown ceiling VALUE -- an
+        # unknown level token, or a resource token outside the catalog -- must
+        # NOT cap the session grant. The unknown value is dropped (never
+        # injected, never banned): fail-OPEN, the session value stands uncapped.
+        session = {"filesystem": "write", "git": "write"}
+        result = apply_workspace_ceiling(
+            {"filesystem": "mega", "git": "banana", "not_a_resource": "banned"},
+            session,
+        )
+        assert result == {"filesystem": "write", "git": "write"}
+        # Fail-open == "no ceiling applied": the unknown resource is neither
+        # capped nor injected, and the permissive session levels survive verbatim.
+        assert "not_a_resource" not in result
+        assert result is not session
+
     def test_git_ask_ceiling_caps_write_to_ask(self):
         result = apply_workspace_ceiling({"git": "ask"}, {"git": "write"})
         assert result == {"git": "ask"}

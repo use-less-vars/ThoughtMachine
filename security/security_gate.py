@@ -102,6 +102,11 @@ def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
 
     Returns a fail-closed (restrictive) ``WorkspaceCapabilities`` when the
     file does not exist or cannot be parsed.
+
+    Fail-policy: this is the unknown-*I/O* direction — a missing or unparsable
+    config is treated as the most restrictive profile (fail-closed).  It is the
+    counterpart of the fail-OPEN rule for an unknown ceiling *value* (see
+    :func:`apply_workspace_ceiling`).
     """
     caps = load_workspace_capabilities(workspace_id)
     if caps is None:
@@ -220,6 +225,13 @@ def apply_workspace_ceiling(
     """
     Cap session permission levels at the workspace permission ceiling.
 
+    Fail-policy: an unknown ceiling *value* (a resource token outside the
+    catalog, or a level token not valid for its resource) is fail-OPEN — it is
+    logged and the session value stands.  An unreadable or missing on-disk
+    configuration is fail-CLOSED — it resolves to the most restrictive profile
+    (handled by the disk read in :func:`get_effective_permissions`).  This
+    function implements only the *value* side of that policy.
+
     Returns a NEW dict; ``session_permissions`` is not mutated.  For every
     resource present in ``workspace_permissions`` the result is the more
     restrictive of the workspace ceiling and the session value, following the
@@ -236,10 +248,11 @@ def apply_workspace_ceiling(
           ``write`` grant down to branch-restricted write — never unlimited.
           Ceilings at rank 4.0 (``outbound``/``full``) are unlimited — the
           session value stands.
-        * An unknown ceiling level is treated as no ceiling (fail-open), so
+        * An unknown ceiling *value* -- a level not in this resource's
+          vocabulary -- is treated as no ceiling (fail-open), so
           forward-compatible workspace maps never break session resolution.
-        * An unknown ceiling resource (outside ``RESOURCE_CATALOG`` and the
-          legacy workspace alias ``docker``) is logged and ignored
+        * An unknown ceiling *value* -- a resource outside ``RESOURCE_CATALOG``
+          and the legacy workspace alias ``docker`` -- is logged and ignored
           (fail-open) -- the session value stands.
         * ``docker`` is a legacy alias for ``container``: it is normalised
           onto ``container`` by ``_WORKSPACE_RESOURCE_MAP`` before ranking,
@@ -783,8 +796,9 @@ def _read_disk_permission_sources(
     """Read ``(session_grants, workspace_ceiling)`` from the vault permission store.
 
     RAISES on ANY failure (missing/corrupt sidecar or config, I/O error,
-    unexpected exception) — it never swallows.  Callers choose the fail-closed
-    policy that suits them:
+    unexpected exception) — it never swallows.  This is the unknown-*I/O*
+    direction of the module fail-policy: callers choose a fail-CLOSED response
+    (most restrictive) that suits them:
 
     * :func:`get_effective_permissions` (disk mode) substitutes the deny-all
       session + deny-all ceiling so a disk-mode caller never receives default
@@ -867,12 +881,14 @@ def get_effective_permissions(
         are not both supplied, a supplied ``workspace_permissions`` governs
         as before (legacy behaviour unchanged).
 
-    Fail-closed contract:
+    Fail-closed contract (unknown *I/O*):
         Disk mode never fabricates permissive defaults.  If the store is
-        missing, corrupt, or raises for any reason, the session resolves to
-        a deny-all profile (every category ``banned`` / ``False``) and the
-        ceiling to a deny-all ceiling, so the merged result is the
-        all-denied shape rather than an accidental grant.
+        missing, corrupt, or raises for any reason -- the unknown-*I/O*
+        direction of the module fail-policy -- the session resolves to a
+        deny-all profile (every category ``banned`` / ``False``) and the
+        ceiling to a deny-all ceiling, so the merged result is the all-denied
+        shape rather than an accidental grant.  (Contrast an unknown ceiling
+        *value*, which is fail-OPEN; see :func:`apply_workspace_ceiling`.)
 
     Absent-grant rule:
         ``SessionPermissions`` carries safe pydantic defaults (filesystem

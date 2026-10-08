@@ -327,3 +327,36 @@ def test_disk_fail_closed_ceiling_bans_mcp():
     capped = apply_workspace_ceiling(sg._DISK_FAIL_CLOSED_CEILING, {"mcp": "full"})
     assert capped["mcp"] == "banned"
 
+
+# ── B4: the module fail-policy has two directions ────────────────────────────
+def test_fail_policy_unknown_io_is_fail_closed(hermetic_vault):
+    """The *I/O* direction of the module fail-policy.
+
+    Contrast the *value* direction, which is fail-OPEN.
+
+    An unreadable/missing on-disk configuration (here: NO ``config.json``, so
+    no ceiling is readable) must resolve to the most-restrictive sentinel --
+    fail-CLOSED -- even though the session GRANT sidecar is perfectly
+    readable.  The unreadable I/O is what forces the deny-all shape; a mere
+    unknown ceiling *value* never would.
+    """
+    ws_id, sid = "ws-b4io", "sess-1"
+    # A readable GRANT sidecar only -- the ceiling/config I/O is what fails.
+    write_session_permissions(
+        hermetic_vault, ws_id, sid,
+        {"filesystem": "write", "git": "write", "network": "write"},
+    )
+    eff = get_effective_permissions(
+        SessionPermissions(),  # ignored in disk mode
+        _FULL_CAPS,
+        session_id=sid,
+        workspace_id=ws_id,
+    )
+    # Most-restrictive sentinel: the deny-all six-key shape, never a grant,
+    # despite the permissive grant sidecar above.
+    assert eff == ALL_BANNED
+    # Distinct from the existing pins: the fail-closed result NAMES its I/O
+    # cause, proving the deny-all came from the unreadable I/O path (not from a
+    # legitimate ceiling reduction) -- this is the fail-CLOSED half of the
+    # policy that fail-OPENS for an unknown ceiling *value*.
+    assert getattr(eff, "_fail_closed_reason", "") != ""
