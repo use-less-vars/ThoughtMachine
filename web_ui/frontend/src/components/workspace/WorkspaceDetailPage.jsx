@@ -313,13 +313,13 @@ function ContainersTab({ summary }) {
   // C.3 step 2: the tab's single container list is the shared C.1
   // ContainerListPanel (ephemeral / persistent / resource groups plus lifecycle
   // controls), which reads the UI set from GET /containers. The retired
-  // read-only summary.active_containers table projected the AGENT set -- the
+  // read-only summary.containers_in_use table projected the AGENT set -- the
   // wrong audience for this slot. ContainerListPanel carries no logs
   // affordance, so a MINIMAL logs element survives here over the same summary
   // container names: one Logs toggle per container that lazily mounts
   // ContainerLogsViewer.
-  const logContainers = Array.isArray(summary.active_containers)
-    ? summary.active_containers
+  const logContainers = Array.isArray(summary.containers_in_use)
+    ? summary.containers_in_use
     : []
   const [logsOpenKey, setLogsOpenKey] = useState(null)
 
@@ -565,7 +565,7 @@ export default function WorkspaceDetailPage({ workspaceId }) {
 
   const activeSessions = summary?.active_sessions?.length || 0
   const activeWorkers = summary?.active_workers?.length || 0
-  const containerCount = summary?.active_containers?.length || 0
+  const containerCount = summary?.containers_listed ?? 0
 
   const posture = summary && summary.allow_host_resources
     ? 'Host resources allowed. This workspace is suitable only for trusted, supervised work.'

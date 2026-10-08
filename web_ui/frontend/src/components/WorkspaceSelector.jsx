@@ -117,7 +117,7 @@ export default function WorkspaceSelector() {
   const summaryData = summary || {}
   const workspaces = Array.isArray(summaryData.workspaces) ? summaryData.workspaces : []
   const sessions = Array.isArray(summaryData.active_sessions) ? summaryData.active_sessions : []
-  const containers = Array.isArray(summaryData.active_containers) ? summaryData.active_containers : []
+  const containers = Array.isArray(summaryData.containers_in_use) ? summaryData.containers_in_use : []
   const providers = Array.isArray(summaryData.providers) ? summaryData.providers : []
   // REST-loaded providers win once a request succeeds; otherwise keep the
   // summary-derived list so behaviour is unchanged before the first call.

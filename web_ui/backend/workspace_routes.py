@@ -1783,6 +1783,51 @@ def _containers_for_workspace(entry) -> Optional[List[Dict[str, Any]]]:
         return None
 
 
+def _containers_listed_for_workspace(entry) -> int:
+    """Count of the workspace's UI container enumeration (the FULL live set).
+
+    This is the count the Containers panel renders: every live container for
+    the workspace, *including* resource containers, which the agent-facing
+    ``_containers_for_workspace()`` deliberately hides.  It reuses the single
+    owner of the "workspace live set" fact
+    (``server._list_workspace_live_containers``) rather than inventing a second
+    enumeration.  Returns 0 when enumeration is unavailable (no docker client /
+    daemon), matching the summary's degrade-to-empty contract.
+    """
+    if not _workspace_root_mountable(entry):
+        return 0
+    try:
+        from infra.container_manager import ContainerManager
+
+        manager = ContainerManager(
+            workspace_path=entry.root_path,
+            workspace_id=entry.id,
+            session_id=None,
+            session_permissions=None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "_containers_listed_for_workspace: ContainerManager construction "
+            "failed for workspace %s: %s",
+            entry.id,
+            exc,
+        )
+        return 0
+    try:
+        from web_ui.backend.server import _list_workspace_live_containers
+
+        live = _list_workspace_live_containers(manager, entry.id)
+    except Exception as exc:
+        logger.warning(
+            "_containers_listed_for_workspace: live container enumeration "
+            "failed for workspace %s: %s",
+            entry.id,
+            exc,
+        )
+        return 0
+    return len(live or [])
+
+
 @router.get("/{ws_id}/summary")
 async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
     """Return a full read-only overview of a workspace for the UI dashboard.
@@ -1865,11 +1910,16 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
     except Exception:
         active_sessions = []
 
-    # Provisioned containers for this workspace.
+    # Provisioned (agent-facing) containers for this workspace.  The agent
+    # enumeration excludes resource containers (list_containers hides them).
     try:
-        active_containers = _containers_for_workspace(entry) or []
+        containers_in_use = _containers_for_workspace(entry) or []
     except Exception:
-        active_containers = []
+        containers_in_use = []
+
+    # UI enumeration count: the full live set, resource containers included.
+    # Derived from the single owner of that fact, never a second list.
+    containers_listed = _containers_listed_for_workspace(entry)
 
     # Tool registry + resource catalog.
     try:
@@ -1903,7 +1953,8 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
         "worker_templates": worker_templates,
         "active_workers": active_workers,
         "active_sessions": active_sessions,
-        "active_containers": active_containers,
+        "containers_in_use": containers_in_use,
+        "containers_listed": containers_listed,
         "tools": tools,
         "resource_catalog": resource_catalog,
     }

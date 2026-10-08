@@ -75,7 +75,7 @@ function stubFetchByUrl(routes, defaultResponse = DEFAULT_FALLBACK) {
 // Realistic summary fixture matching the backend GET /api/workspace/{id}/summary
 // shape: {workspace_id, label, root_path, allow_host_resources, permissions,
 // capabilities, dockerfile, active_workers, active_sessions,
-// active_containers, tools, resource_catalog}.
+// containers_in_use, containers_listed, tools, resource_catalog}.
 function makeSummary(overrides = {}) {
   return {
     workspace_id: WORKSPACE_ID,
@@ -107,7 +107,7 @@ function makeSummary(overrides = {}) {
         started_at: '2026-08-31T10:00:00Z',
       },
     ],
-    active_containers: [
+    containers_in_use: [
       {
         id: 'abc123',
         name: 'research-runner',
@@ -116,6 +116,7 @@ function makeSummary(overrides = {}) {
         status: 'running',
       },
     ],
+    containers_listed: 1,
     tools: ['git', 'file_editor'],
     resource_catalog: [
       {
@@ -511,7 +512,8 @@ describe('WorkspaceDetailPage', () => {
     stubFetchByUrl(
       routesFor(
         makeSummary({
-          active_containers: [],
+          containers_in_use: [],
+          containers_listed: 0,
           dockerfile: { path: '/home/jojo/workspaces/research/Dockerfile', content: null },
         })
       )

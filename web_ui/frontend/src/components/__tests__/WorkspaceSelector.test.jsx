@@ -81,10 +81,11 @@ const SUMMARY = {
       started_at: '2026-08-29T08:00:00Z',
     },
   ],
-  active_containers: [
+  containers_in_use: [
     { name: 'alpha-ctr', type: 'free_use', workspace_id: 'ws-a', status: 'running' },
     { name: 'beta-ctr', type: 'resource', workspace_id: 'ws-b', status: 'stopped' },
   ],
+  containers_listed: 2,
   providers: [],
 }
 
