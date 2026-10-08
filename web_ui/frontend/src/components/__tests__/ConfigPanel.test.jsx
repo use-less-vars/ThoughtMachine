@@ -167,6 +167,23 @@ describe('Permissions tab', () => {
     const selects = container.querySelectorAll('select');
     expect(selects[2].value).toBe('banned');
   });
+
+  it('keeps the panel defaults in lockstep with useStore.PERMISSION_DEFAULTS', () => {
+    // Equivalence pin: ConfigPanel's module-local CANONICAL_PERMISSION_DEFAULTS
+    // and useStore's exported PERMISSION_DEFAULTS must stay values-identical.
+    // Select order is Git, Filesystem, Network, MCP, Host Bash; container is a
+    // checkbox. Expected GREEN at HEAD (the two maps currently agree).
+    const { container } = renderPanel({ config: { ...baseConfig, session_permissions: undefined } });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const selects = container.querySelectorAll('select');
+    expect(selects).toHaveLength(5);
+    const selectKeys = ['git', 'filesystem', 'network', 'mcp', 'host_bash'];
+    selectKeys.forEach((key, i) => {
+      expect(selects[i].value).toBe(PERMISSION_DEFAULTS[key]);
+    });
+    const checkbox = container.querySelector('input[type="checkbox"]');
+    expect(checkbox.checked).toBe(PERMISSION_DEFAULTS.container);
+  });
 });
 
 // ==========================================================================
