@@ -784,18 +784,16 @@ class TestGateDenialInstant:
 
     @pytest.fixture
     def config(self, tmp_path, monkeypatch) -> AgentConfig:
-        # The stored grant is filesystem 'ask', but filesystem's session
-        # vocabulary is banned|read|write -- no 'ask' -- so the sidecar value is
-        # dropped and the disk-effective value resolves to the SessionPermissions
-        # default 'read'.  The spawn-time worker footprint
-        # (config.session_permissions = filesystem 'ask', attached only when
-        # worker_mode=True) can no longer raise that to 'ask': on the A2
-        # grant-level map read STRICTLY BELOW ask, so the worker ask footprint
-        # collapses to the more restrictive 'read' ('read' x 'ask' -> 'read').
-        # A filesystem:write then needs more than the effective 'read', which
-        # worker context (no interactive user) denies instantly.  (The genuine
-        # filesystem-ask denial becomes constructible only after the filesystem
-        # vocabulary unification (A9) adds 'ask' to filesystem's vocab.)
+        # A9 vocabulary unification: filesystem's session vocabulary is now
+        # banned|ask|read|write, so a stored filesystem 'ask' grant is STORABLE
+        # and SURVIVES coercion -- it is no longer dropped to the SessionPermissions
+        # default 'read'.  The disk-effective value is therefore 'ask'; the
+        # spawn-time worker footprint (config.session_permissions = filesystem
+        # 'ask', attached only when worker_mode=True) agrees.  In
+        # non-interactive worker context (no interactive user) a filesystem:write
+        # request is denied instantly on the ask branch: the gate requires
+        # interactive approval, which is unavailable, so it denies and the agent
+        # continues without publishing any prompt event.
         try:
             from thoughtmachine.security import SessionPermissions
             perms = SessionPermissions(filesystem="ask")
@@ -832,10 +830,10 @@ class TestGateDenialInstant:
         )
 
     def test_gate_denial_instant(self, config: AgentConfig, ctx: WorkerContext):
-        """Effective filesystem 'read' (the worker 'ask' footprint collapses to
-        'read' now that read ranks strictly below ask): the gate denies the
-        write instantly via the NullEventBus -- no interactive user -- and the
-        agent continues."""
+        """Effective filesystem 'ask' (A9: the stored 'ask' grant survives and
+        the worker 'ask' footprint agrees): the gate denies the write instantly
+        via the NullEventBus -- no interactive user, so ask cannot be satisfied --
+        and the agent continues."""
         # Script: call FileEditor with write operation (requires filesystem:write)
         # Patch global_event_bus to None to simulate worker context with no interactive user
         # NullEventBus = BOTH module-level bindings must be None:
@@ -889,13 +887,15 @@ class TestGateDenialInstant:
 
             denied_result = tool_results[0]
             result_content = str(denied_result.get("result", ""))
-            # ACTUAL agent-path denial message: security_gate.check_required_categories,
-            # no-event-bus branch. The gate denies BEFORE the tool runs, so the
-            # in-tool atomic message ('Atomic permission check failed: ...') never
-            # appears on this path.
-            assert "Permission denied: Tool requires filesystem:write, but session allows filesystem:read" in result_content, (
-                f"Expected gate denial message in tool result, got: {result_content}"
-            )
+            # ACTUAL agent-path denial message: the ask-branch denial on the
+            # no-event-bus (non-interactive worker) path. Post-A9 the stored
+            # filesystem 'ask' survives, so the gate denies BEFORE the tool runs
+            # with the interactive-approval message (the in-tool atomic message
+            # ('Atomic permission check failed: ...') never appears on this path).
+            assert (
+                "Permission denied: filesystem:write required by 'FileEditor' — ask requires interactive approval; not available in worker context."
+                in result_content
+            ), (f"Expected gate denial message in tool result, got: {result_content}")
 
             # Should mention 'ask requires interactive approval' (the
             # NullEventBus message) or a similar denial explanation

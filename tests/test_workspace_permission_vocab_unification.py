@@ -15,6 +15,14 @@ grains ``git_read`` / ``git_write`` / ``system`` / ``execution`` were
 removed and are rejected fail-closed by the validator (``git_read`` /
 ``git_write`` with a hint pointing at ``git``); the security gate no
 longer recognises them as ceiling keys.
+
+The second half of the module pins the unified 4-value *session* vocabulary
+for ``filesystem`` (``banned | read | ask | write``): ``ask`` is a
+first-class storable level, and the session-grant whitelist
+``security.resource_catalog.RESOURCE_CATALOG`` -- consumed by
+``coerce_resource_permissions`` on every session-permission read/write --
+must include it so a stored ``filesystem: ask`` grant survives round-trip
+instead of being silently dropped back to the safe default.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from fastapi.testclient import TestClient
 
 from agent.config.resource_catalog import validate_workspace_permissions
 from agent.config.workspace_purpose import apply_purpose_preset
+from security.resource_catalog import RESOURCE_CATALOG, coerce_resource_permissions
 from security.security_gate import apply_workspace_ceiling, get_effective_permissions
 from thoughtmachine.security import SessionPermissions
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
@@ -287,3 +296,45 @@ def test_put_permissions_docker_write_roundtrip(tmp_path, monkeypatch):
         (vault / "workspaces" / ws_id / "config.json").read_text(encoding="utf-8")
     )
     assert saved["permissions"] == {"container": True}
+
+
+# --------------------------------------------------------------------------
+# Session vocabulary for ``filesystem``: ``ask`` is a first-class level
+# --------------------------------------------------------------------------
+
+_CATALOG_LOGGER = "security.resource_catalog"
+
+#: The unified session vocab for ``filesystem`` -- exactly these four levels.
+_FILESYSTEM_SESSION_VOCAB = {"banned", "read", "ask", "write"}
+
+
+def test_filesystem_session_vocab_is_exactly_four_values():
+    # Loud on any fifth/stray value: the session vocab is exactly these four.
+    assert set(RESOURCE_CATALOG["filesystem"]) == _FILESYSTEM_SESSION_VOCAB
+
+
+def test_filesystem_ask_survives_coercion(caplog):
+    with caplog.at_level(logging.WARNING, logger=_CATALOG_LOGGER):
+        clean = coerce_resource_permissions({"filesystem": "ask", "git": "read"})
+    assert clean == {"filesystem": "ask", "git": "read"}
+    assert "dropping invalid value" not in caplog.text
+
+
+@pytest.mark.parametrize("level", ["banned", "read", "ask", "write"])
+def test_filesystem_every_documented_level_roundtrips(level, caplog):
+    with caplog.at_level(logging.WARNING, logger=_CATALOG_LOGGER):
+        clean = coerce_resource_permissions({"filesystem": level})
+    assert clean == {"filesystem": level}
+    assert "dropping invalid value" not in caplog.text
+
+
+def test_filesystem_junk_value_still_dropped(caplog):
+    with caplog.at_level(logging.WARNING, logger=_CATALOG_LOGGER):
+        clean = coerce_resource_permissions({"filesystem": "nonsense"})
+    assert "filesystem" not in clean
+    assert "dropping invalid value" in caplog.text
+
+
+def test_session_permissions_model_accepts_filesystem_ask():
+    perms = SessionPermissions(filesystem="ask")
+    assert perms.filesystem == "ask"

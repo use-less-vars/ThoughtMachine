@@ -35,7 +35,7 @@ whitelist (:data:`WORKSPACE_CEILING_VOCAB`); the same level string means
 the same thing in either place.  Session-grant values per canonical key::
 
     git          banned | ask | read | write | write_on_feature_branch
-    filesystem   banned | read | write
+    filesystem   banned | ask | read | write
     container    True | False
     network      banned | ask | write | outbound
     mcp          banned | connect | full
@@ -115,7 +115,7 @@ logger = logging.getLogger(__name__)
 #: Canonical resource name -> allowed values (validated verbatim).
 RESOURCE_CATALOG = {
     "git": ["banned", "ask", "read", "write", "write_on_feature_branch"],
-    "filesystem": ["banned", "read", "write"],
+    "filesystem": ["banned", "ask", "read", "write"],
     "container": [True, False],
     "network": ["banned", "ask", "write", "outbound"],
     "mcp": ["banned", "connect", "full"],
