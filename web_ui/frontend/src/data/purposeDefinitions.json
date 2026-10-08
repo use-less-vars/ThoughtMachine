@@ -65,9 +65,9 @@
     "requiresDocker": true,
     "recommendedSettings": "Container: enabled with device passthrough, Network: ask (restricted), Filesystem: read-only outside workspace.",
     "defaults": {
-      "resources": ["container", "serial", "filesystem"],
-      "permissions": { "container": "true", "serial": "true", "filesystem": "read", "network": "ask" },
-      "tools": ["SerialTool", "FileEditor", "FileReader", "DockerTool"],
+      "resources": ["container", "filesystem"],
+      "permissions": { "container": true, "filesystem": "read", "network": "ask" },
+      "tools": ["FileEditor", "FileReader", "DockerTool"],
       "sessionDefaults": {
         "max_turns": 60,
         "temperature": 0.5,
@@ -85,7 +85,7 @@
     "recommendedSettings": "Container: mandatory isolation, Network: read-only, Filesystem: read-only, no host access.",
     "defaults": {
       "resources": ["container", "network"],
-      "permissions": { "container": "true", "network": "read", "filesystem": "read" },
+      "permissions": { "container": true, "network": "read", "filesystem": "read" },
       "tools": ["DockerTool", "FileReader", "SearchCodebase"],
       "sessionDefaults": {
         "max_turns": 80,

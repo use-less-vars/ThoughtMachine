@@ -123,7 +123,7 @@ function stubFetchByUrl(routes, defaultResponse = DEFAULT_FALLBACK) {
 }
 
 // Backend for ws-1: list entry, effective permissions (container:true →
-// 'enabled'), reachable docker health, two workers, empty containers/sessions.
+// 'Enabled'), reachable docker health, two workers, empty containers/sessions.
 const DEFAULT_ROUTES = {
   '/api/workspace/list': jsonOk([{ id: 'ws-1', label: 'Code Development', root: '/root' }]),
   '/api/workspace/ws-1/effective_permissions': jsonOk({
@@ -285,7 +285,7 @@ describe('SessionSidebar — structure', () => {
 // Permissions (read-only ceiling + effective table)
 // ===========================================================================
 describe('SessionSidebar — permissions (read-only)', () => {
-  it('renders the permission table with ceiling + effective columns; container:true → enabled', async () => {
+  it('renders the permission table with ceiling + effective columns; container:true → Enabled', async () => {
     stubBackend()
     renderSidebar({ tools: [] })
     await act(async () => {})
@@ -293,9 +293,10 @@ describe('SessionSidebar — permissions (read-only)', () => {
     expect(screen.getByText('Ceiling (workspace max)')).toBeInTheDocument()
     expect(screen.getByText('Effective (session default)')).toBeInTheDocument()
     expect(screen.getByText('filesystem')).toBeInTheDocument()
-    // container is a backend bool → frontend 'enabled'; it appears once as
-    // ceiling and once as effective.
-    expect(screen.getAllByText('enabled')).toHaveLength(2)
+    // container is the one boolean resource; the sidebar renders its raw boolean
+    // as the display label 'Enabled' (once for ceiling, once for effective).
+    expect(screen.getAllByText('Enabled')).toHaveLength(2)
+    expect(screen.queryByText('enabled')).not.toBeInTheDocument()
     // network, mcp and host_bash are banned in both columns.
     expect(screen.getAllByText('banned')).toHaveLength(6)
   })

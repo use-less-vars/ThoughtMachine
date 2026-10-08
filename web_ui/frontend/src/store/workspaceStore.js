@@ -19,7 +19,6 @@ const RESOURCE_META = {
   filesystem: { icon: '📁', description: 'Filesystem access' },
   network:    { icon: '🌐', description: 'Network access' },
   container:  { icon: '🐳', description: 'Docker container execution' },
-  serial:     { icon: '🔌', description: 'Serial / device access' },
 }
 
 // --- Tool → resource mapping ---
@@ -30,7 +29,6 @@ const TOOL_RESOURCE = {
   GitTool:        'git',
   DockerTool:     'container',
   HttpTool:       'network',
-  SerialTool:     'serial',
 }
 
 // --- Ceiling per permission name (used when a purpose sets a lower default) ---
@@ -38,8 +36,7 @@ const PERMISSION_CEILINGS = {
   git:        'write',
   filesystem: 'write',
   network:    'write',
-  container:  'enabled',
-  serial:     'enabled',
+  container:  true,
 }
 
 // --- Safety advisory per risk level ---
@@ -73,11 +70,16 @@ function buildWorkspace(purpose, idOverride) {
     enabled: true,
   }))
 
-  const permissions = Object.entries(defaults.permissions || {}).map(([name, effective]) => ({
-    name,
-    ceiling: PERMISSION_CEILINGS[name] || effective,
-    effective,
-  }))
+  const permissions = Object.entries(defaults.permissions || {}).map(([name, effective]) => {
+    // container is the one boolean resource: coerce any JSON 'true'/'false'
+    // string to a real boolean (mirrors fetchWorkspaceConfig).
+    if (name === 'container') effective = effective === true
+    return {
+      name,
+      ceiling: PERMISSION_CEILINGS[name] || effective,
+      effective,
+    }
+  })
 
   const tools = (defaults.tools || []).map((name) => ({
     name,
@@ -349,7 +351,7 @@ const useWorkspaceStore = create((set, get) => ({
       if (ep) {
         permissions = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash'].map((name) => {
           let effective = ep[name]
-          if (name === 'container') effective = effective ? 'enabled' : 'banned'
+          if (name === 'container') effective = effective === true
           return { name, ceiling: effective, effective }
         })
       } else if (purpose) {
