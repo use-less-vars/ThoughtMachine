@@ -29,6 +29,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from security.resource_catalog import WORKSPACE_CEILING_VOCAB
+
 _CATALOG_PATH = Path(__file__).resolve().parent / "resource_catalog.json"
 
 #: Workspace-permission resource grains exposed to the permission
@@ -95,23 +97,18 @@ _LEGACY_RESOURCES = {
     },
 }
 
-#: Canonical per-resource permission vocabularies (workspace ceilings;
-#: mirrors ``security.resource_catalog.WORKSPACE_CEILING_VOCAB``).
-#: ``validate_workspace_permissions`` accepts exactly these levels per
-#: resource: ``git`` retains ``write_on_feature_branch`` (branch-restricted
-#: write ceiling); ``git``/``filesystem`` do NOT accept ``full`` (a legacy
-#: stored ``full`` ceiling is normalised to ``write``); ``docker`` is
-#: handled as a legacy string alias of the boolean ``container`` ceiling
-#: and is NOT a table key.  The removed legacy grains ``git_read``/
-#: ``git_write``/``system``/``execution`` have no entry here -- they are
-#: rejected by validation with a legacy-removed hint.
-_PERMISSION_LEVELS_BY_RESOURCE: Dict[str, Tuple[str, ...]] = {
-    "git": ("banned", "ask", "read", "write_on_feature_branch", "write"),
-    "filesystem": ("banned", "ask", "read", "write"),
-    "network": ("banned", "ask", "write", "outbound"),
-    "mcp": ("banned", "connect", "full"),
-    "host_bash": ("banned", "ask", "allow"),
-}
+#: Canonical per-resource permission vocabularies (workspace ceilings).
+#: Import-backed alias of ``security.resource_catalog.WORKSPACE_CEILING_VOCAB``
+#: (the single source of truth) under the name consumed by the permission
+#: machinery here.  ``validate_workspace_permissions`` accepts exactly these
+#: levels per resource: ``git`` retains ``write_on_feature_branch``
+#: (branch-restricted write ceiling); ``git``/``filesystem`` do NOT accept
+#: ``full`` (a legacy stored ``full`` ceiling is normalised to ``write``);
+#: ``docker`` is handled as a legacy string alias of the boolean
+#: ``container`` ceiling and is NOT a table key.  The removed legacy grains
+#: ``git_read``/``git_write``/``system``/``execution`` have no entry here --
+#: they are rejected by validation with a legacy-removed hint.
+_PERMISSION_LEVELS_BY_RESOURCE: Dict[str, Tuple[str, ...]] = WORKSPACE_CEILING_VOCAB
 
 #: Legacy string vocabulary accepted for the ``docker`` alias of the
 #: boolean ``container`` ceiling. ``banned``/``read``/``ask`` deny the
