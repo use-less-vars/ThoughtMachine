@@ -120,11 +120,24 @@ import json
 import os
 import sys
 
+# The repo root (parent of this script's directory) must be importable so the
+# canonical session-grant catalog (security/resource_catalog.py) resolves
+# whether this file is executed directly or loaded by path from its migrate
+# sibling (scripts/vault_permission_migrate.py).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from security.resource_catalog import RESOURCE_CATALOG
+
 # ---------------------------------------------------------------------------
 # vocabularies & constants
 # ---------------------------------------------------------------------------
 
-SESSION_VOCAB = ("git", "filesystem", "container", "network", "mcp", "host_bash")
+#: Canonical session-grant resource keys, in catalog order.  DERIVED from the
+#: canonical ``RESOURCE_CATALOG`` (security/resource_catalog.py) so the two can
+#: never drift.
+SESSION_VOCAB = tuple(RESOURCE_CATALOG)
 SESSION_VOCAB_SET = frozenset(SESSION_VOCAB)
 
 # system (kept + flagged for review) is valid ONLY inside
