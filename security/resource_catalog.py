@@ -197,6 +197,29 @@ WORKSPACE_CEILING_VOCAB: Dict[str, tuple] = {
     "host_bash": ("banned", "ask", "allow"),
 }
 
+#: Git-grain *breadth* ranks (broader grant = SMALLER number), consumed by
+#: ``thoughtmachine.vault_repair`` to fold the legacy ``git_read`` /
+#: ``git_write`` grains onto the canonical ``git`` grain:
+#:
+#:     write(0) < write_on_feature_branch(1) < ask(2) < read(3) < banned(4)
+#:
+#: DERIVED tie-break ordering -- NOT independent truth.  It is the git level
+#: vocabulary sorted by ``WORKSPACE_CEILING_LEVELS_RANKS`` descending (strict
+#: across the git vocab), re-expressed as integer breadth ranks.  The flat
+#: ``GRANT_LEVEL_RANKS`` cannot order these (it ties ``write`` ==
+#: ``write_on_feature_branch``), so this import-backed view exists purely so the
+#: fold order can never drift from the ceiling scale.
+GIT_BREADTH_RANKS: Dict[str, int] = {
+    level: idx
+    for idx, level in enumerate(
+        sorted(
+            WORKSPACE_CEILING_VOCAB["git"],
+            key=lambda lvl: WORKSPACE_CEILING_LEVELS_RANKS[lvl],
+            reverse=True,
+        )
+    )
+}
+
 
 def _value_is_valid(key: str, value: Any) -> bool:
     """True when *value* is an allowed level for the canonical *key*.

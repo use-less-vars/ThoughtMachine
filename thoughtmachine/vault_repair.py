@@ -33,7 +33,7 @@ repair.  The default remains read-only; ``run_repair(apply=True)`` / the
 * ``--dry-run`` is accepted as a no-op for forward compatibility.
 
 The module never raises and is stdlib-only apart from the repo-local drift
-checker import, so it can be invoked on the host as
+checker and resource-catalog imports, so it can be invoked on the host as
 ``python3 -m thoughtmachine.vault_repair``.
 """
 
@@ -57,6 +57,7 @@ from agent.config.vault_drift import (
     _SEED_MAP,
     _resources_dir,
 )
+from security.resource_catalog import GRANT_LEVEL_RANKS, GIT_BREADTH_RANKS
 
 __version__ = "0.2.0"
 TOOL_VERSION = "thoughtmachine.vault_repair 0.2.0"
@@ -81,16 +82,11 @@ _PERM_INTEREST = LEGACY_SET | SESSION_VOCAB_SET | {"system", "docker"}
 # silently reduce grants); reported as manual_review everywhere it is seen.
 _GAW_KEY = "git_allow_worktree_commits"
 
-# Canonical git grain ranks (mirrors security/resource_catalog.py
-# GRANT_LEVEL_RANKS: banned < read < ask < write == write_on_feature_branch).
-_GIT_MERGE_RANK = {
-    "banned": 0,
-    "read": 1,
-    "ask": 2,
-    "write": 3,
-    "write_on_feature_branch": 3,
-    "full": 4,
-}
+# Git grain ranks reuse the canonical ``GRANT_LEVEL_RANKS``
+# (security/resource_catalog.py) so the git-fold order
+# ``banned < read < ask < write == write_on_feature_branch`` cannot drift
+# from the shared table; the local name stays as an alias.
+_GIT_MERGE_RANK = GRANT_LEVEL_RANKS
 
 # Backups created by this tool: '<name>.bak-<YYYYmmddHHMMSS>[-N]'.  They do
 # NOT end in '.bak' (so agent.config.vault_drift's unknown-root-file scan
@@ -839,16 +835,12 @@ def _collect_seeded_files(root: Path) -> List[dict]:
 # never auto-fixed.
 # ---------------------------------------------------------------------------
 
-# Broader = smaller number (mirrors security/resource_catalog.py
-# GRANT_LEVEL_RANKS: write is broader than write_on_feature_branch, which is
-# broader than ask, which is broader than read ...).
-_GIT_BREADTH = {
-    "write": 0,
-    "write_on_feature_branch": 1,
-    "ask": 2,
-    "read": 3,
-    "banned": 4,
-}
+# Broader = smaller number.  Import-backed alias of the canonical derived table
+# ``security.resource_catalog.GIT_BREADTH_RANKS`` (the git level vocabulary
+# sorted by WORKSPACE_CEILING_LEVELS_RANKS descending: write <
+# write_on_feature_branch < ask < read < banned).  The local name is kept
+# because this module and its callers reference ``_GIT_BREADTH``.
+_GIT_BREADTH = GIT_BREADTH_RANKS
 
 # Segment matcher: '<key>[<idx>][<idx>]...' (dict key, then list indices).
 _SEG_RE = re.compile(r"([^\[]+)((\[\d+\])*)")
