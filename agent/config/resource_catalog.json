@@ -5,9 +5,10 @@
     "description": "Git repository operations (read and write) via the git tools.",
     "permission_grain_set": [
       "banned",
-      "read",
       "ask",
-      "write"
+      "read",
+      "write",
+      "write_on_feature_branch"
     ],
     "execution_mode": "container",
     "container_image": null,
@@ -23,8 +24,8 @@
     "description": "File read/write access to the workspace tree.",
     "permission_grain_set": [
       "banned",
-      "read",
       "ask",
+      "read",
       "write"
     ],
     "execution_mode": "container",
@@ -62,9 +63,8 @@
     "description": "Supervised shell command execution on the host machine.",
     "permission_grain_set": [
       "banned",
-      "read",
       "ask",
-      "write"
+      "allow"
     ],
     "execution_mode": "host",
     "container_image": null,
@@ -77,12 +77,7 @@
     "name": "tty",
     "display_name": "TTY",
     "description": "Interactive terminal sessions.",
-    "permission_grain_set": [
-      "banned",
-      "read",
-      "ask",
-      "write"
-    ],
+    "permission_grain_set": [],
     "execution_mode": "host",
     "container_image": null,
     "dockerfile_reference": null,
@@ -92,12 +87,7 @@
     "name": "jtag",
     "display_name": "JTAG",
     "description": "JTAG hardware debug probe access.",
-    "permission_grain_set": [
-      "banned",
-      "read",
-      "ask",
-      "write"
-    ],
+    "permission_grain_set": [],
     "execution_mode": "host",
     "container_image": null,
     "dockerfile_reference": null,
