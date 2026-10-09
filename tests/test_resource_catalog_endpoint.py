@@ -90,4 +90,10 @@ def test_resource_catalog_git_entry_exact_fields(client):
     assert git["dockerfile_reference"] == "docker/resource/git_overlay.Dockerfile"
     assert git["tools"] == ["git_read", "git_write"]
     assert git["execution_mode"] == "container"
-    assert git["permission_grain_set"] == ["banned", "read", "ask", "write"]
+    assert git["permission_grain_set"] == [
+        "banned",
+        "ask",
+        "read",
+        "write",
+        "write_on_feature_branch",
+    ]
