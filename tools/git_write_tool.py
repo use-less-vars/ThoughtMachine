@@ -41,7 +41,7 @@ class GitWriteTool(GitReadTool):
     read surface (status, diff, diff_cached, log, branch, branch_list, show,
     remote, blame, config) lives in ``GitReadTool`` (tools/git_info_tool.py);
     this subclass inherits the hardened execution backends, path validation,
-    the operator-managed-worktree detection and the per-call execution-mode
+    the per-call execution-mode
     trailer, and adds the write dispatch.
     Parameters:
         working_dir: repository root (defaults to workspace root).
@@ -69,9 +69,8 @@ class GitWriteTool(GitReadTool):
     name: ClassVar[str] = "git_write"
 
     # Branches on which a ``write_on_feature_branch`` session may never
-    # commit. Shared by the commit-time feature-branch restriction and the
-    # operator-managed-worktree agent-commit narrow allow, so the protected
-    # set stays in one place.
+    # commit. Shared by the commit-time feature-branch restriction, so the
+    # protected set stays in one place.
     _PROTECTED_BRANCHES: ClassVar[tuple] = ("dev", "master", "main")
 
     @classmethod
@@ -359,57 +358,6 @@ class GitWriteTool(GitReadTool):
                 raise
             return self._truncate_output(f"Error executing git operation: {e}")
 
-    def _unprotected_branch_agent_commit_allowed(self, repo_root: Path) -> bool:
-        """Narrow allow for agent commits in operator-managed worktrees.
-        An agent commit is permitted in an operator-managed worktree only
-        when ALL of the following hold:
-        1. The session git permission is write-capable (``_git_write_allowed()``).
-        2. Container git execution is active (``_use_container_mode()``).
-        3. The branch check runs through the normal execution-mode dispatch
-           (no silent host fallback exists any more): a container-mode call
-           whose git resource is unavailable/degraded raises, so the hardened
-           host backend (which injects ``--no-verify`` /
-           ``core.hooksPath=/dev/null``) can never silently bypass the gate.
-        4. The current branch is NOT a protected branch (``dev``, ``master``,
-           ``main``); every other branch (feat/*, fix/*, refactor/*, chore/*,
-           docs/*, ...) is allowed.
-        Any violation returns False so the caller keeps the existing
-        operator-managed-worktree block.
-        """
-        # Clear any refusal reason left over from a previous call (tool
-        # instances may be reused); it is set only when THIS call detects a
-        # detached HEAD, so the caller can surface a distinguishable error.
-        self._agent_commit_refusal_reason = None
-        if not self._git_write_allowed():
-            return False
-        if not self._use_container_mode():
-            return False
-        try:
-            output = self._run_git(
-                repo_root,
-                ["rev-parse", "--abbrev-ref", "HEAD"],
-            )
-        except (RuntimeError, PermissionError):
-            # Container-mandatory branch resolution failed (container
-            # unavailable, policy denial): fail closed, never degrade.
-            return False
-        branch = (output or "").strip()
-        if branch == "HEAD":
-            # Detached HEAD: rev-parse --abbrev-ref HEAD reports the literal
-            # string "HEAD" -- a valid ref that is NOT protected, so the
-            # checks below would permit the commit (fail-OPEN). Refuse, and
-            # record the reason so the commit entry point can surface it.
-            self._agent_commit_refusal_reason = _DETACHED_HEAD_ERROR
-            return False
-        if not self._is_valid_branch_ref(branch):
-            # Invalid branch output (empty / multi-line / error-shaped /
-            # over-long): fail closed.  Closes the fail-open where a swallowed
-            # FileNotFoundError / OSError return string ("Git command not
-            # found ...", "Error running git command: ...") was parsed as a
-            # branch name and permitted the commit.
-            return False
-        return branch not in self._PROTECTED_BRANCHES
-
     def _is_detached_head(self, repo_root: Path) -> bool:
         """True when the workspace HEAD is detached (not on a branch).
 
@@ -469,26 +417,6 @@ class GitWriteTool(GitReadTool):
                 return True
 
         raise ValueError(f"Unsupported git protocol: {clone_url}")
-
-    def _is_operator_managed_worktree(self, repo_root: Path) -> bool:
-        """True when ``repo_root`` is an operator-managed git worktree.
-
-        Git worktrees represent ``.git`` as a regular file whose contents
-        start with ``gitdir: <path>`` (instead of a directory). Such
-        workspaces are checked out by operator/host tooling and commits are
-        performed host-side, so in-workspace commits are blocked.
-        """
-        dot_git = repo_root / ".git"
-        if not dot_git.exists() or not dot_git.is_file():
-            return False
-        try:
-            content = dot_git.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            # Unreadable gitfile: treat as not operator-managed so read ops
-            # and staging keep working; a broken worktree surfaces the
-            # underlying git error at commit time instead.
-            return False
-        return content.startswith("gitdir:")
 
     @staticmethod
     def _validate_branch_name(name: str) -> str:
@@ -717,8 +645,8 @@ class GitWriteTool(GitReadTool):
         <paths>``). There is no full-worktree mode -- the historical ``git
         add -A`` auto-stage sweep is removed, so unvetted changes cannot be
         swept into a commit past the review gate. The ``-- <paths>`` pathspec
-        applies on EVERY code path -- including the operator-managed-worktree
-        path -- so a pre-staged unrelated file can never slip into the commit.
+        applies on EVERY code path, so a pre-staged unrelated file can never
+        slip into the commit.
         The named paths are staged
         explicitly (never ``-A``) before committing: ``git commit -- <paths>``
         only commits files git already knows, so untracked files (e.g. the
@@ -738,12 +666,10 @@ class GitWriteTool(GitReadTool):
         if not self._git_write_allowed():
             return self._flag_gate_error()
         # write_on_feature_branch grants: the outer git:write category gate
-        # passes, so the branch restriction is enforced HERE, at commit time
-        # (mirroring _unprotected_branch_agent_commit_allowed, which also
-        # gates commits only). Commits are allowed only on non-protected
-        # branches; resolving the current branch fails closed (empty /
-        # unresolved output -> denied). Full write/full/ask grains are not
-        # branch-restricted by this tool.
+        # passes, so the branch restriction is enforced HERE, at commit time.
+        # Commits are allowed only on non-protected branches; resolving the
+        # current branch fails closed (empty / unresolved output -> denied).
+        # Full write/full/ask grains are not branch-restricted by this tool.
         if self._git_write_restricted_to_feature_branch():
             try:
                 branch_output = self._run_git(
@@ -753,7 +679,7 @@ class GitWriteTool(GitReadTool):
                 branch_output = ""
             branch = (branch_output or "").strip()
             if branch == "HEAD":
-                # Detached HEAD (see _unprotected_branch_agent_commit_allowed):
+                # Detached HEAD:
                 # fail closed instead of reading the literal "HEAD" as an
                 # unprotected branch.
                 return self._truncate_output(_DETACHED_HEAD_ERROR)
@@ -765,25 +691,6 @@ class GitWriteTool(GitReadTool):
                     f"current branch is '{branch_label}' (protected branches: "
                     "dev, master, main)"
                 )
-        # Operator-managed worktrees (a .git FILE pointing at a gitdir) are
-        # committed host-side by the operator; block in-workspace commits
-        # before any git subprocess can run. Narrow exception: agent commits
-        # on feat/* or fix/* branches with the explicit config flag and
-        # mandatory container execution (see
-        # _unprotected_branch_agent_commit_allowed). When the exception applies,
-        # the add/commit subprocesses themselves run with no silent host
-        # fallback (a container outage fails loudly).
-        if self._is_operator_managed_worktree(repo_root):
-            if not self._unprotected_branch_agent_commit_allowed(repo_root):
-                return self._truncate_output(
-                    getattr(self, "_agent_commit_refusal_reason", None)
-                    or (
-                        "Error: commits in this workspace are performed "
-                        "host-side by the operator (workspace is an "
-                        "operator-managed git worktree)"
-                    )
-                )
-
         if not self.message or not self.message.strip():
             return "Error: message is required for commit operation"
 
@@ -795,18 +702,18 @@ class GitWriteTool(GitReadTool):
                 "Error: file_path is required for commit operation (at least one path)"
             )
 
-        # Detached-HEAD gate (fail closed) on the PLAIN path. The two gates
-        # above cover the write_on_feature_branch and operator-managed paths;
-        # neither runs for an ordinary checkout with a write/full/ask grant, so
+        # Detached-HEAD gate (fail closed). The write_on_feature_branch gate
+        # above already refuses a detached HEAD; for every other grant
+        # (write/full/ask) neither that gate nor any worktree check runs, so
         # rev-parse --abbrev-ref HEAD == "HEAD" was read as an unprotected
         # branch and the add/commit below would create a DANGLING commit
-        # (HEAD advances, no branch ref updated). Refuse before any git
-        # subprocess runs. Guarded on the plain path only so the two upstream
-        # gates are never double-probed, and placed after the empty-file_path
-        # guard so a no-op commit request still issues no subprocess at all.
+        # (HEAD advances, no branch ref updated). Refuse on ALL checkouts --
+        # including operator-managed worktrees -- before any git subprocess
+        # runs. Guarded against the wofb gate so that path is never
+        # double-probed, and placed after the empty-file_path guard so a no-op
+        # commit request still issues no subprocess at all.
         if (
             not self._git_write_restricted_to_feature_branch()
-            and not self._is_operator_managed_worktree(repo_root)
             and self._is_detached_head(repo_root)
         ):
             return self._truncate_output(_DETACHED_HEAD_ERROR)

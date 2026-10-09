@@ -1,8 +1,8 @@
 """Unit tests for the git operations added in the GitInfoTool/GitWriteTool split.
 
 Covers the operations added to GitInfoTool: ``diff_cached``, ``branch_list``,
-``branch_create``, ``checkout``, ``stage``, ``unstage``, plus selective commit
-and the operator-managed worktree commit guard. Read operations (diff_cached,
+``branch_create``, ``checkout``, ``stage``, ``unstage``, plus selective commit.
+Read operations (diff_cached,
 branch_list, ...) live in ``GitInfoTool``; write operations (branch_create,
 checkout, stage, unstage, commit) live in ``GitWriteTool`` (which subclasses
 GitInfoTool) and require the session ``git`` permission to be at least
@@ -592,7 +592,7 @@ class TestBranchList:
 
 
 # ---------------------------------------------------------------------------
-# commit (selective + worktree guard)
+# commit (selective)
 # ---------------------------------------------------------------------------
 class TestCommit:
     def test_containerized_selective_commit_argv(self, tmp_path, fake_manager):
@@ -754,78 +754,7 @@ class TestCommit:
         assert ".githooks" not in command
 
 
-class TestWorktreeCommitGuard:
-    def _make_worktree(self, tmp_path):
-        (tmp_path / ".git").write_text(
-            "gitdir: /some/host/repo/.git/worktrees/ws\n", encoding="utf-8"
-        )
 
-    def test_commit_blocked_in_operator_worktree(self, tmp_path, fake_sandbox):
-        self._make_worktree(tmp_path)
-        tool = _host_tool(tmp_path, operation="commit", message="x")
-        result = tool._git_commit(tmp_path)
-
-        assert "host-side" in result
-        assert "operator" in result
-        assert result.startswith("Error:")
-        assert not _FakeSandbox.instances
-
-    def test_detector_true_for_gitfile(self, tmp_path):
-        self._make_worktree(tmp_path)
-        tool = _host_tool(tmp_path, operation="commit", message="x")
-        assert tool._is_operator_managed_worktree(tmp_path) is True
-
-    def test_detector_false_for_git_directory(self, tmp_path):
-        (tmp_path / ".git").mkdir()
-        tool = _host_tool(tmp_path, operation="commit", message="x")
-        assert tool._is_operator_managed_worktree(tmp_path) is False
-
-    def test_other_write_ops_denied_without_flag_in_worktree(self, tmp_path):
-        # Without the session git permission the gate fires for every
-        # write op, worktree or not: branch_create / stage / checkout all return
-        # FLAG_ERROR before any git subprocess could run.
-        self._make_worktree(tmp_path)
-
-        tool = GitWriteTool(operation="branch_create", branch="feature/x")
-        assert tool._git_branch_create(tmp_path) == FLAG_ERROR
-
-        tool = GitWriteTool(operation="stage", file_path="a.txt")
-        assert tool._git_stage(tmp_path) == FLAG_ERROR
-
-        tool = GitWriteTool(operation="checkout", branch="feature/x")
-        assert tool._git_checkout(tmp_path) == FLAG_ERROR
-
-    def test_other_write_ops_allowed_in_worktree(self, tmp_path, fake_sandbox):
-        # The worktree guard is commit-only: branch_create / stage / checkout
-        # keep working in an operator-managed worktree workspace when the
-        # operator flag is set.
-        self._make_worktree(tmp_path)
-
-        tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
-        assert "Error" not in tool._git_branch_create(tmp_path)
-
-        tool = _host_tool(tmp_path, operation="stage", file_path="a.txt")
-        assert "Error" not in tool._git_stage(tmp_path)
-
-        tool = _host_tool(tmp_path, operation="checkout", branch="feature/x")
-        assert "Error" not in tool._git_checkout(tmp_path)
-
-    def test_commit_allowed_when_git_is_directory(self, tmp_path, fake_sandbox):
-        (tmp_path / ".git").mkdir()
-        tool = _host_tool(
-            tmp_path, operation="commit", message="x", file_path="a.txt"
-        )
-        tool._git_commit(tmp_path)
-
-        command = _last_sandbox_command()
-        assert command[command.index("commit"):] == [
-            "commit", "--no-verify", "-m", "x", "--", "a.txt",
-        ]
-
-
-# ---------------------------------------------------------------------------
-# execution_mode trailer reporting
-# ---------------------------------------------------------------------------
 class TestExecutionModeTrailer:
     @pytest.mark.parametrize(
         "op,params",

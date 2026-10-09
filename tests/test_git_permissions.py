@@ -5,8 +5,8 @@ Canonical 6-key contract:
 - The session ``git`` level passes straight through to the effective
   ``git`` grain (SessionPermissions holds a single git key, not split
   read/write grains); the workspace capability (``git_available``) caps it.
-- ``GitWriteTool`` refuses agent commits in operator-managed worktrees
-  unless container execution is active AND the branch is unprotected.
+- ``GitWriteTool`` commits are gated solely by the ``git`` write grain; the
+  legacy operator-managed-worktree exemption is removed.
 """
 
 from pathlib import Path
@@ -47,7 +47,7 @@ class TestGitReadWritePermissionGrains:
 
 
 class TestGitWriteBranchProtection:
-    """Operator-managed worktrees reject agent commits outside the narrow path."""
+    """A commit without the ``git`` write grain is refused (fail closed)."""
 
     @staticmethod
     def _make_operator_managed_repo(tmp_path: Path) -> Path:
@@ -69,42 +69,6 @@ class TestGitWriteBranchProtection:
         defaults.update(params)
         return GitWriteTool(**defaults)
 
-    def test_unprotected_branch_requires_container_mode(self):
-        tool = self._tool()
-        with mock.patch.object(tool, '_git_write_allowed', return_value=True), \
-                mock.patch.object(tool, '_use_container_mode', return_value=False):
-            assert tool._unprotected_branch_agent_commit_allowed(
-                Path('/tmp/nonexistent-repo')
-            ) is False
-
-    def test_unprotected_branch_allowed_on_feature_branch_in_container(self):
-        tool = self._tool()
-        with mock.patch.object(tool, '_git_write_allowed', return_value=True), \
-                mock.patch.object(tool, '_use_container_mode', return_value=True), \
-                mock.patch.object(tool, '_run_git', return_value='feat/x'):
-            assert tool._unprotected_branch_agent_commit_allowed(
-                Path('/tmp/r')
-            ) is True
-
-    def test_protected_branch_denied_even_in_container(self):
-        tool = self._tool()
-        with mock.patch.object(tool, '_git_write_allowed', return_value=True), \
-                mock.patch.object(tool, '_use_container_mode', return_value=True), \
-                mock.patch.object(tool, '_run_git', return_value='main'):
-            assert tool._unprotected_branch_agent_commit_allowed(
-                Path('/tmp/r')
-            ) is False
-
-    def test_commit_in_operator_managed_worktree_denied_without_container(
-        self, tmp_path
-    ):
-        repo = self._make_operator_managed_repo(tmp_path)
-        tool = self._tool()
-        with mock.patch.object(tool, '_git_write_allowed', return_value=True), \
-                mock.patch.object(tool, '_use_container_mode', return_value=False):
-            result = tool._git_commit(repo)
-        assert 'performed host-side by the operator' in result
-
     def test_commit_gate_fails_closed_without_git_write_permission(self, tmp_path):
         repo = self._make_operator_managed_repo(tmp_path)
         tool = self._tool(effective_permissions={})
@@ -125,14 +89,8 @@ def test_git_read_write_permission_grains():
 
 
 def test_git_write_respects_branch_protection(tmp_path):
-    """Contract wrapper: branch protection and operator-managed worktrees."""
+    """Contract wrapper: the commit gate fails closed without the ``git`` write grain."""
     tc = TestGitWriteBranchProtection()
-    tc.test_unprotected_branch_requires_container_mode()
-    tc.test_unprotected_branch_allowed_on_feature_branch_in_container()
-    tc.test_protected_branch_denied_even_in_container()
-    worktree_case = tmp_path / 'case_operator_managed'
-    worktree_case.mkdir()
-    tc.test_commit_in_operator_managed_worktree_denied_without_container(worktree_case)
     gate_case = tmp_path / 'case_commit_gate'
     gate_case.mkdir()
     tc.test_commit_gate_fails_closed_without_git_write_permission(gate_case)

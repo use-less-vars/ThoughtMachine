@@ -1,20 +1,28 @@
-"""Tests for the operator-managed worktree agent commit policy in GitWriteTool.
+"""Tests for the GitWriteTool._git_commit permission and safety gates.
 
-Policy: commits in an operator-managed worktree are blocked by default; they
-are allowed only when all of the following hold:
+Policy: ``_git_commit`` applies the following gates, in order:
 
-1. the effective session ``git`` permission is ``"write"`` (the effective
-   ``git`` grain injected by the ToolExecutor; the legacy
-   ``agent_config["session_permissions"]`` field is never consulted);
-2. the current branch is NOT a protected branch (``dev``, ``master``,
-   ``main``).  Feature-style branches (``feat/*``, ``fix/*``, ``refactor/*``,
-   ``chore/*``, ``docs/*``, ``release/*``, others) are allowed, and a bare
-   ``feat/`` prefix (including whitespace-only suffixes) is also allowed;
-3. the tool is in containerized execution mode (``_use_container_mode()``);
-4. host execution is never permitted for worktree agent commits: the
-   container-mandatory branch check and the add/commit steps hard-fail
-   rather than degrade to the host;
-5. explicit ``file_path``(s) are provided -- ``git add -A`` is never issued.
+1. the effective session ``git`` permission gate -- the effective ``git``
+   grain injected by the ToolExecutor (the legacy
+   ``agent_config["session_permissions"]`` field is never consulted); a
+   ``"write"``/``"full"``/``"ask"`` grant is required.
+2. the write-on-feature-branch (``wofb``) branch gate: a grant restricted to
+   feature branches refuses a protected branch (``dev``, ``master``,
+   ``main``).  A plain ``"write"`` grant is NOT branch-restricted; feature
+   branches (``feat/*``, ``fix/*``, ``refactor/*``, ``chore/*``, ``docs/*``,
+   ``release/*``, others) and a bare ``feat/`` prefix (including
+   whitespace-only suffixes) are allowed.
+3. explicit ``file_path``(s) are required -- ``git add -A`` is never issued.
+4. a detached-HEAD gate: on every checkout, ``rev-parse --abbrev-ref HEAD``
+   reporting the literal ``"HEAD"`` refuses the commit with the named
+   ``_DETACHED_HEAD_ERROR`` message (for every grant, including
+   ``write``/``ask``).
+
+An operator-managed worktree (``.git`` is a gitfile) is NO LONGER
+special-cased: none of the gates above consults the worktree check or the
+execution mode, so a write commit behaves identically on a plain checkout and
+inside a worktree.  An execution-mode outage/denial is no longer converted
+into a worktree refusal -- it surfaces loudly from the execution layer.
 
 These tests exercise ``GitWriteTool._git_commit`` directly (bypassing the
 ``execute()`` validation layer) to lock down the internal policy gates.
@@ -93,7 +101,6 @@ def test_worktree_commit_blocked_on_dev_by_default():
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "dev")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -106,23 +113,35 @@ def test_worktree_commit_blocked_on_dev_by_default():
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
-def test_worktree_commit_blocked_on_main_with_flag():
-    """Flag present but branch is protected (main) -> operator error."""
-    tool = _tool(effective_permissions={"git": "write"})
+def test_worktree_commit_not_refused_on_main_with_write_grant(tmp_path):
+    """A write grant in an operator-managed worktree is NOT worktree-blocked.
+
+    The operator-managed-worktree gate is removed: a plain ``write`` grant is
+    not branch-restricted, so even on the protected branch ``main`` the commit
+    runs (it is only the ``write_on_feature_branch`` grant that is restricted).
+    """
+    (tmp_path / "agent_change.py").write_text("print('x')\n")
+    tool = _tool(
+        file_path="agent_change.py",
+        effective_permissions={"git": "write"},
+    )
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "main")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
     tool._exec_host_raw = exec_host  # noqa: SLF001
 
-    result = tool._git_commit("/tmp/repo")
+    result = tool._git_commit(tmp_path)
 
-    assert OPERATOR_ERROR in result
-    assert len(calls) == 1
-    assert calls[0] == ["rev-parse", "--abbrev-ref", "HEAD"]
+    assert "ok\n" in result
+    assert OPERATOR_ERROR not in result
+    assert calls == [
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["add", "--", "agent_change.py"],
+        ["commit", "-m", "agent commit", "--", "agent_change.py"],
+    ]
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
@@ -136,7 +155,6 @@ def test_feature_branch_commit_allowed_with_flag_container_mode(tmp_path):
     manager = _RecordingManager()
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._resolve_resource_execution = lambda *a, **k: (  # noqa: SLF001
         {"mode": "containerized", "detail": "test"},
@@ -166,7 +184,6 @@ def test_feature_branch_commit_denied_without_flag():
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -189,7 +206,6 @@ def test_feature_branch_commit_allowed_on_non_protected_branch(tmp_path):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "release/1.0")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -208,31 +224,48 @@ def test_feature_branch_commit_allowed_on_non_protected_branch(tmp_path):
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
-def test_feature_branch_commit_denied_when_host_mode():
-    """Host execution mode -> worktree commit denied before branch check."""
-    tool = _tool(effective_permissions={"git": "write"})
-    calls = []
+def test_write_commit_in_worktree_host_mode_fails_loud(tmp_path):
+    """A host-mode worktree commit no longer yields a worktree refusal.
+
+    Guard B (the operator-managed-worktree exemption) is gone, so execution
+    mode is not consulted by the commit gate.  The execution layer's fail-loud
+    denial (here: host git with no workspace id bound) propagates as a
+    ``RuntimeError`` -- exactly what a plain checkout gets -- instead of being
+    masked behind the removed operator-worktree error string.
+    """
+    (tmp_path / "agent_change.py").write_text("print('x')\n")
+    tool = _tool(
+        file_path="agent_change.py",
+        effective_permissions={"git": "write"},
+    )
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: False  # noqa: SLF001
-    tool._run_git = _branch_fake(calls, "feat/foo")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
     tool._exec_host_raw = exec_host  # noqa: SLF001
 
-    result = tool._git_commit("/tmp/repo")
+    with pytest.raises(RuntimeError) as excinfo:
+        tool._git_commit(tmp_path)
 
-    assert OPERATOR_ERROR in result
-    assert calls == []
+    assert OPERATOR_ERROR not in str(excinfo.value)
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
-def test_feature_branch_commit_denied_when_container_unavailable():
-    """No containerized resource -> branch check fails closed."""
-    tool = _tool(effective_permissions={"git": "write"})
+def test_write_commit_in_worktree_container_unavailable_fails_loud(tmp_path):
+    """An unavailable container resource is no longer a worktree refusal.
+
+    Guard B used to turn this into a clean operator error; with it removed the
+    execution layer's fail-loud ``RuntimeError`` ("containerized git execution
+    unavailable") propagates -- no silent host fallback, no worktree-specific
+    refusal -- matching a plain checkout.
+    """
+    (tmp_path / "agent_change.py").write_text("print('x')\n")
+    tool = _tool(
+        file_path="agent_change.py",
+        effective_permissions={"git": "write"},
+    )
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._resolve_resource_execution = lambda *a, **k: (  # noqa: SLF001
         {"mode": "unavailable", "detail": "docker daemon unreachable", "failure_reason": "policy denial"},
@@ -241,18 +274,26 @@ def test_feature_branch_commit_denied_when_container_unavailable():
     tool._exec_container_raw = exec_container  # noqa: SLF001
     tool._exec_host_raw = exec_host  # noqa: SLF001
 
-    result = tool._git_commit("/tmp/repo")
+    with pytest.raises(RuntimeError, match="containerized git execution unavailable"):
+        tool._git_commit(tmp_path)
 
-    assert OPERATOR_ERROR in result
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
-def test_feature_branch_commit_does_not_use_host_fallback():
-    """Execution degraded to host -> denied, no host or container subprocess."""
-    tool = _tool(effective_permissions={"git": "write"})
+def test_write_commit_in_worktree_host_fallback_fails_loud(tmp_path):
+    """A degraded (host_fallback) resource is no longer a worktree refusal.
+
+    Guard B used to turn this into a clean operator error; with it removed the
+    execution layer fails loud instead of silently host-running, matching a
+    plain checkout (no host or container subprocess runs).
+    """
+    (tmp_path / "agent_change.py").write_text("print('x')\n")
+    tool = _tool(
+        file_path="agent_change.py",
+        effective_permissions={"git": "write"},
+    )
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._resolve_resource_execution = lambda *a, **k: (  # noqa: SLF001
         {"mode": "host_fallback", "detail": "image build failed"},
@@ -261,15 +302,19 @@ def test_feature_branch_commit_does_not_use_host_fallback():
     tool._exec_container_raw = exec_container  # noqa: SLF001
     tool._exec_host_raw = exec_host  # noqa: SLF001
 
-    result = tool._git_commit("/tmp/repo")
+    with pytest.raises(RuntimeError, match="containerized git execution unavailable"):
+        tool._git_commit(tmp_path)
 
-    assert OPERATOR_ERROR in result
     assert exec_host.calls == []
     assert exec_container.calls == []
 
 
-def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
-    """Merge-looking messages are allowed only when the branch is unprotected."""
+def test_write_commit_allows_merge_looking_message(tmp_path):
+    """A merge-looking message is passed through verbatim (never re-parsed).
+
+    A plain ``write`` grant is not branch-restricted, so the same message is
+    accepted on an unprotected branch and on the protected branch ``main``.
+    """
     (tmp_path / "agent_change.py").write_text("print('x')\n")
     tool = _tool(
         file_path="agent_change.py",
@@ -279,7 +324,6 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -294,56 +338,43 @@ def test_feature_branch_commit_rejects_merge_or_push_intent(tmp_path):
     assert all("--no-verify" not in c for c in calls)
     assert exec_host.calls == []
 
-    # Same intent but on a protected branch -> denied.
+    # Same intent but on the protected branch ``main`` for a plain write grant
+    # -> NOT refused (write is not branch-restricted; the worktree gate is gone).
     tool2 = _tool(
+        file_path="agent_change.py",
         message="Merge branch 'main' into main",
         effective_permissions={"git": "write"},
     )
     calls2 = []
     exec_container2 = _RecordingExec()
     exec_host2 = _RecordingExec()
-    tool2._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool2._use_container_mode = lambda: True  # noqa: SLF001
     tool2._run_git = _branch_fake(calls2, "main")  # noqa: SLF001
     tool2._exec_container_raw = exec_container2  # noqa: SLF001
     tool2._exec_host_raw = exec_host2  # noqa: SLF001
 
-    result2 = tool2._git_commit("/tmp/repo")
+    result2 = tool2._git_commit(tmp_path)
 
-    assert OPERATOR_ERROR in result2
-    assert len(calls2) == 1
+    assert "ok\n" in result2
+    assert OPERATOR_ERROR not in result2
+    assert calls2 == [
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["add", "--", "agent_change.py"],
+        ["commit", "-m", "Merge branch 'main' into main", "--", "agent_change.py"],
+    ]
     _assert_no_commit_subprocess(exec_container2, exec_host2)
 
 
-def test_unprotected_branch_allows_bare_feature_prefix():
-    """Bare 'feat/' prefix is an unprotected branch."""
-    tool = _tool(effective_permissions={"git": "write"})
-    calls = []
-    tool._use_container_mode = lambda: True  # noqa: SLF001
-    tool._run_git = _branch_fake(calls, "feat/")  # noqa: SLF001
-
-    assert tool._unprotected_branch_agent_commit_allowed("/tmp/repo") is True
-    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
-
-
-def test_unprotected_branch_allows_whitespace_only_suffix():
-    """Bare 'feat/' with a whitespace-only suffix is still unprotected."""
-    tool = _tool(effective_permissions={"git": "write"})
-    calls = []
-    tool._use_container_mode = lambda: True  # noqa: SLF001
-    tool._run_git = _branch_fake(calls, "feat/   ")  # noqa: SLF001
-
-    assert tool._unprotected_branch_agent_commit_allowed("/tmp/repo") is True
-    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
-
-
 def test_commit_requires_file_path():
-    """Missing file_path -> explicit error after the branch check passes."""
+    """Missing file_path -> explicit error before any git subprocess.
+
+    The file_path guard runs before the detached-HEAD gate, so no branch probe
+    is issued at all (``calls`` stays empty).
+    """
     tool = _tool(effective_permissions={"git": "write"})
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -352,7 +383,7 @@ def test_commit_requires_file_path():
     result = tool._git_commit("/tmp/repo")
 
     assert result == "Error: file_path is required for commit operation (at least one path)"
-    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
+    assert calls == []
     _assert_no_commit_subprocess(exec_container, exec_host)
 
 
@@ -367,7 +398,6 @@ def test_feature_branch_commit_stages_only_named_path(tmp_path):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -447,19 +477,11 @@ def _timeout_expired():
 def test_unprotected_branch_agent_commit_fails_closed_on_branch_timeout(
     timeout_exc_factory,
 ):
-    """The worktree agent-commit gate must fail CLOSED on a branch timeout.
-
-    ``_unprotected_branch_agent_commit_allowed`` reads the "Git command timed
-    out" string as a valid, unprotected branch and returns True, so the commit
-    runs. That container-mandatory branch check is the only guard against an
-    agent commit in an operator-managed worktree; a timeout there must deny the
-    commit instead of permitting it.
-    """
+    """A timed-out branch probe aborts the commit (fail closed)."""
     tool = _tool(
         file_path="agent_change.py",
         effective_permissions={"git": "write"},
     )
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._validated_rel_paths = lambda root, paths: [  # noqa: SLF001
         "agent_change.py"
@@ -490,7 +512,6 @@ def test_wofb_feature_branch_gate_fails_closed_on_branch_timeout(
         file_path=["note.txt"],
         effective_permissions={"git": "write_on_feature_branch"},
     )
-    tool._is_operator_managed_worktree = lambda root: False  # noqa: SLF001
     tool._validated_rel_paths = lambda root, paths: ["note.txt"]  # noqa: SLF001
     raw = _TimeoutOnBranchProbe(timeout_exc_factory())
     tool._run_git_raw = raw  # noqa: SLF001
@@ -526,7 +547,6 @@ def test_commit_with_pathspec_ignores_pre_staged_unrelated_file(tmp_path):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -560,7 +580,6 @@ def test_commit_worktree_arm_uses_pathspec(tmp_path):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -595,7 +614,6 @@ def test_commit_empty_paths_errors_no_subprocess(empty_paths):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: False  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -619,20 +637,6 @@ def test_commit_empty_paths_errors_no_subprocess(empty_paths):
 # distinguishable "not on a branch" message, and no add/commit may run.
 
 
-def test_detached_head_denied_by_agent_commit_gate():
-    """Gate (1) refuses a detached HEAD and records the refusal reason."""
-    tool = _tool(effective_permissions={"git": "write"})
-    calls = []
-    tool._use_container_mode = lambda: True  # noqa: SLF001
-    tool._run_git = _branch_fake(calls, "HEAD")  # noqa: SLF001
-
-    allowed = tool._unprotected_branch_agent_commit_allowed("/tmp/repo")
-
-    assert allowed is False
-    assert "not on a branch" in tool._agent_commit_refusal_reason
-    assert calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
-
-
 def test_detached_head_commit_denied_operator_managed():
     """Operator-managed worktree + detached HEAD -> refused, no subprocess.
 
@@ -646,7 +650,6 @@ def test_detached_head_commit_denied_operator_managed():
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "HEAD")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
@@ -670,7 +673,6 @@ def test_detached_head_denied_by_wofb_commit_gate(tmp_path):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: False  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "HEAD")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001
     tool._exec_host_raw = exec_host  # noqa: SLF001
@@ -692,7 +694,6 @@ def test_normal_branch_commit_still_allowed_regression(tmp_path):
     calls = []
     exec_container = _RecordingExec()
     exec_host = _RecordingExec()
-    tool._is_operator_managed_worktree = lambda root: True  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _branch_fake(calls, "feat/x")  # noqa: SLF001
     tool._exec_container_raw = exec_container  # noqa: SLF001

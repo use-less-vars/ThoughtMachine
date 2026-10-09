@@ -1,18 +1,20 @@
-"""RED (COMMIT 4 / gap ii): cross-gate integration -- one branch-probe failure
-must abort the commit in BOTH feature-branch gates.
+"""Cross-gate integration: one branch-probe failure must abort the commit in
+the write-on-feature-branch gate.
 
 The COMMIT 3 claim is "raise on timeout, fail-closed gates". The per-gate tests
-in ``tests/test_git_write_tool.py`` cover each gate separately and only with
-``subprocess.TimeoutExpired`` / ``TimeoutError``. This test drives the SAME single
-source of failure through BOTH gates at once, for the whole set of exception
-types the real ``_run_git`` can surface from the branch probe, and asserts the
-commit is never permitted.
+in ``tests/test_git_write_tool.py`` cover the gate with ``subprocess.TimeoutExpired``
+/ ``TimeoutError``. This test drives the SAME single source of failure through the
+gate for the whole set of exception types the real ``_run_git`` can surface from
+the branch probe, and asserts the commit is never permitted.
 
 A probe failure that maps to a *raised* exception (``TimeoutExpired`` /
-``TimeoutError``) is fail-closed. A failure that ``_run_git`` converts to an
-error *string* (``FileNotFoundError`` -> "Git command not found ...",
-``OSError`` -> "Error running git command: ...") is treated by the gate as a
-valid branch name, so the commit proceeds -- fail-open. Those rows are the RED.
+``TimeoutError``) is fail-closed. A failure that ``_run_git`` converts to an error
+*string* (``FileNotFoundError`` -> "Git command not found ...", ``OSError`` ->
+"Error running git command: ...") is rejected by the branch-ref validation, so the
+commit is likewise refused.
+
+The operator-managed-worktree ("unprotected") commit gate was removed along with
+Guard B, so only the write-on-feature-branch gate is exercised here.
 """
 
 from __future__ import annotations
@@ -42,14 +44,14 @@ class _BranchProbe:
         return any(list(a)[:1] == ["commit"] for a in self.calls)
 
 
-# gate name -> (git permission level, operator-managed-worktree?)
+# Only the write-on-feature-branch gate remains: the operator-managed-worktree
+# ("unprotected") commit gate was removed along with Guard B.
 _GATES = {
-    "wofb": ("write_on_feature_branch", False),
-    "unprotected": ("write", True),
+    "wofb": "write_on_feature_branch",
 }
 
 
-def _make_tool(monkeypatch, tmp_path, probe, git_perm, worktree):
+def _make_tool(monkeypatch, tmp_path, probe, git_perm):
     tool = GitWriteTool(
         operation="commit",
         message="agent commit",
@@ -61,7 +63,6 @@ def _make_tool(monkeypatch, tmp_path, probe, git_perm, worktree):
     object.__setattr__(tool, "_resolved_workspace_id", "ws")
     monkeypatch.setattr(tool, "_run_git_raw", probe)
     monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
-    monkeypatch.setattr(tool, "_is_operator_managed_worktree", lambda repo_root: worktree)
     monkeypatch.setattr(
         tool, "_validated_rel_paths", lambda repo_root, paths: list(paths)
     )
@@ -76,7 +77,7 @@ def _commit_permitted(tool, repo_root):
     return "COMMIT_OK" in result
 
 
-@pytest.mark.parametrize("gate", ["wofb", "unprotected"])
+@pytest.mark.parametrize("gate", ["wofb"])
 @pytest.mark.parametrize(
     "exc",
     [
@@ -87,12 +88,12 @@ def _commit_permitted(tool, repo_root):
     ],
     ids=["TimeoutExpired", "TimeoutError", "FileNotFoundError", "OSError"],
 )
-def test_branch_probe_failure_aborts_commit_in_both_gates(
+def test_branch_probe_failure_aborts_commit(
     monkeypatch, tmp_path, gate, exc
 ):
-    git_perm, worktree = _GATES[gate]
+    git_perm = _GATES[gate]
     probe = _BranchProbe(exc)
-    tool = _make_tool(monkeypatch, tmp_path, probe, git_perm, worktree)
+    tool = _make_tool(monkeypatch, tmp_path, probe, git_perm)
 
     permitted = _commit_permitted(tool, tmp_path)
 
