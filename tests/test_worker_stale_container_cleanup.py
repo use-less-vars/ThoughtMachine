@@ -204,7 +204,7 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
         self.container_manager = container_manager
         self.ContainerManager = container_manager.ContainerManager
 
-    def _entry(self, cid, status, name=None):
+    def _entry(self, cid, status, name=None, labels=None):
         """A list_containers() dict shaped like the real return value."""
         return {
             "container_id": cid,
@@ -214,7 +214,7 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
             "uptime_seconds": 0,
             "workspace_id": "ws1",
             "note": "",
-            "labels": {},
+            "labels": labels or {},
         }
 
     def _make_manager(self, tmp, entries, limit):
@@ -340,6 +340,62 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
                        self._entry("c3", "dead")]
             manager = self._make_manager(tmp, entries, limit=2)
             # 1 active < limit 2 -> create allowed despite 3 total entries.
+            result = self._start(manager)
+            self.assertEqual(result.get("status"), "created", result)
+
+    # ── (e) only PERSISTENT-class containers consume the ceiling ─────────
+
+    def test_counts_toward_limit_persistent_record_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from thoughtmachine.container_record import (
+                LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, RECORD_LABEL_KEY,
+                create_record,
+            )
+            rec = create_record("ws1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE,
+                                vault_root=tmp)
+            manager = self.ContainerManager.__new__(self.ContainerManager)
+            manager.vault_root = tmp
+            entry = self._entry("c1", "running",
+                                labels={RECORD_LABEL_KEY: rec.id})
+            self.assertTrue(manager._counts_toward_limit(entry))
+
+    def test_counts_toward_limit_ephemeral_record_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from thoughtmachine.container_record import (
+                LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE, RECORD_LABEL_KEY,
+                create_record,
+            )
+            rec = create_record("ws1", LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE,
+                                vault_root=tmp)
+            manager = self.ContainerManager.__new__(self.ContainerManager)
+            manager.vault_root = tmp
+            entry = self._entry("c1", "running",
+                                labels={RECORD_LABEL_KEY: rec.id})
+            self.assertFalse(manager._counts_toward_limit(entry))
+
+    def test_counts_toward_limit_resource_label_excluded(self):
+        manager = self.ContainerManager.__new__(self.ContainerManager)
+        entry = self._entry("c1", "running",
+                            labels={"thoughtmachine.resource": "git"})
+        self.assertFalse(manager._counts_toward_limit(entry))
+
+    def test_start_allows_when_only_non_persistent_consume_ceiling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from thoughtmachine.container_record import (
+                LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE, RECORD_LABEL_KEY,
+                create_record,
+            )
+            eph = create_record("ws1", LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE,
+                                vault_root=tmp)
+            entries = [
+                self._entry("c1", "running"),
+                self._entry("c2", "running",
+                            labels={RECORD_LABEL_KEY: eph.id}),
+                self._entry("c3", "running",
+                            labels={"thoughtmachine.resource": "1"}),
+            ]
+            manager = self._make_manager(tmp, entries, limit=2)
+            # only c1 is persistent -> 1 < 2 -> create allowed.
             result = self._start(manager)
             self.assertEqual(result.get("status"), "created", result)
 

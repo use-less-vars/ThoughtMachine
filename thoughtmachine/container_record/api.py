@@ -26,9 +26,13 @@ from pathlib import Path
 from typing import Any
 
 from . import storage
+from .lifecycle_policy import is_resource_like
 from .models import (
+    ContainerRecordError,
     EVENT_ENTRY_KEYS,
     INTENT_SNAPSHOT_KEYS,
+    LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
     SCHEMA_FIELD_NAMES,
     SCHEMA_VERSION_CURRENT,
     STATE_CREATING,
@@ -50,6 +54,44 @@ EVENT_LOG_POINTER_TYPE = "event_log_pointer"
 #: bound positional parameter of ``update_record`` (and cannot appear in
 #: ``**changes``), so it needs no runtime guard here (R5).
 _IMMUTABLE_FIELDS = frozenset({"created_at"})
+
+
+# ── Lifecycle classification from Docker labels ──────────────────────────────
+def lifecycle_class_from_labels(
+    labels, name=None, image_tags=None, vault_root=None, lookup=None
+) -> str:
+    """Classify a container's lifecycle from its Docker labels.
+
+    Shared single-source classifier behind both container-ceiling enforcement
+    sites (``infra.container_manager`` and ``security.admission_gate``):
+
+    * a resource-like container (``RESOURCE_LABEL`` / ``tm-res-`` name prefix /
+      ``tm-resource-git`` image) is :data:`LIFECYCLE_RESOURCE`;
+    * a container carrying :data:`RECORD_LABEL_KEY` whose record declares a
+      non-empty ``lifecycle_class`` takes that class;
+    * anything else is :data:`LIFECYCLE_PERSISTENT`.
+
+    ``lookup`` overrides the record resolver (defaults to
+    :func:`find_by_docker_label`); callers that module-patch their own
+    resolver bind it here so a single-patch seam keeps working.
+
+    Never raises: malformed ``labels``/``name``/``image_tags`` and a missing or
+    unreadable record all fall through to the persistent default.
+    """
+    if is_resource_like(labels, name=name, image_tags=image_tags):
+        return LIFECYCLE_RESOURCE
+    record_id = labels.get(RECORD_LABEL_KEY) if isinstance(labels, Mapping) else None
+    if record_id:
+        finder = lookup or find_by_docker_label
+        try:
+            record = finder(record_id, vault_root=vault_root)
+        except ContainerRecordError:
+            record = None
+        if record is not None:
+            cls = getattr(record, "lifecycle_class", "") or ""
+            if cls:
+                return cls
+    return LIFECYCLE_PERSISTENT
 
 
 # ── Event-log pointer (§2.4) ─────────────────────────────────────────────────
