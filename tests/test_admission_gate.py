@@ -439,13 +439,14 @@ def test_fuzz_admit_never_raises():
 class _FakeContainers:
     """Minimal ``client.containers`` double; ``list`` optionally raises."""
 
-    def __init__(self, raises):
+    def __init__(self, raises, items=None):
         self._raises = raises
+        self._items = items
 
     def list(self, *args, **kwargs):
         if self._raises:
             raise RuntimeError("docker listing failed")
-        return []
+        return list(self._items or [])
 
 
 class FakeDockerClient:
@@ -455,8 +456,8 @@ class FakeDockerClient:
     ``ping`` (a bare test double) must NOT be presumed reachable.
     """
 
-    def __init__(self, *, list_raises=False, ping=None):
-        self.containers = _FakeContainers(list_raises)
+    def __init__(self, *, list_raises=False, ping=None, items=None):
+        self.containers = _FakeContainers(list_raises, items)
         if ping is not None:
             self.ping = ping
 
@@ -486,4 +487,39 @@ def test_client_probes_no_ping_denies_admission():
     decision = admit(make_request(), probes=probes)
     assert isinstance(decision, Deny)
     assert decision.code == REASON_DAEMON_UNREACHABLE
+
+
+def test_client_probes_excludes_ephemeral_and_resource(monkeypatch, tmp_path):
+    """Only persistent-class containers consume the per-workspace ceiling."""
+    from thoughtmachine.container_record import (
+        LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE, RECORD_LABEL_KEY, create_record,
+    )
+    import thoughtmachine.container_record.api as api
+
+    rec = create_record("ws1", LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE,
+                        vault_root=tmp_path)
+    monkeypatch.setattr(
+        api, "find_by_docker_label",
+        lambda rid, vault_root=None: rec if rid == rec.id else None,
+    )
+
+    class _C:
+        def __init__(self, name, labels, image="agent-executor"):
+            self.name = name
+            self.labels = labels
+            self.image = image
+
+    containers = [
+        _C("persistent-1", {}),
+        _C("ephemeral-1", {RECORD_LABEL_KEY: rec.id}),
+        _C("resource-1", {"thoughtmachine.resource": "1"}),
+    ]
+    probes = ag.ClientProbes(FakeDockerClient(items=containers, ping=lambda: True))
+    assert probes.workspace_container_count("ws1") == 1
+
+    req = make_request(
+        spec=make_spec(network_mode="bridge", image="agent-executor"),
+        session_config={"container_limits": {"max_containers": 2}},
+    )
+    assert isinstance(admit(req, probes=probes), Allow)
 

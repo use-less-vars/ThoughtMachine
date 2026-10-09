@@ -124,6 +124,7 @@ from thoughtmachine.container_record import (
     docker_restart_policy,
     find_by_docker_label,
     is_resource_like,
+    lifecycle_class_from_labels,
     list_records,
     load_record,
     normalise_restart_policy,
@@ -750,14 +751,27 @@ class ContainerManager:
         return value
 
     def _counts_toward_limit(self, entry) -> bool:
-        """Whether a container entry occupies a limit slot.
+        """Whether a container entry occupies a persistent-ceiling slot.
 
-        Terminal states (exited/dead/removing) free a slot so a stuck or
-        crashed container never blocks a fresh create. Unknown/new statuses
-        count toward the limit (fail-safe: default to occupying a slot).
+        Two independent filters must both pass:
+        * terminal states (exited/dead/removing) free a slot so a stuck or
+          crashed container never blocks a fresh create; and
+        * only ``persistent``-class containers consume the per-workspace
+          ceiling -- ``resource`` and ``ephemeral`` containers are excluded
+          (classified via the shared ``lifecycle_class_from_labels`` helper).
+        Unknown/new statuses count (fail-safe: default to occupying a slot).
         """
         status = str((entry or {}).get("status", "")).lower()
-        return status not in ("exited", "dead", "removing")
+        if status in ("exited", "dead", "removing"):
+            return False
+        entry = entry or {}
+        cls = lifecycle_class_from_labels(
+            entry.get("labels"),
+            name=entry.get("name"),
+            image_tags=entry.get("image"),
+            vault_root=getattr(self, "vault_root", None),
+        )
+        return cls == LIFECYCLE_PERSISTENT
 
     def _active_containers(self, entries):
         """Filter container entries down to those that occupy a limit slot."""
@@ -3992,28 +4006,18 @@ def _container_lifecycle_class(container) -> str:
     denial for the ``service``/unknown classes).  See :meth:`class_of`.
     """
     try:
-        if ContainerManager._is_resource_container(container):
-            return LIFECYCLE_RESOURCE
-    except Exception:
-        pass
-    record_id = None
-    try:
         labels = getattr(container, "labels", None)
-        if isinstance(labels, dict):
-            record_id = labels.get(RECORD_LABEL_KEY)
+        name = getattr(container, "name", None)
+        image = getattr(container, "image", None)
+        if image is None or isinstance(image, str):
+            image_tags = image
+        else:
+            image_tags = getattr(image, "tags", None)
     except Exception:
-        record_id = None
-    if record_id:
-        try:
-            record = find_by_docker_label(record_id)
-        # The record store raises ContainerRecordError; unexpected errors surface.
-        except ContainerRecordError:
-            record = None
-        if record is not None:
-            cls = getattr(record, "lifecycle_class", "") or ""
-            if cls:
-                return cls
-    return LIFECYCLE_PERSISTENT
+        labels = name = image_tags = None
+    return lifecycle_class_from_labels(
+        labels, name=name, image_tags=image_tags, lookup=find_by_docker_label,
+    )
 
 
 def _gc_should_skip(container) -> bool:

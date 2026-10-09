@@ -66,6 +66,10 @@ from security.security_gate import (
     ContainerConfigError,
     resolve_container_config,
 )
+from thoughtmachine.container_record import (
+    LIFECYCLE_PERSISTENT,
+    lifecycle_class_from_labels,
+)
 
 __all__ = [
     "AdmissionDenied",
@@ -204,6 +208,24 @@ class Probes(Protocol):
     def now(self) -> float: ...
 
 
+def _counts_toward_ceiling(container) -> bool:
+    """Whether a Docker container occupies the persistent per-workspace ceiling.
+
+    Reads the container's labels/name/image-tags and delegates to the shared
+    :func:`thoughtmachine.container_record.lifecycle_class_from_labels`; only
+    ``persistent``-class containers count (``resource``/``ephemeral`` are
+    excluded).  Never raises.
+    """
+    labels = getattr(container, "labels", None)
+    name = getattr(container, "name", None)
+    image = getattr(container, "image", None)
+    image_tags = image if (image is None or isinstance(image, str)) else getattr(image, "tags", None)
+    return (
+        lifecycle_class_from_labels(labels, name=name, image_tags=image_tags)
+        == LIFECYCLE_PERSISTENT
+    )
+
+
 class _RealProbes:
     """Live probes backed by ``shutil`` and the Docker SDK (lazy imports)."""
 
@@ -227,7 +249,7 @@ class _RealProbes:
                 all=True,
                 filters={"label": f"thoughtmachine.workspace_id={workspace_id}"},
             )
-            return len(containers)
+            return sum(1 for c in containers if _counts_toward_ceiling(c))
         except Exception:
             # Fail CLOSED: an unresolvable count is unknown, not zero (a
             # zero would silently admit over the per-workspace limit).
@@ -282,12 +304,11 @@ class ClientProbes:
 
     def workspace_container_count(self, workspace_id: str) -> Optional[int]:
         try:
-            return len(
-                self._client.containers.list(
-                    all=True,
-                    filters={"label": f"thoughtmachine.workspace_id={workspace_id}"},
-                )
+            containers = self._client.containers.list(
+                all=True,
+                filters={"label": f"thoughtmachine.workspace_id={workspace_id}"},
             )
+            return sum(1 for c in containers if _counts_toward_ceiling(c))
         except Exception:
             # Fail CLOSED: an unresolvable count is unknown, not zero (a
             # zero would silently admit over the per-workspace limit).
