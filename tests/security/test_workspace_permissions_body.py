@@ -128,28 +128,22 @@ def test_resolver_preserves_boolean_container_verbatim():
     assert isinstance(resolved["container"], bool)
 
 
-def test_resolver_normalizes_legacy_container_string_levels():
-    """Stored legacy container strings are normalised to real booleans.
+def test_resolver_returns_stored_verbatim():
+    """The read path returns the stored map verbatim (no normalisation).
 
-    The config read-back path (``_resolve_workspace_permissions``) runs
-    ``normalize_legacy_workspace_ceiling``: a stored ``'ask'`` container
-    ceiling (a pre-catalog string) is rewritten to the canonical boolean
-    ``False`` so the security gate never sees a non-bool container ceiling.
-    Non-container canonical values (``host_bash: allow``) pass through
-    untouched.
+    ``_resolve_workspace_permissions`` no longer normalises legacy stored
+    vocabulary at read time; it returns exactly what is stored.
     """
     resolved = _resolve_workspace_permissions(
         {"permissions": {"container": "ask", "host_bash": "allow"}}, "general"
     )
-    assert resolved == {"container": False, "host_bash": "allow"}
-    assert resolved["container"] is False
+    assert resolved == {"container": "ask", "host_bash": "allow"}
 
 
-def test_resolver_falls_back_to_purpose_preset():
-    """No saved ``permissions`` map -> the purpose preset is applied."""
-    resolved = _resolve_workspace_permissions({"purpose": "coding"}, "coding")
-    assert isinstance(resolved, dict)
-    assert resolved  # non-empty preset map
-    # Preset values are strings except the boolean container ceiling.
-    assert all(isinstance(v, (str, bool)) for v in resolved.values())
-    assert resolved["container"] is False
+def test_resolver_returns_empty_when_no_permissions_saved():
+    """No saved ``permissions`` map -> the read path returns ``{}``.
+
+    Reading a ceiling returns what is stored, or ``{}``; no purpose preset is
+    synthesised at read time.
+    """
+    assert _resolve_workspace_permissions({"purpose": "coding"}, "coding") == {}

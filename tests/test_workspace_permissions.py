@@ -217,201 +217,6 @@ def test_grant_level_ranks_connect_aligns_with_read_tier():
     assert GRANT_LEVEL_RANKS["connect"] < GRANT_LEVEL_RANKS["ask"]
 
 
-class TestNormalizeLegacyWorkspaceCeiling:
-    """normalize_legacy_workspace_ceiling rewrites pre-catalog stored ceilings to
-    the canonical vocabulary the PUT validator and the security gate understand.
-    Idempotent, never mutates the input."""
-
-    def test_container_legacy_strings_become_bools(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        for legacy, canonical in [
-            ("ask", False),
-            ("read", False),
-            ("banned", False),
-            ("write", True),
-            ("full", True),
-        ]:
-            assert n({"container": legacy}) == {"container": canonical}, legacy
-
-    def test_container_stringified_booleans_become_real_bools(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        assert n({"container": "True"}) == {"container": True}
-        assert n({"container": "False"}) == {"container": False}
-
-    def test_container_real_bools_pass_through(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        assert n({"container": True}) == {"container": True}
-        assert n({"container": False}) == {"container": False}
-
-    def test_unknown_container_string_left_untouched(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        assert n({"container": "bogus"}) == {"container": "bogus"}
-
-    def test_docker_alias_emitted_under_container_bool(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        assert n({"docker": "write"}) == {"container": True}
-        assert n({"docker": "full"}) == {"container": True}
-        for legacy in ("read", "ask", "banned", "False"):
-            assert n({"docker": legacy}) == {"container": False}, legacy
-        assert "docker" not in n({"docker": "write"})
-
-    def test_network_read_maps_to_ask(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        assert n({"network": "read"}) == {"network": "ask"}
-        assert n({"network": "outbound"}) == {"network": "outbound"}
-
-    def test_mcp_legacy_generic_scale_maps_to_canonical(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        assert n({"mcp": "read"}) == {"mcp": "banned"}
-        assert n({"mcp": "ask"}) == {"mcp": "banned"}
-        assert n({"mcp": "write"}) == {"mcp": "full"}
-        assert n({"mcp": "connect"}) == {"mcp": "connect"}
-
-    def test_full_maps_to_write_on_write_scale_resources(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        for key in ("filesystem", "git"):
-            assert n({key: "full"}) == {key: "write"}, key
-        # removed-legacy resources never survive normalization
-        assert n({"system": "full"}) == {}
-        assert n({"execution": "full"}) == {}
-        assert n({"git_read": "full"}) == {}
-        assert n({"git_read": "read", "git_write": "ask"}) == {"git": "ask"}
-        assert n({"git_write": "banned", "git": "read"}) == {"git": "read"}
-
-    def test_git_write_feature_branches_maps_to_write_on_feature_branch(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        assert n({"git": "write_feature_branches"}) == {
-            "git": "write_on_feature_branch"
-        }
-        assert n({"git": "write_on_feature_branch"}) == {
-            "git": "write_on_feature_branch"
-        }
-
-    def test_unknown_keys_and_values_left_untouched(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        raw = {"unknown_key": "whatever", "host_bash": "read"}
-        assert n(dict(raw)) == raw
-        assert n({"host_bash": "allow"}) == {"host_bash": "allow"}
-
-    def test_normalization_is_idempotent_and_non_mutating(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        raw = {
-            "docker": "write",
-            "git": "write_feature_branches",
-            "network": "read",
-            "mcp": "write",
-            "filesystem": "full",
-            "container": "ask",
-        }
-        once = n(raw)
-        assert n(once) == once
-        assert raw == {
-            "docker": "write",
-            "git": "write_feature_branches",
-            "network": "read",
-            "mcp": "write",
-            "filesystem": "full",
-            "container": "ask",
-        }
-
-    def test_combined_legacy_map_rewrite(self):
-        n = config_manager.normalize_legacy_workspace_ceiling
-        result = n(
-            {
-                "docker": "write",
-                "git": "write_feature_branches",
-                "network": "read",
-                "mcp": "write",
-                "filesystem": "full",
-                "system": "full",
-                "container": "ask",
-                "execution": "full",
-            }
-        )
-        assert result == {
-            "container": False,
-            "git": "write_on_feature_branch",
-            "network": "ask",
-            "mcp": "full",
-            "filesystem": "write",
-        }
-
-
-def test_canonical_fold_equivalence_to_config_manager():
-    """The read-time ``normalize_legacy_workspace_ceiling`` is a thin
-    delegation to ``security.resource_catalog.fold_legacy_workspace_ceiling``:
-    the two must agree on every input (and neither may mutate its argument),
-    so extracting the fold into the canonical module is behaviour-preserving.
-    """
-    from security.resource_catalog import fold_legacy_workspace_ceiling
-
-    cases = [
-        {},
-        {"container": "ask"},
-        {"container": "read"},
-        {"container": "banned"},
-        {"container": "write"},
-        {"container": "full"},
-        {"container": "True"},
-        {"container": "False"},
-        {"container": True},
-        {"container": False},
-        {"container": "bogus"},
-        {"docker": "write"},
-        {"docker": "full"},
-        {"docker": "read"},
-        {"docker": "ask"},
-        {"docker": "banned"},
-        {"docker": "False"},
-        {"network": "read"},
-        {"network": "outbound"},
-        {"network": "ask"},
-        {"mcp": "read"},
-        {"mcp": "ask"},
-        {"mcp": "write"},
-        {"mcp": "connect"},
-        {"filesystem": "full"},
-        {"filesystem": "write"},
-        {"git": "full"},
-        {"git": "write"},
-        {"git": "read"},
-        {"git": "write_feature_branches"},
-        {"git": "write_on_feature_branch"},
-        {"system": "full"},
-        {"system": "read"},
-        {"execution": "full"},
-        {"git_read": "full"},
-        {"git_read": "read"},
-        {"git_write": "ask"},
-        {"git_write": "banned"},
-        {"git_read": "read", "git_write": "ask"},
-        {"git_write": "banned", "git": "read"},
-        {"git": "write", "git_read": "read"},
-        {"git_read": "ask", "git_write": "write"},
-        {"unknown_key": "whatever", "host_bash": "read"},
-        {"host_bash": "allow"},
-        {"host_bash": "banned"},
-        {"host_bash": "ask"},
-        {
-            "docker": "write",
-            "git": "write_feature_branches",
-            "network": "read",
-            "mcp": "write",
-            "filesystem": "full",
-            "system": "full",
-            "container": "ask",
-            "execution": "full",
-        },
-    ]
-    for raw in cases:
-        snapshot = dict(raw)
-        canonical = fold_legacy_workspace_ceiling(dict(raw))
-        delegating = config_manager.normalize_legacy_workspace_ceiling(dict(raw))
-        assert canonical == delegating, raw
-        # neither path may mutate its input
-        assert raw == snapshot, raw
-
-
 class TestApplyWorkspaceCeiling:
     """Unit tests for apply_workspace_ceiling (pure dict reduction)."""
 
@@ -929,7 +734,7 @@ class TestResolveFullConfigCeiling:
         assert perms["filesystem"] == "read"
         assert perms["container"] is False
 
-    def test_purpose_preset_applied(self, monkeypatch, tmp_path):
+    def test_presets_not_applied_at_read_time(self, monkeypatch, tmp_path):
         import thoughtmachine.workspace_capabilities as wc_mod
 
         monkeypatch.setattr(
@@ -942,8 +747,11 @@ class TestResolveFullConfigCeiling:
         )
         merged = config_manager.resolve_full_config(workspace_id="ws1")
         perms = merged["session_permissions"]
-        assert perms["container"] is False
-        # coding preset's network 'ask' ceiling caps the factory network
-        # 'write' grant to the ceiling level itself -- 'ask'.
-        assert perms["network"] == "ask"
+        # No stored permissions -> NO read-time ceiling -> the factory grants
+        # pass uncapped.  The purpose preset is applied at CREATION time
+        # (workspace_routes.create_workspace), never at read time.
+        assert perms["container"] is True
+        assert perms["network"] == "write"
+        assert perms["filesystem"] == "write"
+        assert perms["git"] == "write"
 
