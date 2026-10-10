@@ -2161,13 +2161,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     from web_ui.backend.config_manager import (
                                         _load_workspace_permission_ceiling as _load_ws_ceiling,
                                     )
-                                    from security.security_gate import apply_workspace_ceiling
+                                    from security.security_gate import cap
 
                                     _ceiling = _load_ws_ceiling(_ceiling_ws_id) or {}
                                     _raw_perms = fe_config.get("session_permissions")
                                     if isinstance(_raw_perms, dict):
-                                        fe_config["session_permissions"] = apply_workspace_ceiling(
-                                            _ceiling, _raw_perms
+                                        fe_config["session_permissions"] = cap(
+                                            _raw_perms, _ceiling
                                         )
                             except Exception as exc:
                                 log('WARNING', 'server',

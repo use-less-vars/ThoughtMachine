@@ -862,10 +862,10 @@ def resolve_full_config(
         session_perms = merged.get("session_permissions")
         if isinstance(session_perms, dict):
             try:
-                from security.security_gate import apply_workspace_ceiling
+                from security.security_gate import cap
 
-                merged["session_permissions"] = apply_workspace_ceiling(
-                    _workspace_ceiling, session_perms
+                merged["session_permissions"] = cap(
+                    session_perms, _workspace_ceiling
                 )
             except Exception as exc:
                 log("WARNING", "server.config",
