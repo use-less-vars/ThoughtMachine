@@ -11,7 +11,16 @@ import sys
 import pytest
 from starlette.testclient import TestClient
 
-_EXPECTED_NAMES = {"git", "filesystem", "container", "host_bash", "tty", "jtag"}
+_EXPECTED_NAMES = {
+    "git",
+    "filesystem",
+    "container",
+    "host_bash",
+    "tty",
+    "jtag",
+    "network",
+    "mcp",
+}
 _EXPECTED_KEYS = {
     "name",
     "display_name",
@@ -70,10 +79,10 @@ def test_resource_catalog_returns_bare_array(client):
     assert resp.status_code == 200
     body = resp.json()
     assert isinstance(body, list)
-    assert len(body) == 6
+    assert len(body) == 8
 
 
-def test_resource_catalog_six_resources_with_exact_keys(client):
+def test_resource_catalog_eight_resources_with_exact_keys(client):
     """Each entry carries exactly the 8 declared resource keys."""
     resp = client.get("/api/resource-catalog")
 

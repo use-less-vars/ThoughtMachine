@@ -9,8 +9,9 @@ switches, and risk ratings.
 
 NOTE: the catalog FILE now carries the new resource-level array shape
 (``git`` / ``filesystem`` / ``container`` / ``host_bash`` / ``tty`` /
-``jtag``) and is the source of truth for the ``/api/resource-catalog``
-endpoint.  This loader exposes the workspace-permission view (the
+``jtag`` / ``network`` / ``mcp``) and is the source of truth for the
+``/api/resource-catalog`` endpoint.  This loader exposes the
+workspace-permission view (the
 permission resources in ``_LEGACY_RESOURCES`` — the six canonical
 workspace resources; the removed legacy grains ``git_read``/
 ``git_write``/``system``/``execution`` no longer appear) for the
@@ -36,6 +37,12 @@ _CATALOG_PATH = Path(__file__).resolve().parent / "resource_catalog.json"
 #: Canonical display order of the DERIVED legacy workspace-permission
 #: view (emitted in this order for a stable sequence): ``git``,
 #: ``filesystem``, ``container``, ``network``, ``mcp``, ``host_bash``.
+#: Kept EXPLICIT rather than derived from B's array order: B interleaves the
+#: display-only resources (``tty``/``jtag``) and appends ``network``/``mcp``
+#: last, so B order minus display-only entries would be
+#: ``git``/``filesystem``/``container``/``host_bash``/``network``/``mcp`` --
+#: not this legacy display order.  Deriving it would require reordering B's
+#: SERVED array, which is avoided to keep the endpoint's served order stable.
 _LEGACY_RESOURCE_ORDER: Tuple[str, ...] = (
     "git",
     "filesystem",
@@ -68,30 +75,12 @@ _RESIDUAL_DEFAULT_PERMISSIONS: Dict[str, Any] = {
     "host_bash": "banned",
 }
 
-#: Residual permission-only grains that have NO array-catalog (B)
-#: counterpart (R2).  ``network``/``mcp`` are present in A
-#: (``security.resource_catalog``) but ABSENT from B, so D1's invariant
-#: "A's session vocabulary is a subset of B's catalog" is FALSE on the
-#: current data; step 6 closes it.  They are therefore explicit residual
-#: literals here and are deliberately NOT added to B (doing so would grow
-#: the served array from 6 to 8 entries).  Neither carries an
-#: ``execution_mode``.
-_RESIDUAL_RESOURCES: Dict[str, Dict[str, Any]] = {
-    "network": {
-        "name": "Network",
-        "description": "Outbound network access (HTTP requests, downloads, API calls).",
-        "required_workspace_switch": None,
-        "risk_level": "medium",
-        "ui_category": "network",
-    },
-    "mcp": {
-        "name": "MCP Integrations",
-        "description": "External MCP server tool integrations.",
-        "required_workspace_switch": None,
-        "risk_level": "high",
-        "ui_category": "integrations",
-    },
-}
+#: R13 step 6: the former ``_RESIDUAL_RESOURCES`` block (R2) is RETIRED.
+#: ``network``/``mcp`` appear in A (``security.resource_catalog``) and were
+#: previously absent from B, leaving D1's invariant ("A's session vocabulary
+#: is a subset of B's catalog") FALSE.  They are now full array-catalog (B)
+#: entries, so the legacy view derives them from B like every other resource
+#: and no residual literals remain here.
 
 #: Canonical per-resource permission vocabularies (workspace ceilings).
 #: Import-backed alias of ``security.resource_catalog.WORKSPACE_CEILING_VOCAB``
@@ -165,9 +154,10 @@ def _build_legacy_resources(
     ``name`` <- B ``display_name``; ``description``, ``execution_mode``,
     ``risk_level``, ``ui_category`` and ``required_workspace_switch`` <- the
     matching B fields (R3/R4/E.1).  ``default_permission`` stays a residual
-    literal (R1).  The permission-only grains ``network``/``mcp`` are added
-    as explicit residuals (R2).  A FRESH dict is returned -- never a live
-    reference to a module global.
+    literal (R1).  ``network``/``mcp`` are ordinary B entries (R13 step 6),
+    so every non-display-only resource -- including them -- is derived from
+    B here.  A FRESH dict is returned -- never a live reference to a module
+    global.
     """
     by_key: Dict[str, Dict[str, Any]] = {}
     for entry in catalog_entries:
@@ -186,15 +176,6 @@ def _build_legacy_resources(
         if mode is not None:
             derived["execution_mode"] = mode
         by_key[key] = derived
-    for key, residual in _RESIDUAL_RESOURCES.items():
-        by_key[key] = {
-            "name": residual["name"],
-            "description": residual["description"],
-            "default_permission": _RESIDUAL_DEFAULT_PERMISSIONS[key],
-            "risk_level": residual["risk_level"],
-            "ui_category": residual["ui_category"],
-            "required_workspace_switch": residual["required_workspace_switch"],
-        }
     ordered: Dict[str, Dict[str, Any]] = {
         key: by_key[key] for key in _LEGACY_RESOURCE_ORDER if key in by_key
     }

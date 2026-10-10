@@ -31,7 +31,7 @@ _SHARED = ("git", "filesystem", "container", "host_bash")
 # Per-entry keys carrying the relocated non-A/B metadata (E.1).
 _RELOCATED_KEYS = ("risk_level", "ui_category", "required_workspace_switch")
 
-# Permission-only residual grains that have NO B entry.
+# Former permission-only residual grains (R2) -- R13 step 6 added them to B.
 _RESIDUAL = ("network", "mcp")
 
 
@@ -123,7 +123,7 @@ def test_editing_b_metadata_changes_legacy_view(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# tty/jtag excluded (R6); network/mcp stay explicit residuals (R2).
+# tty/jtag excluded (R6); network/mcp are now real B entries (R13 step 6).
 # ---------------------------------------------------------------------------
 
 
@@ -133,17 +133,22 @@ def test_tty_jtag_excluded_from_legacy_view():
     assert "jtag" not in names
 
 
-def test_network_mcp_remain_residual_grains():
+def test_network_mcp_now_present_in_b():
+    """R13 step 6: the former residuals are now full B entries.
+
+    The legacy view keeps exactly the six canonical permission resources
+    (network/mcp included); both are now derived from B like every other
+    resource rather than from residual literals.
+    """
     view = _legacy_view()["resources"]
     assert set(view) == {
         "git", "filesystem", "container", "network", "mcp", "host_bash",
     }
     assert view["network"]["default_permission"] == "banned"
     assert view["mcp"]["default_permission"] == "banned"
+    b_names = {e["name"] for e in _read_b_hardcoded()}
     for name in _RESIDUAL:
-        assert name not in {e["name"] for e in _read_b_hardcoded()}, (
-            f"residual grain {name!r} must NOT be added to B"
-        )
+        assert name in b_names, f"grain {name!r} must now be present in B"
 
 
 # ---------------------------------------------------------------------------
