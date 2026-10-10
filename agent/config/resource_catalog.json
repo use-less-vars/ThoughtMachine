@@ -110,5 +110,40 @@
     "risk_level": null,
     "ui_category": null,
     "required_workspace_switch": null
+  },
+  {
+    "name": "network",
+    "display_name": "Network",
+    "description": "Outbound network access (HTTP requests, downloads, API calls).",
+    "permission_grain_set": [
+      "banned",
+      "ask",
+      "write",
+      "outbound"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": "medium",
+    "ui_category": "network",
+    "required_workspace_switch": null
+  },
+  {
+    "name": "mcp",
+    "display_name": "MCP",
+    "description": "External MCP server tool integrations.",
+    "permission_grain_set": [
+      "banned",
+      "connect",
+      "full"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": "high",
+    "ui_category": "integrations",
+    "required_workspace_switch": null
   }
 ]

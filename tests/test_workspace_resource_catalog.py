@@ -4,8 +4,8 @@ Tests for the resource catalog (agent/config/resource_catalog.json + loader).
 Canonical model:
 
 - The on-disk catalog FILE is the new resource-level array shape (``git`` /
-  ``filesystem`` / ``container`` / ``host_bash`` / ``tty`` / ``jtag``) used
-  by the ``/api/resource-catalog`` endpoint.
+  ``filesystem`` / ``container`` / ``host_bash`` / ``tty`` / ``jtag`` /
+  ``network`` / ``mcp``) used by the ``/api/resource-catalog`` endpoint.
 - The LOADER exposes the workspace-permission view for the permission
   machinery: exactly the six canonical workspace resources ``git`` /
   ``filesystem`` / ``container`` / ``network`` / ``mcp`` / ``host_bash``
@@ -38,7 +38,16 @@ _CANONICAL_RESOURCES = [
 ]
 
 # On-disk array entries (the endpoint's resource list).
-_ON_DISK_NAMES = {"git", "filesystem", "container", "host_bash", "tty", "jtag"}
+_ON_DISK_NAMES = {
+    "git",
+    "filesystem",
+    "container",
+    "host_bash",
+    "tty",
+    "jtag",
+    "network",
+    "mcp",
+}
 
 
 def test_resource_catalog_contains_canonical_resources():
@@ -84,16 +93,17 @@ def test_resource_catalog_json_matches_loader():
     """The on-disk file (array shape) and the loader's permission view agree.
 
     The raw file is the resource-level array (git / filesystem / container /
-    host_bash / tty / jtag) for the /api/resource-catalog endpoint; the loader
+    host_bash / tty / jtag / network / mcp) for the /api/resource-catalog
+    endpoint; the loader
     shims it into the canonical six-resource workspace-permission view so the
     permission machinery keeps working.
     """
     catalog_path = Path(__file__).resolve().parent.parent / "agent/config/resource_catalog.json"
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
 
-    # Array shape: 6 entries, each with exactly the 8 canonical keys.
+    # Array shape: 8 entries, each with exactly the 11 canonical keys.
     assert isinstance(raw, list)
-    assert len(raw) == 6
+    assert len(raw) == 8
     assert {entry["name"] for entry in raw} == _ON_DISK_NAMES
     for entry in raw:
         assert set(entry.keys()) == {

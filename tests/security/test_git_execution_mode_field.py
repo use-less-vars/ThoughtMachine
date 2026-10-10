@@ -19,7 +19,16 @@ import pytest
 
 from tools.git_info_tool import GitReadTool, resolve_git_execution_mode
 
-_EXPECTED_NAMES = {"git", "filesystem", "container", "host_bash", "tty", "jtag"}
+_EXPECTED_NAMES = {
+    "git",
+    "filesystem",
+    "container",
+    "host_bash",
+    "tty",
+    "jtag",
+    "network",
+    "mcp",
+}
 _EXECUTION_MODES = {"container", "host"}
 
 
