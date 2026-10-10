@@ -1948,10 +1948,10 @@ class WebAgentBridge:
 
                         ceiling = _load_workspace_permission_ceiling(self._workspace_id)
                         if ceiling:
-                            from security.security_gate import apply_workspace_ceiling
+                            from security.security_gate import cap
 
-                            stored_perms = apply_workspace_ceiling(
-                                ceiling, stored_perms
+                            stored_perms = cap(
+                                stored_perms, ceiling
                             )
                     except Exception as exc:
                         log('WARNING', 'server.bridge',

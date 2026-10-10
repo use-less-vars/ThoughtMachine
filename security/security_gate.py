@@ -410,6 +410,28 @@ def apply_workspace_ceiling(
     return result
 
 
+def cap(
+    session_grants: Dict[str, Any],
+    ceiling_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Single public cap funnel: cap session grants at a workspace ceiling.
+
+    Pure function -- NO file reads, NO normalisation/folding, NO preset
+    fallback; the caller is responsible for producing the (already-read,
+    already-folded) ``session_grants`` and ``ceiling_map``.  The canonical
+    argument order is ``(session_grants, ceiling_map)``.
+
+    This is a thin delegator onto the single cap primitive
+    :func:`apply_workspace_ceiling` -- which remains the composed inner step
+    (its own ``workspace_permissions, session_permissions`` order is the swap
+    of this public signature).  Delegating through the module-global keeps
+    the ceiling-application seam patchable.
+
+    Returns a NEW dict; neither argument is mutated.
+    """
+    return apply_workspace_ceiling(ceiling_map, session_grants)
+
+
 def split_git_permission(level: Any) -> tuple:
     """Derive legacy ``(read, write)`` git sub-levels from a merged ``git`` level.
 
@@ -974,7 +996,7 @@ def get_effective_permissions(
     base_session = session
     if workspace_permissions:
         raw = session.model_dump() if hasattr(session, "model_dump") else dict(session.__dict__)
-        capped = apply_workspace_ceiling(workspace_permissions, raw)
+        capped = cap(raw, workspace_permissions)
         try:
             session = SessionPermissions(**capped)
         except Exception:
