@@ -986,12 +986,6 @@ async def get_effective_permissions(
         ceiling = None
     if not isinstance(ceiling, dict):
         ceiling = {}
-    elif ceiling:
-        from web_ui.backend.config_manager import (
-            normalize_legacy_workspace_ceiling,
-        )
-
-        ceiling = normalize_legacy_workspace_ceiling(ceiling)
 
     # ── Merge via security gate (lazy import, with fallback) ──────────────
     try:
@@ -1549,20 +1543,17 @@ def _save_workspace_config(ws_id: str, data: Dict[str, Any]) -> None:
 
 
 def _resolve_workspace_permissions(cfg: Dict[str, Any], purpose: str) -> Dict[str, Any]:
-    """Return the saved permission map, or the purpose preset as fallback.
+    """Return the saved permission map, or ``{}`` when none is stored.
 
     Real booleans are preserved verbatim: ``container`` is stored as a real
     boolean (True == write-level enabled) once validated, and stringifying it
     to 'True'/'False' would break the round trip (the PUT validator rejects
     the string forms) and would be misread as an unknown level downstream.
     """
-    from agent.config.workspace_purpose import apply_purpose_preset
-    from web_ui.backend.config_manager import normalize_legacy_workspace_ceiling
-
     saved = cfg.get("permissions")
     if isinstance(saved, dict) and saved:
-        return normalize_legacy_workspace_ceiling(saved)
-    return normalize_legacy_workspace_ceiling(apply_purpose_preset(purpose))
+        return saved
+    return {}
 
 
 # ── GET /api/workspace/{ws_id}/permissions ─────────────────────────────────────
@@ -1572,11 +1563,9 @@ def _resolve_workspace_permissions(cfg: Dict[str, Any], purpose: str) -> Dict[st
 async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
     """Return the workspace's resource permission map, purpose and host flag.
 
-    Falls back to the purpose preset (or catalog defaults) when the
-    workspace has no saved permission map in ``config.json`` yet.
+    Returns exactly the saved permission map; a workspace with no saved map
+    returns an empty map.
     """
-    from web_ui.backend.config_manager import normalize_legacy_workspace_ceiling
-
     ensure_workspace_dirs(ws_id)
     cfg = _load_workspace_config(ws_id)
     purpose = cfg.get("purpose", "general")
@@ -1588,8 +1577,6 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
         if isinstance(raw_cfg_permissions, dict) and raw_cfg_permissions
         else {}
     )
-    if raw:
-        raw = normalize_legacy_workspace_ceiling(raw)
     return {
         "workspace_id": ws_id,
         "purpose": purpose,

@@ -18,7 +18,6 @@ Exported names (all public — no leading underscore):
     resolve_full_config
     session_config_from_merged
     agent_config_from_merged
-    normalize_legacy_workspace_ceiling
     CONFIG_LAYER_ORDER
     CONFIG_LAYER_OWNERSHIP
 """
@@ -44,9 +43,6 @@ from agent.config.config_manager import (
 )
 from agent.config.deep_merge import deep_merge
 from agent.config.service import create_agent_config_service
-
-from security.resource_catalog import fold_legacy_workspace_ceiling
-from tools.host_resource_policy import load_workspace_config
 
 logger = logging.getLogger(__name__)
 
@@ -668,66 +664,16 @@ def _resolve_provider_layer(
         return merged
 
 
-def normalize_legacy_workspace_ceiling(raw: dict) -> dict:
-    """Map legacy stored workspace ceiling values to canonical catalog values.
-
-    Old workspace ``config.json`` ``permissions`` maps were written with
-    pre-catalog vocabulary: ``container``/``docker`` ceilings as strings or
-    under the legacy ``docker`` alias key, ``full`` where ``write`` is
-    canonical, and per-grain values that predate the canonical level
-    vocabulary.  This helper rewrites them to the canonical values the PUT
-    validator (``validate_workspace_permissions``) and
-    ``security_gate.apply_workspace_ceiling`` understand.  The removed
-    legacy ceiling grains (``git_read``/``git_write``/``system``/
-    ``execution``) never appear in the result:
-
-    - container & docker (docker is the legacy alias of container and is
-      emitted under the canonical ``container`` key, mirroring the PUT
-      validator): real bool passes through; 'True'/'False' -> bool;
-      'banned'|'read'|'ask' -> False; 'write'|'full' -> True; anything
-      else is left untouched.  The container ceiling is NEVER stringified.
-    - network: 'read' -> 'ask'
-    - mcp: 'read'|'ask' -> 'banned'; 'write' -> 'full'
-    - filesystem: 'full' -> 'write'
-    - git: 'full' -> 'write'; 'write_feature_branches' ->
-      'write_on_feature_branch'
-    - git_read / git_write (removed ceiling grains): folded onto the
-      single canonical ``git`` ceiling -- the folded level is the strongest
-      (most permissive) across every present git/git_read/git_write entry,
-      ranked on the workspace-ceiling scale (banned < read < ask <
-      write_on_feature_branch < write; mirrors
-      ``security.resource_catalog.WORKSPACE_CEILING_LEVELS_RANKS``), so
-      stored legacy intent survives (e.g. {git_read: read, git_write: ask}
-      -> git: ask; {git_read: read, git_write: banned} -> git: read).  A
-      git-grain value outside {banned, ask, read, write} is dropped.
-    - system / execution (removed ceiling grains): always dropped --
-      system inspection is unconditionally available and execution is not
-      a user-configurable ceiling.
-    - host_bash: kept iff the value is in {banned, ask, allow}, else left
-      untouched
-    - unknown keys and values: left untouched, EXCEPT the four removed
-      legacy grains above which are always folded or dropped (the runtime
-      gate treats unknown keys as fail-open with a WARN, so they degrade
-      safely)
-
-    Returns a NEW dict (the input is never mutated).  Idempotent: canonical
-    input round-trips unchanged.  Logs a WARNING naming the resource, the
-    old value and the new value on every actual rewrite/fold/drop.
-    """
-    return fold_legacy_workspace_ceiling(raw)
-
-
 def _load_workspace_permission_ceiling(workspace_id: str) -> Dict[str, Any]:
     """Load the workspace permission ceiling for *workspace_id*.
 
     Mirrors ``workspace_routes._resolve_workspace_permissions`` without
     importing that module (which pulls in the worker registry at import
     time): the saved ``permissions`` map in the vault workspace
-    ``config.json`` wins; otherwise the workspace's purpose preset is the
-    ceiling.  Returns ``{}`` when the workspace has no config (no ceiling)
-    or on any failure.
+    ``config.json`` is the ceiling, returned verbatim.  A workspace with no
+    saved permissions has NO ceiling.  Returns ``{}`` when no config or on
+    any failure.
     """
-    from agent.config.workspace_purpose import apply_purpose_preset
     from thoughtmachine.workspace_capabilities import _workspace_dir
 
     cfg: Dict[str, Any] = {}
@@ -742,23 +688,8 @@ def _load_workspace_permission_ceiling(workspace_id: str) -> Dict[str, Any]:
 
     saved = cfg.get("permissions")
     if isinstance(saved, dict) and saved:
-        # Normalise legacy stored vocabulary to the canonical catalog
-        # vocabulary (container as a real bool under the canonical
-        # container key, canonical level strings).  security_gate's
-        # apply_workspace_ceiling only ranks real bools and the canonical
-        # level vocabulary, so anything left unnormalised would be treated
-        # as an UNKNOWN level (fail-open with a WARN - silently dropping
-        # the ceiling).
-        return normalize_legacy_workspace_ceiling(saved)
-
-    try:
-        preset = apply_purpose_preset(cfg.get("purpose", "general"))
-        if isinstance(preset, dict):
-            return normalize_legacy_workspace_ceiling(preset)
-    except Exception:
-        pass
+        return saved
     return {}
-
 
 def resolve_full_config(
     workspace_id: Optional[str] = None,
@@ -792,8 +723,8 @@ def resolve_full_config(
             log("WARNING", "server.config", f"Could not load workspace config: {exc}")
 
         # ── Workspace permission ceiling ────────────────────────────────
-        # The workspace's saved permission map (config.json "permissions",
-        # purpose preset as fallback) is a hard ceiling on session permission
+        # The workspace's saved permission map (config.json "permissions")
+        # is a hard ceiling on session permission
         # levels.  Loaded after the workspace layer so it reflects the
         # workspace's own config; applied to the final merged
         # session_permissions at the end of this function so no later layer
@@ -1345,43 +1276,3 @@ class ConfigManager:
             "warnings": warnings,
             "field_errors": field_errors,
         }
-
-    @staticmethod
-    def workspace_metadata(workspace_id: str) -> Dict[str, Any]:
-        """Return workspace metadata (purpose, permissions, host flag, risk).
-
-        Reads ``vault workspaces/<id>/config.json``; missing files degrade to
-        the ``general`` purpose with catalog-default permissions.  The risk
-        score is computed at runtime by ``agent.config.risk_model``.  Pure
-        read path — does not touch the config merge chain.
-        """
-        from agent.config.workspace_purpose import apply_purpose_preset
-        from agent.config.risk_model import compute_workspace_risk
-
-        cfg = load_workspace_config(workspace_id)
-
-        purpose = cfg.get("purpose", "general")
-        allow_host_resources = cfg.get("allow_host_resources") is True
-        saved = cfg.get("permissions")
-        if isinstance(saved, dict) and saved:
-            permissions = {str(k): str(v) for k, v in saved.items()}
-        else:
-            permissions = apply_purpose_preset(purpose)
-
-        try:
-            risk = compute_workspace_risk(
-                permissions=permissions,
-                allow_host_resources=allow_host_resources,
-                purpose=purpose,
-            )
-        except ImportError:
-            risk = {"level": "low", "error": "risk_model unavailable"}
-
-        return {
-            "workspace_id": workspace_id,
-            "purpose": purpose,
-            "permissions": permissions,
-            "allow_host_resources": allow_host_resources,
-            "risk": risk,
-        }
-

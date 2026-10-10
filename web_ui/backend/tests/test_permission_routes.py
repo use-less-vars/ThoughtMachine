@@ -421,7 +421,7 @@ class TestSessionPermissionsRoutes:
 class TestWorkspacePermissionsRoutes:
     WS = "ws-perm-b"
 
-    def test_get_fresh_workspace_returns_catalog_defaults(self, vault):
+    def test_get_fresh_workspace_returns_empty_permissions(self, vault):
         resp = client.get(f"/api/workspace/{self.WS}/permissions")
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -429,10 +429,10 @@ class TestWorkspacePermissionsRoutes:
         assert data["purpose"] == "general"
         assert data["allow_host_resources"] is False
         assert data["raw"] == {}
-        # With no saved permissions the GET falls back to the purpose preset,
-        # i.e. the catalog defaults for "general".
-        assert data["permissions"] == CATALOG_DEFAULTS
-        assert data["effective"] == CATALOG_DEFAULTS
+        # No saved permissions -> the GET returns exactly the empty stored map
+        # (no read-time purpose-preset fallback).
+        assert data["permissions"] == {}
+        assert data["effective"] == {}
         _assert_iso_utc(data["resolved_at"])
 
     def test_put_then_get_roundtrip_persists_config(self, vault):
@@ -516,7 +516,7 @@ class TestWorkspacePermissionsRoutes:
         errors = resp.json().get("detail", {}).get("errors", [])
         assert errors and "invalid level 'write' for resource 'host_bash'" in errors[0]
 
-    def test_put_empty_permissions_then_get_falls_back_to_preset(self, vault):
+    def test_put_empty_permissions_then_get_returns_empty(self, vault):
         put = client.put(
             f"/api/workspace/{self.WS}/permissions", json={"permissions": {}}
         )
@@ -529,8 +529,8 @@ class TestWorkspacePermissionsRoutes:
         assert get.status_code == 200, get.text
         get_data = get.json()
         assert get_data["raw"] == {}
-        assert get_data["permissions"] == CATALOG_DEFAULTS
-        assert get_data["effective"] == CATALOG_DEFAULTS
+        assert get_data["permissions"] == {}
+        assert get_data["effective"] == {}
         assert get_data["allow_host_resources"] is False
 
     def test_put_empty_permissions_keeps_allow_host_resources(self, vault):
@@ -550,9 +550,9 @@ class TestWorkspacePermissionsRoutes:
         get_data = get.json()
         assert get_data["allow_host_resources"] is True
         assert get_data["raw"] == {}
-        assert get_data["permissions"] == CATALOG_DEFAULTS
+        assert get_data["permissions"] == {}
 
-    def test_purpose_preset_resolves_when_no_permissions_saved(self, vault):
+    def test_purpose_preset_not_resolved_when_no_permissions_saved(self, vault):
         _write_json(
             vault / "workspaces" / self.WS / "config.json",
             {"purpose": "coding"},
@@ -562,8 +562,9 @@ class TestWorkspacePermissionsRoutes:
         data = resp.json()
         assert data["purpose"] == "coding"
         assert data["raw"] == {}
-        assert data["permissions"] == CODING_PRESET
-        assert data["effective"] == CODING_PRESET
+        # No stored permissions -> empty (no read-time preset fallback).
+        assert data["permissions"] == {}
+        assert data["effective"] == {}
 
 
 class TestWorkspaceEffectivePermissionsRoutes:
