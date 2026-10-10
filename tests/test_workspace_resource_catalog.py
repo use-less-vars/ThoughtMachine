@@ -100,7 +100,12 @@ def test_resource_catalog_json_matches_loader():
             "name", "display_name", "description", "permission_grain_set",
             "execution_mode", "container_image",
             "dockerfile_reference", "tools",
+            "risk_level", "ui_category", "required_workspace_switch",
         }
+        if entry["name"] in ("tty", "jtag"):
+            assert entry["risk_level"] is None
+            assert entry["ui_category"] is None
+            assert entry["required_workspace_switch"] is None
     git_entry = next(e for e in raw if e["name"] == "git")
     assert git_entry["dockerfile_reference"] == "docker/resource/git_overlay.Dockerfile"
     assert git_entry["tools"] == ["git_read", "git_write"]

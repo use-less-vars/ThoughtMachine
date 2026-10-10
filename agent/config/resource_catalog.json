@@ -16,7 +16,10 @@
     "tools": [
       "git_read",
       "git_write"
-    ]
+    ],
+    "risk_level": "low",
+    "ui_category": "git",
+    "required_workspace_switch": null
   },
   {
     "name": "filesystem",
@@ -37,7 +40,10 @@
       "apply_edits",
       "file_search",
       "glob"
-    ]
+    ],
+    "risk_level": "low",
+    "ui_category": "filesystem",
+    "required_workspace_switch": null
   },
   {
     "name": "container",
@@ -55,7 +61,10 @@
     "tools": [
       "docker_code_runner",
       "container_control"
-    ]
+    ],
+    "risk_level": "medium",
+    "ui_category": "sandbox",
+    "required_workspace_switch": "allow_docker"
   },
   {
     "name": "host_bash",
@@ -71,7 +80,10 @@
     "dockerfile_reference": null,
     "tools": [
       "host_bash"
-    ]
+    ],
+    "risk_level": "high",
+    "ui_category": "host",
+    "required_workspace_switch": "allow_host_resources"
   },
   {
     "name": "tty",
@@ -81,7 +93,10 @@
     "execution_mode": "host",
     "container_image": null,
     "dockerfile_reference": null,
-    "tools": []
+    "tools": [],
+    "risk_level": null,
+    "ui_category": null,
+    "required_workspace_switch": null
   },
   {
     "name": "jtag",
@@ -91,6 +106,9 @@
     "execution_mode": "host",
     "container_image": null,
     "dockerfile_reference": null,
-    "tools": []
+    "tools": [],
+    "risk_level": null,
+    "ui_category": null,
+    "required_workspace_switch": null
   }
 ]
