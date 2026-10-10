@@ -21,6 +21,9 @@ _EXPECTED_KEYS = {
     "container_image",
     "dockerfile_reference",
     "tools",
+    "risk_level",
+    "ui_category",
+    "required_workspace_switch",
 }
 
 
@@ -79,6 +82,10 @@ def test_resource_catalog_six_resources_with_exact_keys(client):
     assert {entry["name"] for entry in body} == _EXPECTED_NAMES
     for entry in body:
         assert set(entry.keys()) == _EXPECTED_KEYS, entry["name"]
+        if entry["name"] in ("tty", "jtag"):
+            assert entry["risk_level"] is None
+            assert entry["ui_category"] is None
+            assert entry["required_workspace_switch"] is None
 
 
 def test_resource_catalog_git_entry_exact_fields(client):

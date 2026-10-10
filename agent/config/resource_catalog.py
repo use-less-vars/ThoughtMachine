@@ -33,47 +33,51 @@ from security.resource_catalog import WORKSPACE_CEILING_VOCAB
 
 _CATALOG_PATH = Path(__file__).resolve().parent / "resource_catalog.json"
 
-#: Workspace-permission resource grains exposed to the permission
-#: machinery.  The on-disk catalog file is the NEW resource-level array;
-#: this constant is the authoritative view for validation / presets / risk.
-#: It carries exactly the six canonical workspace resources -- the legacy
-#: grains ``git_read`` / ``git_write`` / ``system`` / ``execution`` were
-#: removed from the ceiling surface (``validate_workspace_permissions``
-#: rejects them with a legacy hint).
-_LEGACY_RESOURCES = {
-    "git": {
-        "name": "Git",
-        "description": "Git repository operations (read, write and branch-aware write).",
-        "default_permission": "read",
-        "execution_mode": "container",
-        "required_workspace_switch": None,
-        "risk_level": "low",
-        "ui_category": "git",
-    },
-    "filesystem": {
-        "name": "Filesystem",
-        "description": "File read/write access to the workspace tree.",
-        "default_permission": "read",
-        "execution_mode": "container",
-        "required_workspace_switch": None,
-        "risk_level": "low",
-        "ui_category": "filesystem",
-    },
-    "container": {
-        "name": "Container",
-        "description": "Docker container lifecycle and code execution in sandboxes.",
-        "default_permission": False,
-        "execution_mode": "container",
-        "required_workspace_switch": "allow_docker",
-        "risk_level": "medium",
-        "ui_category": "sandbox",
-    },
-    # ``network`` / ``mcp`` have no array-catalog counterpart (permission-only
-    # grains), so they carry no ``execution_mode`` field.
+#: Canonical display order of the DERIVED legacy workspace-permission
+#: view (emitted in this order for a stable sequence): ``git``,
+#: ``filesystem``, ``container``, ``network``, ``mcp``, ``host_bash``.
+_LEGACY_RESOURCE_ORDER: Tuple[str, ...] = (
+    "git",
+    "filesystem",
+    "container",
+    "network",
+    "mcp",
+    "host_bash",
+)
+
+#: Display-only array-catalog resources EXCLUDED from the legacy
+#: workspace-permission view (R6).  ``tty``/``jtag`` carry no session grant,
+#: so they are not permission resources and must not appear here.
+_DISPLAY_ONLY_RESOURCES: Tuple[str, ...] = ("tty", "jtag")
+
+#: Per-resource ``default_permission`` literals for the legacy view (R1).
+#: ``default_permission`` is intentionally NOT moved into the array-catalog
+#: file (B) during this step; it stays a test-pinned literal here.
+#: DIVERGENCE: ``network``'s default ``"ask"`` differs from
+#: ``security.resource_catalog.SAFE_DEFAULTS["network"]`` (``"banned"``);
+#: this is deliberate and its reconciliation home is step 4, which must
+#: resolve fail-closed (``banned``), never more permissive.
+_RESIDUAL_DEFAULT_PERMISSIONS: Dict[str, Any] = {
+    "git": "read",
+    "filesystem": "read",
+    "container": False,
+    "network": "ask",
+    "mcp": "banned",
+    "host_bash": "banned",
+}
+
+#: Residual permission-only grains that have NO array-catalog (B)
+#: counterpart (R2).  ``network``/``mcp`` are present in A
+#: (``security.resource_catalog``) but ABSENT from B, so D1's invariant
+#: "A's session vocabulary is a subset of B's catalog" is FALSE on the
+#: current data; step 6 closes it.  They are therefore explicit residual
+#: literals here and are deliberately NOT added to B (doing so would grow
+#: the served array from 6 to 8 entries).  Neither carries an
+#: ``execution_mode``.
+_RESIDUAL_RESOURCES: Dict[str, Dict[str, Any]] = {
     "network": {
         "name": "Network",
         "description": "Outbound network access (HTTP requests, downloads, API calls).",
-        "default_permission": "ask",
         "required_workspace_switch": None,
         "risk_level": "medium",
         "ui_category": "network",
@@ -81,19 +85,9 @@ _LEGACY_RESOURCES = {
     "mcp": {
         "name": "MCP Integrations",
         "description": "External MCP server tool integrations.",
-        "default_permission": "banned",
         "required_workspace_switch": None,
         "risk_level": "high",
         "ui_category": "integrations",
-    },
-    "host_bash": {
-        "name": "Host Bash",
-        "description": "Supervised shell command execution on the host machine.",
-        "default_permission": "banned",
-        "execution_mode": "host",
-        "required_workspace_switch": "allow_host_resources",
-        "risk_level": "high",
-        "ui_category": "host",
     },
 }
 
@@ -159,14 +153,64 @@ def _validate_execution_mode(entries: Any) -> None:
             )
 
 
+def _build_legacy_resources(
+    catalog_entries: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """DERIVE the legacy workspace-permission view from B (+ residuals).
+
+    For every array-catalog (B) entry that is not display-only
+    (``tty``/``jtag``) the metadata is read straight from B:
+    ``name`` <- B ``display_name``; ``description``, ``execution_mode``,
+    ``risk_level``, ``ui_category`` and ``required_workspace_switch`` <- the
+    matching B fields (R3/R4/E.1).  ``default_permission`` stays a residual
+    literal (R1).  The permission-only grains ``network``/``mcp`` are added
+    as explicit residuals (R2).  A FRESH dict is returned -- never a live
+    reference to a module global.
+    """
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for entry in catalog_entries:
+        key = entry.get("name")
+        if key in _DISPLAY_ONLY_RESOURCES:
+            continue
+        derived: Dict[str, Any] = {
+            "name": entry.get("display_name"),
+            "description": entry.get("description"),
+            "default_permission": _RESIDUAL_DEFAULT_PERMISSIONS.get(key, "banned"),
+            "risk_level": entry.get("risk_level"),
+            "ui_category": entry.get("ui_category"),
+            "required_workspace_switch": entry.get("required_workspace_switch"),
+        }
+        mode = entry.get("execution_mode")
+        if mode is not None:
+            derived["execution_mode"] = mode
+        by_key[key] = derived
+    for key, residual in _RESIDUAL_RESOURCES.items():
+        by_key[key] = {
+            "name": residual["name"],
+            "description": residual["description"],
+            "default_permission": _RESIDUAL_DEFAULT_PERMISSIONS[key],
+            "risk_level": residual["risk_level"],
+            "ui_category": residual["ui_category"],
+            "required_workspace_switch": residual["required_workspace_switch"],
+        }
+    ordered: Dict[str, Dict[str, Any]] = {
+        key: by_key[key] for key in _LEGACY_RESOURCE_ORDER if key in by_key
+    }
+    for key, value in by_key.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def load_resource_catalog() -> Dict[str, Any]:
     """Load the resource catalog JSON (uncached, always re-read).
 
     Shim: if the file still carries the legacy dict shape it is returned
     as-is; if it carries the NEW array shape, the legacy dict view
     ``{"schema_version": 1, "permission_levels": ["banned", "ask", "read",
-    "write"], "resources": _LEGACY_RESOURCES}`` is returned so the permission
-    machinery keeps its legacy tool-level semantics.
+    "write"], "resources": <derived from B + residuals>}`` is DERIVED (see
+    ``_build_legacy_resources``) so the permission machinery keeps its legacy
+    tool-level semantics while B stays the single metadata store.
 
     Every array entry's ``execution_mode`` is validated against
     ``_EXECUTION_MODES`` (``container`` | ``host``); an invalid value raises
@@ -177,10 +221,13 @@ def load_resource_catalog() -> Dict[str, Any]:
     if isinstance(data, dict):
         return data
     _validate_execution_mode(data)
+    # Wrapper literals (R5): the legacy historical shape contract.  Kept
+    # EXACTLY as-is and deliberately NOT derived from A, whose ``git``
+    # vocabulary is a 5-item list including ``write_on_feature_branch``.
     return {
         "schema_version": 1,
         "permission_levels": ["banned", "ask", "read", "write"],
-        "resources": _LEGACY_RESOURCES,
+        "resources": _build_legacy_resources(data),
     }
 
 
