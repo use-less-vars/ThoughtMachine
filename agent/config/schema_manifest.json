@@ -76,61 +76,113 @@
           "name": "git",
           "display_name": "Git",
           "description": "Git repository operations (read and write) via the git tools.",
-          "permission_grain_set": ["banned", "read", "ask", "write"],
+          "permission_grain_set": [
+            "banned",
+            "ask",
+            "read",
+            "write",
+            "write_on_feature_branch"
+          ],
           "execution_mode": "container",
           "container_image": null,
           "dockerfile_reference": "docker/resource/git_overlay.Dockerfile",
-          "tools": ["git_read", "git_write"]
+          "tools": [
+            "git_read",
+            "git_write"
+          ],
+          "risk_level": "low",
+          "ui_category": "git",
+          "required_workspace_switch": null
         },
         {
           "name": "filesystem",
           "display_name": "Filesystem",
           "description": "File read/write access to the workspace tree.",
-          "permission_grain_set": ["banned", "read", "ask", "write"],
+          "permission_grain_set": [
+            "banned",
+            "ask",
+            "read",
+            "write"
+          ],
           "execution_mode": "container",
           "container_image": null,
           "dockerfile_reference": null,
-          "tools": ["read_file", "file_editor", "apply_edits", "file_search", "glob"]
+          "tools": [
+            "read_file",
+            "file_editor",
+            "apply_edits",
+            "file_search",
+            "glob"
+          ],
+          "risk_level": "low",
+          "ui_category": "filesystem",
+          "required_workspace_switch": null
         },
         {
           "name": "container",
           "display_name": "Container",
           "description": "Container lifecycle and sandboxed code execution (Docker runtime).",
-          "permission_grain_set": ["banned", "read", "ask", "write"],
+          "permission_grain_set": [
+            "banned",
+            "read",
+            "ask",
+            "write"
+          ],
           "execution_mode": "container",
           "container_image": null,
           "dockerfile_reference": "docker/resource/default_runtime.Dockerfile",
-          "tools": ["docker_code_runner", "container_control"]
+          "tools": [
+            "docker_code_runner",
+            "container_control"
+          ],
+          "risk_level": "medium",
+          "ui_category": "sandbox",
+          "required_workspace_switch": "allow_docker"
         },
         {
           "name": "host_bash",
           "display_name": "Host Bash",
           "description": "Supervised shell command execution on the host machine.",
-          "permission_grain_set": ["banned", "read", "ask", "write"],
+          "permission_grain_set": [
+            "banned",
+            "ask",
+            "allow"
+          ],
           "execution_mode": "host",
           "container_image": null,
           "dockerfile_reference": null,
-          "tools": ["host_bash"]
+          "tools": [
+            "host_bash"
+          ],
+          "risk_level": "high",
+          "ui_category": "host",
+          "required_workspace_switch": "allow_host_resources"
         },
         {
           "name": "tty",
           "display_name": "TTY",
           "description": "Interactive terminal sessions.",
-          "permission_grain_set": ["banned", "read", "ask", "write"],
+          "permission_grain_set": [],
           "execution_mode": "host",
           "container_image": null,
           "dockerfile_reference": null,
-          "tools": []
+          "tools": [],
+          "risk_level": null,
+          "ui_category": null,
+          "required_workspace_switch": null
         },
         {
           "name": "jtag",
           "display_name": "JTAG",
           "description": "JTAG hardware debug probe access.",
-          "permission_grain_set": ["banned", "read", "ask", "write"],
+          "permission_grain_set": [],
           "execution_mode": "host",
           "container_image": null,
           "dockerfile_reference": null,
-          "tools": []
+          "tools": [],
+          "risk_level": null,
+          "ui_category": null,
+          "required_workspace_switch": null
         }
       ],
       "root_type": "list",
