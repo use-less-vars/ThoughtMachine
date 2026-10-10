@@ -1,13 +1,10 @@
 """RED test — B1: the PLAIN git-write path must fail closed on a detached HEAD.
 
-``tools/git_write_tool.py`` already refuses a detached HEAD on two NARROW
-paths, both keyed off the same probe (``git rev-parse --abbrev-ref HEAD``
-returns the literal string ``"HEAD"`` when HEAD is detached) and the same
-sentinel string:
+``tools/git_write_tool.py`` already refuses a detached HEAD on the
+``write_on_feature_branch`` grant path, keyed off the probe (``git rev-parse
+--abbrev-ref HEAD`` returns the literal string ``"HEAD"`` when HEAD is
+detached) and the ``_DETACHED_HEAD_ERROR`` sentinel:
 
-* ``GitWriteTool._unprotected_branch_agent_commit_allowed`` — the
-  operator-managed-worktree agent-commit gate (sets
-  ``_agent_commit_refusal_reason = _DETACHED_HEAD_ERROR``); and
 * ``GitWriteTool._git_commit`` — the ``write_on_feature_branch`` grant path
   (returns ``_DETACHED_HEAD_ERROR``).
 
@@ -96,10 +93,10 @@ def _detached_run_git_raw(recorder, sha="a" * 40):
 def test_detached_head_fails_closed(tmp_path, operation):
     """A detached HEAD must refuse `commit`, `branch_create` and `worktree_add`.
 
-    The repo root is an ORDINARY checkout (``_is_operator_managed_worktree``
-    -> False) and the grant is plain ``git: write`` (not
-    ``write_on_feature_branch``), so neither of the two existing detached-HEAD
-    gates runs: this exercises exactly the uncovered PLAIN path.
+    The repo root is an ORDINARY checkout (its ``.git`` is a directory, not a
+    gitfile) and the grant is plain ``git: write`` (not
+    ``write_on_feature_branch``), so the existing detached-HEAD gate does not
+    run: this exercises exactly the uncovered PLAIN path.
     """
     (tmp_path / "note.txt").write_text("x\n")
 
@@ -116,7 +113,6 @@ def test_detached_head_fails_closed(tmp_path, operation):
         # worktree_add defaults base -> "HEAD": a HEAD-resolved target.
         tool = _tool(operation="worktree_add", path="wt-new")
 
-    tool._is_operator_managed_worktree = lambda root: False  # noqa: SLF001
     tool._use_container_mode = lambda: True  # noqa: SLF001
     tool._run_git = _detached_run_git(calls)  # noqa: SLF001
     tool._run_git_raw = _detached_run_git_raw(calls)  # noqa: SLF001

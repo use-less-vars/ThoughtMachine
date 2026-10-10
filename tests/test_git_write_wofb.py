@@ -203,3 +203,65 @@ def test_merged_git_value_prefers_ask_over_read():
     assert _merged_git_value({"git": "read", "git_read": "ask"}) == "ask"
     assert _merged_git_value({"git": "ask", "git_read": "read"}) == "ask"
 
+
+
+# ── Part-2: no operator-managed-worktree exemption in _git_commit ───────────
+#
+# The legacy commit path refused every commit inside an operator-managed
+# worktree unless a narrow feat/*+container exception applied (Guard B).  That
+# worktree exemption is removed: a ``write`` grant is never branch-restricted
+# by the tool, so a worktree checkout behaves exactly like a plain one.
+
+
+def test_write_grant_commit_in_operator_managed_worktree_not_refused(tmp_path):
+    """A ``write`` grant commits even inside an operator-managed worktree.
+
+    Contract: ``_git_commit`` no longer consults any operator-managed
+    worktree gate, so a ``write``-granted commit is not refused for being in
+    a worktree (and protected ``dev`` is fine for a ``write`` grant).  Only
+    the detached-HEAD probe + add/commit subprocesses are expected.  RED on a
+    HEAD whose ``_git_commit`` still runs Guard B (which refuses ``dev`` with
+    the operator-managed message).
+    """
+    tool = _commit_tool(effective_permissions={"git": "write"})
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with mock.patch.object(
+        tool, "_use_container_mode", return_value=True
+    ), mock.patch.object(
+        tool, "_run_git", side_effect=["dev\n", "committed"]
+    ) as run, mock.patch.object(
+        tool, "_validated_rel_paths", return_value=["note.txt"]
+    ), mock.patch.object(tool, "_git_add", return_value=""):
+        result = tool._git_commit(repo)
+    assert "operator" not in result.lower()
+    assert "git:write denied" not in result
+    assert run.call_args_list[-1].args[1][0] == "commit"
+
+
+# ── (a) write + commit to dev (plain checkout) is not refused by the tool ───
+#
+# Folded from the RED-first probe file test_git_commit_branch_permission.py.
+# Cases (b) wofb+dev refused and (c) wofb+feature-branch allowed are already
+# covered above by test_wofb_commit_denied_on_protected_or_unresolved_branch
+# and test_wofb_commit_allowed_on_feature_branch.
+
+
+def test_write_grant_commit_to_dev_not_refused(tmp_path):
+    """``write`` grants full branch access: a commit on ``dev`` (plain
+    checkout) must not be refused by the tool's branch gate."""
+    tool = _commit_tool(effective_permissions={"git": "write"})
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # First _run_git call is the detached-HEAD probe (returns the branch),
+    # the second is the commit itself.
+    with mock.patch.object(
+        tool, "_run_git", side_effect=["dev\n", "committed"]
+    ) as run, mock.patch.object(
+        tool, "_validated_rel_paths", return_value=["note.txt"]
+    ), mock.patch.object(tool, "_git_add", return_value=""):
+        result = tool._git_commit(repo)
+    assert "git:write denied" not in result
+    assert "protected" not in result
+    assert run.call_args_list[-1].args[1][0] == "commit"
+
