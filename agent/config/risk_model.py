@@ -18,7 +18,7 @@ Scoring rules (deterministic, additive):
 
 Levels: score < 20 → ``low``; < 45 → ``medium``; otherwise ``high``.
 
-Sanity: all-banned → 0 → low; catalog defaults → 20 → medium; full grants +
+Sanity: all-banned → 0 → low; catalog defaults → 11 → low; full grants +
 host resources → high.
 """
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
+import useStore from '../store/useStore';
 import WorkerManagementPanel from './WorkerManagementPanel';
 import ContainerListPanel from './workspace/ContainerListPanel';
 import { getPill } from '../data/permissionVocab';
@@ -59,7 +59,10 @@ function EffectivePermissionsSection({ sessionId, effectivePermissions }) {
   // (sessionConfigs[sessionId].permissions). Reading from the store keeps the
   // pills live after apply_config when no REST session profile is loaded.
   const permissions = useStore((s) => (sessionId ? (s.sessionConfigs[sessionId]?.permissions ?? null) : null));
-  const ep = effectivePermissions || permissions || PERMISSION_DEFAULTS;
+  // Fallback source: the backend-published safe defaults mirrored in the store
+  // (GET /api/permission-defaults).  {} until hydrated (fail-closed: no pills).
+  const permissionDefaults = useStore((s) => s.permissionDefaults) || {};
+  const ep = effectivePermissions || permissions || permissionDefaults;
   const categories = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash'];
 
   return (

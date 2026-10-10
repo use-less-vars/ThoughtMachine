@@ -32,15 +32,16 @@
  */
 
 import { create } from 'zustand'
+import { fetchPermissionDefaults } from '../globalApi'
 
-export const PERMISSION_DEFAULTS = {
-  git: 'read',
-  filesystem: 'read',
-  container: false,
-  network: 'banned',
-  mcp: 'banned',
-  host_bash: 'banned',
-}
+// Permission safe defaults have a SINGLE OWNER: the backend
+// (thoughtmachine.security.SAFE_DEFAULTS), served via GET
+// /api/permission-defaults and fetched with fetchPermissionDefaults()
+// (globalApi.js).  The store mirrors that response verbatim in the
+// `permissionDefaults` slice -- there is NO hand-copied literal here (the
+// frontend must never become a second source of truth).  Until the fetch
+// resolves the slice stays {} (fail-closed: consumers render no defaults
+// rather than guessing a value).
 
 // Default per-session entries created by registerSession / receive* actions.
 const DEFAULT_SESSION_CONFIG = { config: null, permissions: null, providers: [], tools: [], isLoaded: false }
@@ -61,6 +62,7 @@ const initialState = {
   sessionStates: {},       // { [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } }
   sessionErrors: {},        // { [sessionId]: last error message string }
   sessionDrafts: {},        // { [sessionId]: ConfigPanel draft with unsaved edits (survives tab unmount) }
+  permissionDefaults: {},   // safe defaults served by GET /api/permission-defaults (single owner: backend)
 }
 
 const useStore = create((set) => ({
@@ -304,7 +306,28 @@ const useStore = create((set) => ({
       },
     })),
 
+  // Replace the permission-defaults mirror with the backend's response.  Any
+  // non-object (null / array / undefined) resets it to {} (fail-closed).
+  setPermissionDefaults: (defaults) =>
+    set({
+      permissionDefaults:
+        defaults && typeof defaults === 'object' && !Array.isArray(defaults) ? defaults : {},
+    }),
+
   reset: () => set({ ...initialState }),
 }))
+
+// Hydrate the permission-defaults mirror from the backend SINGLE OWNER
+// (GET /api/permission-defaults) at module init.  Exposed so callers/tests can
+// await or re-run it; a failed fetch leaves the slice {} (fail-closed).
+export async function hydratePermissionDefaults() {
+  const defaults = await fetchPermissionDefaults()
+  if (defaults) useStore.getState().setPermissionDefaults(defaults)
+  return defaults
+}
+
+// Boot hydration: fire once when the store module loads.  Not awaited -- the
+// app renders immediately and updates when the response lands (or stays {}).
+void hydratePermissionDefaults()
 
 export default useStore

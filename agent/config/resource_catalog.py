@@ -52,16 +52,18 @@ _DISPLAY_ONLY_RESOURCES: Tuple[str, ...] = ("tty", "jtag")
 
 #: Per-resource ``default_permission`` literals for the legacy view (R1).
 #: ``default_permission`` is intentionally NOT moved into the array-catalog
-#: file (B) during this step; it stays a test-pinned literal here.
-#: DIVERGENCE: ``network``'s default ``"ask"`` differs from
-#: ``security.resource_catalog.SAFE_DEFAULTS["network"]`` (``"banned"``);
-#: this is deliberate and its reconciliation home is step 4, which must
-#: resolve fail-closed (``banned``), never more permissive.
+#: file (B); it stays a test-pinned literal here.
+#: RECONCILED (R13 step 4): these literals are now OWNED by
+#: ``thoughtmachine.security.SAFE_DEFAULTS`` (the single owner).  The former
+#: ``network`` divergence (``"ask"``) is resolved fail-closed to ``"banned"``
+#: so outbound access is never granted by default;
+#: ``tests/test_safe_defaults_single_owner.py`` pins this dict EQUAL to
+#: ``SAFE_DEFAULTS`` so the two can never drift again.
 _RESIDUAL_DEFAULT_PERMISSIONS: Dict[str, Any] = {
     "git": "read",
     "filesystem": "read",
     "container": False,
-    "network": "ask",
+    "network": "banned",
     "mcp": "banned",
     "host_bash": "banned",
 }

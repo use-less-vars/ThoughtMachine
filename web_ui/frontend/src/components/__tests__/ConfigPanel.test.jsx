@@ -26,7 +26,19 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import ConfigPanel from '../ConfigPanel';
-import { PERMISSION_DEFAULTS } from '../../store/useStore';
+import useStore from '../../store/useStore';
+
+// The store's permissionDefaults slice is hydrated from the backend single
+// owner (GET /api/permission-defaults) and starts {} (fail-closed), so these
+// tests seed it directly to exercise the "no session permissions" fallbacks.
+const TEST_PERMISSION_DEFAULTS = {
+  git: 'read',
+  filesystem: 'read',
+  container: false,
+  network: 'banned',
+  mcp: 'banned',
+  host_bash: 'banned',
+};
 
 const baseConfig = {
   mode: 'custom',
@@ -60,6 +72,7 @@ function renderPanel(props = {}) {
 }
 
 beforeEach(() => {
+  useStore.setState({ permissionDefaults: { ...TEST_PERMISSION_DEFAULTS } });
   vi.stubGlobal(
     'fetch',
     vi.fn(async () => ({
@@ -138,11 +151,11 @@ describe('Permissions tab', () => {
     const selects = container.querySelectorAll('select');
     expect(selects).toHaveLength(5);
     // Order must be: Git, Filesystem, Network, MCP, Host Bash
-    expect(selects[0].value).toBe(PERMISSION_DEFAULTS.git);       // 'read'
-    expect(selects[1].value).toBe(PERMISSION_DEFAULTS.filesystem); // 'read'
-    expect(selects[2].value).toBe(PERMISSION_DEFAULTS.network);   // 'banned'
-    expect(selects[3].value).toBe('banned');                      // mcp — not in legacy PERMISSION_DEFAULTS
-    expect(selects[4].value).toBe('banned');                      // host_bash — not in legacy PERMISSION_DEFAULTS
+    expect(selects[0].value).toBe(TEST_PERMISSION_DEFAULTS.git);        // 'read'
+    expect(selects[1].value).toBe(TEST_PERMISSION_DEFAULTS.filesystem); // 'read'
+    expect(selects[2].value).toBe(TEST_PERMISSION_DEFAULTS.network);    // 'banned'
+    expect(selects[3].value).toBe(TEST_PERMISSION_DEFAULTS.mcp);        // 'banned'
+    expect(selects[4].value).toBe(TEST_PERMISSION_DEFAULTS.host_bash);  // 'banned'
     const checkbox = container.querySelector('input[type="checkbox"]');
     expect(checkbox).not.toBeChecked();
   });
@@ -168,21 +181,22 @@ describe('Permissions tab', () => {
     expect(selects[2].value).toBe('banned');
   });
 
-  it('keeps the panel defaults in lockstep with useStore.PERMISSION_DEFAULTS', () => {
-    // Equivalence pin: ConfigPanel's module-local CANONICAL_PERMISSION_DEFAULTS
-    // and useStore's exported PERMISSION_DEFAULTS must stay values-identical.
+  it('keeps the panel defaults in lockstep with the store permissionDefaults', () => {
+    // Equivalence pin: ConfigPanel reads its canonical defaults from the store's
+    // permissionDefaults slice (single owner: the backend). The rendered panel
+    // must mirror the seeded store values exactly.
     // Select order is Git, Filesystem, Network, MCP, Host Bash; container is a
-    // checkbox. Expected GREEN at HEAD (the two maps currently agree).
+    // checkbox.
     const { container } = renderPanel({ config: { ...baseConfig, session_permissions: undefined } });
     fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
     const selects = container.querySelectorAll('select');
     expect(selects).toHaveLength(5);
     const selectKeys = ['git', 'filesystem', 'network', 'mcp', 'host_bash'];
     selectKeys.forEach((key, i) => {
-      expect(selects[i].value).toBe(PERMISSION_DEFAULTS[key]);
+      expect(selects[i].value).toBe(TEST_PERMISSION_DEFAULTS[key]);
     });
     const checkbox = container.querySelector('input[type="checkbox"]');
-    expect(checkbox.checked).toBe(PERMISSION_DEFAULTS.container);
+    expect(checkbox.checked).toBe(TEST_PERMISSION_DEFAULTS.container);
   });
 });
 

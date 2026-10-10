@@ -138,7 +138,7 @@ def test_network_mcp_remain_residual_grains():
     assert set(view) == {
         "git", "filesystem", "container", "network", "mcp", "host_bash",
     }
-    assert view["network"]["default_permission"] == "ask"
+    assert view["network"]["default_permission"] == "banned"
     assert view["mcp"]["default_permission"] == "banned"
     for name in _RESIDUAL:
         assert name not in {e["name"] for e in _read_b_hardcoded()}, (
@@ -162,6 +162,6 @@ def test_default_permission_residual_values_pinned():
     assert view["git"]["default_permission"] == "read"
     assert view["filesystem"]["default_permission"] == "read"
     assert view["container"]["default_permission"] is False
-    assert view["network"]["default_permission"] == "ask"
+    assert view["network"]["default_permission"] == "banned"
     assert view["mcp"]["default_permission"] == "banned"
     assert view["host_bash"]["default_permission"] == "banned"
