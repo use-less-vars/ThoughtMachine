@@ -74,7 +74,7 @@ def test_resource_catalog_default_permissions():
     assert defaults["git"] == "read"
     assert defaults["filesystem"] == "read"
     assert defaults["container"] is False
-    assert defaults["network"] == "ask"
+    assert defaults["network"] == "banned"
     assert defaults["mcp"] == "banned"
     assert defaults["host_bash"] == "banned"
     assert levels == ["banned", "ask", "read", "write"]
@@ -121,7 +121,7 @@ def test_resource_catalog_json_matches_loader():
         "git": "read",
         "filesystem": "read",
         "container": False,
-        "network": "ask",
+        "network": "banned",
         "mcp": "banned",
         "host_bash": "banned",
     }

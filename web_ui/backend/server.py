@@ -3218,6 +3218,28 @@ def resource_catalog_endpoint():
     return []
 
 
+@app.get("/api/permission-defaults")
+def permission_defaults_endpoint():
+    """Return the single-owner permission safe defaults as a JSON object.
+
+    Source of truth: ``thoughtmachine.security.SAFE_DEFAULTS`` -- the ONE
+    owner of the out-of-the-box session grants.  This DEDICATED endpoint
+    publishes it across the Py/JS boundary so the frontend never keeps a
+    divergent hand-written default (the JS literal in
+    ``frontend/src/store/useStore.js`` is only a documented BOOT fallback
+    for the window before this fetch resolves).  ``network`` is ``"banned"``
+    (fail-closed).  The response body IS the mapping (no ``{items: ...}``
+    wrapper); if the import fails (partial checkout) an empty object is
+    returned instead of failing.
+    """
+    try:
+        from thoughtmachine.security import SAFE_DEFAULTS
+
+        return dict(SAFE_DEFAULTS)
+    except Exception:
+        return {}
+
+
 @app.get("/api/container/integrity")
 def container_integrity(workspace: str = "", permissions: str = ""):
     """Return container integrity status for the given workspace.

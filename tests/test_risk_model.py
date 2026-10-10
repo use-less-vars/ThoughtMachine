@@ -18,8 +18,8 @@ def test_risk_model_returns_expected_levels():
     assert low["granted_count"] == 0
 
     general = compute_workspace_risk(permissions=apply_purpose_preset("general"))
-    assert general["level"] == "medium"
-    assert general["score"] >= 20
+    assert general["level"] == "low"
+    assert general["score"] >= 11
 
     risky = compute_workspace_risk(
         permissions={"host_bash": "write", "git_write": "write"},

@@ -2,56 +2,57 @@
  * useStore.test.js — Zustand store tests (Phase 0 Frontend Truthfulness Sprint)
  *
  * GREEN (passes today):
- *   - PERMISSION_DEFAULTS: the 6 documented defaults the Permissions tab relies on
+ *   - permissionDefaults: the store mirror of the backend safe defaults
+ *     (GET /api/permission-defaults; no hand-copied literal)
  *   - initial state slices
  *   - setSessions / setSessionMode / setTabRunningState / reset
  *   - foreign-session isolation (per-session keyed maps)
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import useStore, { PERMISSION_DEFAULTS } from '../useStore';
+import useStore from '../useStore';
 
 beforeEach(() => {
   useStore.getState().reset();
 });
 
 // ==========================================================================
-// PERMISSION_DEFAULTS — truthfulness contract for the Permissions tab
+// permissionDefaults — store mirror of the backend SINGLE OWNER
+// (GET /api/permission-defaults, thoughtmachine.security.SAFE_DEFAULTS).
+// The store must NOT carry a hand-copied literal; it starts {} (fail-closed)
+// and is filled by setPermissionDefaults / hydratePermissionDefaults.
 // ==========================================================================
-describe('PERMISSION_DEFAULTS', () => {
-  it('exposes exactly the 6 documented permission keys', () => {
-    expect(Object.keys(PERMISSION_DEFAULTS).sort()).toEqual([
-      'container',
-      'filesystem',
-      'git',
-      'host_bash',
-      'mcp',
-      'network',
-    ]);
+describe('permissionDefaults', () => {
+  it('starts empty (fail-closed) until hydrated from the endpoint', () => {
+    expect(useStore.getState().permissionDefaults).toEqual({});
   });
 
-  it('filesystem defaults to read', () => {
-    expect(PERMISSION_DEFAULTS.filesystem).toBe('read');
+  it('setPermissionDefaults stores the served map verbatim', () => {
+    const defaults = {
+      git: 'read',
+      filesystem: 'read',
+      container: false,
+      network: 'banned',
+      mcp: 'banned',
+      host_bash: 'banned',
+    };
+    useStore.getState().setPermissionDefaults(defaults);
+    expect(useStore.getState().permissionDefaults).toEqual(defaults);
   });
 
-  it('network defaults to banned', () => {
-    expect(PERMISSION_DEFAULTS.network).toBe('banned');
+  it('setPermissionDefaults falls back to {} for a non-object (fail-closed)', () => {
+    useStore.getState().setPermissionDefaults({ git: 'read' });
+    expect(useStore.getState().permissionDefaults).toEqual({ git: 'read' });
+    useStore.getState().setPermissionDefaults(null);
+    expect(useStore.getState().permissionDefaults).toEqual({});
+    useStore.getState().setPermissionDefaults([1, 2]);
+    expect(useStore.getState().permissionDefaults).toEqual({});
   });
 
-  it('container defaults to false', () => {
-    expect(PERMISSION_DEFAULTS.container).toBe(false);
-  });
-
-  it('mcp defaults to banned', () => {
-    expect(PERMISSION_DEFAULTS.mcp).toBe('banned');
-  });
-
-  it('git defaults to read', () => {
-    expect(PERMISSION_DEFAULTS.git).toBe('read');
-  });
-
-  it('host_bash defaults to banned', () => {
-    expect(PERMISSION_DEFAULTS.host_bash).toBe('banned');
+  it('reset clears the mirror back to {}', () => {
+    useStore.getState().setPermissionDefaults({ git: 'read' });
+    useStore.getState().reset();
+    expect(useStore.getState().permissionDefaults).toEqual({});
   });
 });
 

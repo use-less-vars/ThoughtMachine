@@ -46,7 +46,7 @@ CATALOG_DEFAULTS = {
     "git": "read",
     "host_bash": "banned",
     "mcp": "banned",
-    "network": "ask",
+    "network": "banned",
 }
 
 CODING_PRESET = {

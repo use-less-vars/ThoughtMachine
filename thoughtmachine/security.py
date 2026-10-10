@@ -198,13 +198,26 @@ GIT_PERMISSION_LEVELS = tuple(RESOURCE_CATALOG["git"])
 PERMISSION_SCHEMA: Dict[str, tuple] = {
     key: tuple(levels) for key, levels in RESOURCE_CATALOG.items()
 }
-SAFE_DEFAULTS: Dict[str, Any] = {
+# Out-of-the-box session grants -- the SINGLE owner of permission defaults,
+# published to the JS boundary via ``GET /api/permission-defaults`` (see
+# ``web_ui.backend.server``).  ``SAFE_DEFAULTS`` is keyed off
+# ``RESOURCE_CATALOG`` so its key set can never drift from the canonical
+# resource keys, and each value is a member of that resource's scale.  This
+# owner is authoritative: ``agent.config.resource_catalog`` residual literals
+# and the JS boot-fallback literal in ``web_ui/frontend/src/store/useStore.js``
+# must agree with it (pinned by ``tests/test_safe_defaults_single_owner.py``).
+# ``network`` defaults to ``"banned"`` (fail-closed): outbound access is
+# opt-in, never granted by default.
+_SAFE_DEFAULT_LEVELS: Dict[str, Any] = {
     "container": False,
     "filesystem": "read",
     "git": "read",
     "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
+}
+SAFE_DEFAULTS: Dict[str, Any] = {
+    key: _SAFE_DEFAULT_LEVELS[key] for key in RESOURCE_CATALOG
 }
 
 

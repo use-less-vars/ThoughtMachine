@@ -32,6 +32,15 @@ export async function fetchResourceCatalog() {
   return []
 }
 
+// Permission safe defaults published by the backend's SINGLE owner
+// (thoughtmachine.security.SAFE_DEFAULTS via GET /api/permission-defaults).
+// Returns the object (network defaults to 'banned') or null when the backend
+// does not expose the endpoint yet -- callers then keep their boot fallback.
+export async function fetchPermissionDefaults() {
+  const data = await safeGet('/api/permission-defaults')
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : null
+}
+
 export async function fetchCredentials() {
   const data = await safeGet('/api/credentials')
   if (Array.isArray(data)) return data
