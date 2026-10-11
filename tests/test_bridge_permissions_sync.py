@@ -42,7 +42,8 @@ _SESSION_ID = "bridge-sess-001"
 def _seed_disk_grant(monkeypatch, tmp_path, filesystem):
     """Point the vault root at ``tmp_path`` and write the canonical session
     grant ``{"filesystem": filesystem}`` to the session sidecar, with a present
-    workspace config so the ceiling is an empty (non-capping) profile."""
+    workspace config carrying an EXPLICIT permissive ceiling
+    (``filesystem: write``) so the session grant is not capped."""
     from thoughtmachine import permission_store as ps
     from thoughtmachine.vault import vault_root
     monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
@@ -50,7 +51,7 @@ def _seed_disk_grant(monkeypatch, tmp_path, filesystem):
     ws_dir.mkdir(parents=True, exist_ok=True)
     cfg = ws_dir / "config.json"
     if not cfg.exists():
-        cfg.write_text(json.dumps({"permissions": {}}), encoding="utf-8")
+        cfg.write_text(json.dumps({"permissions": {"filesystem": "write"}}), encoding="utf-8")
     ps.write_session_permissions(vault_root(), _WS_ID, _SESSION_ID, {"filesystem": filesystem})
 
 

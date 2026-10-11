@@ -834,6 +834,7 @@ def _read_disk_permission_sources(
     """
     import thoughtmachine.vault as _vault_module
     from thoughtmachine.permission_store import (
+        PermissionStoreError,
         read_session_permissions,
         workspace_ceiling,
     )
@@ -841,6 +842,21 @@ def _read_disk_permission_sources(
     _vault_root = _vault_module.vault_root()
     grants = read_session_permissions(_vault_root, workspace_id, session_id)
     ceiling = workspace_ceiling(_vault_root, workspace_id)
+    if not ceiling:
+        # A PRESENT workspace config.json whose ceiling is EMPTY (no
+        # ``permissions`` key at all -- the store's documented ``{}`` -- or an
+        # explicitly empty map) must fail CLOSED exactly like an UNREADABLE
+        # config, never resolve to "no ceiling".  An empty ceiling applied by
+        # ``apply_workspace_ceiling`` is a NO-OP, so returning it here would
+        # leave the session grants uncapped (fail-OPEN).  RAISING routes both
+        # disk-mode callers through their EXISTING fail-closed substitution
+        # (``_DISK_FAIL_CLOSED_SESSION`` + ``_DISK_FAIL_CLOSED_CEILING``)
+        # rather than inventing a new sentinel.
+        raise PermissionStoreError(
+            "workspace ceiling config present but empty for workspace "
+            f"{workspace_id!r}: no 'permissions' ceiling to apply; "
+            "failing closed"
+        )
     return grants, ceiling
 
 

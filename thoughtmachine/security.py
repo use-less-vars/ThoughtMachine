@@ -220,6 +220,17 @@ SAFE_DEFAULTS: Dict[str, Any] = {
     key: _SAFE_DEFAULT_LEVELS[key] for key in RESOURCE_CATALOG
 }
 
+#: Workspace permission ceiling written EXPLICITLY by the fresh-workspace
+#: seeder (``thoughtmachine.workspace_capabilities.ensure_workspace_dirs``)
+#: into a new ``config.json['permissions']``.  DERIVED from
+#: :data:`SAFE_DEFAULTS` (the single owner of permission defaults) so the value
+#: a fresh workspace carries can never drift from the framework default.  A
+#: fresh workspace is therefore capped at the framework default
+#: (filesystem/git ``read``; network/mcp/host_bash ``banned``; container
+#: ``False``) rather than left with no ``permissions`` key -- an absent key and
+#: an explicit ``{}`` are indistinguishable and both fail closed in the gate.
+FRESH_WORKSPACE_DEFAULT_PERMISSIONS: Dict[str, Any] = dict(SAFE_DEFAULTS)
+
 
 def coerce_session_permissions(
     raw_perms: Any,

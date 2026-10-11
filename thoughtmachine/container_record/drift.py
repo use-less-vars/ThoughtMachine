@@ -59,6 +59,7 @@ from security.security_gate import (
     ContainerConfigError,
     resolve_container_config,
 )
+from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
 
 from .api import RECORD_LABEL_KEY, append_event, read_event_log
 from .lifecycle_policy import normalise_restart_policy, policy_for
@@ -111,17 +112,16 @@ _IMAGE_AXES = ("image_ref", "image_hash")
 #: Key under which the live container id is stored in the ``live`` mapping.
 _LIVE_ID_KEY = "id"
 
-#: The framework-default *effective* grant (what ``permissions={}`` resolves to
-#: with permissive capabilities).  A recorded grant equal to this carries no
-#: information beyond the framework default and is never reported as drift.
-_FRAMEWORK_DEFAULT_PERMISSIONS: dict = {
-    "filesystem": "read",
-    "network": "banned",
-    "container": False,
-    "git": "read",
-    "mcp": "banned",
-    "host_bash": "banned",
-}
+#: The framework-default grant the seeder writes for a FRESH workspace
+#: (``thoughtmachine.workspace_capabilities.ensure_workspace_dirs`` writes
+#: ``config.json['permissions']`` from :data:`FRESH_WORKSPACE_DEFAULT_PERMISSIONS`).
+#: A recorded grant equal to this carries no information beyond the framework
+#: default and is never reported as drift.  One fact, one owner: this
+#: REFERENCES ``thoughtmachine.security.FRESH_WORKSPACE_DEFAULT_PERMISSIONS``
+#: rather than hand-copying the map (it is no longer a description of what
+#: ``permissions={}`` resolves to -- an absent/explicit-empty ceiling now fails
+#: closed in the gate).
+_FRAMEWORK_DEFAULT_PERMISSIONS: dict = dict(FRESH_WORKSPACE_DEFAULT_PERMISSIONS)
 
 
 @dataclass(frozen=True)
