@@ -277,3 +277,38 @@ def test_09_unreadable_config_reported(tmp_path):
     assert mtimes(vault) == before_mtimes, "dry run must not touch mtimes"
     assert not list(vault.rglob("*.bak-*")), "dry run must not write backups"
 
+
+def test_10_nonobject_config_reported(tmp_path):
+    """A config.json that is VALID JSON but NOT a JSON object (e.g. a list) is
+    folded into the `unreadable-config` bucket: reported with its count line, the
+    `! skipped non-object config` diagnostic is preserved, it leaks into no other
+    bucket, and a dry run leaves the tree -- and the file's own bytes -- untouched
+    (never repaired or normalised)."""
+    vault = tmp_path / "vault"
+    cfg = vault / "workspaces/w1/config.json"
+    cfg.parent.mkdir(parents=True)
+    original = b"[1, 2, 3]"  # valid JSON, but not a JSON object
+    cfg.write_bytes(original)
+
+    before_files = snapshot(vault)
+    before_mtimes = mtimes(vault)
+
+    result = _run(vault)  # dry-run
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+
+    # (i) reported under unreadable-config, with its count line and path.
+    assert "unreadable-config: 1" in result.stdout, result.stdout
+    assert str(cfg) in result.stdout, result.stdout
+    # (ii) the pre-existing non-object diagnostic is NOT swallowed.
+    assert "! skipped non-object config" in result.stdout, result.stdout
+    # (iii) it counts in no other bucket.
+    assert "already-migrated: 0" in result.stdout, result.stdout
+    assert "had-config-no-perms: 0" in result.stdout, result.stdout
+    assert "no-config: 0" in result.stdout, result.stdout
+
+    # (iv) nothing on disk changed and the file was not repaired/normalised.
+    assert snapshot(vault) == before_files, "dry run must not create/change files"
+    assert mtimes(vault) == before_mtimes, "dry run must not touch mtimes"
+    assert not list(vault.rglob("*.bak-*")), "dry run must not write backups"
+    assert cfg.read_bytes() == original, "non-object config must be left untouched"
+

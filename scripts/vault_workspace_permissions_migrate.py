@@ -18,7 +18,11 @@ deterministic, deny-by-default ceiling:
   untouched (bucket ``already-migrated``);
 * a ``config.json`` present WITHOUT ``permissions`` gets the key added while
   every other key/value is preserved (bucket ``had-config-no-perms``);
-* a workspace with NO ``config.json`` gets one created (bucket ``no-config``).
+* a workspace with NO ``config.json`` gets one created (bucket ``no-config``);
+* a ``config.json`` that is PRESENT but from which no permission map can be
+  extracted is reported and NEVER written, repaired or normalised (bucket
+  ``unreadable-config``) -- its single definition is "present, but unreadable":
+  invalid JSON, JSON that parses to a non-object, or a read/decode failure.
 
 The block written is ``{"permissions": {...}}``.  When the workspace declares a
 ``purpose`` the preset for that purpose supplies the map
@@ -158,8 +162,8 @@ def _dump(doc):
 def build_plan(root):
     """Scan *root* and return the plan.
 
-    Returns ``(buckets, plan, purpose_ok, all_banned)`` where *buckets* maps the
-    three bucket names to their path lists, *plan* is the ordered list of
+    Returns ``(buckets, plan, purpose_ok, all_banned)`` where *buckets* maps each
+    bucket name to its path list, *plan* is the ordered list of
     pending writes (``{"cfg": path, "kind": "rewrite"|"create", "doc": doc}``),
     *purpose_ok* counts workspaces migrated via a purpose preset and
     *all_banned* counts workspaces that received the all-banned block.
@@ -179,7 +183,7 @@ def build_plan(root):
             try:
                 with open(cfg, "r", encoding="utf-8") as fh:
                     doc = json.load(fh)
-            except (OSError, ValueError, UnicodeDecodeError) as exc:
+            except (OSError, ValueError) as exc:
                 # Exists but cannot be read / parsed: report it under its own
                 # bucket (it receives no block and is never written) while
                 # KEEPING the per-workspace diagnostic.
@@ -187,6 +191,9 @@ def build_plan(root):
                 print("  ! skipped unreadable config %s: %s" % (cfg, exc))
                 continue
             if not isinstance(doc, dict):
+                # Valid JSON, but no permission map can be extracted from it:
+                # same bucket as a parse failure, never written.
+                buckets["unreadable-config"].append(cfg)
                 print("  ! skipped non-object config %s" % cfg)
                 continue
             if "permissions" in doc:
