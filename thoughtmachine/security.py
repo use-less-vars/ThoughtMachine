@@ -7,7 +7,6 @@ with comprehensive logging.
 import os
 import sys
 import logging
-import hashlib
 import time
 import docker
 from pathlib import Path
@@ -700,9 +699,16 @@ def setup_docker_sandbox(
         )
         with open("/tmp/container_audit.log", "a") as _f:
             _f.write(f"{time.time()} | SECURITY_SETUP_DOCKER | workspace={workspace_path} network_passed={network}\n")
+        network_mode, workspace_mode = executor._compute_container_config()
+        container_name = docker_executor.build_container_name(
+            workspace_path,
+            docker_executor.LIFECYCLE_PERSISTENT,
+            network_mode=network_mode,
+            workspace_mode=workspace_mode,
+        )
         _log_docker_sandbox_event(
             container_id="<lazy>",
-            container_name=f"agent-exec-{hashlib.sha256(workspace_path.encode()).hexdigest()[:12]}",
+            container_name=container_name,
             image=image,
             command=[],
             action="setup",

@@ -1064,8 +1064,13 @@ class DockerExecutor:
 
         # Compute container_name for cache key alignment with get_container_status
         normalised = self.workspace_path.replace("\\", "/")
-        digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
-        _container_name = f"agent-exec-{digest}"
+        network_mode, workspace_mode = self._compute_container_config()
+        _container_name = build_container_name(
+            self.workspace_path,
+            LIFECYCLE_PERSISTENT,
+            network_mode=network_mode,
+            workspace_mode=workspace_mode,
+        )
 
         log_lines: list[str] = []
         image_id: str | None = None
@@ -1179,8 +1184,16 @@ def _remove_container_by_workspace(workspace_path: str) -> None:
     ``agent-exec-``).  This is safe to call even when no container exists.
     """
     normalised = os.path.abspath(workspace_path).replace("\\", "/")
-    digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
-    container_name = f"agent-exec-{digest}"
+    workspace_id = _resolve_workspace_id(normalised)
+    network_mode, workspace_mode = _resolve_container_config_via_gate(
+        workspace_id, None
+    )
+    container_name = build_container_name(
+        normalised,
+        LIFECYCLE_PERSISTENT,
+        network_mode=network_mode,
+        workspace_mode=workspace_mode,
+    )
     try:
         client = docker.from_env()
         container = client.containers.get(container_name)
@@ -1300,8 +1313,16 @@ def get_container_status(workspace_path: str) -> dict:
     normalised = os.path.abspath(workspace_path).replace("\\", "/")
 
     # ── 2. Compute container name ──────────────────────────────────────────
-    digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
-    container_name = f"agent-exec-{digest}"
+    workspace_id = _resolve_workspace_id(normalised)
+    network_mode, workspace_mode = _resolve_container_config_via_gate(
+        workspace_id, None
+    )
+    container_name = build_container_name(
+        normalised,
+        LIFECYCLE_PERSISTENT,
+        network_mode=network_mode,
+        workspace_mode=workspace_mode,
+    )
 
     # ── 3. Check build-in-progress ──────────────────────────────────────────
     with _build_log_cache_lock:
