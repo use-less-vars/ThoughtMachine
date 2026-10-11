@@ -244,3 +244,36 @@ def test_08_purpose_lookup_failure_logs_and_falls_back(tmp_path):
 
     doc = json.loads(cfg.read_text(encoding="utf-8"))
     assert doc["permissions"] == ALL_BANNED, doc
+
+
+def test_09_unreadable_config_reported(tmp_path):
+    """A config.json that EXISTS but is not parseable is promoted to the
+    `unreadable-config` bucket: it is reported with its own count line, the
+    per-workspace `! skipped` diagnostic is preserved, it leaks into no other
+    bucket, and a dry run leaves the tree byte-identical and mtime-stable."""
+    vault = tmp_path / "vault"
+    cfg = vault / "workspaces/w1/config.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_bytes(b'{"broken": ')  # exists, but invalid JSON
+
+    before_files = snapshot(vault)
+    before_mtimes = mtimes(vault)
+
+    result = _run(vault)  # dry-run
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+
+    # (i) reported under the new bucket ...
+    assert "unreadable-config: 1" in result.stdout, result.stdout
+    assert str(cfg) in result.stdout, result.stdout
+    # ... and the pre-existing per-workspace diagnostic is NOT swallowed.
+    assert "! skipped unreadable config" in result.stdout, result.stdout
+    # ... and it counts in no other bucket.
+    assert "already-migrated: 0" in result.stdout, result.stdout
+    assert "had-config-no-perms: 0" in result.stdout, result.stdout
+    assert "no-config: 0" in result.stdout, result.stdout
+
+    # (iii) nothing on disk changed.
+    assert snapshot(vault) == before_files, "dry run must not create/change files"
+    assert mtimes(vault) == before_mtimes, "dry run must not touch mtimes"
+    assert not list(vault.rglob("*.bak-*")), "dry run must not write backups"
+

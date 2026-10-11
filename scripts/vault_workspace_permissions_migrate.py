@@ -164,7 +164,12 @@ def build_plan(root):
     *purpose_ok* counts workspaces migrated via a purpose preset and
     *all_banned* counts workspaces that received the all-banned block.
     """
-    buckets = {"already-migrated": [], "had-config-no-perms": [], "no-config": []}
+    buckets = {
+        "already-migrated": [],
+        "had-config-no-perms": [],
+        "no-config": [],
+        "unreadable-config": [],
+    }
     all_banned_paths = []
     plan = []
     purpose_ok = 0
@@ -174,7 +179,11 @@ def build_plan(root):
             try:
                 with open(cfg, "r", encoding="utf-8") as fh:
                     doc = json.load(fh)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                # Exists but cannot be read / parsed: report it under its own
+                # bucket (it receives no block and is never written) while
+                # KEEPING the per-workspace diagnostic.
+                buckets["unreadable-config"].append(cfg)
                 print("  ! skipped unreadable config %s: %s" % (cfg, exc))
                 continue
             if not isinstance(doc, dict):
@@ -230,7 +239,12 @@ def print_report(root, buckets, all_banned_paths, purpose_ok, apply_mode):
     print("vault root: %s" % root)
     print("mode: %s" % ("apply" if apply_mode else "dry-run"))
     print("")
-    for name in ("already-migrated", "had-config-no-perms", "no-config"):
+    for name in (
+        "already-migrated",
+        "had-config-no-perms",
+        "no-config",
+        "unreadable-config",
+    ):
         paths = buckets[name]
         print("%s: %d" % (name, len(paths)))
         for p in paths:
