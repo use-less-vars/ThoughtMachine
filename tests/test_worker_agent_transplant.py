@@ -808,7 +808,7 @@ class TestGateDenialInstant:
         ws_dir = tmp_path / "workspaces" / ws_id
         ws_dir.mkdir(parents=True, exist_ok=True)
         (ws_dir / "config.json").write_text(
-            _json.dumps({"permissions": {}}), encoding="utf-8"
+            _json.dumps({"permissions": {"filesystem": "ask"}}), encoding="utf-8"
         )
         (ws_dir / "capabilities.json").write_text(
             _json.dumps({"filesystem_write": True, "git_available": True}),

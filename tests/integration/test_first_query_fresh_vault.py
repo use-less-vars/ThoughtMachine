@@ -48,13 +48,31 @@ def _provision_workspace(workspace_id: str) -> None:
     session grants from the session permission sidecar.  A MISSING workspace
     config makes ``permission_store.workspace_ceiling`` raise and the gate fail
     CLOSED (all-banned), so the synthetic workspace must actually exist on
-    disk.  ``ensure_workspace_dirs`` seeds ``config.json`` as ``{}`` (a
-    present-but-empty ceiling that caps nothing) plus a fully-permissive
-    ``capabilities.json``.
+    disk.  ``ensure_workspace_dirs`` seeds ``config.json`` with the framework
+    default ceiling (read-only) plus a fully-permissive ``capabilities.json``;
+    that default would CAP the permissive session grants exercised below, so we
+    overwrite it with an EXPLICIT permissive ceiling.
     """
+    from thoughtmachine.vault import vault_root
     from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
 
     ensure_workspace_dirs(workspace_id)
+    config_path = vault_root() / "workspaces" / workspace_id / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "permissions": {
+                    "filesystem": "write",
+                    "git": "write",
+                    "network": "ask",
+                    "container": False,
+                    "mcp": "banned",
+                    "host_bash": "banned",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------

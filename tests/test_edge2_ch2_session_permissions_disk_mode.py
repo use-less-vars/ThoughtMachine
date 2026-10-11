@@ -126,21 +126,20 @@ def test_readable_ceiling_caps_session_grants(tmp_path, monkeypatch):
     assert effective == dict(expected)
 
 
-def test_config_without_permissions_key_passes_grants(tmp_path, monkeypatch):
-    """A ``config.json`` with no ``permissions`` key is a legitimate empty
-    ceiling (not an error): grants pass through unchanged."""
+def test_config_without_permissions_key_fails_closed(tmp_path, monkeypatch):
+    """A ``config.json`` with no ``permissions`` key fails CLOSED.
+
+    Re-pinned to the fail-closed contract: an ABSENT ``permissions`` key and an
+    explicit ``permissions: {}`` are indistinguishable -- both leave the
+    workspace ceiling unspecified, so the gate denies all rather than passing
+    the stored session grants through unchanged (the retired reading treated a
+    missing key as a legitimate empty ceiling -- a FAIL-OPEN grant).
+    """
     vault = _vault(tmp_path, monkeypatch)
     _write_config(vault)  # no "permissions" key
     _write_grants_sidecar(vault, {"filesystem": "write", "git": "write"})
 
-    assert dict(_effective(WS_ID, SESSION_ID)) == {
-        "filesystem": "write",
-        "network": "banned",
-        "container": False,
-        "git": "write",
-        "mcp": "banned",
-        "host_bash": "banned",
-    }
+    assert dict(_effective(WS_ID, SESSION_ID)) == FAIL_CLOSED
 
 
 def test_legacy_record_without_sidecar_fails_closed(tmp_path, monkeypatch):

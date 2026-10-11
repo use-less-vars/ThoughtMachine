@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
 from thoughtmachine.vault import vault_root
 from thoughtmachine.workspace_registry import _normalize_path
 
@@ -273,8 +274,11 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     * ``domain_allowlist.json`` — empty JSON array ``[]``
     * ``workers.json`` — default template worker from worker_templates/ (default)
     * ``mcp_servers.json`` — empty JSON array ``[]``
-    * ``config.json`` — empty JSON object ``{}`` (workspace ceiling source;
-      a missing file makes the security gate fail closed to deny-all)
+    * ``config.json`` — framework-default permission ceiling under the
+      ``permissions`` key (the ``FRESH_WORKSPACE_DEFAULT_PERMISSIONS`` map:
+      filesystem/git ``read``, network/mcp/host_bash ``banned``, container
+      ``False``).  A missing file OR a present file with no ``permissions`` key
+      both make the security gate fail closed to deny-all.
 
     No subdirectories (e.g. ``sessions/``, ``state/``, ``knowledge/``) are
     created inside the workspace config directory.
@@ -334,13 +338,19 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     # The permission store reads ``workspaces/<id>/config.json`` as the
     # workspace ceiling; a MISSING file raises in
     # ``permission_store.workspace_ceiling`` and the security gate then fails
-    # CLOSED to deny-all.  Seeding an empty object keeps the ceiling at the
-    # permissive default (no workspace-level cap) and lets session grants
-    # govern, while still leaving the file present for PUT /workspace to
-    # merge into.  Idempotent: never overwrite an existing config.json.
+    # CLOSED to deny-all.  A present file that carries no ``permissions`` key
+    # is treated the same way (fail closed): an empty ceiling is NO LONGER read
+    # as "no cap".  Seed the framework default EXPLICITLY
+    # (``FRESH_WORKSPACE_DEFAULT_PERMISSIONS``) so a fresh workspace is capped
+    # at the documented default instead of collapsing to deny-all, while still
+    # leaving the file present for PUT /workspace to merge into.  Idempotent:
+    # never overwrite an existing config.json.
     config_path = base / "config.json"
     if not config_path.exists():
-        _atomic_write_json(config_path, {})
+        _atomic_write_json(
+            config_path,
+            {"permissions": dict(FRESH_WORKSPACE_DEFAULT_PERMISSIONS)},
+        )
         created.append(str(config_path))
 
     # ── Safeguard: warn about unexpected items ────────────────────────────

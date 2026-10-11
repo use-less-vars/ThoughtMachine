@@ -186,6 +186,45 @@ def test_disk_mode_missing_or_corrupt_config_fails_closed(hermetic_vault):
     assert eff2 == ALL_BANNED
 
 
+def test_disk_mode_present_config_without_permissions_key_fails_closed(hermetic_vault):
+    """(e3) PRESENT config.json with NO ``permissions`` key must fail CLOSED
+    exactly like an unreadable config.
+
+    The store's documented contract is that a config-present-but-no-key
+    ceiling reads as ``{}`` (the purpose-preset fallback being the caller's
+    job).  Before the fix the gate treats that empty ceiling as "no ceiling",
+    so a perfectly readable PERMISSIVE grant sidecar survives UNCAPPED -- the
+    present-but-empty ceiling is fail-OPEN.  After the fix the empty ceiling
+    is routed through the EXISTING fail-closed path, so the whole effective
+    profile collapses to the all-banned six-key shape.
+    """
+    ws_id, sid = "ws-e3", "sess-1"
+    # A readable, permissive grant sidecar -- only the CEILING is "empty".
+    write_session_permissions(
+        hermetic_vault, ws_id, sid,
+        {
+            "filesystem": "write",
+            "git": "write",
+            "network": "write",
+            "mcp": "full",
+            "host_bash": "allow",
+            "container": True,
+        },
+    )
+    # Config PRESENT, but with NO ``permissions`` key at all.
+    ws_dir = hermetic_vault / "workspaces" / ws_id
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    (ws_dir / "config.json").write_text(json.dumps({"purpose": "coding"}))
+
+    eff = get_effective_permissions(
+        SessionPermissions(),  # ignored in disk mode
+        _FULL_CAPS,
+        session_id=sid,
+        workspace_id=ws_id,
+    )
+    assert eff == ALL_BANNED
+
+
 def test_disk_mode_equals_legacy_explicit_args(hermetic_vault):
     """(f) For identical content, the legacy explicit-args call and the disk
     mode call produce the same result (disk grants == session arg, disk
