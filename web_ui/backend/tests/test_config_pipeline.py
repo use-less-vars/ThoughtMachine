@@ -22,6 +22,42 @@ def _find_session_files(sessions_dir: Path) -> list:
     return sorted(f for f in sessions_dir.glob("*.json") if not f.name.startswith("_meta"))
 
 
+def _restore_real_session_types(monkeypatch) -> None:
+    """Re-bind the concrete ``session`` types onto the bridge modules.
+
+    ``test_bridge_dedup.py`` injects MagicMock stand-ins for the ``session``
+    package into ``sys.modules`` while ``web_ui.backend.bridge`` /
+    ``web_ui.backend.session_manager`` are first imported (to avoid heavy
+    optional deps).  It restores ``sys.modules`` afterwards, but the
+    ``Session`` / ``FileSystemSessionStore`` names those two modules bound at
+    import time remain MagicMocks for the rest of the process.  Consequently
+    ``WebAgentBridge.save_session`` builds a MagicMock ``Session`` whose
+    ``session_id`` / ``metadata['name']`` are not strings, so
+    ``session.store._sanitize_filename`` raises
+    ``TypeError: expected string or bytes-like object, got 'MagicMock'`` and no
+    session file is written.
+
+    Re-binding the real classes (auto-undone by ``monkeypatch``) restores the
+    string-typed contract so the real persistence path runs; the test's
+    assertions are unchanged.
+    """
+    import session.models as _session_models
+    import session.store as _session_store_mod
+    import web_ui.backend.bridge as _bridge_mod
+    import web_ui.backend.session_manager as _session_manager_mod
+
+    monkeypatch.setattr(_bridge_mod, "Session", _session_models.Session)
+    monkeypatch.setattr(
+        _bridge_mod, "FileSystemSessionStore", _session_store_mod.FileSystemSessionStore
+    )
+    monkeypatch.setattr(_session_manager_mod, "Session", _session_models.Session)
+    monkeypatch.setattr(
+        _session_manager_mod,
+        "FileSystemSessionStore",
+        _session_store_mod.FileSystemSessionStore,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Tests: bridge.apply_config
 # ══════════════════════════════════════════════════════════════════════════════
@@ -29,12 +65,16 @@ def _find_session_files(sessions_dir: Path) -> list:
 class TestApplyConfig:
     """Tests for WebAgentBridge.apply_config()."""
 
-    def test_apply_config_updates_bridge_config(self, session_store, temp_session_dir):
+    def test_apply_config_updates_bridge_config(self, session_store, temp_session_dir, monkeypatch):
         """
         apply_config should:
         1. Update bridge._config with the supplied values
         2. Persist the config to a session file on disk
         """
+        # Repair MagicMock leakage from test_bridge_dedup.py so the real (string-
+        # typed) session classes are exercised (see helper for the full story).
+        _restore_real_session_types(monkeypatch)
+
         # ── Setup ──────────────────────────────────────────────────────
         # NOTE: SessionManager caches the session store at construction time
         # (bridge.py:251-252), so the store MUST be passed via the constructor.

@@ -84,6 +84,7 @@ class TestGetSessionSize:
 
         session = Session()
         session.metadata['name'] = 'Worker Session'
+        session.metadata['agent_type'] = 'worker'
         session.add_message('user', 'Hello')
         session.add_message('assistant', 'Hi')
         sid = session.session_id
@@ -134,6 +135,7 @@ class TestListSessionsSize:
 
         session = Session()
         session.metadata['name'] = 'Worker Session'
+        session.metadata['agent_type'] = 'worker'
         session.add_message('user', 'Hello')
         session.add_message('assistant', 'Hi')
         sid = session.session_id

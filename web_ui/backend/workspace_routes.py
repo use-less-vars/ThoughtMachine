@@ -939,10 +939,14 @@ async def get_effective_permissions(
     """Return the effective (merged) permissions for this workspace.
 
     Merges the session-level permissions with workspace-level capabilities.
-    If *session_id* is provided, session permissions are resolved sidecar
-    first (``permission_store.read_session_permissions``), falling back to
-    the saved session's embedded ``session_permissions`` metadata; otherwise
-    a read-only, no-network default is assumed.
+    If *session_id* is provided, session permissions are resolved from the
+    session grants sidecar (``permission_store.read_session_permissions``) --
+    the sidecar is the SOLE grants source.  A missing or unreadable grants
+    source fail-closes to the deny-all sentinel
+    (``permission_store.read_grants_or_deny_all``); it never falls back to a
+    saved session's embedded ``session_permissions`` metadata.  With no
+    *session_id* there is no grants path to read, so a read-only, no-network
+    default is assumed.
     """
     ensure_workspace_dirs(ws_id)
 
@@ -974,11 +978,13 @@ async def get_effective_permissions(
         # explicitly here instead.
         session_perms = SessionPermissions(**deny_all_grants())
 
-    # ── Load the workspace permission ceiling. Only explicitly saved
-    # workspace permissions (config.json "permissions") act as the ceiling
-    # for this endpoint; a workspace with no saved permissions has NO
-    # ceiling (restored session grants pass through raw). The purpose-preset
-    # fallback is intentionally NOT applied here (it remains /summary-only).
+    # ── Load the workspace permission ceiling. The ceiling is the explicitly
+    # saved workspace permissions (config.json "permissions"). A workspace
+    # with no saved permissions is bootstrapped by ensure_workspace_dirs(),
+    # which seeds config.json with the safe-default permission map; so a fresh
+    # workspace's ceiling is that safe-default map (session grants above it
+    # are capped), rather than "no ceiling". The purpose-preset fallback is
+    # intentionally NOT applied here (it remains /summary-only).
     try:
         raw_cfg = _load_workspace_config(ws_id)
         ceiling = raw_cfg.get("permissions") if isinstance(raw_cfg, dict) else None

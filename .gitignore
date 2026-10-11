@@ -177,6 +177,11 @@ docs/testing/test_run_on_host.txt
 !docs/testing/
 !docs/testing/ci_process.md
 !docs/ui_map.md
+# web-ui backend test-dispositions doc (platform-matrix deliverable, 2026).
+# The directory negation lets git descend into docs/ci/; `docs/*` matches only
+# one level and does not cross `/`, so the contents negation is belt-and-braces.
+!docs/ci/
+!docs/ci/**
 scratch/
 # Hygiene (2026-09-21): local toolchain caches, probes, scratch dirs and KB noise
 .deb-cache/
