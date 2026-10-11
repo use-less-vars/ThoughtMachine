@@ -251,6 +251,45 @@ jobs:
         run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
 
   # -------------------------------------------------------------------------
+  # web_ui backend: full suite (advisory).
+  #
+  # Scoped to web_ui/backend/tests only (the main testpaths suite does not
+  # collect it), so this job's anti-vacuity floor is 125, the number that
+  # directory currently collects. Advisory only: a failure never fails the
+  # workflow (continue-on-error).
+  # -------------------------------------------------------------------------
+  web-ui-backend-suite:
+    name: web-ui-backend-suite (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 125
+          web_ui/backend/tests/
+
+      - name: Run web-ui backend suite
+        run: python -m pytest web_ui/backend/tests/ --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
   # macOS: install + startup smoke (advisory).
   #
   # Reports the host facts (uname -m / sw_vers / id -u / id -g), selects the

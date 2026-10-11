@@ -30,11 +30,26 @@ VALID_PERMISSIONS = {"filesystem": "read", "host_bash": "banned"}
 
 @pytest.fixture
 def fake_ws_dir(monkeypatch, tmp_path):
-    """Point the permissions endpoints at a throwaway workspace directory."""
+    """Point the permissions endpoints at a throwaway workspace directory.
+
+    BOTH seams that touch ``config.json`` must be redirected.  The handler
+    *writes* the file through ``_workspace_dir(ws_id)`` (patched here), but it
+    *reads* it back through ``_load_workspace_config`` ->
+    ``workspace_routes.load_workspace_config``, which resolves
+    ``<vault_root>/workspaces/<id>/config.json`` and is governed by the real
+    vault, NOT by ``_workspace_dir``.  Redirecting the read seam too keeps the
+    two seams consistent inside the test, so a seeded config is actually seen.
+    """
     ws_dir = tmp_path / "ws-test"
     ws_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: ws_dir)
     monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
+
+    def _load_from_fake_dir(ws_id):
+        cfg_path = ws_dir / "config.json"
+        return json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+
+    monkeypatch.setattr(workspace_routes, "load_workspace_config", _load_from_fake_dir)
     return ws_dir
 
 
