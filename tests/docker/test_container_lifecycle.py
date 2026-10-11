@@ -139,7 +139,13 @@ class TestContainerLifecycle:
             except (docker.errors.NotFound, docker.errors.APIError):
                 pass
 
-    def _start_manager(self, session_permissions=None, workspace_id=None, session_id=None):
+    def _start_manager(
+        self,
+        session_permissions=None,
+        workspace_id=None,
+        session_id=None,
+        workspace_ceiling=None,
+    ):
         """Start a ContainerManager-backed container and track it for teardown."""
         from infra.container_manager import ContainerManager  # lazy (see module docstring)
         manager = ContainerManager(
@@ -183,6 +189,18 @@ class TestContainerLifecycle:
 
             _root = _vault_root()
             ensure_workspace_dirs(str(workspace_id))
+            if workspace_ceiling is not None:
+                # The fresh-workspace seeder writes the framework-default
+                # ceiling (filesystem/git read, network/mcp/host_bash banned),
+                # which CAPS the session grants these container-mechanics tests
+                # exercise. Overwrite config.json with an EXPLICIT ceiling
+                # permitting exactly the operation under test. A resource
+                # absent from this map has no ceiling (the session value
+                # stands), so a partial map is safe.
+                (_root / "workspaces" / str(workspace_id) / "config.json").write_text(
+                    json.dumps({"permissions": workspace_ceiling}),
+                    encoding="utf-8",
+                )
             if session_id is not None:
                 write_session_permissions(
                     _root, str(workspace_id), str(session_id), session_permissions
@@ -208,6 +226,7 @@ class TestContainerLifecycle:
         session_id = uuid.uuid4()
         manager, res = self._start_manager(
             session_permissions={"filesystem": "write"},
+            workspace_ceiling={"filesystem": "write"},
             workspace_id=workspace_id,
             session_id=session_id,
         )
@@ -237,6 +256,7 @@ class TestContainerLifecycle:
         session_id = uuid.uuid4()
         manager, res = self._start_manager(
             session_permissions={"filesystem": "write"},
+            workspace_ceiling={"filesystem": "write"},
             workspace_id=workspace_id,
             session_id=session_id,
         )
@@ -414,6 +434,7 @@ class TestContainerLifecycle:
         session_id = uuid.uuid4()
         manager, res = self._start_manager(
             session_permissions={"network": "write", "filesystem": "read"},
+            workspace_ceiling={"network": "write", "filesystem": "read"},
             workspace_id=workspace_id,
             session_id=session_id,
         )
