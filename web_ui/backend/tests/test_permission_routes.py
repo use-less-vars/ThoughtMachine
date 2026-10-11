@@ -714,14 +714,22 @@ class TestWorkspaceEffectivePermissionsRoutes:
         assert resp.status_code == 200, resp.text
         assert resp.json()["effective_permissions"]["filesystem"] == "banned"
 
-    def test_effective_unknown_session_returns_read_only_default(self, vault):
+    def test_effective_unknown_session_returns_deny_all(self, vault):
+        # An unknown session id has BOTH ids present, so the grants sidecar is
+        # the sole source: its absence is an UNREADABLE grants path, and the
+        # effective read fail-closes to the deny-all sentinel (all six
+        # categories banned) -- never the permissive read-only default (R1:
+        # deny-all is the fail-closed direction).
         resp = client.get(
             f"/api/workspace/{self.WS}/effective_permissions",
             params={"session_id": "no-such-session"},
         )
         assert resp.status_code == 200, resp.text
         effective = resp.json()["effective_permissions"]
-        assert effective["filesystem"] == "read"
-        assert effective["network"] == "banned"
         assert effective["container"] is False
+        assert effective["filesystem"] == "banned"
+        assert effective["git"] == "banned"
+        assert effective["host_bash"] == "banned"
+        assert effective["mcp"] == "banned"
+        assert effective["network"] == "banned"
 
