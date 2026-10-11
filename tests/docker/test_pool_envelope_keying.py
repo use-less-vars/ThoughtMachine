@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -296,6 +297,137 @@ class TestStartEnvelopeRoundTrip:
         r2 = mgr.start(lifecycle_class=LIFECYCLE_PERSISTENT)
         assert r1["name"] != r2["name"]
         assert len(fresh) == 2
+
+
+# ── 4. the remaining four naming sites route through the builder ─────────────
+# The envelope-keying fix is incomplete while ANY site still derives its pool
+# key as the truncated ``agent-exec-{hash}`` legacy name: that name omits the
+# isolation envelope, so a container created under one grant can be addressed
+# (status-queried, removed) as if it belonged to another.  These four tests pin
+# each remaining site — the image-build cache key, the status lookup, the
+# removal helper, and the sandbox audit label — to the ONE canonical builder.
+class _RecordingContainers:
+    def __init__(self, seen):
+        self._seen = seen
+
+    def get(self, name):
+        self._seen["name"] = name
+        import docker
+        raise docker.errors.NotFound(name)
+
+
+class _RecordingClient:
+    def __init__(self, seen):
+        self.containers = _RecordingContainers(seen)
+
+
+class TestRemainingSitesRouteThroughBuilder:
+    def _bare_build_executor(self, workspace_id="ws-envelope-test"):
+        from docker_executor import DockerExecutor
+
+        executor = object.__new__(DockerExecutor)
+        executor.workspace_path = WS
+        executor.image = "agent-executor"
+        executor.workspace_id = workspace_id
+        executor.session_permissions = {}
+        executor.client = None
+        return executor
+
+    def test_build_image_cache_key_is_envelope_keyed(self, monkeypatch, tmp_path):
+        forced_network, forced_mode = "bridge", "rw"
+        monkeypatch.setattr(
+            docker_executor, "_resolve_container_config_via_gate",
+            lambda workspace_id, perms: (forced_network, forced_mode),
+        )
+        # Hermetic vault Dockerfile for the executor's workspace_id.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        vault_dir = tmp_path / ".thoughtmachine" / "workspaces" / "ws-envelope-test"
+        vault_dir.mkdir(parents=True)
+        (vault_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
+
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: MagicMock(returncode=0, stdout="pkg==1.0\n"),
+        )
+        monkeypatch.setattr(docker_executor, "compute_executor_build_hash",
+                            lambda *a, **k: "fixed-hash")
+        monkeypatch.setattr(docker_executor, "_run_image_build",
+                            lambda *a, **k: ("sha256:img-built", ["step1"]))
+
+        executor = self._bare_build_executor()
+        with docker_executor._build_log_cache_lock:
+            docker_executor._build_log_cache.clear()
+
+        executor._build_image()
+
+        expected = build_container_name(
+            WS, LIFECYCLE_PERSISTENT,
+            network_mode=forced_network, workspace_mode=forced_mode,
+        )
+        with docker_executor._build_log_cache_lock:
+            keys = set(docker_executor._build_log_cache)
+        assert expected in keys, f"cache keys {keys!r} lack envelope key {expected!r}"
+
+    def test_get_container_status_queries_envelope_name(self, monkeypatch):
+        forced_network, forced_mode = "bridge", "rw"
+        monkeypatch.setattr(
+            docker_executor, "_resolve_container_config_via_gate",
+            lambda workspace_id, perms: (forced_network, forced_mode),
+        )
+        monkeypatch.setattr(docker_executor, "_resolve_workspace_id",
+                            lambda path: "ws-envelope-test")
+        seen = {}
+        monkeypatch.setattr("docker.from_env",
+                            lambda *a, **k: _RecordingClient(seen))
+
+        docker_executor.get_container_status(WS)
+
+        expected = build_container_name(
+            WS, LIFECYCLE_PERSISTENT,
+            network_mode=forced_network, workspace_mode=forced_mode,
+        )
+        assert seen.get("name") == expected
+
+    def test_remove_container_by_workspace_uses_envelope_name(self, monkeypatch):
+        forced_network, forced_mode = "bridge", "rw"
+        monkeypatch.setattr(
+            docker_executor, "_resolve_container_config_via_gate",
+            lambda workspace_id, perms: (forced_network, forced_mode),
+        )
+        monkeypatch.setattr(docker_executor, "_resolve_workspace_id",
+                            lambda path: "ws-envelope-test")
+        seen = {}
+        monkeypatch.setattr("docker.from_env",
+                            lambda *a, **k: _RecordingClient(seen))
+
+        docker_executor._remove_container_by_workspace(WS)
+
+        expected = build_container_name(
+            WS, LIFECYCLE_PERSISTENT,
+            network_mode=forced_network, workspace_mode=forced_mode,
+        )
+        assert seen.get("name") == expected
+
+    def test_setup_docker_sandbox_audit_label_is_envelope_keyed(self, monkeypatch):
+        import thoughtmachine.security as sec
+
+        captured = {}
+        monkeypatch.setattr(
+            sec, "_log_docker_sandbox_event",
+            lambda **kwargs: captured.update(kwargs),
+        )
+        monkeypatch.setattr("docker.from_env",
+                            lambda *a, **k: _RecordingClient({}))
+
+        sec.setup_docker_sandbox("agent-executor", WS)
+
+        # No session permissions are threaded through this entry point, so the
+        # fail-closed envelope is the deterministic ("none", "ro") — the same
+        # SSOT the executor's ``_ensure_container`` will use to create it.
+        expected = build_container_name(
+            WS, LIFECYCLE_PERSISTENT, network_mode="none", workspace_mode="ro",
+        )
+        assert captured.get("container_name") == expected
 
 
 if __name__ == "__main__":  # pragma: no cover
