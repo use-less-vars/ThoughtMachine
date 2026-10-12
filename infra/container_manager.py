@@ -1385,6 +1385,18 @@ class ContainerManager:
             except Exception:
                 record = None
             docker_id = str(getattr(record, "docker_id", "") or "") if record else ""
+            if docker_id and self._reuse_container(docker_id) is None:
+                try:
+                    _owns = policy_for(record.lifecycle_class).own_lifecycle is True
+                except UnknownLifecycleClass:
+                    _owns = True   # fail-closed: unknown class -> do NOT write to the record
+                if heal_missing and self._heal_eligible(record, docker_id):
+                    pass  # branch (a) below runs the Edge-4 heal path
+                elif not _owns:
+                    self._reconcile_record_unbound(
+                        name, record_id, docker_id, reason="container_absent"
+                    )
+                    docker_id = ""
             if not docker_id:
                 # allow_fresh is operator-only (recreate path). Do not set in
                 # worker/agent code paths - the refusal is the fail-closed
@@ -1404,8 +1416,9 @@ class ContainerManager:
                 _audit("CONTAINER_START_NO_CONTAINER_RECORD",
                        f"name={name} record_id={record_id} "
                        f"workspace_id={self.workspace_id}")
-                return {"error": (f"Container {name!r} has a record with no bound "
-                                  f"container; refusing to start."),
+                return {"error": ("Container record is unbound — the underlying "
+                                  "container no longer exists. Recovery path not "
+                                  "yet shipped; Wave 1b will add it."),
                         "code": "container_record_unbound"}
             # (a) Record + docker_id: reuse via the record's docker id.
             container = self._reuse_container(docker_id)
@@ -3593,6 +3606,25 @@ class ContainerManager:
             return False
 
     # ── Internals ──────────────────────────────────────────────────────────
+
+    def _reconcile_record_unbound(self, name, record_id, docker_id, *, reason):
+        """Mark a record UNBOUND when the container it names no longer exists.
+
+        Best-effort: any failure is WARNING-logged and never raises, so the
+        caller falls through to the ordinary refusal path. Emits the absent
+        drift + audit via the shared memoised helper (one implementation, not
+        two) so the reconcile path carries the same observability as the heal
+        path it guards.
+        """
+        try:
+            update_record(self.workspace_id, record_id, docker_id=None)
+            self._emit_stale_docker_id_drift_once(
+                name, record_id, docker_id, source="record",
+            )
+        except Exception as exc:
+            log("WARNING", "docker.container_manager",
+                f"_reconcile_record_unbound: failed for record {record_id!r} "
+                f"(reason={reason}): {type(exc).__name__}: {exc}")
 
     def _reuse_container(self, container_id):
         """Return a running container for ``container_id`` or None."""

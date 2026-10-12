@@ -462,7 +462,7 @@ def test_stale_docker_id_refused_and_emits_absent_drift_once(events, audits):
 
     r1 = cm.start(name="agent-x")
     assert "error" in r1
-    assert r1["code"] == "container_record_container_missing"
+    assert r1["code"] == "container_record_unbound"
 
     absent = [e for e in events if e["event_type"] == _ABSENT_EVENT]
     assert len(absent) == 1
@@ -478,7 +478,7 @@ def test_stale_docker_id_refused_and_emits_absent_drift_once(events, audits):
     # Memoised: the SECOND call still refuses but emits NO further event.
     r2 = cm.start(name="agent-x")
     assert "error" in r2
-    assert r2["code"] == "container_record_container_missing"
+    assert r2["code"] == "container_record_unbound"
     assert [e for e in events if e["event_type"] == _ABSENT_EVENT] == absent
 
     # A1: the stale path fires the module-level audit ONCE (it is NOT a
@@ -509,7 +509,7 @@ def test_stale_docker_id_emits_audit_once(monkeypatch, events):
     _mint_record("w1", "agent-x", stale)
 
     r1 = cm.start(name="agent-x")
-    assert r1["code"] == "container_record_container_missing"
+    assert r1["code"] == "container_record_unbound"
 
     fired = [a for a in audits if a[0] == "CONTAINER_START_STALE_DOCKER_ID"]
     assert len(fired) == 1, audits
@@ -601,7 +601,7 @@ def test_missing_without_heal_flag_refuses(events, audits):
 
     result = cm.start(name="agent-x")
 
-    assert result["code"] == "container_record_container_missing"
+    assert result["code"] == "container_record_unbound"
     assert cm._fresh_start.call_count == 0
     assert [e for e in events if e["event_type"] == _HEAL_EVENT] == []
     assert [a for a in audits if a["event"] == _HEAL_AUDIT_OK] == []
@@ -619,7 +619,7 @@ def test_missing_heal_is_attempted_once_only_when_it_fails(events, audits):
     r2 = cm.start(name="agent-x", heal_missing=True)
 
     assert r1["code"] == "container_record_container_missing"
-    assert r2["code"] == "container_record_container_missing"
+    assert r2["code"] == "container_record_unbound"
     # Exactly ONE attempt across BOTH calls: the failed heal is memoised at
     # ATTEMPT time, so a later call never retries.
     assert cm._fresh_start.call_count == 1
@@ -729,7 +729,7 @@ def test_missing_heal_memo_prevents_second_heal(events, audits):
     # The record STILL names the original stale docker_id (no rebind here): a
     # second start must NOT heal again.
     r2 = cm.start(name="agent-x", heal_missing=True)
-    assert r2["code"] == "container_record_container_missing"
+    assert r2["code"] == "container_record_unbound"
     assert cm._fresh_start.call_count == 1
 
 
@@ -874,19 +874,22 @@ def test_missing_heal_omits_empty_snapshot_on_rebuild(monkeypatch):
 
 
 
-def test_start_refusal_message_unchanged_for_stale_docker_id():
-    """The missing-container refusal MESSAGE is pinned byte-for-byte (F4).
+def test_start_refusal_message_is_unbound_for_stale_docker_id():
+    """The missing-container refusal maps to the UNBOUND message + code (F4).
 
-    The refusal text is asserted as a fully LITERAL string built from this
-    test's own known inputs, so an incidental edit to the source f-string
-    (e.g. ``names`` -> ``references``) turns this assertion RED.
+    A record whose ``docker_id`` has no live container is reconciled to an
+    unbound record: the refusal carries the shipped "record is unbound"
+    message and the ``container_record_unbound`` code. The message is asserted
+    as a fully LITERAL string so an incidental edit to the source turns this
+    assertion RED.
     """
     cm = _missing_cm()
     _mint_record("w1", "agent-x", _HEAL_STALE)
 
     result = cm.start(name="agent-x")
 
+    assert result["code"] == "container_record_unbound"
     assert result["error"] == (
-        "Container 'agent-x' record rec-1 names docker_id "
-        "'dddddddddddddddd' but no such container exists."
+        "Container record is unbound — the underlying container no longer "
+        "exists. Recovery path not yet shipped; Wave 1b will add it."
     )

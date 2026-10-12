@@ -471,7 +471,7 @@ def test_start_refuses_stale_docker_id_without_allow_fresh(vault):
 
     result = mgr.start(name="c-a")
     assert isinstance(result, dict), result
-    assert result.get("code") == "container_record_container_missing", result
+    assert result.get("code") == "container_record_unbound", result
     assert fake_client.containers.run_calls == []  # no fresh create
 
 
