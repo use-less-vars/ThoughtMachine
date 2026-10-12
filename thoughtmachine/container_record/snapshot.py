@@ -151,14 +151,17 @@ def rebuild_config_from_snapshot(snapshot: Any) -> dict:
     """Return the rebuild config recoverable from a STORED intent snapshot.
 
     The rebuild source is the record's PERSISTED ``intent_snapshot`` -- the
-    frozen creation intent -- never the current policy.  Only the two isolation
-    modes the snapshot records are needed to restore the container exactly as
-    it was created: ``network_mode`` and ``workspace_mode`` (each ``""`` when
-    unrecorded).
+    frozen creation intent -- never the current policy.  The snapshot records
+    the isolation modes AND the operator-owned resource intent needed to
+    restore the container exactly as it was created: ``network_mode`` and
+    ``workspace_mode`` (each ``""`` when unrecorded) plus ``mem_limit`` /
+    ``cpu_quota`` (each ``None`` when the snapshot carries no recorded value).
 
-    Total: any input yields ``{"network_mode": <str>, "workspace_mode":
-    <str>}`` (a non-mapping -- including ``None`` -- and an all-empty mapping
-    both yield ``""`` for each).  This function deliberately does NOT judge
+    Total: any input yields ``{"network_mode": <str>, "workspace_mode": <str>,
+    "mem_limit": <value-or-None>, "cpu_quota": <value-or-None>}`` (a
+    non-mapping -- including ``None`` -- and an all-empty mapping both yield
+    ``""`` for the isolation modes and ``None`` for the resource limits).
+    This function deliberately does NOT judge
     whether the snapshot is evidence-bearing: that single rule lives in
     :func:`thoughtmachine.container_record.hook.snapshot_has_evidence`, which
     the caller applies before treating the result as a valid rebuild source
@@ -168,4 +171,6 @@ def rebuild_config_from_snapshot(snapshot: Any) -> dict:
     return {
         "network_mode": str(snap.get("network_mode") or ""),
         "workspace_mode": str(snap.get("workspace_mode") or ""),
+        "mem_limit": (snap.get("mem_limit") or None),
+        "cpu_quota": (snap.get("cpu_quota") or None),
     }

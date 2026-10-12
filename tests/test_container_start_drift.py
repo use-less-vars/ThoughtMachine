@@ -769,6 +769,9 @@ class _RunContainers:
     def __init__(self, items, run_result):
         self._items = list(items)
         self.run_result = run_result
+        #: Every kwargs dict the daemon create seam (``run``) was called with,
+        #: in order -- lets a test assert the resource intent that reached it.
+        self.run_calls = []
 
     def get(self, container_id):
         for c in self._items:
@@ -780,6 +783,7 @@ class _RunContainers:
         return list(self._items)
 
     def run(self, *args, **kwargs):
+        self.run_calls.append(kwargs)
         return self.run_result
 
 
@@ -817,18 +821,20 @@ _EMPTY_EVIDENCE_ATTRS = {
 }
 
 
-def test_missing_heal_refresh_snapshot_on_rebuild(monkeypatch):
-    """Guardrail 7: a healed rebuild attaches the FRESH snapshot derived from the
-    live container's attrs (evidence-bearing) and it round-trips into the record.
+def test_missing_heal_preserves_existing_snapshot_on_rebuild(monkeypatch):
+    """Guardrail 7 FILL-ONCE: a record that ALREADY carries an evidence-bearing
+    intent snapshot (an OPERATOR write, e.g. the resources PATCH endpoint) WINS --
+    the healed rebuild must NOT overwrite it from the freshly created container.
 
     Drives the REAL ``_fresh_start`` reuse branch -- ``_fresh_start`` is NOT
     stubbed; only the daemon create seam is faked.
     """
     attrs = _attrs("none", False)  # network_mode/workspace_mode -> real evidence
     cm = _real_heal_cm(attrs)
-    # Seed the record's STORED snapshot so the heal proceeds (its rebuild source);
-    # guardrail 7 then refreshes it from the live attrs.
-    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=_HEAL_SNAPSHOT)
+    # The record's STORED snapshot is BOTH the heal's rebuild source AND the
+    # operator intent that must survive the rebuild byte-identically.
+    seed = dict(_HEAL_SNAPSHOT)
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=seed)
 
     spy = MagicMock(wraps=container_manager.attach_container)
     monkeypatch.setattr(container_manager, "attach_container", spy)
@@ -838,12 +844,13 @@ def test_missing_heal_refresh_snapshot_on_rebuild(monkeypatch):
     assert result.get("error") is None
     assert result["id"] == _HEAL_NEW_ID
     assert spy.call_count == 1
-    expected = snapshot_from_attrs(attrs)
     _args, kwargs = spy.call_args
-    assert kwargs.get("intent_snapshot") == expected
-    # Round-trip: the same snapshot is persisted on the record (default vault).
+    # FILL-ONCE: the record already carries an evidence-bearing snapshot, so the
+    # derived fresh snapshot is NOT attached (the kwarg is omitted entirely).
+    assert "intent_snapshot" not in kwargs
+    # Round-trip: the operator's snapshot survives UNCHANGED.
     rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
-    assert rec.intent_snapshot == expected
+    assert rec.intent_snapshot == seed
 
 
 def test_missing_heal_omits_empty_snapshot_on_rebuild(monkeypatch):
@@ -872,6 +879,219 @@ def test_missing_heal_omits_empty_snapshot_on_rebuild(monkeypatch):
     rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
     assert rec.intent_snapshot == seed      # the good snapshot is byte-identical
 
+
+# ---------------------------------------------------------------------------
+# Resources-endpoint Intent ownership.
+#
+# An OPERATOR write to the record's ``intent_snapshot`` (e.g. the resources
+# PATCH endpoint, which may target a RESOURCE-class record) must SURVIVE the
+# recreate and be HONOURED at rebuild.  These tests drive the REAL
+# ``_fresh_start`` -- only the daemon create seam is faked -- so the guardrail-7
+# FILL-ONCE rule and the reuse-site resource wiring are exercised end to end.
+# ---------------------------------------------------------------------------
+
+#: Evidence-bearing operator intent carrying the resource limits that must be
+#: honoured at rebuild (mem_limit/cpu_quota also count as evidence).
+_OPERATOR_INTENT = {
+    "network_mode": "none",
+    "workspace_mode": "ro",
+    "mem_limit": "2g",
+    "cpu_quota": 50000,
+}
+
+
+def _weak_hardening_attrs():
+    """Attrs that MATCH the isolation policy but FAIL the hardening recipe.
+
+    ``HostConfig.CapDrop`` is PRESENT but omits ``"ALL"``, so
+    ``_hardening_conformance`` reports a real failing axis and
+    ``_start_drift_decision`` returns the ``"recreate"`` action.
+    """
+    attrs = _attrs("none", False)
+    attrs["HostConfig"]["CapDrop"] = []
+    return attrs
+
+
+def _mint_resource_record(workspace_id, name, docker_id, intent_snapshot=None):
+    """Mint a RESOURCE-class record (own_lifecycle True) binding *name*."""
+    vault = _VAULT["root"]
+    create_record(
+        workspace_id, LIFECYCLE_RESOURCE, OWNER_WORKSPACE,
+        id="rec-1", name=name, vault_root=vault,
+    )
+    update_record(workspace_id, "rec-1", vault_root=vault, docker_id=docker_id)
+    if intent_snapshot is not None:
+        update_record(workspace_id, "rec-1", vault_root=vault,
+                      intent_snapshot=intent_snapshot)
+
+
+def test_operator_intent_mem_cpu_honoured_by_heal_rebuild():
+    """THE correctness argument: an OPERATOR write to the record's intent is
+    honoured at rebuild (mem_limit/cpu_quota reach the daemon create call) AND
+    the SAME snapshot survives the rebuild untouched (FILL-ONCE).
+    """
+    attrs = _attrs("none", False)
+    cm = _real_heal_cm(attrs)  # instance defaults mem_limit="1g", cpu_quota=100000
+    seed = dict(_OPERATOR_INTENT)
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=seed)
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result.get("error") is None
+    assert result["id"] == _HEAL_NEW_ID
+    # HONOURED: the operator's resource intent reaches the daemon create call.
+    run_kwargs = cm.client.containers.run_calls[-1]
+    assert run_kwargs["mem_limit"] == "2g"
+    assert run_kwargs["cpu_quota"] == 50000
+    # SURVIVES: the operator's snapshot is never overwritten.
+    rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
+    assert rec.intent_snapshot == seed
+
+
+def test_operator_recreate_of_resource_record_honours_and_preserves_intent(monkeypatch):
+    """Endpoint-ish path: a RESOURCE record (own_lifecycle True) whose container
+    is gone, recreated by the operator (allow_fresh).  The operator intent is
+    honoured AND preserved.
+    """
+    attrs = _attrs("none", False)
+    cm = _real_heal_cm(attrs)
+    seed = dict(_OPERATOR_INTENT)
+    _mint_resource_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=seed)
+
+    spy = MagicMock(wraps=container_manager.attach_container)
+    monkeypatch.setattr(container_manager, "attach_container", spy)
+
+    result = cm.start(name="agent-x", allow_fresh=True)
+
+    assert result.get("error") is None
+    assert result["id"] == _HEAL_NEW_ID
+    run_kwargs = cm.client.containers.run_calls[-1]
+    assert run_kwargs["mem_limit"] == "2g"
+    assert run_kwargs["cpu_quota"] == 50000
+    # FILL-ONCE: the record ALREADY carries an evidence-bearing operator intent,
+    # so the rebuild does NOT overwrite it (the kwarg is omitted entirely).
+    _args, kwargs = spy.call_args
+    assert "intent_snapshot" not in kwargs
+    rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
+    assert rec.intent_snapshot == seed
+
+
+def test_recreate_derives_snapshot_when_record_has_none(monkeypatch):
+    """Derive branch: a record with NO stored snapshot rebuilds and the fresh
+    container's (evidence-bearing) attrs are DERIVED into the record.
+    """
+    attrs = _attrs("none", False)
+    cm = _real_heal_cm(attrs)
+    # Record with NO snapshot and NO bound container -> allow_fresh recreate.
+    create_record("w1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, id="rec-1",
+                  name="agent-x", vault_root=_VAULT["root"])
+
+    spy = MagicMock(wraps=container_manager.attach_container)
+    monkeypatch.setattr(container_manager, "attach_container", spy)
+
+    result = cm.start(name="agent-x", allow_fresh=True)
+
+    assert result.get("error") is None
+    assert result["id"] == _HEAL_NEW_ID
+    assert spy.call_count == 1
+    expected = snapshot_from_attrs(attrs)
+    _args, kwargs = spy.call_args
+    assert kwargs.get("intent_snapshot") == expected
+    rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
+    assert rec.intent_snapshot == expected
+
+
+def test_rebuild_without_resource_intent_falls_back_to_instance_defaults():
+    """No operator resource intent -> no fabricated resources: the rebuild falls
+    back to the INSTANCE defaults (the tool-supplied values).
+    """
+    attrs = _attrs("none", False)
+    cm = _real_heal_cm(attrs)  # mem_limit="1g", cpu_quota=100000
+    # Evidence-bearing snapshot for isolation only -- no mem/cpu keys.
+    _mint_record("w1", "agent-x", _HEAL_STALE, intent_snapshot=dict(_HEAL_SNAPSHOT))
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result.get("error") is None
+    run_kwargs = cm.client.containers.run_calls[-1]
+    assert run_kwargs["mem_limit"] == "1g"
+    assert run_kwargs["cpu_quota"] == 100000
+
+
+@pytest.mark.parametrize(
+    "site", ["allow-fresh-no-docker-id", "allow-fresh-container-missing",
+             "drift-recreate"])
+def test_recreate_sites_honour_operator_intent_mem_cpu(site):
+    """EVERY reuse site that spawns a fresh container on the record's behalf
+    passes the operator's stored resource intent through to ``_fresh_start``.
+    """
+    fresh = MagicMock(return_value={"id": _HEAL_NEW_ID, "name": "agent-x",
+                                    "status": "created", "note": ""})
+    if site == "allow-fresh-no-docker-id":
+        cm = _make_cm(None, want=("none", "ro"))
+        cm.client = _FakeDockerClient([])
+        # Record exists but names no container (no docker_id) -> allow_fresh.
+        create_record("w1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, id="rec-1",
+                      name="agent-x", vault_root=_VAULT["root"])
+        update_record("w1", "rec-1", vault_root=_VAULT["root"],
+                      intent_snapshot=dict(_OPERATOR_INTENT))
+    elif site == "allow-fresh-container-missing":
+        cm = _make_cm(None, want=("none", "ro"))
+        cm.client = _FakeDockerClient([])
+        # RESOURCE class keeps the docker_id (no unbound reconcile) so the
+        # container-missing allowance site is the one that recreates.
+        _mint_resource_record("w1", "agent-x", _HEAL_STALE,
+                              intent_snapshot=dict(_OPERATOR_INTENT))
+    else:  # drift-recreate
+        ctr = _FakeContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                             attrs=_weak_hardening_attrs())
+        cm = _make_cm(ctr, want=("none", "ro"))
+        _mint_record("w1", "agent-x", ctr.id,
+                     intent_snapshot=dict(_OPERATOR_INTENT))
+    cm.mem_limit = "1g"
+    cm.cpu_quota = 100000
+    cm._fresh_start = fresh
+
+    result = cm.start(name="agent-x", allow_fresh=True)
+
+    assert result.get("error") is None
+    _args, kwargs = cm._fresh_start.call_args
+    assert kwargs["mem_limit"] == "2g"
+    assert kwargs["cpu_quota"] == 50000
+
+
+def test_fresh_create_uses_instance_resource_values():
+    """Agent-tool resource overrides are unchanged: with NO operator intent the
+    fresh create uses the INSTANCE values the tool passed to the constructor.
+    """
+    cm = _real_heal_cm(_attrs("none", False))  # defaults 1g / 100000
+    result = cm._fresh_start(
+        image="img", name="fresh-x", note=None, worker_name=None,
+        lifecycle_class=LIFECYCLE_PERSISTENT,
+        network_mode="none", workspace_mode="ro")
+
+    assert result.get("error") is None
+    run_kwargs = cm.client.containers.run_calls[-1]
+    assert run_kwargs["mem_limit"] == "1g"
+    assert run_kwargs["cpu_quota"] == 100000
+
+
+def test_fresh_create_uses_constructor_resource_overrides():
+    """Tool-supplied constructor values win on a fresh create (no operator
+    intent) -- the agent-tool override path is unchanged.
+    """
+    cm = _real_heal_cm(_attrs("none", False))
+    cm.mem_limit = "3g"        # as a tool would pass to the constructor
+    cm.cpu_quota = 200000
+    result = cm._fresh_start(
+        image="img", name="fresh-x", note=None, worker_name=None,
+        lifecycle_class=LIFECYCLE_PERSISTENT,
+        network_mode="none", workspace_mode="ro")
+
+    assert result.get("error") is None
+    run_kwargs = cm.client.containers.run_calls[-1]
+    assert run_kwargs["mem_limit"] == "3g"
+    assert run_kwargs["cpu_quota"] == 200000
 
 
 def test_start_refusal_message_is_unbound_for_stale_docker_id():

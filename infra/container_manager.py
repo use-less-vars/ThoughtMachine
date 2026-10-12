@@ -1385,6 +1385,17 @@ class ContainerManager:
             except Exception:
                 record = None
             docker_id = str(getattr(record, "docker_id", "") or "") if record else ""
+            # Reuse-sourcing for the recreate path: an OPERATOR-persisted
+            # resource intent (``mem_limit`` / ``cpu_quota`` on the record's
+            # ``intent_snapshot``) is honoured when the fresh container is
+            # rebuilt for this record.  An absent / evidence-less snapshot or a
+            # missing key falls back to the instance defaults (pass ``None``),
+            # so ordinary fresh creates are byte-for-byte unchanged.
+            _reuse_intent = getattr(record, "intent_snapshot", None) if record else None
+            if not snapshot_has_evidence(_reuse_intent):
+                _reuse_intent = None
+            _reuse_mem_limit = (_reuse_intent or {}).get("mem_limit") or None
+            _reuse_cpu_quota = (_reuse_intent or {}).get("cpu_quota") or None
             if docker_id and self._reuse_container(docker_id) is None:
                 try:
                     _owns = policy_for(record.lifecycle_class).own_lifecycle is True
@@ -1407,7 +1418,9 @@ class ContainerManager:
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
                         reuse_record_id=record_id,
-                        permissions=want_effective)
+                        permissions=want_effective,
+                        mem_limit=_reuse_mem_limit,
+                        cpu_quota=_reuse_cpu_quota)
                 # (b) Record exists but names no container yet -> REFUSE.
                 self._warn_note_once(
                     ("name.record_without_container", self.workspace_id, name),
@@ -1430,7 +1443,9 @@ class ContainerManager:
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
                         reuse_record_id=record_id,
-                        permissions=want_effective)
+                        permissions=want_effective,
+                        mem_limit=_reuse_mem_limit,
+                        cpu_quota=_reuse_cpu_quota)
                 # Guardrail 5: auto-heal is reachable ONLY from this
                 # container_missing path (never on drift).  It is the agent
                 # counterpart to the operator-only allow_fresh recreate above
@@ -1485,6 +1500,8 @@ class ContainerManager:
                     network_mode=want_network, workspace_mode=want_workspace,
                     reuse_record_id=record_id,
                     permissions=want_effective,
+                    mem_limit=_reuse_mem_limit,
+                    cpu_quota=_reuse_cpu_quota,
                 )
             if note is not None:
                 self._write_note(self._record_id_for(container), note)
@@ -1707,7 +1724,8 @@ class ContainerManager:
         )
 
     def _run_container(self, *, image, name, labels, mounts, tmpfs,
-                       network_mode, lifecycle_class):
+                       network_mode, lifecycle_class,
+                       mem_limit=None, cpu_quota=None):
         """Create one container via the daemon (the single ``run`` call site).
 
         ``labels`` must already carry any record-owned label; the caller binds
@@ -1739,8 +1757,8 @@ class ContainerManager:
             mounts=_mount_specs_from_docker_mounts(mounts),
             tmpfs=tmpfs,
             network_mode=network_mode,
-            mem_limit=self.mem_limit,
-            cpu_quota=self.cpu_quota,
+            mem_limit=mem_limit if mem_limit is not None else self.mem_limit,
+            cpu_quota=cpu_quota if cpu_quota is not None else self.cpu_quota,
             oom_score_adj=1000,  # user containers are the first OOM-kill victims
         )
         return create_hardened_container(
@@ -1760,7 +1778,7 @@ class ContainerManager:
 
     def _fresh_start(self, *, image, name, note, worker_name, lifecycle_class,
                      network_mode, workspace_mode, reuse_record_id=None,
-                     permissions=None):
+                     permissions=None, mem_limit=None, cpu_quota=None):
         """Create exactly one container (the single fresh-create path).
 
         With ``reuse_record_id`` unset a NEW record is minted alongside the
@@ -1872,29 +1890,43 @@ class ContainerManager:
             container = self._run_container(
                 image=image, name=name, labels=labels, mounts=mounts,
                 tmpfs=tmpfs, network_mode=network_mode,
-                lifecycle_class=lifecycle_class)
-            # Guardrail 7: bind the fresh container's intent snapshot to the
-            # record in the SAME attach call — but only when the live inspect
-            # payload carries real evidence.  The gate is the shared, public
-            # ``snapshot_has_evidence`` helper (imported from the container_record
-            # package) — it is the single definition of the evidence rule.
-            # attach_container writes the snapshot whenever the kwarg is not
-            # None, so an all-empty snapshot would clobber the record's good
-            # snapshot with ``{}``; omit the kwarg otherwise, leaving the
-            # record's existing (good) snapshot untouched.
+                lifecycle_class=lifecycle_class,
+                mem_limit=mem_limit, cpu_quota=cpu_quota)
+            # Guardrail 7: fill the record's intent snapshot from the fresh
+            # container in the SAME attach call — but ONLY when the record
+            # carries no intent snapshot yet (FILL-ONCE), and only when the live
+            # inspect payload carries real evidence.  The evidence gate is the
+            # shared, public ``snapshot_has_evidence`` helper (imported from the
+            # container_record package) — it is the single definition of the
+            # evidence rule.  attach_container writes the snapshot whenever the
+            # kwarg is not None, so an all-empty snapshot would clobber the
+            # record's good snapshot with ``{}``; omit the kwarg otherwise,
+            # leaving the record's existing (good) snapshot untouched.
             #
             # INTENTIONAL DIVERGENCE from hook.record_creation().attach(): that
-            # path applies a "a natively-authored snapshot wins" rule (it only
-            # fills a record that has no snapshot yet), whereas guardrail 7
-            # requires a FRESH snapshot on rebuild — so here we always recompute
-            # from the live container and overwrite.
-            _snapshot = None
+            # path applies its "a natively-authored snapshot wins" (fill-once)
+            # rule from the in-memory record handle; here we re-read the record
+            # via ``load_record`` and apply the SAME fill-once rule verbatim — an
+            # OPERATOR write to the record's ``intent_snapshot`` (e.g. the
+            # resources PATCH endpoint) MUST survive the recreate and be
+            # honoured at rebuild, so a record that ALREADY carries a snapshot
+            # WINS and is never overwritten from the freshly created container.
+            _has_existing_snapshot = False
             try:
-                _candidate = snapshot_from_attrs(getattr(container, "attrs", None))
-                if snapshot_has_evidence(_candidate):
-                    _snapshot = _candidate
+                _existing_record = load_record(self.workspace_id, reuse_record_id)
+                _has_existing_snapshot = bool(
+                    getattr(_existing_record, "intent_snapshot", None))
             except Exception:
-                _snapshot = None
+                _has_existing_snapshot = False
+            _snapshot = None
+            if not _has_existing_snapshot:
+                try:
+                    _candidate = snapshot_from_attrs(
+                        getattr(container, "attrs", None))
+                    if snapshot_has_evidence(_candidate):
+                        _snapshot = _candidate
+                except Exception:
+                    _snapshot = None
             if _snapshot is not None:
                 _live_user_attr = None
                 try:
@@ -1943,7 +1975,8 @@ class ContainerManager:
             container = self._run_container(
                 image=image, name=name, labels=labels, mounts=mounts,
                 tmpfs=tmpfs, network_mode=network_mode,
-                lifecycle_class=lifecycle_class)
+                lifecycle_class=lifecycle_class,
+                mem_limit=mem_limit, cpu_quota=cpu_quota)
             record.attach(container, state=STATE_RUNNING)
             # Record-first identity: index the freshly minted record so a
             # subsequent start(name=...) reuses it instead of re-creating.
@@ -2643,7 +2676,9 @@ class ContainerManager:
                 lifecycle_class=lifecycle_class,
                 network_mode=rebuild["network_mode"],
                 workspace_mode=rebuild["workspace_mode"],
-                reuse_record_id=record_id)
+                reuse_record_id=record_id,
+                mem_limit=rebuild["mem_limit"],
+                cpu_quota=rebuild["cpu_quota"])
         except Exception:
             return None
 
