@@ -17,6 +17,7 @@ matches the requested filter), which is exactly how "containers from another
 workspace (or unlabeled) do NOT appear" is enforced in production.
 """
 
+from collections import namedtuple
 import glob
 import json
 import os
@@ -96,6 +97,28 @@ def _daemon_that_filters_by_workspace_label(all_containers):
             if c.labels.get("thoughtmachine.workspace_id") == want
         ]
     return fake_list
+
+
+SeededVaultRequirements = namedtuple("SeededVaultRequirements", ["path", "data"])
+
+
+def seed_vault_requirements(vault_root, workspace_id="default"):
+    """Seed the vault-side requirements.txt that ``build_image`` now requires.
+
+    ``ContainerManager.build_image`` stages
+    ``<vault_root>/workspaces/<workspace_id>/requirements.txt`` into the build
+    context and refuses to build when that vault copy is absent (the
+    workspace-root fallback was removed), so the happy-path tests must seed
+    it. Returns the staged vault path and the bytes written so callers can
+    assert on the staged vault copy.
+    """
+    vault_ws = os.path.join(vault_root, "workspaces", str(workspace_id))
+    os.makedirs(vault_ws, exist_ok=True)
+    data = b"# seeded by TestContainerManagerBuildImage\n"
+    path = os.path.join(vault_ws, "requirements.txt")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return SeededVaultRequirements(path=path, data=data)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -314,6 +337,7 @@ class TestContainerManagerBuildImage:
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        seed_vault_requirements(str(tmp_path))
         captured = {}
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
@@ -341,7 +365,7 @@ class TestContainerManagerBuildImage:
         assert args[3] == "agent-executor-test"
         # Build context = temp dir with ONLY the Dockerfile, NOT the workspace.
         assert captured["path"] != str(tmp_path)
-        assert captured["listing"] == ["Dockerfile"]
+        assert captured["listing"] == ["Dockerfile", "requirements.txt"]
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_missing_vault_dockerfile_raises(self, tmp_path):
@@ -361,6 +385,7 @@ class TestContainerManagerBuildImage:
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -384,6 +409,7 @@ class TestContainerManagerBuildImage:
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -403,6 +429,7 @@ class TestContainerManagerBuildImage:
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -445,6 +472,7 @@ class TestContainerManagerBuildImage:
         manager = self._manager(
             mock_client, str(ws), vault_root=str(vault_root), workspace_id="ws-1"
         )
+        seed_vault_requirements(str(vault_root), workspace_id="ws-1")
 
         captured = {}
 
@@ -456,7 +484,7 @@ class TestContainerManagerBuildImage:
             captured["tag"] = tag
             assert build_path != str(ws), "workspace leaked as build context"
             assert build_path != str(vault_ws), "vault workspace leaked as context"
-            assert sorted(os.listdir(build_path)) == ["Dockerfile"]
+            assert sorted(os.listdir(build_path)) == ["Dockerfile", "requirements.txt"]
             assert "sensitive_file.txt" not in os.listdir(build_path)
             with open(os.path.join(build_path, "Dockerfile")) as fh:
                 assert fh.read() == "FROM python:3.12-slim\n"
@@ -483,6 +511,7 @@ class TestContainerManagerBuildImage:
         before = set(glob.glob(os.path.join(tempfile.gettempdir(), "tm_build_*")))
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
