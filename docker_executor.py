@@ -106,7 +106,7 @@ def _compute_image_tag(workspace_path: str) -> str:
     return f"agent-executor-{path_hash}"
 
 
-def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line=None, labels=None):
+def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line=None, labels=None, networkmode=None):
     """Run ``client.api.build`` over a host directory, streaming log lines.
 
     Shared by :meth:`DockerExecutor._build_image` and
@@ -146,6 +146,8 @@ def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line
         )
         if labels is not None:
             build_kwargs["labels"] = labels
+        if networkmode is not None:
+            build_kwargs["networkmode"] = networkmode
         build_logs = client.api.build(**build_kwargs)
         for chunk in build_logs:
             if "stream" in chunk:
@@ -1133,6 +1135,7 @@ class DockerExecutor:
                 self.client, tmpdir, "Dockerfile", self.image,
                 nocache=nocache, on_line=_stream_line,
                 labels={EXECUTOR_BUILD_HASH_LABEL: build_hash},
+                networkmode=("none" if network_mode == "none" else None),
             )
 
         except RuntimeError:

@@ -329,6 +329,7 @@ class TestContainerManagerBuildImage:
         """Stub docker_executor module: fixed auto-tag + mocked _run_image_build."""
         dex = MagicMock()
         dex._compute_image_tag.side_effect = lambda ws: "agent-executor-test"
+        dex._resolve_container_config_via_gate.return_value = ("none", "ro")
         return dex
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)

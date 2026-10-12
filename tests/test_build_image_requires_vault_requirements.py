@@ -40,6 +40,7 @@ class TestBuildImageRequiresVaultRequirements:
         """Stub docker_executor: fixed auto-tag + a build that snapshots the ctx."""
         dex = MagicMock()
         dex._compute_image_tag.side_effect = lambda ws: "agent-executor-test"
+        dex._resolve_container_config_via_gate.return_value = ("none", "ro")
 
         def _capture_build(client, build_path, dockerfile, tag, **kw):
             # Inspect the temp context WHILE it exists (build_image removes it
