@@ -59,7 +59,6 @@ _ALL_TOOLS = [
     # Worker & advanced
     "Worker",
     "FieldViewer",
-    "MCPValidator",
     "PaginateTool",
     "WorkingDocument",
 ]
@@ -93,7 +92,6 @@ AGENT_TOOLS = [
     "GlobTool",
     "host_bash",
     "KnowledgeBaseTool",
-    "MCPValidator",
     "PaginateTool",
     "ReadFile",
     "Respond",

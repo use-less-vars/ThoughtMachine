@@ -214,12 +214,6 @@ except ImportError as e:
     _record_import_failure("KnowledgeBaseTool", e)
 
 try:
-    from .mcp_validator import MCPValidator
-    TOOL_CLASSES.append(MCPValidator)
-except ImportError as e:
-    _record_import_failure("MCPValidator", e)
-
-try:
     from .paginate_tool import PaginateTool
     TOOL_CLASSES.append(PaginateTool)
 except ImportError as e:
