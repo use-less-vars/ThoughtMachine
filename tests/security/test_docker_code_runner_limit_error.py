@@ -50,7 +50,7 @@ def test_start_error_dict_surfaces_limit_message(tmp_path, monkeypatch):
             return {
                 "error": "Workspace container limit (4) reached "
                          "(4 active container(s)). "
-                         "Stop or remove a running container to free a slot."
+                         "Remove a persistent container to free a slot."
             }
 
         def exec(self, *args, **kwargs):

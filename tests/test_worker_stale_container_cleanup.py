@@ -307,6 +307,24 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
             self.assertIn("limit (2)", result["error"])
             self.assertIn("2 active container(s)", result["error"])
 
+    # ── (b2) the at-limit message tells the user to REMOVE, not stop ───
+
+    def test_start_at_limit_message_says_remove_not_stop(self):
+        """limit=1 with ONE active container: the refusal names the
+        REMEDY as removing a persistent container (not stopping a running
+        one)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            entries = [self._entry("c1", "running")]
+            manager = self._make_manager(tmp, entries, limit=1)
+            result = self._start(manager)
+            self.assertEqual(
+                result,
+                {"error": "Workspace container limit (1) reached "
+                          "(1 active container(s)). "
+                          "Remove a persistent container to free a slot."},
+                result,
+            )
+
     # ── (c) stop one of N running -> next start() SUCCEEDS ───────────────
 
     def test_start_succeeds_after_a_running_container_stops(self):
