@@ -308,12 +308,26 @@ class TestContainerManagerBuildImage:
         dex._compute_image_tag.side_effect = lambda ws: "agent-executor-test"
         return dex
 
+    @staticmethod
+    def _seed_vault_requirements(vault_root, workspace_id="default"):
+        """Seed the vault-side requirements.txt build_image now requires.
+
+        ``build_image`` stages ``<vault_root>/workspaces/<workspace_id>/
+        requirements.txt`` into the build context and refuses to build when
+        that vault copy is absent, so the happy-path tests must seed it.
+        """
+        vault_ws = os.path.join(vault_root, "workspaces", str(workspace_id))
+        os.makedirs(vault_ws, exist_ok=True)
+        with open(os.path.join(vault_ws, "requirements.txt"), "w") as fh:
+            fh.write("# seeded by TestContainerManagerBuildImage\n")
+
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_build_success_with_auto_tag_and_exact_keys(self, tmp_path):
         """Dockerfile present, tag omitted -> auto-tag; result has EXACT keys."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        self._seed_vault_requirements(str(tmp_path))
         captured = {}
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
@@ -341,7 +355,7 @@ class TestContainerManagerBuildImage:
         assert args[3] == "agent-executor-test"
         # Build context = temp dir with ONLY the Dockerfile, NOT the workspace.
         assert captured["path"] != str(tmp_path)
-        assert captured["listing"] == ["Dockerfile"]
+        assert captured["listing"] == ["Dockerfile", "requirements.txt"]
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_missing_vault_dockerfile_raises(self, tmp_path):
@@ -361,6 +375,7 @@ class TestContainerManagerBuildImage:
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        self._seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -384,6 +399,7 @@ class TestContainerManagerBuildImage:
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        self._seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -403,6 +419,7 @@ class TestContainerManagerBuildImage:
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        self._seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -445,6 +462,7 @@ class TestContainerManagerBuildImage:
         manager = self._manager(
             mock_client, str(ws), vault_root=str(vault_root), workspace_id="ws-1"
         )
+        self._seed_vault_requirements(str(vault_root), workspace_id="ws-1")
 
         captured = {}
 
@@ -456,7 +474,7 @@ class TestContainerManagerBuildImage:
             captured["tag"] = tag
             assert build_path != str(ws), "workspace leaked as build context"
             assert build_path != str(vault_ws), "vault workspace leaked as context"
-            assert sorted(os.listdir(build_path)) == ["Dockerfile"]
+            assert sorted(os.listdir(build_path)) == ["Dockerfile", "requirements.txt"]
             assert "sensitive_file.txt" not in os.listdir(build_path)
             with open(os.path.join(build_path, "Dockerfile")) as fh:
                 assert fh.read() == "FROM python:3.12-slim\n"
@@ -483,6 +501,7 @@ class TestContainerManagerBuildImage:
         before = set(glob.glob(os.path.join(tempfile.gettempdir(), "tm_build_*")))
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        self._seed_vault_requirements(str(tmp_path))
 
         with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()

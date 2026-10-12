@@ -3407,10 +3407,12 @@ class ContainerManager:
                 req_vault = (
                     Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "requirements.txt"
                 )
-                req_ws = Path(ws) / "requirements.txt"
-                req_src = req_vault if req_vault.exists() else (req_ws if req_ws.exists() else None)
-                if req_src is not None:
-                    shutil.copy2(str(req_src), os.path.join(tmpdir, "requirements.txt"))
+                if not req_vault.exists():
+                    raise RuntimeError(
+                        f"Vault requirements not found at {req_vault}. "
+                        "Run the vault bootstrap to seed per-workspace requirements."
+                    )
+                shutil.copy2(str(req_vault), os.path.join(tmpdir, "requirements.txt"))
                 staged = set(os.listdir(tmpdir))
                 if not staged <= {"Dockerfile", "requirements.txt"}:
                     raise RuntimeError(
