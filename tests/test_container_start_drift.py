@@ -891,5 +891,6 @@ def test_start_refusal_message_is_unbound_for_stale_docker_id():
     assert result["code"] == "container_record_unbound"
     assert result["error"] == (
         "Container record is unbound — the underlying container no longer "
-        "exists. Recovery path not yet shipped; Wave 1b will add it."
+        "exists. Recovery: an operator can recreate it via the record's "
+        "recreate action."
     )
