@@ -889,7 +889,7 @@ class DockerExecutor:
             oom_score_adj=1000,
         )
         created = create_hardened_container(
-            self.client, spec, admission=None, record=False,
+            self.client, spec, admission=None, record=True,
         )
         self.container = created.container
         # Workspace bind mount already has correct UID (matches host)
