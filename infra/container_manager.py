@@ -1596,7 +1596,7 @@ class ContainerManager:
                 f"workspace_id={self.workspace_id}")
             return {"error": f"Workspace container limit ({limit}) reached "
                              f"({len(active_containers)} active container(s)). "
-                             f"Stop or remove a running container to free a slot."}
+                             f"Remove a persistent container to free a slot."}
 
         # ── Desired isolation from session permissions (all paths) ─────────
         computed = self._compute_config(

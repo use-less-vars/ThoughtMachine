@@ -214,7 +214,7 @@ def test_container_manager_start_registry_limit_error_is_mapped(monkeypatch):
 
     assert result == {
         "error": "Workspace container limit (1) reached (1 active container(s)). "
-                 "Stop or remove a running container to free a slot."
+                 "Remove a persistent container to free a slot."
     }
     assert "Container limit reached" not in result["error"]
     assert cm._containers == {}

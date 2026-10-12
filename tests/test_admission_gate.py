@@ -523,3 +523,61 @@ def test_client_probes_excludes_ephemeral_and_resource(monkeypatch, tmp_path):
     )
     assert isinstance(admit(req, probes=probes), Allow)
 
+
+def test_counts_toward_ceiling_includes_exited_persistent_container(monkeypatch, tmp_path):
+    """PINS include-behaviour: an exited persistent container still counts.
+
+    ``security.admission_gate._counts_toward_ceiling`` is status-BLIND -- it
+    reads only ``labels``/``name``/``image`` (and ``image.tags``) and defers to
+    the shared ``thoughtmachine.container_record`` classifier
+    :func:`lifecycle_class_from_labels`.  A persistent-class container Docker
+    reports as ``status="exited"`` must therefore still occupy the per-workspace
+    ceiling slot.
+
+    This test is EXPECTED TO PASS on unchanged code: it pins the current,
+    correct behaviour (a stopped/exited persistent container is NOT a free slot).
+    It is deliberately built with its OWN container double carrying a ``status``
+    attribute -- no existing fake is modified.
+    """
+    from thoughtmachine.container_record import (
+        LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, RECORD_LABEL_KEY, create_record,
+    )
+    import thoughtmachine.container_record.api as api
+
+    # Explicit persistent-class labels: the record-owned Docker label
+    # ``thoughtmachine.container_id`` (RECORD_LABEL_KEY) pointing at a record
+    # whose ``lifecycle_class`` is the persistent class -- the classifier's
+    # LABEL-DRIVEN branch, not its empty-labels fail-safe default.  The gate
+    # resolves that label through ``find_by_docker_label`` (default vault),
+    # stubbed here exactly as in
+    # ``test_client_probes_excludes_ephemeral_and_resource``.
+    rec = create_record("ws1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE,
+                        vault_root=tmp_path)
+    monkeypatch.setattr(
+        api, "find_by_docker_label",
+        lambda rid, vault_root=None: rec if rid == rec.id else None,
+    )
+
+    class _ExitedPersistentContainer:
+        def __init__(self):
+            # Neutral name/image: no 'tm-res-' prefix, no 'tm-resource-git'
+            # image and no RESOURCE_LABEL, so ``is_resource_like`` is False and
+            # the explicit record label is what drives the persistent class.
+            self.name = "persistent-1"
+            self.labels = {RECORD_LABEL_KEY: rec.id}
+            self.image = "agent-executor"
+            self.status = "exited"
+
+    container = _ExitedPersistentContainer()
+    assert ag._counts_toward_ceiling(container) is True
+
+    # Distinct contract: with NO labels at all the classifier still falls back
+    # to the persistent class, so a bare exited container also counts.
+    class _DefaultedExitedContainer:
+        def __init__(self):
+            self.name = "persistent-2"
+            self.labels = {}
+            self.image = "agent-executor"
+            self.status = "exited"
+
+    assert ag._counts_toward_ceiling(_DefaultedExitedContainer()) is True
