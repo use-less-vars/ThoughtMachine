@@ -193,6 +193,17 @@ class ContainerStartTool(_ContainerControlBase):
         default=None,
         description="Optional sticky note attached to the container. Stored in the per-workspace vault bulletin board (container_notes.json), not in Docker labels. On reuse, overwrites the stored note and returns the new value."
     )
+    heal: bool = Field(
+        default=False,
+        description=(
+            "Request an EXPLICIT heal/recreate of an unbound container record: "
+            "when True, a record whose named container no longer exists is "
+            "rebuilt once for the SAME record (only for lifecycle classes that "
+            "permit it; a resource/service record is refused with code "
+            "'container_record_not_healable'). Operator-style fresh-create "
+            "('allow_fresh') is NOT exposed here and stays operator-only."
+        ),
+    )
     mem_limit: str = Field(
         default="512m",
         description="Memory limit (e.g., '512m', '1g')"
@@ -218,14 +229,25 @@ class ContainerStartTool(_ContainerControlBase):
         start_time = time.time()
         try:
             manager = self._make_manager()
-            info = manager.start(
+            start_kwargs = dict(
                 image=self.image,
                 name=self.name,
                 note=self.note,
                 worker_name=getattr(self, "worker_name", None) or current_worker_name(),
             )
+            # Explicit heal: the ONLY way an agent requests a recreate of an
+            # unbound record. When ``heal`` is False the call is byte-for-byte
+            # identical to before (no extra kwarg); operator-style fresh-create
+            # (``allow_fresh``) is deliberately NOT exposed here.
+            if self.heal:
+                start_kwargs["heal_missing"] = True
+            info = manager.start(**start_kwargs)
             if "error" in info:
                 error_fields = {"error": info["error"]}
+                # Additive, optional: surface the machine-readable refusal code
+                # when start() supplied one (never invented when it did not).
+                if info.get("code"):
+                    error_fields["code"] = info["code"]
                 # Additive, optional: surface start-path drift refusal detail.
                 if info.get("drift") is not None:
                     error_fields["drift"] = info["drift"]
