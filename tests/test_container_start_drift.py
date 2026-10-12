@@ -663,7 +663,9 @@ def test_missing_heal_refused_for_own_lifecycle_class(events, audits):
 
     result = cm.start(name="agent-x", heal_missing=True)
 
-    assert result["code"] == "container_record_container_missing"
+    # CLASS-ONLY refusal: an own-lifecycle class reports the distinct
+    # 'container_record_not_healable' code (NOT the generic missing code).
+    assert result["code"] == "container_record_not_healable"
     assert cm._fresh_start.call_count == 0  # the class gate blocks the rebuild
     assert [e for e in events if e["event_type"] == _HEAL_EVENT] == []
     # Non-vacuous: the ordinary stale-docker-id drift signal still fires.

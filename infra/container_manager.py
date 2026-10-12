@@ -1385,6 +1385,12 @@ class ContainerManager:
             except Exception:
                 record = None
             docker_id = str(getattr(record, "docker_id", "") or "") if record else ""
+            # C3: 'container_record_not_healable' is a CLASS-only refusal; this
+            # defaults False and is set True only for a KNOWN class that owns its
+            # own lifecycle (resource/service).  Initialised here so the step-(a)
+            # heal refusal stays safe even if the live container vanished between
+            # the two _reuse_container lookups.
+            _heal_class_owns = False
             # Reuse-sourcing for the recreate path: an OPERATOR-persisted
             # resource intent (``mem_limit`` / ``cpu_quota`` on the record's
             # ``intent_snapshot``) is honoured when the fresh container is
@@ -1397,10 +1403,15 @@ class ContainerManager:
             _reuse_mem_limit = (_reuse_intent or {}).get("mem_limit") or None
             _reuse_cpu_quota = (_reuse_intent or {}).get("cpu_quota") or None
             if docker_id and self._reuse_container(docker_id) is None:
+                # C3: a KNOWN class that OWNS its lifecycle (resource/service) is
+                # the ONLY class-based heal refusal; an unknown class is treated
+                # as owning (fail-closed) but is NEVER reported as 'not healable'.
                 try:
                     _owns = policy_for(record.lifecycle_class).own_lifecycle is True
+                    _heal_class_owns = _owns
                 except UnknownLifecycleClass:
                     _owns = True   # fail-closed: unknown class -> do NOT write to the record
+                    _heal_class_owns = False
                 if heal_missing and self._heal_eligible(record, docker_id):
                     pass  # branch (a) below runs the Edge-4 heal path
                 elif not _owns:
@@ -1461,6 +1472,21 @@ class ContainerManager:
                         return healed
                 self._emit_stale_docker_id_drift_once(
                     name, record_id, docker_id, "record")
+                # C3 INVARIANT (class-only, heal-requested-only): when a heal was
+                # explicitly requested and the ONLY reason it was refused is the
+                # record's class owning its own lifecycle (resource/service), we
+                # surface the distinct 'container_record_not_healable' code.  An
+                # unknown class, a memoised attempt, or heal_missing=False keep
+                # the ordinary 'container_record_container_missing' code below.
+                if heal_missing and _heal_class_owns:
+                    return {"error": (f"Container {name!r} record {record_id} "
+                                      f"names docker_id {docker_id!r} but no "
+                                      f"such container exists; this record is "
+                                      f"not healable (its lifecycle class owns "
+                                      f"its own container lifecycle). Recovery: "
+                                      f"an operator can recreate it via the "
+                                      f"record's recreate action."),
+                            "code": "container_record_not_healable"}
                 return {"error": (f"Container {name!r} record {record_id} names "
                                   f"docker_id {docker_id!r} but no such container "
                                   f"exists."),
