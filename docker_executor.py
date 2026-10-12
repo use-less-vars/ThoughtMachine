@@ -147,7 +147,11 @@ def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line
         if labels is not None:
             build_kwargs["labels"] = labels
         if networkmode is not None:
-            build_kwargs["networkmode"] = networkmode
+            # docker-py's kwarg is `network_mode` (underscore); it is translated
+            # internally to the `networkmode` query param. There is deliberately NO
+            # try/except fallback here: if this kwarg is ever unsupported the build
+            # MUST fail rather than silently degrade to a networked build.
+            build_kwargs["network_mode"] = networkmode
         build_logs = client.api.build(**build_kwargs)
         for chunk in build_logs:
             if "stream" in chunk:
