@@ -3418,9 +3418,13 @@ class ContainerManager:
                     raise RuntimeError(
                         f"Unexpected files staged in build context: {sorted(staged)}"
                     )
+                _net_mode, _ = dex._resolve_container_config_via_gate(
+                    self.workspace_id, getattr(self, "session_permissions", None)
+                )
                 _, log_lines = dex._run_image_build(
                     self.client, tmpdir, "Dockerfile", tag,
                     labels={dex.EXECUTOR_BUILD_HASH_LABEL: build_hash},
+                    networkmode=("none" if _net_mode == "none" else None),
                 )
         except RuntimeError:
             raise
