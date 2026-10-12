@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
-from thoughtmachine.vault import vault_root
+from thoughtmachine.vault import _copy_resource, vault_root
 from thoughtmachine.workspace_registry import _normalize_path
 
 # Minimal validation for template workers (avoids circular import via agent.__init__)
@@ -271,6 +271,7 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
 
     * ``capabilities.json`` — fully permissive workspace capabilities
     * ``Dockerfile`` — copied from ``resources/default_dockerfile.txt``
+    * ``requirements.txt`` — copied from ``<repo_root>/requirements.txt``
     * ``domain_allowlist.json`` — empty JSON array ``[]``
     * ``workers.json`` — default template worker from worker_templates/ (default)
     * ``mcp_servers.json`` — empty JSON array ``[]``
@@ -314,6 +315,15 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         if src_dockerfile.exists():
             shutil.copy2(str(src_dockerfile), str(dockerfile_path))
             created.append(str(dockerfile_path))
+
+    # ── requirements.txt (copy from <repo_root>/requirements.txt) ─────────
+    requirements_path = base / "requirements.txt"
+    _copy_resource(
+        _resources_dir().parent / "requirements.txt",
+        requirements_path,
+        False,
+        created,
+    )
 
     # ── domain_allowlist.json (empty array) ───────────────────────────────
     domain_allowlist_path = base / "domain_allowlist.json"
@@ -479,6 +489,7 @@ def _safeguard_workspace_dir(base: Path) -> None:
         "config.json",
         "Dockerfile",
         "domain_allowlist.json",
+        "requirements.txt",
         "workers.json",
         "workers",
         "mcp_servers.json",
