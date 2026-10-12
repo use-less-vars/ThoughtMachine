@@ -620,7 +620,6 @@ logger = logging.getLogger("tools.workspace.worker")
 # separate points (enabled_tools filtering and tool class resolution).
 _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "Worker",           # recursion: worker spawning workers
-    "MCPValidator",      # MCP server management
     "CheckSystem",       # system/network/worker/infrastructure discovery
     "KnowledgeBaseTool", # persistent cross-session knowledge store
 })

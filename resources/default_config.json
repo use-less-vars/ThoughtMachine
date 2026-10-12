@@ -59,7 +59,6 @@
     "FileSummaryTool",
     "GitInfoTool",
     "KnowledgeBaseTool",
-    "MCPValidator",
     "PaginateTool",
     "ProgressReport",
     "SummarizeTool",

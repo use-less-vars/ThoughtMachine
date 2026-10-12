@@ -7,7 +7,6 @@ Covers:
 - Successful initialize handshake: real inline mock MCP server verifies the
   request on stdin before responding (real SandboxedExecution subprocess)
 - Unknown server error reporting
-- MCPValidator deprecation contract
 - Registry location constraint (vault, outside the workspace tree)
 
 All tests run on the host -- no docker, no network.
@@ -23,7 +22,6 @@ from pydantic import ValidationError
 import tools.mcp_server_connect as mcp_server_connect
 from security.security_gate import check_required_categories
 from tools.mcp_server_connect import MCPServerConnect, REGISTRY_PATH
-from tools.mcp_validator import MCPValidator
 
 # A tiny stdio MCP server: reads one stdin line, verifies it carries the
 # JSON-RPC "initialize" method (else writes MOCK_ERROR to stderr and exits
@@ -136,12 +134,6 @@ def test_error_on_unknown_server(tmp_path, monkeypatch):
     assert "Available" in out
     assert "other" in out
 
-
-def test_old_validator_returns_deprecation_error():
-    """MCPValidator.execute() returns the deprecation error string."""
-    assert MCPValidator().execute() == (
-        "Error: MCPValidator is deprecated. Use MCPServerConnect with a registered server name instead."
-    )
 
 
 def test_registry_outside_workspace():
