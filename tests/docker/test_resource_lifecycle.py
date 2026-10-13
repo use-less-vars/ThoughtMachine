@@ -687,6 +687,59 @@ def test_sweep_remove_error_collected(monkeypatch):
     assert "remove boom" in result["detail"]
 
 
+def test_sweep_empty_registry_is_noop(monkeypatch):
+    """An empty (or None) registry is fail-closed: nothing is removed."""
+    c_orphan = _FakeContainer(
+        "c-orphan", name="tm-res-x-git", labels=_labels_for("ws-orphan")
+    )
+    containers = _FakeContainers([c_orphan])
+    _monkeypatch_docker(
+        monkeypatch, _FakeDockerModule(images=_fresh_images(), containers=containers)
+    )
+    for registry in ([], None):
+        result = rcm.sweep_stale_resource_containers(registry)
+        assert result == {
+            "removed": 0,
+            "skipped_in_use": 0,
+            "detail": "registry empty; sweep skipped",
+        }
+    assert c_orphan.remove_calls == 0
+
+
+def test_sweep_age_gate_keeps_young_orphan(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    young = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    c_young = _FakeContainer(
+        "c-young", name="tm-res-y-git", labels=_labels_for("ws-orphan")
+    )
+    c_young.attrs = {"Created": young}
+    containers = _FakeContainers([c_young])
+    _monkeypatch_docker(
+        monkeypatch, _FakeDockerModule(images=_fresh_images(), containers=containers)
+    )
+    result = rcm.sweep_stale_resource_containers(["ws-1"])
+    assert c_young.remove_calls == 0
+    assert result["removed"] == 0
+
+
+def test_sweep_age_gate_removes_old_orphan(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    c_old = _FakeContainer(
+        "c-old", name="tm-res-o-git", labels=_labels_for("ws-orphan")
+    )
+    c_old.attrs = {"Created": old}
+    containers = _FakeContainers([c_old])
+    _monkeypatch_docker(
+        monkeypatch, _FakeDockerModule(images=_fresh_images(), containers=containers)
+    )
+    result = rcm.sweep_stale_resource_containers(["ws-1"])
+    assert c_old.remove_calls == 1
+    assert result["removed"] == 1
+
+
 # ------------------------------------- ensure_resource container mounts tests
 
 

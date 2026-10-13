@@ -416,6 +416,33 @@ class TestResourceContainers:
         assert cat["removed"] == []
         assert cat["skipped"] == [{"id": "c-1", "reason": "not old enough"}]
 
+    def test_resource_container_of_registered_workspace_skipped(self, vault):
+        # Ownership gate: its owning workspace is alive (registered), so the
+        # workspace teardown path owns its death — GC must not reap it.
+        cont = FakeContainer(cid="rc-1", status="exited", created=_iso(OLD),
+                             labels={gc._RESOURCE_LABEL: "1",
+                                     gc._WORKSPACE_LABEL: "ws-1"})
+        report = gc.run_gc(now=NOW, registry=FakeRegistry([FakeEntry(id="ws-1")]),
+                           docker_client=FakeClient(containers=[cont]))
+        cat = report["categories"][gc.CAT_ORPHAN_RESOURCE_CONTAINERS]
+        assert cat["removed"] == []
+        assert cat["skipped"] == [
+            {"id": "rc-1", "reason": "belongs to a registered workspace"}
+        ]
+        assert cont.remove_calls == []
+
+    def test_resource_container_of_unregistered_workspace_still_reaped(self, vault):
+        # Residual orphan case: the owning workspace is gone, so this GC is the
+        # teardown authority for its resource sandbox and MUST reap it.
+        cont = FakeContainer(cid="rc-1", status="exited", created=_iso(OLD),
+                             labels={gc._RESOURCE_LABEL: "1",
+                                     gc._WORKSPACE_LABEL: "gone-ws"})
+        report = gc.run_gc(now=NOW, registry=FakeRegistry([FakeEntry(id="ws-1")]),
+                           docker_client=FakeClient(containers=[cont]))
+        cat = report["categories"][gc.CAT_ORPHAN_RESOURCE_CONTAINERS]
+        assert cat["removed"] == ["rc-1"]
+        assert cont.remove_calls == [{"force": True}]
+
 
 # ── Orphan user containers (workspace_id label, unregistered workspace) ────
 

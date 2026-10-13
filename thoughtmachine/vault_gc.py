@@ -629,11 +629,20 @@ def _gc_orphan_resource_containers(report, client, registered_ids, now, threshol
 
     Two sweeps share this category:
 
-    * ``thoughtmachine.resource`` containers (sandboxes etc.) — always
-      eligible regardless of the registry.
+    * ``thoughtmachine.resource`` containers (sandboxes etc.) whose owning
+      workspace is no longer registered.
     * ``thoughtmachine.workspace_id=<id>`` *user* containers whose workspace
       is no longer registered (the stale-workspace path already removes user
       containers of registered workspaces via ``delete_workspace``).
+
+    Ownership gate: a container (resource or user) whose owning workspace is
+    still registered is skipped — that workspace owns the teardown of its
+    containers (``cleanup_workspace_resources``), so GC must not reap them.
+    Only a container whose workspace is *gone* is a true orphan, and that kill
+    is **not** class-gated (teardown authority for orphans): applying
+    ``_gc_should_skip`` would exempt resource/service containers forever and
+    leak orphans. A ``None`` registry means "unknown"; resource containers are
+    then still swept (the user-container sweep is skipped with an error).
 
     Both are stopped-only and use the same age cutoff.
     """
@@ -655,6 +664,21 @@ def _gc_orphan_resource_containers(report, client, registered_ids, now, threshol
             {"category": CAT_ORPHAN_RESOURCE_CONTAINERS, "error": str(exc)}
         )
     for container in resource_containers:
+        labels = getattr(container, "labels", None) or {}
+        ws_id = labels.get(_WORKSPACE_LABEL)
+        if registered_ids is not None and ws_id and ws_id in registered_ids:
+            # Its owning workspace is alive, so it owns this container's death
+            # (teardown authority) — GC must be immortal here. Only a resource
+            # sandbox whose workspace is *gone* is a true orphan we may reap.
+            cid = (
+                getattr(container, "id", "")
+                or getattr(container, "name", "")
+                or str(container)
+            )
+            cat["skipped"].append(
+                {"id": cid, "reason": "belongs to a registered workspace"}
+            )
+            continue
         _maybe_remove_container(cat, container, now, cutoff, dry_run)
 
     # Orphan user containers: labelled ``thoughtmachine.workspace_id=<id>``
