@@ -547,7 +547,7 @@ class TestContainerBuildTool:
             result = _parse_result(tool.execute())
 
         mock_cls.assert_called_once()  # _make_manager() built exactly one manager
-        mock_manager.build_image.assert_called_once_with(tag=None)
+        mock_manager.build_image.assert_called_once_with(tag=None, nocache=False)
         assert set(result.keys()) == {"success", "image_tag", "build_log", "duration"}
         assert result["success"] is True
         assert result["image_tag"] == "agent-executor-abc"
@@ -633,7 +633,7 @@ class TestContainerBuildTool:
             result = _parse_result(tool.execute())
 
         mock_cls.assert_called_once()  # exactly one manager built
-        mock_manager.build_image.assert_called_once_with(tag=None)
+        mock_manager.build_image.assert_called_once_with(tag=None, nocache=False)
         assert mock_manager.build_image.call_count == 1  # no fallback retry/build
         assert result["success"] is False
         assert "Vault Dockerfile not found" in result["error"]

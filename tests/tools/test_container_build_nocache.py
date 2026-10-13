@@ -1,0 +1,125 @@
+"""Agent-facing NO-CACHE build surface for ContainerBuildTool.
+
+DISPATCH-A-NOCACHE-v1, branch ``bug/build-tool-nocache`` (base ``b27fee83``).
+
+Correctness argument: the build-drift gate (existing image tag re-used ONLY when
+its ``thoughtmachine.build_hash`` label matches the freshly computed hash) can
+only be *exercised* by forcing a no-cache rebuild. Before this change NO
+agent-facing surface could request one -- ``ContainerBuildTool`` had no
+``nocache`` field and ``ContainerManager.build_image`` had no ``nocache``
+parameter -- so ``docker_executor._run_image_build`` always received its default
+``nocache=False``. These tests pin the new plumbing end to end:
+
+- T1: ``ContainerBuildTool(nocache=True)`` -> the flag reaches ``_run_image_build``.
+- T2: ``ContainerBuildTool(nocache=False)`` (and the default) -> unchanged, flag
+      arrives as ``False``.
+- T3: other callers (``DockerCodeRunner(build=True)`` -> ``manager.build_image(tag=...)``
+      with no ``nocache``) are unaffected: the default still flows through as ``False``.
+"""
+
+from unittest.mock import MagicMock, patch
+
+from infra.container_manager import ContainerManager
+from tools.container_control import ContainerBuildTool
+
+
+def _real_manager(tmp_path):
+    """A real ``ContainerManager`` (skipping ``docker.from_env()``) with a valid
+    vault Dockerfile + requirements so ``build_image`` reaches the build call."""
+    vault_root = tmp_path / "vault"
+    ws_dir = vault_root / "workspaces" / "ws-1"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    (ws_dir / "requirements.txt").write_text("pin==1.0\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    manager = ContainerManager.__new__(ContainerManager)  # skip docker.from_env()
+    manager.client = MagicMock()
+    manager.workspace_path = str(ws)
+    manager.vault_root = str(vault_root)
+    manager.workspace_id = "ws-1"
+    manager.session_permissions = {"container": True}
+    return manager
+
+
+def _mock_dex(captured):
+    """Stub docker_executor whose ``_run_image_build`` records its kwargs."""
+    dex = MagicMock()
+    dex._compute_image_tag.side_effect = lambda ws: "agent-executor-test"
+    dex._resolve_container_config_via_gate.return_value = ("none", "ro")
+    dex.compute_executor_build_hash.return_value = "hash-xyz"
+
+    def _capture(client, build_path, dockerfile, tag, **kw):
+        captured.update(kw)
+        return "sha256:abc", ["Step 1"]
+
+    dex._run_image_build.side_effect = _capture
+    return dex
+
+
+@patch("infra.container_manager.DOCKER_AVAILABLE", True)
+class TestContainerBuildToolNocache:
+    """T1/T2: the tool's ``nocache`` field is forwarded to ``_run_image_build``."""
+
+    def test_t1_nocache_true_reaches_run_image_build(self, tmp_path):
+        manager = _real_manager(tmp_path)
+        captured = {}
+        with patch("infra.container_manager._load_docker_executor") as mock_load, \
+             patch("tools.container_control.ContainerManager") as mock_cls:
+            dex = _mock_dex(captured)
+            mock_load.return_value = dex
+            mock_cls.return_value = manager
+
+            tool = ContainerBuildTool(
+                workspace_path="/tmp/test_ws",
+                session_permissions={"container": True},
+                nocache=True,
+            )
+            result = tool.execute()
+
+        assert '"success": true' in result
+        assert dex._run_image_build.call_count == 1
+        assert captured.get("nocache") is True
+
+    def test_t2_nocache_false_is_unchanged(self, tmp_path):
+        manager = _real_manager(tmp_path)
+        captured = {}
+        with patch("infra.container_manager._load_docker_executor") as mock_load, \
+             patch("tools.container_control.ContainerManager") as mock_cls:
+            dex = _mock_dex(captured)
+            mock_load.return_value = dex
+            mock_cls.return_value = manager
+
+            tool = ContainerBuildTool(
+                workspace_path="/tmp/test_ws",
+                session_permissions={"container": True},
+                nocache=False,
+            )
+            tool.execute()
+
+        assert captured.get("nocache") is False
+
+    def test_t2b_default_field_is_false(self):
+        tool = ContainerBuildTool(
+            workspace_path="/tmp/test_ws",
+            session_permissions={"container": True},
+        )
+        assert tool.nocache is False
+
+
+@patch("infra.container_manager.DOCKER_AVAILABLE", True)
+class TestBuildImageNocacheDefault:
+    """T3: the OTHER caller (DockerCodeRunner -> build_image(tag=...)) is unaffected."""
+
+    def test_t3_manager_default_forwarded_as_false(self, tmp_path):
+        manager = _real_manager(tmp_path)
+        captured = {}
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
+            dex = _mock_dex(captured)
+            mock_load.return_value = dex
+            # DockerCodeRunner(build=True) calls exactly this: no nocache kwarg.
+            manager.build_image(tag="agent-executor-test")
+
+        assert dex._run_image_build.call_count == 1
+        assert captured.get("nocache") is False
