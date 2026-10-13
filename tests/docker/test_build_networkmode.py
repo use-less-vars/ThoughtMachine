@@ -29,7 +29,7 @@ class TestRunImageBuildKwarg:
         dex._run_image_build(
             client, "/ctx", "Dockerfile", "tag:1", networkmode="none"
         )
-        assert calls[0].get("networkmode") == "none"
+        assert calls[0].get("network_mode") == "none"
 
     def test_networkmode_absent_by_default(self):
         calls = []
@@ -47,7 +47,7 @@ class TestRunImageBuildKwarg:
             labels={"k": "v"}, networkmode="none",
         )
         assert calls[0].get("labels") == {"k": "v"}
-        assert calls[0].get("networkmode") == "none"
+        assert calls[0].get("network_mode") == "none"
 
 
 class TestContainerManagerBuildResolvesNetwork:
