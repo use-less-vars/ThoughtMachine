@@ -110,6 +110,12 @@ from agent.config.defaults import (
     _host_ids,
 )
 
+# Docker per-container user-drift predicate (module-level
+# ``infra.container_manager._user_drift_axis``) is reused directly here.
+# One-way dependency, no import cycle: ``infra.container_manager`` never
+# imports this module (it merely references it in comments).
+from infra.container_manager import _user_drift_axis
+
 # Global resource images are lifecycle-protected shared infrastructure:
 # conservative cleanup/prune NEVER removes them — only an explicit global
 # lifecycle operation may remove or rebuild such an image.
@@ -1376,6 +1382,14 @@ class ResourceContainerManager:
             labels.get(self.WORKSPACE_LABEL) != self.workspace_id
             or labels.get(self.RESOURCE_LABEL) != kind
         ):
+            stale = True
+
+        # Docker per-container user drift is ALSO stale.  The policy user is
+        # ``host_user() or "0:0"`` — the SAME seam both create paths stamp — so
+        # a ``None`` host_user() (Windows) still pins a concrete policy and the
+        # axis can never silently no-op.  An absent/unreadable live
+        # ``Config.User`` is not drift (``_user_drift_axis`` returns None).
+        if _user_drift_axis(container, host_user() or "0:0") is not None:
             stale = True
 
         if stale:
