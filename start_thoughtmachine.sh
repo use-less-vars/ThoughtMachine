@@ -195,13 +195,17 @@ echo "Required tools ..."
 TOOLS_OUT="$(doctor --check-tools 2>&1)"
 TOOLS_RC=$?
 if [ "$TOOLS_RC" -ne 0 ]; then
-    echo "      FAILED: required tools are missing:"
-    printf '%s' "$TOOLS_OUT" | python3 -c 'import json, sys
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "      macOS detected - skipping Linux-only tool requirements."
+    else
+        echo "      FAILED: required tools are missing:"
+        printf '%s' "$TOOLS_OUT" | python3 -c 'import json, sys
 d = json.load(sys.stdin)
 for name in d.get("critical_missing", []):
     print("    - %s: %s" % (name, d["tools"][name].get("hint", "")))' 2>/dev/null | sed 's/^/      /'
-    echo "      Install the missing tools, then re-run this script."
-    exit 1
+        echo "      Install the missing tools, then re-run this script."
+        exit 1
+    fi
 fi
 DOCKER_PRESENT="$(printf '%s' "$TOOLS_OUT" | json_get docker_present)"
 if [ "$DOCKER_PRESENT" = "False" ]; then

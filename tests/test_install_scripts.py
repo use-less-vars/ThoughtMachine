@@ -407,3 +407,147 @@ def test_install_require_docker_opt_in_still_aborts(exec_tmp):
         assert "Installation aborted" not in r.stdout, value
         assert "[--]" in r.stdout, value
 
+
+# ---------------------------------------------------------------------------
+# check_port_free lsof fallback (macOS has no iproute2 / `ss`)
+#
+# `ss` is Linux-only; when it is absent (e.g. on macOS) the port check must
+# fall back to `lsof -nP -iTCP:<port> -sTCP:LISTEN`. These tests mock the
+# module-level _run, so nothing shells out.
+# ---------------------------------------------------------------------------
+
+
+def test_check_port_free_lsof_fallback_detects_busy_port(monkeypatch):
+    def fake_run(cmd, timeout=60):
+        if cmd == ["ss", "-ltn"]:
+            raise FileNotFoundError("ss")
+        if cmd == ["lsof", "-nP", "-iTCP:8000", "-sTCP:LISTEN"]:
+            stdout = (
+                "COMMAND  PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n"
+                "uvicorn 1234 jojo    7u  IPv4  12345      0t0  TCP *:8000 (LISTEN)\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(doctor_checks, "_run", fake_run)
+
+    result = doctor_checks.check_port_free(8000)
+
+    assert result["ok"] is False
+    assert result["reason"] == "in_use"
+    # procname comes from the FIRST data line (line 0 is the lsof header).
+    assert result["detail"] == "8000 is in use by uvicorn"
+
+
+def test_check_port_free_lsof_fallback_port_free_on_nonzero_rc(monkeypatch):
+    def fake_run(cmd, timeout=60):
+        if cmd == ["ss", "-ltn"]:
+            raise FileNotFoundError("ss")
+        if cmd == ["lsof", "-nP", "-iTCP:8000", "-sTCP:LISTEN"]:
+            # lsof exits non-zero when no listener matches -> port is free.
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(doctor_checks, "_run", fake_run)
+
+    result = doctor_checks.check_port_free(8000)
+
+    assert result == {"ok": True, "detail": "port 8000 is free"}
+
+
+def _make_fake_run_no_ss(stdout):
+    """Return a fake ``_run``: raise on ``ss``, answer ``lsof`` with ``stdout``.
+
+    A factory (rather than a loop-local closure) binds ``stdout`` per call, so
+    no fake closes over a loop variable (flake8-bugbear B023).
+    """
+    def fake_run(cmd, timeout=60):
+        if cmd == ["ss", "-ltn"]:
+            raise FileNotFoundError("ss")
+        if cmd == ["lsof", "-nP", "-iTCP:8000", "-sTCP:LISTEN"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    return fake_run
+
+
+def test_check_port_free_lsof_fallback_port_free_when_header_only(monkeypatch):
+    # rc 0 with only the header, and header + a trailing blank line, both
+    # mean no listener -> free. The blank line must not raise IndexError
+    # (regression: the parser used to index lines[1] unconditionally).
+    for stdout in (
+        "COMMAND  PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n",
+        "COMMAND  PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\n",
+    ):
+        monkeypatch.setattr(doctor_checks, "_run", _make_fake_run_no_ss(stdout))
+
+        result = doctor_checks.check_port_free(8000)
+
+        assert result == {"ok": True, "detail": "port 8000 is free"}
+
+
+def test_check_port_free_reports_when_neither_ss_nor_lsof(monkeypatch):
+    def fake_run(cmd, timeout=60):
+        # Both `ss` and `lsof` are missing on this host.
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(doctor_checks, "_run", fake_run)
+
+    result = doctor_checks.check_port_free(8000)
+
+    assert result == {
+        "ok": False,
+        "reason": "other",
+        "detail": "Neither ss nor lsof is available - cannot verify port 8000",
+    }
+
+
+def test_check_port_free_ss_path_unchanged_when_port_free(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, timeout=60):
+        calls.append(cmd)
+        if cmd == ["ss", "-ltn"]:
+            stdout = (
+                "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(doctor_checks, "_run", fake_run)
+
+    result = doctor_checks.check_port_free(8000)
+
+    assert result == {"ok": True, "detail": "port 8000 is free"}
+    # no ss/lsof regression: the ss fast path in use, no lsof probe
+    assert calls == [["ss", "-ltn"]]
+
+
+def test_check_port_free_ss_path_unchanged_when_port_busy(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, timeout=60):
+        calls.append(cmd)
+        if cmd == ["ss", "-ltn"]:
+            stdout = (
+                "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port\n"
+                "LISTEN  0       128     0.0.0.0:8000         0.0.0.0:*\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+        if cmd == ["ss", "-ltnp"]:
+            stdout = (
+                "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process\n"
+                'LISTEN  0       128     0.0.0.0:8000         0.0.0.0:*          '
+                'users:(("uvicorn",pid=1234,fd=3))\n'
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+        raise AssertionError(f"unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(doctor_checks, "_run", fake_run)
+
+    result = doctor_checks.check_port_free(8000)
+
+    assert result["ok"] is False
+    assert result["reason"] == "in_use"
+    assert result["detail"] == "8000 is in use by uvicorn"
+    assert calls == [["ss", "-ltn"], ["ss", "-ltnp"]]

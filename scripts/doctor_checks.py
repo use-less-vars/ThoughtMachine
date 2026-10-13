@@ -140,15 +140,42 @@ def check_docker_daemon() -> Dict[str, Any]:
 
 
 def check_port_free(port: int) -> Dict[str, Any]:
-    """Check whether ``port`` has a TCP listener, using ``ss -ltn``.
+    """Check whether ``port`` has a TCP listener.
 
-    On a busy port, ``ss -ltnp`` is tried to capture the process name.
+    Prefers ``ss -ltn`` (iproute2, Linux); on a busy port ``ss -ltnp`` is
+    tried to capture the process name. When ``ss`` is missing (e.g. macOS
+    ships no iproute2) it falls back to
+    ``lsof -nP -iTCP:<port> -sTCP:LISTEN``, mirroring the ss-first / lsof-
+    fallback preference start_thoughtmachine.sh already uses (behind
+    ``command -v`` guards) for its frontend probe.
     """
     needle = ":%d " % port
     try:
         proc = _run(["ss", "-ltn"])
     except FileNotFoundError:
-        return {"ok": False, "reason": "other", "detail": "ss: command not found (install iproute2) — cannot verify port %d" % port}
+        # `ss` is Linux-only (iproute2); macOS has no iproute2, so fall back
+        # to lsof. start_thoughtmachine.sh's frontend probe already prefers
+        # ss with an lsof fallback behind `command -v` guards.
+        try:
+            lsof = _run(["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN"])
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "reason": "other",
+                "detail": "Neither ss nor lsof is available - cannot verify port %d" % port,
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"ok": False, "reason": "other", "detail": str(exc)}
+        lines = lsof.stdout.splitlines()
+        # Line 0 is the lsof header ("COMMAND PID USER ..."); the first
+        # NON-EMPTY line after it names the listener. No non-empty data
+        # line at all (header only, or a blank line) means nothing is
+        # listening, so the port is free.
+        data = [ln for ln in lines[1:] if ln.strip()]
+        if lsof.returncode != 0 or not data:
+            return {"ok": True, "detail": "port %d is free" % port}
+        procname = data[0].split()[0]
+        return {"ok": False, "reason": "in_use", "detail": "%d is in use by %s" % (port, procname)}
     except Exception as exc:  # pragma: no cover - defensive
         return {"ok": False, "reason": "other", "detail": str(exc)}
     busy_lines = [ln for ln in proc.stdout.splitlines() if needle in ln]
@@ -728,7 +755,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-docker", action="store_true", dest="check_docker",
                         help="check the docker daemon is reachable (docker info)")
     parser.add_argument("--check-port", type=_parse_port, metavar="PORT", dest="check_port",
-                        help="check a TCP port is free (ss -ltn)")
+                        help="check a TCP port is free (ss -ltn, lsof fallback)")
     parser.add_argument("--check-node", action="store_true", dest="check_node",
                         help="check the Node.js major version meets the floor")
     parser.add_argument("--check-python", action="store_true", dest="check_python",
