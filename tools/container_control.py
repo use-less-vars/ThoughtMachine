@@ -550,11 +550,19 @@ class ContainerBuildTool(_ContainerControlBase):
         description="Image tag to build (auto-generated from the workspace path when absent).",
     )
 
+    nocache: bool = Field(
+        False,
+        description=(
+            "If True, force the build to bypass the Docker layer cache. "
+            "Default False preserves the cached/drift-gated behaviour."
+        ),
+    )
+
     def execute(self) -> str:
         start_time = time.time()
         try:
             manager = self._make_manager()
-            result = manager.build_image(tag=self.tag)
+            result = manager.build_image(tag=self.tag, nocache=self.nocache)
             return self._respond(
                 True,
                 **result,

@@ -3412,7 +3412,7 @@ class ContainerManager:
             })
         return result
 
-    def build_image(self, tag=None):
+    def build_image(self, tag=None, nocache=False):
         """Build a Docker image from ONLY the vault-managed Dockerfile.
 
         Vault-gated: always builds from the vault-managed ``<workspace>/Dockerfile``
@@ -3429,6 +3429,8 @@ class ContainerManager:
             tag: Image tag; auto-generated from the workspace path (the same
                 ``agent-executor-<hash>`` convention ``docker_executor`` uses)
                 when omitted.
+            nocache: If True, force a rebuild bypassing the Docker layer cache
+                (forwarded to ``_run_image_build`` -> ``client.api.build``).
 
         Returns:
             Dict with EXACTLY ``image_tag`` and ``build_log`` (the build log,
@@ -3517,6 +3519,7 @@ class ContainerManager:
                 )
                 _, log_lines = dex._run_image_build(
                     self.client, tmpdir, "Dockerfile", tag,
+                    nocache=nocache,
                     labels={dex.EXECUTOR_BUILD_HASH_LABEL: build_hash},
                     networkmode=("none" if _net_mode == "none" else None),
                 )
