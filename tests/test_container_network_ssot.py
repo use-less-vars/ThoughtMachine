@@ -14,7 +14,7 @@ import pytest
 import infra.container_manager as cm
 from infra.container_manager import ContainerManager
 from security.security_gate import WorkspaceCapabilities, resolve_container_config
-from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+from thoughtmachine.container_record import LIFECYCLE_PERSISTENT, UnknownLifecycleClass
 
 SP = {"container": True, "network": "outbound", "filesystem": "write", "git": "read"}
 
@@ -107,7 +107,9 @@ class _FakeContainer:
 
 def test_desired_config_matches_gate_ssot(permissive_caps, disk_grant):
     mgr = _mgr()
-    net, ws = mgr._compute_config(mgr.workspace_path, mgr.workspace_id, SP)
+    net, ws = mgr._compute_config(
+        mgr.workspace_path, mgr.workspace_id, SP, LIFECYCLE_PERSISTENT
+    )
     cfg = resolve_container_config(SP, WorkspaceCapabilities.default(), LIFECYCLE_PERSISTENT)
     assert net == cfg.network_mode
     assert ws == cfg.workspace_mode
@@ -123,7 +125,17 @@ def test_desired_config_fails_closed_without_capabilities(monkeypatch):
         lambda workspace_id=None: None,
     )
     mgr = _mgr()
-    assert mgr._compute_config(mgr.workspace_path, mgr.workspace_id, SP) == ("none", "ro")
+    assert mgr._compute_config(
+        mgr.workspace_path, mgr.workspace_id, SP, LIFECYCLE_PERSISTENT
+    ) == ("none", "ro")
+
+
+def test_desired_config_absent_class_raises(permissive_caps):
+    # An ABSENT lifecycle class RAISES rather than being coerced to a
+    # permissive default — the raise fires before the fail-closed try-block.
+    mgr = _mgr()
+    with pytest.raises(UnknownLifecycleClass):
+        mgr._compute_config(mgr.workspace_path, mgr.workspace_id, SP)
 
 
 def _drive_start(fake_container, monkeypatch):

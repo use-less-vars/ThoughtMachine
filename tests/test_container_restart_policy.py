@@ -39,7 +39,8 @@ import infra.resource_container_manager as rcm
 from infra.container_manager import ContainerManager
 from infra.container_registry import ContainerProfile, create_hardened_container
 from security import admission_gate
-from security.admission_gate import Allow
+from security.admission_gate import AdmissionDenied, Allow, ClientProbes
+from security.security_gate import WorkspaceCapabilities
 import thoughtmachine.container_record as container_record
 from thoughtmachine.container_record import (
     LIFECYCLE_CLASSES,
@@ -283,7 +284,6 @@ def test_site1_container_manager_start(lifecycle_class):
 @pytest.mark.parametrize(
     "container_type, lifecycle_arg, expected_class",
     [
-        ("user", None, LIFECYCLE_PERSISTENT),
         ("resource", None, LIFECYCLE_RESOURCE),
         ("user", LIFECYCLE_EPHEMERAL, LIFECYCLE_EPHEMERAL),
         ("resource", LIFECYCLE_SERVICE, LIFECYCLE_SERVICE),
@@ -304,6 +304,30 @@ def test_site2_create_hardened_container(container_type, lifecycle_arg, expected
     kwargs = client.containers.run_calls[-1]["kwargs"]
     assert kwargs["restart_policy"] == docker_restart_policy(expected_class)
     assert kwargs["restart_policy"]["Name"] == _RESTART_POLICY_BY_CLASS[expected_class]
+
+
+def test_site2_create_hardened_container_absent_class_raises():
+    """An ABSENT lifecycle class must reach admission and be DENIED, not
+    silently coerced to a permissive default."""
+    client = _FakeDockerClient()
+    profile = ContainerProfile(
+        image="agent-executor",
+        command=["tail", "-f", "/dev/null"],
+        container_type="user",
+        network_mode="none",
+    )
+    with pytest.raises(AdmissionDenied) as ei:
+        create_hardened_container(
+            client,
+            profile,
+            "c3",
+            workspace_id="ws-rp",
+            lifecycle_class=None,
+            capabilities=WorkspaceCapabilities.default(),
+            probes=ClientProbes(client),
+        )
+    assert ei.value.code == "unknown_lifecycle_class"
+    assert client.containers.run_calls == []
 
 
 def test_site3_resource_container_manager_legacy_create(monkeypatch):
