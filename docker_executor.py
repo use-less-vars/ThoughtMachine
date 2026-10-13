@@ -32,7 +32,9 @@ from infra.container_create import (
     HardeningRecipe,
     MountSpec,
     create_hardened_container,
+    git_shadow_for_workspace,
 )
+from thoughtmachine.workspace_capabilities import git_shadow_mask_path
 import docker
 import docker.types
 import hashlib
@@ -772,11 +774,11 @@ class DockerExecutor:
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": _home_tmpfs,
         }
-        git_path = os.path.join(self.workspace_path, ".git")
-        if os.path.isdir(git_path):
-            tmpfs["/workspace/.git"] = ""
-        else:
-            pass
+        shadow = git_shadow_for_workspace(
+            self.workspace_path,
+            git_shadow_mask_path(self.workspace_id) if self.workspace_id else None,
+        )
+        tmpfs.update(shadow.tmpfs)
 
         log('INFO', 'tools.docker_executor.container',
             f"AUDIT: Creating container with network={network_mode}, mode={workspace_mode}, tmpfs={tmpfs}")
@@ -806,6 +808,15 @@ class DockerExecutor:
         mounts = [workspace_mount]
         if pkg_mount is not None:
             mounts.append(pkg_mount)
+        for _shadow_mount in shadow.mounts:
+            mounts.append(
+                docker.types.Mount(
+                    target=_shadow_mount.target,
+                    source=_shadow_mount.source,
+                    type=_shadow_mount.type,
+                    read_only=_shadow_mount.read_only,
+                )
+            )
         container_env = {"PYTHONUSERBASE": "/home/agent/.local"}
 
         # ── Admission control (phase 2 gate) ─────────────────────────────
