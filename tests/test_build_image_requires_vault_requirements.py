@@ -23,6 +23,22 @@ import pytest
 from infra.container_manager import ContainerManager
 
 
+def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="default"):
+    """Seed a fully-permissive workspace ``capabilities.json`` for
+    ``workspace_id`` so ``ContainerManager.build_image``'s session
+    container-grant gate admits the build.
+
+    The gate routes through ``ContainerManager._compute_config``, which reads
+    the workspace capabilities from the GLOBAL vault root (honouring
+    ``THOUGHTMACHINE_VAULT_ROOT``), so the capabilities file is seeded under a
+    dedicated tmp vault root via ``ensure_workspace_dirs``.
+    """
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "caps-vault"))
+    from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+    ensure_workspace_dirs(workspace_id)
+
+
 class TestBuildImageRequiresVaultRequirements:
     """Vault-only requirements resolution for ``ContainerManager.build_image``."""
 
@@ -33,6 +49,9 @@ class TestBuildImageRequiresVaultRequirements:
         manager.workspace_path = ws_path
         manager.vault_root = vault_root
         manager.workspace_id = workspace_id
+        # Grant the session container access so build_image's session
+        # container-grant gate admits the build (fail-closed otherwise).
+        manager.session_permissions = {"container": True}
         return manager
 
     @staticmethod
@@ -56,8 +75,9 @@ class TestBuildImageRequiresVaultRequirements:
         return dex
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_vault_requirements_present_stages_vault_bytes(self, tmp_path):
+    def test_vault_requirements_present_stages_vault_bytes(self, tmp_path, monkeypatch):
         """A: vault requirements present -> staged bytes == vault bytes."""
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
         vault_root = tmp_path / "vault"
         vault_ws = vault_root / "workspaces" / "ws-1"
         vault_ws.mkdir(parents=True)
@@ -115,8 +135,9 @@ class TestBuildImageRequiresVaultRequirements:
             dex._run_image_build.assert_not_called()
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_both_present_stages_vault_not_workspace(self, tmp_path):
+    def test_both_present_stages_vault_not_workspace(self, tmp_path, monkeypatch):
         """C: both present -> staged bytes are the VAULT bytes (no fallback)."""
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
         vault_root = tmp_path / "vault"
         vault_ws = vault_root / "workspaces" / "ws-1"
         vault_ws.mkdir(parents=True)

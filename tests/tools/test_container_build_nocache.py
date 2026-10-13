@@ -23,6 +23,22 @@ from infra.container_manager import ContainerManager
 from tools.container_control import ContainerBuildTool
 
 
+def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="default"):
+    """Seed a fully-permissive workspace ``capabilities.json`` for
+    ``workspace_id`` so ``ContainerManager.build_image``'s session
+    container-grant gate admits the build.
+
+    The gate routes through ``ContainerManager._compute_config``, which reads
+    the workspace capabilities from the GLOBAL vault root (honouring
+    ``THOUGHTMACHINE_VAULT_ROOT``), so the capabilities file is seeded under a
+    dedicated tmp vault root via ``ensure_workspace_dirs``.
+    """
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "caps-vault"))
+    from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+    ensure_workspace_dirs(workspace_id)
+
+
 def _real_manager(tmp_path):
     """A real ``ContainerManager`` (skipping ``docker.from_env()``) with a valid
     vault Dockerfile + requirements so ``build_image`` reaches the build call."""
@@ -62,7 +78,8 @@ def _mock_dex(captured):
 class TestContainerBuildToolNocache:
     """T1/T2: the tool's ``nocache`` field is forwarded to ``_run_image_build``."""
 
-    def test_t1_nocache_true_reaches_run_image_build(self, tmp_path):
+    def test_t1_nocache_true_reaches_run_image_build(self, tmp_path, monkeypatch):
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
         manager = _real_manager(tmp_path)
         captured = {}
         with patch("infra.container_manager._load_docker_executor") as mock_load, \
@@ -82,7 +99,8 @@ class TestContainerBuildToolNocache:
         assert dex._run_image_build.call_count == 1
         assert captured.get("nocache") is True
 
-    def test_t2_nocache_false_is_unchanged(self, tmp_path):
+    def test_t2_nocache_false_is_unchanged(self, tmp_path, monkeypatch):
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
         manager = _real_manager(tmp_path)
         captured = {}
         with patch("infra.container_manager._load_docker_executor") as mock_load, \
@@ -112,7 +130,8 @@ class TestContainerBuildToolNocache:
 class TestBuildImageNocacheDefault:
     """T3: the OTHER caller (DockerCodeRunner -> build_image(tag=...)) is unaffected."""
 
-    def test_t3_manager_default_forwarded_as_false(self, tmp_path):
+    def test_t3_manager_default_forwarded_as_false(self, tmp_path, monkeypatch):
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
         manager = _real_manager(tmp_path)
         captured = {}
         with patch("infra.container_manager._load_docker_executor") as mock_load:
