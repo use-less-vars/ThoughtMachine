@@ -66,6 +66,7 @@ import queue
 import shutil
 import tempfile
 import threading
+from datetime import datetime, timezone
 
 try:
     import docker
@@ -2011,7 +2012,29 @@ def cleanup_workspace_resources(workspace_id):
     }
 
 
-def sweep_stale_resource_containers(registered_workspace_ids):
+def _resource_container_created_at(container):
+    """Best-effort creation timestamp for a resource container.
+
+    Reads ``attrs["Created"]`` (docker inspect) or a ``.created`` attribute
+    and parses it to an aware UTC ``datetime``. Returns ``None`` when the
+    value is missing or unparseable \u2014 callers treat ``None`` as "no age
+    information" and never age-gate such a container.
+    """
+    created = (getattr(container, "attrs", None) or {}).get("Created")
+    if not created:
+        created = getattr(container, "created", None)
+    if not created:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def sweep_stale_resource_containers(registered_workspace_ids, max_age_s=86400):
     """Sweep resource containers whose workspace is no longer registered.
 
     Startup/orphan sweep: force-removes every ``thoughtmachine.resource``
@@ -2020,16 +2043,40 @@ def sweep_stale_resource_containers(registered_workspace_ids):
     the label is corrupt). Containers of registered workspaces are NEVER
     touched — even stopped ones (their workspace may just be idle).
 
+    Fail-closed on an empty registry: an empty (or ``None``) id set returns a
+    no-op, so a bad/racing registry read can never orphan-storm the daemon
+    (matches the sibling sweeps' ``[]`` ⇒ no-op behaviour).
+
+    This sweep is **teardown authority for orphans**, so the kill is
+    intentionally NOT class-gated (no ``_gc_should_skip``/own_lifecycle gate,
+    which would exempt resource containers forever and leak orphans). The only
+    thing that may spare an orphan is the age gate below.
+
+    Age gate: an orphan container whose creation time is known and younger than
+    ``max_age_s`` is kept (its workspace may still be mid-registration). A
+    missing/unparseable/future creation time is treated as eligible so the
+    orphan kill is never gated away by clock skew or absent metadata.
+
     Never raises — per-container failures are collected into ``detail``.
 
     Args:
         registered_workspace_ids: iterable of workspace ids considered
             in-use (their resource containers must be kept).
+        max_age_s: minimum orphan age (seconds) before removal.
 
     Returns:
         dict: ``{"removed": int, "skipped_in_use": int, "detail": str}``.
     """
     registered = {str(ws) for ws in (registered_workspace_ids or [])}
+    if not registered:
+        # Fail-closed: an empty (or None) registry is indistinguishable from a
+        # bad/racing read, so never orphan-storm the daemon (matches the sibling
+        # sweeps' ``[]`` \u21d2 no-op behaviour).
+        return {
+            "removed": 0,
+            "skipped_in_use": 0,
+            "detail": "registry empty; sweep skipped",
+        }
     removed = 0
     skipped = 0
     detail = ""
@@ -2054,11 +2101,22 @@ def sweep_stale_resource_containers(registered_workspace_ids):
             "skipped_in_use": 0,
             "detail": f"failed to list resource containers: {exc}",
         }
+    now = datetime.now(timezone.utc)
     for container in containers:
         ws_id = (container.labels or {}).get(
             ResourceContainerManager.WORKSPACE_LABEL
         )
         if ws_id is None or str(ws_id) not in registered:
+            # Age gate: keep an orphan whose creation time is known and young
+            # (its workspace may still be mid-registration). No/unparseable
+            # timestamp => eligible, so the orphan kill is never gated away.
+            created = _resource_container_created_at(container)
+            if (
+                created is not None
+                and 0 <= (now - created).total_seconds() < max_age_s
+            ):
+                skipped += 1
+                continue
             try:
                 container.remove(force=True)
                 removed += 1
