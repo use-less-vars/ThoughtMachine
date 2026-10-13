@@ -542,7 +542,7 @@ def test_stale_docker_id_emits_audit_once(monkeypatch, events):
 
 _HEAL_EVENT = container_manager.EVENT_CONTAINER_RECORD_AUTO_RECREATED
 _HEAL_REFUSED_EVENT = container_manager.EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED
-_HEAL_AUDIT_OK = container_manager._HEAL_AUDIT_RECREATED
+_HEAL_AUDIT_OK = container_manager._HEAL_AUDIT_HEALED
 _HEAL_AUDIT_FAIL = container_manager._HEAL_AUDIT_REFUSED
 _HEAL_NEW_ID = "e" * 16
 _HEAL_STALE = "d" * 16
@@ -1113,6 +1113,7 @@ def test_start_refusal_message_is_unbound_for_stale_docker_id():
     assert result["code"] == "container_record_unbound"
     assert result["error"] == (
         "Container record is unbound — the underlying container no longer "
-        "exists. Recovery: an operator can recreate it via the record's "
+        "exists. Recovery: an agent cannot heal it with `heal=True` once the "
+        "record is unbound; an operator can recreate it via the record's "
         "recreate action."
     )

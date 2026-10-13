@@ -197,7 +197,7 @@ def create_record(
     """Create (or idempotently re-materialise) a record (§3, doc signature).
 
     Natively authored records carry ``schema_version=SCHEMA_VERSION_CURRENT``
-    (currently 3) / ``inferred=False``; ``docker_id`` is empty (§1 default)
+    (currently 5) / ``inferred=False``; ``docker_id`` is empty (§1 default)
     and ``state`` takes its §1 default (``""``, "last observed container
     state").  ``name`` is the workspace-scoped container identity (``""`` when
     unset).  Supplying ``id`` for an existing record returns it unchanged
