@@ -12,7 +12,9 @@ Divergences closed
 Reconciliation is NON-healing: the underlying container is NOT recreated, so
 nothing is created when the record is marked unbound. Recovery is explicit and
 separate: an operator can recreate it via the record's recreate action, and an
-agent heals from the record's ``intent_snapshot``.
+agent heals from the record's ``intent_snapshot`` -- automatically via
+``DockerCodeRunner`` (which passes ``heal_missing=True``) or explicitly via
+``ContainerStartTool`` (``heal=True``).
 
 The manager is built via ``ContainerManager.__new__`` (no Docker daemon) and
 every daemon touchpoint is stubbed, mirroring
@@ -190,7 +192,7 @@ def test_start_marks_record_unbound_when_named_container_is_absent(tmp_path):
     assert result["code"] != "container_record_container_missing"
 
     # (6) the shipped Wave-1 message is surfaced.
-    assert "Recovery: an operator can recreate" in result["error"]
+    assert "an operator can recreate it via the record's recreate action" in result["error"]
 
     # The identity ladder never consulted label discovery.
     assert cm._find_by_labels.called is False

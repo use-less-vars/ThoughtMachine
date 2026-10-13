@@ -259,7 +259,7 @@ _HEAL_ATTEMPTED = OrderedDict()  # (record_id, stale_docker_id) -> True, oldest 
 _HEAL_LOCK = threading.Lock()
 _HEAL_ACTOR = "infra.container_manager.start"
 _HEAL_REASON = "container_missing"
-_HEAL_AUDIT_RECREATED = "CONTAINER_START_MISSING_HEAL"
+_HEAL_AUDIT_HEALED = "CONTAINER_START_MISSING_HEAL"
 _HEAL_AUDIT_REFUSED = "CONTAINER_START_MISSING_HEAL_FAILED"
 
 # Sticky-note migration/warning memos (module scope so dedup holds across the
@@ -1282,8 +1282,8 @@ class ContainerManager:
         record names one that no longer exists.  ``heal_missing`` (agent-only,
         default False) is its auto-heal counterpart: when a record names a
         ``docker_id`` with no live container AND the record's lifecycle class
-        does not own its own container lifecycle, ONE policy-current rebuild is
-        attempted, the attempt is memoised (so a persistently failing heal
+        does not own its own container lifecycle, ONE snapshot-sourced rebuild
+        is attempted, the attempt is memoised (so a persistently failing heal
         refuses thereafter), and on success a ``container_record_auto_recreated``
         event is emitted.  A failed heal never raises and falls through to the
         ordinary refusal.
@@ -1442,8 +1442,10 @@ class ContainerManager:
                        f"workspace_id={self.workspace_id}")
                 return {"error": ("Container record is unbound — the underlying "
                                   "container no longer exists. Recovery: an "
-                                  "operator can recreate it via the record's "
-                                  "recreate action."),
+                                  "agent cannot heal it with `heal=True` once "
+                                  "the record is unbound; an operator can "
+                                  "recreate it via the record's recreate "
+                                  "action."),
                         "code": "container_record_unbound"}
             # (a) Record + docker_id: reuse via the record's docker id.
             container = self._reuse_container(docker_id)
@@ -1484,12 +1486,15 @@ class ContainerManager:
                                       f"such container exists; this record is "
                                       f"not healable (its lifecycle class owns "
                                       f"its own container lifecycle). Recovery: "
-                                      f"an operator can recreate it via the "
-                                      f"record's recreate action."),
+                                      f"an agent cannot heal it with "
+                                      f"`heal=True`; an operator can recreate "
+                                      f"it via the record's recreate action."),
                             "code": "container_record_not_healable"}
                 return {"error": (f"Container {name!r} record {record_id} names "
                                   f"docker_id {docker_id!r} but no such container "
-                                  f"exists."),
+                                  f"exists. Recovery: an agent can heal it with "
+                                  f"`heal=True`; an operator can recreate it via "
+                                  f"the record's recreate action."),
                         "code": "container_record_container_missing"}
             self._containers[name] = container.id  # warm the read-through cache
             if (explicit_image is not None
@@ -2715,7 +2720,7 @@ class ContainerManager:
             return None
 
         try:
-            _audit(_HEAL_AUDIT_RECREATED,
+            _audit(_HEAL_AUDIT_HEALED,
                    f"name={name} record_id={record_id} "
                    f"old_docker_id={stale_docker_id} "
                    f"new_docker_id={result.get('id')} "
