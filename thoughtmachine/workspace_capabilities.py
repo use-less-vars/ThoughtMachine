@@ -158,6 +158,21 @@ class WorkspaceCapabilities:
 # ── Disk I/O ──────────────────────────────────────────────────────────────────
 
 
+# Zero-byte regular file seeded per workspace; bind-mounted read-only over
+# ``/workspace/.git`` when a workspace's ``.git`` is a FILE (git worktree /
+# submodule pointer), so the host git metadata is shielded without the docker
+# daemon silently materialising the bind source as a DIRECTORY.
+GIT_SHADOW_MASK_FILENAME = ".git-shadow-mask"
+
+
+def git_shadow_mask_path(workspace_id: str) -> Path:
+    """Return the host path of the per-workspace ``.git`` shadow mask file.
+
+    Seeded (idempotently) by :func:`ensure_workspace_dirs`.
+    """
+    return _workspace_dir(workspace_id) / GIT_SHADOW_MASK_FILENAME
+
+
 def _workspace_dir(workspace_id: str) -> Path:
     """Return the filesystem path for a given workspace ID."""
     return _user_dir() / "workspaces" / workspace_id
@@ -331,6 +346,12 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         domain_allowlist_path.write_text("[]", encoding="utf-8")
         created.append(str(domain_allowlist_path))
 
+    # ── .git shadow mask (zero-byte regular file) ──────────────────────────
+    git_shadow_mask = base / GIT_SHADOW_MASK_FILENAME
+    if not git_shadow_mask.exists():
+        git_shadow_mask.write_text("", encoding="utf-8")
+        created.append(str(git_shadow_mask))
+
     # ── workers.json (template workers) ────────────────────────────
     workers_path = base / "workers.json"
     if not workers_path.exists():
@@ -485,6 +506,7 @@ def _safeguard_workspace_dir(base: Path) -> None:
     This is a read-only check — no items are deleted or moved.
     """
     allowed = {
+        ".git-shadow-mask",
         "capabilities.json",
         "config.json",
         "Dockerfile",

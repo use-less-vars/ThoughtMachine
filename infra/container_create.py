@@ -20,6 +20,7 @@ duplicate copy of either.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -52,8 +53,10 @@ __all__ = [
     "ContainerCreateSpec",
     "CreatedContainer",
     "HardeningRecipe",
+    "GitShadow",
     "MountSpec",
     "create_hardened_container",
+    "git_shadow_for_workspace",
 ]
 
 
@@ -89,6 +92,70 @@ class MountSpec:
     target: str
     type: str = "bind"
     read_only: bool = False
+
+
+# In-container path at which the host ``.git`` is always shielded.
+GIT_SHADOW_TARGET = "/workspace/.git"
+
+
+@dataclass(frozen=True)
+class GitShadow:
+    """The ``.git`` shadow a workspace container must be created with.
+
+    Attributes:
+        tmpfs: tmpfs entries to merge into the create (``DIR`` shape).
+        mounts: single-file bind mounts to attach (``FILE``/worktree shape).
+    """
+
+    tmpfs: Mapping[str, str] = field(default_factory=dict)
+    mounts: tuple[MountSpec, ...] = ()
+
+
+def git_shadow_for_workspace(workspace_path: str, mask_path: Any = None) -> GitShadow:
+    """Return the ``.git`` shadow spec for the workspace at *workspace_path*.
+
+    The host ``.git`` must be shielded at :data:`GIT_SHADOW_TARGET` on EVERY
+    layout, so that no create path can silently attach the wrong shape:
+
+    * ``.git`` is a DIRECTORY -> a ``tmpfs`` entry shadows it with a fresh
+      empty directory (byte-for-byte today's behaviour);
+    * ``.git`` is a FILE (a git worktree / submodule pointer) -> a SINGLE-FILE
+      read-only bind of *mask_path* (a zero-byte regular file) at
+      :data:`GIT_SHADOW_TARGET`;
+    * ``.git`` is ABSENT -> no shadow (there is no host git metadata to shield).
+
+    FAIL-LOUD: when ``.git`` is a FILE, *mask_path* MUST exist as a host file.
+    A missing bind SOURCE is SILENTLY materialised by the docker daemon as a
+    DIRECTORY, handing the container the WRONG shape (a directory where a file
+    must be).  Rather than allow that silently, a :class:`RuntimeError` names
+    the mount target, the missing source path, and why the absence is fatal.
+    """
+    dot_git = os.path.join(str(workspace_path), ".git")
+    if os.path.isdir(dot_git):
+        return GitShadow(tmpfs={GIT_SHADOW_TARGET: ""})
+    if os.path.isfile(dot_git):
+        source = str(mask_path) if mask_path is not None else None
+        if source is None or not os.path.exists(source):
+            raise RuntimeError(
+                "refusing to create container: the .git shadow bind mount "
+                f"target {GIT_SHADOW_TARGET!r} has no existing host source "
+                f"(source={source!r}). The workspace .git is a FILE, so a "
+                "read-only single-file bind is required to shield host git "
+                "metadata; a missing bind source is SILENTLY materialised by "
+                "the docker daemon as a DIRECTORY, producing the wrong shape. "
+                "Ensure ensure_workspace_dirs() seeded the mask file."
+            )
+        return GitShadow(
+            mounts=(
+                MountSpec(
+                    source=source,
+                    target=GIT_SHADOW_TARGET,
+                    type="bind",
+                    read_only=True,
+                ),
+            )
+        )
+    return GitShadow()
 
 
 def _expected_hardening_recipe() -> HardeningRecipe:

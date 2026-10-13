@@ -106,7 +106,9 @@ from infra.container_create import (
     _expected_hardening_recipe,
     _hardening_conformance,
     create_hardened_container,
+    git_shadow_for_workspace,
 )
+from thoughtmachine.workspace_capabilities import git_shadow_mask_path
 from thoughtmachine.container_record import (
     attach_container,
     ContainerRecordError,
@@ -1835,8 +1837,11 @@ class ContainerManager:
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": home_tmpfs,
         }
-        if os.path.isdir(os.path.join(self.workspace_path, ".git")):
-            tmpfs["/workspace/.git"] = ""
+        shadow = git_shadow_for_workspace(
+            self.workspace_path,
+            git_shadow_mask_path(self.workspace_id) if self.workspace_id else None,
+        )
+        tmpfs.update(shadow.tmpfs)
 
         mounts = [
             Mount(
@@ -1850,6 +1855,15 @@ class ContainerManager:
                 type="volume",
             ),
         ]
+        for _shadow_mount in shadow.mounts:
+            mounts.append(
+                Mount(
+                    target=_shadow_mount.target,
+                    source=_shadow_mount.source,
+                    type=_shadow_mount.type,
+                    read_only=_shadow_mount.read_only,
+                )
+            )
 
         labels = {
             CONTAINER_NAME_LABEL: name,
