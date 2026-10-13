@@ -3606,10 +3606,14 @@ class ContainerManager:
         The registry records ``container_type`` for every tracked container, so
         a ``"resource"`` handle is classified without touching the daemon.  Any
         other handle is bridged to :meth:`class_of` via the live container (the
-        handle's ``id``/``name``), and finally by the ``tm-res-`` name prefix.
+        handle's ``id``/``name``), and finally by the ``tm-res-`` name prefix.  An
+        unclassifiable handle RAISES :class:`UnknownLifecycleClass` rather than
+        defaulting to ``LIFECYCLE_PERSISTENT`` (fail-closed).
         """
         if not isinstance(handle, dict):
-            return LIFECYCLE_PERSISTENT
+            raise UnknownLifecycleClass(
+                f"cannot classify lifecycle of non-dict handle: {type(handle).__name__}"
+            )
         if handle.get("container_type") == CONTAINER_TYPE_RESOURCE:
             return LIFECYCLE_RESOURCE
         container = None
@@ -3624,7 +3628,7 @@ class ContainerManager:
         name = handle.get("name") or handle.get("id") or ""
         if isinstance(name, str) and name.lstrip("/").startswith(RESOURCE_NAME_PREFIX):
             return LIFECYCLE_RESOURCE
-        return LIFECYCLE_PERSISTENT
+        raise UnknownLifecycleClass(f"cannot classify lifecycle of handle name={name!r}")
 
     def policy_of(self, container):
         """Lifecycle policy for a live ``container`` object."""
@@ -3927,7 +3931,7 @@ class ContainerManager:
         workspace_path,
         workspace_id,
         session_permissions,
-        lifecycle_class=LIFECYCLE_PERSISTENT,
+        lifecycle_class=None,
         *,
         strict=False,
     ):
@@ -3939,6 +3943,11 @@ class ContainerManager:
         to ``("none", "ro")`` only if the SSOT is unavailable, raises, or
         reports a ``ContainerConfigError``.
 
+        ``lifecycle_class`` is REQUIRED (no default): an ABSENT class raises
+        :class:`UnknownLifecycleClass` rather than being coerced to a permissive
+        default.  An unrecognised (non-empty) string still fails closed through
+        the SSOT's ``ContainerConfigError`` as before.
+
         ``strict`` (keyword-only, default ``False``): when ``True`` the method
         does NOT fail-closed to the ``("none", "ro")`` sentinel; instead it
         PROPAGATES the resolution failure (re-raises / raises ``RuntimeError``)
@@ -3947,6 +3956,11 @@ class ContainerManager:
         drift admission passes ``strict=True``; every other caller keeps the
         historical fail-closed behaviour byte-for-byte.
         """
+        if lifecycle_class is None:
+            raise UnknownLifecycleClass(
+                "_compute_config requires an explicit lifecycle_class; an absent "
+                "class is not coerced to a default"
+            )
         try:
             from security.security_gate import (
                 ContainerConfig,

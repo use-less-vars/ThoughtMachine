@@ -272,7 +272,7 @@ def create_hardened_container(client, profile: ContainerProfile, container_name:
     lifecycle = lifecycle_class or (
         LIFECYCLE_RESOURCE
         if profile.container_type == "resource"
-        else LIFECYCLE_PERSISTENT
+        else None
     )
     if workspace_id is not None:
         if capabilities is None:

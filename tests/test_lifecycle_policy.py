@@ -320,9 +320,11 @@ def test_class_of_resource_probe_wins_over_record(vault):
 # -- class_of_handle (registry handle vocab) ---------------------------------
 
 
-def test_class_of_handle_non_dict_is_persistent():
-    assert _cm().class_of_handle(None) == LIFECYCLE_PERSISTENT
-    assert _cm().class_of_handle("nope") == LIFECYCLE_PERSISTENT
+def test_class_of_handle_non_dict_raises():
+    with pytest.raises(UnknownLifecycleClass):
+        _cm().class_of_handle(None)
+    with pytest.raises(UnknownLifecycleClass):
+        _cm().class_of_handle("nope")
 
 
 def test_class_of_handle_reads_handle_container_type():
@@ -339,7 +341,8 @@ def test_class_of_handle_daemon_miss_falls_back_to_name_prefix():
     mgr.client.containers.get.side_effect = Exception("no daemon")
     assert mgr.class_of_handle({"name": "tm-res-abc-git"}) == LIFECYCLE_RESOURCE
     assert mgr.class_of_handle({"name": "/tm-res-abc-git"}) == LIFECYCLE_RESOURCE
-    assert mgr.class_of_handle({"name": "agent-exec-1"}) == LIFECYCLE_PERSISTENT
+    with pytest.raises(UnknownLifecycleClass):
+        mgr.class_of_handle({"name": "agent-exec-1"})
 
 
 # -- _is_resource_container probe widenings ----------------------------------
