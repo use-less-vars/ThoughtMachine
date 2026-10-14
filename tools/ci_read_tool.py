@@ -18,9 +18,12 @@ Containment / egress posture
 * The repository owner/name are derived from the workspace's ``origin`` remote
   URL via a read-only ``git remote get-url origin`` (``_resolve_owner_repo``,
   monkeypatchable) -- a bare in-process host ``git remote get-url origin``,
-  NOT routed through ``GitReadTool``'s container/host execution-mode
-  backends nor its host-resource (``allow_host_resources``) ceiling.
-  The git lookup never contacts a remote and runs no hooks.
+  NOT routed through ``GitReadTool``'s container/host execution-mode backends,
+  but gated on the same workspace host-resource (``allow_host_resources``)
+  ceiling: the lookup is refused fail-closed (``ValueError``) unless the
+  resolved workspace declares top-level ``allow_host_resources`` true
+  (``tools.host_resource_policy``).  The git lookup never contacts a remote and
+  runs no hooks.
 
 Permission model
 ----------------
@@ -199,6 +202,12 @@ class CiReadTool(ToolBase):
         default=None,
         description="Path to the git repository root (defaults to workspace root).",
     )
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description="Workspace identifier resolved by the ToolExecutor (used to "
+        "consult the workspace allow_host_resources ceiling before the bare git "
+        "origin lookup).",
+    )
 
     # ------------------------------------------------------------------
     # Helpers (monkeypatch seams for tests)
@@ -225,10 +234,28 @@ class CiReadTool(ToolBase):
     def _resolve_origin_url(self, repo_root: Path) -> Optional[str]:
         """Return the ``origin`` remote URL for *repo_root*, or None.
 
-        Read-only ``git remote get-url origin`` (no network, no hooks). Returns
-        None when git is missing, the directory is not a repository, or no
-        ``origin`` remote is configured.
+        Read-only ``git remote get-url origin`` (no network, no hooks), gated on
+        the workspace host-resource ceiling: unless the resolved workspace
+        declares top-level ``allow_host_resources`` true
+        (``tools.host_resource_policy``) it refuses fail-closed by raising
+        ``ValueError`` (turned into an error string by ``execute``).  On allow
+        it returns None when git is missing, the directory is not a repository,
+        or no ``origin`` remote is configured.
         """
+        ws_id = getattr(self, "workspace_id", None)
+        try:
+            from tools.host_resource_policy import workspace_allows_host_resources
+
+            allowed = workspace_allows_host_resources(ws_id)
+        except Exception:
+            allowed = False
+        if not allowed:
+            raise ValueError(
+                "ci_read: host-resource access denied -- the workspace does not "
+                "declare allow_host_resources true (the 'ci' catalog "
+                "host-resource ceiling); the 'git remote get-url origin' lookup "
+                "is refused fail-closed."
+            )
         try:
             proc = subprocess.run(
                 ["git", "-C", str(repo_root), "remote", "get-url", "origin"],

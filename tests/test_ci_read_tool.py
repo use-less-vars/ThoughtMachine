@@ -18,6 +18,7 @@ derived default.  The default-off guard lives in the permission layer: the
 session grants ``ci:read``.
 """
 
+import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -27,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 import tools.ci_read_tool as ci_read_tool
+import tools.host_resource_policy as host_resource_policy
 from tools.ci_read_tool import CiReadTool, parse_origin_owner_repo
 from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
@@ -266,6 +268,109 @@ def test_execute_reports_valueerror_from_resolution(monkeypatch):
 
     assert out.startswith("Error: ")
     assert "origin" in out
+
+
+# ---------------------------------------------------------------------------
+# Host-resource ceiling: the bare `git remote get-url origin` lookup is gated
+# on the workspace allow_host_resources switch (fail-closed when off)
+# ---------------------------------------------------------------------------
+
+
+def _bind_workspace_id(tool, ws_id):
+    """Attach a workspace id without depending on the field being declared.
+
+    The ``workspace_id`` field may or may not exist on the tool yet (RED/GREEN),
+    so set it via ``object.__setattr__`` to bypass pydantic's ``extra='forbid'``
+    guard and behave identically before and after the field is added.
+    """
+    object.__setattr__(tool, "workspace_id", ws_id)
+    return tool
+
+
+def test_ci_read_origin_lookup_denied_when_workspace_switch_off(monkeypatch):
+    # Workspace switch OFF -> the policy returns False for any workspace id.
+    monkeypatch.setattr(
+        host_resource_policy,
+        "workspace_allows_host_resources",
+        lambda ws_id: False,
+    )
+
+    # The bare host `git remote get-url origin` must NOT run when denied.
+    subprocess_calls = []
+
+    def _record_run(*args, **kwargs):
+        subprocess_calls.append((args, kwargs))
+        raise AssertionError("subprocess.run must not be called when denied")
+
+    monkeypatch.setattr(subprocess, "run", _record_run)
+
+    # The HTTP egress seam must NOT be reached either.
+    recorder = _Recorder()
+    monkeypatch.setattr(ci_read_tool, "_http_get", recorder)
+
+    # NOTE: _resolve_owner_repo is deliberately NOT patched, so the real
+    # _resolve_origin_url (the gated seam) is exercised.
+    tool = _bind_workspace_id(CiReadTool(branch="main"), "ws-ci-test")
+    out = tool.execute()
+
+    # git was never shelled out to, and no request was issued.
+    assert subprocess_calls == []
+    assert recorder.calls == []
+
+    # The refusal is surfaced as an error string naming the ceiling.
+    assert out.startswith("Error: ")
+    assert "host-resource access denied" in out
+    assert "allow_host_resources" in out
+    assert "workspace" in out
+
+    # Nothing was leaked: no repo identity, no API host.
+    assert "octocat" not in out
+    assert "hello-world" not in out
+    assert "api.github.com" not in out
+
+
+def test_ci_read_origin_lookup_allowed_when_workspace_switch_on(monkeypatch):
+    # Workspace switch ON -> the policy returns True for any workspace id.
+    monkeypatch.setattr(
+        host_resource_policy,
+        "workspace_allows_host_resources",
+        lambda ws_id: True,
+    )
+
+    # Capture the exact argv + kwargs of the one bare host git lookup.
+    subprocess_calls = []
+
+    def _record_run(argv, **kwargs):
+        subprocess_calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="https://github.com/octocat/hello-world.git\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _record_run)
+
+    recorder = _Recorder()
+    monkeypatch.setattr(ci_read_tool, "_http_get", recorder)
+
+    tool = _bind_workspace_id(CiReadTool(branch="main"), "ws-ci-test")
+    out = tool.execute()
+
+    # Exactly one bare git lookup, with the byte-identical argv and kwargs.
+    assert len(subprocess_calls) == 1
+    argv, kwargs = subprocess_calls[0]
+    assert isinstance(argv, list)
+    assert argv[0] == "git"
+    assert argv[1] == "-C"
+    assert isinstance(argv[2], str) and argv[2]
+    assert argv[3:] == ["remote", "get-url", "origin"]
+    assert kwargs == {"capture_output": True, "text": True, "timeout": 15}
+
+    # On allow the behaviour is unchanged: exactly one HTTP request, success.
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0][0].startswith(
+        "https://api.github.com/repos/octocat/hello-world/actions/runs"
+    )
+    assert "octocat/hello-world" in out
+    assert not out.startswith("Error")
 
 
 # ---------------------------------------------------------------------------
