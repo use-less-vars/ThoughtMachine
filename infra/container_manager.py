@@ -115,6 +115,7 @@ from thoughtmachine.container_record import (
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
+    LIFECYCLE_SERVICE,
     RECORD_LABEL_KEY,
     RESOURCE_LABEL,
     RESOURCE_NAME_PREFIX,
@@ -4295,12 +4296,26 @@ def _container_name(container):
 
 
 def sweep_exited_workspace_containers(registered_workspace_ids=None,
-                                      max_age_s=86400, dry_run=False):
+                                      max_age_s=86400, dry_run=False,
+                                      max_age_s_by_class=None):
     """Sweep EXITED ``thoughtmachine.workspace_id``-labelled containers that
-    have been idle for at least ``max_age_s`` seconds.
+    have been idle past the TTL for their lifecycle class.
+
+    ``max_age_s_by_class`` maps a lifecycle class (``LIFECYCLE_EPHEMERAL`` /
+    ``LIFECYCLE_PERSISTENT`` / ``LIFECYCLE_RESOURCE`` / ``LIFECYCLE_SERVICE``)
+    to its idle TTL in seconds.  When it is ``None`` the per-class defaults are
+    used: ephemeral containers are reclaimed quickly (15 min) because they are
+    cheap and expected to be re-created on demand, while every owning class
+    keeps the historical 24 h retention.  Any class missing from the map falls
+    back to the flat ``max_age_s`` (default 24 h).
+
+    ``max_age_s`` remains the flat fallback TTL.  Callers that need to force
+    ONE TTL on EVERY class (e.g. the ``THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S``
+    debug knob in ``web_ui/backend/server.py``) must pass a ``max_age_s_by_class``
+    that names every class -- a bare ``max_age_s`` cannot override the defaults.
 
     Two branches share the same predicate (``status == 'exited'`` AND idle
-    age ``>= max_age_s``):
+    age ``>= ttl-for-class``):
     - registered workspaces -> idle/TTL branch (``removed_registered``)
     - unregistered workspaces -> orphan branch (``removed_orphan``)
     Resource containers (``thoughtmachine.resource`` label) are ALWAYS
@@ -4331,6 +4346,17 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
         "removed_orphan": 0,
         "removed_containers": [],
     }
+
+    if max_age_s_by_class is None:
+        # Per-class default idle TTLs (seconds). Ephemeral containers are cheap
+        # and expected to be re-created on demand, so they are reclaimed
+        # quickly; every owning class keeps the historical 24 h retention.
+        max_age_s_by_class = {
+            LIFECYCLE_EPHEMERAL: 900,
+            LIFECYCLE_PERSISTENT: 86400,
+            LIFECYCLE_RESOURCE: 86400,
+            LIFECYCLE_SERVICE: 86400,
+        }
 
     if registered_workspace_ids is not None and len(registered_workspace_ids) == 0:
         # Empty registry -> nothing can be classified as "registered"; wiping
@@ -4397,7 +4423,9 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
         if ts > now:
             _note_skip("FinishedAt in future")
             continue
-        if now - ts < max_age_s:
+        cls = _container_lifecycle_class(container)
+        ttl = max_age_s_by_class.get(cls, max_age_s)
+        if now - ts < ttl:
             _note_skip("too young")
             continue
 

@@ -2144,7 +2144,8 @@ class WebAgentBridge:
     def close_session(self, session_id: Optional[str] = None) -> None:
         """
         Save session, remove from open sessions list, and stop the bridge.
-        This is the complete "close tab" sequence.
+        This is the session/bridge close sequence, NOT a complete "close tab"
+        teardown: workspace-scoped containers are left running.
         Persistence cleanup is delegated to SessionManager.
 
         Args:
@@ -2169,6 +2170,9 @@ class WebAgentBridge:
             # Containers are now workspace-scoped (thoughtmachine.workspace_id
             # label) and survive session close; workspace cleanup is handled
             # by cleanup_workspace() when a workspace is decommissioned.
+            # They are NOT leaked, though: the periodic container sweep
+            # reclaims EXITED ephemeral containers at their lifecycle-class
+            # TTL, and any container still left is reclaimed on decommission.
 
         # Gracefully stop any worker threads spawned during this session
         if shutdown_workers is not None:
