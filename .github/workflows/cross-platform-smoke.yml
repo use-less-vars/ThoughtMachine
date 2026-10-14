@@ -17,6 +17,11 @@
 #     scripts/smoke_windows.ps1 boots the backend the same way the Windows
 #     launcher does (python -m web_ui.backend.server) and polls
 #     GET http://127.0.0.1:8000/api/health until HTTP 200, then stops it.
+#
+#   * macos-launcher (macos-latest): a GATING preflight asserting the LAUNCHER
+#     class of macOS code paths (ss-absent lsof port fallback, Darwin skip for
+#     Linux-only tools, doctor naming its Docker verdict). The SUBSTRATE class
+#     (Docker Desktop + VirtioFS host integration) is a NAMED GAP, not asserted.
 #===============================================================================
 name: Cross-Platform Smoke
 
@@ -66,8 +71,17 @@ jobs:
       # lib_missing / permission problems only WARN in --check-only mode
       # (the project supports a docker-less degraded mode), so this proves
       # the checks that matter: tools, venv, ports, Node.js, vault.
-      - name: Run ./start_thoughtmachine.sh --check-only
-        run: bash start_thoughtmachine.sh --check-only
+      #
+      # NON-VACUITY (Part A): capture the run and prove the [2/8] Docker step
+      # actually RESOLVED. `set -o pipefail` is REQUIRED so a non-zero launcher
+      # rc is not swallowed by the pipe into tee. The default assertion mode
+      # requires Docker to be USABLE (this runner ships a live daemon => the
+      # [2/8] section must carry "      ok." and emit no Docker WARNING).
+      - name: Run ./start_thoughtmachine.sh --check-only (non-vacuous)
+        run: |
+          set -o pipefail
+          bash start_thoughtmachine.sh --check-only 2>&1 | tee /tmp/tm-check-only.log
+          bash scripts/assert_check_only_not_vacuous.sh /tmp/tm-check-only.log
 
       # Boot the real backend exactly like start_thoughtmachine.sh does
       # (.venv/bin/python -m web_ui.backend.server), poll GET /api/health
@@ -215,3 +229,130 @@ jobs:
         run: |
           # Polls GET http://127.0.0.1:8000/api/health until HTTP 200 (inside the script), then stops the backend.
           powershell -ExecutionPolicy Bypass -File scripts\smoke_windows.ps1
+
+  #---------------------------------------------------------------------------
+  # Job C - macOS launcher preflight (GATING: deliberately NO continue-on-error).
+  #
+  # CLASS BOUNDARY - this job asserts the LAUNCHER class only: the macOS code
+  # paths inside start_thoughtmachine.sh / scripts/doctor_checks.py, i.e.
+  #   (i)   the port check falls back to `lsof` when `ss` is absent
+  #         (doctor_checks.py:142-180, lsof branch :160, cannot-verify :165);
+  #   (ii)  the Darwin branch skips the Linux-only tool requirements
+  #         (start_thoughtmachine.sh:197-209, skip echo :199); and
+  #   (iii) `doctor --check-docker` NAMES its Docker verdict in its own terms
+  #         (doctor_checks.py:115-139).
+  # It does NOT assert the SUBSTRATE class (Docker Desktop + VirtioFS host
+  # integration): that is environment-/licence-dependent and stays with the
+  # advisory macos-docker-probe in platform-matrix.yml.
+  # A fourth assertion (iv) - `--check-only` reaching [8/8] with rc 0 - is
+  # OMITTED on purpose: it hinges on the [1/8] venv, [5/8] node, [6/8] vault
+  # and [7/8] locale checks, which cannot be proven deterministically from
+  # code alone, so shipping it GATING would risk a flaky RED.
+  #---------------------------------------------------------------------------
+  macos-launcher:
+    name: macOS launcher preflight (gating)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (3.12)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # (i) `ss` is iproute2 = Linux-only; on macOS the port check MUST use the
+      # lsof fallback and still reach a DEFINITIVE verdict (not "cannot verify").
+      - name: '[macOS launcher] port check uses the lsof fallback'
+        run: |
+          set -euo pipefail
+          # Collision-proof: pick a random high port (49152-65535) instead of a
+          # fixed one, so a busy/tested 58214 can never turn this into a flaky RED.
+          PORT="$(( (RANDOM % 16384) + 49152 ))"
+          if command -v ss >/dev/null 2>&1; then echo "::error::ss unexpectedly present on macOS - cannot prove the lsof fallback"; exit 1; fi
+          if ! command -v lsof >/dev/null 2>&1; then echo "::error::lsof absent too - the ss-less port check has no resolver to fall back to"; exit 1; fi
+          OUT="$(python3 scripts/doctor_checks.py --check-port "$PORT")" && RC=0 || RC=$?
+          echo "doctor --check-port $PORT (rc=$RC): $OUT"
+          printf '%s' "$OUT" | python3 -c '
+          import json, sys
+          port = sys.argv[1]
+          d = json.load(sys.stdin)
+          detail = d.get("detail", "")
+          free = "port %s is free" % port
+          in_use = "%s is in use by " % port  # real string: "%d is in use by %s" % (port, proc)
+          # RED if doctor_checks.py:160-165 lsof fallback is removed: the whole
+          # verdict then degrades to the :165 cannot-verify string.
+          assert "cannot verify" not in detail, "unresolved port verdict: %r" % detail
+          assert "Neither ss nor lsof" not in detail, "lsof fallback did not fire: %r" % detail
+          assert str(port) in detail, "port %s not named in detail: %r" % (port, detail)
+          assert detail == free or detail.startswith(in_use), "unexpected detail: %r" % detail
+          if detail == free:
+              assert d.get("ok") is True, "free port must be ok=true: %r" % d
+              print("OK lsof fallback resolved: ok=true detail=%r" % detail)
+          else:
+              assert d.get("ok") is False, "in-use port must be ok=false: %r" % d
+              print("OK lsof fallback resolved (port in use): ok=false detail=%r" % detail)
+          ' "$PORT"
+
+      # (ii) `ss` is a CRITICAL tool in doctor --check-tools (doctor_checks.py:
+      # 444-450) and iproute2 is never present on macOS, so --check-tools exits
+      # non-zero => TOOLS_RC != 0 => the Darwin branch (start_thoughtmachine.sh:
+      # 197-199) fires. The skip echo is emitted at :194-199, BEFORE [1/8], so
+      # this is deterministic regardless of any later failing check.
+      #
+      # We START the launcher in the background and POLL for the skip marker
+      # rather than run it to completion: on macOS [1/8] may perform a real venv
+      # creation + pip install, which is slow and irrelevant here. The marker is
+      # emitted BEFORE any [N/8] banner, so polling it is fast and exact.
+      - name: '[macOS launcher] Darwin skip for Linux-only tool requirements fires'
+        run: |
+          set -euo pipefail
+          TOOLS_JSON="$(python3 scripts/doctor_checks.py --check-tools)" && TRC=0 || TRC=$?
+          echo "doctor --check-tools (rc=$TRC): $TOOLS_JSON"
+          printf '%s' "$TOOLS_JSON" | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d.get("ok") is False, "expected ok=false on macOS (ss missing): %r" % d
+          assert "ss" in d.get("critical_missing", []), "ss not critical-missing: %r" % d.get("critical_missing")
+          print("OK precondition: check-tools ok=false, critical_missing includes ss -> TOOLS_RC!=0")
+          '
+          [ "$TRC" -ne 0 ] || { echo "::error::--check-tools returned 0 on macOS - Darwin skip would NOT fire"; exit 1; }
+          MARKER='macOS detected - skipping Linux-only tool requirements.'
+          LOG=/tmp/tm-macos-start.log
+          bash start_thoughtmachine.sh --check-only > "$LOG" 2>&1 &
+          LAUNCH_PID=$!
+          SEEN=0
+          for _ in $(seq 1 60); do
+            if grep -Fq "$MARKER" "$LOG" 2>/dev/null; then SEEN=1; break; fi
+            if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          kill "$LAUNCH_PID" 2>/dev/null || true
+          wait "$LAUNCH_PID" 2>/dev/null || true
+          if [ "$SEEN" -ne 1 ]; then
+            echo "::error::Darwin skip line (start_thoughtmachine.sh:199) missing - launcher aborted early or never emitted it"
+            tail -n 40 "$LOG" || true
+            exit 1
+          fi
+          echo "OK: start_thoughtmachine.sh:199 fired on macOS: $MARKER"
+
+      # (iii) Without Docker Desktop, `doctor --check-docker` must not be silent:
+      # it NAMES the verdict (reason in permission_denied|daemon_down|lib_missing|
+      # other) with a non-empty detail. Tolerant if Docker IS usable.
+      - name: '[macOS launcher] doctor names Docker unusable in its own terms'
+        run: |
+          set -euo pipefail
+          D_JSON="$(python3 scripts/doctor_checks.py --check-docker)" && DRC=0 || DRC=$?
+          echo "doctor --check-docker (rc=$DRC): $D_JSON"
+          printf '%s' "$D_JSON" | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          ok = d.get("ok"); reason = d.get("reason"); detail = d.get("detail", "")
+          if ok is True:
+              assert detail == "docker info succeeded", "Docker claimed usable but detail=%r" % detail
+              print("OK: Docker present and named usable (detail=%r)" % detail)
+          else:
+              assert reason in ("permission_denied","daemon_down","lib_missing","other"), "Docker unusable but no NAME: %r" % d
+              assert detail, "Docker unusable but no detail: %r" % d
+              print("OK: doctor NAMED Docker unusable: reason=%r detail=%r" % (reason, detail[:80]))
+          '

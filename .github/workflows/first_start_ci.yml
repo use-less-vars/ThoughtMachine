@@ -66,7 +66,15 @@ jobs:
       # Full pre-launch gate: venv, docker (via mounted host socket + CLI),
       # ports 8000/5173, Node.js >= 18, ~/.thoughtmachine. Exits 0 only if
       # every check passes.
-      - name: Run ./start_thoughtmachine.sh --check-only
-        run: bash start_thoughtmachine.sh --check-only
-
-
+      #
+      # NON-VACUITY (Part A): capture the run and prove the [2/8] Docker step
+      # actually RESOLVED. `set -o pipefail` is REQUIRED so a non-zero launcher
+      # rc is not swallowed by the pipe into tee. This lane installs docker.io
+      # and talks to the host socket, so the default mode (Docker expected
+      # usable: "      ok." + no WARNING) is the right contract here.
+      - name: Run ./start_thoughtmachine.sh --check-only (non-vacuous)
+        shell: bash
+        run: |
+          set -o pipefail
+          bash start_thoughtmachine.sh --check-only 2>&1 | tee /tmp/tm-check-only.log
+          bash scripts/assert_check_only_not_vacuous.sh /tmp/tm-check-only.log
