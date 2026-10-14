@@ -3508,6 +3508,30 @@ class ContainerManager:
                         f"Vault requirements not found at {req_vault}. "
                         "Run the vault bootstrap to seed per-workspace requirements."
                     )
+                # Session container-grant gate: a build is agent-reachable, so
+                # refuse it when the session has no container access
+                # (fail-closed).
+                try:
+                    _computed = self._compute_config(
+                        self.workspace_path,
+                        getattr(self, "workspace_id", None),
+                        getattr(self, "session_permissions", None),
+                        LIFECYCLE_PERSISTENT,
+                        strict=True,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "refusing to build: session policy could not be resolved "
+                        f"({exc!r}); fix the session permission config and retry"
+                    ) from exc
+                if not (
+                    dict(getattr(_computed, "effective", None) or {})
+                ).get("container"):
+                    raise RuntimeError(
+                        "refusing to build: session container grant denied "
+                        "(read it in the session permission config: "
+                        "session_permissions['container'])"
+                    )
                 shutil.copy2(str(req_vault), os.path.join(tmpdir, "requirements.txt"))
                 staged = set(os.listdir(tmpdir))
                 if not staged <= {"Dockerfile", "requirements.txt"}:
@@ -3970,8 +3994,9 @@ class ContainerManager:
         PROPAGATES the resolution failure (re-raises / raises ``RuntimeError``)
         so the caller can tell "the policy genuinely resolved to none/ro" apart
         from "the policy could not be resolved at all".  Only the exec-path
-        drift admission passes ``strict=True``; every other caller keeps the
-        historical fail-closed behaviour byte-for-byte.
+        drift admission and the ``build_image`` session container-grant gate
+        pass ``strict=True``; every other caller keeps the historical
+        fail-closed behaviour byte-for-byte.
         """
         if lifecycle_class is None:
             raise UnknownLifecycleClass(

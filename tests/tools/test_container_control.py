@@ -121,6 +121,22 @@ def seed_vault_requirements(vault_root, workspace_id="default"):
     return SeededVaultRequirements(path=path, data=data)
 
 
+def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="default"):
+    """Seed a fully-permissive workspace ``capabilities.json`` for
+    ``workspace_id`` so ``ContainerManager.build_image``'s session
+    container-grant gate admits the build.
+
+    The gate routes through ``ContainerManager._compute_config``, which reads
+    the workspace capabilities from the GLOBAL vault root (honouring
+    ``THOUGHTMACHINE_VAULT_ROOT``), so the capabilities file is seeded under a
+    dedicated tmp vault root via ``ensure_workspace_dirs``.
+    """
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "caps-vault"))
+    from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+    ensure_workspace_dirs(workspace_id)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ContainerManager.list_containers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -322,6 +338,9 @@ class TestContainerManagerBuildImage:
         manager.workspace_path = ws_path
         manager.vault_root = vault_root
         manager.workspace_id = workspace_id
+        # Grant the session container access so build_image's session
+        # container-grant gate admits the build (fail-closed otherwise).
+        manager.session_permissions = {"container": True}
         return manager
 
     @staticmethod
@@ -333,8 +352,9 @@ class TestContainerManagerBuildImage:
         return dex
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_build_success_with_auto_tag_and_exact_keys(self, tmp_path):
+    def test_build_success_with_auto_tag_and_exact_keys(self, tmp_path, monkeypatch):
         """Dockerfile present, tag omitted -> auto-tag; result has EXACT keys."""
+        _seed_ws_capabilities(monkeypatch, tmp_path, "default")
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -381,8 +401,9 @@ class TestContainerManagerBuildImage:
         mock_load.assert_not_called()
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_vault_dockerfile_with_explicit_tag(self, tmp_path):
+    def test_vault_dockerfile_with_explicit_tag(self, tmp_path, monkeypatch):
         """Explicit tag + vault Dockerfile -> used as-is, auto-tag skipped."""
+        _seed_ws_capabilities(monkeypatch, tmp_path, "default")
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -405,8 +426,9 @@ class TestContainerManagerBuildImage:
         dex._compute_image_tag.assert_not_called()
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_build_log_truncated_at_100kb(self, tmp_path):
+    def test_build_log_truncated_at_100kb(self, tmp_path, monkeypatch):
         """Build log > EXEC_OUTPUT_LIMIT_BYTES (100 KiB) -> truncated + notice."""
+        _seed_ws_capabilities(monkeypatch, tmp_path, "default")
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -425,8 +447,9 @@ class TestContainerManagerBuildImage:
         assert len(result["build_log"]) <= EXEC_OUTPUT_LIMIT_BYTES + len(_TRUNCATION_NOTICE)
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_build_failure_raises_runtime_error(self, tmp_path):
+    def test_build_failure_raises_runtime_error(self, tmp_path, monkeypatch):
         """_run_image_build raising -> RuntimeError propagates unchanged."""
+        _seed_ws_capabilities(monkeypatch, tmp_path, "default")
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -454,13 +477,14 @@ class TestContainerManagerBuildImage:
         mock_load.assert_not_called()  # planted file ignored, no build attempted
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_build_image_context_excludes_workspace_files(self, tmp_path):
+    def test_build_image_context_excludes_workspace_files(self, tmp_path, monkeypatch):
         """Security: build context contains ONLY the vault Dockerfile.
 
         The resolved vault Dockerfile is copied into a temporary build
         directory; the workspace tree (with sensitive_file.txt) is never part
         of the build context.
         """
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
         vault_root = tmp_path / "vault"
         vault_ws = vault_root / "workspaces" / "ws-1"
         vault_ws.mkdir(parents=True)
@@ -506,8 +530,9 @@ class TestContainerManagerBuildImage:
         assert (ws / "sensitive_file.txt").exists()  # workspace file untouched
 
     @patch("infra.container_manager.DOCKER_AVAILABLE", True)
-    def test_build_image_tempdir_cleaned_up(self, tmp_path):
+    def test_build_image_tempdir_cleaned_up(self, tmp_path, monkeypatch):
         """Temporary build directory is removed after a successful build."""
+        _seed_ws_capabilities(monkeypatch, tmp_path, "default")
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         before = set(glob.glob(os.path.join(tempfile.gettempdir(), "tm_build_*")))
         mock_client = MagicMock()
