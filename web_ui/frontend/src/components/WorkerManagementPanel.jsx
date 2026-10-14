@@ -307,7 +307,7 @@ const formRow = {
   marginBottom: '0.6rem',
 };
 
-function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemplate }) {
+export function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemplate }) {
   const isEdit = !!worker && !isCreateFromTemplate;
   const [name, setName] = useState(worker?.name || '');
   const [description, setDescription] = useState(worker?.description || '');
@@ -319,9 +319,9 @@ function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemp
     worker?.permission_footprint ? JSON.stringify(worker.permission_footprint, null, 2) : '{}'
   );
   const [timeoutSeconds, setTimeoutSeconds] = useState(worker?.timeout_seconds ?? '');
-  const [maxContextTokens, setMaxContextTokens] = useState(worker?.max_context_tokens ?? '');
+  const [maxContextTokens, setMaxContextTokens] = useState(worker?.max_tokens ?? '');
   const [warningThresholdTokens, setWarningThresholdTokens] = useState(worker?.warning_threshold_tokens ?? '');
-  const [turnLimit, setTurnLimit] = useState(worker?.turn_limit ?? '');
+  const [turnLimit, setTurnLimit] = useState(worker?.max_turns ?? '');
   const [temperature, setTemperature] = useState(worker?.temperature ?? '');
   const [saveError, setSaveError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -368,9 +368,9 @@ function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemp
 
     // Only include optional fields if they have a value
     if (timeoutSeconds !== '') payload.timeout_seconds = Number(timeoutSeconds);
-    if (maxContextTokens !== '') payload.max_context_tokens = Number(maxContextTokens);
+    if (maxContextTokens !== '') payload.max_tokens = Number(maxContextTokens);
     if (warningThresholdTokens !== '') payload.warning_threshold_tokens = Number(warningThresholdTokens);
-    if (turnLimit !== '') payload.turn_limit = Number(turnLimit);
+    if (turnLimit !== '') payload.max_turns = Number(turnLimit);
     if (temperature !== '') payload.temperature = Number(temperature);
 
     onSave(payload, isEdit);
@@ -869,9 +869,9 @@ export default function WorkerManagementPanel({
       tools: template.tools || [],
       permission_footprint: template.permission_footprint || {},
       timeout_seconds: template.timeout_seconds,
-      max_context_tokens: template.max_context_tokens,
+      max_tokens: template.max_tokens,
       warning_threshold_tokens: template.warning_threshold_tokens,
-      turn_limit: template.turn_limit,
+      max_turns: template.max_turns,
       temperature: template.temperature,
     });
     setShowForm(true);
