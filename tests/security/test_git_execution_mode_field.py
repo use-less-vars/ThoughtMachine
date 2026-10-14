@@ -28,6 +28,7 @@ _EXPECTED_NAMES = {
     "jtag",
     "network",
     "mcp",
+    "ci",
 }
 _EXECUTION_MODES = {"container", "host"}
 

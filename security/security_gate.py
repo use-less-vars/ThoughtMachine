@@ -93,6 +93,7 @@ _DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
     "git": "banned",
     "network": "banned",
     "mcp": "banned",
+    "ci": "banned",
 }
 
 
@@ -581,6 +582,7 @@ def _merge_with_capabilities(
         "git": git,
         "mcp": session.mcp,
         "host_bash": session.host_bash,
+        "ci": getattr(session, "ci", "banned"),
     }
 
 

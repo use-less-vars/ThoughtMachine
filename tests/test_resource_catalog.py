@@ -35,6 +35,7 @@ def test_canonical_resource_keys_match_catalog():
     assert canonical_resource_keys == set(RESOURCE_CATALOG)
     assert canonical_resource_keys == {
         "git", "filesystem", "container", "network", "mcp", "host_bash",
+        "ci",
     }
 
 

@@ -36,7 +36,7 @@ _WORKSPACE_ID = "ws-failclosed"
 _SESSION_ID = "sess-failclosed"
 _MIRROR = {"network": "write", "filesystem": "write"}
 
-#: The deny-all 6-key effective profile a disk read failure must produce.
+#: The deny-all 7-key effective profile a disk read failure must produce.
 _ALL_BANNED = {
     "filesystem": "banned",
     "network": "banned",
@@ -44,6 +44,7 @@ _ALL_BANNED = {
     "git": "banned",
     "mcp": "banned",
     "host_bash": "banned",
+    "ci": "banned",
 }
 
 

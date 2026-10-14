@@ -120,6 +120,7 @@ RESOURCE_CATALOG = {
     "network": ["banned", "ask", "write", "outbound"],
     "mcp": ["banned", "connect", "full"],
     "host_bash": ["banned", "ask", "allow"],
+    "ci": ["banned", "read"],
 }
 
 #: Set of canonical resource keys (for membership checks / introspection).
@@ -193,6 +194,7 @@ WORKSPACE_CEILING_VOCAB: Dict[str, tuple] = {
     "network": ("banned", "ask", "write", "outbound"),
     "mcp": ("banned", "connect", "full"),
     "host_bash": ("banned", "ask", "allow"),
+    "ci": ("banned", "read"),
 }
 
 #: Git-grain *breadth* ranks (broader grant = SMALLER number), consumed by

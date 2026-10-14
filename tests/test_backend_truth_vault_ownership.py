@@ -30,6 +30,7 @@ _CANONICAL_PERMISSION_FIELDS = {
     "git",
     "mcp",
     "host_bash",
+    "ci",
 }
 
 
@@ -51,7 +52,7 @@ class TestGitAllowWorktreeCommitsMigration:
     def test_legacy_flag_is_not_a_field_anymore(self):
         assert 'git_allow_worktree_commits' not in AgentConfig.model_fields
         assert 'git_allow_worktree_commits' not in SessionConfig.model_fields
-        # The canonical session-permission model has exactly the six fields;
+        # The canonical session-permission model has exactly the seven fields;
         # the split git_write grain is a tool name, not a permission field.
         assert set(SessionPermissions.model_fields) == _CANONICAL_PERMISSION_FIELDS
 

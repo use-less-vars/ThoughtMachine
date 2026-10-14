@@ -110,8 +110,8 @@ class SessionPermissions(BaseModel):
     Maps to the permission system used by
     ``tool_executor._check_permissions()``:
 
-    The canonical session permission categories are exactly six:
-    ``container | network | filesystem | git | mcp | host_bash``.
+    The canonical session permission categories are exactly seven:
+    ``container | network | filesystem | git | mcp | host_bash | ci``.
 
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
@@ -151,6 +151,10 @@ class SessionPermissions(BaseModel):
     host_bash: Literal['banned', 'ask', 'allow'] = Field(
         default='banned',
         description='Supervised host shell access level.',
+    )
+    ci: Literal['banned', 'read'] = Field(
+        default='banned',
+        description='CI monitoring (read-only) access level.',
     )
 
     @field_validator('network', mode='before')
@@ -214,6 +218,7 @@ _SAFE_DEFAULT_LEVELS: Dict[str, Any] = {
     "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
+    "ci": "banned",
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
     key: _SAFE_DEFAULT_LEVELS[key] for key in RESOURCE_CATALOG

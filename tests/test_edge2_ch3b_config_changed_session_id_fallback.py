@@ -61,6 +61,7 @@ CANONICAL_KEYS = {
     "host_bash",
     "mcp",
     "network",
+    "ci",
 }
 
 DENY_ALL = {
@@ -70,6 +71,7 @@ DENY_ALL = {
     "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
+    "ci": "banned",
 }
 
 # The real, gate-computed, ceiling-capped profile the six sites must be able to
@@ -84,6 +86,7 @@ EXPECTED_REAL_PROFILE = {
     "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
+    "ci": "banned",
 }
 
 SERVER_PATH = _ROOT / "web_ui" / "backend" / "server.py"

@@ -40,6 +40,8 @@ _ALL_TOOLS = [
     # Git
     "git_read",
     "git_write",
+    # CI (read-only GitHub Actions monitor; gated by the ci:read permission)
+    "ci_read",
     # Host execution (gated by the host_bash permission grain)
     "host_bash",
     # Execution

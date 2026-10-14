@@ -30,7 +30,7 @@ from security.security_gate import get_effective_permissions
 # merge below never downgrades beyond what the disk ceiling/grants dictate.
 _FULL_CAPS = WorkspaceCapabilities()
 
-# The fail-closed six-key shape produced by a deny-all session + deny-all
+# The fail-closed seven-key shape produced by a deny-all session + deny-all
 # ceiling merged with the fully-permissive workspace caps.
 ALL_BANNED = {
     "container": False,
@@ -39,6 +39,7 @@ ALL_BANNED = {
     "git": "banned",
     "mcp": "banned",
     "host_bash": "banned",
+    "ci": "banned",
 }
 
 
