@@ -7,10 +7,15 @@ otherwise reach the network, so NO live request is ever made.  The captured URL
 and headers are asserted to prove the containment posture: exactly one request
 per call, and NO ``Authorization``/token is ever sent.
 
-Registration tests pin the intended posture: ``ci_read`` is a first-class tool
-(``TOOL_CLASSES`` / ``SIMPLIFIED_TOOL_CLASSES``) but is deliberately absent from
-the ``AGENT_TOOLS`` and ``ENGINEER_TOOLS`` default presets -- so it is never
-enabled by default and still requires an explicit ``ci:read`` grant.
+Registration tests pin the REAL posture: ``ci_read`` is a first-class tool
+(``TOOL_CLASSES`` / ``SIMPLIFIED_TOOL_CLASSES``) and is deliberately absent from
+the ``AGENT_TOOLS`` / ``ENGINEER_TOOLS`` presets.  That omission does NOT make it
+default-off: the default ``enabled_tools`` is derived from
+``SIMPLIFIED_TOOL_CLASSES`` (agent/config/models.py default_factory), which
+contains ``ci_read``, so the preset omission alone does not exclude it from the
+derived default.  The default-off guard lives in the permission layer: the
+``ci`` grain defaults to ``banned``, so the read is denied fail-closed until a
+session grants ``ci:read``.
 """
 
 import sys
@@ -322,8 +327,10 @@ def test_ci_read_in_simplified_toolset():
     # builds the runtime tool set EXCLUSIVELY from SIMPLIFIED_TOOL_CLASSES
     # (models.py:302 `tool_classes = list(SIMPLIFIED_TOOL_CLASSES)`), so a class
     # only in TOOL_CLASSES could never be instantiated/executed in any mode --
-    # excluding it here would be dead code.  Default-off posture is instead
-    # enforced by leaving "ci_read" out of AGENT_TOOLS/ENGINEER_TOOLS below.
+    # excluding it here would be dead code.  NOTE: this same list is what the
+    # default `enabled_tools` is derived from (see
+    # test_ci_read_default_enablement_is_not_never below).  The default-off
+    # guard is the ci:banned permission default, NOT the AGENT/ENGINEER presets.
     assert CiReadTool in SIMPLIFIED_TOOL_CLASSES
 
 
@@ -332,8 +339,71 @@ def test_ci_read_absent_from_default_presets():
     assert "ci_read" not in ENGINEER_TOOLS
 
 
+def test_ci_read_default_enablement_is_not_never():
+    # Pin the REAL posture (there is no "never enabled by default" property):
+    # the default `enabled_tools` is derived from SIMPLIFIED_TOOL_CLASSES
+    # (agent/config/models.py default_factory), which contains ci_read; the
+    # AGENT/ENGINEER presets only omit it for those two modes.  The genuine
+    # default-off guard is the ci:banned permission default (asserted at the
+    # end), NOT the preset omission.
+    #
+    # We assert the derivation list directly rather than
+    # ``AgentConfig(mode="custom").enabled_tools``: models.py binds
+    # ``from tools import SIMPLIFIED_TOOL_CLASSES`` while ``tools/__init__``
+    # REASSIGNS that global late, so under the pytest import order (models
+    # reached via the agent.config.defaults -> agent.config.models -> tools
+    # cycle) models can capture the pre-population [] and the custom-mode
+    # default comes out empty.  That import-order fragility is a separate
+    # latent issue; the robust, order-independent fact pinned here is that
+    # ci_read IS part of the SIMPLIFIED_TOOL_CLASSES-derived default.
+    from agent.config.models import AgentConfig
+
+    derived_default = [cls.tool_name() for cls in SIMPLIFIED_TOOL_CLASSES]
+    assert "ci_read" in derived_default
+
+    # `mode` defaults to "agent", whose preset omits ci_read (a stock config).
+    assert AgentConfig().mode == "agent"
+    assert "ci_read" not in AgentConfig().enabled_tools
+    assert "ci_read" not in AgentConfig(mode="engineer").enabled_tools
+
+    # ...yet the read is still denied fail-closed until ci:read is granted.
+    ok, _ = check_required_categories(
+        CiReadTool.get_required_categories(),
+        _eff(),
+        "CiReadTool",
+        {},
+        "read ci",
+        event_bus=None,
+    )
+    assert ok is False
+
+
 def test_ci_read_in_canonical_all_tools():
     assert "ci_read" in _ALL_TOOLS
+
+
+def test_ci_read_not_in_worker_blocklist():
+    # Pin the INTENDED posture: ci_read is advertised to default workers.
+    # _WORKER_BLOCKLIST is a frozenset of CLASS NAMES ("Worker", "CheckSystem",
+    # "KnowledgeBaseTool") -- see tools/workspace/worker_thread.py:621 -- so the
+    # key form is cls.__name__ (NOT tool_name()): the call sites are
+    # `cls.__name__ not in _WORKER_BLOCKLIST` (lines 1624/1628/4031).
+    from tools.workspace.worker_thread import _WORKER_BLOCKLIST
+
+    # Class-name form: ci_read is NOT hard-blocked for workers.
+    assert CiReadTool.__name__ not in _WORKER_BLOCKLIST
+
+    # Mirror the default-worker derivation verbatim
+    # (tools/workspace/worker_thread.py:1626-1628):
+    #   from tools import SIMPLIFIED_TOOL_CLASSES
+    #   enabled_tools = [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES
+    #                    if cls.__name__ not in _WORKER_BLOCKLIST]
+    # -> ci_read is part of the tool set a default worker is advertised.
+    default_worker_tools = [
+        cls for cls in SIMPLIFIED_TOOL_CLASSES
+        if cls.__name__ not in _WORKER_BLOCKLIST
+    ]
+    assert CiReadTool in default_worker_tools
 
 
 def test_ci_read_openai_schema_name():

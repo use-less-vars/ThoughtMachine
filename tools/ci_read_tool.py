@@ -32,6 +32,17 @@ gate: ``get_required_categories`` returns ``["ci:read"]``, checked by
 ``security_gate.check_required_categories`` against the effective session
 permissions (session grant ``ci: read`` allows it; the default ``ci: banned``
 denies it).
+
+Enablement posture
+------------------
+``ci_read`` is registered (``TOOL_CLASSES`` / ``SIMPLIFIED_TOOL_CLASSES``) and
+deliberately absent from the ``AGENT_TOOLS`` / ``ENGINEER_TOOLS`` presets, but it
+is NOT "never enabled by default": ``mode`` defaults to ``"agent"`` (so a stock
+config omits it), but the default ``enabled_tools`` is derived from
+``SIMPLIFIED_TOOL_CLASSES``, which contains ``ci_read`` -- the preset omission
+alone does not exclude it from that derived default.  The default-off guard for
+the capability is the ``ci`` permission grain defaulting to ``banned`` (see
+"Permission model" above).
 """
 
 from typing import ClassVar, List, Literal, Optional, Tuple
