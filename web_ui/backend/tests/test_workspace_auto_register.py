@@ -181,10 +181,14 @@ class TestAutoRegisterIdempotent:
         # Both should have all bootstrap files
         for ws_id in (ws_id_1, ws_id_2):
             ws_dir = _workspace_dir(ws_id)
-            expected_files = _bootstrap_file_names() | {"config.json"}
+            # Superset check — the exact-set form caught the CATALOG_DEFAULTS drift (#108),
+            # but that class is now covered by the testpaths extension (Wave 7b); this
+            # test asserts presence, not exactness.
+            required_files = _bootstrap_file_names() | {"config.json"}
             actual_files = {f.name for f in ws_dir.iterdir() if f.is_file()}
-            assert expected_files == actual_files, \
-                f"Workspace {ws_id} has unexpected file set: {actual_files}"
+            missing_files = required_files - actual_files
+            assert not missing_files, \
+                f"Workspace {ws_id} missing bootstrap files: {missing_files}"
 
     def test_ensure_workspace_dirs_idempotent(self, fake_home, project_root):
         """
@@ -266,12 +270,15 @@ class TestMultipleWorkspaces:
         ws_id_a = _simulate_auto_register(root_a)
         ws_id_b = _simulate_auto_register(root_b)
 
-        expected = _bootstrap_file_names() | {"config.json"}
-
+        # Superset check — the exact-set form caught the CATALOG_DEFAULTS drift (#108),
+        # but that class is now covered by the testpaths extension (Wave 7b); this
+        # test asserts presence, not exactness.
+        required = _bootstrap_file_names() | {"config.json"}
         for ws_id in (ws_id_a, ws_id_b):
             actual = {f.name for f in _workspace_dir(ws_id).iterdir() if f.is_file()}
-            assert actual == expected, \
-                f"Workspace {ws_id}: expected {expected}, got {actual}"
+            missing = required - actual
+            assert not missing, \
+                f"Workspace {ws_id}: missing {missing} (got {actual})"
 
     def test_worker_templates_in_both(self, fake_home, tmp_path):
         """Both workspaces should have the default worker in their workers.json.
