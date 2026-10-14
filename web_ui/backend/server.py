@@ -653,7 +653,7 @@ async def lifespan(app: FastAPI):
         from agent.config import AgentConfig
         from agent.logging import create_logger
 
-        agent_logger = create_logger(AgentConfig())
+        agent_logger = create_logger(AgentConfig(enable_file_logging=False))
     except Exception as exc:
         agent_logger = None
         log('WARNING', 'server', f'Agent logger creation skipped: {exc}')
