@@ -74,14 +74,14 @@ jobs:
       #
       # NON-VACUITY (Part A): capture the run and prove the [2/8] Docker step
       # actually RESOLVED. `set -o pipefail` is REQUIRED so a non-zero launcher
-      # rc is not swallowed by the pipe into tee. The default assertion mode
-      # requires Docker to be USABLE (this runner ships a live daemon => the
-      # [2/8] section must carry "      ok." and emit no Docker WARNING).
+      # rc is not swallowed by the pipe into tee. This runner ships a live
+      # Docker daemon, so --expect-docker is the right contract here: the [2/8]
+      # section must carry "      ok." and emit no Docker WARNING.
       - name: Run ./start_thoughtmachine.sh --check-only (non-vacuous)
         run: |
           set -o pipefail
           bash start_thoughtmachine.sh --check-only 2>&1 | tee /tmp/tm-check-only.log
-          bash scripts/assert_check_only_not_vacuous.sh /tmp/tm-check-only.log
+          bash scripts/assert_check_only_not_vacuous.sh --expect-docker /tmp/tm-check-only.log
 
       # Boot the real backend exactly like start_thoughtmachine.sh does
       # (.venv/bin/python -m web_ui.backend.server), poll GET /api/health

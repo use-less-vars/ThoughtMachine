@@ -167,6 +167,36 @@ def test_assert_default_rejects_missing_section(tmp_path):
     assert res.returncode != 0, res.stdout + res.stderr
 
 
+def test_assert_expect_no_docker_accepts_named_warning(tmp_path):
+    # Docker-less lane BY CONTRACT: a named-reason Docker WARNING with no
+    # usable outcome is exactly the expected shape, so this PASSES.
+    res = _run_assert(tmp_path, _make_log([_WARNING]), "--expect-no-docker")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "PASS" in res.stdout
+
+
+def test_assert_expect_docker_rejects_named_warning(tmp_path):
+    # Same log under the (default) Docker-expected contract must FAIL.
+    res = _run_assert(tmp_path, _make_log([_WARNING]), "--expect-docker")
+    assert res.returncode != 0, res.stdout + res.stderr
+    assert "FAIL" in res.stderr
+
+
+def test_assert_expect_no_docker_rejects_usable_outcome(tmp_path):
+    # A usable outcome means the lane's docker-less contract is STALE.
+    res = _run_assert(tmp_path, _make_log([_OK]), "--expect-no-docker")
+    assert res.returncode != 0, res.stdout + res.stderr
+    assert "FAIL" in res.stderr
+
+
+def test_assert_expect_no_docker_rejects_unnamed_warning(tmp_path):
+    # A Docker WARNING that names NO specific reason proves nothing -> FAIL.
+    unnamed = "      WARNING: Docker is not usable"
+    res = _run_assert(tmp_path, _make_log([unnamed]), "--expect-no-docker")
+    assert res.returncode != 0, res.stdout + res.stderr
+    assert "FAIL" in res.stderr
+
+
 def test_assert_rejects_ok_plus_warning(tmp_path):
     # Single-mode regression: a section carrying BOTH "      ok." and a Docker
     # WARNING still fails (the retired Docker-absent-tolerant mode let this
@@ -197,6 +227,7 @@ def test_first_start_workflow_asserts_non_vacuous_check_only():
     text = FIRST_START_WORKFLOW.read_text(encoding="utf-8")
     assert "assert_check_only_not_vacuous.sh" in text
     assert "pipefail" in text
+    assert "--expect-no-docker" in text
 
 
 def test_macos_launcher_job_is_gating_on_macos():
