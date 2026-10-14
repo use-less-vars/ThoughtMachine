@@ -4505,13 +4505,14 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
     def _emit_summary():
         """Emit the once-per-invocation sweep summary (WARNING + audit).
 
-        WARNING is used deliberately: at boot no agent logger is attached
-        (``server.py`` never calls ``set_logger``), so an INFO line would be
-        dropped by the console gate (``msg_priority >= WARNING`` when
-        ``TM_LOG_TAGS`` is empty) and no agent sink would receive it.  WARNING
-        reaches stderr, which ``start_thoughtmachine.sh`` tees into
-        ``logs/backend_startup.log``.  Each emit is independently best-effort
-        and never raises.
+        WARNING is used deliberately: an INFO line would be dropped by the
+        console gate (``msg_priority >= WARNING`` when ``TM_LOG_TAGS`` is
+        empty), so it would not be printed to stderr.  WARNING reaches stderr,
+        which ``start_thoughtmachine.sh`` tees into
+        ``logs/backend_startup.log``.  (``server.py`` now calls ``set_logger``,
+        so an INFO line would also reach the agent sink -- but the console gate
+        still suppresses INFO on stderr, so WARNING stays the level visible on
+        boot.)  Each emit is independently best-effort and never raises.
         """
         try:
             log("WARNING", "docker.container_manager",

@@ -643,6 +643,34 @@ async def lifespan(app: FastAPI):
         log('WARNING', 'server', f'EventLogger startup skipped: {exc}')
         app.state.event_logger = None
 
+    # Register an agent logger with BOTH logging facades so the server process
+    # has the same registered-logger path the agent process has --
+    # agent/core/agent.py calls create_logger(config) and registers the result
+    # with agent.logging.unified (read back via _get_logger()) and
+    # thoughtmachine.security.set_logger.  Best-effort: each step is
+    # independently guarded and a failure must never break startup.
+    try:
+        from agent.config import AgentConfig
+        from agent.logging import create_logger
+
+        agent_logger = create_logger(AgentConfig(enable_file_logging=False))
+    except Exception as exc:
+        agent_logger = None
+        log('WARNING', 'server', f'Agent logger creation skipped: {exc}')
+    if agent_logger is not None:
+        try:
+            from agent.logging.unified import set_logger as unified_set_logger
+
+            unified_set_logger(agent_logger)
+        except Exception as exc:
+            log('WARNING', 'server', f'unified.set_logger skipped: {exc}')
+        try:
+            from thoughtmachine.security import set_logger as security_set_logger
+
+            security_set_logger(agent_logger)
+        except Exception as exc:
+            log('WARNING', 'server', f'security.set_logger skipped: {exc}')
+
     # Ensure user ~/.thoughtmachine/ defaults exist before any connection
     try:
         from thoughtmachine.bootstrap import ensure_user_defaults, get_version
