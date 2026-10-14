@@ -3360,9 +3360,19 @@ class ContainerManager:
         other workspaces — or unlabeled ones — never appear. ``note`` is the
         container's RECORD sticky note (a legacy container_notes.json sidecar is
         consulted read-only as a fallback when the container has no record).
-        Returns a list of dicts with EXACTLY: ``container_id``,
+        Returns a list of dicts with the 8 base keys ``container_id``,
         ``name``, ``image``, ``status``, ``uptime_seconds``, ``workspace_id``,
-        ``note``, ``labels``.
+        ``note``, ``labels`` — PLUS an OPTIONAL 9th key
+        ``unavailable_reason``, present ONLY when the row's isolation is MORE
+        permissive than the CALLING session's grant (the key is ABSENT when the
+        row is within bounds).
+
+        SESSION SCOPING: ephemeral rows (``class_of`` == ``LIFECYCLE_EPHEMERAL``)
+        are visible ONLY to the session that owns the container NAME
+        (``agent-exec-ephemeral-{ws}-{session_tag}-{env}``); the NAME is the sole
+        ownership vector (the worker label is never consulted). A manager whose
+        ``session_id`` is ``None`` (UI/dashboard) applies NO session filter, so
+        the workspace-wide listing is preserved.
         """
         try:
             containers = self.client.containers.list(
@@ -3373,12 +3383,35 @@ class ContainerManager:
             return []
 
         result = []
+        # Read the session id ONCE, defensively: hand-built managers that bypass
+        # __init__ (e.g. object.__new__(ContainerManager)) carry no ``session_id``
+        # attribute, and this method must NEVER raise. ``None`` => a session-less
+        # manager => no ephemeral filtering (workspace-wide listing).
+        session_id = getattr(self, "session_id", None)
+        # Ownership pattern for THIS session's ephemeral containers (NAME only;
+        # the worker label is deliberately NOT consulted).
+        owned_ephemeral_re = None
+        if session_id is not None:
+            owned_ephemeral_re = re.compile(
+                r"^agent-exec-ephemeral-[0-9a-f]{12}-"
+                + re.escape(_safe_session_tag(session_id))
+                + r"-[0-9a-f]{8}$"
+            )
         for container in containers:
             # Skip hidden resource containers (e.g. the git sandbox from
             # infra/resource_container_manager.py, label thoughtmachine.resource):
             # they carry the workspace_id label so cleanup_workspace sweeps them,
             # but must stay invisible to agent-facing listings.
-            if self._agent_access_denial(self.class_of(container)) is not None:
+            lifecycle_class = self.class_of(container)
+            if self._agent_access_denial(lifecycle_class) is not None:
+                continue
+            # Ephemeral rows are session-scoped: a manager WITH a session sees
+            # only the ephemeral containers it owns (matched by NAME).
+            if (
+                lifecycle_class == LIFECYCLE_EPHEMERAL
+                and owned_ephemeral_re is not None
+                and owned_ephemeral_re.match(container.name) is None
+            ):
                 continue
             # uptime: now - StartedAt (mirrors status()); None when missing/unparseable
             uptime_seconds = None
@@ -3399,7 +3432,7 @@ class ContainerManager:
             except Exception:
                 image = None
 
-            result.append({
+            row = {
                 "container_id": container.id,
                 "name": container.name,
                 "image": image,
@@ -3409,8 +3442,62 @@ class ContainerManager:
                                  or self.workspace_id),
                 "labels": dict(container.labels or {}),
                 "note": self._read_note(container),
-            })
+            }
+            # Envelope tag: PERSISTENT rows only, and only when this manager has
+            # a session (otherwise there is no session grant to compare against).
+            if session_id is not None and lifecycle_class == LIFECYCLE_PERSISTENT:
+                try:
+                    reason = self._session_envelope_unavailable_reason(container)
+                except Exception:
+                    reason = None
+                if reason is not None:
+                    row["unavailable_reason"] = reason
+            result.append(row)
         return result
+
+    def _session_envelope_unavailable_reason(self, container):
+        """Reason string when ``container`` is MORE permissive than this session.
+
+        Reuses the exec-drift envelope comparison (NEVER raises):
+
+        * live isolation via the module-level ``_exec_live_isolation`` (default
+          non-strict; returns ``(None, None)`` when unreadable);
+        * this session's wanted ``(network_mode, workspace_mode)`` via
+          ``_compute_config(..., LIFECYCLE_PERSISTENT)`` -- the SAME call shape
+          the enforcement path uses (``_check_exec_drift`` ~:2157 and the build
+          gate ~:3517), in its NON-strict form.  A resolution failure yields the
+          plain ``("none", "ro")`` sentinel (not a
+          ``_ComputedContainerConfig``), which proves NO grant -> return None;
+        * ``_exec_drift_decision`` rules; ONLY ``decision == "deny"`` (the live
+          container is MORE permissive than the session may have) yields a
+          string.  ``run``/``warn`` yield ``None``.  Only the network + workspace
+          axes are compared (never mem_limit/cpu_quota/oom_score_adj).
+
+        Returns ``None`` on any failure or when the row is within bounds.
+        """
+        try:
+            live_net, live_ws = _exec_live_isolation(container)
+            cfg = self._compute_config(
+                getattr(self, "workspace_path", None),
+                getattr(self, "workspace_id", None),
+                getattr(self, "session_permissions", None),
+                LIFECYCLE_PERSISTENT,
+            )
+            if not isinstance(cfg, _ComputedContainerConfig):
+                return None
+            want_net, want_ws = cfg[0], cfg[1]
+            decision, reason = _exec_drift_decision(
+                live_net, live_ws, want_net, want_ws
+            )
+        except Exception:
+            return None
+        if decision != "deny":
+            return None
+        if reason == "network_more_permissive":
+            return "needs network:write; session has network:none"
+        if reason == "workspace_more_permissive":
+            return "needs filesystem:write; session has filesystem:read"
+        return None
 
     def build_image(self, tag=None, nocache=False):
         """Build a Docker image from ONLY the vault-managed Dockerfile.
