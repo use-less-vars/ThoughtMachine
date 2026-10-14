@@ -350,9 +350,16 @@ class TestResolveContainerConfigFromPermissions:
         """workspace + write perms → bridge + rw."""
         import security.security_gate as sg
         monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
+        # Disk-authoritative: the gate reads the on-disk envelope (stubbed here),
+        # then merges it with the capabilities via get_effective_permissions
+        # (called with the ceiling -> 3-arg signature).
+        monkeypatch.setattr(
+            sg, "_read_disk_permission_sources",
+            lambda workspace_id, session_id: ({}, None),
+        )
         monkeypatch.setattr(
             sg, "get_effective_permissions",
-            lambda s, w: {"network": "write", "filesystem": "write", "container": True},
+            lambda s, w, wp=None: {"network": "write", "filesystem": "write", "container": True},
         )
         from docker_executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
@@ -369,8 +376,12 @@ class TestResolveContainerConfigFromPermissions:
             lambda wid: _make_workspace(allow_network=False),
         )
         monkeypatch.setattr(
+            sg, "_read_disk_permission_sources",
+            lambda workspace_id, session_id: ({}, None),
+        )
+        monkeypatch.setattr(
             sg, "get_effective_permissions",
-            lambda s, w: {"network": False, "filesystem": "write", "container": True},
+            lambda s, w, wp=None: {"network": False, "filesystem": "write", "container": True},
         )
         from docker_executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
@@ -387,8 +398,12 @@ class TestResolveContainerConfigFromPermissions:
             lambda wid: _make_workspace(filesystem_write=False),
         )
         monkeypatch.setattr(
+            sg, "_read_disk_permission_sources",
+            lambda workspace_id, session_id: ({}, None),
+        )
+        monkeypatch.setattr(
             sg, "get_effective_permissions",
-            lambda s, w: {"network": "write", "filesystem": "read", "container": False},
+            lambda s, w, wp=None: {"network": "write", "filesystem": "read", "container": False},
         )
         from docker_executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
@@ -402,8 +417,12 @@ class TestResolveContainerConfigFromPermissions:
         import security.security_gate as sg
         monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
         monkeypatch.setattr(
+            sg, "_read_disk_permission_sources",
+            lambda workspace_id, session_id: ({}, None),
+        )
+        monkeypatch.setattr(
             sg, "get_effective_permissions",
-            lambda s, w: {"network": "write", "filesystem": "ask", "container": True},
+            lambda s, w, wp=None: {"network": "write", "filesystem": "ask", "container": True},
         )
         from docker_executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
@@ -428,8 +447,12 @@ class TestResolveContainerConfigFromPermissions:
         import security.security_gate as sg
         monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
         monkeypatch.setattr(
+            sg, "_read_disk_permission_sources",
+            lambda workspace_id, session_id: ({}, None),
+        )
+        monkeypatch.setattr(
             sg, "get_effective_permissions",
-            lambda s, w: {"network": "banned", "filesystem": "write", "container": True},
+            lambda s, w, wp=None: {"network": "banned", "filesystem": "write", "container": True},
         )
         from docker_executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(

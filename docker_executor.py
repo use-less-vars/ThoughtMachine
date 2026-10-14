@@ -242,7 +242,9 @@ def build_container_name(
     return f"agent-exec-persistent-{ws_hash}-{env_hash}"
 
 
-def _resolve_container_config_via_gate(workspace_id, session_permissions):
+def _resolve_container_config_via_gate(
+    workspace_id, session_permissions, session_id=None
+):
     """Resolve ``(network_mode, workspace_mode)`` via the security-gate SSOT.
 
     The single shared adapter over ``security.security_gate``: it normalises
@@ -251,13 +253,21 @@ def _resolve_container_config_via_gate(workspace_id, session_permissions):
     and resolves the ``(network_mode, workspace_mode)`` pair with the persistent
     lifecycle class.
 
-    Pure, total, fail-closed: a missing workspace id, a ``ContainerConfigError``,
-    or any exception returns the locked-down ``("none", "ro")``.
+    The gate is invoked in DISK-AUTHORITATIVE mode (``use_disk=True``): the
+    on-disk workspace ceiling is the source of truth and the in-memory
+    ``session_permissions`` is not trusted as a fallback.  ``session_id`` is
+    threaded through so a workspace-only envelope (``session_id=None``) uses the
+    designed-default session grants capped by the on-disk ceiling; a set
+    ``session_id`` reads that session's sidecar.
+
+    Pure, total, fail-closed: a falsy workspace id, a ``ContainerConfigError``
+    (including the ``workspace_id_required`` refusal), or any exception returns
+    the locked-down ``("none", "ro")``.
     """
     network_mode = "none"
     workspace_mode = "ro"
     wsid = str(workspace_id) if workspace_id is not None else None
-    if wsid and session_permissions is not None:
+    if wsid:
         try:
             from security.security_gate import (
                 ContainerConfig,
@@ -268,7 +278,12 @@ def _resolve_container_config_via_gate(workspace_id, session_permissions):
 
             capabilities = get_workspace_capabilities(wsid)
             cfg = resolve_container_config(
-                session_permissions, capabilities, LIFECYCLE_PERSISTENT
+                session_permissions if session_permissions is not None else {},
+                capabilities,
+                LIFECYCLE_PERSISTENT,
+                session_id=session_id,
+                workspace_id=wsid,
+                use_disk=True,
             )
             if isinstance(cfg, ContainerConfig):
                 network_mode = cfg.network_mode
@@ -407,7 +422,7 @@ def verify_container_integrity(
     # (``_resolve_container_config_via_gate``) — the pure, fail-closed path
     # shared with ``DockerExecutor._compute_container_config``.
     desired_network, desired_mode = _resolve_container_config_via_gate(
-        workspace_id, session_permissions
+        workspace_id, session_permissions, None
     )
 
     # Canonical, envelope-keyed persistent name — the LEGACY fallback lookup
@@ -587,7 +602,8 @@ class DockerExecutor:
             and workspace_mode is "rw" or "ro".
         """
         network_mode, workspace_mode = _resolve_container_config_via_gate(
-            self.workspace_id, self.session_permissions
+            self.workspace_id, self.session_permissions,
+            getattr(self, "session_id", None),
         )
         audit_event(
             "NETWORK_DECISION",
@@ -1204,7 +1220,7 @@ def _remove_container_by_workspace(workspace_path: str) -> None:
     normalised = os.path.abspath(workspace_path).replace("\\", "/")
     workspace_id = _resolve_workspace_id(normalised)
     network_mode, workspace_mode = _resolve_container_config_via_gate(
-        workspace_id, None
+        workspace_id, None, None
     )
     container_name = build_container_name(
         normalised,
@@ -1333,7 +1349,7 @@ def get_container_status(workspace_path: str) -> dict:
     # ── 2. Compute container name ──────────────────────────────────────────
     workspace_id = _resolve_workspace_id(normalised)
     network_mode, workspace_mode = _resolve_container_config_via_gate(
-        workspace_id, None
+        workspace_id, None, None
     )
     container_name = build_container_name(
         normalised,

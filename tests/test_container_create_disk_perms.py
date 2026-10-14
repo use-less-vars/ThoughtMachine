@@ -146,7 +146,12 @@ def test_request_container_disk_denies_even_when_mirror_permits(
     assert _run_kwargs(fake_client)["network_mode"] == "none"
 
 
-def test_legacy_mirror_unchanged_without_ids(permissive_caps):
-    # No session_id/workspace_id threaded -> the 2-arg legacy mirror is used
-    # byte-for-byte; "network": "write" still resolves to "bridge".
+def test_legacy_mirror_unchanged_without_ids(permissive_caps, monkeypatch):
+    # Workspace-only envelope (session_id=None): the vault is the SSoT, so the
+    # seam is pinned to the same grant the caller mirrors in memory;
+    # "network": "write" still resolves to "bridge".
+    monkeypatch.setattr(
+        "security.security_gate._read_disk_permission_sources",
+        lambda workspace_id, session_id: ({"network": "write"}, None),
+    )
     assert _resolve_network_mode_via_gate("ws-legacy", {"network": "write"}) == "bridge"

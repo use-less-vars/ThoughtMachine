@@ -59,6 +59,19 @@ def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="default"):
     ensure_workspace_dirs(workspace_id)
 
 
+def _grant_disk_container(monkeypatch, grants=None):
+    """Wave 9a-0b: build_image's container-grant gate reads the session grants
+    from the vault permission store (disk is the source of truth), so stub that
+    read to grant a container envelope (ceiling ``None`` == no workspace cap)."""
+    import security.security_gate as _sg
+    _grants = {"container": True} if grants is None else dict(grants)
+    monkeypatch.setattr(
+        _sg,
+        "_read_disk_permission_sources",
+        lambda workspace_id, session_id: (_grants, None),
+    )
+
+
 class TestBuildImageSessionGrantGate:
     """Session container-grant gate on ``ContainerManager.build_image``."""
 
@@ -170,6 +183,7 @@ class TestBuildImageSessionGrantGate:
     def test_granted_build_proceeds(self, tmp_path, monkeypatch):
         """Session grant + permissive caps -> the build runs exactly once."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         vault_root = self._seed_vault(tmp_path, "ws-1")
 
         manager = self._manager(
@@ -234,6 +248,7 @@ class TestBuildImageSessionGrantGate:
         not perturb the egress gating applied afterwards.
         """
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         vault_root = self._seed_vault(tmp_path, "ws-1")
 
         manager = self._manager(

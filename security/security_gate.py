@@ -831,6 +831,11 @@ def _read_disk_permission_sources(
       deny-all session + deny-all ceiling (fail closed): the caller-supplied
       in-memory session is never used as a fallback.
 
+    When ``session_id`` is ``None`` there is no session sidecar to read: the
+    workspace-only envelope uses the designed-default :class:`SessionPermissions`
+    (NOT an unreadable-store sentinel).  The workspace CEILING is still required
+    from disk and still raises on failure.
+
     Imports are lazy so the in-memory path never depends on
     ``thoughtmachine.permission_store`` / ``thoughtmachine.vault``.
     """
@@ -842,7 +847,14 @@ def _read_disk_permission_sources(
     )
 
     _vault_root = _vault_module.vault_root()
-    grants = read_session_permissions(_vault_root, workspace_id, session_id)
+    if session_id is None:
+        # Workspace-only envelope: there is no session sidecar to read, so use
+        # the designed-default SessionPermissions (NOT an unreadable-store
+        # sentinel).  The workspace CEILING below is still read from disk and
+        # still raises on failure.
+        grants = SessionPermissions().model_dump()
+    else:
+        grants = read_session_permissions(_vault_root, workspace_id, session_id)
     ceiling = workspace_ceiling(_vault_root, workspace_id)
     if not ceiling:
         # A PRESENT workspace config.json whose ceiling is EMPTY (no
@@ -1187,13 +1199,20 @@ def resolve_container_config(
     * **Pure by default** — it performs no filesystem, vault, environment or
       network IO unless explicitly opted in with ``use_disk=True``; otherwise
       everything is derived from the three positional arguments.  With
-      ``use_disk=True`` AND both keyword-only ``session_id`` and ``workspace_id``
-      supplied, the session grants and workspace ceiling are read from the vault
-      permission store (``thoughtmachine.permission_store``) — the disk is then
-      the source of truth and the in-memory ``permissions`` argument is ignored.
-      A store read failure is observable (a WARNING naming the ids) and fails
-      closed (the deny-all session + deny-all ceiling) rather than using the
-      caller-supplied in-memory session.
+      ``use_disk=True`` a non-``None`` ``workspace_id`` is REQUIRED: the
+      workspace ceiling (and, when ``session_id`` is supplied, the session
+      grants) are read from the vault permission store
+      (``thoughtmachine.permission_store``) and the disk is the source of truth
+      — the in-memory ``permissions`` argument is ignored.  A ``None``
+      ``session_id`` is a legitimate workspace-only request: there is no session
+      sidecar to read, so the designed-default session grants are used and the
+      workspace ceiling still comes from disk.  ``use_disk=True`` with a
+      ``None`` ``workspace_id`` yields
+      ``ContainerConfigError("workspace_id_required")`` — a workspace-only
+      envelope cannot be resolved without a workspace id.  A store read failure
+      is observable (a WARNING naming the ids) and fails closed (the deny-all
+      session + deny-all ceiling) rather than using the caller-supplied
+      in-memory session.
     * **Total** — it never raises; every input maps to exactly one
       :class:`ContainerConfig` or :class:`ContainerConfigError` value.
     * **Fail-closed** — any ambiguity (unknown lifecycle class, missing
@@ -1209,15 +1228,20 @@ def resolve_container_config(
         capabilities: A ``WorkspaceCapabilities`` instance. ``None`` is rejected
             with ``ContainerConfigError("capabilities_required")``.
         lifecycle_class: One of :data:`LIFECYCLE_CLASSES`.
-        session_id: Optional session id.  When supplied together with
-            ``workspace_id`` the disk permission store is consulted.
-        workspace_id: Optional workspace id.  Required (with ``session_id``) to
-            enable the disk-store read.
+        session_id: Optional session id.  With ``use_disk=True`` a ``None``
+            session id requests the workspace-only envelope (designed-default
+            session grants capped by the on-disk workspace ceiling); a
+            non-``None`` id additionally reads the session sidecar from the
+            vault store.
+        workspace_id: Optional workspace id.  REQUIRED when ``use_disk=True``;
+            ``use_disk=True`` with ``None`` yields
+            ``ContainerConfigError("workspace_id_required")``.
         use_disk: Opt-in (default ``False``) to consult the vault permission
-            store.  The disk read engages ONLY when ``use_disk`` is ``True``
-            AND both ``session_id`` and ``workspace_id`` are supplied; any
-            other combination stays pure.  On a store read failure the resolver
-            logs a WARNING and fails closed (the deny-all session + deny-all
+            store.  The disk read engages when ``use_disk`` is ``True`` — a
+            non-``None`` ``workspace_id`` is then mandatory (else
+            ``workspace_id_required``) and ``session_id`` may be ``None``
+            (workspace-only).  On a store read failure the resolver logs a
+            WARNING and fails closed (the deny-all session + deny-all
             ceiling).
 
     Returns:
@@ -1255,16 +1279,27 @@ def resolve_container_config(
             )
 
         # 4. Merge permissions with capabilities.
-        # Disk-mode (opt-in): only when ``use_disk`` is True AND BOTH ids are
-        # supplied is the vault permission store the source of truth.  The
-        # session grants + workspace ceiling are read from disk and the
-        # in-memory ``session`` normalised above is ignored.  A store read
-        # failure is observable (WARNING naming the ids) and FAILS CLOSED: the
-        # deny-all session + deny-all ceiling are substituted, so the caller's
-        # in-memory ``session`` mirror can never override a store that cannot
-        # express its ids.  Every other combination uses the legacy 2-arg
-        # in-memory merge BYTE-FOR-BYTE.
-        if use_disk and session_id is not None and workspace_id is not None:
+        # Disk-mode (opt-in): when ``use_disk`` is True the vault permission
+        # store is the source of truth and the in-memory ``session`` normalised
+        # above is ignored.  A ``None`` ``workspace_id`` cannot resolve a
+        # workspace-only envelope, so it is REFUSED with
+        # ``workspace_id_required`` rather than fabricated.  A ``None``
+        # ``session_id`` is legitimate: the workspace-only envelope uses the
+        # designed-default session grants capped by the on-disk workspace
+        # ceiling (there is no session sidecar to read).  A store read failure
+        # is observable (WARNING naming the ids) and FAILS CLOSED: the deny-all
+        # session + deny-all ceiling are substituted, so the caller's in-memory
+        # ``session`` mirror can never override a store that cannot express its
+        # ids.  When ``use_disk`` is False the legacy 2-arg in-memory merge is
+        # used BYTE-FOR-BYTE.
+        if use_disk:
+            if workspace_id is None:
+                return ContainerConfigError(
+                    "workspace_id_required",
+                    "workspace_id must not be None when use_disk=True: a "
+                    "workspace-only permission envelope cannot be resolved "
+                    "from disk without a workspace id",
+                )
             try:
                 disk_grants, disk_ceiling = _read_disk_permission_sources(
                     workspace_id, session_id

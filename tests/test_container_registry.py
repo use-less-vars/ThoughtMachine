@@ -914,14 +914,27 @@ class TestFeatureFlagAndHelpers:
         # ``ContainerRegistry.resolve_network_mode`` was removed in the
         # SSOT migration; the module-level gate adapter is the replacement
         # leaf for the same permissions-dict -> network-mode mapping.
-        assert _resolve_network_mode_via_gate("ws", {"network": "write"}) == "bridge"
-        assert _resolve_network_mode_via_gate("ws", {"network": "outbound"}) == "bridge"
-        assert _resolve_network_mode_via_gate("ws", {"network": True}) == "bridge"
-        assert _resolve_network_mode_via_gate("ws", {"network": False}) == "none"
-        assert _resolve_network_mode_via_gate("ws", {"network": "banned"}) == "none"
-        assert _resolve_network_mode_via_gate("ws", {"network": "ask"}) == "none"
-        assert _resolve_network_mode_via_gate("ws", {}) == "none"
-        assert _resolve_network_mode_via_gate("ws", None) == "none"
+        #
+        # Disk-authoritative: the vault is the source of truth, so the seam is
+        # stubbed per-call to the corresponding on-disk grant.
+        def _resolve(perms):
+            with mock.patch(
+                "security.security_gate._read_disk_permission_sources",
+                return_value=(perms or {}, None),
+            ):
+                return _resolve_network_mode_via_gate("ws", perms)
+
+        assert _resolve({"network": "write"}) == "bridge"
+        assert _resolve({"network": "outbound"}) == "bridge"
+        # A bare bool is NOT a canonical stored network level (the disk store
+        # holds only "banned"/"ask"/"write"/"outbound"); the loader drops it
+        # fail-closed to "none".
+        assert _resolve({"network": True}) == "none"
+        assert _resolve({"network": False}) == "none"
+        assert _resolve({"network": "banned"}) == "none"
+        assert _resolve({"network": "ask"}) == "none"
+        assert _resolve({}) == "none"
+        assert _resolve(None) == "none"
 
 
 # ---------------------------------------------------------------------------

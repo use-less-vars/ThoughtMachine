@@ -344,6 +344,16 @@ class TestAskPermissionRestrictive:
             "get_workspace_capabilities",
             lambda workspace_id: WorkspaceCapabilities.default(),
         )
+        # Disk-authoritative: pin the vault seam to the intended WRITE grant so
+        # the gate resolves the recreated container's network to bridge.
+        monkeypatch.setattr(
+            _security_gate,
+            "_read_disk_permission_sources",
+            lambda workspace_id, session_id: (
+                {"network": "write", "filesystem": "write", "container": True},
+                None,
+            ),
+        )
 
         with patch.object(
             executor.__class__, "_compute_container_config",

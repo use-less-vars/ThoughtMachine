@@ -3627,7 +3627,9 @@ class ContainerManager:
                         f"Unexpected files staged in build context: {sorted(staged)}"
                     )
                 _net_mode, _ = dex._resolve_container_config_via_gate(
-                    self.workspace_id, getattr(self, "session_permissions", None)
+                    self.workspace_id,
+                    getattr(self, "session_permissions", None),
+                    getattr(self, "session_id", None),
                 )
                 _, log_lines = dex._run_image_build(
                     self.client, tmpdir, "Dockerfile", tag,
