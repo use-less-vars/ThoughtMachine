@@ -145,5 +145,23 @@
     "risk_level": "high",
     "ui_category": "integrations",
     "required_workspace_switch": null
+  },
+  {
+    "name": "ci",
+    "display_name": "CI",
+    "description": "Read-only CI pipeline status/log monitoring.",
+    "permission_grain_set": [
+      "banned",
+      "read"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [
+      "ci_read"
+    ],
+    "risk_level": "low",
+    "ui_category": "host",
+    "required_workspace_switch": "allow_host_resources"
   }
 ]

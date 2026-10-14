@@ -20,6 +20,7 @@ _EXPECTED_NAMES = {
     "jtag",
     "network",
     "mcp",
+    "ci",
 }
 _EXPECTED_KEYS = {
     "name",
@@ -79,10 +80,10 @@ def test_resource_catalog_returns_bare_array(client):
     assert resp.status_code == 200
     body = resp.json()
     assert isinstance(body, list)
-    assert len(body) == 8
+    assert len(body) == 9
 
 
-def test_resource_catalog_eight_resources_with_exact_keys(client):
+def test_resource_catalog_nine_resources_with_exact_keys(client):
     """Each entry carries exactly the 8 declared resource keys."""
     resp = client.get("/api/resource-catalog")
 

@@ -190,6 +190,12 @@ except ImportError as e:
 # Final/FinalReport removed in Phase B — use Respond instead
 
 try:
+    from .ci_read_tool import CiReadTool
+    TOOL_CLASSES.append(CiReadTool)
+except ImportError as e:
+    _record_import_failure("CiReadTool", e)
+
+try:
     from .git_info_tool import GitReadTool
     TOOL_CLASSES.append(GitReadTool)
 except ImportError as e:

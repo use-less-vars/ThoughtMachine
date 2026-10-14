@@ -52,6 +52,7 @@ FAIL_CLOSED = {
     "git": "banned",
     "mcp": "banned",
     "host_bash": "banned",
+    "ci": "banned",
 }
 
 
@@ -109,6 +110,7 @@ def test_readable_ceiling_caps_session_grants(tmp_path, monkeypatch):
         "git": "read",
         "mcp": "banned",
         "host_bash": "banned",
+        "ci": "banned",
     }
 
     # True differential: identical to the gate's disk-mode call.

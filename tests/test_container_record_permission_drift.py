@@ -54,7 +54,7 @@ from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 WS = "ws-1"
 
-#: Six-key effective-permission grants (``security.get_effective_permissions``).
+#: Seven-key effective-permission grants (``security.get_effective_permissions``).
 _PERMISSION_KEYS = (
     "filesystem",
     "network",
@@ -62,6 +62,7 @@ _PERMISSION_KEYS = (
     "git",
     "mcp",
     "host_bash",
+    "ci",
 )
 
 #: Framework-default profile == "current side UNKNOWN" (what ``permissions={}``
@@ -90,9 +91,10 @@ STORED_PERMS = {
     # must be in canonical (already-resolved) form to compare byte-for-byte
     # against ``config.effective``.
     "host_bash": "banned",
+    "ci": "banned",
 }
 
-#: The same six keys, later NARROWED (still not the all-default unknown profile).
+#: The same seven keys, later NARROWED (still not the all-default unknown profile).
 CURRENT_PERMS = {
     "filesystem": "read",
     "network": "write",
@@ -100,6 +102,7 @@ CURRENT_PERMS = {
     "git": "read",
     "mcp": "banned",
     "host_bash": "banned",
+    "ci": "banned",
 }
 
 

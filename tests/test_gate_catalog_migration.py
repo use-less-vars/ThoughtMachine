@@ -283,7 +283,7 @@ def _branch_write_eff():
 def test_effective_branch_write_session_grains():
     """A branch-write session yields git='write_on_feature_branch' as the
     single canonical git category value.  The effective dict exposes only
-    the six canonical keys — the derived git_read/git_write split lives in
+    the seven canonical keys — the derived git_read/git_write split lives in
     ``split_git_permission`` (consumed by the git tools), never as
     effective keys."""
     eff = _branch_write_eff()
@@ -292,7 +292,7 @@ def test_effective_branch_write_session_grains():
         "read",
         "write_on_feature_branch",
     )
-    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash"}
+    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci"}
 
 
 def test_outer_gate_branch_write_allows_write_and_read():
@@ -354,7 +354,7 @@ def test_disk_mode_branch_write_grant_capped_by_ceiling(hermetic_vault):
         workspace_id=ws_id,
     )
     assert eff["git"] == "read"
-    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash"}
+    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci"}
 
     # Control: a write-level ceiling leaves the branch-write grant standing.
     _write_config(hermetic_vault, ws_id, {"git": "write"})
@@ -395,7 +395,7 @@ def test_disk_mode_non_catalog_grant_keys_dropped(
             session_id=sid,
             workspace_id=ws_id,
         )
-    # The effective dict carries only the six canonical keys; the dropped
+    # The effective dict carries only the seven canonical keys; the dropped
     # system/stray grants leave the pydantic defaults standing.
     assert eff == {
         "filesystem": "read",  # session default
@@ -404,6 +404,7 @@ def test_disk_mode_non_catalog_grant_keys_dropped(
         "git": "read",
         "mcp": "banned",  # session default
         "host_bash": "banned",  # session default
+        "ci": "banned",  # session default
     }
     assert "system" not in eff
     assert "execution" not in eff

@@ -136,13 +136,14 @@ def test_tty_jtag_excluded_from_legacy_view():
 def test_network_mcp_now_present_in_b():
     """R13 step 6: the former residuals are now full B entries.
 
-    The legacy view keeps exactly the six canonical permission resources
+    The legacy view keeps exactly the seven canonical permission resources
     (network/mcp included); both are now derived from B like every other
     resource rather than from residual literals.
     """
     view = _legacy_view()["resources"]
     assert set(view) == {
         "git", "filesystem", "container", "network", "mcp", "host_bash",
+        "ci",
     }
     assert view["network"]["default_permission"] == "banned"
     assert view["mcp"]["default_permission"] == "banned"

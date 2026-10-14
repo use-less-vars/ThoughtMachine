@@ -18,7 +18,7 @@ It now mirrors the canonical gate-resolved computation in every case:
 The in-memory ``session_config.session_permissions`` dict is NEVER consulted —
 not even its ``workspace_id`` attribute.
 
-These tests pin the **shape contract** (exactly the six canonical category
+These tests pin the **shape contract** (exactly the seven canonical category
 keys) and the **behaviour** (no-ids / partial-ids fail closed; disk fail-closed;
 disk + ceiling cap; disk-authoritative precedence over a divergent in-memory
 config) across all modes.
@@ -39,6 +39,7 @@ CANONICAL_KEYS = {
     "host_bash",
     "mcp",
     "network",
+    "ci",
 }
 
 DENY_ALL = {
@@ -48,6 +49,7 @@ DENY_ALL = {
     "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
+    "ci": "banned",
 }
 
 
@@ -175,4 +177,5 @@ def test_disk_mode_reads_store_and_applies_ceiling(monkeypatch, tmp_path):
         "host_bash": "banned",
         "mcp": "banned",
         "network": "banned",
+        "ci": "banned",
     }
