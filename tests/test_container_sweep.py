@@ -1,5 +1,10 @@
 """Tests for infra.container_manager.sweep_exited_workspace_containers.
 
+The idle TTL is now keyed off each container's LIFECYCLE CLASS
+(``max_age_s_by_class``); a bare ``max_age_s`` is only a fallback for
+classes missing from the map.  These Phase-3 cases all express a SINGLE
+uniform TTL, so ``_run`` names every lifecycle class with that value.
+
 Covers the 9 Phase-3 sweep cases:
   1. exited + old           -> removed (TTL branch)
   2. exited + too young     -> kept
@@ -16,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from infra import container_manager
+from thoughtmachine.container_record import LIFECYCLE_CLASSES
 
 WORKSPACE_LABEL = "thoughtmachine.workspace_id"
 RESOURCE_LABEL = "thoughtmachine.resource"
@@ -60,13 +66,22 @@ class FakeClient:
 
 
 def _run(containers, registered_workspace_ids=None, max_age_s=3600,
-         dry_run=False, list_error=None):
+         dry_run=False, list_error=None, max_age_s_by_class=None):
+    # The sweep now keys its idle TTL off each container's LIFECYCLE CLASS; a
+    # bare ``max_age_s`` is only a fallback for classes absent from the map.
+    # Every case here expresses a SINGLE uniform TTL, so name EVERY class with
+    # that value (the original intent) -- otherwise the per-class defaults
+    # (persistent/resource/service 86400) would keep the 7200 s 'old' fakes the
+    # tests expect to be removed.
+    if max_age_s_by_class is None:
+        max_age_s_by_class = {cls: max_age_s for cls in LIFECYCLE_CLASSES}
     client = FakeClient(containers, list_error=list_error)
     with mock.patch("docker.from_env", return_value=client) as from_env:
         result = container_manager.sweep_exited_workspace_containers(
             registered_workspace_ids=registered_workspace_ids,
             max_age_s=max_age_s,
             dry_run=dry_run,
+            max_age_s_by_class=max_age_s_by_class,
         )
     return result, client, from_env
 

@@ -387,10 +387,17 @@ def _sweep_orphan_resource_containers():
 
 
 # Idle TTL (seconds) after which an EXITED generic workspace container is
-# removed at startup. Tune via env override if needed.
-_EXITED_CONTAINER_SWEEP_MAX_AGE_S = int(
-    os.environ.get('THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S', '86400')
+# removed by the container sweep.
+#
+# ABSENT  -> the sweep applies its own PER-CLASS defaults (ephemeral 900 s;
+#            persistent / resource / service 86400 s).
+# PRESENT -> DEBUG KNOB: this single value is forced on EVERY lifecycle class
+#            (it names every class so no per-class default can survive).
+_EXITED_CONTAINER_SWEEP_MAX_AGE_S = os.environ.get(
+    'THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S'
 )
+if _EXITED_CONTAINER_SWEEP_MAX_AGE_S is not None:
+    _EXITED_CONTAINER_SWEEP_MAX_AGE_S = int(_EXITED_CONTAINER_SWEEP_MAX_AGE_S)
 
 # Default retention (seconds) applied to an orphaned container RECORD whose own
 # ``retention_days`` is unset when the record sweeper considers reaping it.
@@ -405,7 +412,10 @@ def _sweep_exited_workspace_containers():
 
     Two concerns, both best-effort and NEVER raising:
     - idle/TTL: exited containers of registered workspaces that have been idle
-      past ``_EXITED_CONTAINER_SWEEP_MAX_AGE_S`` are removed;
+      past their lifecycle-class TTL are removed (per-class sweep defaults:
+      ephemeral 900 s, persistent/resource/service 86400 s). The env override
+      ``THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S`` is a DEBUG KNOB: when set
+      it forces its single value on EVERY class;
     - orphan GC: exited containers of UNREGISTERED workspaces are removed too.
     Resource containers (``thoughtmachine.resource`` label) are excluded.
     If the workspace registry cannot be read the sweep degrades to TTL-only
@@ -422,9 +432,22 @@ def _sweep_exited_workspace_containers():
                 f'Startup sweep: could not list registered workspaces: {exc}')
             ids = None  # TTL-only; never orphan-wipe on registry failure
 
+        # THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S is a DEBUG KNOB. PRESENT ->
+        # force its value on EVERY lifecycle class (name them all, because a
+        # bare ``max_age_s`` cannot override the sweep's per-class defaults).
+        # ABSENT -> pass ``None`` so the sweep applies its own class defaults.
+        if _EXITED_CONTAINER_SWEEP_MAX_AGE_S is None:
+            ttl_by_class = None
+        else:
+            from thoughtmachine.container_record import LIFECYCLE_CLASSES
+            ttl_by_class = {
+                cls: _EXITED_CONTAINER_SWEEP_MAX_AGE_S
+                for cls in LIFECYCLE_CLASSES
+            }
+
         result = sweep_exited_workspace_containers(
             registered_workspace_ids=ids,
-            max_age_s=_EXITED_CONTAINER_SWEEP_MAX_AGE_S,
+            max_age_s_by_class=ttl_by_class,
         )
         detail = result.get("detail") or ""
         log('INFO', 'server',
