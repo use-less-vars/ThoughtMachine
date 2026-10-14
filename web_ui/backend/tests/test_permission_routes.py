@@ -38,7 +38,7 @@ client = TestClient(app)
 
 SESSION_SCHEMA_KEYS = sorted(PERMISSION_SCHEMA.keys())
 
-# Canonical six-key workspace purpose presets (agent/config/workspace_purpose).
+# Canonical seven-key workspace purpose presets (agent/config/workspace_purpose).
 # "general" preset == catalog defaults.
 CATALOG_DEFAULTS = {
     "container": False,
