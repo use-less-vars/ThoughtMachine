@@ -47,6 +47,7 @@ CATALOG_DEFAULTS = {
     "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
+    "ci": "banned",
 }
 
 CODING_PRESET = {
