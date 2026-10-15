@@ -1550,26 +1550,50 @@ class ContainerManager:
             if _action == "deny":
                 return _payload
             if _action == "recreate":
-                _removed_id = getattr(container, "id", None)
-                try:
-                    container.remove(force=True)
-                except Exception as exc:
-                    log("WARNING", "docker.container_manager",
-                        f"Recreate: failed to remove weak container "
-                        f"{_removed_id!r} for {name!r}: {exc}")
-                _audit("CONTAINER_CREATE",
-                       f"source=recreate+remove name={name} "
-                       f"removed_id={_removed_id} session={self.session_id} "
-                       f"workspace_id={self.workspace_id}")
-                return self._fresh_start(
-                    image=image, name=name, note=note, worker_name=worker_name,
-                    lifecycle_class=lifecycle_class,
-                    network_mode=want_network, workspace_mode=want_workspace,
-                    reuse_record_id=record_id,
-                    permissions=want_effective,
-                    mem_limit=_reuse_mem_limit,
-                    cpu_quota=_reuse_cpu_quota,
+                # Recreate trigger = a HARDENING weakness (see
+                # _start_drift_decision): the live container is too weak and must
+                # be destroyed+recreated.  The destroy is an explicit reap intent
+                # routed through the lifecycle funnel, which emits ONE
+                # CONTAINER_LIFECYCLE decision and returns action="reap".  A
+                # (defensive) non-destroy decision is HONOURED: the weak
+                # container is left in place and start() falls through to reuse.
+                _recreate_decision = ContainerLifecycle.reconcile(
+                    container, self.session_permissions,
+                    ContainerIntent(
+                        kind="reap",
+                        explicit=True,
+                        reason="start_recreate",
+                        force=True,
+                        workspace_id=self.workspace_id,
+                        session_id=self.session_id,
+                    ),
                 )
+                if _recreate_decision.destroys:
+                    _removed_id = getattr(container, "id", None)
+                    try:
+                        container.remove(force=True)
+                    except Exception as exc:
+                        log("WARNING", "docker.container_manager",
+                            f"Recreate: failed to remove weak container "
+                            f"{_removed_id!r} for {name!r}: {exc}")
+                    _audit("CONTAINER_CREATE",
+                           f"source=recreate+remove name={name} "
+                           f"removed_id={_removed_id} session={self.session_id} "
+                           f"workspace_id={self.workspace_id}")
+                    return self._fresh_start(
+                        image=image, name=name, note=note, worker_name=worker_name,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=want_network, workspace_mode=want_workspace,
+                        reuse_record_id=record_id,
+                        permissions=want_effective,
+                        mem_limit=_reuse_mem_limit,
+                        cpu_quota=_reuse_cpu_quota,
+                    )
+                log("WARNING", "docker.container_manager",
+                    f"start: lifecycle funnel refused recreate of {name!r} "
+                    f"(action={_recreate_decision.action!r} "
+                    f"reason={_recreate_decision.reason!r}); "
+                    f"reusing the existing container")
             if note is not None:
                 self._write_note(self._record_id_for(container), note)
             note_value = (note if note is not None else self._read_note(container))
@@ -1647,27 +1671,49 @@ class ContainerManager:
                     if _action == "deny":
                         return _payload
                     if _action == "recreate":
-                        _removed_id = getattr(container, "id", None)
-                        try:
-                            container.remove(force=True)
-                        except Exception as exc:
-                            log("WARNING", "docker.container_manager",
-                                f"Recreate: failed to remove weak container "
-                                f"{_removed_id!r} for {name!r}: {exc}")
-                        _audit("CONTAINER_CREATE",
-                               f"source=recreate+remove name={name} "
-                               f"removed_id={_removed_id} "
-                               f"session={self.session_id} "
-                               f"workspace_id={self.workspace_id}")
-                        return self._fresh_start(
-                            image=image, name=name, note=note,
-                            worker_name=worker_name,
-                            lifecycle_class=lifecycle_class,
-                            network_mode=want_network,
-                            workspace_mode=want_workspace,
-                            reuse_record_id=None,
-                            permissions=want_effective,
+                        # HARDENING weakness -> destroy+recreate.  The destroy is
+                        # an explicit reap intent routed through the lifecycle
+                        # funnel (ONE CONTAINER_LIFECYCLE event).  A non-destroy
+                        # decision is HONOURED: fall through to reuse.
+                        _recreate_decision = ContainerLifecycle.reconcile(
+                            container, self.session_permissions,
+                            ContainerIntent(
+                                kind="reap",
+                                explicit=True,
+                                reason="start_recreate",
+                                force=True,
+                                workspace_id=self.workspace_id,
+                                session_id=self.session_id,
+                            ),
                         )
+                        if _recreate_decision.destroys:
+                            _removed_id = getattr(container, "id", None)
+                            try:
+                                container.remove(force=True)
+                            except Exception as exc:
+                                log("WARNING", "docker.container_manager",
+                                    f"Recreate: failed to remove weak container "
+                                    f"{_removed_id!r} for {name!r}: {exc}")
+                            _audit("CONTAINER_CREATE",
+                                   f"source=recreate+remove name={name} "
+                                   f"removed_id={_removed_id} "
+                                   f"session={self.session_id} "
+                                   f"workspace_id={self.workspace_id}")
+                            return self._fresh_start(
+                                image=image, name=name, note=note,
+                                worker_name=worker_name,
+                                lifecycle_class=lifecycle_class,
+                                network_mode=want_network,
+                                workspace_mode=want_workspace,
+                                reuse_record_id=None,
+                                permissions=want_effective,
+                            )
+                        log("WARNING", "docker.container_manager",
+                            f"start: lifecycle funnel refused recreate of "
+                            f"{name!r} "
+                            f"(action={_recreate_decision.action!r} "
+                            f"reason={_recreate_decision.reason!r}); "
+                            f"reusing the existing container")
                     if _action == "reuse":
                         _start_drift = _payload
                     try:
@@ -1769,24 +1815,46 @@ class ContainerManager:
             if _action == "deny":
                 return _payload
             if _action == "recreate":
-                _removed_id = getattr(container, "id", None)
-                try:
-                    container.remove(force=True)
-                except Exception as exc:
-                    log("WARNING", "docker.container_manager",
-                        f"Recreate: failed to remove weak container "
-                        f"{_removed_id!r} for {name!r}: {exc}")
-                _audit("CONTAINER_CREATE",
-                       f"source=recreate+remove name={name} "
-                       f"removed_id={_removed_id} session={self.session_id} "
-                       f"workspace_id={self.workspace_id}")
-                return self._fresh_start(
-                    image=image, name=name, note=note, worker_name=worker_name,
-                    lifecycle_class=lifecycle_class,
-                    network_mode=network_mode, workspace_mode=workspace_mode,
-                    reuse_record_id=None,
-                    permissions=effective,
+                # Recreate trigger = a HARDENING weakness (see
+                # _start_drift_decision).  The destroy is an explicit reap intent
+                # routed through the lifecycle funnel (ONE CONTAINER_LIFECYCLE
+                # event).  A non-destroy decision is HONOURED: fall through to
+                # reuse the existing container.
+                _recreate_decision = ContainerLifecycle.reconcile(
+                    container, self.session_permissions,
+                    ContainerIntent(
+                        kind="reap",
+                        explicit=True,
+                        reason="start_recreate",
+                        force=True,
+                        workspace_id=self.workspace_id,
+                        session_id=self.session_id,
+                    ),
                 )
+                if _recreate_decision.destroys:
+                    _removed_id = getattr(container, "id", None)
+                    try:
+                        container.remove(force=True)
+                    except Exception as exc:
+                        log("WARNING", "docker.container_manager",
+                            f"Recreate: failed to remove weak container "
+                            f"{_removed_id!r} for {name!r}: {exc}")
+                    _audit("CONTAINER_CREATE",
+                           f"source=recreate+remove name={name} "
+                           f"removed_id={_removed_id} session={self.session_id} "
+                           f"workspace_id={self.workspace_id}")
+                    return self._fresh_start(
+                        image=image, name=name, note=note, worker_name=worker_name,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=network_mode, workspace_mode=workspace_mode,
+                        reuse_record_id=None,
+                        permissions=effective,
+                    )
+                log("WARNING", "docker.container_manager",
+                    f"start: lifecycle funnel refused recreate of {name!r} "
+                    f"(action={_recreate_decision.action!r} "
+                    f"reason={_recreate_decision.reason!r}); "
+                    f"reusing the existing container")
             _reuse_running = self._ensure_running(container)
             if _reuse_running:
                 self._containers[name] = container.id
@@ -4603,6 +4671,26 @@ def cleanup_stale_worker_containers(docker_client, owner_identity):
             if status not in _REMOVABLE_WORKER_STATES:
                 continue
             container_id = getattr(container, "id", None)
+            # Route the destroy decision through the lifecycle funnel: a stale
+            # worker cleanup is an explicit reap intent, so reconcile returns
+            # action="reap" and emits ONE CONTAINER_LIFECYCLE decision event.  A
+            # non-destroy decision is HONOURED -- the container is left alone.
+            _decision = ContainerLifecycle.reconcile(
+                container, None,
+                ContainerIntent(
+                    kind="reap",
+                    explicit=True,
+                    reason="stale_worker_cleanup",
+                    force=True,
+                ),
+            )
+            if not _decision.destroys:
+                log("WARNING", "docker.container_manager",
+                    f"cleanup_stale_worker_containers refused to remove "
+                    f"container {str(container_id)[:12]} "
+                    f"(action={_decision.action!r} "
+                    f"reason={_decision.reason!r})")
+                continue
             container.remove(force=True)
             removed.append(container_id)
             short = str(container_id)[:12]

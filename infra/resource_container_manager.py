@@ -1393,6 +1393,41 @@ class ResourceContainerManager:
             stale = True
 
         if stale:
+            # The lifecycle funnel is the single arbiter of whether the
+            # container may be destroyed.  An explicit reap intent always wins
+            # (ONE CONTAINER_LIFECYCLE event); only on that decision do we
+            # remove+recreate.  A (defensive) non-destroy decision leaves the
+            # container alive and falls back to the host.
+            from infra.container_lifecycle import (
+                ContainerIntent as _CLIntent,
+                ContainerLifecycle as _CLLifecycle,
+            )
+            _stale_decision = _CLLifecycle.reconcile(
+                container,
+                self.session_permissions,
+                _CLIntent(
+                    kind="reap",
+                    explicit=True,
+                    reason="resource_stale_removal",
+                    force=True,
+                    workspace_id=self.workspace_id,
+                    session_id=self.session_id,
+                ),
+            )
+            if not _stale_decision.destroys:
+                _LOG.warning(
+                    "stale resource container %s removal refused by lifecycle "
+                    "funnel (%s); falling back to host",
+                    getattr(container, "id", None),
+                    _stale_decision.reason,
+                )
+                return self._resource_result(
+                    "host_fallback",
+                    detail="resource stale removal refused by lifecycle funnel "
+                           f"({_stale_decision.reason})",
+                    failure_reason="fallback_used",
+                    fallback_used=True,
+                )
             try:
                 container.remove(force=True)
             except Exception as exc:
@@ -1534,6 +1569,14 @@ class ResourceContainerManager:
     def stop(self):
         """Stop the container (idempotent). Never raises.
 
+        The stop decision routes through the lifecycle funnel with an explicit
+        ``reap`` intent (the funnel has no standalone stop verb; an explicit
+        stop is expressed as an explicit reap intent, mirroring
+        ``ContainerManager.stop``): an explicit intent always wins, so reconcile
+        returns ``action="reap"`` and emits ONE ``CONTAINER_LIFECYCLE`` decision
+        event, and the stop proceeds.  A (defensive) non-destroy decision is
+        HONOURED -- the container is left running.
+
         Returns:
             dict: ``{"status": "stopped"|"missing"|"error", "container_id": ...,
             "error": ...}`` — "missing" when no resource container exists.
@@ -1544,6 +1587,40 @@ class ResourceContainerManager:
                     "error": "resource container not found"}
         try:
             container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"status": "missing", "container_id": container_id}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        from infra.container_lifecycle import (
+            ContainerIntent as _CLIntent,
+            ContainerLifecycle as _CLLifecycle,
+        )
+        _stop_decision = _CLLifecycle.reconcile(
+            container,
+            self.session_permissions,
+            _CLIntent(
+                kind="reap",
+                explicit=True,
+                reason="resource_stop",
+                force=True,
+                workspace_id=self.workspace_id,
+                session_id=self.session_id,
+            ),
+        )
+        if not _stop_decision.destroys:
+            _LOG.warning(
+                "resource container %s stop refused by lifecycle funnel (%s); "
+                "leaving container running",
+                container_id,
+                _stop_decision.reason,
+            )
+            return {
+                "status": "error",
+                "container_id": container_id,
+                "error": "resource stop refused by container lifecycle funnel "
+                         f"({_stop_decision.reason})",
+            }
+        try:
             container.stop(timeout=5)
             return {"status": "stopped", "container_id": container_id}
         except NotFound:
@@ -2208,6 +2285,31 @@ def sweep_stale_resource_containers(registered_workspace_ids, max_age_s=86400):
                 and 0 <= (now - created).total_seconds() < max_age_s
             ):
                 skipped += 1
+                continue
+            # Route the orphan destroy through the lifecycle funnel: an explicit
+            # reap intent always wins (ONE CONTAINER_LIFECYCLE event).  A
+            # (defensive) non-destroy decision is HONOURED -- the orphan is left.
+            from infra.container_lifecycle import (
+                ContainerIntent as _CLIntent,
+                ContainerLifecycle as _CLLifecycle,
+            )
+            _orphan_decision = _CLLifecycle.reconcile(
+                container,
+                None,
+                _CLIntent(
+                    kind="reap",
+                    explicit=True,
+                    reason="resource_orphan_sweep",
+                    force=True,
+                    workspace_id=(str(ws_id) if ws_id is not None else None),
+                ),
+            )
+            if not _orphan_decision.destroys:
+                detail = _join_detail(
+                    detail,
+                    f"skipped {getattr(container, 'id', '?')}: "
+                    f"lifecycle {_orphan_decision.action}",
+                )
                 continue
             try:
                 container.remove(force=True)
