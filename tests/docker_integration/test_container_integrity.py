@@ -6,8 +6,7 @@ Covers all return-value branches:
   * Docker unavailable
   * No existing container
   * Container matches desired config
-  * Container config mismatch → container removed
-  * Container config mismatch → removal fails
+  * Container config mismatch → refused (container left intact)
   * Permissions flow (None, restrictive, permissive)
   * Workspace path normalisation
 
@@ -161,74 +160,85 @@ class TestContainerMatches:
 
 
 # ===================================================================
-# Container mismatch → removal
+# Container mismatch → REFUSED (container left intact)
 # ===================================================================
 
 class TestContainerMismatch:
-    """When the container exists but has different config than desired."""
+    """When the container exists but has different config than desired.
 
-    def test_network_mismatch_removes_container(self, patch_docker, make_container, mock_docker_client):
-        """Container with ``bridge`` network but desired ``none`` → removed."""
+    The lifecycle funnel refuses to destroy a workspace-owned container on an
+    envelope mismatch (a permissions-tightening drift): ``action_taken`` is
+    ``"refused"`` and the container is left running, never stopped/removed.
+    """
+
+    def test_network_mismatch_refused_container_intact(self, patch_docker, make_container, mock_docker_client):
+        """Container with ``bridge`` network but desired ``none`` → refused."""
         container = make_container(network_mode="bridge", mount_mode="ro")
 
         result = verify_container_integrity("/tmp/workspace", None)
 
         assert result["container_exists"] is True
         assert result["matches_config"] is False
-        assert result["action_taken"] == "removed"
+        assert result["action_taken"] == "refused"
         assert "network" in result["mismatch_reason"]
-        container.stop.assert_called_once_with(timeout=5)
-        container.remove.assert_called_once()
+        container.stop.assert_not_called()
+        container.remove.assert_not_called()
 
-    def test_mount_mode_mismatch_removes_container(self, patch_docker, make_container, mock_docker_client):
-        """Container with ``rw`` mount but desired ``ro`` → removed."""
+    def test_mount_mode_mismatch_refused_container_intact(self, patch_docker, make_container, mock_docker_client):
+        """Container with ``rw`` mount but desired ``ro`` → refused."""
         container = make_container(network_mode="none", mount_mode="rw")
 
         result = verify_container_integrity("/tmp/workspace", None)
 
-        assert result["action_taken"] == "removed"
+        assert result["action_taken"] == "refused"
         assert "mode" in result["mismatch_reason"]
-        container.stop.assert_called_once()
-        container.remove.assert_called_once()
+        container.stop.assert_not_called()
+        container.remove.assert_not_called()
 
     def test_both_network_and_mode_mismatch(self, patch_docker, make_container):
-        """Both network and mode differ."""
+        """Both network and mode differ → refused."""
         container = make_container(network_mode="bridge", mount_mode="rw")
 
         result = verify_container_integrity("/tmp/workspace", None)
 
-        assert result["action_taken"] == "removed"
+        assert result["action_taken"] == "refused"
         assert "network" in result["mismatch_reason"]
         assert "mode" in result["mismatch_reason"]
+        container.stop.assert_not_called()
+        container.remove.assert_not_called()
 
-    def test_stop_failure_reported_as_error(self, patch_docker, make_container, mock_docker_client):
-        """If ``container.stop()`` raises, action_taken is ``error``."""
+    def test_no_destroy_even_if_stop_would_raise(self, patch_docker, make_container, mock_docker_client):
+        """A mismatch never stops the container, so a raising ``stop`` is moot."""
         container = make_container(network_mode="bridge", mount_mode="ro")
         container.stop.side_effect = RuntimeError("stop failed")
 
         result = verify_container_integrity("/tmp/workspace", None)
 
-        assert result["action_taken"] == "error"
+        assert result["action_taken"] == "refused"
         assert result["matches_config"] is False
+        container.stop.assert_not_called()
+        container.remove.assert_not_called()
 
-    def test_remove_failure_reported_as_error(self, patch_docker, make_container, mock_docker_client):
-        """If ``container.remove()`` raises, action_taken is ``error``."""
+    def test_no_destroy_even_if_remove_would_raise(self, patch_docker, make_container, mock_docker_client):
+        """A mismatch never removes the container, so a raising ``remove`` is moot."""
         container = make_container(network_mode="bridge", mount_mode="ro")
         container.remove.side_effect = RuntimeError("remove failed")
 
         result = verify_container_integrity("/tmp/workspace", None)
 
-        assert result["action_taken"] == "error"
+        assert result["action_taken"] == "refused"
         assert result["matches_config"] is False
+        container.stop.assert_not_called()
+        container.remove.assert_not_called()
 
-    def test_container_still_stopped_even_if_remove_fails(self, patch_docker, make_container):
-        """stop() is still called even if remove() will fail later."""
+    def test_container_survives_mismatch(self, patch_docker, make_container):
+        """The mismatched container is left running (not stopped)."""
         container = make_container(network_mode="bridge", mount_mode="ro")
-        container.remove.side_effect = RuntimeError("remove failed")
 
         verify_container_integrity("/tmp/workspace", None)
 
-        container.stop.assert_called_once()
+        container.stop.assert_not_called()
+        container.remove.assert_not_called()
 
 
 # ===================================================================

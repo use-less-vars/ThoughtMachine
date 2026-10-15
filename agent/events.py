@@ -93,6 +93,7 @@ class EventType(enum.Enum):
     WORKER_RESUMED = 'worker_resumed'
     # Container lifecycle events (routed to the tenant event log)
     CONTAINER_REMOVED = 'container_removed'
+    CONTAINER_LIFECYCLE = 'container_lifecycle'
 
 
 class EventMetadata(BaseModel):

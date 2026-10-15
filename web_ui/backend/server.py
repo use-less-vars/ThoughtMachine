@@ -778,6 +778,12 @@ async def lifespan(app: FastAPI):
                     log('WARNING', 'server',
                         f'Startup integrity: error checking container '
                         f'{result["container_name"]}: {result.get("mismatch_reason")}')
+                elif result.get("action_taken") == "refused":
+                    log('WARNING', 'server',
+                        f'Startup integrity: container '
+                        f'{result["container_name"]} for workspace {ws_path} '
+                        f'mismatches current defaults; left intact '
+                        f'(refused to remove): {result.get("mismatch_reason")}')
     except Exception as exc:
         log('DEBUG', 'server', f'Startup container scan skipped: {exc}')
 
@@ -3297,8 +3303,9 @@ def container_integrity(workspace: str = "", permissions: str = ""):
 
     Calls ``get_integrity_status()`` which wraps ``verify_container_integrity()``
     to check the existing container against the expected security config.
-    If permissions have been tightened since the container was created,
-    it is removed so it will be recreated with the new settings.
+    This endpoint is READ-ONLY: it reports the verdict and never mutates the
+    container.  A permissions-tightening mismatch is refused (the container is
+    left intact) and reported as ``"mismatch"``.
 
     Query params:
         workspace: Absolute path to the workspace.

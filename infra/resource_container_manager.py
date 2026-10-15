@@ -1569,6 +1569,37 @@ class ResourceContainerManager:
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
+        # The lifecycle funnel is the single arbiter of whether the container
+        # may be destroyed.  An explicit reap intent ALWAYS wins, so the
+        # decision emits exactly one CONTAINER_LIFECYCLE event and returns
+        # ``destroys=True``; only on that decision do we stop/remove the
+        # container.  A (defensive) non-destroy decision leaves it untouched.
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+        decision = ContainerLifecycle.reconcile(
+            container,
+            self.session_permissions,
+            ContainerIntent(
+                kind="reap",
+                explicit=True,
+                reason="resource_removed",
+                force=True,
+                workspace_id=self.workspace_id,
+                session_id=self.session_id,
+            ),
+        )
+        if not decision.destroys:
+            _LOG.warning(
+                "resource container %s removal refused by lifecycle funnel "
+                "(%s); leaving container alive",
+                container_id,
+                decision.reason,
+            )
+            return {
+                "status": "error",
+                "container_id": container_id,
+                "error": "resource removal refused by container lifecycle "
+                         f"funnel ({decision.reason})",
+            }
         try:
             container.stop(timeout=5)
         except Exception:
@@ -1981,6 +2012,33 @@ def cleanup_workspace_resources(workspace_id):
         )
         for container in containers:
             try:
+                # The lifecycle funnel is the single arbiter of whether the
+                # container may be destroyed.  An explicit reap intent ALWAYS
+                # wins (exactly one CONTAINER_LIFECYCLE event per decision); a
+                # (defensive) non-destroy decision leaves the container alive.
+                from infra.container_lifecycle import (
+                    ContainerIntent as _CLIntent,
+                    ContainerLifecycle as _CLLifecycle,
+                )
+                decision = _CLLifecycle.reconcile(
+                    container,
+                    None,
+                    _CLIntent(
+                        kind="reap",
+                        explicit=True,
+                        reason="workspace_cleanup",
+                        force=True,
+                        workspace_id=workspace_id,
+                    ),
+                )
+                if not decision.destroys:
+                    _LOG.warning(
+                        "resource container %s cleanup refused by lifecycle "
+                        "funnel (%s); leaving container alive",
+                        getattr(container, "id", "?"),
+                        decision.reason,
+                    )
+                    continue
                 container.remove(force=True)
                 try:
                     from infra.container_manager import (
