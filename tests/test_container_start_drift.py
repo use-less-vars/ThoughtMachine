@@ -1399,3 +1399,130 @@ def test_remove_keep_record_idempotent_second_call_never_raises():
     assert second["status"] == "removed"  # idempotent; never raises
     assert _load_rec() is not None  # preserved across BOTH calls
 
+
+
+# ---------------------------------------------------------------------------
+# ``cleanup_workspace`` (module-level teardown): force-removes every labelled
+# container, REAPS each removed container's bound record, and emits exactly ONE
+# ``container_removed`` event (reason="workspace_cleanup").  A container
+# force-removed while still RUNNING is reported at WARNING, naming it.
+# ---------------------------------------------------------------------------
+
+
+def _state_attrs(status):
+    return {"State": {"Status": status, "Running": status == "running"},
+            "HostConfig": {"NetworkMode": "none"}, "Mounts": []}
+
+
+class _CleanupContainer(_FakeContainer):
+    def __init__(self, cid, *, name="agent-x", labels=None, status="exited"):
+        super().__init__(cid, name=name, labels=labels, attrs=_state_attrs(status))
+        self.status = status
+        self.stops = []
+
+    def stop(self, timeout=None):
+        self.stops.append(timeout)
+        self.status = "exited"
+
+
+class _CleanupContainers:
+    def __init__(self, cs):
+        self._cs = list(cs)
+
+    def list(self, all=True, filters=None):
+        return list(self._cs)
+
+
+class _CleanupDocker:
+    def __init__(self, cs):
+        self.containers = _CleanupContainers(cs)
+
+
+def test_cleanup_workspace_removes_reaps_and_emits_workspace_cleanup_reason(monkeypatch):
+    """A clean cleanup: force-remove + reap the record + ONE workspace_cleanup event."""
+    ctr = _CleanupContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                            status="exited")
+    _mint_record("w1", "agent-x", ctr.id)
+    assert _load_rec() is not None  # minted + bound before cleanup
+
+    log_calls = []
+    monkeypatch.setattr(
+        container_manager, "log",
+        lambda level, logger, msg, *a, **k: log_calls.append((level, logger, msg)))
+
+    captured, unsub = _capture_removal_events()
+    try:
+        res = container_manager.cleanup_workspace("w1", _CleanupDocker([ctr]))
+    finally:
+        unsub()
+
+    assert res == {"removed": 1}
+    assert ctr.removed == [{"force": True}]
+    assert _load_rec() is None  # the bound record was REAPED
+    assert len(captured) == 1
+    assert captured[0].data["reason"] == "workspace_cleanup"
+    assert captured[0].data["workspace_id"] == "w1"
+    assert captured[0].data["container_id"] == ctr.id
+    # An exited container is NOT a running force-removal: no WARNING.
+    assert [c for c in log_calls if c[0] == "WARNING"] == []
+
+
+def test_cleanup_workspace_warns_when_force_removing_running_container(monkeypatch):
+    """A RUNNING container force-removed by cleanup is reported at WARNING, named."""
+    ctr = _CleanupContainer("d" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                            status="running")
+    _mint_record("w1", "agent-x", ctr.id)
+
+    log_calls = []
+    monkeypatch.setattr(
+        container_manager, "log",
+        lambda level, logger, msg, *a, **k: log_calls.append((level, logger, msg)))
+
+    captured, unsub = _capture_removal_events()
+    try:
+        res = container_manager.cleanup_workspace("w1", _CleanupDocker([ctr]))
+    finally:
+        unsub()
+
+    assert res == {"removed": 1}
+    assert ctr.removed == [{"force": True}]
+    assert _load_rec() is None  # still reaped
+    assert len(captured) == 1
+    assert captured[0].data["reason"] == "workspace_cleanup"
+    warnings = [c for c in log_calls if c[0] == "WARNING"]
+    assert len(warnings) == 1
+    assert "agent-x" in warnings[0][2]
+    assert ctr.id in warnings[0][2]
+
+
+def test_cleanup_workspace_reap_and_emit_are_not_vacuous(monkeypatch):
+    """Neutering either step proves the other is not vacuous (RED if absent)."""
+    # (a) neuter the REAP step -> the bound record SURVIVES (proves the reap runs).
+    ctr = _CleanupContainer("e" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                            status="exited")
+    _mint_record("w1", "agent-x", ctr.id)
+    monkeypatch.setattr(container_manager, "_reap_bound_record", lambda *a, **k: None)
+
+    captured, unsub = _capture_removal_events()
+    try:
+        res = container_manager.cleanup_workspace("w1", _CleanupDocker([ctr]))
+    finally:
+        unsub()
+
+    assert res == {"removed": 1}
+    assert _load_rec() is not None  # reap neutralised -> record still there
+    assert len(captured) == 1  # the emit step still fired
+
+    # (b) neuter the EMIT step -> NO event despite a real removal (proves the emit).
+    monkeypatch.setattr(container_manager, "_emit_container_removed",
+                        lambda *a, **k: None)
+    ctr2 = _CleanupContainer("f" * 16, status="exited")
+    captured2, unsub2 = _capture_removal_events()
+    try:
+        res2 = container_manager.cleanup_workspace("w1", _CleanupDocker([ctr2]))
+    finally:
+        unsub2()
+
+    assert res2 == {"removed": 1}
+    assert captured2 == []
+

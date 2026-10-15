@@ -1575,6 +1575,16 @@ class ResourceContainerManager:
             pass  # already stopped / already gone — removal below is authoritative
         try:
             container.remove(force=True)
+            try:
+                from infra.container_manager import (
+                    _reap_bound_record as _cm_reap_bound_record,
+                    _emit_container_removed as _cm_emit_container_removed,
+                )
+                _cm_reap_bound_record(self.workspace_id, container)
+                _cm_emit_container_removed(
+                    self.workspace_id, self.session_id, container, reason="removed")
+            except Exception:
+                pass
             return {"status": "removed", "container_id": container_id}
         except NotFound:
             return {"status": "removed", "container_id": container_id}
@@ -1972,6 +1982,16 @@ def cleanup_workspace_resources(workspace_id):
         for container in containers:
             try:
                 container.remove(force=True)
+                try:
+                    from infra.container_manager import (
+                        _reap_bound_record as _cm_reap_bound_record,
+                        _emit_container_removed as _cm_emit_container_removed,
+                    )
+                    _cm_reap_bound_record(workspace_id, container)
+                    _cm_emit_container_removed(
+                        workspace_id, None, container, reason="workspace_cleanup")
+                except Exception:
+                    pass
                 removed_containers += 1
             except Exception as exc:
                 detail = _join_detail(
