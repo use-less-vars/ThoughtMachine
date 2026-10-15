@@ -603,6 +603,13 @@ class WorkerSupervisor:
             image, name, note = permissions, None, None
         # Per-worker container budget (Phase 3, item 6): fail closed BEFORE
         # delegating, so the registry/manager is never called over budget.
+        #
+        # NOTE: this budget counts raw in-memory container ids only; it cannot
+        # consult the shared ``consumes_workspace_slot`` /
+        # ``TERMINAL_CONTAINER_STATUSES`` predicate because no docker status or
+        # lifecycle labels are observable here (only the ids this supervisor
+        # handed out are tracked). Terminal-state slot release is therefore
+        # enforced at the registry/manager cap sites, not here.
         with self._lock:
             if len(self._active_container_ids) >= self._max_container_count:
                 raise RuntimeError(

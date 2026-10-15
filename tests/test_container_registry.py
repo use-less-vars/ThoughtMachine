@@ -47,6 +47,10 @@ from infra.container_registry import (  # noqa: E402
     get_container_registry,
     _resolve_network_mode_via_gate,
 )
+from thoughtmachine.container_record import (  # noqa: E402
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +646,103 @@ class TestRequestContainer:
             reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: True)
             with pytest.raises(RuntimeError, match="Docker client unavailable"):
                 reg.request_container("w", "s", {}, workspace_id="ws")
+
+
+# ---------------------------------------------------------------------------
+# workspace container-cap slot accounting (availability fix)
+# ---------------------------------------------------------------------------
+
+
+def _seed_record(registry, name, workspace_id, status, container_id="",
+                 lifecycle_class=LIFECYCLE_PERSISTENT, session_id="sess-cap"):
+    """Seed a registry record in an arbitrary lifecycle state."""
+    profile = ContainerProfile(image="i")
+    registry.register(name, session_id, workspace_id, "user", profile)
+    state = registry._containers[name]
+    state["status"] = status
+    state["container_id"] = container_id
+    state["lifecycle_class"] = lifecycle_class
+
+
+def _raise_not_found(cid):
+    raise docker.errors.NotFound(f"no such container: {cid}")
+
+
+class TestWorkspaceCapSlotAccounting:
+    """The per-workspace cap must bound LIVE PERSISTENT containers only, so a
+    workspace whose containers have stopped is never deadlocked."""
+
+    def test_exited_records_do_not_consume_slots(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-live{i}")
+        # 3 of the 6 records have actually stopped (exited/dead); one even names
+        # a docker id that no longer exists.
+        registry._containers["c0"]["status"] = "exited"
+        registry._containers["c1"]["status"] = "dead"
+        registry._containers["c2"]["status"] = "exited"
+        registry._containers["c2"]["container_id"] = "id-gone"
+        fake_client.containers.get.side_effect = (
+            lambda cid: _raise_not_found(cid) if cid == "id-gone"
+            else FakeContainer(cid)
+        )
+        assert registry._count_consuming_slots("ws") == 3
+        handle = registry.request_container("w", "s", {}, workspace_id="ws")
+        assert handle["status"] == "running"
+        assert fake_client.containers.run.call_count == 1
+
+    def test_gone_container_id_does_not_consume_a_slot(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-{i}")
+        fake_client.containers.get.side_effect = (
+            lambda cid: _raise_not_found(cid) if cid == "id-4"
+            else FakeContainer(cid)
+        )
+        assert registry._count_consuming_slots("ws") == DEFAULT_MAX_CONTAINERS - 1
+        handle = registry.request_container("w", "s", {}, workspace_id="ws")
+        assert handle["status"] == "running"
+
+    def test_live_persistent_cap_still_refuses(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-{i}")
+        assert registry._count_consuming_slots("ws") == DEFAULT_MAX_CONTAINERS
+        with pytest.raises(RuntimeError, match="Container limit reached"):
+            registry.request_container("w", "s", {}, workspace_id="ws")
+        assert fake_client.containers.run.call_count == 0
+        # the refused reservation was never inserted (no slot leak)
+        assert len(registry._containers) == DEFAULT_MAX_CONTAINERS
+
+    def test_ephemeral_records_do_not_consume_the_persistent_budget(
+        self, registry, fake_client
+    ):
+        for i in range(DEFAULT_MAX_CONTAINERS - 1):
+            _seed_record(registry, f"p{i}", "ws", "running", f"pid-{i}")
+        for i in range(3):
+            _seed_record(registry, f"e{i}", "ws", "running", f"eid-{i}",
+                         lifecycle_class=LIFECYCLE_EPHEMERAL)
+        assert registry._count_consuming_slots("ws") == DEFAULT_MAX_CONTAINERS - 1
+        handle = registry.request_container("w", "s", {}, workspace_id="ws")
+        assert handle["status"] == "running"
+        assert fake_client.containers.run.call_count == 1
+
+    def test_refusal_message_is_actionable_and_accurate(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-{i}")
+        # 3 extra EXITED records must not inflate the reported number.
+        for i in range(3):
+            _seed_record(registry, f"x{i}", "ws", "exited", f"xid-{i}")
+        with pytest.raises(RuntimeError) as excinfo:
+            registry.request_container("w", "s", {}, workspace_id="ws")
+        msg = str(excinfo.value)
+        assert "Container limit reached" in msg
+        # reports the LIVE count (6), not the raw record count (9)
+        assert "6/6" in msg
+        assert "9" not in msg
+        # names an action that actually exists
+        from tools.container_control import ContainerRemoveTool
+        assert ContainerRemoveTool is not None
+        assert "ContainerRemoveTool" in msg
+        # and does not reuse the misleading "active container(s)" phrasing
+        assert "active container(s)" not in msg
 
 
 # ---------------------------------------------------------------------------

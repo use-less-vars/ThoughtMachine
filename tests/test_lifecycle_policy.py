@@ -16,6 +16,7 @@ import pytest
 import infra.container_manager as cm_mod
 from agent.config.defaults import CONTAINER_TYPE_RESOURCE
 from infra.container_manager import ContainerManager
+from infra.container_registry import ContainerRegistry
 from infra.resource_container_manager import ResourceContainerManager
 from security.admission_gate import REASON_UNKNOWN_LIFECYCLE_CLASS
 from thoughtmachine.container_record import (
@@ -24,8 +25,10 @@ from thoughtmachine.container_record import (
     RESOURCE_IMAGE,
     RESOURCE_LABEL,
     RESOURCE_NAME_PREFIX,
+    TERMINAL_CONTAINER_STATUSES,
     LifecyclePolicy,
     UnknownLifecycleClass,
+    consumes_workspace_slot,
     create_record,
     is_resource_like,
     policy_for,
@@ -441,3 +444,124 @@ def test_security_gate_first_import_keeps_docker_code_runner():
 
     assert "DockerCodeRunner" in [c.__name__ for c in tools.TOOL_CLASSES]
     assert tools.get_import_failures() == []
+
+
+# ── (i) shared slot predicate + cap call-sites (SSOT unification) ────────────
+
+
+def test_terminal_container_statuses_shared_constant():
+    assert TERMINAL_CONTAINER_STATUSES == frozenset({"exited", "dead", "removing"})
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        # persistent + live -> consumes
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": "running"}, True),
+        # terminal states free the slot
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": "exited"}, False),
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": "dead"}, False),
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": "removing"}, False),
+        # unknown / absent status counts (fail-closed)
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": None}, True),
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": "bogus"}, True),
+        # container gone -> nothing occupied (even when persistent + live status)
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": "running", "exists": False}, False),
+        ({"lifecycle_class": LIFECYCLE_PERSISTENT, "status": "exited", "exists": False}, False),
+        # non-persistent lifecycles never consume... except the documented RESOURCE
+        ({"lifecycle_class": LIFECYCLE_EPHEMERAL, "status": "running"}, False),
+        ({"lifecycle_class": LIFECYCLE_RESOURCE, "status": "running"}, True),
+    ],
+)
+def test_consumes_workspace_slot_truth_table(kwargs, expected):
+    assert consumes_workspace_slot(**kwargs) is expected
+
+
+# -- ContainerManager._counts_toward_limit delegates to the shared predicate ---
+
+
+def test_manager_counts_toward_limit_excludes_terminal(vault):
+    cm = _cm()
+    assert cm._counts_toward_limit({"status": "running", "labels": {}}) is True
+    assert cm._counts_toward_limit({"status": "exited", "labels": {}}) is False
+    assert cm._counts_toward_limit({"status": "dead", "labels": {}}) is False
+    assert cm._counts_toward_limit({"status": "removing", "labels": {}}) is False
+    # unknown / absent status counts (fail-closed)
+    assert cm._counts_toward_limit({"status": "bogus", "labels": {}}) is True
+    assert cm._counts_toward_limit({}) is True
+
+
+def test_manager_counts_toward_limit_keeps_resource_excluded(vault):
+    cm = _cm()
+    resource_entry = {"status": "running", "labels": {RESOURCE_LABEL: "1"}}
+    assert cm._counts_toward_limit(resource_entry) is False
+
+
+def test_manager_exited_containers_do_not_consume_or_block(vault):
+    cm = _cm()
+    live = {"status": "running", "labels": {}, "name": "agent-exec-1"}
+    exited = {"status": "exited", "labels": {}, "name": "agent-exec-2"}
+    entries = [exited, exited, live]
+    assert len(cm._active_containers(entries)) == 1
+    assert cm._active_containers(entries) == [live]
+
+
+# -- ContainerRegistry._record_consumes_slot / _count_consuming_slots ----------
+
+
+def _registry():
+    reg = object.__new__(ContainerRegistry)
+    reg._docker_client = None
+    return reg
+
+
+def test_registry_record_consumes_slot_excludes_terminal():
+    reg = _registry()
+    assert reg._record_consumes_slot(
+        {"status": "exited", "lifecycle_class": LIFECYCLE_PERSISTENT}
+    ) is False
+    assert reg._record_consumes_slot(
+        {"status": "dead", "lifecycle_class": LIFECYCLE_PERSISTENT}
+    ) is False
+    assert reg._record_consumes_slot(
+        {"status": "removing", "lifecycle_class": LIFECYCLE_PERSISTENT}
+    ) is False
+    assert reg._record_consumes_slot(
+        {"status": "running", "lifecycle_class": LIFECYCLE_PERSISTENT}
+    ) is True
+    # absent status counts (fail-closed)
+    assert reg._record_consumes_slot(
+        {"lifecycle_class": LIFECYCLE_PERSISTENT}
+    ) is True
+    # non-persistent lifecycles never consume
+    assert reg._record_consumes_slot(
+        {"status": "running", "lifecycle_class": LIFECYCLE_RESOURCE}
+    ) is False
+
+
+def test_registry_exited_records_do_not_consume_slots():
+    reg = _registry()
+    reg._containers = {
+        "a": {"workspace_id": "ws", "status": "exited",
+              "lifecycle_class": LIFECYCLE_PERSISTENT},
+        "b": {"workspace_id": "ws", "status": "dead",
+              "lifecycle_class": LIFECYCLE_PERSISTENT},
+        "c": {"workspace_id": "ws", "status": "running",
+              "lifecycle_class": LIFECYCLE_PERSISTENT},
+        "d": {"workspace_id": "other", "status": "running",
+              "lifecycle_class": LIFECYCLE_PERSISTENT},
+    }
+    assert reg._count_consuming_slots("ws") == 1
+
+
+# -- ContainerRemoveTool surfaced in agent + canonical presets -----------------
+
+
+def test_container_remove_tool_is_surfaced_in_presets():
+    from session.tool_presets import _ALL_TOOLS, AGENT_TOOLS, ENGINEER_TOOLS
+
+    assert "ContainerRemoveTool" in _ALL_TOOLS
+    assert "ContainerRemoveTool" in AGENT_TOOLS
+    # engineer mode stays container-tool free
+    assert "ContainerRemoveTool" not in ENGINEER_TOOLS
+

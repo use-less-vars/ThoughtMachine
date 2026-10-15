@@ -68,6 +68,7 @@ from security.security_gate import (
 )
 from thoughtmachine.container_record import (
     LIFECYCLE_PERSISTENT,
+    consumes_workspace_slot,
     lifecycle_class_from_labels,
 )
 
@@ -208,21 +209,53 @@ class Probes(Protocol):
     def now(self) -> float: ...
 
 
+def _container_status(container) -> Optional[str]:
+    """Best-effort read of a Docker container's ``State.Status``.
+
+    Prefers the SDK's ``container.status`` attribute and falls back to the raw
+    ``container.attrs["State"]["Status"]``.  Returns ``None`` when neither is
+    readable.  :func:`_counts_toward_ceiling` treats ``None`` as NON-terminal
+    (fail-closed): a container whose status cannot be inspected still counts.
+    Never raises.
+    """
+    status = getattr(container, "status", None)
+    if isinstance(status, str) and status:
+        return status
+    attrs = getattr(container, "attrs", None)
+    if isinstance(attrs, Mapping):
+        state = attrs.get("State")
+        if isinstance(state, Mapping):
+            raw = state.get("Status")
+            if isinstance(raw, str) and raw:
+                return raw
+    return None
+
+
 def _counts_toward_ceiling(container) -> bool:
     """Whether a Docker container occupies the persistent per-workspace ceiling.
 
     Reads the container's labels/name/image-tags and delegates to the shared
-    :func:`thoughtmachine.container_record.lifecycle_class_from_labels`; only
-    ``persistent``-class containers count (``resource``/``ephemeral`` are
-    excluded).  Never raises.
+    :func:`thoughtmachine.container_record.lifecycle_class_from_labels`; only a
+    ``persistent``-class container can count (``resource``/``ephemeral`` are
+    excluded).  A persistent-class container still counts only while it
+    *consumes* a workspace slot: a terminal Docker status
+    (``exited``/``dead``/``removing``) frees the slot, so it is excluded via the
+    shared :func:`thoughtmachine.container_record.consumes_workspace_slot`
+    predicate.  A missing or unreadable status is treated as NON-terminal
+    (fail-closed: it still counts; ``consumes_workspace_slot`` returns True for a
+    ``None`` status).  Never raises.
     """
     labels = getattr(container, "labels", None)
     name = getattr(container, "name", None)
     image = getattr(container, "image", None)
     image_tags = image if (image is None or isinstance(image, str)) else getattr(image, "tags", None)
-    return (
-        lifecycle_class_from_labels(labels, name=name, image_tags=image_tags)
-        == LIFECYCLE_PERSISTENT
+    lifecycle_class = lifecycle_class_from_labels(labels, name=name, image_tags=image_tags)
+    if lifecycle_class != LIFECYCLE_PERSISTENT:
+        return False
+    return consumes_workspace_slot(
+        lifecycle_class=lifecycle_class,
+        status=_container_status(container),
+        exists=True,
     )
 
 
@@ -452,7 +485,8 @@ def _admit(request: Any, probes: Optional[Any]) -> Decision:
     if count >= limit:
         return Deny(
             REASON_CONTAINER_LIMIT_EXCEEDED,
-            f"container limit reached ({count}/{limit})",
+            f"container limit reached ({count}/{limit} consuming container(s)); "
+            "remove an existing container to free a slot",
         )
 
     # ── step 7: derived-policy narrowing ───────────────────────────────────

@@ -112,6 +112,7 @@ from thoughtmachine.workspace_capabilities import git_shadow_mask_path
 from thoughtmachine.container_record import (
     attach_container,
     ContainerRecordError,
+    consumes_workspace_slot,
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
@@ -763,10 +764,12 @@ class ContainerManager:
           ceiling -- ``resource`` and ``ephemeral`` containers are excluded
           (classified via the shared ``lifecycle_class_from_labels`` helper).
         Unknown/new statuses count (fail-safe: default to occupying a slot).
+
+        The terminal-state filter is delegated to the shared
+        ``consumes_workspace_slot`` predicate (single SSOT shared with the
+        registry and the admission gate); the persistent-only filter stays
+        local because the shared predicate treats ``resource`` as consuming.
         """
-        status = str((entry or {}).get("status", "")).lower()
-        if status in ("exited", "dead", "removing"):
-            return False
         entry = entry or {}
         cls = lifecycle_class_from_labels(
             entry.get("labels"),
@@ -774,7 +777,13 @@ class ContainerManager:
             image_tags=entry.get("image"),
             vault_root=getattr(self, "vault_root", None),
         )
-        return cls == LIFECYCLE_PERSISTENT
+        if cls != LIFECYCLE_PERSISTENT:
+            return False
+        return consumes_workspace_slot(
+            lifecycle_class=cls,
+            status=entry.get("status"),
+            exists=True,
+        )
 
     def _active_containers(self, entries):
         """Filter container entries down to those that occupy a limit slot."""
@@ -1659,9 +1668,10 @@ class ContainerManager:
                 f"Workspace container limit reached: active={len(active_containers)} "
                 f"exited={len(containers) - len(active_containers)} limit={limit} "
                 f"workspace_id={self.workspace_id}")
-            return {"error": f"Workspace container limit ({limit}) reached "
-                             f"({len(active_containers)} active container(s)). "
-                             f"Remove a persistent container to free a slot."}
+            return {"error": f"Workspace container limit reached "
+                             f"({len(active_containers)}/{limit} consuming "
+                             f"container(s)); remove an existing container with "
+                             f"ContainerRemoveTool to free a slot"}
 
         # ── Desired isolation from session permissions (all paths) ─────────
         computed = self._compute_config(
