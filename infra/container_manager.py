@@ -1436,7 +1436,7 @@ class ContainerManager:
                 _reuse_intent = None
             _reuse_mem_limit = (_reuse_intent or {}).get("mem_limit") or None
             _reuse_cpu_quota = (_reuse_intent or {}).get("cpu_quota") or None
-            if docker_id and self._reuse_container(docker_id) is None:
+            if docker_id and self._reuse_container(docker_id)[0] is None:
                 # C3: a KNOWN class that OWNS its lifecycle (resource/service) is
                 # the ONLY class-based heal refusal; an unknown class is treated
                 # as owning (fail-closed) but is NEVER reported as 'not healable'.
@@ -1482,7 +1482,7 @@ class ContainerManager:
                                   "action."),
                         "code": HEAL_OUTCOME_UNBOUND}
             # (a) Record + docker_id: reuse via the record's docker id.
-            container = self._reuse_container(docker_id)
+            container, _reuse_running = self._reuse_container(docker_id)
             if container is None:
                 if allow_fresh:
                     return self._fresh_start(
@@ -1530,7 +1530,8 @@ class ContainerManager:
                                   f"`heal=True`; an operator can recreate it via "
                                   f"the record's recreate action."),
                         "code": HEAL_OUTCOME_CONTAINER_MISSING}
-            self._containers[name] = container.id  # warm the read-through cache
+            if _reuse_running:
+                self._containers[name] = container.id  # warm the read-through cache
             if (explicit_image is not None
                     and not self._image_matches(container, explicit_image)):
                 actual = self._image_ref(container)
@@ -1582,6 +1583,10 @@ class ContainerManager:
                            "note": note_value}
             if _payload is not None:
                 _reuse_resp["drift"] = _payload
+            if not _reuse_running:
+                # VERIFIED state: only claim a plain reuse when the container was
+                # observed running; otherwise surface the unverified state.
+                _reuse_resp["running"] = False
             return _reuse_resp
 
         # (c) Cached name with NO record -> drift: REFUSE (no-container-record).
@@ -1632,6 +1637,7 @@ class ContainerManager:
                 # (see _start_drift_decision; mirrors the registry/label checks
                 # below).
                 _start_drift = None
+                _reuse_running = False
                 if container is not None:
                     _action, _payload = self._start_drift_decision(
                         container, want_network, want_workspace, "workspace-label",
@@ -1664,9 +1670,9 @@ class ContainerManager:
                     if _action == "reuse":
                         _start_drift = _payload
                     try:
-                        self._ensure_running(container)
+                        _reuse_running = self._ensure_running(container)
                     except Exception:
-                        pass
+                        _reuse_running = False
                 if note is not None:
                     _rid = (self._record_id_for(container)
                             if container is not None
@@ -1695,6 +1701,10 @@ class ContainerManager:
                                "note": note_value}
                 if _start_drift is not None:
                     _reuse_resp["drift"] = _start_drift
+                if not _reuse_running:
+                    # VERIFIED state: only claim a plain reuse when the container
+                    # was observed running; otherwise surface the unverified state.
+                    _reuse_resp["running"] = False
                 return _reuse_resp
         limit = self._get_max_containers()
         active_containers = self._active_containers(containers)
@@ -1776,8 +1786,9 @@ class ContainerManager:
                     reuse_record_id=None,
                     permissions=effective,
                 )
-            self._ensure_running(container)
-            self._containers[name] = container.id
+            _reuse_running = self._ensure_running(container)
+            if _reuse_running:
+                self._containers[name] = container.id
             if note is not None:
                 self._write_note(self._record_id_for(container), note)
             note_value = (note if note is not None
@@ -1794,6 +1805,10 @@ class ContainerManager:
                            "note": note_value}
             if _payload is not None:
                 _reuse_resp["drift"] = _payload
+            if not _reuse_running:
+                # VERIFIED state: only claim a plain reuse when the container was
+                # observed running; otherwise surface the unverified state.
+                _reuse_resp["running"] = False
             return _reuse_resp
 
         # 3) Fresh create: one shared creation path.
@@ -3941,15 +3956,20 @@ class ContainerManager:
                 f"(reason={reason}): {type(exc).__name__}: {exc}")
 
     def _reuse_container(self, container_id):
-        """Return a running container for ``container_id`` or None."""
+        """Return ``(container, running)`` for ``container_id``.
+
+        ``(None, False)`` when ``container_id`` is falsy or the container cannot
+        be fetched; ``running`` is the VERIFIED result of ``_ensure_running`` --
+        callers must never claim a running reuse they did not observe.
+        """
         if not container_id:
-            return None
+            return None, False
         try:
             container = self.client.containers.get(container_id)
-            self._ensure_running(container)
-            return container
+            running = self._ensure_running(container)
+            return container, running
         except Exception:
-            return None
+            return None, False
 
     def _find_by_labels(self, name):
         """Find a container by its thoughtmachine labels (or None)."""
@@ -3987,6 +4007,23 @@ class ContainerManager:
             log("WARNING", "docker.container_manager",
                 f"_ensure_running: container.start()/reload() failed for "
                 f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
+        # VERIFY the outcome instead of assuming it: a best-effort start that
+        # silently failed -- or a container that came back non-running -- must
+        # never be reported as a running reuse.  The status read is defensive so
+        # this helper NEVER raises out to its caller.
+        try:
+            observed = container.status
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: status read failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
+            observed = None
+        running = observed == "running"
+        if not running:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: container {getattr(container, 'id', '?')} "
+                f"still not running after start attempt (status={observed!r})")
+        return running
 
     def set_note(self, container_id, note):
         """Set the container's sticky note on its RECORD; NEVER raises.

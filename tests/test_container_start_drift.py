@@ -1925,3 +1925,190 @@ def test_unknown_status_admission_is_fail_closed_and_load_bearing(monkeypatch):
                         lambda **kwargs: False)
     assert cm._active_containers([unknown, novel]) == []
 
+
+
+
+# ===========================================================================
+# W5 (wave9a) VERIFIED-RUNNING INVARIANT  ("finding E").
+#
+# CLAIM pinned here: a REUSE never claims a running container it did not
+# observe.  ``_ensure_running`` now VERIFIES the post-start status and returns a
+# bool (never raising); every reuse site gates BOTH the response (``"running":
+# False`` on a container it could not verify) AND the warm-cache write on that
+# verified result.
+#
+#   * ``_ensure_running`` returns True for a running container; False when
+#     ``start()`` raises / the container never reaches ``running`` / the status
+#     read itself raises; it WARNs and never raises out to its caller;
+#   * for EACH reuse site: a container that will not run is surfaced (``"running":
+#     False``) and its dead id is NOT warmed into the read-through cache, while a
+#     genuinely running container reuses with NO ``running`` key and DOES warm the
+#     cache (non-vacuity);
+#   * DIFFERENTIAL: neutering the verified result (constant True == the pre-fix
+#     "assume it worked") re-warms the dead id and drops the marker, proving the
+#     gate is load-bearing.
+# ===========================================================================
+
+
+class _StuckContainer(_FakeContainer):
+    """A container that is NOT running and whose ``start()`` does not help.
+
+    Models a best-effort start that silently failed: ``start`` is COUNTED (so the
+    daemon seam is observable) but never transitions the status.
+    """
+
+    def __init__(self, container_id, name=None, labels=None, attrs=None,
+                 status="exited"):
+        super().__init__(container_id, name=name, labels=labels, attrs=attrs)
+        self.status = status
+        self.start_calls = 0
+
+    def start(self):
+        self.start_calls += 1  # observed ... but the daemon start did not take
+
+
+class _RaisingStartContainer(_StuckContainer):
+    """A container whose ``start()`` raises (the start-failure path)."""
+
+    def start(self):
+        self.start_calls += 1
+        raise RuntimeError("start failed")
+
+
+class _RaisingStatusContainer(_FakeContainer):
+    """A container whose ``status`` read raises (defensive-read path)."""
+
+    def __init__(self, container_id, name=None, labels=None, attrs=None):
+        # Deliberately avoid ``self.status = ...`` (the property has no setter).
+        self.id = container_id
+        self.name = name or container_id
+        self.image = _FakeImageRef()
+        self.labels = dict(labels or {})
+        self.attrs = attrs if attrs is not None else _attrs("none", False)
+        self.removed = []
+
+    @property
+    def status(self):
+        raise RuntimeError("status unavailable")
+
+
+def _log_spy(monkeypatch):
+    """Capture ``container_manager.log`` calls as a list of arg-tuples."""
+    seen = []
+    monkeypatch.setattr(container_manager, "log",
+                        lambda *a, **k: seen.append(a))
+    return seen
+
+
+# --- ``_ensure_running`` verification contract ------------------------------
+
+
+def test_ensure_running_true_for_running_container():
+    ctr = _FakeContainer("c" * 16, attrs=_attrs("none", False))  # status running
+    cm = _make_cm(ctr, want=("none", "ro"))
+    assert cm._ensure_running(ctr) is True
+
+
+def test_ensure_running_false_when_start_raises(monkeypatch):
+    seen = _log_spy(monkeypatch)
+    ctr = _RaisingStartContainer("c" * 16, attrs=_attrs("none", False))
+    cm = _make_cm(ctr, want=("none", "ro"))
+    assert cm._ensure_running(ctr) is False  # never raises out to the caller
+    assert ctr.start_calls == 1
+    assert any(a and a[0] == "WARNING" for a in seen)
+
+
+def test_ensure_running_false_when_still_not_running(monkeypatch):
+    seen = _log_spy(monkeypatch)
+    ctr = _StuckContainer("c" * 16, attrs=_attrs("none", False))
+    cm = _make_cm(ctr, want=("none", "ro"))
+    assert cm._ensure_running(ctr) is False
+    assert ctr.start_calls == 1
+    msgs = " ".join(str(a[-1]) for a in seen if a and a[0] == "WARNING")
+    assert "still not running" in msgs
+    assert ctr.id in msgs  # the WARNING names the offending container
+
+
+def test_ensure_running_never_raises_when_status_read_raises(monkeypatch):
+    seen = _log_spy(monkeypatch)
+    ctr = _RaisingStatusContainer("c" * 16)
+    cm = _make_cm(ctr, want=("none", "ro"))
+    assert cm._ensure_running(ctr) is False  # defensive read -> False, no raise
+    assert any(a and a[0] == "WARNING" for a in seen)
+
+
+# --- every reuse site surfaces only VERIFIED state --------------------------
+
+# The workspace-label path never warms the read-through cache; the record and
+# label paths do.  Encoding that here keeps the non-vacuity control honest.
+_REUSE_SITE_WARMS_CACHE = {
+    "record": True,
+    "workspace-label": False,
+    "label": True,
+}
+
+
+@pytest.mark.parametrize("site", list(_REUSE_SITE_WARMS_CACHE))
+def test_non_running_reuse_surfaces_unverified_state(site, events):
+    """A reuse of a container that will not run reports ``"running": False``.
+
+    The container is STOPPED and its ``start()`` does not take, so the reuse must
+    NOT claim a running container -- and must NOT warm the cache with the dead id
+    it could not verify.
+    """
+    ctr = _StuckContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                          attrs=_attrs("none", False))  # matches ("none", "ro")
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", site)
+
+    result = cm.start(name="agent-x")
+
+    assert result["status"] == "reused"
+    assert result.get("running") is False          # unverified state surfaced
+    assert ctr.id not in cm._containers.values()   # dead id never warmed
+    assert cm._containers.get("agent-x") != ctr.id
+    assert ctr.start_calls >= 1                    # the start WAS attempted
+
+
+@pytest.mark.parametrize("site", list(_REUSE_SITE_WARMS_CACHE))
+def test_running_reuse_claims_no_unverified_state(site, events):
+    """NON-VACUITY: a genuinely running container reuses with NO ``running`` key."""
+    ctr = _FakeContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                         attrs=_attrs("none", False))  # already running
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", site)
+
+    result = cm.start(name="agent-x")
+
+    assert result["status"] == "reused"
+    assert "running" not in result                 # verified -> byte-identical
+    if _REUSE_SITE_WARMS_CACHE[site]:
+        assert cm._containers.get("agent-x") == ctr.id
+
+
+@pytest.mark.parametrize("site", ["record", "label"])
+def test_verified_running_gate_is_load_bearing(site, monkeypatch, events):
+    """DIFFERENTIAL: neuter the verification and the assertions above go FALSE.
+
+    Forcing the verified result to a constant ``True`` (the pre-W5 "assume the
+    start worked" behaviour) re-warms the dead id and drops the ``running``
+    marker -- proving BOTH the verified return (change 1) and the call-site gate
+    (change 3) are load-bearing.
+    """
+    ctr = _StuckContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                          attrs=_attrs("none", False))
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", site)
+
+    # Honest: the stopped container is surfaced and the cache stays clean.
+    resp = cm.start(name="agent-x")
+    assert resp.get("running") is False
+    assert ctr.id not in cm._containers.values()
+
+    # Mutation: the verified result is replaced by "we assume it worked".
+    monkeypatch.setattr(cm, "_ensure_running", lambda c: True)
+    cm._containers.clear()
+    resp2 = cm.start(name="agent-x")
+    assert "running" not in resp2                  # the lie is now hidden
+    assert cm._containers.get("agent-x") == ctr.id  # ...and the dead id warmed
+
