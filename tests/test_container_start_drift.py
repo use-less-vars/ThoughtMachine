@@ -201,9 +201,11 @@ def _start(container, want, site, **kwargs):
 def _clear_memo():
     container_manager._EXEC_DRIFT_SEEN.clear()
     container_manager._START_DRIFT_SEEN.clear()
+    container_manager._CONTAINER_REUSED_SEEN.clear()
     yield
     container_manager._EXEC_DRIFT_SEEN.clear()
     container_manager._START_DRIFT_SEEN.clear()
+    container_manager._CONTAINER_REUSED_SEEN.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -304,7 +306,12 @@ def test_clean_match_reuses_without_drift(site, events):
     assert "drift" not in result
     assert ctr.removed == []
     assert cm._remove_container.called is False
-    assert events == []
+    # No DRIFT event; the affirmative ``container_reused`` event fires ONCE.
+    assert [e for e in events if e["event_type"] == _EVENT] == []
+    assert len(events) == 1
+    assert events[0]["event_type"] == "container_reused"
+    assert events[0]["record_id"] == "rec-1"
+    assert events[0]["payload"]["docker_id"] == ctr.id
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +381,13 @@ def test_less_permissive_is_reused_with_warn(site, events):
     assert result["drift"]["source"] == site
     assert ctr.removed == []
     assert cm._remove_container.called is False
-    assert len(events) == 1
-    assert events[0]["payload"]["decision"] == "warn"
+    # The drift "warn" event PLUS the affirmative reuse event.
+    drift_evs = [e for e in events if e["event_type"] == _EVENT]
+    reused_evs = [e for e in events if e["event_type"] == "container_reused"]
+    assert len(drift_evs) == 1
+    assert drift_evs[0]["payload"]["decision"] == "warn"
+    assert len(reused_evs) == 1
+    assert len(events) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +456,12 @@ def test_unreadable_attrs_reuse_without_drift(site, events):
     assert result["status"] == "reused"
     assert "drift" not in result
     assert cm._remove_container.called is False
-    assert events == []
+    # No DRIFT event.  A ``container_reused`` event can fire ONLY on the
+    # record-driven site: the raising-attrs container carries no record label,
+    # so the label / workspace-label sites cannot resolve a record id.
+    assert [e for e in events if e["event_type"] == _EVENT] == []
+    assert all(e["event_type"] == "container_reused" for e in events)
+    assert len(events) == (1 if site == "record" else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1525,4 +1542,121 @@ def test_cleanup_workspace_reap_and_emit_are_not_vacuous(monkeypatch):
 
     assert res2 == {"removed": 1}
     assert captured2 == []
+
+
+
+# ---------------------------------------------------------------------------
+# W3-4: the heal-outcome refusal codes are DECLARED once and produced verbatim.
+# ---------------------------------------------------------------------------
+
+
+def test_heal_outcome_codes_are_a_single_declared_set():
+    """The three heal-outcome codes live in ONE frozen set, byte-for-byte."""
+    assert container_manager.HEAL_OUTCOME_CODES == frozenset({
+        "container_record_unbound",
+        "container_record_not_healable",
+        "container_record_container_missing",
+    })
+    assert container_manager.HEAL_OUTCOME_UNBOUND == "container_record_unbound"
+    assert container_manager.HEAL_OUTCOME_NOT_HEALABLE == "container_record_not_healable"
+    assert (container_manager.HEAL_OUTCOME_CONTAINER_MISSING
+            == "container_record_container_missing")
+
+
+def test_producer_unbound_returns_the_declared_constant(events):
+    """The (b) unbound producer yields HEAL_OUTCOME_UNBOUND."""
+    cm = _make_cm(None, want=("none", "ro"))
+    cm.client = _FakeDockerClient([])
+    # A record present but naming NO container -> the unbound refusal.
+    create_record("w1", LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, id="rec-1",
+                  name="agent-x", vault_root=_VAULT["root"])
+
+    result = cm.start(name="agent-x")
+
+    assert result["code"] == container_manager.HEAL_OUTCOME_UNBOUND
+    assert result["code"] in container_manager.HEAL_OUTCOME_CODES
+
+
+def test_producer_not_healable_returns_the_declared_constant(events):
+    """The own-lifecycle class refusal yields HEAL_OUTCOME_NOT_HEALABLE."""
+    cm = _missing_cm()
+    create_record("w1", LIFECYCLE_RESOURCE, OWNER_WORKSPACE, id="rec-1",
+                  name="agent-x", vault_root=_VAULT["root"])
+    update_record("w1", "rec-1", vault_root=_VAULT["root"], docker_id=_HEAL_STALE)
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result["code"] == container_manager.HEAL_OUTCOME_NOT_HEALABLE
+    assert result["code"] in container_manager.HEAL_OUTCOME_CODES
+
+
+def test_producer_container_missing_returns_the_declared_constant(events):
+    """The stale-docker-id fallback yields HEAL_OUTCOME_CONTAINER_MISSING."""
+    cm = _missing_cm()
+    _mint_record("w1", "agent-x", _HEAL_STALE)  # no evidence snapshot -> refuse
+
+    result = cm.start(name="agent-x", heal_missing=True)
+
+    assert result["code"] == container_manager.HEAL_OUTCOME_CONTAINER_MISSING
+    assert result["code"] in container_manager.HEAL_OUTCOME_CODES
+
+
+# ---------------------------------------------------------------------------
+# W3-5: the affirmative ``container_reused`` event fires ONCE per identity pair.
+# ---------------------------------------------------------------------------
+
+
+def test_reuse_emits_container_reused_event_once_per_identity(events):
+    """A reuse records ONE ``container_reused`` event (kind + payload pinned)."""
+    ctr = _FakeContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                         attrs=_attrs("none", False))
+    cm, result = _start(ctr, want=("none", "ro"), site="record", name="agent-x")
+
+    assert result["status"] == "reused"
+    reused = [e for e in events if e["event_type"] == "container_reused"]
+    assert len(reused) == 1
+    ev = reused[0]
+    assert ev["record_id"] == "rec-1"
+    assert ev["workspace_id"] == "w1"
+    assert ev["actor"] == container_manager._CONTAINER_REUSED_ACTOR
+    assert ev["payload"]["docker_id"] == ctr.id
+
+
+def test_container_reused_event_is_deduped_across_calls(events):
+    """A SECOND identical reuse emits NO further ``container_reused`` event."""
+    ctr = _FakeContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                         attrs=_attrs("none", False))
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", "record")
+
+    cm.start(name="agent-x")
+    cm.start(name="agent-x")
+
+    reused = [e for e in events if e["event_type"] == "container_reused"]
+    assert len(reused) == 1
+
+
+def test_container_reused_event_is_not_emitted_for_unresolvable_record(events):
+    """A label-site reuse whose record id cannot be resolved emits NOTHING."""
+    ctr = _FakeContainer("c" * 16, labels={}, attrs=_attrs("none", False))
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", "label")
+
+    result = cm.start(name="agent-x")
+
+    assert result["status"] == "reused"
+    assert [e for e in events if e["event_type"] == "container_reused"] == []
+
+
+def test_container_reused_emitter_is_not_vacuous(monkeypatch, events):
+    """Neutering the emitter drops the event -> the call sites are load-bearing."""
+    monkeypatch.setattr(
+        container_manager.ContainerManager, "_emit_container_reused_once",
+        lambda self, record_id, docker_id: None)
+    ctr = _FakeContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                         attrs=_attrs("none", False))
+    cm, result = _start(ctr, want=("none", "ro"), site="record", name="agent-x")
+
+    assert result["status"] == "reused"
+    assert [e for e in events if e["event_type"] == "container_reused"] == []
 

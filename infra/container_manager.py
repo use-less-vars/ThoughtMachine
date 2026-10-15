@@ -266,6 +266,28 @@ _HEAL_REASON = "container_missing"
 _HEAL_AUDIT_HEALED = "CONTAINER_START_MISSING_HEAL"
 _HEAL_AUDIT_REFUSED = "CONTAINER_START_MISSING_HEAL_FAILED"
 
+# W3-4: the SINGLE SOURCE OF TRUTH for the three heal-outcome refusal codes
+# produced by ``start()`` on the missing/absent-container branches.  Producers
+# and every consumer must agree on these byte-for-byte values; the frozen set
+# lets a test pin the declared vocabulary.
+HEAL_OUTCOME_UNBOUND = "container_record_unbound"
+HEAL_OUTCOME_NOT_HEALABLE = "container_record_not_healable"
+HEAL_OUTCOME_CONTAINER_MISSING = "container_record_container_missing"
+HEAL_OUTCOME_CODES = frozenset({
+    HEAL_OUTCOME_UNBOUND,
+    HEAL_OUTCOME_NOT_HEALABLE,
+    HEAL_OUTCOME_CONTAINER_MISSING,
+})
+
+# W3-5: dedup for the affirmative ``container_reused`` RECORD event emitted from
+# the three reuse-continue sites of ``start()``.  MODULE scope (like the drift
+# memos above) so the once-per-``(record_id, docker_id)`` guarantee holds across
+# the fresh ``ContainerManager`` built for every tool call.
+_CONTAINER_REUSED_SEEN = OrderedDict()  # (record_id, docker_id) -> True, oldest evicted
+_CONTAINER_REUSED_LOCK = threading.Lock()
+_CONTAINER_REUSED_EVENT = "container_reused"
+_CONTAINER_REUSED_ACTOR = "infra.container_manager.start"
+
 # Sticky-note migration/warning memos (module scope so dedup holds across the
 # fresh ContainerManager instances built for every tool call). ``_NOTES_WARNED``
 # dedupes the once-per-condition WARNINGs (a legacy sidecar note served, a write
@@ -1458,7 +1480,7 @@ class ContainerManager:
                                   "the record is unbound; an operator can "
                                   "recreate it via the record's recreate "
                                   "action."),
-                        "code": "container_record_unbound"}
+                        "code": HEAL_OUTCOME_UNBOUND}
             # (a) Record + docker_id: reuse via the record's docker id.
             container = self._reuse_container(docker_id)
             if container is None:
@@ -1501,13 +1523,13 @@ class ContainerManager:
                                       f"an agent cannot heal it with "
                                       f"`heal=True`; an operator can recreate "
                                       f"it via the record's recreate action."),
-                            "code": "container_record_not_healable"}
+                            "code": HEAL_OUTCOME_NOT_HEALABLE}
                 return {"error": (f"Container {name!r} record {record_id} names "
                                   f"docker_id {docker_id!r} but no such container "
                                   f"exists. Recovery: an agent can heal it with "
                                   f"`heal=True`; an operator can recreate it via "
                                   f"the record's recreate action."),
-                        "code": "container_record_container_missing"}
+                        "code": HEAL_OUTCOME_CONTAINER_MISSING}
             self._containers[name] = container.id  # warm the read-through cache
             if (explicit_image is not None
                     and not self._image_matches(container, explicit_image)):
@@ -1551,6 +1573,7 @@ class ContainerManager:
             note_value = (note if note is not None else self._read_note(container))
             _audit("CONTAINER_REUSE_OK",
                    f"source=record name={name} id={container.id} session={self.session_id}")
+            self._emit_container_reused_once(record_id, container.id)
             log_container_event("started", container_id=container.id,
                                 session_id=self.session_id or "",
                                 data={"image": self._image_ref(container),
@@ -1652,6 +1675,18 @@ class ContainerManager:
                 _audit("CONTAINER_REUSE_OK",
                        f"source=workspace-label name={name} id={entry['container_id']} "
                        f"session={self.session_id}")
+                # Resolve the record id from data already in hand (the
+                # container object) and only fall back to the NAME-based
+                # daemon lookup when a docker client is actually present.
+                # A hand-built manager that bypasses __init__ (no ``.client``)
+                # must never crash here: the emission is best-effort and the
+                # record id is left unresolved (nothing emitted).
+                _reused_rid = None
+                if container is not None:
+                    _reused_rid = self._record_id_for(container)
+                elif getattr(self, "client", None) is not None:
+                    _reused_rid = self._record_id_for_name(name)
+                self._emit_container_reused_once(_reused_rid, entry["container_id"])
                 log_container_event("started", container_id=entry["container_id"],
                                     session_id=self.session_id or "",
                                     data={"image": self._image_ref(container),
@@ -1749,6 +1784,8 @@ class ContainerManager:
                           else self._read_note(container))
             _audit("CONTAINER_REUSE_OK",
                    f"source=label name={name} id={container.id} session={self.session_id}")
+            self._emit_container_reused_once(self._record_id_for(container),
+                                             container.id)
             log_container_event("started", container_id=container.id,
                                 session_id=self.session_id or "",
                                 data={"image": self._image_ref(container),
@@ -2616,6 +2653,40 @@ class ContainerManager:
                     actual={"restart_policy": actual},
                     detected_at=datetime.now(timezone.utc).isoformat(),
                 )
+        except Exception:
+            pass
+
+    def _emit_container_reused_once(self, record_id, docker_id):
+        """Append ONE ``container_reused`` record event per identity pair.
+
+        The affirmative counterpart to the drift events: a REUSE that actually
+        proceeded is recorded on the container's record.  Deduped on
+        ``(record_id, docker_id)`` via a MODULE-scope memo (like
+        ``_START_DRIFT_SEEN``) so it holds across the fresh ``ContainerManager``
+        built per tool call.  Best-effort: never raises, and a reuse whose
+        record id cannot be resolved emits nothing.
+        """
+        if not record_id or not docker_id:
+            return
+        if not getattr(self, "workspace_id", None):
+            return
+        key = (str(record_id), str(docker_id))
+        with _CONTAINER_REUSED_LOCK:
+            if key in _CONTAINER_REUSED_SEEN:
+                return
+            _CONTAINER_REUSED_SEEN[key] = True
+            while len(_CONTAINER_REUSED_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _CONTAINER_REUSED_SEEN.popitem(last=False)
+        try:
+            from thoughtmachine.container_record import append_event
+            append_event(
+                self.workspace_id,
+                str(record_id),
+                _CONTAINER_REUSED_EVENT,
+                _CONTAINER_REUSED_ACTOR,
+                docker_id=str(docker_id),
+                detected_at=datetime.now(timezone.utc).isoformat(),
+            )
         except Exception:
             pass
 
