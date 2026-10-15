@@ -392,3 +392,269 @@ def test_site7b_refuse_keeps_record(monkeypatch):
 
     assert result["removed"] == 0
     assert load_record(_ORPHAN_WS, "rec-1") is not None
+
+
+# ===========================================================================
+# T1a -- funnel the two PUBLIC primitives: stop() (U1) + remove() (U2)
+# ===========================================================================
+# These exercise the two agent-facing ContainerManager primitives that now
+# route their explicit-reap decision through the lifecycle funnel, plus the
+# three transitive teardown sites (U11 release_container, U12
+# cleanup_worker_containers, U13 ExecutionTracker.terminate_all) that reach
+# the funnel THROUGH those primitives (their source files are untouched).
+
+
+class _LiveFakeContainer:
+    """A container whose status flips to ``exited`` once stopped."""
+
+    def __init__(self, *, cid="c1", name="tm-c1", status="running", labels=None):
+        self.id = cid
+        self.name = name
+        self.status = status
+        self.labels = dict(labels or {})
+        self.stop_calls = []
+        self.remove_calls = []
+        self.kill_calls = 0
+
+    def reload(self):  # noqa: D401 - docker SDK no-op here
+        return None
+
+    def stop(self, timeout=None):
+        self.stop_calls.append({"timeout": timeout})
+        if self.status == "running":
+            self.status = "exited"
+
+    def kill(self):
+        self.kill_calls += 1
+        self.status = "exited"
+
+    def remove(self, force=False):
+        self.remove_calls.append({"force": force})
+
+
+class _GetFakeContainers:
+    def __init__(self, mapping):
+        self._mapping = dict(mapping)
+
+    def get(self, cid):
+        return self._mapping[cid]
+
+
+class _GetFakeClient:
+    def __init__(self, mapping):
+        self.containers = _GetFakeContainers(mapping)
+
+
+def _mgr_with(mapping, **attrs):
+    """A bare ``ContainerManager`` wired to a ``containers.get`` fake client."""
+    mgr = _bare_manager(**attrs)
+    mgr.client = _GetFakeClient(mapping)
+    mgr._containers = {}
+    return mgr
+
+
+# -- U1 -- ContainerManager.stop() ------------------------------------------
+def test_u1_stop_routes_through_reconcile(monkeypatch):
+    EventType, captured = _capture_lifecycle(monkeypatch)
+    spy = _ReconcileSpy(monkeypatch)
+    c = _LiveFakeContainer(cid="c1", name="tm-c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    res = mgr.stop("c1")
+
+    assert res == {"status": "stopped", "container_id": "c1", "name": "tm-c1"}
+    # Exactly one decision, driven by an explicit reap intent.
+    assert len(spy.calls) == 1
+    _, session, intent = spy.calls[0]
+    assert intent.kind == "reap"
+    assert intent.explicit is True
+    assert intent.reason == "explicit_stop"
+    assert session is None  # session_permissions=None passed through
+
+    # Destroy proceeded (action="reap" -> destroys): stop fired, kill did not
+    # (status already exited after the stop).
+    assert c.stop_calls == [{"timeout": 5}]
+    assert c.kill_calls == 0
+
+    # One CONTAINER_LIFECYCLE event per reconcile.
+    events = [e for e in captured if e.type == EventType.CONTAINER_LIFECYCLE]
+    assert len(events) == len(spy.calls) == 1
+    assert events[0].data["action"] == "reap"
+
+
+def test_u1_stop_only_fires_on_decision_destroys(monkeypatch):
+    monkeypatch.setattr(container_manager, "_audit", lambda *a, **k: None)
+    # Force a non-destroy decision: the container must be left running.
+    _ReconcileSpy(
+        monkeypatch,
+        decision=ReconcileDecision("refuse", "nope", "default"),
+    )
+    c = _LiveFakeContainer(cid="c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    res = mgr.stop("c1")
+
+    assert res["status"] == "refused"
+    assert res["reason"] == "nope"
+    assert c.stop_calls == []
+    assert c.kill_calls == 0
+
+
+def test_u1_stop_running_container_kills_when_still_running(monkeypatch):
+    """stop()+kill() both fire when the container stays running after stop()."""
+    EventType, captured = _capture_lifecycle(monkeypatch)
+    _ReconcileSpy(monkeypatch)
+
+    class _Stubborn(_LiveFakeContainer):
+        def stop(self, timeout=None):  # noqa: D401 - stays running
+            self.stop_calls.append({"timeout": timeout})
+
+    c = _Stubborn(cid="c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    res = mgr.stop("c1")
+
+    assert res["status"] == "stopped"
+    assert c.stop_calls == [{"timeout": 5}]
+    assert c.kill_calls == 1
+
+
+# -- U2 -- ContainerManager.remove() ----------------------------------------
+def test_u2_remove_routes_through_reconcile_once(monkeypatch):
+    EventType, captured = _capture_lifecycle(monkeypatch)
+    monkeypatch.setattr(container_manager, "_reap_bound_record",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(container_manager, "_emit_container_removed",
+                        lambda *a, **k: None)
+    spy = _ReconcileSpy(monkeypatch)
+    c = _LiveFakeContainer(cid="c1", name="tm-c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    res = mgr.remove("c1")
+
+    assert res == {"status": "removed", "container_id": "c1"}
+    # A SINGLE removal decides ONCE: the internal stop must not re-reconcile.
+    assert len(spy.calls) == 1
+    _, session, intent = spy.calls[0]
+    assert intent.kind == "reap"
+    assert intent.explicit is True
+    assert intent.reason == "explicit_remove"
+
+    # Destroy proceeded: stop (via the reconcile-free core) + remove.
+    assert c.stop_calls == [{"timeout": 5}]
+    assert c.remove_calls == [{"force": True}]
+
+    # ONE CONTAINER_LIFECYCLE event per reconcile.
+    events = [e for e in captured if e.type == EventType.CONTAINER_LIFECYCLE]
+    assert len(events) == 1
+    assert len(events) == len(spy.calls)
+    assert events[0].data["action"] == "reap"
+
+
+def test_u2_remove_only_fires_on_decision_destroys(monkeypatch):
+    monkeypatch.setattr(container_manager, "_reap_bound_record",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(container_manager, "_emit_container_removed",
+                        lambda *a, **k: None)
+    _ReconcileSpy(
+        monkeypatch,
+        decision=ReconcileDecision("refuse", "nope", "default"),
+    )
+    c = _LiveFakeContainer(cid="c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    res = mgr.remove("c1")
+
+    assert res["status"] == "refused"
+    assert c.stop_calls == []
+    assert c.remove_calls == []
+
+
+def test_u2_remove_keep_record_preserves_record(monkeypatch):
+    """keep_record=True skips the record reap but still funnels the removal."""
+    EventType, _ = _capture_lifecycle(monkeypatch)
+    reap, emit = [], []
+    monkeypatch.setattr(container_manager, "_reap_bound_record",
+                        lambda ws, c: reap.append((ws, c)))
+    monkeypatch.setattr(container_manager, "_emit_container_removed",
+                        lambda ws, sid, c, reason="removed": emit.append(reason))
+    spy = _ReconcileSpy(monkeypatch)
+    c = _LiveFakeContainer(cid="c1", status="exited")
+    mgr = _mgr_with({"c1": c})
+
+    res = mgr.remove("c1", keep_record=True)
+
+    assert res == {"status": "removed", "container_id": "c1"}
+    assert len(spy.calls) == 1
+    assert spy.calls[0][2].reason == "explicit_remove"
+    assert reap == []                       # record preserved
+    assert emit == ["recreate"]             # tagged for the recreate ladder
+    assert c.remove_calls == [{"force": True}]
+
+
+# -- U11 / U12 / U13 -- transitive sites reach the funnel for free ----------
+def test_u11_release_container_routes_through_reconcile(monkeypatch):
+    _capture_lifecycle(monkeypatch)
+    spy = _ReconcileSpy(monkeypatch)
+    c = _LiveFakeContainer(cid="c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    from infra.workspace_lifecycle_manager import WorkerSupervisor
+
+    sup = WorkerSupervisor("w1", mgr, None, feature_flag_check=lambda: True)
+    res = sup.release_container("c1")
+
+    assert res["status"] == "stopped"
+    assert len(spy.calls) == 1
+    assert spy.calls[0][2].reason == "explicit_stop"
+
+
+def test_u12_cleanup_worker_containers_routes_through_reconcile(monkeypatch):
+    _capture_lifecycle(monkeypatch)
+    import tools.workspace.worker_container as worker_container
+
+    # The lifecycle-class exclusion is orthogonal here: treat the fixture as
+    # reclaimable so the ownership sweep reaches the two primitives.
+    monkeypatch.setattr(worker_container, "is_worker_teardown_excluded_container",
+                        lambda c: False)
+    monkeypatch.setattr(container_manager, "_reap_bound_record",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(container_manager, "_emit_container_removed",
+                        lambda *a, **k: None)
+    spy = _ReconcileSpy(monkeypatch)
+
+    owner = "s1:w1"
+    c = _LiveFakeContainer(cid="c1", name="tm-c1", status="running",
+                           labels={"thoughtmachine.worker": owner})
+    mgr = _mgr_with({"c1": c})
+    mgr.list_containers = lambda: [
+        {"container_id": "c1", "name": "tm-c1",
+         "labels": {"thoughtmachine.worker": owner}}
+    ]
+
+    worker_container.cleanup_worker_containers(mgr, owner)
+
+    # cleanup_worker_containers calls stop() THEN remove(); both route through
+    # the funnel (each emits exactly one decision).
+    reasons = [call[2].reason for call in spy.calls]
+    assert reasons == ["explicit_stop", "explicit_remove"]
+    assert c.remove_calls == [{"force": True}]
+
+
+def test_u13_terminate_all_routes_through_reconcile(monkeypatch):
+    _capture_lifecycle(monkeypatch)
+    spy = _ReconcileSpy(monkeypatch)
+    c = _LiveFakeContainer(cid="c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    from tools.workspace.worker_execution import ExecutionTracker
+
+    tracker = ExecutionTracker()
+    tracker.register("w1", query_id="q1", container_id="c1",
+                     type="scoped_container")
+
+    tracker.terminate_all("w1", mgr, None, session_id="s1")
+
+    assert len(spy.calls) == 1
+    assert spy.calls[0][2].reason == "explicit_stop"
+

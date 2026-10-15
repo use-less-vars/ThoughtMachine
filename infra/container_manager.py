@@ -3153,7 +3153,16 @@ class ContainerManager:
             return False
 
     def stop(self, container_id):
-        """Stop the container. Idempotent; NEVER raises."""
+        """Stop the container. Idempotent; NEVER raises.
+
+        The stop decision routes through :meth:`ContainerLifecycle.reconcile`
+        with an explicit ``reap`` intent: an explicit stop always wins, so
+        reconcile returns ``action="reap"`` (ONE ``CONTAINER_LIFECYCLE``
+        decision event is emitted) and the stop proceeds unchanged.  The
+        destroy is guarded on ``decision.destroys``; on a non-destroy decision
+        (which cannot arise for an explicit intent) a WARNING is logged and the
+        container is left running.
+        """
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
@@ -3165,6 +3174,33 @@ class ContainerManager:
         if _denial is not None:
             return {"status": "error", "container_id": container_id,
                     "error": _denial}
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="explicit_stop",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent
+        )
+        if not decision.destroys:
+            log("WARNING", "docker.container_manager",
+                f"stop: lifecycle funnel refused stop of {container_id!r} "
+                f"(action={decision.action!r} reason={decision.reason!r}); "
+                f"container left running")
+            return {"status": "refused", "container_id": container_id,
+                    "reason": decision.reason}
+        return self._stop_container(container, container_id)
+
+    def _stop_container(self, container, container_id):
+        """Stop+kill ``container``; the reconcile-FREE core (NEVER raises).
+
+        Shared by :meth:`stop` (which reconciles first, then calls this) and
+        :meth:`remove` (which reconciles the *removal* decision once, so its
+        internal stop must NOT emit a SECOND ``CONTAINER_LIFECYCLE`` event).
+        Idempotent.
+        """
         try:
             container.reload()
         except Exception as e:
@@ -3190,8 +3226,18 @@ class ContainerManager:
     def remove(self, container_id, *, keep_record=False):
         """Remove the container. Idempotent; NEVER raises.
 
-        Stops the container first (best-effort, via :meth:`stop`) then removes
-        it with ``force=True``. Returns one of:
+        The removal decision routes through :meth:`ContainerLifecycle.reconcile`
+        with an explicit ``reap`` intent: an explicit removal always wins, so
+        reconcile returns ``action="reap"`` (ONE ``CONTAINER_LIFECYCLE``
+        decision event is emitted) and the destroy proceeds unchanged.  The
+        guard is on ``decision.destroys``; on a non-destroy decision (which
+        cannot arise for an explicit intent) a WARNING is logged and the
+        container is left in place.  The internal stop runs through the
+        reconcile-FREE :meth:`_stop_container` core, so a single removal emits
+        exactly ONE lifecycle decision.
+
+        Stops the container first (best-effort) then removes it with
+        ``force=True``. Returns one of:
             {"status": "removed", "container_id": ...}
             {"status": "error", "container_id": ..., "error": ...}
 
@@ -3203,7 +3249,34 @@ class ContainerManager:
         so the record must survive the removal.  Every other caller keeps the
         default terminal semantics (the record is reaped, ``reason="removed"``).
         """
-        stopped = self.stop(container_id)
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"status": "removed", "container_id": container_id}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            return {"status": "error", "container_id": container_id,
+                    "error": _denial}
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="explicit_remove",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent
+        )
+        if not decision.destroys:
+            log("WARNING", "docker.container_manager",
+                f"remove: lifecycle funnel refused removal of {container_id!r} "
+                f"(action={decision.action!r} reason={decision.reason!r}); "
+                f"container left in place")
+            return {"status": "refused", "container_id": container_id,
+                    "reason": decision.reason}
+        stopped = self._stop_container(container, container_id)
         if stopped.get("status") not in ("stopped", "missing"):
             return stopped
         try:
