@@ -29,6 +29,7 @@ from thoughtmachine.container_record import (
     LIFECYCLE_CLASSES,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
+    LIFECYCLE_SERVICE,
     OWNER_WORKSPACE,
     RECORD_LABEL_KEY,
     create_record,
@@ -1117,3 +1118,284 @@ def test_start_refusal_message_is_unbound_for_stale_docker_id():
         "record is unbound; an operator can recreate it via the record's "
         "recreate action."
     )
+
+
+# ---------------------------------------------------------------------------
+# (j) IMMEDIATE record reap on container REMOVAL (W3 item 3).
+#
+# ``ContainerManager.remove`` (success branch) deletes the durable record bound
+# to the removed container AT ONCE -- best-effort, never raising -- mirroring the
+# orphan sweeper's class gate.  ``stop`` alone NEVER reaps: the stop-only caller
+# keeps owning the record (only removal ends the record's life).  The reap is
+# fail-closed on record-vs-container ownership and never resurrects a
+# lifecycle-owning (SERVICE) record.
+#
+# These tests drive the REAL ``remove``/``stop`` against the vault floor; only
+# the Docker daemon is faked (``_FakeContainer`` / ``_FakeDockerClient``).  The
+# status is set to ``"exited"`` so ``stop`` skips ``container.stop()`` /
+# ``container.kill()`` (the minimal fake has neither); ``_agent_access_denial``
+# is overridden to ``None`` because the ACCESS gate would otherwise reject the
+# own-lifecycle classes (the reap gate under test is ``policy_for``, not the
+# access gate).
+# ---------------------------------------------------------------------------
+
+
+def _remove_cm(container, workspace_id="w1"):
+    """Manager wired for a real ``remove``/``stop`` against the vault floor."""
+    cm = _make_cm(container, want=("none", "ro"), workspace_id=workspace_id)
+    # The ACCESS gate (stop) is not the subject here; the reap gate is
+    # ``policy_for`` directly.  Resolve it to "allowed" so stop() proceeds.
+    cm._agent_access_denial = lambda *a, **k: None
+    return cm
+
+
+def _exited_record_container(container_id="c" * 16, name="agent-x"):
+    """A removable fake whose ``status`` short-circuits stop()'s kill path."""
+    ctr = _FakeContainer(container_id, name=name,
+                         labels={RECORD_LABEL_KEY: "rec-1"})
+    ctr.status = "exited"  # stop() skips container.stop()/kill()
+    return ctr
+
+
+def _load_rec():
+    return load_record("w1", "rec-1", vault_root=_VAULT["root"])
+
+
+def test_remove_deletes_the_bound_durable_record():
+    """The success branch of remove() reaps the record once the container is gone."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+    assert _load_rec() is not None  # minted and bound before removal
+
+    result = cm.remove(ctr.id)
+
+    assert result["status"] == "removed"
+    assert ctr.removed == [{"force": True}]  # the container really was removed
+    assert _load_rec() is None  # ...and the durable record went with it
+
+
+def test_second_remove_is_a_noop_and_never_raises():
+    """A repeat remove() finds no record (already reaped) and does NOT raise."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+
+    assert cm.remove(ctr.id)["status"] == "removed"
+    assert _load_rec() is None
+
+    # delete_record() raises RecordNotFound for an absent record; the reap
+    # swallows it, so the second removal still reports the idempotent status.
+    second = cm.remove(ctr.id)
+    assert second["status"] == "removed"
+    assert _load_rec() is None
+
+
+def test_remove_leaves_a_record_bound_to_a_different_container():
+    """Ownership guard: a record whose docker_id != this container is untouched."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    # The container's record LABEL resolves "rec-1", but the record names a
+    # DIFFERENT docker id -- so it is not this container's record to reap.
+    _mint_record("w1", "agent-x", "d" * 16)
+
+    result = cm.remove(ctr.id)
+
+    assert result["status"] == "removed"
+    rec = _load_rec()
+    assert rec is not None
+    assert rec.docker_id == "d" * 16  # left intact (bound to another container)
+
+
+def test_stop_alone_does_not_reap_the_record():
+    """The stop-only path keeps the record: only removal ends its life."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+
+    result = cm.stop(ctr.id)
+
+    assert result["status"] == "stopped"
+    assert _load_rec() is not None  # stop() never reaps
+
+
+def test_remove_does_not_reap_a_service_class_record():
+    """Own-lifecycle SERVICE records are skipped by the reap (class gate)."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    create_record("w1", LIFECYCLE_SERVICE, OWNER_WORKSPACE, id="rec-1",
+                  name="agent-x", vault_root=_VAULT["root"])
+    update_record("w1", "rec-1", vault_root=_VAULT["root"], docker_id=ctr.id)
+
+    result = cm.remove(ctr.id)
+
+    assert result["status"] == "removed"
+    assert _load_rec() is not None  # own-lifecycle -> NOT reaped
+
+
+
+
+# ---------------------------------------------------------------------------
+# Container-removal event emission (tenant event log)
+# ---------------------------------------------------------------------------
+
+
+def _capture_removal_events():
+    """Subscribe a wildcard capture for CONTAINER_REMOVED; return (list, unsub)."""
+    from agent.events import EventType, global_event_bus
+
+    captured = []
+
+    def capture(ev):
+        if getattr(ev, "type", None) == EventType.CONTAINER_REMOVED:
+            captured.append(ev)
+
+    global_event_bus.subscribe(None, capture)
+    return captured, (lambda: global_event_bus.unsubscribe(None, capture))
+
+
+def test_remove_publishes_exactly_one_container_removed_event():
+    """The success branch of remove() emits EXACTLY ONE container_removed event."""
+    from agent.events import EventType
+
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+
+    captured, unsub = _capture_removal_events()
+    try:
+        result = cm.remove(ctr.id)
+    finally:
+        unsub()
+
+    assert result["status"] == "removed"
+    assert len(captured) == 1  # EXACTLY one event -- not zero, not two
+    ev = captured[0]
+    assert ev.type == EventType.CONTAINER_REMOVED
+    assert ev.type.value == "container_removed"
+    assert ev.data["container_id"] == ctr.id
+    assert ev.data["name"] == "agent-x"
+    assert ev.data["workspace_id"] == "w1"
+    assert ev.data["session_id"] == "s1"
+    assert ev.data["reason"] == "removed"
+
+
+def test_monitored_remove_is_noop_return_shape_unchanged():
+    """remove() still returns the same shape; the publish adds no behaviour."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+
+    captured, unsub = _capture_removal_events()
+    try:
+        result = cm.remove(ctr.id)
+    finally:
+        unsub()
+
+    assert set(result.keys()) == {"status", "container_id"}
+    assert result == {"status": "removed", "container_id": ctr.id}
+    assert ctr.removed == [{"force": True}]  # log/return/flow unchanged
+    assert len(captured) == 1
+
+
+def test_removal_refused_by_access_gate_publishes_nothing():
+    """A stop() access refusal short-circuits remove() -> NO event published."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    # Override the allow stub: stop() now refuses -> remove() returns early.
+    cm._agent_access_denial = lambda *a, **k: "service-class access denied"
+
+    captured, unsub = _capture_removal_events()
+    try:
+        result = cm.remove(ctr.id)
+    finally:
+        unsub()
+
+    assert result["status"] == "error"
+    assert captured == []  # refused removal emits nothing
+    assert ctr.removed == []  # the container was never touched
+
+
+def test_removal_failure_publishes_nothing():
+    """A container.remove() failure emits NO event (success branch not reached)."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    ctr.remove = MagicMock(side_effect=RuntimeError("boom"))
+
+    captured, unsub = _capture_removal_events()
+    try:
+        result = cm.remove(ctr.id)
+    finally:
+        unsub()
+
+    assert result["status"] == "error"
+    assert captured == []  # failed removal emits nothing
+
+
+
+# ---------------------------------------------------------------------------
+# ``keep_record`` flag: the recreate/rebind ladder PRESERVES the bound record
+# ---------------------------------------------------------------------------
+# The record-user-action *recreate* ladder is remove + start: it removes the old
+# container then (re)starts a fresh one and rebinds the SAME record.  It passes
+# ``keep_record=True`` so ``remove()`` does NOT reap the record it still needs.
+# Every other caller keeps the default (terminal removal reaps).
+
+def test_remove_keep_record_preserves_bound_record_and_emits_recreate_reason():
+    """``remove(keep_record=True)`` keeps the record; event reason='recreate'."""
+    from agent.events import EventType
+
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+    assert _load_rec() is not None  # minted + bound before removal
+
+    captured, unsub = _capture_removal_events()
+    try:
+        result = cm.remove(ctr.id, keep_record=True)
+    finally:
+        unsub()
+
+    assert result == {"status": "removed", "container_id": ctr.id}
+    assert ctr.removed == [{"force": True}]
+    # The record SURVIVES the removal -- the ladder rebinds it to the new one.
+    rec = _load_rec()
+    assert rec is not None
+    assert rec.docker_id == ctr.id  # unchanged until the ladder rebinds it
+    # Exactly ONE event, tagged as a recreate (distinct from a terminal removal).
+    assert len(captured) == 1
+    assert captured[0].type == EventType.CONTAINER_REMOVED
+    assert captured[0].data["reason"] == "recreate"
+
+
+def test_remove_default_still_reaps_and_emits_removed_reason():
+    """Contrast: a DEFAULT (terminal) removal reaps the record; reason='removed'."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+
+    captured, unsub = _capture_removal_events()
+    try:
+        result = cm.remove(ctr.id)  # no flag -> terminal removal
+    finally:
+        unsub()
+
+    assert result["status"] == "removed"
+    assert _load_rec() is None  # reaped
+    assert len(captured) == 1
+    assert captured[0].data["reason"] == "removed"
+
+
+def test_remove_keep_record_idempotent_second_call_never_raises():
+    """A second ``keep_record`` removal is a no-op that never raises."""
+    ctr = _exited_record_container()
+    cm = _remove_cm(ctr)
+    _mint_record("w1", "agent-x", ctr.id)
+
+    first = cm.remove(ctr.id, keep_record=True)
+    second = cm.remove(ctr.id, keep_record=True)
+
+    assert first["status"] == "removed"
+    assert second["status"] == "removed"  # idempotent; never raises
+    assert _load_rec() is not None  # preserved across BOTH calls
+

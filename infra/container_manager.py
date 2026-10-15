@@ -3100,13 +3100,21 @@ class ContainerManager:
             return {"status": "error", "container_id": container_id, "error": str(e),
                     "name": getattr(container, "name", "")}
 
-    def remove(self, container_id):
+    def remove(self, container_id, *, keep_record=False):
         """Remove the container. Idempotent; NEVER raises.
 
         Stops the container first (best-effort, via :meth:`stop`) then removes
         it with ``force=True``. Returns one of:
             {"status": "removed", "container_id": ...}
             {"status": "error", "container_id": ..., "error": ...}
+
+        ``keep_record`` (keyword-only, default False) PRESERVES the durable
+        container record bound to the removed container instead of reaping it,
+        and tags the ``container_removed`` audit event ``reason="recreate"``.
+        The record-user-action *recreate* ladder passes ``keep_record=True``:
+        it removes the old container then (re)starts + rebinds the SAME record,
+        so the record must survive the removal.  Every other caller keeps the
+        default terminal semantics (the record is reaped, ``reason="removed"``).
         """
         stopped = self.stop(container_id)
         if stopped.get("status") not in ("stopped", "missing"):
@@ -3120,11 +3128,79 @@ class ContainerManager:
         try:
             container.remove(force=True)
             self._drop_container(container_id)
+            if not keep_record:
+                self._reap_record(container)
             log_container_event("removed", container_id=container_id,
                                 session_id=self.session_id or "")
+            self._emit_removal_event(
+                container_id, container,
+                reason="recreate" if keep_record else "removed")
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
+
+    def _emit_removal_event(self, container_id, container, reason="removed"):
+        """Publish ONE ``container_removed`` event to the tenant event bus.
+
+        Best-effort and success-only: called from :meth:`remove`'s SUCCESS
+        branch (never on a failed/refused removal).  Reaches
+        ``<vault_root>/logs/event_log.jsonl`` through the ``EventLogger`` bus
+        subscriber.  Never raises -- event emission must never fail a removal
+        (mirrors the guarded publish in ``agent/controller``).
+        """
+        try:
+            from agent.events import create_event, global_event_bus, EventType
+            if global_event_bus is None:
+                return
+            data = {
+                "container_id": container_id,
+                "name": getattr(container, "name", None),
+                "workspace_id": self.workspace_id,
+                "session_id": self.session_id,
+                "reason": reason,
+            }
+            event = create_event(
+                EventType.CONTAINER_REMOVED,
+                data,
+                source="infra.container_manager.remove",
+                session_id=self.session_id,
+            )
+            global_event_bus.publish(event)
+        except Exception:
+            pass
+
+    def _reap_record(self, container):
+        """Delete the durable record bound to a REMOVED container (best-effort).
+
+        Called only from :meth:`remove`'s success branch (never from
+        :meth:`stop`); mirrors the orphan sweeper's class gate
+        (:func:`sweep_orphan_container_records`); never raises -- record
+        cleanup must never fail a removal.
+        """
+        record_id = self._record_id_for(container)
+        if not record_id:
+            return
+        try:
+            record = load_record(self.workspace_id, record_id)
+        except Exception:
+            record = None
+        if record is None:
+            return
+        docker_id = str(getattr(record, "docker_id", "") or "")
+        container_id = str(getattr(container, "id", "") or "")
+        if docker_id and container_id and docker_id != container_id:
+            return
+        try:
+            policy = policy_for(record.lifecycle_class)
+        except UnknownLifecycleClass:
+            return
+        if policy.own_lifecycle and record.lifecycle_class != LIFECYCLE_RESOURCE:
+            return
+        try:
+            delete_record(self.workspace_id, record.id)
+            _name_index_forget(record.id)
+        except Exception:
+            return
 
     def status(self, container_id):
         """Report container status; NEVER raises."""
