@@ -1660,3 +1660,268 @@ def test_container_reused_emitter_is_not_vacuous(monkeypatch, events):
     assert result["status"] == "reused"
     assert [e for e in events if e["event_type"] == "container_reused"] == []
 
+
+
+# ===========================================================================
+# W4 (wave9a) REFUSAL-ADMISSION INVARIANTS.
+#
+# CLAIM pinned here: a REFUSED / DENIED ``start`` NEVER starts the existing
+# container and NEVER creates a new one.
+#   * (A) on every refusal path the daemon start seam reached ONLY through
+#     ``_ensure_running`` (L3975; ``container.start()`` L3983) is never invoked
+#     on the discovered container, no fresh container is minted
+#     (``_fresh_start`` L1860 not called) and the fake daemon's container set is
+#     unchanged;
+#   * (B) a drift-DENIED exited orphan discovered by label is not started, holds
+#     no new slot and registers no new container;
+#   * (C) NON-VACUOUS: a REUSE of the same fixture DOES reach the seam, and
+#     forcing the SAME drifted fixture down the reuse branch DOES start it;
+#   * (D) ADMISSION FAIL-CLOSED: an unknown/None status counts as slot-consuming
+#     (the positive pin already exists elsewhere; only the load-bearing
+#     sensitivity is proven here);
+#   * (E) FINDING: a reuse response may hand back a container that is NOT
+#     running (``_ensure_running`` is best-effort and never verified).
+# ===========================================================================
+
+
+class _StartSpyContainer(_FakeContainer):
+    """Fake container that COUNTS every ``.start()`` daemon call.
+
+    ``_FakeContainer`` has no ``start`` method at all, so the ONLY way to observe
+    ``_ensure_running`` actually ordering the daemon to start an existing
+    container is to spy on the container itself.
+    """
+
+    def __init__(self, container_id, name=None, labels=None, attrs=None):
+        super().__init__(container_id, name=name, labels=labels, attrs=attrs)
+        self.start_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+        self.status = "running"  # a real start transitions the container
+
+
+def _fresh_spy(cm):
+    """Replace ``_fresh_start`` with a spy: any fresh container shows up here."""
+    cm._fresh_start = MagicMock(
+        return_value={"id": "f" * 16, "name": "fresh",
+                      "status": "created", "note": ""})
+    return cm._fresh_start
+
+
+def _ensure_spy(cm):
+    """Wrap ``cm._ensure_running`` in a recorder (returns the call list)."""
+    calls = []
+    real = cm._ensure_running
+
+    def _rec(container):
+        calls.append(container)
+        return real(container)
+
+    cm._ensure_running = _rec
+    return calls
+
+
+def _image_attrs(network="none", workspace_rw=False):
+    """Isolation attrs carrying a DIFFERENT image ref (forces image mismatch)."""
+    attrs = _attrs(network, workspace_rw)
+    attrs["Config"] = {"Image": "sha256:deadbeef"}
+    return attrs
+
+
+# --- (A) NO-REFUSAL-STARTS: the live-container refusal / deny paths ---------
+_LIVE_REFUSALS = [
+    ("record", "image"),
+    ("workspace-label", "image"),
+    ("label", "image"),
+    ("record", "deny"),
+    ("workspace-label", "deny"),
+    ("label", "deny"),
+]
+
+
+@pytest.mark.parametrize("site,kind", _LIVE_REFUSALS)
+def test_refusal_never_starts_existing_container(site, kind, events):
+    """A refused reuse of a LIVE container never starts it and creates nothing."""
+    if kind == "image":
+        ctr = _StartSpyContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                                 attrs=_image_attrs("none", False))
+        kwargs = {"name": "agent-x", "image": "otherimg"}
+    else:
+        # Live is MORE permissive than the ("none","ro") policy -> drift DENY.
+        ctr = _StartSpyContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                                 attrs=_attrs("bridge", True))
+        kwargs = {"name": "agent-x"}
+
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", site)
+    fresh = _fresh_spy(cm)
+    _ensure_spy(cm)
+    containers_before = list(cm.client.containers.containers)
+    cache_before = dict(cm._containers)
+
+    result = cm.start(**kwargs)
+
+    assert "error" in result
+    assert "status" not in result            # NOT handed back as "reused"
+    if kind == "deny":
+        assert result["drift"]["decision"] == "deny"
+    # (A1) the daemon start seam was NEVER reached for the existing container.
+    assert ctr.start_calls == 0
+    # (A2) no fresh container was minted.
+    assert fresh.call_count == 0
+    assert cm.client.containers.containers == containers_before
+    # (A3) the cache gained no NEW container id (the record path only WARMS the
+    #      cache to the pre-existing container).
+    assert set(cm._containers.values()) <= (set(cache_before.values()) | {ctr.id})
+    assert ctr.removed == []
+
+
+_NO_CONTAINER_REFUSALS = {
+    "unbound": {},
+    "not_healable": {"heal_missing": True},
+    "container_missing": {"heal_missing": True},
+}
+
+
+@pytest.mark.parametrize("case", list(_NO_CONTAINER_REFUSALS))
+def test_refusal_without_live_container_creates_nothing(case, events):
+    """A record whose docker_id has NO live container refuses and creates nothing.
+
+    Covers the three record-path refusals that never reach a live container:
+    ``container_record_unbound`` / ``container_record_not_healable`` /
+    ``container_record_container_missing``.
+    """
+    cm = _make_cm(None, want=("none", "ro"))
+    cm.client = _FakeDockerClient([])  # no live containers
+    if case == "not_healable":
+        create_record("w1", LIFECYCLE_RESOURCE, OWNER_WORKSPACE, id="rec-1",
+                      name="agent-x", vault_root=_VAULT["root"])
+        update_record("w1", "rec-1", vault_root=_VAULT["root"], docker_id="d" * 16)
+    else:
+        _mint_record("w1", "agent-x", "d" * 16)
+    kwargs = _NO_CONTAINER_REFUSALS[case]
+
+    fresh = _fresh_spy(cm)
+    ensure = _ensure_spy(cm)
+
+    result = cm.start(name="agent-x", **kwargs)
+
+    assert "error" in result
+    assert result["code"] in container_manager.HEAL_OUTCOME_CODES
+    assert "status" not in result
+    assert fresh.call_count == 0                  # nothing created
+    assert ensure == []                           # no live container -> seam untouched
+    assert cm._containers == {}                   # cache unchanged
+    assert cm.client.containers.containers == []  # no new daemon container
+
+
+# --- (B) DRIFT-DENIED ORPHAN HOLDS NO SLOT ----------------------------------
+
+
+@pytest.mark.parametrize("site", ["workspace-label", "label"])
+def test_drift_denied_exited_orphan_holds_no_slot(site, events):
+    """A STOPPED container whose config DENIES reuse is left stopped, no slot."""
+    ctr = _StartSpyContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                             attrs=_attrs("bridge", True))  # MORE permissive
+    ctr.status = "exited"                                  # an orphaned container
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", site)
+    fresh = _fresh_spy(cm)
+    cache_before = dict(cm._containers)
+    n_before = len(cm.client.containers.containers)
+
+    result = cm.start(name="agent-x")
+
+    assert "error" in result
+    assert result["drift"]["decision"] == "deny"
+    assert ctr.status == "exited"               # STILL not running
+    assert ctr.start_calls == 0                 # never started
+    assert cm._containers == cache_before       # no new container registered
+    assert fresh.call_count == 0                # no fresh container -> no new slot
+    assert len(cm.client.containers.containers) == n_before
+
+
+# --- (C) NON-VACUITY --------------------------------------------------------
+
+
+@pytest.mark.parametrize("site", _SITES)
+def test_reuse_reaches_the_ensure_running_seam(site, events):
+    """(C-i) The SAME seam instrumented in (A) IS reached on a clean reuse."""
+    ctr = _StartSpyContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                             attrs=_attrs("none", False))  # matches ("none","ro")
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", site)
+    ensure = _ensure_spy(cm)
+
+    result = cm.start(name="agent-x")
+
+    assert result["status"] == "reused"
+    # The start-ensuring seam IS reached (the record site reaches it through
+    # ``_reuse_container``; the others through the explicit call).
+    assert ensure and all(c is ctr for c in ensure)
+
+
+def test_drift_deny_suppresses_the_start_reuse_would_do(monkeypatch, events):
+    """(C-ii) DIFFERENTIAL: the DENY, not the fixture, suppresses the start.
+
+    The identical drifted+exited fixture goes down the REUSE branch once the
+    drift decision is forced to "reuse" -- and THEN the exited container really
+    IS started, proving ``start_calls`` observes the daemon start seam (so the
+    zero-starts assertions in (A)/(B) are non-vacuous).
+    """
+    ctr = _StartSpyContainer("c" * 16, labels={RECORD_LABEL_KEY: "rec-1"},
+                             attrs=_attrs("bridge", True))  # drift DENY
+    ctr.status = "exited"
+    cm = _make_cm(ctr, want=("none", "ro"))
+    _arrange(cm, ctr, "agent-x", "workspace-label")
+
+    denied = cm.start(name="agent-x")
+    assert "error" in denied
+    assert denied["drift"]["decision"] == "deny"
+    assert ctr.start_calls == 0            # DENY -> no start
+    assert ctr.status == "exited"
+
+    forced = {"drifted": True, "decision": "warn",
+              "reason": "forced_reuse_for_non_vacuity",
+              "network_mode": "bridge", "workspace_mode": "ro",
+              "source": "workspace-label"}
+    monkeypatch.setattr(
+        container_manager.ContainerManager, "_start_drift_decision",
+        lambda self, *a, **k: ("reuse", forced))
+
+    reused = cm.start(name="agent-x")
+    assert reused["status"] == "reused"
+    assert ctr.start_calls == 1            # REUSE -> the exited container starts
+    assert ctr.status == "running"
+
+
+# --- (D) ADMISSION FAIL-CLOSED (non-vacuity only; positive pin exists) -------
+
+
+def test_unknown_status_admission_is_fail_closed_and_load_bearing(monkeypatch):
+    """(D) An unknown/None container status counts as slot-CONSUMING.
+
+    The POSITIVE pin already lives elsewhere and is deliberately NOT duplicated
+    here:
+      * tests/test_worker_stale_container_cleanup.py:282 (missing/None status)
+      * tests/test_worker_stale_container_cleanup.py:345 (unknown status)
+      * tests/test_lifecycle_policy.py:483/:489 (bogus / absent status)
+      * tests/test_admission_gate.py:661 (explicit None status)
+    This test only proves the classifier is LOAD-BEARING: neuter the shared
+    ``consumes_workspace_slot`` predicate so an unknown status is treated as FREE
+    and the SAME entry drops out of the consuming set.
+    """
+    cm = _make_cm(None, want=("none", "ro"))
+    unknown = {"name": "agent-x", "status": None, "labels": {}}
+    novel = {"name": "agent-y", "status": "weird-new-state", "labels": {}}
+    terminal = {"name": "agent-z", "status": "exited", "labels": {}}
+
+    # Fail-closed: unknown / novel statuses consume; the terminal one does not.
+    assert cm._active_containers([unknown, novel, terminal]) == [unknown, novel]
+
+    # Non-vacuity: neuter the SSOT predicate -> the unknowns are now "free".
+    monkeypatch.setattr(container_manager, "consumes_workspace_slot",
+                        lambda **kwargs: False)
+    assert cm._active_containers([unknown, novel]) == []
+
