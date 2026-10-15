@@ -651,6 +651,37 @@ class DockerExecutor:
         )
         return network_mode, workspace_mode
 
+    def _reap_container(self, container):
+        """Destroy ``container`` through the container lifecycle funnel.
+
+        The ``_ensure_container`` recreate paths are explicitly destructive, so
+        this routes an explicit reap intent (``kind="reap", explicit=True``)
+        through :meth:`ContainerLifecycle.reconcile`: an explicit reap ALWAYS
+        wins, emitting exactly one CONTAINER_LIFECYCLE decision event and
+        returning ``destroys=True`` — there is deliberately no refusal path
+        here.  The original ``stop()``/``remove()`` calls are preserved (swallow
+        ``NotFound``: the container is already gone).
+        """
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+        decision = ContainerLifecycle.reconcile(
+            container,
+            self.session_permissions,
+            ContainerIntent(
+                kind="reap",
+                explicit=True,
+                reason="ensure_container_recreate",
+                workspace_id=self.workspace_id,
+                session_id=getattr(self, "session_id", None),
+            ),
+        )
+        if not decision.destroys:
+            return
+        try:
+            container.stop()
+            container.remove()
+        except docker.errors.NotFound:
+            pass
+
     def _ensure_container(self):
         # Ensure the Docker image exists
         self._ensure_image()
@@ -689,11 +720,7 @@ class DockerExecutor:
                                    f"workspace={self.workspace_path} container={self.container.id[:12]} "
                                    f"network={actual_network}->{desired_network} "
                                    f"mode={actual_workspace_mode}->{desired_workspace_mode} source=live_object")
-                        try:
-                            self.container.stop()
-                            self.container.remove()
-                        except docker.errors.NotFound:
-                            pass
+                        self._reap_container(self.container)
                         self.container = None
                     else:
                         log("DEBUG", "tools.docker_executor.container",
@@ -726,11 +753,7 @@ class DockerExecutor:
 
         # ── Force rebuild: always remove existing ──
         if self.force_rebuild and existing:
-            try:
-                existing.stop()
-                existing.remove()
-            except docker.errors.NotFound:
-                pass
+            self._reap_container(existing)
             existing = None
             audit_event("CONTAINER_RECREATE",
                        f"workspace={self.workspace_path} reason=force_rebuild")
@@ -760,11 +783,7 @@ class DockerExecutor:
                            f"workspace={self.workspace_path} container={existing.id[:12]} "
                            f"network={current_network}->{network_mode} "
                            f"mode={current_workspace_mode}->{workspace_mode}")
-                try:
-                    existing.stop()
-                    existing.remove()
-                except docker.errors.NotFound:
-                    pass
+                self._reap_container(existing)
                 existing = None
             else:
                 try:
@@ -779,11 +798,7 @@ class DockerExecutor:
                              "current_image": current_image_id[:19] + "..."})
                         audit_event("CONTAINER_RECREATE_MISMATCH",
                                    f"workspace={self.workspace_path} container={existing.id[:12]} reason=stale_image")
-                        try:
-                            existing.stop()
-                            existing.remove()
-                        except docker.errors.NotFound:
-                            pass
+                        self._reap_container(existing)
                         existing = None
                     else:
                         log("DEBUG", "tools.docker_executor.container",
@@ -795,25 +810,21 @@ class DockerExecutor:
                     log("WARNING", "tools.docker_executor.container",
                         "Could not compare image IDs (image not found), recreating container",
                         {"container_id": existing.id[:12]})
-                    try:
-                        existing.stop()
-                        existing.remove()
-                    except docker.errors.NotFound:
-                        pass
+                    self._reap_container(existing)
                     existing = None
 
         # ── Reuse existing if still valid ──
         if existing is not None:
             self.container = existing
             if self.container.status == "dead":
-                self.container.remove()
+                self._reap_container(self.container)
                 self.container = None
                 raise docker.errors.NotFound(f"Container {container_name} was dead and removed")
             elif self.container.status != "running":
                 try:
                     self.container.start()
                 except docker.errors.APIError:
-                    self.container.remove()
+                    self._reap_container(self.container)
                     self.container = None
                     raise docker.errors.NotFound(f"Container {container_name} failed to start and was removed")
             self.last_used = time.time()
