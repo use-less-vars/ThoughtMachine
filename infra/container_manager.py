@@ -99,6 +99,7 @@ from thoughtmachine.audit_logger import audit_event
 _audit = lambda event, data: audit_event(event, data)
 
 from infra.container_env import merge_container_identity_env
+from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
 from infra.container_create import (
     ContainerCreateSpec,
     HardeningRecipe as _HardeningRecipe,
@@ -4279,11 +4280,31 @@ class ContainerManager:
         )
 
     def _remove_container(self, container):
-        """Stop and remove a container; best-effort, NEVER raises.
+        """Stop and remove a container via the lifecycle funnel; NEVER raises.
+
+        The removal decision routes through
+        :meth:`ContainerLifecycle.reconcile` with an explicit ``reap`` intent:
+        an explicit removal always wins, so reconcile returns
+        ``action="reap"`` (one ``CONTAINER_LIFECYCLE`` decision event is
+        emitted) and the destroy proceeds.  ``remove()`` is called ONLY when
+        the decision destroys; on any non-destroy decision the container is
+        left untouched.
 
         On a successful removal the bound record is reaped and ONE
         ``container_removed`` event (``reason="removed"``) is emitted.
         """
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="removed",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent
+        )
+        if not decision.destroys:
+            return
         try:
             container.stop(timeout=5)
         except Exception:
@@ -4417,6 +4438,24 @@ def cleanup_workspace(workspace_id, docker_client):
                 was_running = getattr(container, "status", None) == "running"
             except Exception:
                 was_running = False
+        # Route the destroy decision through the funnel: a workspace teardown
+        # is an explicit removal intent, so reconcile returns action="reap"
+        # (and emits a CONTAINER_LIFECYCLE decision event).  A refuse is
+        # HONOURED -- the container is left ALIVE rather than destroyed.
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="workspace_cleanup",
+            workspace_id=wid,
+        )
+        decision = ContainerLifecycle.reconcile(container, None, intent)
+        if not decision.destroys:
+            log("WARNING", "docker.container_manager",
+                f"cleanup_workspace refused to destroy container "
+                f"{getattr(container, 'name', None)!r} "
+                f"(action={decision.action!r} reason={decision.reason!r}) "
+                f"for workspace {wid!r}")
+            continue
         try:
             container.stop(timeout=5)
         except Exception:
@@ -4700,6 +4739,7 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
             continue
 
         is_registered = registered is None or wid in registered
+        ttl_reason = "ttl_expired" if is_registered else "orphaned"
 
         if dry_run:
             result["removed"] += 1
@@ -4710,6 +4750,21 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
             result["removed_containers"].append(name)
             continue
 
+        # Route the TTL/orphan removal through the funnel: an explicit reap
+        # intent returns action="reap" and emits a CONTAINER_LIFECYCLE decision
+        # event.  The TTL semantics above are UNCHANGED -- only the decision
+        # point moves.  A non-destroy decision is honoured (nothing removed).
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason=ttl_reason,
+            force=True,
+            workspace_id=wid,
+        )
+        decision = ContainerLifecycle.reconcile(container, None, intent)
+        if not decision.destroys:
+            _note_skip(f"lifecycle {decision.action}")
+            continue
         try:
             container.remove(force=True)
         except Exception as exc:
@@ -4899,6 +4954,23 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
                 result["removed"] += 1
                 result["removed_orphan"] += 1
                 result["removed_records"].append(record.id)
+                continue
+
+            # Route the orphan-record reap through the funnel: the bound
+            # container is already GONE (that is what makes the record an
+            # orphan), so reconcile is handed ``None`` with an explicit reap
+            # intent; it returns action="reap" and emits a CONTAINER_LIFECYCLE
+            # decision event.  A non-destroy decision is honoured.
+            intent = ContainerIntent(
+                kind="reap",
+                explicit=True,
+                reason="orphaned",
+                force=True,
+                workspace_id=ws,
+            )
+            decision = ContainerLifecycle.reconcile(None, None, intent)
+            if not decision.destroys:
+                _note_skip(f"lifecycle {decision.action}")
                 continue
 
             try:
