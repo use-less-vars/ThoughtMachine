@@ -106,7 +106,7 @@ class FakeManager:
         self.calls.append(("stop", container_id))
         return dict(self._stop_result)
 
-    def remove(self, container_id):
+    def remove(self, container_id, **kwargs):
         self.calls.append(("remove", container_id))
         return dict(self._remove_result)
 
@@ -552,3 +552,30 @@ def test_decisions_only_canonical_vocabulary(vault, monkeypatch):
 
     assert seen <= server_module.VALID_DECISIONS, seen
     assert seen == {"applied", "denied", "conflict", "error"}, seen
+
+
+# ── keep_record threading: recreate PRESERVES, kill/restart never remove ─────
+
+def test_recreate_route_tells_manager_to_keep_record(vault, monkeypatch):
+    """The recreate ladder passes ``keep_record=True`` to ``ContainerManager.remove``.
+
+    Non-vacuity: if the ladder stopped passing ``keep_record=True`` (or the
+    manager ignored it) the record would be reaped and the rebind would 503 --
+    exactly the regression this pins.  See
+    ``test_recreate_success_real_ladder`` for the end-to-end real-ladder proof.
+    """
+    _seed(vault)
+    seen = {}
+
+    class _RecordingManager(FakeManager):
+        def remove(self, container_id, **kwargs):
+            seen.update(kwargs)
+            return super().remove(container_id, **kwargs)
+
+    _install_manager(monkeypatch, _RecordingManager())
+    _allow(monkeypatch)
+
+    resp = _post(RECREATE, "rec-a", actor="tester")
+    assert resp.status_code == 200, resp.text
+    assert seen == {"keep_record": True}
+

@@ -4304,7 +4304,9 @@ def _record_user_action(record_id: str, action: str, request: Request,
             if action == "restart":
                 pre_result = manager.stop(container_id)
             else:  # recreate
-                pre_result = manager.remove(container_id)
+                # Recreate = remove + start: the SAME record is rebound to the
+                # fresh container below, so the removal must NOT reap it.
+                pre_result = manager.remove(container_id, keep_record=True)
             conflict = _fail(pre_result, f"{action} failed")
             if conflict is not None:
                 return conflict

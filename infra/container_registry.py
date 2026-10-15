@@ -57,6 +57,7 @@ from thoughtmachine.container_record import (
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     STATE_RUNNING,
+    consumes_workspace_slot,
     docker_restart_policy,
 )
 from thoughtmachine.container_record.hook import record_creation
@@ -395,6 +396,12 @@ class ContainerRegistry:
                 "created_at": time.time(),
                 "quarantined": False,
                 "container_id": "",
+                # Resource records never consume the persistent budget; every
+                # other registered record defaults to persistent (fail closed).
+                "lifecycle_class": (
+                    LIFECYCLE_RESOURCE if container_type == "resource"
+                    else LIFECYCLE_PERSISTENT
+                ),
             }
             self._session_map.setdefault(session_id, set()).add(container_name)
         log_container_event(
@@ -526,13 +533,25 @@ class ContainerRegistry:
         # check and overshoot the limit. The placeholder is inserted BEFORE the
         # (slow) docker create so it immediately occupies a slot (use
         # ``status="registering"``); a failed create rolls the slot back.
+        #
+        # Slot-accounting invariant: the workspace cap bounds LIVE PERSISTENT
+        # containers only.  A record whose container has stopped must not keep
+        # consuming a slot (that would deadlock the workspace), and a slot must
+        # never be double-counted (a stopped record plus its EXITED container
+        # row).  ``_count_consuming_slots`` reads ``_containers`` exactly once,
+        # under the SAME held lock as the reservation, so the read-and-reserve
+        # stays atomic (mirrors ``container_manager._counts_toward_limit``).
         with self._lock:
-            current = sum(
-                1 for st in self._containers.values()
-                if st.get("workspace_id") == workspace_id
-            )
+            current = self._count_consuming_slots(workspace_id)
             if current >= max_containers:
-                raise RuntimeError("Container limit reached")
+                raise RuntimeError(
+                    "Container limit reached: "
+                    f"{current}/{max_containers} workspace container slot(s) "
+                    f"already in use for workspace {workspace_id!r}. "
+                    "Stop and remove an existing container with "
+                    "ContainerRemoveTool (or wait for the exited-container "
+                    "sweep) to free a slot."
+                )
             # Parity with register(): refuse a duplicate name instead of
             # silently overwriting an existing entry.
             if container_name in self._containers:
@@ -546,6 +565,10 @@ class ContainerRegistry:
                 "created_at": time.time(),
                 "quarantined": False,
                 "container_id": "",
+                # The requested lifecycle class drives slot accounting: an
+                # ephemeral/self-cleaning runner must never be counted against
+                # the persistent workspace cap.
+                "lifecycle_class": lifecycle_class,
             }
             self._session_map.setdefault(session_id, set()).add(container_name)
 
@@ -881,6 +904,9 @@ class ContainerRegistry:
                     "created_at": time.time(),
                     "quarantined": False,
                     "container_id": getattr(fresh, "id", "") or "",
+                    # A permission-change recreate is always persistent (see the
+                    # lifecycle_class arg above); keep slot accounting intact.
+                    "lifecycle_class": LIFECYCLE_PERSISTENT,
                 }
             log.info(
                 "on_permission_changed: recreated %s with network_mode=%s",
@@ -912,6 +938,60 @@ class ContainerRegistry:
                         raw, DEFAULT_MAX_CONTAINERS,
                     )
         return DEFAULT_MAX_CONTAINERS
+
+    def _count_consuming_slots(self, workspace_id) -> int:
+        """Number of LIVE PERSISTENT containers the workspace currently holds.
+
+        Single pass over ``_containers.values()`` (exactly one read) so the
+        read-and-reserve in :meth:`request_container` stays atomic under the
+        caller's lock.
+        """
+        return sum(
+            1 for st in self._containers.values()
+            if st.get("workspace_id") == workspace_id
+            and self._record_consumes_slot(st)
+        )
+
+    def _record_consumes_slot(self, state) -> bool:
+        """True when *state* currently occupies one workspace container slot.
+
+        Mirrors ``container_manager._counts_toward_limit``: the workspace cap
+        bounds LIVE PERSISTENT containers.  A record frees its slot when
+
+        * its container reached a terminal Docker state
+          (``exited``/``dead``/``removing``);
+        * its ``container_id`` no longer names a live container; or
+        * it is a non-persistent lifecycle (``ephemeral``/``resource``
+          /``service``) — the self-cleaning code-execution runner and the
+          hidden resource/git containers never consume the persistent budget.
+
+        Anything indeterminate counts (fail closed) so an unknown record can
+        never smuggle a slot past the budget.
+
+        The terminal-state / existence decision is delegated to the shared
+        ``consumes_workspace_slot`` predicate (single SSOT shared with
+        ``container_manager`` and the admission gate); the persistent-only
+        filter stays local because the shared predicate would treat
+        ``resource`` as consuming.
+        """
+        lifecycle_class = state.get("lifecycle_class") or LIFECYCLE_PERSISTENT
+        if lifecycle_class != LIFECYCLE_PERSISTENT:
+            return False
+        container_id = state.get("container_id") or ""
+        client = self._docker_client
+        exists = True
+        if container_id and client is not None:
+            try:
+                client.containers.get(container_id)
+            except docker.errors.NotFound:
+                exists = False  # container is gone — nothing is occupied
+            except Exception:  # noqa: BLE001 - indeterminate -> fail closed
+                return True
+        return consumes_workspace_slot(
+            lifecycle_class=lifecycle_class,
+            status=state.get("status"),
+            exists=exists,
+        )
 
     def _to_handle(self, name, state) -> dict:
         return {

@@ -91,6 +91,8 @@ class EventType(enum.Enum):
     WORKER_TIMEOUT = 'worker_timeout'
     WORKER_PAUSED = 'worker_paused'
     WORKER_RESUMED = 'worker_resumed'
+    # Container lifecycle events (routed to the tenant event log)
+    CONTAINER_REMOVED = 'container_removed'
 
 
 class EventMetadata(BaseModel):

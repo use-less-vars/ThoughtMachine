@@ -56,8 +56,10 @@ from .lifecycle_policy import (
     RESOURCE_IMAGE,
     RESOURCE_LABEL,
     RESOURCE_NAME_PREFIX,
+    TERMINAL_CONTAINER_STATUSES,
     LifecyclePolicy,
     UnknownLifecycleClass,
+    consumes_workspace_slot,
     is_resource_like,
     docker_restart_policy,
     normalise_restart_policy,
@@ -125,4 +127,6 @@ __all__ = [
     "RESOURCE_LABEL",
     "RESOURCE_NAME_PREFIX",
     "RESOURCE_IMAGE",
+    "TERMINAL_CONTAINER_STATUSES",
+    "consumes_workspace_slot",
 ]

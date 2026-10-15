@@ -304,8 +304,8 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
             manager = self._make_manager(tmp, entries, limit=2)
             result = self._start(manager)
             self.assertIn("error", result, result)
-            self.assertIn("limit (2)", result["error"])
-            self.assertIn("2 active container(s)", result["error"])
+            self.assertIn("container limit reached (2/2", result["error"])
+            self.assertIn("2/2 consuming container(s)", result["error"])
 
     # ── (b2) the at-limit message tells the user to REMOVE, not stop ───
 
@@ -319,9 +319,9 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
             result = self._start(manager)
             self.assertEqual(
                 result,
-                {"error": "Workspace container limit (1) reached "
-                          "(1 active container(s)). "
-                          "Remove a persistent container to free a slot."},
+                {"error": "Workspace container limit reached (1/1 consuming "
+                          "container(s)); remove an existing container with "
+                          "ContainerRemoveTool to free a slot"},
                 result,
             )
 
@@ -349,7 +349,7 @@ class ContainerLimitCountsActiveOnlyTest(unittest.TestCase):
             manager = self._make_manager(tmp, entries, limit=2)
             result = self._start(manager)
             self.assertIn("error", result, result)
-            self.assertIn("2 active container(s)", result["error"])
+            self.assertIn("2/2 consuming container(s)", result["error"])
 
     def test_mixed_statuses_count_only_non_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:

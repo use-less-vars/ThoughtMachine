@@ -278,7 +278,10 @@ class FakeManager:
         self._info(container_id)["status"] = "stopped"
         return {"status": "stopped", "container_id": container_id}
 
-    def remove(self, container_id):
+    def remove(self, container_id, *, keep_record=False):
+        # ``keep_record`` mirrors ContainerManager.remove(): the durable record
+        # is out of scope for this fake (it lives in the vault), so the keyword
+        # is accepted and ignored here.
         self.calls.append(("remove", container_id))
         self._statuses.pop(container_id, None)
         return {"status": "removed", "container_id": container_id}

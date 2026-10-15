@@ -549,20 +549,21 @@ def test_client_probes_excludes_ephemeral_and_resource(monkeypatch, tmp_path):
     assert isinstance(admit(req, probes=probes), Allow)
 
 
-def test_counts_toward_ceiling_includes_exited_persistent_container(monkeypatch, tmp_path):
-    """PINS include-behaviour: an exited persistent container still counts.
+def test_counts_toward_ceiling_excludes_exited_persistent_container(monkeypatch, tmp_path):
+    """CHUNK-2 fix: an exited persistent container no longer counts.
 
-    ``security.admission_gate._counts_toward_ceiling`` is status-BLIND -- it
-    reads only ``labels``/``name``/``image`` (and ``image.tags``) and defers to
-    the shared ``thoughtmachine.container_record`` classifier
-    :func:`lifecycle_class_from_labels`.  A persistent-class container Docker
-    reports as ``status="exited"`` must therefore still occupy the per-workspace
-    ceiling slot.
+    ``security.admission_gate._counts_toward_ceiling`` still reads only
+    ``labels``/``name``/``image`` (and ``image.tags``) for the CLASS and defers
+    to the shared ``thoughtmachine.container_record`` classifier
+    :func:`lifecycle_class_from_labels`; it then consults the shared
+    :func:`consumes_workspace_slot` predicate for the STATUS.  A persistent-class
+    container Docker reports as ``status="exited"`` is terminal and therefore
+    does NOT occupy the per-workspace ceiling slot: it must NOT count.
 
-    This test is EXPECTED TO PASS on unchanged code: it pins the current,
-    correct behaviour (a stopped/exited persistent container is NOT a free slot).
-    It is deliberately built with its OWN container double carrying a ``status``
-    attribute -- no existing fake is modified.
+    This SUPERSEDES the prior pin (``..._includes_exited_...``), which asserted
+    the retired status-BLIND behaviour.  It is deliberately built with its OWN
+    container double carrying a ``status`` attribute -- no existing fake is
+    modified.
     """
     from thoughtmachine.container_record import (
         LIFECYCLE_PERSISTENT, OWNER_WORKSPACE, RECORD_LABEL_KEY, create_record,
@@ -594,10 +595,10 @@ def test_counts_toward_ceiling_includes_exited_persistent_container(monkeypatch,
             self.status = "exited"
 
     container = _ExitedPersistentContainer()
-    assert ag._counts_toward_ceiling(container) is True
+    assert ag._counts_toward_ceiling(container) is False
 
     # Distinct contract: with NO labels at all the classifier still falls back
-    # to the persistent class, so a bare exited container also counts.
+    # to the persistent class, but the terminal status still frees the slot.
     class _DefaultedExitedContainer:
         def __init__(self):
             self.name = "persistent-2"
@@ -605,4 +606,123 @@ def test_counts_toward_ceiling_includes_exited_persistent_container(monkeypatch,
             self.image = "agent-executor"
             self.status = "exited"
 
-    assert ag._counts_toward_ceiling(_DefaultedExitedContainer()) is True
+    assert ag._counts_toward_ceiling(_DefaultedExitedContainer()) is False
+
+
+
+# ─═ CHUNK 2: terminal / dead containers must not consume the ceiling ════════
+def _container(name, labels=None, status="running", image="agent-executor"):
+    """Docker-container double carrying a mutable ``status`` attribute."""
+
+    class _C:
+        pass
+
+    c = _C()
+    c.name = name
+    c.labels = labels or {}
+    c.image = image
+    c.status = status
+    return c
+
+
+def test_counts_toward_ceiling_excludes_each_terminal_status():
+    """Every terminal Docker status (exited/dead/removing) frees the slot."""
+    for status in ("exited", "dead", "removing"):
+        assert ag._counts_toward_ceiling(_container("live", status=status)) is False
+
+
+def test_counts_toward_ceiling_counts_running_persistent_container():
+    """A live persistent container still consumes a slot."""
+    assert ag._counts_toward_ceiling(_container("live", status="running")) is True
+
+
+def test_counts_toward_ceiling_reads_status_from_attrs():
+    """Falls back to ``attrs['State']['Status']`` when ``status`` is absent."""
+
+    class _AttrsOnly:
+        name = "live"
+        labels = {}
+        image = "agent-executor"
+        attrs = {"State": {"Status": "exited"}}
+
+    assert ag._counts_toward_ceiling(_AttrsOnly()) is False
+
+
+def test_counts_toward_ceiling_counts_when_status_unreadable():
+    """Fail-closed: a container whose status cannot be read still counts."""
+
+    class _NoStatus:
+        name = "live"
+        labels = {}
+        image = "agent-executor"
+
+    assert ag._counts_toward_ceiling(_NoStatus()) is True
+    # An explicitly-None status is likewise non-terminal (counts).
+    assert ag._counts_toward_ceiling(_container("live", status=None)) is True
+
+
+def test_field_regression_exited_containers_do_not_block_admission(monkeypatch):
+    """N terminal containers >= limit must NOT deny a NEW container.
+
+    Three exited (terminal) persistent containers are present with a limit of 2;
+    admission is ALLOWED because none of them consumes a slot.
+    """
+    _pin_disk_seam(monkeypatch)
+    exited = [_container(f"exited-{i}", status="exited") for i in range(3)]
+    probes = ag.ClientProbes(FakeDockerClient(items=exited, ping=lambda: True))
+    assert probes.workspace_container_count("ws1") == 0
+    req = make_request(
+        spec=make_spec(network_mode="bridge", image="agent-executor"),
+        session_config={"container_limits": {"max_containers": 2}},
+    )
+    assert isinstance(admit(req, probes=probes), Allow)
+
+
+def test_field_regression_live_persistent_containers_still_refuse(monkeypatch):
+    """The refusal path still fires when LIVE persistent containers fill the cap."""
+    _pin_disk_seam(monkeypatch)
+    live = [_container(f"live-{i}", status="running") for i in range(2)]
+    probes = ag.ClientProbes(FakeDockerClient(items=live, ping=lambda: True))
+    assert probes.workspace_container_count("ws1") == 2
+    req = make_request(
+        spec=make_spec(network_mode="bridge", image="agent-executor"),
+        session_config={"container_limits": {"max_containers": 2}},
+    )
+    decision = admit(req, probes=probes)
+    assert isinstance(decision, Deny)
+    assert decision.code == REASON_CONTAINER_LIMIT_EXCEEDED
+
+
+def test_free_use_container_does_not_consume_a_slot():
+    """A free_use-labelled (ephemeral) container never consumes a slot."""
+    from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL
+
+    c = _container(
+        "free-use",
+        labels={CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE},
+        status="running",
+    )
+    assert ag._counts_toward_ceiling(c) is False
+
+
+def test_refusal_message_reports_consuming_count(monkeypatch):
+    """The refusal names the CONSUMING count (terminal containers excluded)."""
+    _pin_disk_seam(monkeypatch)
+    items = [
+        _container("live-1", status="running"),
+        _container("live-2", status="running"),
+        _container("dead-1", status="exited"),
+        _container("dead-2", status="dead"),
+    ]
+    probes = ag.ClientProbes(FakeDockerClient(items=items, ping=lambda: True))
+    req = make_request(
+        spec=make_spec(network_mode="bridge", image="agent-executor"),
+        session_config={"container_limits": {"max_containers": 2}},
+    )
+    decision = admit(req, probes=probes)
+    assert isinstance(decision, Deny)
+    assert decision.code == REASON_CONTAINER_LIMIT_EXCEEDED
+    # Consuming count is 2 (the two live containers), NOT the raw 4.
+    assert "(2/2" in decision.message
+    assert "4/2" not in decision.message
+

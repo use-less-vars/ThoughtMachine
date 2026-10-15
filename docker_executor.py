@@ -543,6 +543,16 @@ def verify_container_integrity(
             "mismatch_reason": mismatch_reason,
         }
 
+    try:
+        from infra.container_manager import (
+            _reap_bound_record as _cm_reap_bound_record,
+            _emit_container_removed as _cm_emit_container_removed,
+        )
+        _cm_reap_bound_record(workspace_id, container)
+        _cm_emit_container_removed(workspace_id, None, container, reason="removed")
+    except Exception:
+        pass
+
     return {
         "container_exists": True,
         "container_name": container_name,

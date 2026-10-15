@@ -241,3 +241,50 @@ def docker_restart_policy(lifecycle_class: str) -> dict | None:
     if policy is None:
         return None
     return {"Name": normalise_restart_policy(policy), "MaximumRetryCount": 0}
+
+
+# ── Workspace-slot accounting ─────────────────────────────────────────────
+#
+# A container "consumes a workspace slot" when it occupies one of the
+# workspace's finite container-ceiling slots.  This is the single predicate the
+# ceiling-enforcement sites (``infra.container_manager`` and
+# ``security.admission_gate``) share, so the two never drift apart.
+
+#: Container statuses that mean the container no longer runs (Docker
+#: ``State.Status`` vocabulary).  A container in one of these states has been
+#: stopped/removed and therefore frees its workspace slot.
+TERMINAL_CONTAINER_STATUSES: frozenset[str] = frozenset(
+    {"exited", "dead", "removing"}
+)
+
+
+def consumes_workspace_slot(
+    *,
+    lifecycle_class: str | None,
+    status: str | None,
+    exists: bool = True,
+) -> bool:
+    """Return whether a container occupies a workspace container slot.
+
+    A container consumes a slot only when it is *present*, *live* and of a
+    class the workspace itself owns and must bound:
+
+    * ``exists=False`` -> ``False`` (the container is gone; frees its slot);
+    * a terminal ``status`` (:data:`TERMINAL_CONTAINER_STATUSES`) -> ``False``
+      (stopped/exited containers are swept and do not count);
+    * :data:`LIFECYCLE_EPHEMERAL` -> ``False`` (ephemeral / free-use containers
+      are short-lived and never pinned against the ceiling);
+    * otherwise -> ``True``.
+
+    Fail-closed: an unknown or ``None`` ``status`` or ``lifecycle_class`` is
+    treated as still consuming a slot (``True``), so a caller never
+    *under*-counts the workspace's live containers.  Never raises.
+    """
+    if not exists:
+        return False
+    normalised_status = str(status or "").strip().lower()
+    if normalised_status in TERMINAL_CONTAINER_STATUSES:
+        return False
+    if lifecycle_class == LIFECYCLE_EPHEMERAL:
+        return False
+    return True

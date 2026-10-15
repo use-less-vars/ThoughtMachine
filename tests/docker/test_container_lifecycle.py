@@ -365,9 +365,10 @@ class TestContainerLifecycle:
 
         r_b = manager.start(name=name_b)
         assert r_b == {
-            "error": "Workspace container limit (1) reached "
-                      "(1 active container(s)). "
-                      "Remove a persistent container to free a slot."
+            "error": "Workspace container limit reached "
+                      "(1/1 consuming container(s)); "
+                      "remove an existing container with "
+                      "ContainerRemoveTool to free a slot"
         }, f"unexpected limit result: {r_b!r}"
 
         r_a_again = manager.start(name=name_a)

@@ -112,6 +112,7 @@ from thoughtmachine.workspace_capabilities import git_shadow_mask_path
 from thoughtmachine.container_record import (
     attach_container,
     ContainerRecordError,
+    consumes_workspace_slot,
     LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
@@ -264,6 +265,28 @@ _HEAL_ACTOR = "infra.container_manager.start"
 _HEAL_REASON = "container_missing"
 _HEAL_AUDIT_HEALED = "CONTAINER_START_MISSING_HEAL"
 _HEAL_AUDIT_REFUSED = "CONTAINER_START_MISSING_HEAL_FAILED"
+
+# W3-4: the SINGLE SOURCE OF TRUTH for the three heal-outcome refusal codes
+# produced by ``start()`` on the missing/absent-container branches.  Producers
+# and every consumer must agree on these byte-for-byte values; the frozen set
+# lets a test pin the declared vocabulary.
+HEAL_OUTCOME_UNBOUND = "container_record_unbound"
+HEAL_OUTCOME_NOT_HEALABLE = "container_record_not_healable"
+HEAL_OUTCOME_CONTAINER_MISSING = "container_record_container_missing"
+HEAL_OUTCOME_CODES = frozenset({
+    HEAL_OUTCOME_UNBOUND,
+    HEAL_OUTCOME_NOT_HEALABLE,
+    HEAL_OUTCOME_CONTAINER_MISSING,
+})
+
+# W3-5: dedup for the affirmative ``container_reused`` RECORD event emitted from
+# the three reuse-continue sites of ``start()``.  MODULE scope (like the drift
+# memos above) so the once-per-``(record_id, docker_id)`` guarantee holds across
+# the fresh ``ContainerManager`` built for every tool call.
+_CONTAINER_REUSED_SEEN = OrderedDict()  # (record_id, docker_id) -> True, oldest evicted
+_CONTAINER_REUSED_LOCK = threading.Lock()
+_CONTAINER_REUSED_EVENT = "container_reused"
+_CONTAINER_REUSED_ACTOR = "infra.container_manager.start"
 
 # Sticky-note migration/warning memos (module scope so dedup holds across the
 # fresh ContainerManager instances built for every tool call). ``_NOTES_WARNED``
@@ -763,10 +786,12 @@ class ContainerManager:
           ceiling -- ``resource`` and ``ephemeral`` containers are excluded
           (classified via the shared ``lifecycle_class_from_labels`` helper).
         Unknown/new statuses count (fail-safe: default to occupying a slot).
+
+        The terminal-state filter is delegated to the shared
+        ``consumes_workspace_slot`` predicate (single SSOT shared with the
+        registry and the admission gate); the persistent-only filter stays
+        local because the shared predicate treats ``resource`` as consuming.
         """
-        status = str((entry or {}).get("status", "")).lower()
-        if status in ("exited", "dead", "removing"):
-            return False
         entry = entry or {}
         cls = lifecycle_class_from_labels(
             entry.get("labels"),
@@ -774,7 +799,13 @@ class ContainerManager:
             image_tags=entry.get("image"),
             vault_root=getattr(self, "vault_root", None),
         )
-        return cls == LIFECYCLE_PERSISTENT
+        if cls != LIFECYCLE_PERSISTENT:
+            return False
+        return consumes_workspace_slot(
+            lifecycle_class=cls,
+            status=entry.get("status"),
+            exists=True,
+        )
 
     def _active_containers(self, entries):
         """Filter container entries down to those that occupy a limit slot."""
@@ -1405,7 +1436,7 @@ class ContainerManager:
                 _reuse_intent = None
             _reuse_mem_limit = (_reuse_intent or {}).get("mem_limit") or None
             _reuse_cpu_quota = (_reuse_intent or {}).get("cpu_quota") or None
-            if docker_id and self._reuse_container(docker_id) is None:
+            if docker_id and self._reuse_container(docker_id)[0] is None:
                 # C3: a KNOWN class that OWNS its lifecycle (resource/service) is
                 # the ONLY class-based heal refusal; an unknown class is treated
                 # as owning (fail-closed) but is NEVER reported as 'not healable'.
@@ -1449,9 +1480,9 @@ class ContainerManager:
                                   "the record is unbound; an operator can "
                                   "recreate it via the record's recreate "
                                   "action."),
-                        "code": "container_record_unbound"}
+                        "code": HEAL_OUTCOME_UNBOUND}
             # (a) Record + docker_id: reuse via the record's docker id.
-            container = self._reuse_container(docker_id)
+            container, _reuse_running = self._reuse_container(docker_id)
             if container is None:
                 if allow_fresh:
                     return self._fresh_start(
@@ -1492,14 +1523,15 @@ class ContainerManager:
                                       f"an agent cannot heal it with "
                                       f"`heal=True`; an operator can recreate "
                                       f"it via the record's recreate action."),
-                            "code": "container_record_not_healable"}
+                            "code": HEAL_OUTCOME_NOT_HEALABLE}
                 return {"error": (f"Container {name!r} record {record_id} names "
                                   f"docker_id {docker_id!r} but no such container "
                                   f"exists. Recovery: an agent can heal it with "
                                   f"`heal=True`; an operator can recreate it via "
                                   f"the record's recreate action."),
-                        "code": "container_record_container_missing"}
-            self._containers[name] = container.id  # warm the read-through cache
+                        "code": HEAL_OUTCOME_CONTAINER_MISSING}
+            if _reuse_running:
+                self._containers[name] = container.id  # warm the read-through cache
             if (explicit_image is not None
                     and not self._image_matches(container, explicit_image)):
                 actual = self._image_ref(container)
@@ -1542,6 +1574,7 @@ class ContainerManager:
             note_value = (note if note is not None else self._read_note(container))
             _audit("CONTAINER_REUSE_OK",
                    f"source=record name={name} id={container.id} session={self.session_id}")
+            self._emit_container_reused_once(record_id, container.id)
             log_container_event("started", container_id=container.id,
                                 session_id=self.session_id or "",
                                 data={"image": self._image_ref(container),
@@ -1550,6 +1583,10 @@ class ContainerManager:
                            "note": note_value}
             if _payload is not None:
                 _reuse_resp["drift"] = _payload
+            if not _reuse_running:
+                # VERIFIED state: only claim a plain reuse when the container was
+                # observed running; otherwise surface the unverified state.
+                _reuse_resp["running"] = False
             return _reuse_resp
 
         # (c) Cached name with NO record -> drift: REFUSE (no-container-record).
@@ -1600,6 +1637,7 @@ class ContainerManager:
                 # (see _start_drift_decision; mirrors the registry/label checks
                 # below).
                 _start_drift = None
+                _reuse_running = False
                 if container is not None:
                     _action, _payload = self._start_drift_decision(
                         container, want_network, want_workspace, "workspace-label",
@@ -1632,9 +1670,9 @@ class ContainerManager:
                     if _action == "reuse":
                         _start_drift = _payload
                     try:
-                        self._ensure_running(container)
+                        _reuse_running = self._ensure_running(container)
                     except Exception:
-                        pass
+                        _reuse_running = False
                 if note is not None:
                     _rid = (self._record_id_for(container)
                             if container is not None
@@ -1643,6 +1681,18 @@ class ContainerManager:
                 _audit("CONTAINER_REUSE_OK",
                        f"source=workspace-label name={name} id={entry['container_id']} "
                        f"session={self.session_id}")
+                # Resolve the record id from data already in hand (the
+                # container object) and only fall back to the NAME-based
+                # daemon lookup when a docker client is actually present.
+                # A hand-built manager that bypasses __init__ (no ``.client``)
+                # must never crash here: the emission is best-effort and the
+                # record id is left unresolved (nothing emitted).
+                _reused_rid = None
+                if container is not None:
+                    _reused_rid = self._record_id_for(container)
+                elif getattr(self, "client", None) is not None:
+                    _reused_rid = self._record_id_for_name(name)
+                self._emit_container_reused_once(_reused_rid, entry["container_id"])
                 log_container_event("started", container_id=entry["container_id"],
                                     session_id=self.session_id or "",
                                     data={"image": self._image_ref(container),
@@ -1651,6 +1701,10 @@ class ContainerManager:
                                "note": note_value}
                 if _start_drift is not None:
                     _reuse_resp["drift"] = _start_drift
+                if not _reuse_running:
+                    # VERIFIED state: only claim a plain reuse when the container
+                    # was observed running; otherwise surface the unverified state.
+                    _reuse_resp["running"] = False
                 return _reuse_resp
         limit = self._get_max_containers()
         active_containers = self._active_containers(containers)
@@ -1659,9 +1713,10 @@ class ContainerManager:
                 f"Workspace container limit reached: active={len(active_containers)} "
                 f"exited={len(containers) - len(active_containers)} limit={limit} "
                 f"workspace_id={self.workspace_id}")
-            return {"error": f"Workspace container limit ({limit}) reached "
-                             f"({len(active_containers)} active container(s)). "
-                             f"Remove a persistent container to free a slot."}
+            return {"error": f"Workspace container limit reached "
+                             f"({len(active_containers)}/{limit} consuming "
+                             f"container(s)); remove an existing container with "
+                             f"ContainerRemoveTool to free a slot"}
 
         # ── Desired isolation from session permissions (all paths) ─────────
         computed = self._compute_config(
@@ -1731,14 +1786,17 @@ class ContainerManager:
                     reuse_record_id=None,
                     permissions=effective,
                 )
-            self._ensure_running(container)
-            self._containers[name] = container.id
+            _reuse_running = self._ensure_running(container)
+            if _reuse_running:
+                self._containers[name] = container.id
             if note is not None:
                 self._write_note(self._record_id_for(container), note)
             note_value = (note if note is not None
                           else self._read_note(container))
             _audit("CONTAINER_REUSE_OK",
                    f"source=label name={name} id={container.id} session={self.session_id}")
+            self._emit_container_reused_once(self._record_id_for(container),
+                                             container.id)
             log_container_event("started", container_id=container.id,
                                 session_id=self.session_id or "",
                                 data={"image": self._image_ref(container),
@@ -1747,6 +1805,10 @@ class ContainerManager:
                            "note": note_value}
             if _payload is not None:
                 _reuse_resp["drift"] = _payload
+            if not _reuse_running:
+                # VERIFIED state: only claim a plain reuse when the container was
+                # observed running; otherwise surface the unverified state.
+                _reuse_resp["running"] = False
             return _reuse_resp
 
         # 3) Fresh create: one shared creation path.
@@ -2609,6 +2671,40 @@ class ContainerManager:
         except Exception:
             pass
 
+    def _emit_container_reused_once(self, record_id, docker_id):
+        """Append ONE ``container_reused`` record event per identity pair.
+
+        The affirmative counterpart to the drift events: a REUSE that actually
+        proceeded is recorded on the container's record.  Deduped on
+        ``(record_id, docker_id)`` via a MODULE-scope memo (like
+        ``_START_DRIFT_SEEN``) so it holds across the fresh ``ContainerManager``
+        built per tool call.  Best-effort: never raises, and a reuse whose
+        record id cannot be resolved emits nothing.
+        """
+        if not record_id or not docker_id:
+            return
+        if not getattr(self, "workspace_id", None):
+            return
+        key = (str(record_id), str(docker_id))
+        with _CONTAINER_REUSED_LOCK:
+            if key in _CONTAINER_REUSED_SEEN:
+                return
+            _CONTAINER_REUSED_SEEN[key] = True
+            while len(_CONTAINER_REUSED_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _CONTAINER_REUSED_SEEN.popitem(last=False)
+        try:
+            from thoughtmachine.container_record import append_event
+            append_event(
+                self.workspace_id,
+                str(record_id),
+                _CONTAINER_REUSED_EVENT,
+                _CONTAINER_REUSED_ACTOR,
+                docker_id=str(docker_id),
+                detected_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            pass
+
     def _heal_eligible(self, record, stale_docker_id):
         """Return True when ``start()`` may auto-heal this missing container.
 
@@ -3090,13 +3186,21 @@ class ContainerManager:
             return {"status": "error", "container_id": container_id, "error": str(e),
                     "name": getattr(container, "name", "")}
 
-    def remove(self, container_id):
+    def remove(self, container_id, *, keep_record=False):
         """Remove the container. Idempotent; NEVER raises.
 
         Stops the container first (best-effort, via :meth:`stop`) then removes
         it with ``force=True``. Returns one of:
             {"status": "removed", "container_id": ...}
             {"status": "error", "container_id": ..., "error": ...}
+
+        ``keep_record`` (keyword-only, default False) PRESERVES the durable
+        container record bound to the removed container instead of reaping it,
+        and tags the ``container_removed`` audit event ``reason="recreate"``.
+        The record-user-action *recreate* ladder passes ``keep_record=True``:
+        it removes the old container then (re)starts + rebinds the SAME record,
+        so the record must survive the removal.  Every other caller keeps the
+        default terminal semantics (the record is reaped, ``reason="removed"``).
         """
         stopped = self.stop(container_id)
         if stopped.get("status") not in ("stopped", "missing"):
@@ -3110,11 +3214,34 @@ class ContainerManager:
         try:
             container.remove(force=True)
             self._drop_container(container_id)
+            if not keep_record:
+                self._reap_record(container)
             log_container_event("removed", container_id=container_id,
                                 session_id=self.session_id or "")
+            self._emit_removal_event(
+                container_id, container,
+                reason="recreate" if keep_record else "removed")
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
+
+    def _emit_removal_event(self, container_id, container, reason="removed"):
+        """Publish ONE ``container_removed`` event (thin wrapper).
+
+        Delegates to the module-level :func:`_emit_container_removed` so removal
+        sites WITHOUT a manager instance share the SAME emission.  ``container_id``
+        is retained for signature stability; the emitted id is ``container.id``.
+        Never raises.
+        """
+        _emit_container_removed(self.workspace_id, self.session_id, container, reason)
+
+    def _reap_record(self, container):
+        """Delete the durable record bound to a REMOVED container (thin wrapper).
+
+        Delegates to the module-level :func:`_reap_bound_record` so removal sites
+        WITHOUT a manager instance share the SAME reap + class gate; never raises.
+        """
+        _reap_bound_record(self.workspace_id, container)
 
     def status(self, container_id):
         """Report container status; NEVER raises."""
@@ -3829,15 +3956,20 @@ class ContainerManager:
                 f"(reason={reason}): {type(exc).__name__}: {exc}")
 
     def _reuse_container(self, container_id):
-        """Return a running container for ``container_id`` or None."""
+        """Return ``(container, running)`` for ``container_id``.
+
+        ``(None, False)`` when ``container_id`` is falsy or the container cannot
+        be fetched; ``running`` is the VERIFIED result of ``_ensure_running`` --
+        callers must never claim a running reuse they did not observe.
+        """
         if not container_id:
-            return None
+            return None, False
         try:
             container = self.client.containers.get(container_id)
-            self._ensure_running(container)
-            return container
+            running = self._ensure_running(container)
+            return container, running
         except Exception:
-            return None
+            return None, False
 
     def _find_by_labels(self, name):
         """Find a container by its thoughtmachine labels (or None)."""
@@ -3875,6 +4007,23 @@ class ContainerManager:
             log("WARNING", "docker.container_manager",
                 f"_ensure_running: container.start()/reload() failed for "
                 f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
+        # VERIFY the outcome instead of assuming it: a best-effort start that
+        # silently failed -- or a container that came back non-running -- must
+        # never be reported as a running reuse.  The status read is defensive so
+        # this helper NEVER raises out to its caller.
+        try:
+            observed = container.status
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: status read failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
+            observed = None
+        running = observed == "running"
+        if not running:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: container {getattr(container, 'id', '?')} "
+                f"still not running after start attempt (status={observed!r})")
+        return running
 
     def set_note(self, container_id, note):
         """Set the container's sticky note on its RECORD; NEVER raises.
@@ -4130,7 +4279,11 @@ class ContainerManager:
         )
 
     def _remove_container(self, container):
-        """Stop and remove a container; best-effort, NEVER raises."""
+        """Stop and remove a container; best-effort, NEVER raises.
+
+        On a successful removal the bound record is reaped and ONE
+        ``container_removed`` event (``reason="removed"``) is emitted.
+        """
         try:
             container.stop(timeout=5)
         except Exception:
@@ -4138,14 +4291,111 @@ class ContainerManager:
         try:
             container.remove()
         except Exception:
-            pass
+            return
+        _reap_bound_record(self.workspace_id, container)
+        _emit_container_removed(
+            self.workspace_id, self.session_id, container, reason="removed")
 
 
 # ── Module-level workspace helpers ──────────────────────────────────────────
+def _record_id_from_container(container):
+    """Return the record id carried by *container*'s labels, or None.
+
+    Module-level twin of :meth:`ContainerManager._record_id_for`, for removal
+    sites without a manager instance.  Never raises.
+    """
+    if container is None:
+        return None
+    labels = getattr(container, "labels", None)
+    if not labels:
+        try:
+            attrs = getattr(container, "attrs", None) or {}
+            labels = (attrs.get("Config") or {}).get("Labels")
+        except Exception:
+            labels = None
+    try:
+        value = (labels or {}).get(RECORD_LABEL_KEY)
+    except Exception:
+        return None
+    if not value:
+        return None
+    return str(value)
+
+
+def _reap_bound_record(workspace_id, container):
+    """Delete the durable record bound to a REMOVED *container* (best-effort).
+
+    Module-level twin of :meth:`ContainerManager._reap_record`: resolves the
+    record via the container's ``RECORD_LABEL_KEY`` label, applies the ownership
+    guard (the record's ``docker_id`` must match the container) and the SAME
+    class gate as the orphan sweeper (:func:`sweep_orphan_container_records`),
+    then deletes the record.  Never raises -- record cleanup must never fail a
+    removal.
+    """
+    record_id = _record_id_from_container(container)
+    if not record_id:
+        return
+    try:
+        record = load_record(workspace_id, record_id)
+    except Exception:
+        record = None
+    if record is None:
+        return
+    docker_id = str(getattr(record, "docker_id", "") or "")
+    container_id = str(getattr(container, "id", "") or "")
+    if docker_id and container_id and docker_id != container_id:
+        return
+    try:
+        policy = policy_for(record.lifecycle_class)
+    except UnknownLifecycleClass:
+        return
+    if policy.own_lifecycle and record.lifecycle_class != LIFECYCLE_RESOURCE:
+        return
+    try:
+        delete_record(workspace_id, record.id)
+        _name_index_forget(record.id)
+    except Exception:
+        return
+
+
+def _emit_container_removed(workspace_id, session_id, container, reason="removed"):
+    """Publish ONE ``container_removed`` event to the tenant event bus.
+
+    Module-level twin of :meth:`ContainerManager._emit_removal_event`, for
+    removal sites without a manager instance.  Best-effort and success-only;
+    reaches ``<vault_root>/logs/event_log.jsonl`` through the ``EventLogger`` bus
+    subscriber.  Never raises -- event emission must never fail a removal.
+    """
+    try:
+        from agent.events import create_event, global_event_bus, EventType
+        if global_event_bus is None:
+            return
+        data = {
+            "container_id": getattr(container, "id", None),
+            "name": getattr(container, "name", None),
+            "workspace_id": workspace_id,
+            "session_id": session_id,
+            "reason": reason,
+        }
+        event = create_event(
+            EventType.CONTAINER_REMOVED,
+            data,
+            source="infra.container_manager.remove",
+            session_id=session_id,
+        )
+        global_event_bus.publish(event)
+    except Exception:
+        pass
+
+
 def cleanup_workspace(workspace_id, docker_client):
     """Stop + remove every container labelled with ``workspace_id``.
 
-    Returns {"removed": n}. Never raises.
+    Every container is removed (``force=True``); each removed container's bound
+    record is reaped and ONE ``container_removed`` event
+    (``reason="workspace_cleanup"``) is emitted.  A container force-removed while
+    still RUNNING is reported at WARNING, naming it.  Returns ``{"removed": n}``.
+    Never raises.
     """
     wid = str(workspace_id) if workspace_id is not None else "default"
     removed = 0
@@ -4156,6 +4406,17 @@ def cleanup_workspace(workspace_id, docker_client):
     except Exception:
         containers = []
     for container in containers:
+        was_running = False
+        try:
+            state = (getattr(container, "attrs", None) or {}).get("State") or {}
+            was_running = bool(state.get("Running")) or state.get("Status") == "running"
+        except Exception:
+            was_running = False
+        if not was_running:
+            try:
+                was_running = getattr(container, "status", None) == "running"
+            except Exception:
+                was_running = False
         try:
             container.stop(timeout=5)
         except Exception:
@@ -4164,9 +4425,16 @@ def cleanup_workspace(workspace_id, docker_client):
             # force=True: a stuck/still-running container must not leave
             # the counter at 0 (plain remove() raises on running containers).
             container.remove(force=True)
-            removed += 1
         except Exception:
-            pass
+            continue
+        removed += 1
+        if was_running:
+            log("WARNING", "docker.container_manager",
+                f"cleanup_workspace force-removed RUNNING container "
+                f"{getattr(container, 'name', None)!r} "
+                f"(id={getattr(container, 'id', None)!r}) for workspace {wid!r}")
+        _reap_bound_record(wid, container)
+        _emit_container_removed(wid, None, container, reason="workspace_cleanup")
     _audit("CONTAINER_CLEANUP", f"workspace={wid} count={removed}")
     return {"removed": removed}
 

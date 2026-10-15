@@ -25,12 +25,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL
+
 from . import storage
 from .lifecycle_policy import is_resource_like
 from .models import (
     ContainerRecordError,
     EVENT_ENTRY_KEYS,
     INTENT_SNAPSHOT_KEYS,
+    LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     SCHEMA_FIELD_NAMES,
@@ -69,6 +72,8 @@ def lifecycle_class_from_labels(
       ``tm-resource-git`` image) is :data:`LIFECYCLE_RESOURCE`;
     * a container carrying :data:`RECORD_LABEL_KEY` whose record declares a
       non-empty ``lifecycle_class`` takes that class;
+    * a free-use container (``CONTAINER_TYPE_LABEL == CONTAINER_TYPE_FREE_USE``)
+      is :data:`LIFECYCLE_EPHEMERAL`;
     * anything else is :data:`LIFECYCLE_PERSISTENT`.
 
     ``lookup`` overrides the record resolver (defaults to
@@ -91,6 +96,13 @@ def lifecycle_class_from_labels(
             cls = getattr(record, "lifecycle_class", "") or ""
             if cls:
                 return cls
+    container_type = (
+        str(labels.get(CONTAINER_TYPE_LABEL) or "").strip().lower()
+        if isinstance(labels, Mapping)
+        else ""
+    )
+    if container_type == CONTAINER_TYPE_FREE_USE:
+        return LIFECYCLE_EPHEMERAL
     return LIFECYCLE_PERSISTENT
 
 
