@@ -123,8 +123,8 @@ def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
         working_dir=str(repo),
         workspace_path=str(workspace),
         workspace_id=HOST_TEST_WS,
-        session_permissions={"git": "write"},  # explicit perms: required for the host sandbox guard (an unresolved session fails closed)
-        effective_permissions={"git": "write"},  # effective grant: the git gate is governed solely by effective_permissions
+        session_permissions={"git": "write", "filesystem": "write"},  # explicit perms: required for the host sandbox guard (an unresolved session fails closed)
+        effective_permissions={"git": "write", "filesystem": "write"},  # effective grant: the git + filesystem gates are governed solely by effective_permissions
     )
 
 
@@ -270,7 +270,7 @@ FULL_PERMISSIONS = {
     "git": "write",
     "container": False,
     "network": "banned",
-    "filesystem": "read",
+    "filesystem": "write",
     "system": "read",
     "execution": "banned",
 }

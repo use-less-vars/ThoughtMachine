@@ -52,7 +52,7 @@ FULL_PERMISSIONS = {
     "git": "write",
     "container": False,
     "network": "outbound",
-    "filesystem": "read",
+    "filesystem": "write",
     "system": "read",
     "execution": "banned",
     "mcp": "banned",
