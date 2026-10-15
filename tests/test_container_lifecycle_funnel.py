@@ -60,6 +60,9 @@ class FakeContainer:
     def remove(self, force=False):
         self.remove_calls.append({"force": force})
 
+    def reload(self):
+        return self
+
 
 class ExplodingContainer:
     """Container whose attrs/labels read raises -- forces the fail-closed path."""
@@ -336,6 +339,69 @@ def test_apply_swallows_lifecycle_errors():
         container, None, ContainerIntent(kind="reap", explicit=True)
     )
     assert decision.action == "reap"
+
+
+# ---------------------------------------------------------------------------
+# (g)+(h) the integrity entry points are READ-ONLY (never mutate the container)
+# ---------------------------------------------------------------------------
+def _patch_verify(monkeypatch, container):
+    """Wire ``verify_container_integrity`` to see exactly one container.
+
+    Patches ``docker.from_env`` to a mock client whose ``containers.get``
+    returns *container*, forces the workspace-id lookup to miss (so the legacy
+    name lookup is used), and pins the desired envelope to the locked-down
+    ``(none, ro)`` so ``container`` (bridge/ro) is a mismatch.
+    """
+    from unittest.mock import MagicMock
+
+    import docker_executor
+
+    client = MagicMock()
+    client.containers.get.return_value = container
+
+    monkeypatch.setattr("docker.from_env", lambda: client)
+    monkeypatch.setattr(
+        docker_executor, "_resolve_workspace_id", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        docker_executor,
+        "_resolve_container_config_via_gate",
+        lambda *_a, **_k: ("none", "ro"),
+    )
+    return client
+
+
+def test_get_integrity_status_mismatch_is_read_only(monkeypatch):
+    """(g) ``get_integrity_status`` reports a mismatch without touching the
+    container -- a refused mismatch maps to ``status == "mismatch"``."""
+    from docker_executor import get_integrity_status
+
+    container = FakeContainer(network_mode="bridge", mount_mode="ro")
+    _patch_verify(monkeypatch, container)
+
+    result = get_integrity_status("/tmp/workspace", None)
+
+    assert result["status"] == "mismatch"
+    assert container.stop_calls == []
+    assert container.remove_calls == []
+
+
+def test_verify_container_integrity_field_repro_leaves_container_intact(monkeypatch):
+    """(h) Field repro: ``verify_container_integrity`` with
+    ``session_permissions=None`` on a permissions-drifted container REFUSES
+    (action_taken ``"refused"``) and leaves it running -- no stop/remove."""
+    from docker_executor import verify_container_integrity
+
+    container = FakeContainer(network_mode="bridge", mount_mode="ro")
+    _patch_verify(monkeypatch, container)
+
+    result = verify_container_integrity("/tmp/workspace", None)
+
+    assert result["action_taken"] == "refused"
+    assert result["matches_config"] is False
+    assert result["container_exists"] is True
+    assert container.stop_calls == []
+    assert container.remove_calls == []
 
 
 if __name__ == "__main__":  # pragma: no cover

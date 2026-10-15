@@ -410,7 +410,7 @@ def verify_container_integrity(
             - matches_config (bool | None): None if no container
             - desired (dict): {"network": ..., "mode": ...}
             - actual (dict | None): {"network": ..., "mode": ...}
-            - action_taken (str): "none", "removed", or "error"
+            - action_taken (str): "none", "removed", "refused", or "error"
             - mismatch_reason (str | None)
     """
     workspace_path = normalize_workspace_path(workspace_path)
@@ -511,47 +511,77 @@ def verify_container_integrity(
             "mismatch_reason": None,
         }
 
-    # Mismatch — log warning, stop, and remove
+    # Mismatch — the lifecycle funnel is the single arbiter of whether the
+    # container may be destroyed.  ``reconcile`` is READ-ONLY (it never stops
+    # or removes anything); it may return "refuse" (the safe default for a
+    # permissions-tightening drift) or "reap" (an explicit destroy is allowed).
     mismatch_reason = (
         f"network={actual_network}->{desired_network}, "
         f"mode={actual_mode}->{desired_mode}"
     )
-    log("WARNING", "docker.verify_integrity",
-        f"Container {container.id[:12]} config mismatch — removing",
-        {"container_name": container_name,
-         "actual_network": actual_network, "desired_network": desired_network,
-         "actual_mode": actual_mode, "desired_mode": desired_mode})
 
-    audit_event("VERIFY_RECREATE",
-               f"workspace={workspace_path} container={container.id[:12]} "
-               f"network={actual_network}->{desired_network} "
-               f"mode={actual_mode}->{desired_mode}")
+    from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+    decision = ContainerLifecycle.reconcile(
+        container,
+        session_permissions,
+        ContainerIntent(
+            kind="use",
+            desired_network=desired_network,
+            desired_workspace_mode=desired_mode,
+            workspace_owned=True,
+            reason="verify_integrity_mismatch",
+            workspace_id=workspace_id,
+        ),
+    )
 
-    try:
-        container.stop(timeout=5)
-        container.remove()
-    except Exception as exc:
-        log("ERROR", "docker.verify_integrity",
-            f"Failed to remove mismatched container: {exc}")
-        return {
-            "container_exists": True,
-            "container_name": container_name,
-            "matches_config": False,
-            "desired": {"network": desired_network, "mode": desired_mode},
-            "actual": {"network": actual_network, "mode": actual_mode},
-            "action_taken": "error",
-            "mismatch_reason": mismatch_reason,
-        }
+    action_taken = "none"
+    if decision.destroys:
+        log("WARNING", "docker.verify_integrity",
+            f"Container {container.id[:12]} config mismatch — removing",
+            {"container_name": container_name,
+             "actual_network": actual_network, "desired_network": desired_network,
+             "actual_mode": actual_mode, "desired_mode": desired_mode})
 
-    try:
-        from infra.container_manager import (
-            _reap_bound_record as _cm_reap_bound_record,
-            _emit_container_removed as _cm_emit_container_removed,
-        )
-        _cm_reap_bound_record(workspace_id, container)
-        _cm_emit_container_removed(workspace_id, None, container, reason="removed")
-    except Exception:
-        pass
+        audit_event("VERIFY_RECREATE",
+                   f"workspace={workspace_path} container={container.id[:12]} "
+                   f"network={actual_network}->{desired_network} "
+                   f"mode={actual_mode}->{desired_mode}")
+
+        try:
+            container.stop(timeout=5)
+            container.remove()
+        except Exception as exc:
+            log("ERROR", "docker.verify_integrity",
+                f"Failed to remove mismatched container: {exc}")
+            return {
+                "container_exists": True,
+                "container_name": container_name,
+                "matches_config": False,
+                "desired": {"network": desired_network, "mode": desired_mode},
+                "actual": {"network": actual_network, "mode": actual_mode},
+                "action_taken": "error",
+                "mismatch_reason": mismatch_reason,
+            }
+
+        try:
+            from infra.container_manager import (
+                _reap_bound_record as _cm_reap_bound_record,
+                _emit_container_removed as _cm_emit_container_removed,
+            )
+            _cm_reap_bound_record(workspace_id, container)
+            _cm_emit_container_removed(workspace_id, None, container, reason="removed")
+        except Exception:
+            pass
+
+        action_taken = "removed"
+    elif decision.action == "refuse":
+        log("WARNING", "docker.verify_integrity",
+            f"Container {container.id[:12]} config mismatch — refused "
+            f"(container left intact): {decision.reason}",
+            {"container_name": container_name,
+             "actual_network": actual_network, "desired_network": desired_network,
+             "actual_mode": actual_mode, "desired_mode": desired_mode})
+        action_taken = "refused"
 
     return {
         "container_exists": True,
@@ -559,7 +589,7 @@ def verify_container_integrity(
         "matches_config": False,
         "desired": {"network": desired_network, "mode": desired_mode},
         "actual": {"network": actual_network, "mode": actual_mode},
-        "action_taken": "removed",
+        "action_taken": action_taken,
         "mismatch_reason": mismatch_reason,
     }
 
@@ -1444,12 +1474,14 @@ def get_integrity_status(
     frontend API.  The returned dict always includes at least:
 
     - **status** -- ``"ok"``, ``"mismatch"``, ``"removed"``, or ``"error"``
+      (a refused mismatch reports ``"mismatch"``)
     - **container_name** -- the expected container name (str)
     - **desired** -- ``{"network": ..., "mode": ...}``
     - **actual** -- ``{"network": ..., "mode": ...}`` or ``None`` if not found
 
     When a mismatch was detected and the container was removed, ``status``
-    is ``"removed"`` and ``mismatch_reason`` explains why.
+    is ``"removed"`` and ``mismatch_reason`` explains why.  When the mismatch
+    was refused (the container was left intact), ``status`` is ``"mismatch"``.
 
     Args:
         workspace_path: Absolute path to the workspace.
@@ -1465,6 +1497,7 @@ def get_integrity_status(
     action_map = {
         "none": "ok" if result.get("matches_config") in (True, None) else "mismatch",
         "removed": "removed",
+        "refused": "mismatch",
         "error": "error",
     }
     return {
