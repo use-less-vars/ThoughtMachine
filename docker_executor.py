@@ -683,6 +683,7 @@ class DockerExecutor:
             pass
 
     def _ensure_container(self):
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
         # Ensure the Docker image exists
         self._ensure_image()
 
@@ -774,6 +775,37 @@ class DockerExecutor:
             )
 
             if config_mismatch:
+                # ── Name-matched drift is routed through the lifecycle funnel.
+                # A workspace-owned container is only replaced when the funnel
+                # says the intent destroys it; otherwise it is kept and used.
+                intent = ContainerIntent(
+                    kind="use",
+                    explicit=False,
+                    workspace_owned=True,
+                    reason="ensure_drift_config",
+                    desired_network=network_mode,
+                    desired_workspace_mode=workspace_mode,
+                    workspace_id=self.workspace_id,
+                    session_id=getattr(self, "session_id", None),
+                )
+                decision = ContainerLifecycle.reconcile(
+                    existing, self.session_permissions, intent
+                )
+                if not decision.destroys:
+                    log("WARNING", "tools.docker_executor.container",
+                        "Drifted container config refused (not recreating)",
+                        {"container_id": existing.id[:12],
+                         "current_network": current_network, "desired_network": network_mode,
+                         "current_mode": current_workspace_mode, "desired_mode": workspace_mode})
+                    audit_event("CONTAINER_DRIFT_REFUSED",
+                               f"workspace={self.workspace_path} container={existing.id[:12]} "
+                               f"network={current_network}->{network_mode} "
+                               f"mode={current_workspace_mode}->{workspace_mode} "
+                               f"reason={decision.reason}")
+                    self.container = existing
+                    self.last_used = time.time()
+                    return {"status": "refused", "reason": decision.reason,
+                            "container": existing.id}
                 log("INFO", "tools.docker_executor.container",
                     "Container config mismatch, recreating",
                     {"container_id": existing.id[:12],
@@ -1016,14 +1048,31 @@ class DockerExecutor:
             return "", str(e), -1
 
     def close(self):
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
         # Safely check if container attribute exists and is not None
         if hasattr(self, 'container') and self.container:
-            try:
-                self.container.stop()
-                self.container.remove()
-            except docker.errors.NotFound:
-                pass
-            self.container = None
+            decision = ContainerLifecycle.reconcile(
+                self.container,
+                self.session_permissions,
+                ContainerIntent(
+                    kind="reap",
+                    explicit=True,
+                    reason="executor_close",
+                    workspace_id=self.workspace_id,
+                    session_id=getattr(self, "session_id", None),
+                ),
+            )
+            if decision.destroys:
+                try:
+                    self.container.stop()
+                    self.container.remove()
+                except docker.errors.NotFound:
+                    pass
+                self.container = None
+            else:
+                log("WARNING", "tools.docker_executor.container",
+                    "Refusing to destroy container on close",
+                    {"container_id": self.container.id[:12], "reason": decision.reason})
 
     def _exec_with_timeout(self, command, timeout=30, workdir="/workspace", environment=None):
         """Execute command with timeout support using threading."""
@@ -1282,10 +1331,22 @@ def _remove_container_by_workspace(workspace_path: str) -> None:
     try:
         client = docker.from_env()
         container = client.containers.get(container_name)
-        container.stop()
-        container.remove()
-        log("INFO", "tools.docker_executor.rebuild",
-            f"Removed old container {container_name} after rebuild")
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+        decision = ContainerLifecycle.reconcile(
+            container,
+            None,
+            ContainerIntent(
+                kind="reap",
+                explicit=True,
+                reason="remove_container_by_workspace",
+                workspace_id=workspace_id,
+            ),
+        )
+        if decision.destroys:
+            container.stop()
+            container.remove()
+            log("INFO", "tools.docker_executor.rebuild",
+                f"Removed old container {container_name} after rebuild")
     except docker.errors.NotFound:
         pass  # container didn't exist — nothing to do
     except docker.errors.DockerException as exc:

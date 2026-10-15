@@ -49,18 +49,92 @@ def mock_container() -> MagicMock:
 
 @pytest.fixture
 def mock_docker(mock_container: MagicMock) -> MagicMock:
-    """Mock ``docker.from_env()`` returning a client that yields ``mock_container``.
+    """Mock ``docker.from_env()`` returning a *name-aware* daemon client.
+
+    Production keys persistent containers by their canonical envelope name
+    (:func:`build_container_name`): ``containers.get(name)`` resolves a
+    container ONLY when that exact envelope already exists (otherwise it
+    raises ``docker.errors.NotFound``); ``containers.run(name=...)`` creates a
+    container under that name; ``container.remove()`` deletes it from the
+    daemon.  The fake mirrors that daemon contract so ``_ensure_container``
+    exercises its real name-match / drift / create branches instead of finding
+    (and refusing to replace) ``mock_container`` under *every* name.
 
     ``images.get`` returns an image whose ``thoughtmachine.build_hash`` label
     matches the CURRENT executor build sources, so ``_ensure_image`` reuses it
     instead of triggering a drift rebuild (which would need a real vault
     Dockerfile).
     """
-    from docker_executor import EXECUTOR_BUILD_HASH_LABEL, compute_executor_build_hash
+    import docker as _docker
+
+    from docker_executor import (
+        EXECUTOR_BUILD_HASH_LABEL,
+        LIFECYCLE_PERSISTENT,
+        build_container_name,
+        compute_executor_build_hash,
+    )
+
+    workspace_path = "/tmp/test-workspace"
+    # Names created via ``containers.run(name=...)`` (plus the single envelope
+    # the live ``mock_container.attrs`` already occupies) are the only
+    # resolvable ones: the daemon cannot return a container for a name it does
+    # not hold.
+    registry: dict[str, MagicMock] = {}
+    mock_container._removed = False
+
+    def _envelope_name() -> str:
+        """Canonical name of the envelope the live ``mock_container`` occupies."""
+        network = mock_container.attrs["HostConfig"]["NetworkMode"]
+        mode = "ro"
+        for m in mock_container.attrs.get("Mounts", []):
+            if m.get("Destination") == "/workspace":
+                mode = m.get("Mode", "ro")
+                break
+        return build_container_name(
+            workspace_path,
+            LIFECYCLE_PERSISTENT,
+            network_mode=network,
+            workspace_mode=mode,
+        )
+
+    def _get(name: str) -> MagicMock:
+        # A removed container is gone from the daemon; any name it does not
+        # currently hold is a NotFound, exactly like the docker daemon.
+        if not mock_container._removed and (
+            name == _envelope_name() or name in registry
+        ):
+            return mock_container
+        raise _docker.errors.NotFound(f"No such container: {name}")
+
+    def _run(*args: object, **kwargs: object) -> MagicMock:
+        name = kwargs.get("name")
+        if name:
+            # ``run`` creates the container under ``name``; record the created
+            # config on the (reused) mock object so later name lookups and
+            # drift checks observe the live envelope.
+            registry[name] = mock_container
+            mock_container._removed = False
+            network = kwargs.get("network_mode")
+            if network is not None:
+                mock_container.attrs["HostConfig"]["NetworkMode"] = network
+            for m in kwargs.get("mounts") or []:  # docker.types.Mount is a dict
+                if m.get("Target") == "/workspace":
+                    mock_container.attrs["Mounts"] = [
+                        {
+                            "Destination": "/workspace",
+                            "Mode": "ro" if m.get("ReadOnly") else "rw",
+                            "Type": "bind",
+                        }
+                    ]
+                    break
+        return mock_container
 
     client = MagicMock()
-    client.containers.get.return_value = mock_container
-    client.containers.run.return_value = mock_container
+    client.containers.get.side_effect = _get
+    client.containers.run.side_effect = _run
+    mock_container.remove.side_effect = (
+        lambda *a, **k: setattr(mock_container, "_removed", True)
+    )
     img = MagicMock()
     img.labels = {EXECUTOR_BUILD_HASH_LABEL: compute_executor_build_hash()}
     client.images.get.return_value = img
