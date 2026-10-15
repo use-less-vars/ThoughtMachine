@@ -68,7 +68,7 @@ pytestmark = pytest.mark.skipif(
 # Seeded into BOTH ``session_permissions`` and ``effective_permissions`` (see
 # ``_tool()``) because the ToolExecutor injects BOTH -- the raw session profile
 # AND the session x ceiling view -- as distinct objects on every real call.
-_WRITE_GRANT = {"git": "write"}
+_WRITE_GRANT = {"git": "write", "filesystem": "write"}
 # Throwaway vault workspace id the tool is bound to.
 _WORKSPACE_ID = "wstest"
 

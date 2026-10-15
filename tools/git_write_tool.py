@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import Field
 from .git_info_tool import GitReadTool, resolve_git_execution_mode
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
+from security.gate_helpers import _value_satisfies
 
 logger = logging.getLogger(__name__)
 
@@ -76,13 +77,15 @@ class GitWriteTool(GitReadTool):
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
         """Return dynamic permission categories based on the git operation.
-        Every write operation requires ``git:write``; ``clone`` additionally
-        needs network egress to reach the remote.
+        Every write operation requires ``git:write`` and ``filesystem:write``
+        (a git write mutates the working tree); ``clone`` additionally needs
+        network egress to reach the remote.
         """
         if params:
             op = params.get("operation", "")
             if op == "clone":
-                return ["git:write", "network:outbound"]
+                return ["git:write", "filesystem:write", "network:outbound"]
+            return ["git:write", "filesystem:write"]
         return ["git:write"]
 
     tool: Literal["GitWriteTool"] = "GitWriteTool"
@@ -186,6 +189,32 @@ class GitWriteTool(GitReadTool):
                 return False
         return False
 
+    def _filesystem_write_allowed(self) -> bool:
+        """Fail-closed check that this write call carries a write-capable
+        effective ``filesystem`` grain.
+
+        A git write mutates the working tree, so it additionally requires an
+        effective ``filesystem`` grant of ``write`` / ``full`` (or ``ask``,
+        which the outer ToolExecutor gate already prompted and approved).
+        The gate is governed SOLELY by ``effective_permissions``; a missing,
+        ``read`` or ``banned`` filesystem grant fails closed.
+        """
+        effective = self.effective_permissions or {}
+        fs = effective.get("filesystem")
+        result = _value_satisfies("write", fs)
+        return result is True or result == "ASK"
+
+    def _filesystem_grain_gate_error(self) -> str:
+        """Return the filesystem-grain denial message, naming the missing
+        grain (``filesystem:write``) and the session's actual grain."""
+        effective = self.effective_permissions or {}
+        fs = effective.get("filesystem")
+        label = "none" if fs is None else str(fs).lower()
+        return (
+            f"Error: git:write requires filesystem:write; "
+            f"this session has filesystem:{label}"
+        )
+
     def execute(self) -> str:
         # Reset per-call runtime state (tool instances may be reused).
         self._resource_manager = None
@@ -202,6 +231,14 @@ class GitWriteTool(GitReadTool):
         # defense-in-depth for direct callers.
         if not self._git_write_allowed():
             return self._flag_gate_error()
+
+        # Filesystem grain binding (fail closed): a git write mutates the
+        # working tree, so it additionally requires a write-capable effective
+        # ``filesystem`` grain. This is an ADDITIONAL gate on top of the git
+        # check above; it is enforced in execute() only (the _git_* methods
+        # keep their git-only defense-in-depth gate for direct callers).
+        if not self._filesystem_write_allowed():
+            return self._filesystem_grain_gate_error()
 
         # Atomic permission re-check for network operations. An 'ask' level
         # is NOT re-checked here: it defers to the ToolExecutor's outer gate,

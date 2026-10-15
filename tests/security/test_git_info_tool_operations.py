@@ -128,12 +128,17 @@ def _tool(tmp_path, **params):
     Write operations require the session git permission, so it is set
     by default unless the caller overrides agent_config explicitly. The
     resolved session/effective permission grains are also defaulted to
-    git:"write" (satisfying git:read and git:write) unless the caller
-    supplies them, reproducing the fully-allowed behaviour.
+    git:"write" and filesystem:"write" (satisfying git:read/git:write and the
+    filesystem:write grain a git write now additionally requires) unless the
+    caller supplies them, reproducing the fully-allowed behaviour.
     """
     params.setdefault("agent_config", {"session_permissions": {"git": "write"}})
-    params.setdefault("session_permissions", {"git": "write"})
-    params.setdefault("effective_permissions", {"git": "write"})
+    params.setdefault(
+        "session_permissions", {"git": "write", "filesystem": "write"}
+    )
+    params.setdefault(
+        "effective_permissions", {"git": "write", "filesystem": "write"}
+    )
     tool = GitWriteTool(**params)
     object.__setattr__(tool, "workspace_path", str(tmp_path))
     return tool
@@ -834,10 +839,17 @@ class TestNoRawFlagsExposed:
 
     def test_write_categories_required(self):
         for op in ("branch_create", "checkout", "stage", "unstage", "commit"):
-            assert GitWriteTool.get_required_categories({"operation": op}) == ["git:write"]
+            assert GitWriteTool.get_required_categories({"operation": op}) == [
+                "git:write", "filesystem:write",
+            ]
+        # ``stage``/``unstage`` also span the remaining write operations.
+        for op in ("worktree_add", "worktree_remove", "stash_push", "stash_pop", "init"):
+            assert GitWriteTool.get_required_categories({"operation": op}) == [
+                "git:write", "filesystem:write",
+            ]
         assert GitWriteTool.get_required_categories(
             {"operation": "clone"}
-        ) == ["git:write", "network:outbound"]
+        ) == ["git:write", "filesystem:write", "network:outbound"]
         assert GitInfoTool.get_required_categories(
             {"operation": "diff_cached"}
         ) == ["git:read"]

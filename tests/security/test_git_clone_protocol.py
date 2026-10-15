@@ -84,6 +84,7 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
             clone_url=clone_url,
             effective_permissions={
                 "git": "write",
+                "filesystem": "write",
                 "network": network_level,
             },
         )
