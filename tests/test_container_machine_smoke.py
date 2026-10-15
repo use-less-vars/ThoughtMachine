@@ -220,7 +220,13 @@ def test_g1_resolve_container_config_fail_closed():
 # ── G2: admit is narrow-only, vocabulary closed ─────────────────────────────
 
 
-def test_g2_admit_is_narrow_only():
+def test_g2_admit_is_narrow_only(monkeypatch):
+    # The admission gate resolves the disk (vault) envelope; pin the seam to the
+    # intended WRITE grant so the derived policy is bridge (the in-memory mirror).
+    monkeypatch.setattr(
+        "security.security_gate._read_disk_permission_sources",
+        lambda workspace_id, session_id: (dict(WRITE_PERMS), None),
+    )
     probes = FakeProbes()
 
     # Every verdict is a member of the closed decision algebra; a Deny's code
@@ -273,7 +279,11 @@ def test_g2_admit_is_narrow_only():
 # ── G3: container limit is 6 (count==6 denies, <6 allows, None denies) ───────
 
 
-def test_g3_container_limit_is_six():
+def test_g3_container_limit_is_six(monkeypatch):
+    monkeypatch.setattr(
+        "security.security_gate._read_disk_permission_sources",
+        lambda workspace_id, session_id: (dict(WRITE_PERMS), None),
+    )
     allow_spec = _spec(network_mode="bridge")
 
     at_limit = admit(_request(spec=allow_spec), probes=FakeProbes(count=6))

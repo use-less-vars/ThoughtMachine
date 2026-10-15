@@ -39,6 +39,19 @@ def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="default"):
     ensure_workspace_dirs(workspace_id)
 
 
+def _grant_disk_container(monkeypatch, grants=None):
+    """Wave 9a-0b: build_image's container-grant gate reads the session grants
+    from the vault permission store (disk is the source of truth), so stub that
+    read to grant a container envelope (ceiling ``None`` == no workspace cap)."""
+    import security.security_gate as _sg
+    _grants = {"container": True} if grants is None else dict(grants)
+    monkeypatch.setattr(
+        _sg,
+        "_read_disk_permission_sources",
+        lambda workspace_id, session_id: (_grants, None),
+    )
+
+
 def _real_manager(tmp_path):
     """A real ``ContainerManager`` (skipping ``docker.from_env()``) with a valid
     vault Dockerfile + requirements so ``build_image`` reaches the build call."""
@@ -80,6 +93,7 @@ class TestContainerBuildToolNocache:
 
     def test_t1_nocache_true_reaches_run_image_build(self, tmp_path, monkeypatch):
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         manager = _real_manager(tmp_path)
         captured = {}
         with patch("infra.container_manager._load_docker_executor") as mock_load, \
@@ -101,6 +115,7 @@ class TestContainerBuildToolNocache:
 
     def test_t2_nocache_false_is_unchanged(self, tmp_path, monkeypatch):
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         manager = _real_manager(tmp_path)
         captured = {}
         with patch("infra.container_manager._load_docker_executor") as mock_load, \
@@ -132,6 +147,7 @@ class TestBuildImageNocacheDefault:
 
     def test_t3_manager_default_forwarded_as_false(self, tmp_path, monkeypatch):
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         manager = _real_manager(tmp_path)
         captured = {}
         with patch("infra.container_manager._load_docker_executor") as mock_load:

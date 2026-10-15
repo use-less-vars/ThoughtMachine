@@ -39,6 +39,19 @@ def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="default"):
     ensure_workspace_dirs(workspace_id)
 
 
+def _grant_disk_container(monkeypatch, grants=None):
+    """Wave 9a-0b: build_image's container-grant gate reads the session grants
+    from the vault permission store (disk is the source of truth), so stub that
+    read to grant a container envelope (ceiling ``None`` == no workspace cap)."""
+    import security.security_gate as _sg
+    _grants = {"container": True} if grants is None else dict(grants)
+    monkeypatch.setattr(
+        _sg,
+        "_read_disk_permission_sources",
+        lambda workspace_id, session_id: (_grants, None),
+    )
+
+
 class TestBuildImageRequiresVaultRequirements:
     """Vault-only requirements resolution for ``ContainerManager.build_image``."""
 
@@ -78,6 +91,7 @@ class TestBuildImageRequiresVaultRequirements:
     def test_vault_requirements_present_stages_vault_bytes(self, tmp_path, monkeypatch):
         """A: vault requirements present -> staged bytes == vault bytes."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         vault_root = tmp_path / "vault"
         vault_ws = vault_root / "workspaces" / "ws-1"
         vault_ws.mkdir(parents=True)
@@ -138,6 +152,7 @@ class TestBuildImageRequiresVaultRequirements:
     def test_both_present_stages_vault_not_workspace(self, tmp_path, monkeypatch):
         """C: both present -> staged bytes are the VAULT bytes (no fallback)."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         vault_root = tmp_path / "vault"
         vault_ws = vault_root / "workspaces" / "ws-1"
         vault_ws.mkdir(parents=True)

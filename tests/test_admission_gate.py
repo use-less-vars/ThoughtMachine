@@ -117,6 +117,23 @@ def make_request(spec=None, permissions=WRITE_PERMS, capabilities=PERMISSIVE,
     )
 
 
+def _pin_disk_seam(monkeypatch, grants=WRITE_PERMS):
+    """Pin the ``use_disk=True`` vault read to the in-memory session grants.
+
+    ``admit`` resolves the container envelope with ``use_disk=True`` (the vault
+    permission store is the source of truth).  This hermetic suite has no vault,
+    so the disk seam is stubbed to return the SAME grants the request carries in
+    memory plus a ``None`` (uncapped) workspace ceiling -- reproducing exactly
+    the pure in-memory merge these tests describe.  No real disk/vault is read.
+    """
+    import security.security_gate as sg
+
+    def _read(workspace_id, session_id):
+        return (dict(grants), None)
+
+    monkeypatch.setattr(sg, "_read_disk_permission_sources", _read)
+
+
 # ─═ Vocabulary ══════════════════════════════════════════════════════════════
 def test_reason_codes_are_exactly_the_thirteen():
     assert REASON_CODES == frozenset(
@@ -140,7 +157,8 @@ def test_reason_codes_are_exactly_the_thirteen():
 
 
 # ─═ Happy path ══════════════════════════════════════════════════════════════
-def test_allow_happy_path():
+def test_allow_happy_path(monkeypatch):
+    _pin_disk_seam(monkeypatch)
     # Permissive caps + a network:write session -> derived network "bridge",
     # which matches the proposed "bridge": no transform, no notes.
     spec = make_spec(network_mode="bridge", image="agent-executor")
@@ -150,7 +168,8 @@ def test_allow_happy_path():
     assert decision.notes == ()
 
 
-def test_allow_with_disk_warning_note():
+def test_allow_with_disk_warning_note(monkeypatch):
+    _pin_disk_seam(monkeypatch)
     # free 5 GiB trips the advisory tier (below 10 GiB) but not the deny tier.
     spec = make_spec(network_mode="bridge")
     decision = admit(make_request(spec=spec), probes=FakeProbes(free=5 * GiB))
@@ -159,7 +178,8 @@ def test_allow_with_disk_warning_note():
 
 
 # ─═ Image allowlist: tag/registry normalisation ═════════════════════════════
-def test_admit_accepts_tagged_allowlisted_image():
+def test_admit_accepts_tagged_allowlisted_image(monkeypatch):
+    _pin_disk_seam(monkeypatch)
     # Regression: a ':tag' suffix must not defeat the image allowlist.
     spec = make_spec(network_mode="bridge", image="agent-executor:latest")
     decision = admit(make_request(spec=spec), probes=FakeProbes(count=0))
@@ -175,7 +195,8 @@ def test_admit_rejects_similar_prefix_imposter(image):
     assert decision.code == REASON_IMAGE_NOT_ALLOWED
 
 
-def test_admit_accepts_registry_qualified_allowlisted_image():
+def test_admit_accepts_registry_qualified_allowlisted_image(monkeypatch):
+    _pin_disk_seam(monkeypatch)
     # Regression: a registry/path prefix must not defeat the image allowlist.
     spec = make_spec(
         network_mode="bridge",
@@ -278,7 +299,9 @@ def test_admit_accepts_registry_qualified_allowlisted_image():
         ),
     ],
 )
-def test_reason_code_scenarios(name, req, probes, expected_kind, expected_code):
+def test_reason_code_scenarios(name, req, probes, expected_kind, expected_code,
+                            monkeypatch):
+    _pin_disk_seam(monkeypatch)
     decision = admit(req, probes=probes)
     assert isinstance(decision, expected_kind), (name, decision)
     if isinstance(decision, (Deny, Transform)):
@@ -316,7 +339,8 @@ def test_all_reason_codes_have_a_scenario_or_fault_path():
 
 
 # ─═ Container-limit precedence ═════════════════════════════════════════════
-def test_session_config_limit_override():
+def test_session_config_limit_override(monkeypatch):
+    _pin_disk_seam(monkeypatch)
     spec = make_spec(network_mode="bridge")
     req = make_request(
         spec=spec,
@@ -517,6 +541,7 @@ def test_client_probes_excludes_ephemeral_and_resource(monkeypatch, tmp_path):
     probes = ag.ClientProbes(FakeDockerClient(items=containers, ping=lambda: True))
     assert probes.workspace_container_count("ws1") == 1
 
+    _pin_disk_seam(monkeypatch)
     req = make_request(
         spec=make_spec(network_mode="bridge", image="agent-executor"),
         session_config={"container_limits": {"max_containers": 2}},

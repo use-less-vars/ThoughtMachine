@@ -103,7 +103,7 @@ class TestSitesRouteThroughBuilder:
         forced_network, forced_mode = "bridge", "rw"
         monkeypatch.setattr(
             docker_executor, "_resolve_container_config_via_gate",
-            lambda workspace_id, perms: (forced_network, forced_mode),
+            lambda workspace_id, perms, session_id=None: (forced_network, forced_mode),
         )
         # Force the early "docker unavailable" return deterministically.
         monkeypatch.setattr("docker.from_env", lambda *a, **k: (_ for _ in ()).throw(
@@ -337,7 +337,7 @@ class TestRemainingSitesRouteThroughBuilder:
         forced_network, forced_mode = "bridge", "rw"
         monkeypatch.setattr(
             docker_executor, "_resolve_container_config_via_gate",
-            lambda workspace_id, perms: (forced_network, forced_mode),
+            lambda workspace_id, perms, session_id=None: (forced_network, forced_mode),
         )
         # Hermetic vault Dockerfile for the executor's workspace_id.
         monkeypatch.setenv("HOME", str(tmp_path))
@@ -372,7 +372,7 @@ class TestRemainingSitesRouteThroughBuilder:
         forced_network, forced_mode = "bridge", "rw"
         monkeypatch.setattr(
             docker_executor, "_resolve_container_config_via_gate",
-            lambda workspace_id, perms: (forced_network, forced_mode),
+            lambda workspace_id, perms, session_id=None: (forced_network, forced_mode),
         )
         monkeypatch.setattr(docker_executor, "_resolve_workspace_id",
                             lambda path: "ws-envelope-test")
@@ -392,7 +392,7 @@ class TestRemainingSitesRouteThroughBuilder:
         forced_network, forced_mode = "bridge", "rw"
         monkeypatch.setattr(
             docker_executor, "_resolve_container_config_via_gate",
-            lambda workspace_id, perms: (forced_network, forced_mode),
+            lambda workspace_id, perms, session_id=None: (forced_network, forced_mode),
         )
         monkeypatch.setattr(docker_executor, "_resolve_workspace_id",
                             lambda path: "ws-envelope-test")

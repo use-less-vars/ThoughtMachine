@@ -39,6 +39,19 @@ def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="test-ws"):
     ensure_workspace_dirs(workspace_id)
 
 
+def _grant_disk_container(monkeypatch, grants=None):
+    """Wave 9a-0b: build_image's container-grant gate reads the session grants
+    from the vault permission store (disk is the source of truth), so stub that
+    read to grant a container envelope (ceiling ``None`` == no workspace cap)."""
+    import security.security_gate as _sg
+    _grants = {"container": True} if grants is None else dict(grants)
+    monkeypatch.setattr(
+        _sg,
+        "_read_disk_permission_sources",
+        lambda workspace_id, session_id: (_grants, None),
+    )
+
+
 class TestRunImageBuildKwarg:
     def test_networkmode_is_passed(self):
         calls = []
@@ -110,6 +123,7 @@ class TestContainerManagerBuildResolvesNetwork:
 
     def test_banned_passes_none(self, tmp_path, monkeypatch):
         _seed_ws_capabilities(monkeypatch, tmp_path, "test-ws")
+        _grant_disk_container(monkeypatch)
         mgr = self._make_manager(tmp_path, {"network": "banned"})
         monkeypatch.setattr(
             dex, "_resolve_container_config_via_gate",
@@ -125,6 +139,7 @@ class TestContainerManagerBuildResolvesNetwork:
 
     def test_outbound_omits(self, tmp_path, monkeypatch):
         _seed_ws_capabilities(monkeypatch, tmp_path, "test-ws")
+        _grant_disk_container(monkeypatch, {"container": True, "network": "outbound"})
         mgr = self._make_manager(tmp_path, {"network": "outbound"})
         monkeypatch.setattr(
             dex, "_resolve_container_config_via_gate",

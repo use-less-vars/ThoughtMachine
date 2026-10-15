@@ -137,6 +137,19 @@ def _seed_ws_capabilities(monkeypatch, tmp_path, workspace_id="default"):
     ensure_workspace_dirs(workspace_id)
 
 
+def _grant_disk_container(monkeypatch, grants=None):
+    """Wave 9a-0b: build_image's container-grant gate reads the session grants
+    from the vault permission store (disk is the source of truth), so stub that
+    read to grant a container envelope (ceiling ``None`` == no workspace cap)."""
+    import security.security_gate as _sg
+    _grants = {"container": True} if grants is None else dict(grants)
+    monkeypatch.setattr(
+        _sg,
+        "_read_disk_permission_sources",
+        lambda workspace_id, session_id: (_grants, None),
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ContainerManager.list_containers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -355,6 +368,7 @@ class TestContainerManagerBuildImage:
     def test_build_success_with_auto_tag_and_exact_keys(self, tmp_path, monkeypatch):
         """Dockerfile present, tag omitted -> auto-tag; result has EXACT keys."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "default")
+        _grant_disk_container(monkeypatch)
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -404,6 +418,7 @@ class TestContainerManagerBuildImage:
     def test_vault_dockerfile_with_explicit_tag(self, tmp_path, monkeypatch):
         """Explicit tag + vault Dockerfile -> used as-is, auto-tag skipped."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "default")
+        _grant_disk_container(monkeypatch)
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -429,6 +444,7 @@ class TestContainerManagerBuildImage:
     def test_build_log_truncated_at_100kb(self, tmp_path, monkeypatch):
         """Build log > EXEC_OUTPUT_LIMIT_BYTES (100 KiB) -> truncated + notice."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "default")
+        _grant_disk_container(monkeypatch)
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -450,6 +466,7 @@ class TestContainerManagerBuildImage:
     def test_build_failure_raises_runtime_error(self, tmp_path, monkeypatch):
         """_run_image_build raising -> RuntimeError propagates unchanged."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "default")
+        _grant_disk_container(monkeypatch)
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
@@ -485,6 +502,7 @@ class TestContainerManagerBuildImage:
         of the build context.
         """
         _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
         vault_root = tmp_path / "vault"
         vault_ws = vault_root / "workspaces" / "ws-1"
         vault_ws.mkdir(parents=True)
@@ -533,6 +551,7 @@ class TestContainerManagerBuildImage:
     def test_build_image_tempdir_cleaned_up(self, tmp_path, monkeypatch):
         """Temporary build directory is removed after a successful build."""
         _seed_ws_capabilities(monkeypatch, tmp_path, "default")
+        _grant_disk_container(monkeypatch)
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         before = set(glob.glob(os.path.join(tempfile.gettempdir(), "tm_build_*")))
         mock_client = MagicMock()

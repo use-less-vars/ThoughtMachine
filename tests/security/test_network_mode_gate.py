@@ -61,9 +61,15 @@ class TestResolveNetworkModeMapping:
 
 class TestResolveContainerConfigFromPermissions:
     def test_outbound_via_gate_gives_bridge_rw(self):
+        # Disk-authoritative: the gate resolves from the on-disk envelope.  The
+        # seam is stubbed to the intended PERMIT grant so the allow path (not
+        # the in-memory mirror) is exercised.
         with patch(
             "security.security_gate.get_workspace_capabilities",
             return_value=PERMISSIVE_CAPS,
+        ), patch(
+            "security.security_gate._read_disk_permission_sources",
+            return_value=(PERMS_OUTBOUND, None),
         ):
             result = _resolve_container_config_via_gate(
                 "ws-1", PERMS_OUTBOUND
@@ -87,6 +93,9 @@ class TestResolveContainerConfigFromPermissions:
         with patch(
             "security.security_gate.get_workspace_capabilities",
             return_value=PERMISSIVE_CAPS,
+        ), patch(
+            "security.security_gate._read_disk_permission_sources",
+            return_value=(PERMS_BANNED, None),
         ):
             result = _resolve_container_config_via_gate(
                 "ws-1", PERMS_BANNED
@@ -134,9 +143,21 @@ class TestResolveContainerConfigSlice:
 
 class TestRegistryResolveNetworkMode:
     def test_outbound_bridge_and_banned_none(self):
+        # Disk-authoritative: each call resolves its own on-disk envelope, so
+        # the seam is stubbed per-call to the intended grant.
         with patch(
             "security.security_gate.get_workspace_capabilities",
             return_value=PERMISSIVE_CAPS,
+        ), patch(
+            "security.security_gate._read_disk_permission_sources",
+            return_value=({"network": "outbound"}, None),
         ):
             assert _resolve_network_mode_via_gate("ws-1", {"network": "outbound"}) == "bridge"
+        with patch(
+            "security.security_gate.get_workspace_capabilities",
+            return_value=PERMISSIVE_CAPS,
+        ), patch(
+            "security.security_gate._read_disk_permission_sources",
+            return_value=({"network": "banned"}, None),
+        ):
             assert _resolve_network_mode_via_gate("ws-1", {"network": "banned"}) == "none"

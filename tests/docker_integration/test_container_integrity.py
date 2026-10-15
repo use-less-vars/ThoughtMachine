@@ -138,6 +138,13 @@ class TestContainerMatches:
         ), patch(
             "security.security_gate.get_workspace_capabilities",
             return_value=permissive,
+        ), patch(
+            # Disk-authoritative gate: pin the vault seam to the intended
+            # permit grant so the desired config resolves to bridge/rw.
+            "security.security_gate._read_disk_permission_sources",
+            return_value=(
+                {"network": "write", "filesystem": "write"}, None,
+            ),
         ):
             result = verify_container_integrity("/tmp/workspace", perms)
 
