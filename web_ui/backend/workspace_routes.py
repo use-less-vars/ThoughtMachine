@@ -997,7 +997,15 @@ async def get_effective_permissions(
     try:
         from security.security_gate import get_effective_permissions as _gate_effective
 
-        effective = _gate_effective(session_perms, caps, ceiling)
+        # Supplying both ids engages the gate's DISK branch: the vault grants
+        # sidecar and the config.json ceiling become the authoritative sources,
+        # and any unreadable/empty source fails CLOSED to the deny-all
+        # sentinels (the supplied session_perms/ceiling are then ignored).
+        # With no session_id there is no grants path to read, so the gate keeps
+        # the legacy in-memory merge of session_perms against this ceiling.
+        effective = _gate_effective(
+            session_perms, caps, ceiling, session_id=session_id, workspace_id=ws_id
+        )
     except ImportError:
         # Fallback when security gate dependencies are not available
         # (e.g., in minimal test environments)
