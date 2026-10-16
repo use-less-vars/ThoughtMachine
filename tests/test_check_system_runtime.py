@@ -131,7 +131,7 @@ def test_runtime_state_returns_no_secrets(tmp_path):
     for key in (
         "token_limits",
         "worker_limits",
-        "container_status",
+        "session_sandbox_status",
         "effective_permission_levels",
         "allowlist_count",
         "vault_status",

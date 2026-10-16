@@ -179,6 +179,19 @@ def _canonical_permission_display(effective):
     return reported
 
 
+def _server_revision() -> str:
+    """Return the web-UI server revision (git HEAD), or "unknown".
+
+    Lazily imported so CheckSystem has no hard dependency on the web UI
+    package; the /health route surfaces the same value as ``revision``.
+    """
+    try:
+        from web_ui.backend.server import _SERVER_REVISION
+        return _SERVER_REVISION
+    except Exception:
+        return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Tool
 # ---------------------------------------------------------------------------
@@ -210,7 +223,7 @@ class CheckSystem(ToolBase):
                       "'vault_status' (vault drift vs schema manifest), "
                       "'vault_repair_status' (full read-only vault repair dry-run report), "
                       "'runtime_state' (redacted runtime snapshot — token limits, worker caps, "
-                      "container status, permissions, allowlist).",
+                      "session sandbox status, permissions, allowlist).",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -422,6 +435,11 @@ class CheckSystem(ToolBase):
         if DOCKER_EXECUTOR_AVAILABLE and _get_docker_status:
             try:
                 result = _get_docker_status(workspace_path=ws_path)
+                if isinstance(result, dict):
+                    # Alias the server revision under runtime_commit so the panel
+                    # can pin which runtime produced this status. Existing image
+                    # build-hash handling is left untouched.
+                    result.setdefault("runtime_commit", _server_revision())
                 return result
             except Exception as e:
                 return {"status": "error", "error": str(e)}
@@ -536,6 +554,19 @@ class CheckSystem(ToolBase):
         except ImportError:
             risk = {"level": "low", "error": "risk_model unavailable"}
 
+        # GATE-RESOLVED host_bash: the config-declared ``permissions`` above is
+        # the on-disk request, not the effective grant. Surface the effective
+        # (session x workspace) value; fail closed to "banned".
+        host_bash = "banned"
+        try:
+            eff = self._query_permissions(ws_id)
+            if isinstance(eff, dict):
+                host_bash = (eff.get("effective_permissions") or {}).get("host_bash", "banned")
+        except Exception:
+            host_bash = "banned"
+        if not host_bash:
+            host_bash = "banned"
+
         return {
             "workspace_id": ws_id,
             "capabilities": capabilities,
@@ -544,6 +575,7 @@ class CheckSystem(ToolBase):
             "mcp_tools": mcp_tools,
             "purpose": purpose,
             "permissions": permissions,
+            "host_bash": host_bash,
             "allow_host_resources": allow_host_resources,
             "risk": risk,
         }
@@ -1112,7 +1144,7 @@ class CheckSystem(ToolBase):
 
     def _query_runtime_state(self, ws_id: Optional[str], workspace_path: Optional[str] = None) -> dict:
         """Return a REDACTED runtime snapshot: token limits, worker caps,
-        container status, effective permission levels, allowlist, vault status.
+        session sandbox status, effective permission levels, allowlist, vault status.
 
         Never exposes api_key, raw_config or secret material; every sub-probe
         is best-effort and failures degrade to explicit status values.
@@ -1168,7 +1200,7 @@ class CheckSystem(ToolBase):
                 "status": "ok",
                 "token_limits": token_limits,
                 "worker_limits": worker_limits,
-                "container_status": container_status,
+                "session_sandbox_status": container_status,
                 "effective_permission_levels": effective_permission_levels,
                 "allowlist_count": allowlist_count,
                 "enabled_tools_count": enabled_tools_count,
