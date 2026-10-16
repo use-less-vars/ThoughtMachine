@@ -565,3 +565,6 @@ def test_container_remove_tool_is_surfaced_in_presets():
     # engineer mode stays container-tool free
     assert "ContainerRemoveTool" not in ENGINEER_TOOLS
 
+    assert "ContainerRestartTool" in _ALL_TOOLS
+    assert "ContainerRestartTool" in AGENT_TOOLS
+    assert "ContainerRestartTool" not in ENGINEER_TOOLS

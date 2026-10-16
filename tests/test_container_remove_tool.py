@@ -8,8 +8,11 @@ constructs a real ``ContainerManager``. Covers:
 - the stable tool identifier follows the sibling container-tool convention
   (the class name, since these tools do not override the ``name`` ClassVar)
 - ``execute()`` surfaces ``ContainerManager.remove()``'s dict verbatim as JSON
+- the per-lifecycle-class removal gate: ephemeral removes freely, persistent
+  requires the ``container: remove`` grain, resource is operator-only
+- idempotent NotFound -> "removed"
 - error results and RuntimeError failures are returned, never raised
-- ``container_id`` is required
+- ``container_id_or_name`` is required
 """
 
 import json
@@ -20,10 +23,21 @@ from pydantic import ValidationError
 
 from tools import TOOL_CLASSES
 from tools.container_control import ContainerRemoveTool
+import tools.container_control as container_control
 
 
 def _parse(result: str) -> dict:
     return json.loads(result)
+
+
+def _manager(lifecycle_class="ephemeral", remove_result=None):
+    """Build a MagicMock manager whose container classifies as given."""
+    manager = MagicMock()
+    manager.class_of.return_value = lifecycle_class
+    manager.client.containers.get.return_value = MagicMock()
+    if remove_result is not None:
+        manager.remove.return_value = remove_result
+    return manager
 
 
 class TestContainerRemoveToolRegistration:
@@ -38,39 +52,66 @@ class TestContainerRemoveToolRegistration:
         # name as the tool identifier; ContainerRemoveTool must match.
         assert ContainerRemoveTool.tool_name() == "ContainerRemoveTool"
         assert ContainerRemoveTool.model_fields["tool"].default == "ContainerRemoveTool"
-        assert ContainerRemoveTool(container_id="x").tool == "ContainerRemoveTool"
+        assert ContainerRemoveTool(container_id_or_name="x").tool == "ContainerRemoveTool"
+
+
+class TestContainerRemoveToolParameters:
+    def test_container_id_or_name_is_required(self):
+        with pytest.raises(ValidationError):
+            ContainerRemoveTool()
+
+    def test_workspace_id_defaults_to_none(self):
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
+        assert tool.workspace_id is None
+
+    def test_workspace_id_is_forwarded_to_make_manager(self):
+        manager = _manager(remove_result={"status": "removed", "name": "tm-x"})
+        tool = ContainerRemoveTool(container_id_or_name="abc123", workspace_id="ws-9")
+        with patch.object(
+            ContainerRemoveTool, "_make_manager", return_value=manager
+        ) as make_manager:
+            with patch.object(
+                ContainerRemoveTool,
+                "_session_permissions_map",
+                return_value={"container": "remove"},
+            ):
+                _parse(tool.execute())
+        make_manager.assert_called_once_with("ws-9")
 
 
 class TestContainerRemoveToolExecute:
     def test_success_removed(self):
-        manager = MagicMock()
-        manager.remove.return_value = {"status": "removed", "container_id": "abc123"}
-        tool = ContainerRemoveTool(container_id="abc123")
+        manager = _manager(
+            remove_result={"status": "removed", "container_id": "abc123"}
+        )
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
         with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
             result = _parse(tool.execute())
-        manager.remove.assert_called_once_with("abc123")
+        manager.remove.assert_called_once_with("abc123", keep_record=False)
         assert result["success"] is True
         assert result["status"] == "removed"
         assert result["container_id"] == "abc123"
         assert "error" not in result
 
     def test_success_removed_with_name(self):
-        manager = MagicMock()
-        manager.remove.return_value = {
-            "status": "removed", "container_id": "abc123", "name": "tm-x",
-        }
-        tool = ContainerRemoveTool(container_id="abc123")
+        manager = _manager(
+            remove_result={
+                "status": "removed", "container_id": "abc123", "name": "tm-x",
+            }
+        )
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
         with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
             result = _parse(tool.execute())
         assert result["success"] is True
         assert result["name"] == "tm-x"
 
     def test_error_dict_surfaced_not_raised(self):
-        manager = MagicMock()
-        manager.remove.return_value = {
-            "status": "error", "container_id": "abc123", "error": "boom",
-        }
-        tool = ContainerRemoveTool(container_id="abc123")
+        manager = _manager(
+            remove_result={
+                "status": "error", "container_id": "abc123", "error": "boom",
+            }
+        )
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
         with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
             result = _parse(tool.execute())
         assert result["success"] is False
@@ -79,7 +120,7 @@ class TestContainerRemoveToolExecute:
         assert result["container_id"] == "abc123"
 
     def test_runtime_error_surfaced_not_raised(self):
-        tool = ContainerRemoveTool(container_id="abc123")
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
         with patch.object(
             ContainerRemoveTool,
             "_make_manager",
@@ -90,15 +131,128 @@ class TestContainerRemoveToolExecute:
         assert "Docker Python SDK not installed." in result["error"]
 
     def test_unexpected_error_surfaced_not_raised(self):
-        manager = MagicMock()
+        manager = _manager()
         manager.remove.side_effect = ValueError("kaboom")
-        tool = ContainerRemoveTool(container_id="abc123")
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
         with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
             result = _parse(tool.execute())
         assert result["success"] is False
         assert "kaboom" in result["error"]
 
+    def test_missing_container_is_idempotent_removed(self):
+        """Docker NotFound -> already removed; the manager is never called."""
+        manager = _manager()
+        manager.client.containers.get.side_effect = container_control.NotFound(
+            "404 Client Error: No such container: abc123"
+        )
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is True
+        assert result["status"] == "removed"
+        assert result["container_id"] == "abc123"
+        manager.remove.assert_not_called()
 
-def test_container_id_is_required():
-    with pytest.raises(ValidationError):
-        ContainerRemoveTool()
+    def test_container_lookup_failure_reports_error(self):
+        manager = _manager()
+        manager.client.containers.get.side_effect = RuntimeError("daemon down")
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is False
+        assert result["status"] == "error"
+        assert "daemon down" in result["error"]
+        manager.remove.assert_not_called()
+
+
+class TestContainerRemoveToolLifecycleGrain:
+    def test_ephemeral_removes_freely(self):
+        manager = _manager(
+            lifecycle_class="ephemeral",
+            remove_result={"status": "removed", "container_id": "abc123"},
+        )
+        tool = ContainerRemoveTool(
+            container_id_or_name="abc123",
+            session_permissions={"container": True},
+        )
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is True
+        assert result["status"] == "removed"
+
+    def test_persistent_without_remove_grain_is_refused(self):
+        manager = _manager(lifecycle_class="persistent")
+        tool = ContainerRemoveTool(
+            container_id_or_name="abc123",
+            session_permissions={"container": True},
+        )
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is False
+        assert result["status"] == "refused"
+        assert result["container_id"] == "abc123"
+        assert "container: remove" in result["reason"]
+        assert "error" not in result
+        manager.remove.assert_not_called()
+
+    def test_persistent_without_grain_names_current_grain(self):
+        manager = _manager(lifecycle_class="persistent")
+        tool = ContainerRemoveTool(container_id_or_name="abc123")  # no permissions
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["status"] == "refused"
+        assert "container: none" in result["reason"]
+
+    @pytest.mark.parametrize(
+        "permissions",
+        [{"container": "remove"}, {"container:remove": True}],
+    )
+    def test_persistent_with_remove_grain_is_allowed(self, permissions):
+        manager = _manager(
+            lifecycle_class="persistent",
+            remove_result={"status": "removed", "container_id": "abc123"},
+        )
+        tool = ContainerRemoveTool(
+            container_id_or_name="abc123",
+            session_permissions=permissions,
+        )
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is True
+        assert result["status"] == "removed"
+        manager.remove.assert_called_once_with("abc123", keep_record=False)
+
+    def test_resource_is_operator_only(self):
+        manager = _manager(lifecycle_class="resource")
+        tool = ContainerRemoveTool(
+            container_id_or_name="abc123",
+            session_permissions={"container": "remove"},
+        )
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is False
+        assert result["status"] == "refused"
+        assert "operator" in result["reason"]
+        manager.remove.assert_not_called()
+
+    def test_unknown_lifecycle_class_is_left_to_the_manager(self):
+        """An unclassifiable/unknown class is not refused by the tool itself."""
+        manager = _manager(
+            lifecycle_class=None,
+            remove_result={"status": "removed", "container_id": "abc123"},
+        )
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["status"] == "removed"
+
+    def test_class_of_failure_is_tolerated(self):
+        manager = _manager(
+            remove_result={"status": "removed", "container_id": "abc123"},
+        )
+        manager.class_of.side_effect = RuntimeError("classification failed")
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is True
+        assert result["status"] == "removed"

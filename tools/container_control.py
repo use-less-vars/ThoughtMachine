@@ -6,6 +6,7 @@ These tools expose a persistent, composable container lifecycle to the agent:
 - ``ContainerStartTool``   - start (or reuse) a container for the session
 - ``ContainerExecTool``    - run a shell command inside an existing container
 - ``ContainerStopTool``    - stop a container (idempotent)
+- ``ContainerRestartTool`` - restart a container (stop + start composition)
 - ``ContainerRemoveTool``  - remove a container (stop + delete; idempotent)
 - ``ContainerStatusTool``  - report a container's status
 - ``ContainerListTool``    - list this session's containers
@@ -33,6 +34,7 @@ permissions allow a bridge network.
 import json
 import os
 import time
+from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from pydantic import Field
@@ -96,7 +98,7 @@ class _ContainerControlBase(ToolBase):
 
     required_categories: ClassVar[List[str]] = ["container:true"]
 
-    def _make_manager(self):
+    def _make_manager(self, workspace_id: Optional[str] = None):
         """Build a ContainerManager bound to the current session/workspace.
 
         Raises RuntimeError when Docker is unavailable, ContainerManager cannot
@@ -119,16 +121,17 @@ class _ContainerControlBase(ToolBase):
             raise RuntimeError(
                 "workspace path could not be resolved; refusing to fall back to cwd"
             )
-        workspace_id = None
-        try:
-            from thoughtmachine.workspace_capabilities import resolve_workspace_id
-            workspace_id = resolve_workspace_id(ws)
-        except Exception:
-            pass
+        resolved_workspace_id = workspace_id
+        if not resolved_workspace_id:
+            try:
+                from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                resolved_workspace_id = resolve_workspace_id(ws)
+            except Exception:
+                pass
         return ContainerManager(
             workspace_path=ws,
             session_id=getattr(self, "session_id", None),
-            workspace_id=workspace_id,
+            workspace_id=resolved_workspace_id,
             session_permissions=getattr(self, "session_permissions", None),
             image=getattr(self, "image", None) or DEFAULT_IMAGE,
             mem_limit=getattr(self, "mem_limit", "512m"),
@@ -271,7 +274,7 @@ class ContainerStartTool(_ContainerControlBase):
                 **start_fields,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -422,7 +425,7 @@ class ContainerStopTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -431,13 +434,129 @@ class ContainerStopTool(_ContainerControlBase):
             )
 
 
+class ContainerRestartTool(_ContainerControlBase):
+    """Restart a container started by ContainerStartTool.
+
+    Restart is a documented composition: the container is stopped (exactly as
+    ``ContainerStopTool`` would) and then started again by name, which reuses
+    the very same container/record and brings it back up. ``ContainerManager``
+    exposes no native ``restart`` method, so this two-step composition is the
+    supported path. Like the other lifecycle tools this one never raises —
+    failures are returned in the JSON response.
+
+    Returns JSON with structure:
+    {
+      "success": bool,
+      "container_id": str,
+      "status": "restarted" | "missing" | "refused" | "error",
+      "name": str (optional),
+      "reason": str (optional),
+      "error": str (optional),
+      "duration": float
+    }
+    """
+    tool: Literal["ContainerRestartTool"] = "ContainerRestartTool"
+
+    container_id: str = Field(
+        ...,
+        min_length=1,
+        description="ID or name of the container to restart."
+    )
+
+    def execute(self) -> str:
+        start_time = time.time()
+        try:
+            manager = self._make_manager()
+        except RuntimeError as e:
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
+        except Exception as e:
+            return self._respond(
+                False,
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+
+        # Resolve the container name first: start(name=...) is what reuses (and
+        # thus restarts) the existing container.
+        try:
+            container = manager.client.containers.get(self.container_id)
+            name = getattr(container, "name", None) or self.container_id
+        except NotFound:
+            return self._respond(
+                False,
+                container_id=self.container_id,
+                status="missing",
+                error="container not found",
+                duration=time.time() - start_time,
+            )
+        except Exception as e:
+            return self._respond(
+                False,
+                container_id=self.container_id,
+                status="error",
+                error=str(e),
+                duration=time.time() - start_time,
+            )
+
+        stopped = manager.stop(self.container_id)
+        stop_status = stopped.get("status")
+        if stop_status not in ("stopped", "missing"):
+            return self._respond(
+                False,
+                container_id=self.container_id,
+                status=stop_status or "error",
+                name=stopped.get("name"),
+                reason=stopped.get("reason"),
+                error=stopped.get("error"),
+                duration=time.time() - start_time,
+            )
+
+        try:
+            result = manager.start(name=name)
+        except RuntimeError as e:
+            return self._respond(
+                False,
+                container_id=self.container_id,
+                status="error",
+                error=str(e),
+                duration=time.time() - start_time,
+            )
+        except Exception as e:
+            return self._respond(
+                False,
+                container_id=self.container_id,
+                status="error",
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+
+        if isinstance(result, dict) and result.get("error"):
+            return self._respond(
+                False,
+                container_id=self.container_id,
+                status="error",
+                error=result.get("error"),
+                duration=time.time() - start_time,
+            )
+
+        return self._respond(
+            True,
+            container_id=result.get("id") or self.container_id,
+            status="restarted",
+            name=result.get("name") or name,
+            duration=time.time() - start_time,
+        )
+
+
 class ContainerStatusTool(_ContainerControlBase):
     """Report the status of a container.
 
     Returns the current state of the container identified by ``container_id``
     (running/exited/created/missing), including uptime and memory usage when
-    available. This tool never raises — failures are returned in the JSON
-    response.
+    available, plus the lifecycle/ownership description of the container: its
+    lifecycle class, owning scope, creator, remaining retention TTL, and the
+    permission grain required to remove it. This tool never raises — failures
+    are returned in the JSON response.
 
     Returns JSON with structure:
     {
@@ -447,9 +566,17 @@ class ContainerStatusTool(_ContainerControlBase):
       "status": str,
       "uptime_seconds": int | null,
       "memory_usage_bytes": int | null,
+      "owner": str | null,
+      "lifecycle_class": str | null,
+      "created_by": str | null,
+      "ttl_remaining_s": int | null,
+      "grain_required_for_remove": str | null,
       "error": str (optional),
       "duration": float
     }
+
+    A container reported as "missing" carries ``null`` for the five
+    description fields (there is nothing attached to describe).
     """
     tool: Literal["ContainerStatusTool"] = "ContainerStatusTool"
 
@@ -459,16 +586,107 @@ class ContainerStatusTool(_ContainerControlBase):
         description="ID or name of the container to inspect."
     )
 
+    def _describe_container(self, manager) -> Dict[str, Any]:
+        """Derive the five lifecycle/ownership description fields.
+
+        Fail-safe: any resolution error degrades to a neutral value rather
+        than raising, and an unclassifiable container is treated fail-closed
+        (``container:remove``).
+        """
+        lifecycle_class = None
+        container = None
+        try:
+            container = manager.client.containers.get(self.container_id)
+        except Exception:
+            container = None
+        if container is not None:
+            try:
+                lifecycle_class = manager.class_of(container)
+            except Exception:
+                lifecycle_class = None
+
+        record = None
+        if container is not None:
+            try:
+                from thoughtmachine.container_record import (
+                    RECORD_LABEL_KEY,
+                    find_by_docker_label,
+                )
+                labels = getattr(container, "labels", None) or {}
+                record_id = labels.get(RECORD_LABEL_KEY) if hasattr(labels, "get") else None
+                if record_id:
+                    record = find_by_docker_label(record_id)
+            except Exception:
+                record = None
+
+        if lifecycle_class == "resource":
+            owner = "operator"
+        elif lifecycle_class == "ephemeral":
+            owner = getattr(self, "session_id", None) or "workspace"
+        else:
+            owner = "workspace"
+
+        # The record schema carries no session field, so the creator is only
+        # reported when a session reference happens to be present.
+        created_by = "unknown"
+        if record is not None:
+            snapshot = getattr(record, "intent_snapshot", None) or {}
+            if isinstance(snapshot, dict) and snapshot.get("session_id"):
+                created_by = "session-{}".format(snapshot["session_id"])
+
+        ttl_remaining_s = None
+        retention_days = (
+            getattr(record, "retention_days", None) if record is not None else None
+        )
+        if retention_days:
+            try:
+                created_at = str(getattr(record, "created_at", "") or "")
+                if created_at:
+                    created_ts = datetime.fromisoformat(
+                        created_at.replace("Z", "+00:00")
+                    ).timestamp()
+                    ttl_remaining_s = max(
+                        0, int(retention_days * 86400 - (time.time() - created_ts))
+                    )
+            except Exception:
+                ttl_remaining_s = None
+
+        if lifecycle_class == "resource":
+            grain_required_for_remove = "operator"
+        elif lifecycle_class == "ephemeral":
+            grain_required_for_remove = "container:true"
+        else:
+            grain_required_for_remove = "container:remove"
+
+        return {
+            "owner": owner,
+            "lifecycle_class": lifecycle_class,
+            "created_by": created_by,
+            "ttl_remaining_s": ttl_remaining_s,
+            "grain_required_for_remove": grain_required_for_remove,
+        }
+
     def execute(self) -> str:
         start_time = time.time()
         try:
             manager = self._make_manager()
             result = manager.status(self.container_id)
-            return self._respond(True, **result, duration=time.time() - start_time)
+            described = dict(result)
+            if described.get("status") == "missing":
+                described.update(
+                    owner=None,
+                    lifecycle_class=None,
+                    created_by=None,
+                    ttl_remaining_s=None,
+                    grain_required_for_remove=None,
+                )
+            else:
+                described.update(self._describe_container(manager))
+            return self._respond(True, **described, duration=time.time() - start_time)
         except RuntimeError as e:
-            return self._respond(False, error=str(e))
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
-            return self._respond(False, error=f"Unexpected error: {e}")
+            return self._respond(False, status="error", error=f"Unexpected error: {e}", duration=time.time() - start_time)
 
 
 class ContainerListTool(_ContainerControlBase):
@@ -513,7 +731,7 @@ class ContainerListTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -569,7 +787,7 @@ class ContainerBuildTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -630,7 +848,7 @@ class ContainerLogsTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -649,43 +867,139 @@ class ContainerRemoveTool(_ContainerControlBase):
     status "removed". This tool never raises — failures are returned in the JSON
     response.
 
+    Removal is gated per lifecycle class (the grain is declarative — the
+    security gate itself only sees the boolean ``container`` grant):
+
+    - ``ephemeral`` containers may be removed freely;
+    - ``persistent`` containers additionally require the ``container: remove``
+      grain on the session;
+    - ``resource`` containers are operator-only and always refused;
+    - an unclassifiable container is left to the manager's own checks.
+
     Returns JSON with structure:
     {
       "success": bool,
       "container_id": str,
-      "status": "removed" | "error",
+      "status": "removed" | "refused" | "error",
       "name": str (optional),
+      "reason": str (optional),
       "error": str (optional),
       "duration": float
     }
     """
     tool: Literal["ContainerRemoveTool"] = "ContainerRemoveTool"
 
-    container_id: str = Field(
+    container_id_or_name: str = Field(
         ...,
         min_length=1,
         description="ID or name of the container to remove (returned by ContainerStartTool)."
     )
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional workspace id; resolved from the registry workspace when "
+            "omitted."
+        ),
+    )
+
+    def _session_permissions_map(self) -> Dict[str, Any]:
+        """Return the session permission map (empty dict when unavailable)."""
+        permissions = getattr(self, "session_permissions", None)
+        return permissions if isinstance(permissions, dict) else {}
+
+    def _session_holds_remove_grain(self) -> bool:
+        """Whether the session explicitly holds the ``container: remove`` grain."""
+        permissions = self._session_permissions_map()
+        if permissions.get("container:remove"):
+            return True
+        return permissions.get("container") == "remove"
+
+    def _current_container_grain_label(self) -> str:
+        """Human-readable label for the session's current container grain."""
+        permissions = self._session_permissions_map()
+        if self._session_holds_remove_grain():
+            return "container: remove"
+        if permissions.get("container"):
+            return "container: true"
+        return "container: none"
 
     def execute(self) -> str:
         start_time = time.time()
         try:
-            manager = self._make_manager()
-            result = manager.remove(self.container_id)
-            return self._respond(
-                result.get("status") == "removed",
-                container_id=self.container_id,
-                status=result.get("status"),
-                name=result.get("name"),
-                error=result.get("error"),
-                duration=time.time() - start_time,
-            )
+            manager = self._make_manager(self.workspace_id)
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
                 error=f"Unexpected error: {e}",
                 duration=time.time() - start_time,
             )
+
+        try:
+            container = manager.client.containers.get(self.container_id_or_name)
+        except NotFound:
+            # Idempotent: an absent container is already "removed".
+            return self._respond(
+                True,
+                container_id=self.container_id_or_name,
+                status="removed",
+                duration=time.time() - start_time,
+            )
+        except Exception as e:
+            return self._respond(
+                False,
+                container_id=self.container_id_or_name,
+                status="error",
+                error=str(e),
+                duration=time.time() - start_time,
+            )
+
+        try:
+            lifecycle_class = manager.class_of(container)
+        except Exception:
+            lifecycle_class = None
+
+        if lifecycle_class == "resource":
+            return self._respond(
+                False,
+                container_id=self.container_id_or_name,
+                status="refused",
+                reason="Resource containers can only be removed by the operator.",
+                duration=time.time() - start_time,
+            )
+        if lifecycle_class == "persistent" and not self._session_holds_remove_grain():
+            return self._respond(
+                False,
+                container_id=self.container_id_or_name,
+                status="refused",
+                reason=(
+                    "Persistent containers require the `container: remove` grain; "
+                    "this session has `{}`.".format(self._current_container_grain_label())
+                ),
+                duration=time.time() - start_time,
+            )
+
+        try:
+            result = manager.remove(self.container_id_or_name, keep_record=False)
+        except RuntimeError as e:
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
+        except Exception as e:
+            return self._respond(
+                False,
+                container_id=self.container_id_or_name,
+                status="error",
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+
+        return self._respond(
+            result.get("status") == "removed",
+            container_id=self.container_id_or_name,
+            status=result.get("status"),
+            name=result.get("name"),
+            reason=result.get("reason"),
+            error=result.get("error"),
+            duration=time.time() - start_time,
+        )
 
