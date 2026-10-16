@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 from pydantic import Field
@@ -33,6 +34,9 @@ from tools.base import ToolBase
 from tools.host_resource_policy import load_workspace_config
 
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
+
+# Vault-relative prefix for per-workspace entries in a vault_status report.
+_VAULT_WORKSPACE_PREFIX = "workspaces/"
 
 # ---------------------------------------------------------------------------
 # Optional dependencies
@@ -317,7 +321,7 @@ class CheckSystem(ToolBase):
                 "mcp_servers": lambda: self._query_mcp_servers(ws_id),
                 "event_bus_status": lambda: self._query_event_bus_status(),
                 "event_log": lambda: self._query_event_log(),
-                "vault_status": lambda: self._query_vault_status(),
+                "vault_status": lambda: self._query_vault_status(ws_id),
                 "vault_repair_status": lambda: self._query_vault_repair_status(),
                 "runtime_state": lambda: self._query_runtime_state(ws_id, workspace_path),
             }
@@ -954,7 +958,7 @@ class CheckSystem(ToolBase):
         except Exception as e:
             return f"[event_log] Error: {e}"
 
-    def _query_vault_status(self) -> dict:
+    def _query_vault_status(self, caller_ws_id: Optional[str] = None) -> dict:
         """Run VaultDriftChecker against the vault root; returns a structured, secret-free report.
 
         Strictly read-only: repairable drift is reported but never auto-fixed.
@@ -963,6 +967,11 @@ class CheckSystem(ToolBase):
         manual-review and GAW findings never count. ``repair_hint`` points the
         operator at the Vault Health panel in the landing page, where repairs
         are applied. This query tool has no apply capability.
+
+        Cross-tenant scoping: the report is filtered to the caller's own
+        workspace plus vault-wide files; foreign workspace session titles are
+        dropped.  The vault-wide view requires the explicit
+        ``vault_status: global`` grant (operator-only).
         """
         checker = None
         try:
@@ -997,7 +1006,83 @@ class CheckSystem(ToolBase):
             report["repair_hint"] = (
                 "use the Vault Health panel in the landing page to apply repairs"
             )
+            report = self._scope_vault_status_report(report, caller_ws_id)
         return report
+
+    def _vault_status_global_allowed(self) -> bool:
+        """True only when the caller holds the explicit ``vault_status: global`` grant.
+
+        Operator-only: opt-in vault-wide visibility is granted by the literal
+        ``{"vault_status": "global"}`` entry in the caller's injected
+        permission / config snapshot (checked in precedence order:
+        effective_permissions, session_permissions, agent_config).  Anything
+        else -- including a boolean truthy value -- is NOT a grant.  Read-only.
+        """
+        for source in (self.effective_permissions, self.session_permissions,
+                       self.agent_config):
+            if isinstance(source, dict) and source.get("vault_status") == "global":
+                return True
+        return False
+
+    def _scope_vault_status_report(
+        self, report: dict, caller_ws_id: Optional[str]
+    ) -> dict:
+        """Restrict a vault_status report to the caller's workspace + vault-wide files.
+
+        By default (no ``vault_status: global`` grant) only the caller's own
+        ``workspaces/<caller>/`` entries are kept alongside vault-wide
+        (non-``workspaces/``) files; every other workspace's entries are
+        dropped from ``files``, ``warnings`` and ``pending_repairs`` so foreign
+        session titles never leak.  A ``workspaces/*/...`` manifest-pattern
+        placeholder is vault-wide (not tenant data) and is kept.  With the
+        grant, the report is returned vault-wide (``scope: "global"``).
+        """
+        prefix = _VAULT_WORKSPACE_PREFIX
+        if self._vault_status_global_allowed():
+            scoped = dict(report)
+            scoped["scope"] = "global"
+            return scoped
+
+        own_prefix = f"{prefix}{caller_ws_id}/" if caller_ws_id else None
+
+        def _in_scope(relpath: Any) -> bool:
+            if not isinstance(relpath, str) or not relpath.startswith(prefix):
+                return True  # vault-wide / shared file
+            if relpath.startswith(f"{prefix}*/"):
+                return True  # manifest-pattern placeholder, not tenant data
+            return bool(own_prefix) and relpath.startswith(own_prefix)
+
+        def _warning_mentions_foreign(warning: Any) -> bool:
+            if not isinstance(warning, str):
+                return False
+            for match in re.finditer(r"workspaces/([^/\s]+)/", warning):
+                if f"{prefix}{match.group(1)}/" != own_prefix:
+                    return True
+            return False
+
+        scoped = dict(report)
+        files = report.get("files")
+        if isinstance(files, dict):
+            scoped["files"] = {k: v for k, v in files.items() if _in_scope(k)}
+        warnings = report.get("warnings")
+        if isinstance(warnings, list):
+            scoped["warnings"] = [
+                w for w in warnings if not _warning_mentions_foreign(w)
+            ]
+        pending = report.get("pending_repairs")
+        if isinstance(pending, list):
+            scoped["pending_repairs"] = [
+                p for p in pending
+                if not (isinstance(p, dict) and not _in_scope(p.get("file", "")))
+            ]
+        scoped["scope"] = "workspace"
+        if caller_ws_id:
+            scoped["scoped_to"] = caller_ws_id
+        else:
+            scoped["scope_note"] = (
+                "no workspace context resolved; only vault-wide files reported"
+            )
+        return scoped
 
     def _query_vault_repair_status(self) -> dict:
         """Full read-only vault repair dry run (vault_repair.run_inspection).
