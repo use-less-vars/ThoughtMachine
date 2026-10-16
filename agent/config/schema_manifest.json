@@ -682,11 +682,26 @@
       "fields": {}
     },
     "workspaces/*/capabilities.json": {
-      "description": "Per-workspace capabilities (token limits, docker/git flags). Pattern entry.",
+      "description": "Per-workspace capabilities (token limits, docker/git flags, tool/provider allow-lists, network/filesystem flags). Pattern entry. This manifest MUST mirror every field of the WorkspaceCapabilities dataclass (thoughtmachine/workspace_capabilities.py); each field description records whether the capability is enforced, container-propagated, or inert.",
       "required": false,
       "pattern": true,
       "root_type": "dict",
       "fields": {
+        "allowed_tools": {
+          "type": "list",
+          "required": false,
+          "description": "Tool-name allow-list (empty = all tools). INERT: recorded for forward-compat; not yet enforced by the security gate."
+        },
+        "blocked_tools": {
+          "type": "list",
+          "required": false,
+          "description": "Tool-name deny-list (takes precedence over allowed_tools). INERT: recorded for forward-compat; not yet enforced by the security gate."
+        },
+        "allowed_providers": {
+          "type": "list",
+          "required": false,
+          "description": "Provider-ID allow-list (empty = all configured providers). INERT: recorded for forward-compat; not yet enforced."
+        },
         "max_context_length": {
           "type": "int",
           "required": false,
@@ -697,20 +712,45 @@
           "required": false,
           "description": "Max conversation turns."
         },
+        "allowed_file_extensions": {
+          "type": "list",
+          "required": false,
+          "description": "File-extension allow-list for file tools (empty = all). CONTAINER-PROPAGATED: serialised into the container config; no host-gate enforcement yet."
+        },
         "max_file_size_bytes": {
           "type": "int",
           "required": false,
           "description": "Max file size in bytes."
         },
+        "allow_network": {
+          "type": "bool",
+          "required": false,
+          "description": "Whether outbound network access is allowed. ENFORCED: caps the effective network permission in the security gate."
+        },
         "allow_docker": {
           "type": "bool",
           "required": false,
-          "description": "Whether Docker is allowed for this workspace."
+          "description": "Whether Docker is allowed for this workspace. ENFORCED: caps the effective container permission in the security gate."
+        },
+        "filesystem_write": {
+          "type": "bool",
+          "required": false,
+          "description": "Whether filesystem write access is allowed. ENFORCED: downgrades effective filesystem permission to read when false."
         },
         "git_available": {
           "type": "bool",
           "required": false,
-          "description": "Whether git is available for this workspace."
+          "description": "Whether git is available for this workspace. ENFORCED: reported by the git tools."
+        },
+        "allowed_workspace_dirs": {
+          "type": "list",
+          "required": false,
+          "description": "Directory allow-list relative to the workspace root (empty or ['.'] = whole workspace). CONTAINER-PROPAGATED: serialised into the container config; no host-gate enforcement yet."
+        },
+        "extra": {
+          "type": "dict",
+          "required": false,
+          "description": "Arbitrary extra capability flags for future extensibility. INERT: recorded for forward-compat; not yet enforced."
         }
       }
     },
