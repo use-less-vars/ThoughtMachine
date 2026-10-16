@@ -866,8 +866,6 @@ def _introspection_exec_run(raise_on_usage_log=False, pip_output=None):
             return (0, (b"2025-01-01T00:00:00+00:00 | s1 | echo hi\n", b""))
         if "pip list --format=json" in command:
             return (0, (pip_output or b'[{"name":"requests","version":"2.31.0"}]', b""))
-        if "/proc/" in command:
-            return (0, (b"1\t/bin/sh\n42\tpython3 main.py\n", b""))
         if "du -sh /workspace" in command:
             return (0, (b"12M\t/workspace\n3M\t/home/agent/.local\n", b""))
         if "echo hello" in command:
@@ -889,6 +887,12 @@ class TestContainerManagerStatusIntrospection:
         fake.name = "tm-1"
         fake.status = "running"
         fake.attrs = {"State": {"StartedAt": _iso_dt(120)}}
+        # Process enumeration is a PASSIVE ``container.top()`` daemon read
+        # (Wave 10a commit 7) -- no /proc exec is issued any more.
+        fake.top.return_value = {
+            "Titles": ["PID", "CMD"],
+            "Processes": [[1, "/bin/sh"], [42, "python3 main.py"]],
+        }
         if dispatcher is not None:
             fake.exec_run.side_effect = dispatcher
         client.containers.get.return_value = fake
@@ -929,6 +933,7 @@ class TestContainerManagerStatusIntrospection:
         """Daemon exec failures -> error entries, no raise, no partial keys."""
         manager, fake = self._manager()
         fake.exec_run.side_effect = Exception("daemon down")
+        fake.top.side_effect = Exception("daemon down")
 
         result = manager.status("c1")
 
@@ -964,6 +969,7 @@ class TestContainerManagerStatusIntrospection:
                     "recent_commands", "introspection_errors"):
             assert key not in result
         fake.exec_run.assert_not_called()
+        fake.top.assert_not_called()
 
     def test_exec_appends_usage_log(self):
         """exec() success appends a session-scoped line to usage.log."""

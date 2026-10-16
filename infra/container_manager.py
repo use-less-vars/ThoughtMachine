@@ -3529,23 +3529,13 @@ class ContainerManager:
             else:
                 introspection_errors.append("pip list failed")
 
-            exit_code, stdout = (
-                self._exec_checked(
-                    container,
-                    "for p in /proc/[0-9]*; do pid=${p#/proc/}; "
-                    "cmd=$(tr '\\0' ' ' < \"$p/cmdline\" 2>/dev/null); "
-                    "[ -n \"$cmd\" ] && printf '%s\\t%s\\n' \"$pid\" \"$cmd\"; done",
-                )
-                or (None, "")
-            )
-            if exit_code == 0:
-                processes = []
-                for line in stdout.splitlines():
-                    pid, sep, cmd = line.partition("\t")
-                    if sep and pid.isdigit():
-                        processes.append({"pid": int(pid), "command": cmd})
-                result["running_processes"] = processes
-            else:
+            # Process enumeration is a PASSIVE daemon read: ``container.top()``
+            # issues ``GET /containers/{id}/top`` and never execs a shell
+            # inside the target. The old /proc shell probe was an execution
+            # path on a read tool (and was not recorded in ``recent_commands``).
+            try:
+                result["running_processes"] = self._parse_top(container.top())
+            except Exception:
                 introspection_errors.append("process scan failed")
 
             exit_code, stdout = (
@@ -3674,6 +3664,40 @@ class ContainerManager:
             return summary
         except Exception:
             return {}
+
+    @staticmethod
+    def _parse_top(top):
+        """Parse ``container.top()`` into ``[{"pid", "command"}, ...]``.
+
+        ``container.top()`` returns the daemon's ``GET /containers/{id}/top``
+        payload: ``{"Titles": [...], "Processes": [[pid, cmd, ...], ...]}``.
+        The PID/CMD columns are resolved from ``Titles`` (case-insensitive,
+        accepting ``CMD`` or ``COMMAND``); when ``Titles`` is absent the first
+        two columns are assumed. Passive -- never execs inside the container
+        and never raises (malformed input yields ``[]``).
+        """
+        if not isinstance(top, dict):
+            return []
+        titles = [str(t).upper() for t in (top.get("Titles") or [])]
+        rows = top.get("Processes") or []
+        pid_i = titles.index("PID") if "PID" in titles else 0
+        cmd_i = None
+        for name in ("CMD", "COMMAND"):
+            if name in titles:
+                cmd_i = titles.index(name)
+                break
+        if cmd_i is None:
+            cmd_i = 1
+        idx = max(pid_i, cmd_i)
+        processes = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) <= idx:
+                continue
+            raw_pid = str(row[pid_i]).strip()
+            if not raw_pid.isdigit():
+                continue
+            processes.append({"pid": int(raw_pid), "command": str(row[cmd_i])})
+        return processes
 
     @staticmethod
     def _parse_disk_usage(text):
