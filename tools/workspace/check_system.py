@@ -195,32 +195,20 @@ def _server_revision() -> str:
 def _server_version() -> dict:
     """Return the runtime version ``{revision, branch, dirty}``.
 
-    ``revision`` is the same value the web-UI ``/health`` route exposes (git
-    HEAD captured at server import). ``branch`` and ``dirty`` are resolved
-    best-effort from git in the same repo root; any failure (no git binary,
-    not a checkout) degrades to ``"unknown"``/``False`` rather than raising.
+    All three fields are read from the SAME import-time snapshot captured by
+    the web-UI server module, so they describe one consistent revision.  There
+    is no subprocess git invocation here: ``revision`` comes from
+    :func:`_server_revision` and ``branch``/``dirty`` come from
+    ``_SERVER_BRANCH``/``_SERVER_DIRTY``.  Any failure (web UI package not
+    importable, no git at server-import time) degrades to
+    ``"unknown"``/``False`` rather than raising.
     """
     branch = "unknown"
     dirty = False
     try:
-        import subprocess
-
-        try:
-            from web_ui.backend.server import _project_root as _root
-        except Exception:
-            _root = str(Path(__file__).resolve().parents[2])
-        head = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=_root, capture_output=True, text=True, timeout=5.0,
-        )
-        if head.returncode == 0 and head.stdout.strip():
-            branch = head.stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=_root, capture_output=True, text=True, timeout=5.0,
-        )
-        if status.returncode == 0:
-            dirty = bool(status.stdout.strip())
+        from web_ui.backend.server import _SERVER_BRANCH, _SERVER_DIRTY
+        branch = _SERVER_BRANCH
+        dirty = bool(_SERVER_DIRTY)
     except Exception:
         branch = "unknown"
         dirty = False
