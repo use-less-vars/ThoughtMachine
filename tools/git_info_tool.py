@@ -7,6 +7,7 @@ import unicodedata
 from pathlib import Path
 from .base import ToolBase
 from security.sandboxed_execution import SandboxedExecution
+from security.gate_helpers import _value_satisfies
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
 from agent.config.resource_catalog import catalog_entry
 
@@ -906,6 +907,16 @@ class GitReadTool(ToolBase):
         if (self.effective_permissions or {}).get("git") != "ask":
             required_category = f"git:{self._get_operation_level(args)}"
 
+        # Filesystem grain binding (fail closed, read side): reading repository
+        # content requires a read-capable effective ``filesystem`` grain. An
+        # explicit ``filesystem: banned`` mirrors the operator ruling that a
+        # banned filesystem makes repository content unreadable, so the git read
+        # is refused even when git:read itself would be allowed. A missing
+        # ``filesystem`` key defers to the out-of-band session mirror
+        # (legacy/direct callers), preserving historical behaviour.
+        if not self._filesystem_read_allowed():
+            raise PermissionError(self._filesystem_read_gate_error())
+
         result = executor.run(
             ["git"] + hardened_args + args,
             cwd=str(repo_root),
@@ -994,6 +1005,15 @@ class GitReadTool(ToolBase):
                     f"Permission denied: git:{level} required for this operation"
                     + (f" (workspace ceiling: {note})" if note else "")
                 )
+
+        # Filesystem grain binding (fail closed, read side, mirrors the host
+        # path): reading repository content requires a read-capable effective
+        # ``filesystem`` grain. An explicit ``filesystem: banned`` makes the
+        # repository content unreadable, so the git read is refused even when
+        # git:read itself would be allowed. A missing ``filesystem`` key defers
+        # to the out-of-band session mirror (legacy/direct callers).
+        if not self._filesystem_read_allowed():
+            raise PermissionError(self._filesystem_read_gate_error())
 
         # NOTE: no --no-verify here. The resource container IS the security
         # boundary; hooks are restricted to the workspace .githooks dir via
@@ -1308,6 +1328,36 @@ class GitReadTool(ToolBase):
         ):
             return "write"
         return "read"
+
+    def _filesystem_read_allowed(self) -> bool:
+        """Fail-closed check that this git read call carries a read-capable
+        effective ``filesystem`` grain.
+
+        Reading repository content needs the session to be able to read the
+        filesystem at all: an explicit ``filesystem: banned`` effective grant
+        makes repository content unreadable, so the git read is refused. A
+        missing ``filesystem`` key defers to the out-of-band session mirror
+        (legacy/direct callers), preserving historical behaviour. ``read`` /
+        ``write`` / ``full`` -- and ``ask`` (already prompted and approved by
+        the outer ToolExecutor gate) -- are read-capable.
+        """
+        effective = self.effective_permissions or {}
+        fs = effective.get("filesystem")
+        if fs is None:
+            return True
+        result = _value_satisfies("read", fs)
+        return result is True or result == "ASK"
+
+    def _filesystem_read_gate_error(self) -> str:
+        """Return the filesystem-grain denial message, naming the missing
+        grain (``filesystem:read``) and the session's actual grain."""
+        effective = self.effective_permissions or {}
+        fs = effective.get("filesystem")
+        label = "none" if fs is None else str(fs).lower()
+        return (
+            f"Error: git:read requires filesystem:read; "
+            f"this session has filesystem:{label}"
+        )
 
     def _git_status(self, repo_root: Path) -> str:
         """Run git status, reconciling Unicode-equivalent path spellings."""
