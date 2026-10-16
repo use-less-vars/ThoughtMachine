@@ -1008,6 +1008,16 @@ class DockerExecutor:
             self.client, spec, admission=None, record=True,
         )
         self.container = created.container
+        # Wave-10a: record the executor-side container creation as a
+        # container_lifecycle (action="create") event. The call is fail-safe
+        # (telemetry never breaks a caller) and strictly additive.
+        ContainerLifecycle.record_create(
+            self.container,
+            reason="executor_container_created",
+            contributing_source="docker_executor._ensure_container",
+            workspace_id=self.workspace_id,
+            session_id=getattr(self, "session_id", None),
+        )
         # Workspace bind mount already has correct UID (matches host)
         self.last_used = time.time()
 

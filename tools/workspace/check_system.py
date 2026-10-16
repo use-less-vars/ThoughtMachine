@@ -192,6 +192,29 @@ def _server_revision() -> str:
         return "unknown"
 
 
+def _server_version() -> dict:
+    """Return the runtime version ``{revision, branch, dirty}``.
+
+    All three fields are read from the SAME import-time snapshot captured by
+    the web-UI server module, so they describe one consistent revision.  There
+    is no subprocess git invocation here: ``revision`` comes from
+    :func:`_server_revision` and ``branch``/``dirty`` come from
+    ``_SERVER_BRANCH``/``_SERVER_DIRTY``.  Any failure (web UI package not
+    importable, no git at server-import time) degrades to
+    ``"unknown"``/``False`` rather than raising.
+    """
+    branch = "unknown"
+    dirty = False
+    try:
+        from web_ui.backend.server import _SERVER_BRANCH, _SERVER_DIRTY
+        branch = _SERVER_BRANCH
+        dirty = bool(_SERVER_DIRTY)
+    except Exception:
+        branch = "unknown"
+        dirty = False
+    return {"revision": _server_revision(), "branch": branch, "dirty": dirty}
+
+
 # ---------------------------------------------------------------------------
 # Tool
 # ---------------------------------------------------------------------------
@@ -215,6 +238,7 @@ class CheckSystem(ToolBase):
                       "'worker/<name>' (specific worker config), 'capabilities' (workspace features), "
                       "'dockerfile' (container environment), 'mcp_servers' (external tool servers), "
                       "'effective_permissions' (session × workspace permissions), "
+                      "'version' (runtime git revision, branch, dirty), "
                       "'container_status' (Docker status), 'containers' (per-workspace container list with notes), "
                       "'workspace_info' (workspace metadata), "
                       "'network_diagnostics' (connectivity checks), "
@@ -322,6 +346,7 @@ class CheckSystem(ToolBase):
 
             handler_map = {
                 "effective_permissions": lambda: self._query_permissions(ws_id),
+                "version": lambda: self._query_version(),
                 "container_status": lambda: self._query_container_status(workspace_path),
                 "containers": lambda: self._query_containers(workspace_path),
                 "workspace_info": lambda: self._query_workspace_info(ws_id),
@@ -425,6 +450,15 @@ class CheckSystem(ToolBase):
             "permission_origin": permission_origin,
             "permission_fetch_error": permission_fetch_error,
         }
+
+    def _query_version(self) -> dict:
+        """Return the runtime version ``{revision, branch, dirty}``.
+
+        ``revision`` is the same value the web-UI ``/health`` route exposes;
+        ``branch``/``dirty`` are resolved best-effort from git and degrade to
+        ``"unknown"``/``False`` when git is unavailable.
+        """
+        return _server_version()
 
     def _query_container_status(self, ws_path: Optional[str]) -> dict:
         """Return Docker container status for the workspace."""
@@ -554,14 +588,17 @@ class CheckSystem(ToolBase):
         except ImportError:
             risk = {"level": "low", "error": "risk_model unavailable"}
 
-        # GATE-RESOLVED host_bash: the config-declared ``permissions`` above is
-        # the on-disk request, not the effective grant. Surface the effective
-        # (session x workspace) value; fail closed to "banned".
+        # GATE-RESOLVED: the config-declared ``permissions`` above is the
+        # on-disk request, not the effective grant. Resolve the effective
+        # (session x workspace) dict once and surface both the host_bash value
+        # and the full effective_permissions block; fail closed to "banned".
+        effective_permissions = {}
         host_bash = "banned"
         try:
             eff = self._query_permissions(ws_id)
             if isinstance(eff, dict):
-                host_bash = (eff.get("effective_permissions") or {}).get("host_bash", "banned")
+                effective_permissions = eff.get("effective_permissions") or {}
+                host_bash = effective_permissions.get("host_bash", "banned")
         except Exception:
             host_bash = "banned"
         if not host_bash:
@@ -574,7 +611,13 @@ class CheckSystem(ToolBase):
             "workers": workers,
             "mcp_tools": mcp_tools,
             "purpose": purpose,
+            # DECLARED config (the workspace ceiling), read verbatim from
+            # config.json. This is NOT the session-effective grant; read the
+            # sibling ``effective_permissions`` for the gate-resolved value.
             "permissions": permissions,
+            # GATE-RESOLVED (session x workspace). This is what the agent
+            # should read.
+            "effective_permissions": effective_permissions,
             "host_bash": host_bash,
             "allow_host_resources": allow_host_resources,
             "risk": risk,

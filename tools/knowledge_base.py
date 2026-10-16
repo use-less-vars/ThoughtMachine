@@ -291,7 +291,37 @@ class KnowledgeBaseTool(ToolBase):
 
         # Atomic permission re-check for write modes
         mode = self.mode
-        if mode in write_modes:
+
+        # ── Workspace-scope filesystem grain gate ─────────────────────────
+        # Workspace-scoped KB reads AND writes obey the `filesystem` grain.
+        # This gate is ADDITIVE over the historical all-scope write check:
+        # non-workspace write modes (global included) still run the
+        # historical atomic `filesystem:write` check in the `elif` branch
+        # below, so NO scope loses its previous permission enforcement.
+        # Mirrors the shipped
+        # gate in tools/git_info_tool.py (_filesystem_read_allowed /
+        # _filesystem_read_gate_error): a missing `filesystem` key defers to
+        # the out-of-band session mirror (legacy/direct callers), preserving
+        # historical behaviour; read/search/list/summary/status need
+        # filesystem:read and append/update/create_domain need filesystem:write.
+        if self.scope == "workspace":
+            from security.gate_helpers import _value_satisfies
+            _kb_fs = (self.effective_permissions or {}).get("filesystem")
+            if _kb_fs is not None:
+                _kb_level = (
+                    "write" if mode in write_modes
+                    else ("read" if mode in ("read", "search", "list", "summary", "status") else None)
+                )
+                if _kb_level is not None:
+                    _kb_result = _value_satisfies(_kb_level, _kb_fs)
+                    if not (_kb_result is True or _kb_result == "ASK"):
+                        return json.dumps({
+                            "error": (
+                                f"Error: workspace KB requires filesystem:{_kb_level}; "
+                                f"this session has filesystem:{str(_kb_fs).lower()}"
+                            )
+                        })
+        elif mode in write_modes:
             from security.security_gate import check_atomic_operation
             effective = self.effective_permissions or {}
             if not check_atomic_operation(

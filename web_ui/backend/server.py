@@ -247,6 +247,48 @@ def _get_server_revision() -> str:
 _SERVER_REVISION = _get_server_revision()
 
 
+def _get_server_branch() -> str:
+    """Return the git branch this server was built from, or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=_project_root,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode == 0:
+            branch = result.stdout.strip()
+            if branch:
+                return branch
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _get_server_dirty() -> bool:
+    """Return True if the checkout has uncommitted changes, else False."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_project_root,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode == 0:
+            return bool(result.stdout.strip())
+    except Exception:
+        pass
+    return False
+
+
+# Branch and dirty flag captured at the SAME import-time point as the
+# revision, so all three version fields describe one consistent snapshot.
+_SERVER_BRANCH = _get_server_branch()
+_SERVER_DIRTY = _get_server_dirty()
+
+
 def _session_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Filter a (translated) frontend config dict to SessionConfig fields.
 

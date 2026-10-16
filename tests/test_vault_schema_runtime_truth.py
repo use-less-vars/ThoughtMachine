@@ -12,7 +12,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_ALLOWLIST_SHA256 = "201f3e9839ceaca5e3241bd914d2343c0059c6efbe35f49594650686b6ec335f"
+_ALLOWLIST_SHA256 = "988b35402843767eef634a7d1b6fb2057b40dd9ada72190167c689629ba020d6"
 
 _REQUIRED_ENTRIES = (
     "vault_version.json",

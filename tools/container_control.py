@@ -46,6 +46,21 @@ from agent.config.defaults import DEFAULT_IMAGE, WORKSPACE_ID_LABEL
 
 logger = logging.getLogger(__name__)
 
+
+def _runtime_commit() -> str:
+    """Return the runtime revision (git HEAD) the web UI ``/health`` exposes.
+
+    Sourced from ``web_ui.backend.server._SERVER_REVISION``; lazily imported so
+    this module has no hard dependency on the web UI package. Degrades to
+    ``"unknown"`` when the import (or the revision) is unavailable.
+    """
+    try:
+        from web_ui.backend.server import _SERVER_REVISION
+        return _SERVER_REVISION
+    except Exception:
+        return "unknown"
+
+
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the container tools keep working outside a worker turn.
 try:
@@ -440,12 +455,12 @@ class ContainerStopTool(_ContainerControlBase):
 class ContainerRestartTool(_ContainerControlBase):
     """Restart a container started by ContainerStartTool.
 
-    Restart is a documented composition: the container is stopped (exactly as
-    ``ContainerStopTool`` would) and then started again by name, which reuses
-    the very same container/record and brings it back up. ``ContainerManager``
-    exposes no native ``restart`` method, so this two-step composition is the
-    supported path. Like the other lifecycle tools this one never raises —
-    failures are returned in the JSON response.
+    Restart delegates to ``ContainerManager.restart``, a native lifecycle
+    action in its own right: the manager evaluates the destruction gate
+    silently, records a single ``action="restart"`` lifecycle event, then
+    stops and restarts the very same container/record in place. Like the other
+    lifecycle tools this one never raises — failures are returned in the JSON
+    response.
 
     Returns JSON with structure:
     {
@@ -479,43 +494,8 @@ class ContainerRestartTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
 
-        # Resolve the container name first: start(name=...) is what reuses (and
-        # thus restarts) the existing container.
         try:
-            container = manager.client.containers.get(self.container_id)
-            name = getattr(container, "name", None) or self.container_id
-        except NotFound:
-            return self._respond(
-                False,
-                container_id=self.container_id,
-                status="missing",
-                error="container not found",
-                duration=time.time() - start_time,
-            )
-        except Exception as e:
-            return self._respond(
-                False,
-                container_id=self.container_id,
-                status="error",
-                error=str(e),
-                duration=time.time() - start_time,
-            )
-
-        stopped = manager.stop(self.container_id)
-        stop_status = stopped.get("status")
-        if stop_status not in ("stopped", "missing"):
-            return self._respond(
-                False,
-                container_id=self.container_id,
-                status=stop_status or "error",
-                name=stopped.get("name"),
-                reason=stopped.get("reason"),
-                error=stopped.get("error"),
-                duration=time.time() - start_time,
-            )
-
-        try:
-            result = manager.start(name=name)
+            result = manager.restart(self.container_id)
         except RuntimeError as e:
             return self._respond(
                 False,
@@ -533,20 +513,23 @@ class ContainerRestartTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
 
-        if isinstance(result, dict) and result.get("error"):
+        if not isinstance(result, dict):
+            result = {}
+        if result.get("status") == "restarted":
             return self._respond(
-                False,
-                container_id=self.container_id,
-                status="error",
-                error=result.get("error"),
+                True,
+                container_id=result.get("container_id") or self.container_id,
+                status="restarted",
+                name=result.get("name"),
                 duration=time.time() - start_time,
             )
-
         return self._respond(
-            True,
-            container_id=result.get("id") or self.container_id,
-            status="restarted",
-            name=result.get("name") or name,
+            False,
+            container_id=result.get("container_id") or self.container_id,
+            status=result.get("status") or "error",
+            name=result.get("name"),
+            reason=result.get("reason"),
+            error=result.get("error"),
             duration=time.time() - start_time,
         )
 
@@ -574,11 +557,13 @@ class ContainerStatusTool(_ContainerControlBase):
       "created_by": str | null,
       "ttl_remaining_s": int | null,
       "grain_required_for_remove": str | null,
+      "runtime_commit": str | null,
+      "unavailable_reason": str | null,
       "error": str (optional),
       "duration": float
     }
 
-    A container reported as "missing" carries ``null`` for the five
+    A container reported as "missing" carries ``null`` for the seven
     description fields (there is nothing attached to describe).
     """
     tool: Literal["ContainerStatusTool"] = "ContainerStatusTool"
@@ -590,7 +575,7 @@ class ContainerStatusTool(_ContainerControlBase):
     )
 
     def _describe_container(self, manager) -> Dict[str, Any]:
-        """Derive the five lifecycle/ownership description fields.
+        """Derive the seven lifecycle/ownership description fields.
 
         Fail-safe: any resolution error degrades to a neutral value rather
         than raising, and an unclassifiable container is treated fail-closed
@@ -661,12 +646,24 @@ class ContainerStatusTool(_ContainerControlBase):
         else:
             grain_required_for_remove = "container:remove"
 
+        # The unmet-session-requirement reason only applies to persistent
+        # containers (they may outlive a session whose grant narrowed).
+        # Recomputed live on each call; fail-safe to None.
+        unavailable_reason = None
+        if lifecycle_class == "persistent":
+            try:
+                unavailable_reason = manager.unavailable_reason(container) or None
+            except Exception:
+                unavailable_reason = None
+
         return {
             "owner": owner,
             "lifecycle_class": lifecycle_class,
             "created_by": created_by,
             "ttl_remaining_s": ttl_remaining_s,
             "grain_required_for_remove": grain_required_for_remove,
+            "runtime_commit": _runtime_commit(),
+            "unavailable_reason": unavailable_reason,
         }
 
     def _workspace_ownership_refusal(self, manager) -> Optional[str]:
@@ -716,6 +713,8 @@ class ContainerStatusTool(_ContainerControlBase):
                     created_by=None,
                     ttl_remaining_s=None,
                     grain_required_for_remove=None,
+                    runtime_commit=None,
+                    unavailable_reason=None,
                 )
             else:
                 described.update(self._describe_container(manager))

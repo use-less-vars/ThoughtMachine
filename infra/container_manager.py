@@ -2132,6 +2132,13 @@ class ContainerManager:
                    f"source=recreate image={image} name={name} "
                    f"record_id={reuse_record_id} session={self.session_id} "
                    f"workspace_id={self.workspace_id}")
+            ContainerLifecycle.record_create(
+                container,
+                reason="container_created",
+                contributing_source="container_manager.create",
+                workspace_id=self.workspace_id,
+                session_id=self.session_id,
+            )
             log_container_event("started", container_id=container.id,
                                 session_id=self.session_id or "",
                                 data={"image": image, "name": name,
@@ -2161,6 +2168,13 @@ class ContainerManager:
         container = self._cache_container(name, container)
         if note is not None:
             self._write_note(self._record_id_for(container), note)
+        ContainerLifecycle.record_create(
+            container,
+            reason="container_created",
+            contributing_source="container_manager.create",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
         log_container_event("started", container_id=container.id,
                             session_id=self.session_id or "",
                             data={"image": image, "name": name, "status": "created",
@@ -3291,6 +3305,63 @@ class ContainerManager:
             return {"status": "error", "container_id": container_id, "error": str(e),
                     "name": getattr(container, "name", "")}
 
+    def restart(self, container_id):
+        """Stop then start ``container_id`` in place. NEVER raises.
+
+        Restart is a lifecycle action in its own right: it emits exactly ONE
+        ``CONTAINER_LIFECYCLE`` event with ``action="restart"`` -- NOT the
+        shape-identical ``action="reap"/reason="explicit_stop"`` a bare stop
+        would log.  The stop half still routes through the same reconcile gate
+        (the container is only recycled when the funnel permits its
+        destruction), but that gate is evaluated silently so only the restart
+        event is emitted.
+
+        Returns ``{"status": "restarted"|"refused"|"missing"|"error", ...}``.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"status": "missing", "container_id": container_id,
+                    "error": "container not found"}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        name = getattr(container, "name", None) or container_id
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            return {"status": "error", "container_id": container_id, "error": _denial}
+        intent = ContainerIntent(
+            kind="restart",
+            explicit=True,
+            reason="explicit_restart",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        # Evaluate the destruction gate WITHOUT emitting (the restart emits its
+        # own, distinct action below).
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent, emit=False
+        )
+        ContainerLifecycle.record_restart(
+            container,
+            reason="explicit_restart",
+            contributing_source="container_manager.restart",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        if not decision.destroys:
+            return {"status": "refused", "container_id": container_id,
+                    "name": name, "reason": decision.reason}
+        stopped = self._stop_container(container, container_id)
+        if stopped.get("status") not in ("stopped", "missing"):
+            return stopped
+        result = self.start(name=name)
+        if isinstance(result, dict) and result.get("error"):
+            return {"status": "error", "container_id": container_id,
+                    "name": name, "error": result.get("error")}
+        new_name = (result.get("name") if isinstance(result, dict) else None) or name
+        new_id = (result.get("id") if isinstance(result, dict) else None) or container_id
+        return {"status": "restarted", "container_id": new_id, "name": new_name}
+
     def remove(self, container_id, *, keep_record=False):
         """Remove the container. Idempotent; NEVER raises.
 
@@ -3458,23 +3529,13 @@ class ContainerManager:
             else:
                 introspection_errors.append("pip list failed")
 
-            exit_code, stdout = (
-                self._exec_checked(
-                    container,
-                    "for p in /proc/[0-9]*; do pid=${p#/proc/}; "
-                    "cmd=$(tr '\\0' ' ' < \"$p/cmdline\" 2>/dev/null); "
-                    "[ -n \"$cmd\" ] && printf '%s\\t%s\\n' \"$pid\" \"$cmd\"; done",
-                )
-                or (None, "")
-            )
-            if exit_code == 0:
-                processes = []
-                for line in stdout.splitlines():
-                    pid, sep, cmd = line.partition("\t")
-                    if sep and pid.isdigit():
-                        processes.append({"pid": int(pid), "command": cmd})
-                result["running_processes"] = processes
-            else:
+            # Process enumeration is a PASSIVE daemon read: ``container.top()``
+            # issues ``GET /containers/{id}/top`` and never execs a shell
+            # inside the target. The old /proc shell probe was an execution
+            # path on a read tool (and was not recorded in ``recent_commands``).
+            try:
+                result["running_processes"] = self._parse_top(container.top())
+            except Exception:
                 introspection_errors.append("process scan failed")
 
             exit_code, stdout = (
@@ -3605,6 +3666,40 @@ class ContainerManager:
             return {}
 
     @staticmethod
+    def _parse_top(top):
+        """Parse ``container.top()`` into ``[{"pid", "command"}, ...]``.
+
+        ``container.top()`` returns the daemon's ``GET /containers/{id}/top``
+        payload: ``{"Titles": [...], "Processes": [[pid, cmd, ...], ...]}``.
+        The PID/CMD columns are resolved from ``Titles`` (case-insensitive,
+        accepting ``CMD`` or ``COMMAND``); when ``Titles`` is absent the first
+        two columns are assumed. Passive -- never execs inside the container
+        and never raises (malformed input yields ``[]``).
+        """
+        if not isinstance(top, dict):
+            return []
+        titles = [str(t).upper() for t in (top.get("Titles") or [])]
+        rows = top.get("Processes") or []
+        pid_i = titles.index("PID") if "PID" in titles else 0
+        cmd_i = None
+        for name in ("CMD", "COMMAND"):
+            if name in titles:
+                cmd_i = titles.index(name)
+                break
+        if cmd_i is None:
+            cmd_i = 1
+        idx = max(pid_i, cmd_i)
+        processes = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) <= idx:
+                continue
+            raw_pid = str(row[pid_i]).strip()
+            if not raw_pid.isdigit():
+                continue
+            processes.append({"pid": int(raw_pid), "command": str(row[cmd_i])})
+        return processes
+
+    @staticmethod
     def _parse_disk_usage(text):
         """Parse ``du -sh`` output into {"workspace": size, "packages": size}."""
         try:
@@ -3725,7 +3820,7 @@ class ContainerManager:
             result.append(row)
         return result
 
-    def _session_envelope_unavailable_reason(self, container):
+    def _session_envelope_unavailable_reasons(self, container):
         """Reason string when ``container`` is MORE permissive than this session.
 
         Reuses the exec-drift envelope comparison (NEVER raises):
@@ -3756,18 +3851,47 @@ class ContainerManager:
             if not isinstance(cfg, _ComputedContainerConfig):
                 return None
             want_net, want_ws = cfg[0], cfg[1]
-            decision, reason = _exec_drift_decision(
-                live_net, live_ws, want_net, want_ws
+            # Isolate each axis by neutralising the other, so an unmet
+            # requirement on one axis never MASKS an unmet one on the other;
+            # this enumerates ALL unmet requirements, not just the first.
+            net_decision, net_reason = _exec_drift_decision(
+                live_net, want_ws, want_net, want_ws
+            )
+            ws_decision, ws_reason = _exec_drift_decision(
+                want_net, live_ws, want_net, want_ws
             )
         except Exception:
+            return []
+        reasons = []
+        if net_decision == "deny" and net_reason == "network_more_permissive":
+            reasons.append("needs network:write; session has network:none")
+        if ws_decision == "deny" and ws_reason == "workspace_more_permissive":
+            reasons.append("needs filesystem:write; session has filesystem:read")
+        return reasons
+
+    def _session_envelope_unavailable_reason(self, container):
+        """Single reason string (``"; "``-joined) or ``None`` when within bounds.
+
+        Thin wrapper over :meth:`_session_envelope_unavailable_reasons`; kept so
+        list rows retain the historical shape (the key stays ABSENT when there
+        is no unmet requirement).
+        """
+        reasons = self._session_envelope_unavailable_reasons(container)
+        if not reasons:
             return None
-        if decision != "deny":
+        return "; ".join(reasons)
+
+    def unavailable_reason(self, container):
+        """Public: unmet-session-requirement reason for ``container`` (or None).
+
+        RECOMPUTED on every call from the LIVE envelope and this session's
+        grant -- never cached, never stale.  Returns ``None`` when the row is
+        within bounds.  NEVER raises.
+        """
+        try:
+            return self._session_envelope_unavailable_reason(container)
+        except Exception:
             return None
-        if reason == "network_more_permissive":
-            return "needs network:write; session has network:none"
-        if reason == "workspace_more_permissive":
-            return "needs filesystem:write; session has filesystem:read"
-        return None
 
     def build_image(self, tag=None, nocache=False):
         """Build a Docker image from ONLY the vault-managed Dockerfile.

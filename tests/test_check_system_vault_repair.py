@@ -63,10 +63,11 @@ _ALLOWLIST = {
         "running_workers",
         "runtime_state",
         "vault_status",
+        "version",
         "workers",
         "workspace_info",
     ],
-    "sha256": "201f3e9839ceaca5e3241bd914d2343c0059c6efbe35f49594650686b6ec335f",
+    "sha256": "988b35402843767eef634a7d1b6fb2057b40dd9ada72190167c689629ba020d6",
 }
 
 _USER_DEFAULTS = {

@@ -3724,6 +3724,17 @@ class Worker(ToolBase):
 
     def _action_spawn(self, workers: list, ws_id: Optional[str]) -> dict:
         """Spawn a worker thread from its definition in workers.json."""
+        # ── Commit 8: dispatcher-side duration instrumentation ──
+        # Definition of the "dispatch wall" window: it measures the PARENT
+        # session's own wall-clock time spent handling THIS spawn action —
+        # from the moment _action_spawn begins (spawn_started_at, taken before
+        # any worker lookup, creation, or registry lock) to the moment the
+        # response envelope is returned to the caller (dispatch_finished_at).
+        # dispatch_started_at marks the actual point at which the worker is
+        # started/queried.  These numbers are DISPATCHER-side (this parent
+        # process) and are deliberately independent of the worker's own clock
+        # (see worker_self_reported) — anti-pattern member 4.
+        spawn_started_at = time.time()
         from tools.workspace.worker import GATE_AVAILABLE, WorkerThread, _registry_lock, _worker_registry, check_required_categories, resolve_workspace_id
         definition = self._find_worker(workers, self.worker_name)
         if definition is None:
@@ -3883,6 +3894,8 @@ class Worker(ToolBase):
                 getattr(reuse_thread, "_timeout_seconds", None),
                 fallback=300.0,
             )
+            # ── Commit 8: dispatch window opens — query about to be delivered ──
+            dispatch_started_at = time.time()
             try:
                 response = reuse_thread.send_query(query, timeout=wait)
             except TimeoutError as exc:
@@ -3901,6 +3914,8 @@ class Worker(ToolBase):
                     "status": reuse_thread.status,
                 }
             elapsed = reuse_thread._last_elapsed()
+            # ── Commit 8: dispatch window closes — envelope about to return ──
+            dispatch_finished_at = time.time()
             return {
                 "worker_name": self.worker_name,
                 "instance_id": reuse_iid,
@@ -3909,6 +3924,18 @@ class Worker(ToolBase):
                 "status": reuse_thread.status,
                 "response": response,
                 "elapsed_seconds": round(elapsed, 1) if elapsed is not None else None,
+                # Commit 8: worker's self-measured value, never trusted as the
+                # dispatch duration (anti-pattern member 4).  Always present;
+                # null when the worker self-reported nothing.
+                "worker_self_reported": (
+                    {"elapsed_seconds": round(elapsed, 1)}
+                    if elapsed is not None else None
+                ),
+                # Commit 8: dispatcher-side timing (this parent process).
+                "spawn_started_at": spawn_started_at,
+                "dispatch_started_at": dispatch_started_at,
+                "dispatch_finished_at": dispatch_finished_at,
+                "dispatch_duration_wall": dispatch_finished_at - dispatch_started_at,
             }
 
         if resume_paused_worker is not None:
@@ -3936,6 +3963,8 @@ class Worker(ToolBase):
             except queue.Empty:
                 pass
 
+            # ── Commit 8: dispatch window opens — query about to be delivered ──
+            dispatch_started_at = time.time()
             resume_paused_worker._input_queue.put(query)
             if stale_query is not None:
                 resume_paused_worker._input_queue.put(stale_query)
@@ -3963,6 +3992,17 @@ class Worker(ToolBase):
             elapsed = resume_paused_worker._last_elapsed()
             if elapsed is not None:
                 parsed["elapsed_seconds"] = round(elapsed, 1)
+            # ── Commit 8: dispatch window closes — envelope about to return ──
+            dispatch_finished_at = time.time()
+            # Commit 8: self-reported value (never trusted as dispatch duration).
+            parsed["worker_self_reported"] = (
+                {"elapsed_seconds": round(elapsed, 1)}
+                if elapsed is not None else None
+            )
+            parsed["spawn_started_at"] = spawn_started_at
+            parsed["dispatch_started_at"] = dispatch_started_at
+            parsed["dispatch_finished_at"] = dispatch_finished_at
+            parsed["dispatch_duration_wall"] = dispatch_finished_at - dispatch_started_at
             return parsed
 
         # ── Session-level spawn cap ──
@@ -4180,6 +4220,8 @@ class Worker(ToolBase):
                 }
             _worker_registry[(session_key, self.worker_name, spawn_iid)] = thread
 
+        # ── Commit 8: dispatch window opens — the worker thread starts here ──
+        dispatch_started_at = time.time()
         thread.start()
 
         if missing_tools:
@@ -4227,15 +4269,34 @@ class Worker(ToolBase):
             elapsed = thread._last_elapsed()
             if elapsed is not None:
                 parsed["elapsed_seconds"] = round(elapsed, 1)
+            # ── Commit 8: dispatch window closes — envelope about to return ──
+            dispatch_finished_at = time.time()
+            # Commit 8: self-reported value (never trusted as dispatch duration).
+            parsed["worker_self_reported"] = (
+                {"elapsed_seconds": round(elapsed, 1)}
+                if elapsed is not None else None
+            )
+            parsed["spawn_started_at"] = spawn_started_at
+            parsed["dispatch_started_at"] = dispatch_started_at
+            parsed["dispatch_finished_at"] = dispatch_finished_at
+            parsed["dispatch_duration_wall"] = dispatch_finished_at - dispatch_started_at
             return parsed
         else:
             # No auto-query — return immediately; worker stays alive
+            # ── Commit 8: dispatch window closes — envelope about to return ──
+            dispatch_finished_at = time.time()
             return {
                 "worker_name": self.worker_name,
                 "instance_id": thread.instance_id,
                 "instance_label": thread.instance_label,
                 "spawned": True,
                 "status": "ready",
+                # Commit 8: worker reported nothing yet (no query ran).
+                "worker_self_reported": None,
+                "spawn_started_at": spawn_started_at,
+                "dispatch_started_at": dispatch_started_at,
+                "dispatch_finished_at": dispatch_finished_at,
+                "dispatch_duration_wall": dispatch_finished_at - dispatch_started_at,
             }
 
     def _heartbeat_summary(self, hb_iso: Optional[str]):
