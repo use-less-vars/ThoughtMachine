@@ -60,14 +60,14 @@ except ImportError:
     get_effective_permissions = None
 
 try:
-    from docker_executor import get_container_status as _get_docker_status
+    from infra.containers.executor import get_container_status as _get_docker_status
     DOCKER_EXECUTOR_AVAILABLE = True
 except ImportError:
     DOCKER_EXECUTOR_AVAILABLE = False
     _get_docker_status = None
 
 try:
-    from docker_executor import DockerExecutor
+    from infra.containers.executor import DockerExecutor
     DOCKER_EXECUTOR_CLS_AVAILABLE = True
 except ImportError:
     DOCKER_EXECUTOR_CLS_AVAILABLE = False

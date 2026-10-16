@@ -361,7 +361,7 @@ class TestResolveContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w, wp=None: {"network": "write", "filesystem": "write", "container": True},
         )
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "write", "filesystem": "write"},
         )
@@ -383,7 +383,7 @@ class TestResolveContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w, wp=None: {"network": False, "filesystem": "write", "container": True},
         )
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "write", "filesystem": "write"},
         )
@@ -405,7 +405,7 @@ class TestResolveContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w, wp=None: {"network": "write", "filesystem": "read", "container": False},
         )
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "write", "filesystem": "write"},
         )
@@ -424,7 +424,7 @@ class TestResolveContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w, wp=None: {"network": "write", "filesystem": "ask", "container": True},
         )
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "write", "filesystem": "ask"},
         )
@@ -435,7 +435,7 @@ class TestResolveContainerConfigFromPermissions:
         """full filesystem → fail-closed none + ro (token removed)."""
         import security.security_gate as sg
         monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "write", "filesystem": "full"},
         )
@@ -454,7 +454,7 @@ class TestResolveContainerConfigFromPermissions:
             sg, "get_effective_permissions",
             lambda s, w, wp=None: {"network": "banned", "filesystem": "write", "container": True},
         )
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "banned", "filesystem": "write"},
         )
@@ -467,7 +467,7 @@ class TestResolveContainerConfigFromPermissions:
         def _raise(*a):
             raise RuntimeError("gate down")
         monkeypatch.setattr(sg, "get_workspace_capabilities", _raise)
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             "ws-123", {"network": "write", "filesystem": "write"},
         )
@@ -478,7 +478,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_fallback_write_network_and_fs(self, monkeypatch):
         """No workspace_id, write perms → fail-closed none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, {"network": "write", "filesystem": "write"},
         )
@@ -487,7 +487,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_fallback_banned_network(self, monkeypatch):
         """No workspace_id, banned network → fail-closed none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, {"network": "banned", "filesystem": "write"},
         )
@@ -496,7 +496,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_fallback_ask_network(self, monkeypatch):
         """No workspace_id, ask network → fail-closed none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, {"network": "ask", "filesystem": "write"},
         )
@@ -505,7 +505,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_fallback_read_filesystem(self, monkeypatch):
         """No workspace_id, read filesystem → fail-closed none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, {"network": "write", "filesystem": "read"},
         )
@@ -514,7 +514,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_fallback_ask_filesystem_ro(self, monkeypatch):
         """No workspace_id, ask filesystem → fail-closed none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, {"network": "write", "filesystem": "ask"},
         )
@@ -523,7 +523,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_fallback_full_filesystem(self, monkeypatch):
         """No workspace_id, full filesystem → fail-closed none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, {"network": "write", "filesystem": "full"},
         )
@@ -532,7 +532,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_fallback_defaults_when_missing_keys(self, monkeypatch):
         """No workspace_id, empty perms dict → defaults (none + ro)."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, {},
         )
@@ -543,7 +543,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_safe_defaults_no_permissions(self, monkeypatch):
         """Both None → none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, None,
         )
@@ -552,7 +552,7 @@ class TestResolveContainerConfigFromPermissions:
 
     def test_safe_defaults_no_workspace_id_no_permissions(self, monkeypatch):
         """workspace_id None + permissions None → none + ro."""
-        from docker_executor import _resolve_container_config_via_gate
+        from infra.containers.executor import _resolve_container_config_via_gate
         net, mode = _resolve_container_config_via_gate(
             None, None,
         )

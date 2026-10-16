@@ -687,7 +687,7 @@ def setup_docker_sandbox(
         import os
         import importlib
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import docker_executor
+        import infra.containers.executor as docker_executor
         DockerExecutor = importlib.reload(docker_executor).DockerExecutor
     except ImportError as e:
         raise DockerSetupError(f"Could not import DockerExecutor: {e}")

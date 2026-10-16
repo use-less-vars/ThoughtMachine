@@ -66,7 +66,7 @@ try:
     import docker  # noqa: E402
     from docker.types import Mount  # noqa: E402
 
-    from docker_executor import (  # noqa: E402
+    from infra.containers.executor import (  # noqa: E402
         _resolve_container_config_via_gate,
     )
     # from tools import ... also verifies the tools/__init__.py re-exports

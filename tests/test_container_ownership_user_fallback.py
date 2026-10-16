@@ -279,8 +279,8 @@ def _executor_run_kwargs(monkeypatch, host_user_value):
     import hashlib
     from unittest.mock import MagicMock
 
-    import docker_executor
-    from docker_executor import DockerExecutor
+    import infra.containers.executor as docker_executor
+    from infra.containers.executor import DockerExecutor
     import security.admission_gate as admission_gate
     from security.admission_gate import Allow
 

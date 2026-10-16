@@ -67,7 +67,7 @@ def mock_docker(mock_container: MagicMock) -> MagicMock:
     """
     import docker as _docker
 
-    from docker_executor import (
+    from infra.containers.executor import (
         EXECUTOR_BUILD_HASH_LABEL,
         LIFECYCLE_PERSISTENT,
         build_container_name,
@@ -153,9 +153,9 @@ def _make_executor(
     workspace_id: str | None = "test-ws",
 ) -> "DockerExecutor":
     """Return a DockerExecutor with ``docker.from_env()`` and workspace mocks."""
-    from docker_executor import DockerExecutor
+    from infra.containers.executor import DockerExecutor
 
-    with patch("docker_executor.docker.from_env", return_value=mock_docker_client):
+    with patch("infra.containers.executor.docker.from_env", return_value=mock_docker_client):
         executor = DockerExecutor(
             workspace_path="/tmp/test-workspace",
             image="agent-executor-test",

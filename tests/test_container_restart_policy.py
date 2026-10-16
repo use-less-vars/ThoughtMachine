@@ -351,7 +351,7 @@ def test_site3_resource_container_manager_legacy_create(monkeypatch):
 
 
 def test_site4_docker_executor_ensure_container(monkeypatch):
-    from docker_executor import DockerExecutor
+    from infra.containers.executor import DockerExecutor
 
     try:
         from docker.errors import NotFound
@@ -371,7 +371,7 @@ def test_site4_docker_executor_ensure_container(monkeypatch):
         admission_gate, "admit", lambda request, *, probes=None: Allow(spec=request.spec)
     )
 
-    with patch("docker_executor.docker.from_env", return_value=client):
+    with patch("infra.containers.executor.docker.from_env", return_value=client):
         executor = DockerExecutor(
             workspace_path="/tmp/tm-rp-ws",
             image="agent-executor-test",

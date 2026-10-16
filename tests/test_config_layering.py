@@ -612,7 +612,7 @@ def test_idle_timeout_constants_are_unified():
 
     assert IDLE_TIMEOUT_SECONDS == 600
 
-    from docker_executor import DockerExecutor
+    from infra.containers.executor import DockerExecutor
     from tools.docker_code_runner import DockerCodeRunner
     from thoughtmachine.security import setup_docker_sandbox
     from tools.workspace.check_system import CheckSystem

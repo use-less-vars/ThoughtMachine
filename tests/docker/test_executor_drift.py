@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import docker_executor as dex
+import infra.containers.executor as dex
 import infra.resource_container_manager as rcm
 
 try:

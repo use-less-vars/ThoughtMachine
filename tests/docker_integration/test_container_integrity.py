@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # The conftest fixes sys.path so this import works
-from docker_executor import verify_container_integrity
+from infra.containers.executor import verify_container_integrity
 
 
 # ===================================================================
@@ -376,7 +376,7 @@ class TestRecordLabelLookup:
     def _patches(self, tmp_path):
         return (
             patch("thoughtmachine.vault.vault_root", return_value=str(tmp_path)),
-            patch("docker_executor._resolve_workspace_id", return_value=self._WS),
+            patch("infra.containers.executor._resolve_workspace_id", return_value=self._WS),
         )
 
     def test_lookup_via_label_when_name_drifted(
