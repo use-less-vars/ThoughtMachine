@@ -1589,7 +1589,7 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
         "permissions": permissions,
         "allow_host_resources": allow_host_resources,
         "raw": raw,
-        "effective": permissions,
+        "declared_ceiling": permissions,
         "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 

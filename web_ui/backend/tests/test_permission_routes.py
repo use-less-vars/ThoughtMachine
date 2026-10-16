@@ -515,7 +515,7 @@ class TestWorkspacePermissionsRoutes:
         assert data["allow_host_resources"] is False
         assert data["raw"] == CATALOG_DEFAULTS
         assert data["permissions"] == CATALOG_DEFAULTS
-        assert data["effective"] == CATALOG_DEFAULTS
+        assert data["declared_ceiling"] == CATALOG_DEFAULTS
         _assert_iso_utc(data["resolved_at"])
 
     def test_put_then_get_roundtrip_persists_config(self, vault):
@@ -613,7 +613,7 @@ class TestWorkspacePermissionsRoutes:
         get_data = get.json()
         assert get_data["raw"] == {}
         assert get_data["permissions"] == {}
-        assert get_data["effective"] == {}
+        assert get_data["declared_ceiling"] == {}
         assert get_data["allow_host_resources"] is False
 
     def test_put_empty_permissions_keeps_allow_host_resources(self, vault):
@@ -647,7 +647,7 @@ class TestWorkspacePermissionsRoutes:
         assert data["raw"] == {}
         # No stored permissions -> empty (no read-time preset fallback).
         assert data["permissions"] == {}
-        assert data["effective"] == {}
+        assert data["declared_ceiling"] == {}
 
 
 class TestWorkspaceEffectivePermissionsRoutes:
