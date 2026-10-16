@@ -798,7 +798,7 @@ async def lifespan(app: FastAPI):
     # run with permissive settings are stopped and removed.
     try:
         import docker
-        from docker_executor import verify_container_integrity
+        from infra.containers.executor import verify_container_integrity
         client = docker.from_env()
         # List all containers with names starting with agent-exec-
         all_containers = client.containers.list(all=True, filters={"name": "agent-exec-"})
@@ -2962,7 +2962,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     if not workspace:
                         await ws.send_json({"type": "rebuild_result", "status": "error", "build_log": "No workspace path provided."})
                     else:
-                        from docker_executor import rebuild_container
+                        from infra.containers.executor import rebuild_container
                         try:
                             result = rebuild_container(workspace)
                             await ws.send_json({"type": "rebuild_result", "status": result.get("status", "unknown"), "build_log": result.get("build_log", "")})
@@ -3367,7 +3367,7 @@ def container_integrity(workspace: str = "", permissions: str = ""):
                 "desired": {}, "actual": None,
                 "mismatch_reason": "No workspace path provided."}
 
-    from docker_executor import get_integrity_status
+    from infra.containers.executor import get_integrity_status
 
     sp = None
     if permissions:
@@ -3395,7 +3395,7 @@ def container_status(workspace: str = ""):
         return {"status": "unavailable", "capabilities": {}, "build_log": ""}
 
     # Import lazily to avoid circular imports at module level
-    from docker_executor import get_container_status
+    from infra.containers.executor import get_container_status
 
     try:
         result = get_container_status(workspace)

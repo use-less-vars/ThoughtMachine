@@ -35,8 +35,8 @@ from agent.config.defaults import host_user
 import security.admission_gate as admission_gate
 from security.admission_gate import AdmissionDenied
 
-import docker_executor
-from docker_executor import DockerExecutor
+import infra.containers.executor as docker_executor
+from infra.containers.executor import DockerExecutor
 
 import infra.container_manager as container_manager
 from infra.container_manager import ContainerManager, _user_drift_axis

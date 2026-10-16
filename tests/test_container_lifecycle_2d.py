@@ -100,10 +100,10 @@ def _manager(monkeypatch, containers):
 
 
 def _make_executor(session_permissions=None, workspace_id="ws-1"):
-    from docker_executor import DockerExecutor
+    from infra.containers.executor import DockerExecutor
 
     client = MagicMock()
-    with patch("docker_executor.docker.from_env", return_value=client):
+    with patch("infra.containers.executor.docker.from_env", return_value=client):
         return DockerExecutor(
             workspace_path="/tmp/tm-2d-exec-ws",
             image="agent-executor-test",
@@ -313,7 +313,7 @@ def _spy_reconcile_intents(monkeypatch):
 
 def _shortcircuit_create(monkeypatch):
     """Make the (offline) create path raise immediately at create_hardened_*."""
-    import docker_executor as de
+    import infra.containers.executor as de
     import security.admission_gate as ag
 
     dummy = types.SimpleNamespace(mounts=[], tmpfs={})
@@ -498,7 +498,7 @@ def test_ensure_start_failed_container_still_reaps(monkeypatch):
 # --- U9: _remove_container_by_workspace routes through the funnel ----------
 
 def _wire_rebuild(monkeypatch, container):
-    import docker_executor as de
+    import infra.containers.executor as de
 
     client = MagicMock()
     client.containers.get.return_value = container

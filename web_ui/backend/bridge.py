@@ -1421,7 +1421,7 @@ class WebAgentBridge:
 
         sp_dict = session_permissions.model_dump() if hasattr(session_permissions, 'model_dump') else session_permissions
         try:
-            from docker_executor import verify_container_integrity
+            from infra.containers.executor import verify_container_integrity
             result = verify_container_integrity(workspace_path, sp_dict)
             if result.get('action_taken') == 'removed':
                 log('INFO', 'server.bridge',

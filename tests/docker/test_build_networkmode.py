@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import docker_executor as dex
+import infra.containers.executor as dex
 
 
 def _fake_build(calls):

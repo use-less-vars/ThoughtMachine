@@ -24,8 +24,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import docker_executor
-from docker_executor import DockerExecutor
+import infra.containers.executor as docker_executor
+from infra.containers.executor import DockerExecutor
 import security.admission_gate as admission_gate
 from security.admission_gate import Allow
 
@@ -136,7 +136,7 @@ def _drive_ensure_container(monkeypatch):
     # Pass the root-host guard (non-root host id).
     monkeypatch.setattr(docker_executor, "_host_ids", lambda: (1000, 1000))
 
-    with patch("docker_executor.docker.from_env", return_value=client):
+    with patch("infra.containers.executor.docker.from_env", return_value=client):
         executor = DockerExecutor(
             workspace_path="/tmp/tm-exec-record-ws",
             image="agent-executor-test",

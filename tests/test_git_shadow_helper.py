@@ -59,7 +59,7 @@ def test_t3b_git_file_with_no_mask_path_refuses(tmp_path):
 
 def test_t4_both_create_sites_use_the_shared_helper():
     import infra.container_manager as cm
-    import docker_executor as de
+    import infra.containers.executor as de
 
     cm_src = inspect.getsource(cm.ContainerManager._fresh_start)
     de_src = inspect.getsource(de.DockerExecutor._ensure_container)

@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest  # noqa: F401  (pytest fixtures/raises used across the file)
 
 from security.gate_helpers import resolve_network_mode
-from docker_executor import _resolve_container_config_via_gate
+from infra.containers.executor import _resolve_container_config_via_gate
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
 from security.security_gate import resolve_container_config

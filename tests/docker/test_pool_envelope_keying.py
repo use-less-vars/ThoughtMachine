@@ -35,8 +35,8 @@ _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
 
-import docker_executor  # noqa: E402
-from docker_executor import (  # noqa: E402
+import infra.containers.executor as docker_executor  # noqa: E402
+from infra.containers.executor import (  # noqa: E402
     _safe_session_tag,
     build_container_name,
     normalize_workspace_path,
@@ -120,7 +120,7 @@ class TestSitesRouteThroughBuilder:
         )
 
     def test_docker_executor_ensure_container_site2(self, monkeypatch):
-        from docker_executor import DockerExecutor
+        from infra.containers.executor import DockerExecutor
 
         forced_network, forced_mode = "bridge", "rw"
         executor = object.__new__(DockerExecutor)
@@ -323,7 +323,7 @@ class _RecordingClient:
 
 class TestRemainingSitesRouteThroughBuilder:
     def _bare_build_executor(self, workspace_id="ws-envelope-test"):
-        from docker_executor import DockerExecutor
+        from infra.containers.executor import DockerExecutor
 
         executor = object.__new__(DockerExecutor)
         executor.workspace_path = WS

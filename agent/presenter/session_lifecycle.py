@@ -318,7 +318,7 @@ class SessionLifecycle:
             # If a container exists with stale permissions (e.g. from before
             # the security refactor), remove it so it gets recreated.
             try:
-                from docker_executor import verify_container_integrity
+                from infra.containers.executor import verify_container_integrity
                 ws_path = (
                     session.metadata.get('workspace_path')
                     or getattr(self.state_bridge.current_config, 'workspace_path', None)
@@ -374,7 +374,7 @@ class SessionLifecycle:
 
         # ── Verify container integrity on session load ──────────────
         try:
-            from docker_executor import verify_container_integrity
+            from infra.containers.executor import verify_container_integrity
             ws_path = (
                 session.metadata.get('workspace_path')
                 or getattr(self.state_bridge.current_config, 'workspace_path', None)

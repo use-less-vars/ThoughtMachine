@@ -197,7 +197,7 @@ def _load_docker_executor():
             repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             if repo_root not in sys.path:
                 sys.path.insert(0, repo_root)
-            import docker_executor  # noqa: F401 — deliberately NOT reloaded
+            import infra.containers.executor as docker_executor  # noqa: F401 — deliberately NOT reloaded
             _docker_executor_module = docker_executor
         return _docker_executor_module
 

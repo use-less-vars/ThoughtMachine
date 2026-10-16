@@ -42,7 +42,7 @@ import infra.container_registry as container_registry
 from infra.container_registry import ContainerProfile
 
 import infra.resource_container_manager as rcm
-from docker_executor import DockerExecutor
+from infra.containers.executor import DockerExecutor
 
 try:
     from docker.errors import NotFound
@@ -163,7 +163,7 @@ def _executor_container_name(workspace_path="/tmp/tm-adm-ws"):
 
 
 def _make_executor(client, workspace_id="ws-1"):
-    with patch("docker_executor.docker.from_env", return_value=client):
+    with patch("infra.containers.executor.docker.from_env", return_value=client):
         return DockerExecutor(
             workspace_path="/tmp/tm-adm-ws",
             image="agent-executor-test",

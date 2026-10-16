@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from docker_executor import (
+from infra.containers.executor import (
     _resolve_container_config_via_gate,
     _resolve_workspace_id,
     verify_container_integrity,

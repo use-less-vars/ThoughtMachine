@@ -66,7 +66,7 @@ _build_in_progress: bool = False
 # algorithm is identical to infra/resource_container_manager.py so the two
 # systems' hashes are comparable.
 EXECUTOR_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXECUTOR_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
 EXECUTOR_RUNTIME_DOCKERFILE = os.path.join(_REPO_ROOT, "resources", "default_dockerfile.txt")
 

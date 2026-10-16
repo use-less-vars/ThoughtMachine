@@ -354,7 +354,7 @@ def _patch_verify(monkeypatch, container):
     """
     from unittest.mock import MagicMock
 
-    import docker_executor
+    import infra.containers.executor as docker_executor
 
     client = MagicMock()
     client.containers.get.return_value = container
@@ -374,7 +374,7 @@ def _patch_verify(monkeypatch, container):
 def test_get_integrity_status_mismatch_is_read_only(monkeypatch):
     """(g) ``get_integrity_status`` reports a mismatch without touching the
     container -- a refused mismatch maps to ``status == "mismatch"``."""
-    from docker_executor import get_integrity_status
+    from infra.containers.executor import get_integrity_status
 
     container = FakeContainer(network_mode="bridge", mount_mode="ro")
     _patch_verify(monkeypatch, container)
@@ -390,7 +390,7 @@ def test_verify_container_integrity_field_repro_leaves_container_intact(monkeypa
     """(h) Field repro: ``verify_container_integrity`` with
     ``session_permissions=None`` on a permissions-drifted container REFUSES
     (action_taken ``"refused"``) and leaves it running -- no stop/remove."""
-    from docker_executor import verify_container_integrity
+    from infra.containers.executor import verify_container_integrity
 
     container = FakeContainer(network_mode="bridge", mount_mode="ro")
     _patch_verify(monkeypatch, container)
