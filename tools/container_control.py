@@ -32,6 +32,7 @@ permissions allow a bridge network.
 """
 
 import json
+import logging
 import os
 import time
 from datetime import datetime
@@ -41,7 +42,9 @@ from pydantic import Field
 
 from .base import ToolBase
 
-from agent.config.defaults import DEFAULT_IMAGE
+from agent.config.defaults import DEFAULT_IMAGE, WORKSPACE_ID_LABEL
+
+logger = logging.getLogger(__name__)
 
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the container tools keep working outside a worker turn.
@@ -666,11 +669,45 @@ class ContainerStatusTool(_ContainerControlBase):
             "grain_required_for_remove": grain_required_for_remove,
         }
 
+    def _workspace_ownership_refusal(self, manager) -> Optional[str]:
+        """Return a refusal message when the container is not owned by this workspace.
+
+        The container's ``thoughtmachine.workspace_id`` label must match the
+        caller's workspace; a mismatch (or an unresolvable caller workspace)
+        fails closed so a session can never inspect another workspace's
+        container. Returns None when ownership is confirmed or the container
+        cannot be resolved (a missing container has nothing to compare).
+        """
+        try:
+            container = manager.client.containers.get(self.container_id)
+        except Exception:
+            return None
+        labels = getattr(container, "labels", None) or {}
+        owner_ws = labels.get(WORKSPACE_ID_LABEL) if hasattr(labels, "get") else None
+        caller_ws = getattr(manager, "workspace_id", None)
+        if not caller_ws or str(caller_ws) in ("", "default"):
+            return "cannot verify container ownership: this session's workspace is unknown"
+        if owner_ws and str(owner_ws) != str(caller_ws):
+            return (f"container belongs to workspace `{owner_ws}`; "
+                    f"this session is `{caller_ws}`.")
+        if not owner_ws:
+            logger.warning(
+                "container %s has no workspace_id label; caller workspace "
+                "unknown, allowing query (legacy container).",
+                self.container_id,
+            )
+        return None
+
     def execute(self) -> str:
         start_time = time.time()
         try:
             manager = self._make_manager()
             result = manager.status(self.container_id)
+            _refusal = self._workspace_ownership_refusal(manager)
+            if _refusal is not None:
+                return self._respond(False, status="error", error=_refusal,
+                                     container_id=self.container_id,
+                                     duration=time.time() - start_time)
             described = dict(result)
             if described.get("status") == "missing":
                 described.update(
