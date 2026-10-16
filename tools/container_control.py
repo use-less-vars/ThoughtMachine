@@ -32,6 +32,7 @@ permissions allow a bridge network.
 """
 
 import json
+import logging
 import os
 import time
 from datetime import datetime
@@ -42,6 +43,8 @@ from pydantic import Field
 from .base import ToolBase
 
 from agent.config.defaults import DEFAULT_IMAGE, WORKSPACE_ID_LABEL
+
+logger = logging.getLogger(__name__)
 
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the container tools keep working outside a worker turn.
@@ -687,6 +690,12 @@ class ContainerStatusTool(_ContainerControlBase):
         if owner_ws and str(owner_ws) != str(caller_ws):
             return (f"container belongs to workspace `{owner_ws}`; "
                     f"this session is `{caller_ws}`.")
+        if not owner_ws:
+            logger.warning(
+                "container %s has no workspace_id label; caller workspace "
+                "unknown, allowing query (legacy container).",
+                self.container_id,
+            )
         return None
 
     def execute(self) -> str:

@@ -9,6 +9,7 @@ Docker: the manager is a MagicMock and ``_make_manager`` is patched.
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 from agent.config.defaults import WORKSPACE_ID_LABEL
@@ -73,3 +74,17 @@ def test_allows_unlabeled_container():
 
     assert result["success"] is True
     assert result["status"] == "running"
+
+
+def test_warns_on_unlabeled_legacy_container(caplog):
+    """M3: an unlabeled (legacy) container is allowed but logs a WARNING."""
+    manager = _manager("ws-a", {})
+    with caplog.at_level(logging.WARNING, logger=ContainerStatusTool.__module__):
+        result = _run(manager)
+
+    assert result["success"] is True
+    assert result["status"] == "running"
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any(
+        "has no workspace_id label" in m and "abc123" in m for m in messages
+    ), messages
