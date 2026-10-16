@@ -17,6 +17,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import useWorkspaceStore from '../workspaceStore'
+import useSessionTabsStore from '../../sessionTabsStore'
 
 // ---------------------------------------------------------------------------
 // fetch stubs
@@ -65,6 +66,7 @@ const CONFIG_ROUTES = {
 beforeEach(() => {
   localStorage.clear()
   useWorkspaceStore.getState().reset()
+  useSessionTabsStore.setState({ byWorkspace: {} })
 })
 
 afterEach(() => {
@@ -190,6 +192,30 @@ describe('fetchWorkspaceConfig', () => {
     stubFetchByUrl({ ...CONFIG_ROUTES, '/api/health/containers': jsonErr('down') })
     await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
     expect(useWorkspaceStore.getState().dockerAvailable).toBeNull()
+  })
+
+  it('passes the active session id as a session_id query param (session-scoped fetch)', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    useSessionTabsStore.setState({
+      byWorkspace: {
+        'ws-1': { tabs: [{ sessionId: 'sess-42', title: 'T' }], activeSessionId: 'sess-42' },
+      },
+    })
+    const fetchMock = stubFetchByUrl(CONFIG_ROUTES)
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    const urls = fetchMock.mock.calls.map(([url]) => String(url))
+    expect(urls.some((u) => u.includes('/effective_permissions?session_id=sess-42'))).toBe(true)
+    expect(useWorkspaceStore.getState().currentWorkspace.permissionsSessionScoped).toBe(true)
+  })
+
+  it('omits session_id and flags permissionsSessionScoped=false when no session is active', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    const fetchMock = stubFetchByUrl(CONFIG_ROUTES)
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    const urls = fetchMock.mock.calls.map(([url]) => String(url))
+    expect(urls.some((u) => u.includes('/effective_permissions?session_id='))).toBe(false)
+    expect(urls.some((u) => u.endsWith('/api/workspace/ws-1/effective_permissions'))).toBe(true)
+    expect(useWorkspaceStore.getState().currentWorkspace.permissionsSessionScoped).toBe(false)
   })
 })
 

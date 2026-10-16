@@ -88,6 +88,10 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
 
   const wsMatch = currentWorkspace?.id === workspaceId
   const permissions = wsMatch ? (currentWorkspace.permissions || []) : []
+  // Whether the store resolved these permissions for an ACTIVE session. When
+  // false, the panel must not present the backend's default response as
+  // authoritative (see fetchWorkspaceConfig in store/workspaceStore.js).
+  const permissionsSessionScoped = wsMatch && !!currentWorkspace.permissionsSessionScoped
   const workers = wsMatch ? activeWorkers : []
   const containers = (wsMatch ? (currentWorkspace.containers || []) : [])
     .filter((c) => c.kind !== 'resource')
@@ -142,6 +146,9 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
         {/* ── 1. Permissions (read-only ceiling + effective) ─────────────── */}
         <section className="session-sidebar-section">
           <h4>Permissions</h4>
+          {wsMatch && !wsLoading && !permissionsSessionScoped && (
+            <p className="session-sidebar-hint">No active session — showing defaults</p>
+          )}
           {wsLoading && wsMatch ? (
             <p className="session-sidebar-empty">Loading permissions...</p>
           ) : permissions.length === 0 ? (

@@ -38,6 +38,7 @@ import SessionSidebar from '../SessionSidebar'
 import SessionTab from '../SessionTab'
 import useWorkspaceStore from '../../store/workspaceStore'
 import useStore from '../../store/useStore'
+import useSessionTabsStore from '../../sessionTabsStore'
 
 // ---------------------------------------------------------------------------
 // Mock WebSocket (SessionTab wiring test) + ResizeObserver (jsdom lacks it)
@@ -219,6 +220,7 @@ beforeEach(() => {
   vi.stubGlobal('ResizeObserver', MockResizeObserver)
   useWorkspaceStore.getState().reset()
   useStore.getState().reset()
+  useSessionTabsStore.setState({ byWorkspace: {} })
 })
 
 afterEach(() => {
@@ -299,6 +301,26 @@ describe('SessionSidebar — permissions (read-only)', () => {
     expect(screen.queryByText('enabled')).not.toBeInTheDocument()
     // network, mcp and host_bash are banned in both columns.
     expect(screen.getAllByText('banned')).toHaveLength(6)
+  })
+
+  it('shows a "no active session" notice when the workspace has no active session', async () => {
+    stubBackend()
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    expect(screen.getByText('No active session — showing defaults')).toBeInTheDocument()
+  })
+
+  it('hides the notice once an active session resolves the effective permissions', async () => {
+    useSessionTabsStore.setState({
+      byWorkspace: {
+        'ws-1': { tabs: [{ sessionId: 's1', title: 'T' }], activeSessionId: 's1' },
+      },
+    })
+    stubBackend()
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    expect(screen.queryByText('No active session — showing defaults')).not.toBeInTheDocument()
+    expect(screen.getByText('Effective (session default)')).toBeInTheDocument()
   })
 
   it('is read-only — no buttons, checkboxes or text inputs inside the section', async () => {

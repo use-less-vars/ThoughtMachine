@@ -10,6 +10,7 @@
 
 import { create } from 'zustand'
 import purposeDefinitions from '../data/purposeDefinitions.json'
+import useSessionTabsStore from '../sessionTabsStore'
 
 const API_BASE = ''
 
@@ -322,10 +323,22 @@ const useWorkspaceStore = create((set, get) => ({
     set({ isLoading: true, error: '' })
 
     const fallbackEntry = get().workspaceList.find((w) => w.id === id)
+
+    // Session scoping: pass the workspace's ACTIVE session id so the backend
+    // resolves that session's effective permissions. When no session is active
+    // we still call the endpoint (no session_id) and flag the result below so
+    // the panel can show an explicit "showing defaults" notice instead of
+    // presenting the endpoint's default response as authoritative.
+    const activeSessionId =
+      useSessionTabsStore.getState().byWorkspace[id]?.activeSessionId || null
+    const effectivePermissionsUrl =
+      `${API_BASE}/api/workspace/${encodeURIComponent(id)}/effective_permissions` +
+      (activeSessionId ? `?session_id=${encodeURIComponent(activeSessionId)}` : '')
+
     try {
       const [listData, permsData, healthData, workersData, containersData, sessionsData] = await Promise.all([
         tryGet(`${API_BASE}/api/workspace/list`),
-        tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/effective_permissions`),
+        tryGet(effectivePermissionsUrl),
         tryGet(`${API_BASE}/api/health/containers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/workers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers`),
@@ -422,6 +435,7 @@ const useWorkspaceStore = create((set, get) => ({
         workers,
         sessions,
         sessionDefaults,
+        permissionsSessionScoped: Boolean(activeSessionId),
       }
 
       set((state) => ({
