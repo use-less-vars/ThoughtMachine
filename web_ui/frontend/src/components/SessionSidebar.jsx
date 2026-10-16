@@ -92,6 +92,9 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
   // false, the panel must not present the backend's default response as
   // authoritative (see fetchWorkspaceConfig in store/workspaceStore.js).
   const permissionsSessionScoped = wsMatch && !!currentWorkspace.permissionsSessionScoped
+  // Session permission values that exceed their workspace ceiling, as reported
+  // by the backend (carried on the workspace by the store). [] when none.
+  const permissionContradictions = wsMatch ? (currentWorkspace.permissionContradictions || []) : []
   const workers = wsMatch ? activeWorkers : []
   const containers = (wsMatch ? (currentWorkspace.containers || []) : [])
     .filter((c) => c.kind !== 'resource')
@@ -149,6 +152,17 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
           {wsMatch && !wsLoading && !permissionsSessionScoped && (
             <p className="session-sidebar-hint">No active session — showing defaults</p>
           )}
+          {wsMatch && !wsLoading && permissionContradictions.length > 0 && (
+            <ul className="session-sidebar-hint" data-testid="permission-contradictions">
+              {permissionContradictions.map((c) => (
+                <li key={c.resource}>
+                  {typeof c.reason === 'string' && c.reason
+                    ? c.reason
+                    : `session ${renderPermissionValue(c.session_value)} exceeds ceiling ${renderPermissionValue(c.workspace_value)}`}
+                </li>
+              ))}
+            </ul>
+          )}
           {wsLoading && wsMatch ? (
             <p className="session-sidebar-empty">Loading permissions...</p>
           ) : permissions.length === 0 ? (
@@ -159,7 +173,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
                 <tr>
                   <th>Permission</th>
                   <th>Ceiling (workspace max)</th>
-                  <th>Effective (session default)</th>
+                  <th>{permissionsSessionScoped ? 'Effective (active session)' : 'Effective (session default)'}</th>
                 </tr>
               </thead>
               <tbody>

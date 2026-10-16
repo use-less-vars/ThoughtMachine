@@ -136,6 +136,17 @@ const DEFAULT_ROUTES = {
       mcp: 'banned',
       host_bash: 'banned',
     },
+    // The endpoint reports the workspace ceiling separately, listing only the
+    // resources it actually restricted. container + the three banned resources
+    // are ceiling-bound; git/filesystem are 'present but never restrictive' and
+    // omitted → their ceiling renders the em-dash placeholder.
+    workspace_ceiling: {
+      container: true,
+      network: 'banned',
+      mcp: 'banned',
+      host_bash: 'banned',
+    },
+    contradictions: [],
   }),
   '/api/health/containers': jsonOk({ docker: 'reachable' }),
   '/api/workspace/ws-1/workers/active': jsonOk([
@@ -320,7 +331,74 @@ describe('SessionSidebar — permissions (read-only)', () => {
     renderSidebar({ tools: [] })
     await act(async () => {})
     expect(screen.queryByText('No active session — showing defaults')).not.toBeInTheDocument()
-    expect(screen.getByText('Effective (session default)')).toBeInTheDocument()
+    // Session-scoped: the effective column is labelled for the active session.
+    expect(screen.getByText('Effective (active session)')).toBeInTheDocument()
+    expect(screen.queryByText('Effective (session default)')).not.toBeInTheDocument()
+  })
+
+  it('renders the ceiling column from the response workspace_ceiling, not the effective value', async () => {
+    stubBackend({
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { git: 'read', filesystem: 'read' },
+        workspace_ceiling: { git: 'write', filesystem: 'write' },
+        contradictions: [],
+      }),
+    })
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    // ceiling column 'write' (2 rows), effective column 'read' (2 rows).
+    expect(screen.getAllByText('write')).toHaveLength(2)
+    expect(screen.getAllByText('read')).toHaveLength(2)
+  })
+
+  it('renders an em-dash ceiling (not the effective value) when workspace_ceiling is {}', async () => {
+    stubBackend({
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { git: 'write', filesystem: 'read' },
+        workspace_ceiling: {},
+        contradictions: [],
+      }),
+    })
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    const section = screen.getByRole('heading', { name: 'Permissions' }).closest('section')
+    const rows = Array.from(section.querySelectorAll('tbody tr'))
+    expect(rows).toHaveLength(6)
+    for (const row of rows) {
+      // Ceiling column [1] is the em-dash; it must NOT echo the effective value.
+      expect(row.querySelectorAll('td')[1].textContent).toBe('\u2014')
+    }
+    const gitRow = rows.find((r) => r.querySelectorAll('td')[0].textContent === 'git')
+    expect(gitRow.querySelectorAll('td')[2].textContent).toBe('write') // effective preserved
+  })
+
+  it('surfaces permission contradictions (one <li> each) when the response reports them', async () => {
+    stubBackend({
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { network: 'read', git: 'write' },
+        workspace_ceiling: { network: 'banned', git: 'read' },
+        contradictions: [
+          { resource: 'network', session_value: 'read', workspace_value: 'banned', reason: 'network exceeds the workspace ceiling' },
+          { resource: 'git', session_value: 'write', workspace_value: 'read', reason: '' },
+        ],
+      }),
+    })
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    const list = screen.getByTestId('permission-contradictions')
+    // one <li> per reported contradiction
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2)
+    // server-provided reason is used verbatim…
+    expect(screen.getByText('network exceeds the workspace ceiling')).toBeInTheDocument()
+    // …and an empty reason falls back to the session-vs-ceiling sentence.
+    expect(screen.getByText('session write exceeds ceiling read')).toBeInTheDocument()
+  })
+
+  it('omits the contradictions list when the response reports none', async () => {
+    stubBackend() // DEFAULT_ROUTES carries contradictions: []
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    expect(screen.queryByTestId('permission-contradictions')).not.toBeInTheDocument()
   })
 
   it('is read-only — no buttons, checkboxes or text inputs inside the section', async () => {
