@@ -46,6 +46,21 @@ from agent.config.defaults import DEFAULT_IMAGE, WORKSPACE_ID_LABEL
 
 logger = logging.getLogger(__name__)
 
+
+def _runtime_commit() -> str:
+    """Return the runtime revision (git HEAD) the web UI ``/health`` exposes.
+
+    Sourced from ``web_ui.backend.server._SERVER_REVISION``; lazily imported so
+    this module has no hard dependency on the web UI package. Degrades to
+    ``"unknown"`` when the import (or the revision) is unavailable.
+    """
+    try:
+        from web_ui.backend.server import _SERVER_REVISION
+        return _SERVER_REVISION
+    except Exception:
+        return "unknown"
+
+
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the container tools keep working outside a worker turn.
 try:
@@ -574,11 +589,12 @@ class ContainerStatusTool(_ContainerControlBase):
       "created_by": str | null,
       "ttl_remaining_s": int | null,
       "grain_required_for_remove": str | null,
+      "runtime_commit": str | null,
       "error": str (optional),
       "duration": float
     }
 
-    A container reported as "missing" carries ``null`` for the five
+    A container reported as "missing" carries ``null`` for the six
     description fields (there is nothing attached to describe).
     """
     tool: Literal["ContainerStatusTool"] = "ContainerStatusTool"
@@ -590,7 +606,7 @@ class ContainerStatusTool(_ContainerControlBase):
     )
 
     def _describe_container(self, manager) -> Dict[str, Any]:
-        """Derive the five lifecycle/ownership description fields.
+        """Derive the six lifecycle/ownership description fields.
 
         Fail-safe: any resolution error degrades to a neutral value rather
         than raising, and an unclassifiable container is treated fail-closed
@@ -667,6 +683,7 @@ class ContainerStatusTool(_ContainerControlBase):
             "created_by": created_by,
             "ttl_remaining_s": ttl_remaining_s,
             "grain_required_for_remove": grain_required_for_remove,
+            "runtime_commit": _runtime_commit(),
         }
 
     def _workspace_ownership_refusal(self, manager) -> Optional[str]:
@@ -716,6 +733,7 @@ class ContainerStatusTool(_ContainerControlBase):
                     created_by=None,
                     ttl_remaining_s=None,
                     grain_required_for_remove=None,
+                    runtime_commit=None,
                 )
             else:
                 described.update(self._describe_container(manager))
