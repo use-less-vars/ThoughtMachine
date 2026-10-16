@@ -169,6 +169,7 @@ def test_manager_construction_failure_reports_error():
         result = json.loads(tool.execute())
 
     assert result["success"] is False
+    assert result["status"] == "error"
     assert "no docker" in result["error"]
 
 

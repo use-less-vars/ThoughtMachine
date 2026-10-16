@@ -274,7 +274,7 @@ class ContainerStartTool(_ContainerControlBase):
                 **start_fields,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -425,7 +425,7 @@ class ContainerStopTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -468,7 +468,7 @@ class ContainerRestartTool(_ContainerControlBase):
         try:
             manager = self._make_manager()
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -684,9 +684,9 @@ class ContainerStatusTool(_ContainerControlBase):
                 described.update(self._describe_container(manager))
             return self._respond(True, **described, duration=time.time() - start_time)
         except RuntimeError as e:
-            return self._respond(False, error=str(e))
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
-            return self._respond(False, error=f"Unexpected error: {e}")
+            return self._respond(False, status="error", error=f"Unexpected error: {e}", duration=time.time() - start_time)
 
 
 class ContainerListTool(_ContainerControlBase):
@@ -731,7 +731,7 @@ class ContainerListTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -787,7 +787,7 @@ class ContainerBuildTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -848,7 +848,7 @@ class ContainerLogsTool(_ContainerControlBase):
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -928,7 +928,7 @@ class ContainerRemoveTool(_ContainerControlBase):
         try:
             manager = self._make_manager(self.workspace_id)
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
@@ -983,7 +983,7 @@ class ContainerRemoveTool(_ContainerControlBase):
         try:
             result = manager.remove(self.container_id_or_name, keep_record=False)
         except RuntimeError as e:
-            return self._respond(False, error=str(e), duration=time.time() - start_time)
+            return self._respond(False, status="error", error=str(e), duration=time.time() - start_time)
         except Exception as e:
             return self._respond(
                 False,
