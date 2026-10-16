@@ -24,6 +24,9 @@ def _manager(workspace_id, labels):
     manager.workspace_id = workspace_id
     manager.status.return_value = dict(RUNNING)
     manager.class_of.return_value = "persistent"
+    # The persistent path now consults manager.unavailable_reason(); pin it to
+    # a JSON-serializable value (the real manager returns str | None).
+    manager.unavailable_reason.return_value = None
     container = MagicMock()
     container.name = "tm-x"
     container.labels = dict(labels)

@@ -29,13 +29,15 @@ RUNNING = {
     "oom_killed": False,
 }
 
-# The five PHASE-2 description keys every non-missing status response carries.
+# The description keys every non-missing status response carries
+# (the five PHASE-2 keys plus Wave 10a's ``unavailable_reason``).
 DESCRIPTION_KEYS = {
     "owner",
     "lifecycle_class",
     "created_by",
     "ttl_remaining_s",
     "grain_required_for_remove",
+    "unavailable_reason",
 }
 
 
@@ -49,6 +51,9 @@ def _manager(status_result=None, lifecycle_class="ephemeral", labels=None):
     manager = MagicMock()
     manager.status.return_value = dict(status_result or RUNNING)
     manager.class_of.return_value = lifecycle_class
+    # The persistent path now consults manager.unavailable_reason(); pin it to
+    # a JSON-serializable value (the real manager returns str | None).
+    manager.unavailable_reason.return_value = None
     container = MagicMock()
     container.name = "tm-x"
     container.labels = dict(labels or {})

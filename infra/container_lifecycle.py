@@ -98,11 +98,15 @@ class ContainerLifecycle:
         container: Any,
         session: Any,
         intent: Optional[ContainerIntent] = None,
+        *,
+        emit: bool = True,
     ) -> ReconcileDecision:
         """Decide what should happen to ``container``; never touches it.
 
         Always emits one ``CONTAINER_LIFECYCLE`` event, even when the decision
-        is a failed-closed ``refuse``.
+        is a failed-closed ``refuse``.  ``emit=False`` computes the decision
+        WITHOUT publishing an event -- used by callers that record their own,
+        differently-shaped action (e.g. a restart).
         """
         intent = intent or ContainerIntent()
         try:
@@ -119,7 +123,7 @@ class ContainerLifecycle:
         except Exception:  # noqa: BLE001 - telemetry must never break a decision
             event = None
             decision.event = None
-        if event is not None:
+        if emit and event is not None:
             cls._emit(event)
         return decision
 
@@ -145,6 +149,84 @@ class ContainerLifecycle:
             except Exception as exc:  # noqa: BLE001
                 log("WARNING", "container_lifecycle", f"container remove failed: {exc}")
         return decision
+
+    # ------------------------------------------------------------------
+    # Non-destructive lifecycle actions (create / restart)
+    # ------------------------------------------------------------------
+    @classmethod
+    def _record_action(
+        cls,
+        action: str,
+        container: Any,
+        *,
+        reason: str,
+        contributing_source: str,
+        workspace_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Emit a non-destructive ``CONTAINER_LIFECYCLE`` event for ``action``.
+
+        ``create``/``restart`` do not terminate a container's life, so they are
+        recorded directly (never through the destructive ``_decide``
+        precedence), which gives each its own distinguishable ``action``.
+        """
+        intent = ContainerIntent(
+            kind=action,
+            reason=reason,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        decision = ReconcileDecision(action, reason, contributing_source)
+        event: Optional[dict]
+        try:
+            event = cls._build_event(decision, container, intent)
+            decision.event = event
+        except Exception:  # noqa: BLE001 - telemetry must never break a caller
+            event = None
+            decision.event = None
+        if event is not None:
+            cls._emit(event)
+        return decision.event
+
+    @classmethod
+    def record_create(
+        cls,
+        container: Any,
+        *,
+        reason: str = "container_created",
+        contributing_source: str = "container_manager.create",
+        workspace_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Record that ``container`` was CREATED (``action="create"``)."""
+        return cls._record_action(
+            "create",
+            container,
+            reason=reason,
+            contributing_source=contributing_source,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+
+    @classmethod
+    def record_restart(
+        cls,
+        container: Any,
+        *,
+        reason: str = "explicit_restart",
+        contributing_source: str = "container_manager.restart",
+        workspace_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Record that ``container`` was RESTARTED (``action="restart"``)."""
+        return cls._record_action(
+            "restart",
+            container,
+            reason=reason,
+            contributing_source=contributing_source,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
 
     # ------------------------------------------------------------------
     # Decision
