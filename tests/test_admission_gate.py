@@ -693,13 +693,48 @@ def test_field_regression_live_persistent_containers_still_refuse(monkeypatch):
     assert decision.code == REASON_CONTAINER_LIMIT_EXCEEDED
 
 
-def test_free_use_container_does_not_consume_a_slot():
-    """A free_use-labelled (ephemeral) container never consumes a slot."""
+def test_free_use_label_without_a_record_consumes_a_slot():
+    """A record-less ``free_use`` container now consumes a ceiling slot.
+
+    SUPERSEDES the prior pin (``test_free_use_container_does_not_consume_a_slot``),
+    which encoded the fail-open: the classifier's ``free_use`` container-type
+    branch sat BEFORE its persistent default, so an unattributable container
+    (no ``thoughtmachine.container_id`` record label) escaped the per-workspace
+    ceiling.  The classifier now ignores ``thoughtmachine.container_type``; with
+    no resolvable record the container is PERSISTENT and counts.
+    """
     from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL
 
     c = _container(
         "free-use",
         labels={CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE},
+        status="running",
+    )
+    assert ag._counts_toward_ceiling(c) is True
+
+
+def test_free_use_container_with_ephemeral_record_does_not_consume_a_slot(
+    monkeypatch, tmp_path
+):
+    """The recorded class still wins: an EPHEMERAL record frees the slot."""
+    from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL
+    from thoughtmachine.container_record import (
+        LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE, RECORD_LABEL_KEY, create_record,
+    )
+    import thoughtmachine.container_record.api as api
+
+    rec = create_record("ws1", LIFECYCLE_EPHEMERAL, OWNER_WORKSPACE,
+                        vault_root=tmp_path)
+    monkeypatch.setattr(
+        api, "find_by_docker_label",
+        lambda rid, vault_root=None: rec if rid == rec.id else None,
+    )
+    c = _container(
+        "free-use",
+        labels={
+            CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
+            RECORD_LABEL_KEY: rec.id,
+        },
         status="running",
     )
     assert ag._counts_toward_ceiling(c) is False
