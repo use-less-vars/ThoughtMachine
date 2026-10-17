@@ -10,6 +10,7 @@
 
 import { create } from 'zustand'
 import purposeDefinitions from '../data/purposeDefinitions.json'
+import useSessionTabsStore from '../sessionTabsStore'
 
 const API_BASE = ''
 
@@ -322,10 +323,22 @@ const useWorkspaceStore = create((set, get) => ({
     set({ isLoading: true, error: '' })
 
     const fallbackEntry = get().workspaceList.find((w) => w.id === id)
+
+    // Session scoping: pass the workspace's ACTIVE session id so the backend
+    // resolves that session's effective permissions. When no session is active
+    // we still call the endpoint (no session_id) and flag the result below so
+    // the panel can show an explicit "showing defaults" notice instead of
+    // presenting the endpoint's default response as authoritative.
+    const activeSessionId =
+      useSessionTabsStore.getState().byWorkspace[id]?.activeSessionId || null
+    const effectivePermissionsUrl =
+      `${API_BASE}/api/workspace/${encodeURIComponent(id)}/effective_permissions` +
+      (activeSessionId ? `?session_id=${encodeURIComponent(activeSessionId)}` : '')
+
     try {
       const [listData, permsData, healthData, workersData, containersData, sessionsData] = await Promise.all([
         tryGet(`${API_BASE}/api/workspace/list`),
-        tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/effective_permissions`),
+        tryGet(effectivePermissionsUrl),
         tryGet(`${API_BASE}/api/health/containers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/workers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers`),
@@ -345,15 +358,22 @@ const useWorkspaceStore = create((set, get) => ({
       const purposeId = purpose ? purpose.id : overlay.purposeId || 'blank'
       const risk = purpose ? purpose.risk : overlay.risk || 'Low'
 
-      // ── Permissions: backend effective permissions (container is a bool) ──
+      // ── Permissions: the ceiling comes from the endpoint's workspace_ceiling
+      // (the resource → max-level map the workspace gate actually enforced) and
+      // the effective value from effective_permissions. Both values pass
+      // through AS-IS — container is no longer coerced with `=== true`. A
+      // resource absent from workspace_ceiling (including the present-but-empty
+      // {} 'never restrictive' case) keeps an undefined ceiling so the panel
+      // renders its em-dash placeholder instead of echoing the effective value.
       const ep = permsData && permsData.effective_permissions
+      const wc = (permsData && permsData.workspace_ceiling) || {}
       let permissions = []
       if (ep) {
-        permissions = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash'].map((name) => {
-          let effective = ep[name]
-          if (name === 'container') effective = effective === true
-          return { name, ceiling: effective, effective }
-        })
+        permissions = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash'].map((name) => ({
+          name,
+          ceiling: Object.prototype.hasOwnProperty.call(wc, name) ? wc[name] : undefined,
+          effective: ep[name],
+        }))
       } else if (purpose) {
         permissions = Object.entries(purpose.defaults.permissions || {}).map(([name, effective]) => ({
           name,
@@ -361,6 +381,13 @@ const useWorkspaceStore = create((set, get) => ({
           effective,
         }))
       }
+
+      // The endpoint also reports permission contradictions (a session value
+      // exceeding its workspace ceiling). Consumed here and carried on the
+      // workspace so a consumer can surface them; [] when none / not reported.
+      const permissionContradictions = Array.isArray(permsData && permsData.contradictions)
+        ? permsData.contradictions
+        : []
 
       // ── Docker availability (tri-state) ──
       // true only when the health payload reports Docker available; false when
@@ -422,6 +449,8 @@ const useWorkspaceStore = create((set, get) => ({
         workers,
         sessions,
         sessionDefaults,
+        permissionsSessionScoped: Boolean(activeSessionId),
+        permissionContradictions,
       }
 
       set((state) => ({

@@ -17,6 +17,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import useWorkspaceStore from '../workspaceStore'
+import useSessionTabsStore from '../../sessionTabsStore'
 
 // ---------------------------------------------------------------------------
 // fetch stubs
@@ -55,6 +56,11 @@ const CONFIG_ROUTES = {
       host_bash: 'banned',
       container: true,
     },
+    // The endpoint reports the workspace ceiling SEPARATELY from the effective
+    // values, listing only the resources the ceiling actually restricted.
+    // filesystem is capped at 'write' (its effective is the lower 'read').
+    workspace_ceiling: { filesystem: 'write' },
+    contradictions: [],
   }),
   '/api/health/containers': jsonOk({ docker: 'reachable' }),
   '/api/workspace/ws-1/workers': jsonOk([{ name: 'w1', runtime_status: 'ready', system_prompt: 'p', tools: ['FileEditor'] }]),
@@ -65,6 +71,7 @@ const CONFIG_ROUTES = {
 beforeEach(() => {
   localStorage.clear()
   useWorkspaceStore.getState().reset()
+  useSessionTabsStore.setState({ byWorkspace: {} })
 })
 
 afterEach(() => {
@@ -164,8 +171,15 @@ describe('fetchWorkspaceConfig', () => {
     expect(st.currentWorkspace.permissions.map((p) => p.name)).toEqual([
       'git', 'filesystem', 'container', 'network', 'mcp', 'host_bash',
     ])
+    const filesystemPerm = st.currentWorkspace.permissions.find((p) => p.name === 'filesystem')
+    // ceiling comes from the response workspace_ceiling, NOT echoed from the
+    // effective value ('read').
+    expect(filesystemPerm.ceiling).toBe('write')
+    expect(filesystemPerm.effective).toBe('read')
     const containerPerm = st.currentWorkspace.permissions.find((p) => p.name === 'container')
-    expect(containerPerm.ceiling).toBe(true)
+    // container is absent from workspace_ceiling → undefined ceiling (the panel
+    // renders its em-dash placeholder); effective passes through as-is.
+    expect(containerPerm.ceiling).toBeUndefined()
     expect(containerPerm.effective).toBe(true)
     expect(st.currentWorkspace.workers).toEqual([
       expect.objectContaining({ name: 'w1', runtimeStatus: 'ready', systemPrompt: 'p' }),
@@ -190,6 +204,115 @@ describe('fetchWorkspaceConfig', () => {
     stubFetchByUrl({ ...CONFIG_ROUTES, '/api/health/containers': jsonErr('down') })
     await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
     expect(useWorkspaceStore.getState().dockerAvailable).toBeNull()
+  })
+
+  it('passes the active session id as a session_id query param (session-scoped fetch)', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    useSessionTabsStore.setState({
+      byWorkspace: {
+        'ws-1': { tabs: [{ sessionId: 'sess-42', title: 'T' }], activeSessionId: 'sess-42' },
+      },
+    })
+    const fetchMock = stubFetchByUrl(CONFIG_ROUTES)
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    const urls = fetchMock.mock.calls.map(([url]) => String(url))
+    expect(urls.some((u) => u.includes('/effective_permissions?session_id=sess-42'))).toBe(true)
+    expect(useWorkspaceStore.getState().currentWorkspace.permissionsSessionScoped).toBe(true)
+  })
+
+  it('omits session_id and flags permissionsSessionScoped=false when no session is active', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    const fetchMock = stubFetchByUrl(CONFIG_ROUTES)
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    const urls = fetchMock.mock.calls.map(([url]) => String(url))
+    expect(urls.some((u) => u.includes('/effective_permissions?session_id='))).toBe(false)
+    expect(urls.some((u) => u.endsWith('/api/workspace/ws-1/effective_permissions'))).toBe(true)
+    expect(useWorkspaceStore.getState().currentWorkspace.permissionsSessionScoped).toBe(false)
+  })
+
+  it('takes the ceiling column from the response workspace_ceiling, not the effective value', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    stubFetchByUrl(CONFIG_ROUTES)
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    const filesystem = useWorkspaceStore
+      .getState()
+      .currentWorkspace.permissions.find((p) => p.name === 'filesystem')
+    expect(filesystem.ceiling).toBe('write') // from workspace_ceiling
+    expect(filesystem.effective).toBe('read') // from effective_permissions
+  })
+
+  it('leaves every ceiling undefined when workspace_ceiling is a present-but-empty object', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    stubFetchByUrl({
+      ...CONFIG_ROUTES,
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { git: 'write', filesystem: 'read', container: true },
+        workspace_ceiling: {},
+        contradictions: [],
+      }),
+    })
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    const perms = useWorkspaceStore.getState().currentWorkspace.permissions
+    // {} ⇒ the ceiling restricted nothing ⇒ no per-resource ceiling (the panel
+    // renders its em-dash placeholder instead of echoing the effective value).
+    expect(perms.length).toBeGreaterThan(0)
+    expect(perms.every((p) => p.ceiling === undefined)).toBe(true)
+    expect(perms.find((p) => p.name === 'git').effective).toBe('write')
+  })
+
+  it('passes non-boolean effective values through unchanged (no container coercion)', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    stubFetchByUrl({
+      ...CONFIG_ROUTES,
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { container: 'banned', filesystem: 'read' },
+        workspace_ceiling: {},
+        contradictions: [],
+      }),
+    })
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    const container = useWorkspaceStore
+      .getState()
+      .currentWorkspace.permissions.find((p) => p.name === 'container')
+    // The old store coerced container with `=== true` (→ false); non-boolean
+    // values now pass straight through.
+    expect(container.effective).toBe('banned')
+  })
+
+  it('consumes the response contradictions and carries them on the workspace', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    const contradictions = [
+      {
+        resource: 'network',
+        session_value: 'read',
+        workspace_value: 'banned',
+        reason: 'session exceeds workspace ceiling',
+        guidance: 'lower network back to banned',
+      },
+    ]
+    stubFetchByUrl({
+      ...CONFIG_ROUTES,
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { network: 'read' },
+        workspace_ceiling: { network: 'banned' },
+        contradictions,
+      }),
+    })
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    expect(useWorkspaceStore.getState().currentWorkspace.permissionContradictions).toEqual(contradictions)
+  })
+
+  it('defaults contradictions to an empty list when the response omits the field', async () => {
+    useWorkspaceStore.setState({ workspaceList: [{ id: 'ws-1', name: 'WS One', root: '/root' }] })
+    stubFetchByUrl({
+      ...CONFIG_ROUTES,
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { git: 'write' },
+        workspace_ceiling: {},
+      }),
+    })
+    await useWorkspaceStore.getState().fetchWorkspaceConfig('ws-1')
+    expect(useWorkspaceStore.getState().currentWorkspace.permissionContradictions).toEqual([])
   })
 })
 
