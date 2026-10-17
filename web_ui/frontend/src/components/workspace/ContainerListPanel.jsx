@@ -2,6 +2,13 @@ import React, { useCallback, useEffect, useState } from 'react'
 
 // ── Copy pinned by the C.1 contract ──────────────────────────────────────
 const SHARED_TITLE = 'Stopping affects other sessions in this workspace.'
+
+//: Fixed actor id for the record-keyed write actions (matches
+//: RecordContainerPanel). The backend `_resolve_actor` requires a non-empty
+//: body `actor` OR an `X-Actor` header, else the request 401s before any
+//: handler runs. Both are sent so either resolution path succeeds.
+const ACTOR = 'operator'
+
 const DRIFT_AMBER_TEXT = 'Running under older permissions — restart to apply.'
 const DRIFT_NEUTRAL_TITLE =
   'Drift check not yet wired for this container — see backend/record-create-permission-snapshot.'
@@ -243,18 +250,23 @@ export default function ContainerListPanel({ workspaceId }) {
   const dispatch = useCallback(
     async ({ entry, action, value }) => {
       const base = `/api/workspace/${workspaceId}/containers/${entry.id}`
-      if (action === 'resources') {
-        await fetch(`${base}/resources`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mem_limit: value }),
-        })
-      } else {
-        await fetch(`${base}/action`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action }),
-        })
+      const headers = { 'Content-Type': 'application/json', 'X-Actor': ACTOR }
+      const res =
+        action === 'resources'
+          ? await fetch(`${base}/resources`, {
+              method: 'PATCH',
+              headers,
+              body: JSON.stringify({ mem_limit: value, actor: ACTOR }),
+            })
+          : await fetch(`${base}/action`, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ action, actor: ACTOR }),
+            })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        setError(body.detail || `Action failed (${res.status})`)
+        return
       }
       await refresh()
     },
