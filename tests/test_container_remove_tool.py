@@ -8,9 +8,9 @@ constructs a real ``ContainerManager``. Covers:
 - the stable tool identifier follows the sibling container-tool convention
   (the class name, since these tools do not override the ``name`` ClassVar)
 - ``execute()`` surfaces ``ContainerManager.remove()``'s dict verbatim as JSON
-- the per-lifecycle-class removal gate: ephemeral removes freely, persistent
-  removes with the base ``container:true`` grain (no sub-grain), resource is
-  operator-only
+- the per-lifecycle-class removal gate: ephemeral removes freely; persistent
+  and resource are operator-only and refused for agent sessions; an
+  unclassifiable class is left to the lifecycle funnel
 - idempotent NotFound -> "removed"
 - error results and RuntimeError failures are returned, never raised
 - ``container_id_or_name`` is required
@@ -176,8 +176,8 @@ class TestContainerRemoveToolLifecycleGrain:
         assert result["success"] is True
         assert result["status"] == "removed"
 
-    def test_persistent_removes_with_container_true(self):
-        """Persistent remove needs only the base ``container:true`` grain."""
+    def test_persistent_is_refused_for_agent_sessions(self):
+        """Persistent removal is operator-only: the agent path refuses it."""
         manager = _manager(
             lifecycle_class="persistent",
             remove_result={"status": "removed", "container_id": "abc123"},
@@ -188,13 +188,16 @@ class TestContainerRemoveToolLifecycleGrain:
         )
         with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
             result = _parse(tool.execute())
-        assert result["success"] is True
-        assert result["status"] == "removed"
-        assert "error" not in result
-        manager.remove.assert_called_once_with("abc123", keep_record=False)
+        assert result["success"] is False
+        assert result["status"] == "refused"
+        assert result["reason"] == (
+            "Persistent containers can only be removed by the operator."
+        )
+        manager.remove.assert_not_called()
 
-    def test_persistent_no_longer_requires_a_sub_grain(self):
-        """The ungrantable ``container:remove`` token is no longer consulted."""
+    def test_persistent_refusal_is_class_based_not_session_based(self):
+        """The refusal comes from the lifecycle class alone; no session
+        permission is consulted, so supplying none changes nothing."""
         manager = _manager(
             lifecycle_class="persistent",
             remove_result={"status": "removed", "container_id": "abc123"},
@@ -202,8 +205,12 @@ class TestContainerRemoveToolLifecycleGrain:
         tool = ContainerRemoveTool(container_id_or_name="abc123")  # no permissions
         with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
             result = _parse(tool.execute())
-        assert result["status"] == "removed"
-        manager.remove.assert_called_once_with("abc123", keep_record=False)
+        assert result["success"] is False
+        assert result["status"] == "refused"
+        assert result["reason"] == (
+            "Persistent containers can only be removed by the operator."
+        )
+        manager.remove.assert_not_called()
 
     def test_envelope_is_the_session_gate(self):
         """The hard session gate is the base category, not a per-class grain."""

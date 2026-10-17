@@ -104,8 +104,9 @@ def test_persistent_container_description():
     # A persistent container belongs to the workspace, not a session.
     assert result["owner"] == "workspace"
     assert result["lifecycle_class"] == "persistent"
-    # Persistent removal needs only the base grain (no ungrantable sub-grain).
-    assert result["grain_required_for_remove"] == "container:true"
+    # Persistent removal is operator-only: the agent path refuses it, so no
+    # session grain is ever sufficient.
+    assert result["grain_required_for_remove"] == "operator"
 
 
 def test_resource_container_description():

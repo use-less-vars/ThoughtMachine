@@ -640,12 +640,14 @@ class ContainerStatusTool(_ContainerControlBase):
             except Exception:
                 ttl_remaining_s = None
 
-        if lifecycle_class == "resource":
+        if lifecycle_class in ("resource", "persistent"):
+            # Operator-only classes: the removal tool refuses agent sessions for
+            # both, so no session grain is ever sufficient.
             grain_required_for_remove = "operator"
         else:
-            # Persistent and ephemeral both require only the base grain; an
-            # unclassifiable container advertises the same base grain (the
-            # funnel, not the grain, is what refuses it).
+            # Ephemeral requires only the base grain; an unclassifiable container
+            # advertises the same base grain (the funnel, not the grain, is what
+            # refuses it).
             grain_required_for_remove = "container:true"
 
         # The unmet-session-requirement reason only applies to persistent
@@ -905,15 +907,18 @@ class ContainerRemoveTool(_ContainerControlBase):
     status "removed". This tool never raises — failures are returned in the JSON
     response.
 
-    Removal is gated per lifecycle class. The hard gate is the permission
-    envelope (the security gate refuses any session without the boolean
-    ``container`` grant before this tool runs) plus the lifecycle funnel's own
-    class/ownership checks — there is no per-class sub-grain:
+    Removal is gated per lifecycle class, in three layers. The hard gate is the
+    permission envelope (the security gate refuses any session without the
+    boolean ``container`` grant before this tool runs); after it, this tool
+    itself refuses the operator-only classes (``persistent`` and ``resource``)
+    before any Docker verb is reached — there is no per-class sub-grain; what is
+    left then passes to the lifecycle funnel's own class/ownership checks:
 
     - ``ephemeral`` containers may be removed freely;
-    - ``persistent`` containers are workspace property: any session whose
-      envelope passes the gate may remove one (trust-by-note — the container's
-      ``note`` is the coordination mechanism, not a per-session grain);
+    - ``persistent`` containers are operator-only and refused to agent
+      sessions: the container's ``note`` can only be set at creation, so the
+      trust-by-note coordination model that would make agent removal safe does
+      not exist yet;
     - ``resource`` containers are operator-only and always refused;
     - an unclassifiable container is left to the manager's own checks (the
       lifecycle funnel refuses it, fail-closed).
@@ -987,6 +992,16 @@ class ContainerRemoveTool(_ContainerControlBase):
                 container_id=self.container_id_or_name,
                 status="refused",
                 reason="Resource containers can only be removed by the operator.",
+                duration=time.time() - start_time,
+            )
+        if lifecycle_class == "persistent":
+            # A note can only be set at creation, so no later session can leave or
+            # read the signal that makes removal safe; until it exists, operator-only.
+            return self._respond(
+                False,
+                container_id=self.container_id_or_name,
+                status="refused",
+                reason="Persistent containers can only be removed by the operator.",
                 duration=time.time() - start_time,
             )
         try:
