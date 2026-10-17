@@ -4587,6 +4587,71 @@ def workspace_container_action(workspace_id: str, record_id: str,
         _container_view_entry(record_after, manager, workspace_id))
 
 
+#: Units accepted by :func:`_parse_mem_limit` -> byte multiplier.  This is
+#: Docker's own ``mem_limit`` grammar; the trailing ``b`` is optional
+#: (``512m`` and ``512mb`` are the same limit).
+_MEM_LIMIT_UNITS = {
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024 ** 2,
+    "mb": 1024 ** 2,
+    "g": 1024 ** 3,
+    "gb": 1024 ** 3,
+}
+
+#: Explicit digit set: ``str.isdigit`` also accepts non-ASCII digits, which the
+#: daemon does not.
+_MEM_LIMIT_DIGITS = "0123456789"
+
+
+def _parse_mem_limit(value):
+    """Normalise a ``mem_limit`` string to a byte count, or ``None`` if invalid.
+
+    Accepted (case-insensitive, surrounding whitespace ignored): a plain integer
+    byte count (``"1073741824"``), or a number with a unit -- ``b``/``k``/``m``/
+    ``g``, optionally followed by ``b`` (``"512m"``, ``"1g"``, ``"2gb"``,
+    ``"512MB"``).  A unit accepts ONE optional decimal fraction (``"1.5g"``).
+    Rejected: an empty string, a negative value, prose (``"banana"``), trailing
+    junk (``"1g extra"``), and a bare fraction with no unit (``"1.5"``).
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    # Split the numeric prefix from the unit suffix without regex guesswork:
+    # scan the explicit digit set and allow at most one '.'.
+    end = 0
+    seen_dot = False
+    for ch in text:
+        if ch in _MEM_LIMIT_DIGITS:
+            end += 1
+        elif ch == "." and not seen_dot:
+            seen_dot = True
+            end += 1
+        else:
+            break
+    number = text[:end]
+    unit = text[end:]
+    if unit and unit not in _MEM_LIMIT_UNITS:
+        return None
+    multiplier = _MEM_LIMIT_UNITS.get(unit, 1)
+    if "." in number:
+        # A fraction is only meaningful with a unit (``1.5g``); bytes must be
+        # integral, and both sides of the '.' must be present.
+        if not unit:
+            return None
+        whole, _, frac = number.partition(".")
+        if not whole or not frac:
+            return None
+        return (int(whole) * multiplier
+                + int(frac) * multiplier // (10 ** len(frac)))
+    if not number:
+        return None
+    return int(number) * multiplier
+
+
 @app.patch("/api/workspace/{workspace_id}/containers/{record_id}/resources")
 def workspace_container_resources(workspace_id: str, record_id: str,
                                   request: Request,
@@ -4641,6 +4706,24 @@ def workspace_container_resources(workspace_id: str, record_id: str,
             f"workspace '{workspace_id}' not found or path unresolvable",
             status_code=404)
 
+    # Validate the requested limits BEFORE anything is persisted and before the
+    # old container is destroyed: the record is updated and the container removed
+    # below, so an invalid value would otherwise reach Docker only AFTER the
+    # container was already gone (leaving a record claiming limits never applied).
+    if "cpu_quota" in updates:
+        cpu_quota = updates["cpu_quota"]
+        if (isinstance(cpu_quota, bool) or not isinstance(cpu_quota, int)
+                or cpu_quota < 0):
+            return _json_error("cpu_quota must be a non-negative integer",
+                               status_code=400)
+    if "mem_limit" in updates:
+        if _parse_mem_limit(updates["mem_limit"]) is None:
+            return _json_error(
+                f"invalid mem_limit {updates['mem_limit']!r}: expected an "
+                "integer byte count (e.g. '1073741824') or a number with a "
+                "unit b/k/m/g (e.g. '512m', '1g', '2gb')",
+                status_code=400)
+
     container_id = _view_action_container_id(manager, record)
     snapshot = dict(getattr(record, "intent_snapshot", None) or {})
     snapshot.update(updates)
@@ -4651,7 +4734,9 @@ def workspace_container_resources(workspace_id: str, record_id: str,
         # old container and rebinding the record's docker_id happen afterwards.
         _cr_api.update_record(workspace_id, record_id, intent_snapshot=snapshot)
         if container_id:
-            pre = manager.remove(container_id)
+            # keep_record=True: the record (and the intent just written) must
+            # survive the remove -- a bare remove() reaps a non-resource record.
+            pre = manager.remove(container_id, keep_record=True)
             if isinstance(pre, dict) and pre.get("status") == "error":
                 return _json_error(pre.get("error", "remove failed"),
                                    status_code=503)
