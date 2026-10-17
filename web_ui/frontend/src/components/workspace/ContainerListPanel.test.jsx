@@ -541,12 +541,15 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     })
   })
 
-  // -- Round B: trust-by-note for persistent containers ---------------------
-  // A persistent container is workspace property: any session whose envelope
-  // passes may remove one. Remove is therefore offered on persistent rows too,
-  // and the container's `note` is the coordination mechanism that lets the
-  // acting session see whose work it is about to delete. Resource rows stay
-  // operator-only and never offer Remove. Ephemeral behaviour is unchanged.
+  // -- Round B: persistent containers are removable from this panel ---------
+  // The backend route treats `remove` as an ALLOW-list: `ephemeral` and
+  // `persistent` records may be removed, and every other class -- `resource`
+  // (operator-managed outside this panel), `service`, or an unknown one -- is
+  // refused with 403 before any Docker verb. The panel only *attributes*
+  // `actor=operator` on each request; that token is attribution, not
+  // authentication -- the backend gate is what authorises the call. The
+  // container's `note` is surfaced in the confirm copy so whoever deletes it can
+  // see whose work it is about to delete. Ephemeral behaviour is unchanged.
 
   it('Round B persistent row renders the Remove action and POSTs action=remove after confirm-ok', async () => {
     const fetchMock = stubFetch(payload({ persistent: [persistentEntry({ id: 'pers-rm', state: 'running' })] }))
@@ -565,6 +568,33 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
       expect(url).toBe(`/api/workspace/${WORKSPACE_ID}/containers/pers-rm/action`)
       expect(body).toEqual({ action: 'remove', actor: 'operator' })
     })
+  })
+
+  it('Round B removing a persistent container succeeds and drops the row on refresh', async () => {
+    // Stateful stub: the first list GET sees the persistent container, the GET
+    // issued after a successful remove does not -- the panel must re-fetch and
+    // drop the row instead of keeping a ghost entry.
+    const firstList = payload({ persistent: [persistentEntry({ id: 'pers-gone', state: 'running' })] })
+    const emptyList = payload({})
+    let listCalls = 0
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).includes('/action')) {
+        return { ok: true, status: 200, json: async () => ({ id: 'pers-gone', removed: true }) }
+      }
+      listCalls += 1
+      return { ok: true, status: 200, json: async () => (listCalls === 1 ? firstList : emptyList) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await screen.findByTestId('container-row-pers-gone')
+    fireEvent.click(screen.getByTestId('container-action-pers-gone-remove'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+
+    await waitFor(() => expect(screen.queryByTestId('container-row-pers-gone')).toBeNull())
+    // success path: no error surfaced, and the list was re-fetched exactly once.
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(listCalls).toBe(2)
   })
 
   it('Round B persistent row renders its note with the full text in the title attribute', async () => {
@@ -586,8 +616,10 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     const message = (await screen.findByTestId('confirm-message')).textContent || ''
     expect(message).toContain(NOTE)
     expect(message).toMatch(/remove pers-1/)
-    // honest copy: removal is gated by the permissions envelope; no sub-grain
-    // token is mentioned anywhere in the UI
+    // honest copy: the route allows `remove` only for the ephemeral and
+    // persistent classes (every other class is refused) and the request must
+    // pass the workspace write envelope; no sub-grain token is mentioned
+    // anywhere in the UI
     expect(message).not.toMatch(/grain/i)
   })
 
