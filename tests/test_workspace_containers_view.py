@@ -15,8 +15,10 @@ Pinned contract (from the C.1 brief + recon, dev=bf7fb9f):
   ``workspace`` keys are GONE.  ``containers_in_use`` / ``containers_available``
   stay derived from ``ContainerManager.list_containers()`` /
   ``max_containers``.
-* Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
-  permission_drift, shared, live, unrecorded, live_envelope``.  ``kind`` is
+* Entry keys: ``id, name, note, kind, state, intent_snapshot, permissions,
+  permission_drift, shared, live, unrecorded, live_envelope``.  ``note`` is the
+  record's sticky note (``notes``), verbatim; ``""`` when unset and on a
+  recordless (live-only) entry.  ``kind`` is
   ``ephemeral``|
   ``persistent``|``resource`` (PC5).  ``ephemeral`` lifecycle -> ``ephemeral``;
   ``persistent`` and ``service`` -> ``persistent`` (PC4: ``service`` is a
@@ -67,6 +69,9 @@ RESOURCES = "/api/workspace/{ws}/containers/{rid}/resources"
 ENTRY_KEYS = {
     "id",
     "name",
+    # Sticky note (D1): the record's ``notes`` field surfaced verbatim, so every
+    # entry-shape assertion binds it.  ``""`` when unset / on a recordless row.
+    "note",
     "kind",
     "state",
     "intent_snapshot",
@@ -940,3 +945,38 @@ def test_entries_pin_live_and_unrecorded_keys(vault, monkeypatch):
     sample.pop("unrecorded")
     assert not (ENTRY_KEYS <= set(sample))
 
+
+# ── Sticky note on the entry (D1: the note was missing from the payload) ─────
+
+def test_entry_carries_record_note_and_recordless_empty(vault, monkeypatch):
+    """D1: every entry carries ``note`` -- the record's sticky note VERBATIM,
+    and ``""`` for a live container that has no record (no note lives there).
+
+    Currently FAILS: neither view-entry shape emits ``note``, so the panel's
+    ``entry.note`` read (whose work a shared container is doing) is dead.
+    """
+    _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
+          lifecycle_class="persistent")
+    cr_api.update_record("ws1", "rec-p", vault_root=vault,
+                         notes="alice: deploy smoke-test")
+    _install_manager(monkeypatch, FakeManager(
+        statuses={"docker-p": {"status": "running"},
+                  "tm-res-abc": {"status": "running"}},
+        names={"tm-res-abc": "tm-res-abc-git"}))
+
+    # The pin set itself must bind the key.
+    assert "note" in ENTRY_KEYS
+
+    data = _list().json()
+    entry = _find_entry(data["containers"], "rec-p")
+    assert entry["note"] == "alice: deploy smoke-test"
+
+    # Recordless (live-only) row: no note, but the key is still present.
+    recordless = _find_entry_by_name(data["containers"], "tm-res-abc-git")
+    assert recordless["note"] == ""
+
+    # An unset note is "", never None (the UI reads a string).
+    _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
+          lifecycle_class="ephemeral")
+    blank = _find_entry(_list().json()["containers"], "rec-e")
+    assert blank["note"] == ""
