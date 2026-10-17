@@ -96,6 +96,21 @@ function actionCall(fetchMock, needle) {
   return { url: String(url), method: opts.method, body }
 }
 
+// All fetch calls whose URL contains `needle`, with url/method/headers/body.
+function actionCalls(fetchMock, needle) {
+  return fetchMock.mock.calls
+    .filter(([u]) => String(u).includes(needle))
+    .map(([u, init]) => {
+      const opts = init || {}
+      return {
+        url: String(u),
+        method: opts.method,
+        headers: opts.headers || {},
+        body: opts.body ? JSON.parse(opts.body) : undefined,
+      }
+    })
+}
+
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
@@ -173,7 +188,7 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
       const { url, method, body } = actionCall(fetchMock, '/containers/eph-stop/action')
       expect(method).toBe('POST')
       expect(url).toBe(`/api/workspace/${WORKSPACE_ID}/containers/eph-stop/action`)
-      expect(body).toEqual({ action: 'stop' })
+      expect(body).toEqual({ action: 'stop', actor: 'operator' })
     })
   })
 
@@ -188,7 +203,7 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
       const { url, method, body } = actionCall(fetchMock, '/containers/eph-rm/action')
       expect(method).toBe('POST')
       expect(url).toBe(`/api/workspace/${WORKSPACE_ID}/containers/eph-rm/action`)
-      expect(body).toEqual({ action: 'remove' })
+      expect(body).toEqual({ action: 'remove', actor: 'operator' })
     })
   })
 
@@ -299,6 +314,40 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     expect(dialog).not.toHaveTextContent(SHARED_TEXT)
   })
 
+  // ── T11b (Round B) ──────────────────────────────────────────────────────
+  // T11b: the shared confirm line is VERB-CORRECT. The stop copy stays
+  // byte-identical (C.1 pin above); start/restart derive their own gerund and
+  // must never claim "Stopping".
+  it('T11b shared confirm copy is verb-correct: stop verbatim, start/restart never say "Stopping"', async () => {
+    stubFetch(
+      payload({
+        persistent: [
+          persistentEntry({ id: 'pers-stop', state: 'running' }),
+          persistentEntry({ id: 'pers-start', state: 'exited' }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    // stop on a shared container -> the verbatim pinned stop line
+    fireEvent.click(await screen.findByTestId('container-action-pers-stop-stop'))
+    expect(await screen.findByTestId('confirm-dialog')).toHaveTextContent(SHARED_TEXT)
+    fireEvent.click(screen.getByTestId('confirm-cancel'))
+
+    // start on an exited shared container -> a "Starting" line, NOT "Stopping"
+    fireEvent.click(await screen.findByTestId('container-action-pers-start-start'))
+    const startMsg = screen.getByTestId('confirm-message').textContent || ''
+    expect(startMsg).not.toMatch(/Stopping/)
+    expect(startMsg).toMatch(/Starting/)
+    fireEvent.click(screen.getByTestId('confirm-cancel'))
+
+    // restart on a running shared container -> a "Restarting" line, NOT "Stopping"
+    fireEvent.click(await screen.findByTestId('container-action-pers-stop-restart'))
+    const restartMsg = screen.getByTestId('confirm-message').textContent || ''
+    expect(restartMsg).not.toMatch(/Stopping/)
+    expect(restartMsg).toMatch(/Restarting/)
+  })
+
   // ── T13 ─────────────────────────────────────────────────────────────────
   // T13: oom state chip is text "oom" and distinct (class) from a running chip.
   it('T13 oom chip reads "oom" with class container-state-chip--oom, distinct from a running chip', async () => {
@@ -403,5 +452,91 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
 
     const badge = await screen.findByTestId('permission-badge-eph-no-env')
     expect(badge).toHaveTextContent('net on · fs rw · mem 512m')
+  })
+
+  // Wave (panel-actions funnel) commit 1: a failed action is visible and is
+  // never treated as success.
+  it('a failed action (401) surfaces the server detail and does not refetch as if it succeeded', async () => {
+    const containersBody = payload({ ephemeral: [ephemeralEntry({ id: 'eph-fail', state: 'running' })] })
+    const fetchMock = vi.fn(async (url) => {
+      const u = String(url)
+      if (u.endsWith('/action') || u.endsWith('/resources')) {
+        return { ok: false, status: 401, json: async () => ({ detail: 'actor required' }) }
+      }
+      return { ok: true, status: 200, json: async () => containersBody }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.click(await screen.findByTestId('container-action-eph-fail-stop'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('actor required')
+
+    // the confirm modal is closed and no success state was entered
+    expect(screen.queryByTestId('confirm-dialog')).toBeNull()
+
+    // the failure returned BEFORE refresh(): exactly one containers GET happened
+    const listGets = fetchMock.mock.calls.filter(
+      ([u, init]) => String(u).endsWith('/containers') && (!init || !init.method || init.method === 'GET')
+    )
+    expect(listGets).toHaveLength(1)
+  })
+
+  // Wave commit 2: every panel action attributes the operator.
+  it('each panel action request sends actor=operator in the body and the X-Actor header', async () => {
+    const fetchMock = stubFetch(payload({ ephemeral: [ephemeralEntry({ id: 'eph-act', state: 'running' })] }))
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.click(await screen.findByTestId('container-action-eph-act-stop'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+    await waitFor(() =>
+      expect(
+        actionCalls(fetchMock, '/containers/eph-act/action').some((c) => c.body && c.body.action === 'stop')
+      ).toBe(true)
+    )
+
+    fireEvent.click(screen.getByTestId('container-action-eph-act-restart'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+    await waitFor(() =>
+      expect(
+        actionCalls(fetchMock, '/containers/eph-act/action').some((c) => c.body && c.body.action === 'restart')
+      ).toBe(true)
+    )
+
+    fireEvent.click(screen.getByTestId('container-action-eph-act-resources'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+    await waitFor(() =>
+      expect(actionCalls(fetchMock, '/containers/eph-act/resources').length).toBeGreaterThan(0)
+    )
+
+    const calls = actionCalls(fetchMock, '/containers/eph-act/')
+    const stop = calls.find((c) => c.body && c.body.action === 'stop')
+    const restart = calls.find((c) => c.body && c.body.action === 'restart')
+    const resize = calls.find((c) => c.method === 'PATCH')
+    expect(stop && restart && resize).toBeTruthy()
+    for (const call of [stop, restart, resize]) {
+      expect(call.body.actor).toBe('operator')
+      expect(call.headers['X-Actor']).toBe('operator')
+    }
+    expect(resize.body.mem_limit).toBeDefined()
+  })
+
+  it('start on an exited row also attributes the operator', async () => {
+    const fetchMock = stubFetch(payload({ ephemeral: [ephemeralEntry({ id: 'eph-start', state: 'exited' })] }))
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.click(await screen.findByTestId('container-action-eph-start-start'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+
+    await waitFor(() => {
+      const call = actionCalls(fetchMock, '/containers/eph-start/action').find(
+        (c) => c.body && c.body.action === 'start'
+      )
+      expect(call).toBeTruthy()
+      expect(call.body.actor).toBe('operator')
+      expect(call.headers['X-Actor']).toBe('operator')
+    })
   })
 })

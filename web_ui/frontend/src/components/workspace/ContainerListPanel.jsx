@@ -2,6 +2,30 @@ import React, { useCallback, useEffect, useState } from 'react'
 
 // ── Copy pinned by the C.1 contract ──────────────────────────────────────
 const SHARED_TITLE = 'Stopping affects other sessions in this workspace.'
+
+// Verb-correct shared line for the confirm dialog. The `stop` string is the
+// C.1-pinned copy (== SHARED_TITLE); the other verbs are derived from the same
+// `<Gerund> affects other sessions in this workspace.` template so a start or
+// restart prompt never claims "Stopping".
+const SHARED_ACTIONS = {
+  stop: 'Stopping',
+  start: 'Starting',
+  restart: 'Restarting',
+  resize: 'Resizing',
+  remove: 'Removing',
+}
+const SHARED_SUFFIX = 'affects other sessions in this workspace.'
+function sharedLineFor(action) {
+  const gerund = SHARED_ACTIONS[action] || SHARED_ACTIONS.stop
+  return `${gerund} ${SHARED_SUFFIX}`
+}
+
+//: Fixed actor id for the record-keyed write actions (matches
+//: RecordContainerPanel). The backend `_resolve_actor` requires a non-empty
+//: body `actor` OR an `X-Actor` header, else the request 401s before any
+//: handler runs. Both are sent so either resolution path succeeds.
+const ACTOR = 'operator'
+
 const DRIFT_AMBER_TEXT = 'Running under older permissions — restart to apply.'
 const DRIFT_NEUTRAL_TITLE =
   'Drift check not yet wired for this container — see backend/record-create-permission-snapshot.'
@@ -243,18 +267,23 @@ export default function ContainerListPanel({ workspaceId }) {
   const dispatch = useCallback(
     async ({ entry, action, value }) => {
       const base = `/api/workspace/${workspaceId}/containers/${entry.id}`
-      if (action === 'resources') {
-        await fetch(`${base}/resources`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mem_limit: value }),
-        })
-      } else {
-        await fetch(`${base}/action`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action }),
-        })
+      const headers = { 'Content-Type': 'application/json', 'X-Actor': ACTOR }
+      const res =
+        action === 'resources'
+          ? await fetch(`${base}/resources`, {
+              method: 'PATCH',
+              headers,
+              body: JSON.stringify({ mem_limit: value, actor: ACTOR }),
+            })
+          : await fetch(`${base}/action`, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ action, actor: ACTOR }),
+            })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        setError(body.detail || `Action failed (${res.status})`)
+        return
       }
       await refresh()
     },
@@ -302,7 +331,7 @@ export default function ContainerListPanel({ workspaceId }) {
     const { entry, action } = pending
     const verb = action === 'resources' ? 'resize' : action
     const base = `Are you sure you want to ${verb} ${entry.name}?`
-    if (entry.shared) return `${base} ${SHARED_TITLE}`
+    if (entry.shared) return `${base} ${sharedLineFor(verb)}`
     return base
   }
 
