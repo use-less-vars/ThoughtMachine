@@ -312,7 +312,16 @@ export default function ContainerListPanel({ workspaceId }) {
             })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        setError(body.detail || `Action failed (${res.status})`)
+        const message = body.detail || `Action failed (${res.status})`
+        // Re-read server state even when the action failed: a 404 means the
+        // record is already gone, so the row that caused it must be dropped
+        // from the list -- otherwise every later click on it 404s again and
+        // the row is an unrecoverable dead end on screen. `refresh()` runs
+        // FIRST and the error is surfaced after it, because a successful
+        // reload clears `error` (re-setting it afterwards keeps the message
+        // visible exactly as before).
+        await refresh()
+        setError(message)
         return
       }
       await refresh()

@@ -456,8 +456,9 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
   })
 
   // Wave (panel-actions funnel) commit 1: a failed action is visible and is
-  // never treated as success.
-  it('a failed action (401) surfaces the server detail and does not refetch as if it succeeded', async () => {
+  // never treated as success. It DOES still re-read server state (see the
+  // zombie-row regression test below).
+  it('a failed action (401) surfaces the server detail and still refetches the list', async () => {
     const containersBody = payload({ ephemeral: [ephemeralEntry({ id: 'eph-fail', state: 'running' })] })
     const fetchMock = vi.fn(async (url) => {
       const u = String(url)
@@ -478,11 +479,45 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     // the confirm modal is closed and no success state was entered
     expect(screen.queryByTestId('confirm-dialog')).toBeNull()
 
-    // the failure returned BEFORE refresh(): exactly one containers GET happened
-    const listGets = fetchMock.mock.calls.filter(
-      ([u, init]) => String(u).endsWith('/containers') && (!init || !init.method || init.method === 'GET')
-    )
-    expect(listGets).toHaveLength(1)
+    // the failure still refreshes: the mount GET plus the post-failure GET
+    await waitFor(() => {
+      const listGets = fetchMock.mock.calls.filter(
+        ([u, init]) => String(u).endsWith('/containers') && (!init || !init.method || init.method === 'GET')
+      )
+      expect(listGets).toHaveLength(2)
+    })
+    // ...and the error survives that refetch (refresh() resets `error` on success)
+    expect(screen.getByRole('alert')).toHaveTextContent('actor required')
+  })
+
+  // Regression: a non-ok action response used to return BEFORE refresh(), so
+  // the row that caused the failure (a 404 -- the record is already gone)
+  // stayed on screen and 404'd again on every later click: a UI dead end.
+  it('a failed remove (404) surfaces the error AND refetches, dropping the stale row', async () => {
+    const firstList = payload({ persistent: [persistentEntry({ id: 'pers-zombie', state: 'running' })] })
+    const emptyList = payload({})
+    let listCalls = 0
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).includes('/action')) {
+        return { ok: false, status: 404, json: async () => ({ detail: 'container record not found' }) }
+      }
+      listCalls += 1
+      return { ok: true, status: 200, json: async () => (listCalls === 1 ? firstList : emptyList) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await screen.findByTestId('container-row-pers-zombie')
+    fireEvent.click(screen.getByTestId('container-action-pers-zombie-remove'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+
+    // (1) the server detail is surfaced, exactly as before the fix
+    expect(await screen.findByRole('alert')).toHaveTextContent('container record not found')
+    // (2) the panel re-read server state, so the zombie row is gone
+    await waitFor(() => expect(screen.queryByTestId('container-row-pers-zombie')).toBeNull())
+    expect(listCalls).toBe(2)
+    // (3) the error is not swallowed by that refetch's `error` reset
+    expect(screen.getByRole('alert')).toHaveTextContent('container record not found')
   })
 
   // Wave commit 2: every panel action attributes the operator.
