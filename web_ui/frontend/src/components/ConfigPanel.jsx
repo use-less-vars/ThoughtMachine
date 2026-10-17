@@ -19,6 +19,19 @@ const SESSION_PERMISSION_OPTION_ORDER = {
 // Only these keys may be PUT to /api/session/{id}/permissions (mirrors the
 // backend session-permission store schema).
 const CANONICAL_SESSION_PERMISSION_KEYS = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash']
+
+// Canonical-key subset of a raw permission map. BOTH sides of the permissions
+// dirty compare go through this: a GET can carry legacy `system`/`execution` or
+// gate grains (which is exactly why the PUT below may send canonical keys only),
+// and comparing the FULL raw map against a canonical-only applied baseline would
+// pin the panel dirty forever -- Apply stays blue and 'Unsaved permission
+// changes' never clears. Identity for canonical-only data. Null-safe.
+const canonicalPermKeySubset = (raw) =>
+  !raw || typeof raw !== 'object'
+    ? {}
+    : Object.fromEntries(
+        CANONICAL_SESSION_PERMISSION_KEYS.filter((k) => k in raw).map((k) => [k, raw[k]])
+      );
 const permissionOptionStyle = { background: '#1e1e2e', color: '#cdd6f4' }
 const permissionOptionLabel = (value) => value === 'write_on_feature_branch'
   ? 'Write on feature branches'
@@ -279,7 +292,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : null,
           resolved_at: data?.resolved_at ?? null,
         });
-        setLastAppliedRaw(raw);
+        // Baseline is the canonical projection, never the full raw map: see
+        // canonicalPermKeySubset.
+        setLastAppliedRaw(canonicalPermKeySubset(raw));
       })
       .catch(() => {
         if (cancelled) return;
@@ -329,7 +344,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   // by the last GET/PUT response. Only meaningful while a REST source is loaded.
   const permsDirty = useMemo(() => {
     if (!sessionPerms || !lastAppliedRaw) return false;
-    return !isEqualRaw(permsRaw, lastAppliedRaw);
+    // Compare canonical projections on both sides (a legacy key in the GET raw
+    // must never pin the panel dirty).
+    return !isEqualRaw(canonicalPermKeySubset(permsRaw), lastAppliedRaw);
   }, [sessionPerms, lastAppliedRaw, permsRaw]);
 
   const handleProviderChange = (e) => {
@@ -372,9 +389,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         // PUT only canonical session-permission keys — the backend schema rejects
         // any other key (legacy system/execution or gate grains).
         const rawPerms = sessionPerms.raw ?? {};
-        const payload = Object.fromEntries(
-          CANONICAL_SESSION_PERMISSION_KEYS.filter((k) => k in rawPerms).map((k) => [k, rawPerms[k]])
-        );
+        const payload = canonicalPermKeySubset(rawPerms);
         const res = await fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
