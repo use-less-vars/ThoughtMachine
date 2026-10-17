@@ -314,6 +314,40 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     expect(dialog).not.toHaveTextContent(SHARED_TEXT)
   })
 
+  // ── T11b (Round B) ──────────────────────────────────────────────────────
+  // T11b: the shared confirm line is VERB-CORRECT. The stop copy stays
+  // byte-identical (C.1 pin above); start/restart derive their own gerund and
+  // must never claim "Stopping".
+  it('T11b shared confirm copy is verb-correct: stop verbatim, start/restart never say "Stopping"', async () => {
+    stubFetch(
+      payload({
+        persistent: [
+          persistentEntry({ id: 'pers-stop', state: 'running' }),
+          persistentEntry({ id: 'pers-start', state: 'exited' }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    // stop on a shared container -> the verbatim pinned stop line
+    fireEvent.click(await screen.findByTestId('container-action-pers-stop-stop'))
+    expect(await screen.findByTestId('confirm-dialog')).toHaveTextContent(SHARED_TEXT)
+    fireEvent.click(screen.getByTestId('confirm-cancel'))
+
+    // start on an exited shared container -> a "Starting" line, NOT "Stopping"
+    fireEvent.click(await screen.findByTestId('container-action-pers-start-start'))
+    const startMsg = screen.getByTestId('confirm-message').textContent || ''
+    expect(startMsg).not.toMatch(/Stopping/)
+    expect(startMsg).toMatch(/Starting/)
+    fireEvent.click(screen.getByTestId('confirm-cancel'))
+
+    // restart on a running shared container -> a "Restarting" line, NOT "Stopping"
+    fireEvent.click(await screen.findByTestId('container-action-pers-stop-restart'))
+    const restartMsg = screen.getByTestId('confirm-message').textContent || ''
+    expect(restartMsg).not.toMatch(/Stopping/)
+    expect(restartMsg).toMatch(/Restarting/)
+  })
+
   // ── T13 ─────────────────────────────────────────────────────────────────
   // T13: oom state chip is text "oom" and distinct (class) from a running chip.
   it('T13 oom chip reads "oom" with class container-state-chip--oom, distinct from a running chip', async () => {
