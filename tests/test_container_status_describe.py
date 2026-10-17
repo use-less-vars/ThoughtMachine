@@ -14,8 +14,6 @@ touching Docker: ``_make_manager`` is patched and the manager is a MagicMock.
 import json
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from tools.container_control import ContainerStatusTool
 
 # Canonical happy-path payload returned by ``manager.status()``.
@@ -106,7 +104,8 @@ def test_persistent_container_description():
     # A persistent container belongs to the workspace, not a session.
     assert result["owner"] == "workspace"
     assert result["lifecycle_class"] == "persistent"
-    assert result["grain_required_for_remove"] == "container:remove"
+    # Persistent removal needs only the base grain (no ungrantable sub-grain).
+    assert result["grain_required_for_remove"] == "container:true"
 
 
 def test_resource_container_description():
@@ -120,13 +119,13 @@ def test_resource_container_description():
 
 
 def test_unclassifiable_container_fails_closed():
-    # No lifecycle class -> conservative "container:remove" requirement.
+    # No lifecycle class -> the base grain is advertised; the funnel refuses.
     manager = _manager(lifecycle_class=None)
     result = _run(manager)
 
     assert result["success"] is True
     assert result["lifecycle_class"] is None
-    assert result["grain_required_for_remove"] == "container:remove"
+    assert result["grain_required_for_remove"] == "container:true"
 
 
 def test_missing_container_reports_null_description():
@@ -150,7 +149,7 @@ def test_description_survives_lookup_and_classification_failure():
     assert result["success"] is True
     assert result["status"] == "running"
     assert result["lifecycle_class"] is None
-    assert result["grain_required_for_remove"] == "container:remove"
+    assert result["grain_required_for_remove"] == "container:true"
 
 
 def test_status_response_always_carries_description_keys():

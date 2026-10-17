@@ -578,8 +578,9 @@ class ContainerStatusTool(_ContainerControlBase):
         """Derive the seven lifecycle/ownership description fields.
 
         Fail-safe: any resolution error degrades to a neutral value rather
-        than raising, and an unclassifiable container is treated fail-closed
-        (``container:remove``).
+        than raising, and an unclassifiable container advertises the base
+        ``container:true`` grain (its removal is refused fail-closed by the
+        lifecycle funnel, not by the tool).
         """
         lifecycle_class = None
         container = None
@@ -641,10 +642,11 @@ class ContainerStatusTool(_ContainerControlBase):
 
         if lifecycle_class == "resource":
             grain_required_for_remove = "operator"
-        elif lifecycle_class == "ephemeral":
-            grain_required_for_remove = "container:true"
         else:
-            grain_required_for_remove = "container:remove"
+            # Persistent and ephemeral both require only the base grain; an
+            # unclassifiable container advertises the same base grain (the
+            # funnel, not the grain, is what refuses it).
+            grain_required_for_remove = "container:true"
 
         # The unmet-session-requirement reason only applies to persistent
         # containers (they may outlive a session whose grant narrowed).
@@ -903,14 +905,18 @@ class ContainerRemoveTool(_ContainerControlBase):
     status "removed". This tool never raises — failures are returned in the JSON
     response.
 
-    Removal is gated per lifecycle class (the grain is declarative — the
-    security gate itself only sees the boolean ``container`` grant):
+    Removal is gated per lifecycle class. The hard gate is the permission
+    envelope (the security gate refuses any session without the boolean
+    ``container`` grant before this tool runs) plus the lifecycle funnel's own
+    class/ownership checks — there is no per-class sub-grain:
 
     - ``ephemeral`` containers may be removed freely;
-    - ``persistent`` containers additionally require the ``container: remove``
-      grain on the session;
+    - ``persistent`` containers are workspace property: any session whose
+      envelope passes the gate may remove one (trust-by-note — the container's
+      ``note`` is the coordination mechanism, not a per-session grain);
     - ``resource`` containers are operator-only and always refused;
-    - an unclassifiable container is left to the manager's own checks.
+    - an unclassifiable container is left to the manager's own checks (the
+      lifecycle funnel refuses it, fail-closed).
 
     Returns JSON with structure:
     {
@@ -937,27 +943,6 @@ class ContainerRemoveTool(_ContainerControlBase):
             "omitted."
         ),
     )
-
-    def _session_permissions_map(self) -> Dict[str, Any]:
-        """Return the session permission map (empty dict when unavailable)."""
-        permissions = getattr(self, "session_permissions", None)
-        return permissions if isinstance(permissions, dict) else {}
-
-    def _session_holds_remove_grain(self) -> bool:
-        """Whether the session explicitly holds the ``container: remove`` grain."""
-        permissions = self._session_permissions_map()
-        if permissions.get("container:remove"):
-            return True
-        return permissions.get("container") == "remove"
-
-    def _current_container_grain_label(self) -> str:
-        """Human-readable label for the session's current container grain."""
-        permissions = self._session_permissions_map()
-        if self._session_holds_remove_grain():
-            return "container: remove"
-        if permissions.get("container"):
-            return "container: true"
-        return "container: none"
 
     def execute(self) -> str:
         start_time = time.time()
@@ -1004,18 +989,6 @@ class ContainerRemoveTool(_ContainerControlBase):
                 reason="Resource containers can only be removed by the operator.",
                 duration=time.time() - start_time,
             )
-        if lifecycle_class == "persistent" and not self._session_holds_remove_grain():
-            return self._respond(
-                False,
-                container_id=self.container_id_or_name,
-                status="refused",
-                reason=(
-                    "Persistent containers require the `container: remove` grain; "
-                    "this session has `{}`.".format(self._current_container_grain_label())
-                ),
-                duration=time.time() - start_time,
-            )
-
         try:
             result = manager.remove(self.container_id_or_name, keep_record=False)
         except RuntimeError as e:

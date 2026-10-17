@@ -3776,6 +3776,7 @@ def _recordless_view_entry(container, manager, workspace_id):
     return {
         "id": container_id,
         "name": name,
+        "note": "",
         "kind": kind,
         "state": _map_container_view_state(status, ""),
         "intent_snapshot": None,
@@ -3791,8 +3792,11 @@ def _recordless_view_entry(container, manager, workspace_id):
 def _container_view_entry(record, manager, workspace_id, live=None, live_envelope=None):
     """Build one container-view entry dict from a record (+ its live status).
 
-    Entry keys: ``id, name, kind, state, intent_snapshot, permissions,
-    permission_drift, shared, live, unrecorded, live_envelope``.  ``live`` is ``True`` when the
+    Entry keys: ``id, name, note, kind, state, intent_snapshot, permissions,
+    permission_drift, shared, live, unrecorded, live_envelope``.  ``note`` is
+    the record's sticky note (``notes`` field; ``""`` when unset), surfaced
+    verbatim so the UI can show whose work a shared container is doing.
+    ``live`` is ``True`` when the
     record has a matching live container, ``False`` when it has none (the UI
     renders it distinctly, it is never hidden), and ``None`` when the live set
     could not be enumerated (unverified -- not rendered as missing).
@@ -3828,6 +3832,7 @@ def _container_view_entry(record, manager, workspace_id, live=None, live_envelop
     return {
         "id": record.id,
         "name": getattr(record, "name", "") or "",
+        "note": getattr(record, "notes", "") or "",
         "kind": kind,
         "state": state,
         "intent_snapshot": getattr(record, "intent_snapshot", None),

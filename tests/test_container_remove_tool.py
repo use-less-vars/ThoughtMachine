@@ -9,7 +9,8 @@ constructs a real ``ContainerManager``. Covers:
   (the class name, since these tools do not override the ``name`` ClassVar)
 - ``execute()`` surfaces ``ContainerManager.remove()``'s dict verbatim as JSON
 - the per-lifecycle-class removal gate: ephemeral removes freely, persistent
-  requires the ``container: remove`` grain, resource is operator-only
+  removes with the base ``container:true`` grain (no sub-grain), resource is
+  operator-only
 - idempotent NotFound -> "removed"
 - error results and RuntimeError failures are returned, never raised
 - ``container_id_or_name`` is required
@@ -70,12 +71,7 @@ class TestContainerRemoveToolParameters:
         with patch.object(
             ContainerRemoveTool, "_make_manager", return_value=manager
         ) as make_manager:
-            with patch.object(
-                ContainerRemoveTool,
-                "_session_permissions_map",
-                return_value={"container": "remove"},
-            ):
-                _parse(tool.execute())
+            _parse(tool.execute())
         make_manager.assert_called_once_with("ws-9")
 
 
@@ -180,8 +176,44 @@ class TestContainerRemoveToolLifecycleGrain:
         assert result["success"] is True
         assert result["status"] == "removed"
 
-    def test_persistent_without_remove_grain_is_refused(self):
-        manager = _manager(lifecycle_class="persistent")
+    def test_persistent_removes_with_container_true(self):
+        """Persistent remove needs only the base ``container:true`` grain."""
+        manager = _manager(
+            lifecycle_class="persistent",
+            remove_result={"status": "removed", "container_id": "abc123"},
+        )
+        tool = ContainerRemoveTool(
+            container_id_or_name="abc123",
+            session_permissions={"container": True},
+        )
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["success"] is True
+        assert result["status"] == "removed"
+        assert "error" not in result
+        manager.remove.assert_called_once_with("abc123", keep_record=False)
+
+    def test_persistent_no_longer_requires_a_sub_grain(self):
+        """The ungrantable ``container:remove`` token is no longer consulted."""
+        manager = _manager(
+            lifecycle_class="persistent",
+            remove_result={"status": "removed", "container_id": "abc123"},
+        )
+        tool = ContainerRemoveTool(container_id_or_name="abc123")  # no permissions
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        assert result["status"] == "removed"
+        manager.remove.assert_called_once_with("abc123", keep_record=False)
+
+    def test_envelope_is_the_session_gate(self):
+        """The hard session gate is the base category, not a per-class grain."""
+        assert ContainerRemoveTool.required_categories == ["container:true"]
+
+    def test_resource_is_operator_only(self):
+        """Resource containers stay operator-only for agent sessions."""
+        from infra.container_manager import ContainerManager
+
+        manager = _manager(lifecycle_class="resource")
         tool = ContainerRemoveTool(
             container_id_or_name="abc123",
             session_permissions={"container": True},
@@ -190,50 +222,13 @@ class TestContainerRemoveToolLifecycleGrain:
             result = _parse(tool.execute())
         assert result["success"] is False
         assert result["status"] == "refused"
-        assert result["container_id"] == "abc123"
-        assert "container: remove" in result["reason"]
-        assert "error" not in result
-        manager.remove.assert_not_called()
-
-    def test_persistent_without_grain_names_current_grain(self):
-        manager = _manager(lifecycle_class="persistent")
-        tool = ContainerRemoveTool(container_id_or_name="abc123")  # no permissions
-        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
-            result = _parse(tool.execute())
-        assert result["status"] == "refused"
-        assert "container: none" in result["reason"]
-
-    @pytest.mark.parametrize(
-        "permissions",
-        [{"container": "remove"}, {"container:remove": True}],
-    )
-    def test_persistent_with_remove_grain_is_allowed(self, permissions):
-        manager = _manager(
-            lifecycle_class="persistent",
-            remove_result={"status": "removed", "container_id": "abc123"},
-        )
-        tool = ContainerRemoveTool(
-            container_id_or_name="abc123",
-            session_permissions=permissions,
-        )
-        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
-            result = _parse(tool.execute())
-        assert result["success"] is True
-        assert result["status"] == "removed"
-        manager.remove.assert_called_once_with("abc123", keep_record=False)
-
-    def test_resource_is_operator_only(self):
-        manager = _manager(lifecycle_class="resource")
-        tool = ContainerRemoveTool(
-            container_id_or_name="abc123",
-            session_permissions={"container": "remove"},
-        )
-        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
-            result = _parse(tool.execute())
-        assert result["success"] is False
-        assert result["status"] == "refused"
         assert "operator" in result["reason"]
         manager.remove.assert_not_called()
+        # ... and the funnel refuses it too, independently of the tool.
+        assert (
+            ContainerManager._agent_access_denial("resource")
+            == "Resource container access denied"
+        )
 
     def test_unknown_lifecycle_class_is_left_to_the_manager(self):
         """An unclassifiable/unknown class is not refused by the tool itself."""
@@ -245,6 +240,32 @@ class TestContainerRemoveToolLifecycleGrain:
         with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
             result = _parse(tool.execute())
         assert result["status"] == "removed"
+
+    def test_unclassifiable_is_refused_by_the_funnel(self):
+        """A4: the unclassifiable refusal lives in the funnel, not the tool."""
+        from infra.container_manager import ContainerManager
+        from security.admission_gate import REASON_UNKNOWN_LIFECYCLE_CLASS
+
+        # The layer that actually refuses (None has no lifecycle policy).
+        assert (
+            ContainerManager._agent_access_denial(None)
+            == REASON_UNKNOWN_LIFECYCLE_CLASS
+        )
+        manager = _manager(
+            lifecycle_class=None,
+            remove_result={
+                "status": "error",
+                "container_id": "abc123",
+                "error": REASON_UNKNOWN_LIFECYCLE_CLASS,
+            },
+        )
+        tool = ContainerRemoveTool(container_id_or_name="abc123")
+        with patch.object(ContainerRemoveTool, "_make_manager", return_value=manager):
+            result = _parse(tool.execute())
+        # The tool passed the call through; the funnel's refusal is surfaced.
+        manager.remove.assert_called_once_with("abc123", keep_record=False)
+        assert result["success"] is False
+        assert result["error"] == REASON_UNKNOWN_LIFECYCLE_CLASS
 
     def test_class_of_failure_is_tolerated(self):
         manager = _manager(
