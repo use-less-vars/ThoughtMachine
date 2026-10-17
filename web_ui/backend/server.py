@@ -4442,6 +4442,31 @@ _CONTAINER_VIEW_ACTIONS = {
     "remove": "remove",
 }
 
+#: Lifecycle classes the container-view ``remove`` action may reap. An
+#: ALLOW-list, not a deny-list: ``resource`` is operator-managed outside this
+#: route, ``service`` has no producers yet, and an unknown / blank class is
+#: refused rather than guessed at. Anything absent from this set is refused
+#: BEFORE a manager is built, so no Docker verb is ever reached.
+_CONTAINER_REMOVE_ALLOWED_CLASSES = frozenset({"ephemeral", "persistent"})
+
+
+def _delete_container_record_if_present(cr_api, workspace_id: str,
+                                        record_id: str) -> None:
+    """Delete a container record, tolerating one the manager already reaped.
+
+    ``ContainerManager.remove`` reaps the bound record itself
+    (``_reap_bound_record`` does not gate on ``own_lifecycle`` for the
+    ``ephemeral`` / ``persistent`` classes), so by the time this route deletes
+    the record it may already be gone. ``api.delete_record`` raises
+    :class:`RecordNotFound` in that case, which is NOT an error for a removal
+    that just succeeded -- swallowing it keeps a successful remove from being
+    reported as a 503. Every other failure still propagates.
+    """
+    try:
+        cr_api.delete_record(workspace_id, record_id)
+    except cr_api.RecordNotFound:
+        return
+
 
 @app.post("/api/workspace/{workspace_id}/containers/{record_id}/action")
 def workspace_container_action(workspace_id: str, record_id: str,
@@ -4450,12 +4475,26 @@ def workspace_container_action(workspace_id: str, record_id: str,
     """Apply a lifecycle action to a workspace container record.
 
     Body ``{"action": "stop"|"start"|"restart"|"remove"}``. ``start`` is an
-    alias of ``restart`` (reported as such). ``remove`` is refused for runtime
-    (non-ephemeral) containers (403 ``permission_denied``). The response is the
-    same entry shape the container-view GET emits.
+    alias of ``restart`` (reported as such). ``remove`` is an ALLOW-list
+    decision: only ``ephemeral`` and ``persistent`` records may be removed;
+    every other class (``resource``, ``service``, or an unknown / blank one)
+    is refused with 403 ``permission_denied``. The response is the same entry
+    shape the container-view GET emits.
 
     restart semantics: ephemeral -> stop then start (``allow_fresh=False``);
-    runtime -> remove then start (``allow_fresh=True``, i.e. a recreate).
+    every other class -> remove then start (``allow_fresh=True``, i.e. a
+    recreate).
+
+    acting identity: ``_resolve_actor`` is ATTRIBUTION, not authentication.
+    It only requires a present, well-formed token (401 when absent, 400 when
+    malformed) and never compares the name against anything, so there is no
+    caller-name gate on this route. The operator-only property of a
+    ``persistent`` record therefore comes from surface separation, not from a
+    check here: agent sessions do not reach this HTTP API at all, and the
+    agent's own remove path (``ContainerRemoveTool``) refuses ``persistent``
+    containers outright under the interim rule ("Persistent containers can
+    only be removed by the operator"). The ``actor`` value labels who to
+    blame in the audit trail; it authorises nothing.
     """
     actor, actor_error = _resolve_actor(request, body)
     if actor_error is not None:
@@ -4479,11 +4518,16 @@ def workspace_container_action(workspace_id: str, record_id: str,
     lifecycle = getattr(record, "lifecycle_class", "") or ""
     is_runtime = lifecycle != "ephemeral"
 
-    # remove is permitted only for ephemeral (session) containers -- refuse
-    # BEFORE building the manager so no Docker verb is ever reached.
-    if action == "remove" and is_runtime:
+    # remove is an ALLOW-list decision: only the classes this surface knows how
+    # to reap (ephemeral session containers and persistent workspace
+    # containers) may be removed. ``resource`` is operator-managed outside this
+    # route, ``service`` has no producers yet, and an unknown / blank class is
+    # refused rather than guessed at. Refuse BEFORE building the manager so no
+    # Docker verb is ever reached for a forbidden action.
+    if action == "remove" and lifecycle not in _CONTAINER_REMOVE_ALLOWED_CLASSES:
         return JSONResponse(
-            {"error": "removing a runtime container is not permitted",
+            {"error": "removing a container with lifecycle class "
+                      f"'{lifecycle or 'unclassified'}' is not permitted",
              "code": "permission_denied"},
             status_code=403)
 
@@ -4512,16 +4556,20 @@ def workspace_container_action(workspace_id: str, record_id: str,
             _cr_api.update_record(workspace_id, record_id, state="stopped")
         elif action == "remove":
             if container_id:
+                # ``ContainerManager.remove`` reaps the bound record as part of
+                # the removal, so the delete below is a no-op safety net rather
+                # than the primary one.
                 manager.remove(container_id)
-            _cr_api.delete_record(workspace_id, record_id)
+            _delete_container_record_if_present(_cr_api, workspace_id,
+                                               record_id)
             return JSONResponse({"id": record_id, "removed": True})
         else:  # restart (start is an alias)
             # Delegate the Docker verb to the record-keyed handler
             # (kill/restart/recreate) so the two surfaces cannot drift: a
-            # runtime container is recreated (allow_fresh=True), an ephemeral
-            # one is restarted (stop + start, allow_fresh=False). The delegated
-            # response is discarded -- this route emits the container-view
-            # entry shape below.
+            # non-ephemeral container is recreated (allow_fresh=True), an
+            # ephemeral one is restarted (stop + start, allow_fresh=False).
+            # The delegated response is discarded -- this route emits the
+            # container-view entry shape below.
             delegate_action = "recreate" if is_runtime else "restart"
             resp = _record_user_action(record_id, delegate_action, request,
                                        workspace_id, body)
@@ -4546,11 +4594,11 @@ def workspace_container_resources(workspace_id: str, record_id: str,
     """Edit a record's resource limits by recreating the container.
 
     Body ``{"mem_limit"?: str, "cpu_quota"?: int}`` -- at least one required.
-    Applies to BOTH ephemeral and runtime containers (an ephemeral edit is NOT
-    refused): the record's ``intent_snapshot`` is updated, then the container
-    is removed and started fresh (``allow_fresh=True``). The record ``id``
-    stays stable across the recreate; the response is the same entry shape the
-    container-view GET emits.
+    Applies to BOTH ephemeral and persistent containers (an ephemeral edit is
+    NOT refused): the record's ``intent_snapshot`` is updated, then the
+    container is removed and started fresh (``allow_fresh=True``). The record
+    ``id`` stays stable across the recreate; the response is the same entry
+    shape the container-view GET emits.
     """
     actor, actor_error = _resolve_actor(request, body)
     if actor_error is not None:

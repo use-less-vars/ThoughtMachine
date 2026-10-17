@@ -43,9 +43,13 @@ const ACTION_LABELS = {
 }
 
 // Which lifecycle controls a row exposes for a given state. `remove` is added
-// separately by kind: ephemeral rows and persistent rows (workspace property,
-// removable by any session whose envelope passes). Resource containers stay
-// operator-only, so a resource row never offers `remove`.
+// separately by kind: ephemeral rows and persistent rows both offer it, which
+// mirrors the route's ALLOW-list (it reaps `ephemeral` and `persistent` and
+// refuses every other class before any Docker verb). The panel attributes
+// `actor=operator` on every request -- that token is attribution, not
+// authentication; the route's gate, not this UI, is what authorises the call.
+// Resource containers stay operator-managed outside this panel, so a resource
+// row never offers `remove`.
 function lifecycleActions(state) {
   if (state === 'running') return ['stop', 'restart']
   if (state === 'paused') return ['start', 'restart']
@@ -101,9 +105,12 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
 
   const actions = lifecycleActions(state)
   actions.push('resources')
-  // Persistent containers are workspace property: any session whose envelope
-  // passes may remove one, coordinating through the container's note.
-  // Resource rows stay operator-only.
+  // Persistent containers are removable from this panel: the route's allow-list
+  // covers `ephemeral` and `persistent` and refuses every other class, and the
+  // panel only ever *attributes* `actor=operator` (attribution is not
+  // authentication -- the backend gate decides). The container's note is
+  // surfaced in the confirm copy so whoever else is using it can see whose work
+  // it was. Resource rows stay operator-managed outside this panel.
   if (entry.kind === 'ephemeral' || entry.kind === 'persistent') actions.push('remove')
 
   return (

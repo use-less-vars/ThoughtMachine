@@ -35,9 +35,18 @@ Pinned contract (from the C.1 brief + recon, dev=bf7fb9f):
   ``stopped``.
 * ``ContainerManager.status()`` gains ``oom_killed`` (read from the SAME
   ``container.attrs["State"]`` dict it already reads -- no new Docker call).
-* ``remove`` is refused for runtime (resource) containers -> 403
-  ``permission_denied`` with body ``{"error", "code"}`` (the convention already
-  used by ``_record_user_action`` at server.py:~3564).
+* ``remove`` is an ALLOW-list decision, refused with 403 ``permission_denied``
+  and body ``{"error", "code"}`` (the convention already used by
+  ``_record_user_action`` at server.py:~3564) for EVERY class other than
+  ``ephemeral`` and ``persistent``: ``resource`` (operator-managed outside this
+  surface), ``service`` (no producers yet), and an unknown / blank class.
+  Ephemeral and ``persistent`` records ARE removable through this route: a
+  persistent container is workspace property and the operator is its only
+  authorized actor (the agent-side tool refuses the same class -- commit 1 of
+  the interim rule).  The record delete is idempotent:
+  ``ContainerManager.remove`` already reaps the bound record, so the route must
+  not turn a successful removal into a 503 when the record is gone by the time
+  it looks.
 * ``PATCH .../resources`` = stop + recreate, and applies to BOTH kinds (an
   ephemeral edit is NOT refused).
 
@@ -51,6 +60,8 @@ pattern from tests/test_container_record_user_action_routes.py).
 """
 
 from __future__ import annotations
+
+import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -421,7 +432,7 @@ def test_action_restart_resource_recreates(vault, monkeypatch):
     assert rec.docker_id != "docker-r"
 
 
-# ── T5: remove a resource container => refused ───────────────────────────────
+# ── T5: remove a RESOURCE container => refused ───────────────────────────────
 
 def test_action_remove_resource_refused(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
@@ -438,6 +449,157 @@ def test_action_remove_resource_refused(vault, monkeypatch):
 
     # No Docker-mutating verb was reached.
     assert mgr.calls == []
+
+
+# ── T5b: remove a PERSISTENT container => allowed (operator path) ───────────
+#
+# World B: removal is an ALLOW-list decision -- the classes the route may reap
+# are ``ephemeral`` and ``persistent`` (T5 above covers ``resource``; T5c/T5d
+# cover ``service`` and an unknown class). A persistent record is workspace
+# property whose operator is the only actor routed through this HTTP path; _resolve_actor is attribution, not authentication, so the record-keyed
+# route must reach ``manager.remove`` and end with the record gone.
+
+def test_action_remove_persistent_allowed(vault, monkeypatch):
+    _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
+          lifecycle_class="persistent")
+    mgr = _install_manager(monkeypatch, FakeManager())
+    _allow(monkeypatch)
+
+    resp = _action("rec-p", "remove")
+    assert resp.status_code == 200
+    assert resp.json() == {"id": "rec-p", "removed": True}
+
+    # The Docker container was actually removed ...
+    assert ("remove", "docker-p") in mgr.calls
+    # ... and the record itself is gone from the store.
+    assert cr_api.load_record("ws1", "rec-p", vault_root=vault) is None
+
+
+def test_action_remove_persistent_requires_actor(vault, monkeypatch):
+    """The actor token is still mandatory: no actor -> 401, nothing removed."""
+    _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
+          lifecycle_class="persistent")
+    mgr = _install_manager(monkeypatch, FakeManager())
+    _allow(monkeypatch)
+
+    resp = client.post(ACTION.format(ws="ws1", rid="rec-p"),
+                       json={"action": "remove"})
+    assert resp.status_code == 401
+    assert mgr.calls == []
+    assert cr_api.load_record("ws1", "rec-p", vault_root=vault) is not None
+
+
+# ── T5c: the manager ALREADY reaped the record => remove is still 200 ───────
+#
+# ``ContainerManager.remove`` -> ``_reap_record`` -> ``_reap_bound_record`` ->
+# ``api.delete_record``: the real manager deletes the bound record as part of
+# the removal for the ``ephemeral`` and ``persistent`` classes, so the route's
+# own delete hits a record that is already gone and ``api.delete_record``
+# raises ``RecordNotFound``. A successful removal must not be reported as 503.
+
+class _ReapingManager(FakeManager):
+    """``FakeManager`` whose ``remove`` reaps the bound record like the real one."""
+
+    def __init__(self, *, record_id="rec-p", **kwargs):
+        super().__init__(**kwargs)
+        self._record_id = record_id
+
+    def remove(self, container_id, *, keep_record=False):
+        result = super().remove(container_id, keep_record=keep_record)
+        try:
+            cr_api.delete_record(self.workspace_id, self._record_id)
+        except cr_api.RecordNotFound:
+            pass
+        return result
+
+
+def test_action_remove_persistent_reaped_by_manager(vault, monkeypatch):
+    _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
+          lifecycle_class="persistent")
+    mgr = _install_manager(monkeypatch, _ReapingManager(record_id="rec-p"))
+    _allow(monkeypatch)
+
+    resp = _action("rec-p", "remove")
+    assert resp.status_code == 200
+    assert resp.json() == {"id": "rec-p", "removed": True}
+
+    assert ("remove", "docker-p") in mgr.calls
+    assert cr_api.load_record("ws1", "rec-p", vault_root=vault) is None
+
+
+def test_action_remove_persistent_identity_is_attribution_only(vault,
+                                                              monkeypatch):
+    """This route carries no actor-NAME authorisation; any token removes.
+
+    The ``actor`` (``X-Actor`` header or body field) is ATTRIBUTION only:
+    ``_resolve_actor`` checks that a well-formed token is present and nothing
+    else. "operator" is therefore a label the panel volunteers, not a
+    credential, and this test pins that absence -- it exists so nobody later
+    assumes a gate that was never there and "fixes" the route into refusing a
+    name it was never told to check.
+
+    The operator-only property of ``persistent`` records still holds, but by
+    surface separation rather than by a caller-name check: agent sessions
+    cannot reach this surface at all, and the agent's own remove path
+    (``ContainerRemoveTool``) refuses ``persistent`` containers outright.
+    """
+    _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
+          lifecycle_class="persistent")
+    mgr = _install_manager(monkeypatch, FakeManager())
+    _allow(monkeypatch)
+
+    resp = client.post(ACTION.format(ws="ws1", rid="rec-p"),
+                       headers={"X-Actor": "tester"},
+                       json={"action": "remove"})
+    assert resp.status_code == 200
+    assert resp.json() == {"id": "rec-p", "removed": True}
+    assert ("remove", "docker-p") in mgr.calls
+
+
+# ── T5d: remove is an ALLOW-list => service / unknown classes are refused ────
+
+def test_action_remove_service_refused(vault, monkeypatch):
+    """``service`` is not on the remove allow-list -> 403, no Docker verb."""
+    _seed(vault, record_id="rec-s", name="c-s", docker_id="docker-s",
+          lifecycle_class="service")
+    mgr = _install_manager(monkeypatch, FakeManager())
+    _allow(monkeypatch)
+
+    resp = _action("rec-s", "remove")
+    assert resp.status_code == 403
+
+    body = resp.json()
+    assert set(body) == {"error", "code"}
+    assert body["code"] == "permission_denied"
+
+    assert mgr.calls == []
+    assert cr_api.load_record("ws1", "rec-s", vault_root=vault) is not None
+
+
+def test_action_remove_unknown_class_refused(monkeypatch):
+    """Fail closed: an unreadable lifecycle class is refused, pre-manager."""
+    monkeypatch.setattr(
+        cr_api, "load_record",
+        lambda workspace_id, rid, **kwargs: types.SimpleNamespace(
+            id="rec-x", lifecycle_class=None, docker_id="docker-x"))
+    built = []
+
+    def _factory(workspace_id, workspace_path=""):
+        built.append(workspace_id)
+        return FakeManager()
+
+    monkeypatch.setattr(server_module, "_make_container_manager", _factory)
+    _allow(monkeypatch)
+
+    resp = _action("rec-x", "remove")
+    assert resp.status_code == 403
+
+    body = resp.json()
+    assert set(body) == {"error", "code"}
+    assert body["code"] == "permission_denied"
+
+    # Refused BEFORE a manager exists: no Docker verb is even reachable.
+    assert built == []
 
 
 # ── T6: PATCH resource resources => stop + recreate, new limits ──────────────
