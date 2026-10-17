@@ -7,8 +7,13 @@ import time
 
 import pytest
 
+from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL
 from thoughtmachine.container_record import api, storage
+from thoughtmachine.container_record.lifecycle_policy import RESOURCE_LABEL
 from thoughtmachine.container_record.models import (
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
     SCHEMA_VERSION_CURRENT,
     STATE_CREATING,
     RecordCorrupt,
@@ -257,3 +262,52 @@ def test_event_log_moves_to_sidecar_above_ceiling(vault, monkeypatch):
     # read_event_log merges the sidecar (first) with the embedded entries.
     merged = api.read_event_log(WS, rec.id, vault_root=vault)
     assert [entry["payload"].get("n") for entry in merged][-1] == 99
+
+
+# ── lifecycle_class_from_labels: fail-closed persistent default ──────────────
+
+
+def test_lifecycle_class_record_less_free_use_is_persistent():
+    """A record-less ``free_use`` container is PERSISTENT, not ephemeral.
+
+    The ``thoughtmachine.container_type`` label alone is not evidence of an
+    ephemeral lifecycle: with no container record the container cannot be
+    attributed to anyone, so it falls through to the fail-closed persistent
+    default (matching the ``ContainerManager.class_of`` docstring).
+    """
+    labels = {CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE}
+    assert api.lifecycle_class_from_labels(labels) == LIFECYCLE_PERSISTENT
+
+
+@pytest.mark.parametrize("container_type", ["resource", "worker", "", None])
+def test_lifecycle_class_record_less_other_types_are_persistent(container_type):
+    """No container_type value can reach the ephemeral class without a record."""
+    labels = {CONTAINER_TYPE_LABEL: container_type}
+    assert api.lifecycle_class_from_labels(labels) == LIFECYCLE_PERSISTENT
+
+
+def test_lifecycle_class_record_fact_wins_over_free_use_label(vault):
+    """When the record resolves, its class wins over the free_use label."""
+    rec = api.create_record(WS, "ephemeral", "workspace-owned", vault_root=vault)
+    labels = {
+        api.RECORD_LABEL_KEY: rec.id,
+        CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
+    }
+    assert (
+        api.lifecycle_class_from_labels(labels, vault_root=vault)
+        == LIFECYCLE_EPHEMERAL
+    )
+
+
+def test_lifecycle_class_resource_probe_beats_record_and_type_labels(vault):
+    """The resource probe outranks both the record class and the type label."""
+    rec = api.create_record(WS, "ephemeral", "workspace-owned", vault_root=vault)
+    labels = {
+        RESOURCE_LABEL: "1",
+        api.RECORD_LABEL_KEY: rec.id,
+        CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
+    }
+    assert (
+        api.lifecycle_class_from_labels(labels, vault_root=vault)
+        == LIFECYCLE_RESOURCE
+    )

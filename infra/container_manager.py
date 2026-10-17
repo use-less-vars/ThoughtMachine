@@ -98,6 +98,19 @@ from thoughtmachine.audit_logger import audit_event
 
 _audit = lambda event, data: audit_event(event, data)
 
+
+def _redact_permission_shape(permissions) -> str:
+    """Shape-only view of a session-permissions mapping for the audit log.
+
+    The plaintext audit log must never disclose permission *values*, so this
+    returns only a count plus the sorted permission category names — enough for
+    an operator to correlate a config change, nothing that leaks a grant.
+    """
+    if not isinstance(permissions, dict) or not permissions:
+        return "count=0 categories=none"
+    categories = ",".join(sorted(str(k) for k in permissions))
+    return "count={} categories={}".format(len(permissions), categories)
+
 from infra.container_env import merge_container_identity_env
 from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
 from infra.container_create import (
@@ -1776,7 +1789,8 @@ class ContainerManager:
         effective = getattr(computed, "effective", None)
         _audit("CONTAINER_CONFIG",
                f"name={name} network={network_mode} workspace={workspace_mode} "
-               f"session={self.session_permissions} workspace_id={self.workspace_id}")
+               f"session=[REDACTED {_redact_permission_shape(self.session_permissions)}] "
+               f"workspace_id={self.workspace_id}")
         # Explicit-grant guard: never silently fail-closed on a session that
         # explicitly granted write access — surface it loudly instead.
         sp = self.session_permissions or {}
@@ -3949,8 +3963,18 @@ class ContainerManager:
         # sources — the vault-managed workspace Dockerfile (build context) plus
         # the executor build sources resolved via docker_executor; otherwise
         # rebuild with the fresh hash recorded as the label.
+        req_vault = (
+            Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "requirements.txt"
+        )
         try:
-            build_hash = dex.compute_executor_build_hash()
+            # The hash MUST cover what is actually built: the executor sources
+            # plus the vault-supplied Dockerfile and requirements.txt that are
+            # copied into the build context below. Hashing only the repo sources
+            # leaves the label matching after a workspace Dockerfile edit, which
+            # silently skips the rebuild.
+            build_hash = dex.compute_executor_build_hash(
+                extra_paths=[str(vault_dockerfile), str(req_vault)]
+            )
         except OSError as e:
             raise RuntimeError(
                 f"Cannot read executor build sources ({e}); the vault-managed "
@@ -3981,9 +4005,6 @@ class ContainerManager:
             # part of the build context (no COPY . exfiltration).
             with tempfile.TemporaryDirectory(prefix="tm_build_") as tmpdir:
                 shutil.copy2(str(vault_dockerfile), os.path.join(tmpdir, "Dockerfile"))
-                req_vault = (
-                    Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "requirements.txt"
-                )
                 if not req_vault.exists():
                     raise RuntimeError(
                         f"Vault requirements not found at {req_vault}. "

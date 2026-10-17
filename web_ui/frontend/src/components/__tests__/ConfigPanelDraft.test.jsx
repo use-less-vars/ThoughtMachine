@@ -251,6 +251,57 @@ describe('ConfigPanel draft persistence (disk-pure permissions flow)', () => {
     expect(useStore.getState().sessionDrafts['s1']).toBeUndefined()
   })
 
+  it('clears the permissions dirty state after a successful PUT even when the GET raw carries a non-canonical legacy key', async () => {
+    // The stored profile carries a legacy `system` grant next to the six
+    // canonical keys: the GET returns it, but the PUT may send canonical keys
+    // only (see CANONICAL_SESSION_PERMISSION_KEYS). Seeding the applied baseline
+    // from the FULL raw map made the canonical PUT payload compare unequal to it
+    // forever — Apply stayed blue and 'Unsaved permission changes' never cleared.
+    const LEGACY_RAW = { ...RAW_PROFILE, system: 'ask' }
+    const fetchMock = vi.fn(async (url, options) => {
+      const s = String(url)
+      if (s.includes('/api/session/s1/permissions')) {
+        if (options && options.method === 'PUT') {
+          return jsonOk(PERMISSIONS_RESPONSE(JSON.parse(options.body)))
+        }
+        return jsonOk(PERMISSIONS_RESPONSE(LEGACY_RAW))
+      }
+      const key = Object.keys(DEFAULT_ROUTES).filter((k) => s.includes(k)).sort((a, b) => b.length - a.length)[0]
+      return DEFAULT_ROUTES[key] || DEFAULT_FALLBACK
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { sendCommand } = renderPanel()
+    const select = await openPermissionsTabLoaded()
+    // Untouched profile — legacy key included — is clean: no dirty label and
+    // Apply is not highlighted.
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Apply' })).toHaveStyle({ background: '#45475a' })
+
+    fireEvent.change(select, { target: { value: 'ask' } })
+    expect(screen.getByText('Unsaved permission changes')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Apply' })).toHaveStyle({ background: '#89b4fa' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled())
+
+    // The PUT carried canonical keys only — the legacy key was dropped.
+    const putCall = fetchMock.mock.calls.find(
+      ([url, opts]) => String(url).includes('/api/session/s1/permissions') && opts && opts.method === 'PUT'
+    )
+    expect(putCall).toBeTruthy()
+    expect(JSON.parse(putCall[1].body)).toEqual({ ...RAW_PROFILE, network: 'ask' })
+
+    // The save landed, so the panel is clean again despite the legacy key that
+    // is still present in the tab's raw map.
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Apply' })).toHaveStyle({ background: '#45475a' })
+    expect(select.value).toBe('ask')
+
+    // Still a permission-only apply: nothing routed to apply_config.
+    expect(sendCommand).not.toHaveBeenCalled()
+  })
+
   it('applies rapid successive permission changes sequentially via the session PUT — no dropped edits', async () => {
     const { sendCommand } = renderPanel()
     const select = await openPermissionsTabLoaded()

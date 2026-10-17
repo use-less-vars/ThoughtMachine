@@ -76,18 +76,47 @@ def _hash_executor_build_bytes(req_b: bytes, df_b: bytes) -> str:
     return hashlib.sha256(req_b + b"\n" + df_b).hexdigest()
 
 
-def compute_executor_build_hash(requirements_path=None, dockerfile_path=None) -> str:
+def _fold_extra_build_inputs(digest: str, extra_paths) -> str:
+    """Fold additional build-input files into an existing build hash.
+
+    Used when the build actually copies extra, caller-supplied files into the
+    build context (e.g. a vault ``Dockerfile``/``requirements.txt``): those
+    files are real build inputs, so their content must affect the hash or a
+    changed-but-still-matching label would skip the rebuild.
+
+    A missing/unreadable extra file is itself a distinct build state and is
+    folded as a marker rather than raising, so callers keep their own
+    missing-file error messages.
+    """
+    h = hashlib.sha256(digest.encode("utf-8"))
+    for path in extra_paths:
+        h.update(b"\x00")
+        try:
+            with open(path, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            h.update(b"<missing>")
+    return h.hexdigest()
+
+
+def compute_executor_build_hash(requirements_path=None, dockerfile_path=None,
+                               extra_paths=None) -> str:
     """Compute the content hash of the executor image build sources.
 
     Args:
         requirements_path: path to requirements.txt (defaults to the repo one).
         dockerfile_path: path to the runtime Dockerfile (defaults to the repo one).
+        extra_paths: optional additional build-input files that are copied into
+            the build context by the caller (e.g. the vault Dockerfile). When
+            omitted the digest is byte-identical to the historical two-source
+            hash, so unrelated callers are unaffected.
 
     Returns:
-        sha256 hex digest of ``requirements_bytes + b"\n" + dockerfile_bytes``.
+        sha256 hex digest of ``requirements_bytes + b"\n" + dockerfile_bytes``,
+        folded together with ``extra_paths`` contents when any are supplied.
 
     Raises:
-        OSError: If either source file is missing or unreadable.
+        OSError: If either base source file is missing or unreadable.
     """
     req_path = requirements_path or EXECUTOR_REQUIREMENTS
     df_path = dockerfile_path or EXECUTOR_RUNTIME_DOCKERFILE
@@ -95,7 +124,10 @@ def compute_executor_build_hash(requirements_path=None, dockerfile_path=None) ->
         req_b = f.read()
     with open(df_path, "rb") as f:
         df_b = f.read()
-    return _hash_executor_build_bytes(req_b, df_b)
+    digest = _hash_executor_build_bytes(req_b, df_b)
+    if extra_paths:
+        digest = _fold_extra_build_inputs(digest, list(extra_paths))
+    return digest
 
 
 def _compute_image_tag(workspace_path: str) -> str:
