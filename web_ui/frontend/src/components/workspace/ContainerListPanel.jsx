@@ -43,7 +43,9 @@ const ACTION_LABELS = {
 }
 
 // Which lifecycle controls a row exposes for a given state. `remove` is added
-// separately for ephemeral rows only (the server refuses resource removal).
+// separately by kind: ephemeral rows and persistent rows (workspace property,
+// removable by any session whose envelope passes). Resource containers stay
+// operator-only, so a resource row never offers `remove`.
 function lifecycleActions(state) {
   if (state === 'running') return ['stop', 'restart']
   if (state === 'paused') return ['start', 'restart']
@@ -95,10 +97,14 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
   const perms = badgeSourceOf(entry)
   const drift = driftState(entry)
   const isOom = state === 'oom'
+  const noteText = typeof entry.note === 'string' ? entry.note.trim() : ''
 
   const actions = lifecycleActions(state)
   actions.push('resources')
-  if (entry.kind === 'ephemeral') actions.push('remove')
+  // Persistent containers are workspace property: any session whose envelope
+  // passes may remove one, coordinating through the container's note.
+  // Resource rows stay operator-only.
+  if (entry.kind === 'ephemeral' || entry.kind === 'persistent') actions.push('remove')
 
   return (
     <div
@@ -164,6 +170,23 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
             title={DRIFT_NEUTRAL_TITLE}
           >
             {DRIFT_NEUTRAL_TITLE}
+          </span>
+        ) : null}
+
+        {noteText ? (
+          <span
+            className="container-row-note"
+            data-testid={`container-note-${id}`}
+            title={noteText}
+            style={{
+              display: 'block',
+              maxWidth: '100%',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {noteText}
           </span>
         ) : null}
       </div>
@@ -331,8 +354,15 @@ export default function ContainerListPanel({ workspaceId }) {
     const { entry, action } = pending
     const verb = action === 'resources' ? 'resize' : action
     const base = `Are you sure you want to ${verb} ${entry.name}?`
-    if (entry.shared) return `${base} ${sharedLineFor(verb)}`
-    return base
+    // Removing a persistent container deletes workspace property, so the actor
+    // is shown the note its previous user left — the coordination mechanism.
+    const note = typeof entry.note === 'string' ? entry.note.trim() : ''
+    const noteLine =
+      action === 'remove' && entry.kind === 'persistent' && note
+        ? ` Its note reads: "${note}".`
+        : ''
+    if (entry.shared) return `${base}${noteLine} ${sharedLineFor(verb)}`
+    return `${base}${noteLine}`
   }
 
   return (

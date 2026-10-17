@@ -9,7 +9,7 @@
 //   * payload shape: { containers: [entries] } -- a FLAT list (PC3); the legacy
 //     `session`/`workspace` keys are GONE. Entries are grouped by `kind`.
 //   * entry keys: id, name, kind, state, intent_snapshot, permissions,
-//     permission_drift, shared
+//     permission_drift, shared, and (when the backend sends it) note
 //   * `kind` is "ephemeral" | "persistent" | "resource" (PC5); the old
 //     "runtime" kind is RETIRED.
 //   * three group sections: container-group-ephemeral / -persistent / -resource
@@ -279,7 +279,8 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
 
   // ── T11 ─────────────────────────────────────────────────────────────────
   // T11: persistent/resource rows carry a shared chip + shared confirm copy;
-  // ephemeral rows do not, and only ephemeral rows offer `remove`.
+  // ephemeral rows do not. `remove` is offered on ephemeral AND persistent
+  // rows (Round B); it is never offered on a resource row.
   it('T11 persistent row shows the shared chip and its confirm modal contains the shared copy', async () => {
     stubFetch(payload({ persistent: [persistentEntry({ id: 'pers-shared', state: 'running' })] }))
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
@@ -292,7 +293,7 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     expect(dialog).toHaveTextContent(SHARED_TEXT)
   })
 
-  it('T11 resource row does NOT render a remove control (server refuses non-ephemeral removal)', async () => {
+  it('T11 resource row does NOT render a remove control (resource removal is operator-only)', async () => {
     stubFetch(payload({ resource: [resourceEntry({ id: 'res-norm', state: 'running' })] }))
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
 
@@ -538,5 +539,75 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
       expect(call.body.actor).toBe('operator')
       expect(call.headers['X-Actor']).toBe('operator')
     })
+  })
+
+  // -- Round B: trust-by-note for persistent containers ---------------------
+  // A persistent container is workspace property: any session whose envelope
+  // passes may remove one. Remove is therefore offered on persistent rows too,
+  // and the container's `note` is the coordination mechanism that lets the
+  // acting session see whose work it is about to delete. Resource rows stay
+  // operator-only and never offer Remove. Ephemeral behaviour is unchanged.
+
+  it('Round B persistent row renders the Remove action and POSTs action=remove after confirm-ok', async () => {
+    const fetchMock = stubFetch(payload({ persistent: [persistentEntry({ id: 'pers-rm', state: 'running' })] }))
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    // wait on the ROW (not the group testid, which can resolve before the
+    // stubbed fetch settles -- see the T7 flake note)
+    await screen.findByTestId('container-row-pers-rm')
+    fireEvent.click(screen.getByTestId('container-action-pers-rm-remove'))
+    expect(await screen.findByTestId('confirm-dialog')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('confirm-ok'))
+
+    await waitFor(() => {
+      const { url, method, body } = actionCall(fetchMock, '/containers/pers-rm/action')
+      expect(method).toBe('POST')
+      expect(url).toBe(`/api/workspace/${WORKSPACE_ID}/containers/pers-rm/action`)
+      expect(body).toEqual({ action: 'remove', actor: 'operator' })
+    })
+  })
+
+  it('Round B persistent row renders its note with the full text in the title attribute', async () => {
+    const NOTE = 'nightly build cache - safe to delete after 18:00'
+    stubFetch(payload({ persistent: [persistentEntry({ id: 'pers-note', note: NOTE })] }))
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const note = await screen.findByTestId('container-note-pers-note')
+    expect(note).toHaveTextContent(NOTE)
+    expect(note).toHaveAttribute('title', NOTE)
+  })
+
+  it('Round B remove confirmation for a persistent container shows its note (whose work it is)', async () => {
+    const NOTE = 'leaving the db warm for the api tests'
+    stubFetch(payload({ persistent: [persistentEntry({ id: 'pers-rmnote', state: 'running', note: NOTE })] }))
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.click(await screen.findByTestId('container-action-pers-rmnote-remove'))
+    const message = (await screen.findByTestId('confirm-message')).textContent || ''
+    expect(message).toContain(NOTE)
+    expect(message).toMatch(/remove pers-1/)
+    // honest copy: removal is gated by the permissions envelope; no sub-grain
+    // token is mentioned anywhere in the UI
+    expect(message).not.toMatch(/grain/i)
+  })
+
+  it('Round B resource row still offers no Remove control while a persistent row in the same payload does', async () => {
+    stubFetch(
+      payload({
+        persistent: [persistentEntry({ id: 'pers-ctl', note: 'mine' })],
+        resource: [resourceEntry({ id: 'res-ctl' })],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await screen.findByTestId('container-row-res-ctl')
+    await screen.findByTestId('container-row-pers-ctl')
+
+    // resource: no remove control, no Remove button in the group at all
+    expect(screen.queryByTestId('container-action-res-ctl-remove')).toBeNull()
+    const resGroup = screen.getByTestId('container-group-resource')
+    expect(within(resGroup).queryByText('Remove')).toBeNull()
+    // the same gate DOES allow it one group over -- proves it is per-kind
+    expect(screen.getByTestId('container-action-pers-ctl-remove')).toBeInTheDocument()
   })
 })
