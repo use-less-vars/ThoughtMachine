@@ -4604,6 +4604,13 @@ _MEM_LIMIT_UNITS = {
 #: daemon does not.
 _MEM_LIMIT_DIGITS = "0123456789"
 
+#: Docker's hard minimum container memory.  The daemon refuses anything smaller
+#: with ``APIError 400 "Minimum memory limit allowed is 6MB"`` -- and it only
+#: says so at ``containers.run()``, i.e. AFTER the resize route has already
+#: destroyed the previous container.  Rejecting the value here keeps that
+#: failure on the request side of the destroy.
+_MIN_MEM_LIMIT_BYTES = 6 * 1024 * 1024          # 6_291_456
+
 
 def _parse_mem_limit(value):
     """Normalise a ``mem_limit`` string to a byte count, or ``None`` if invalid.
@@ -4717,16 +4724,88 @@ def workspace_container_resources(workspace_id: str, record_id: str,
             return _json_error("cpu_quota must be a non-negative integer",
                                status_code=400)
     if "mem_limit" in updates:
-        if _parse_mem_limit(updates["mem_limit"]) is None:
+        # Parse ONCE and compare with ``is None``: ``_parse_mem_limit("0")``
+        # legitimately returns 0, so a truthiness test would let "0" through.
+        _mem_bytes = _parse_mem_limit(updates["mem_limit"])
+        if _mem_bytes is None:
             return _json_error(
                 f"invalid mem_limit {updates['mem_limit']!r}: expected an "
                 "integer byte count (e.g. '1073741824') or a number with a "
                 "unit b/k/m/g (e.g. '512m', '1g', '2gb')",
                 status_code=400)
+        if _mem_bytes < _MIN_MEM_LIMIT_BYTES:
+            return _json_error(
+                f"mem_limit {updates['mem_limit']!r} "
+                f"({_mem_bytes} bytes) is below the Docker minimum of 6MB "
+                f"({_MIN_MEM_LIMIT_BYTES} bytes); use e.g. '6m' or '64m'",
+                status_code=400)
 
     container_id = _view_action_container_id(manager, record)
-    snapshot = dict(getattr(record, "intent_snapshot", None) or {})
+    prev_snapshot = dict(getattr(record, "intent_snapshot", None) or {})
+    prev_docker_id = getattr(record, "docker_id", "") or ""
+    snapshot = dict(prev_snapshot)
     snapshot.update(updates)
+
+    def _resize_failed(cause, status_code):
+        """Restore the record to its pre-edit intent, then try to rebuild.
+
+        Called only AFTER step 1 (persist) may have run, so the restore is
+        unconditional: rewriting ``prev_snapshot`` is a no-op when the write
+        never happened.  Never raises -- the caller's error response matters
+        more than the recovery.
+        """
+        try:
+            _cr_api.update_record(workspace_id, record_id,
+                                  intent_snapshot=prev_snapshot)
+        except Exception as exc:
+            log("ERROR", "server.workspace_container_resources",
+                f"could not restore intent_snapshot on record {record_id}: {exc}")
+
+        # One best-effort rebuild with the PREVIOUS limits.  `start` re-reads
+        # intent_snapshot from the record, so the restore above is what makes
+        # this start use the old values.
+        try:
+            restored = manager.start(name=record.name, note=record.notes,
+                                     allow_fresh=True)
+        except Exception as exc:
+            restored = {"error": str(exc)}
+        restored_id = ((restored or {}).get("id")
+                       if isinstance(restored, dict) else None)
+        if restored_id:
+            try:
+                _cr_api.update_record(workspace_id, record_id,
+                                      docker_id=restored_id, state="running")
+            except Exception as exc:
+                log("ERROR", "server.workspace_container_resources",
+                    f"rebound record {record_id} could not be updated: {exc}")
+            outcome = "previous limits restored"
+        else:
+            err = ((restored or {}).get("error")
+                   if isinstance(restored, dict) else restored)
+            try:
+                # Unbind rather than point at a destroyed container: the record
+                # then reads as "no container" instead of "container that
+                # vanished", which the orphan sweeper treats far more kindly.
+                _cr_api.update_record(workspace_id, record_id,
+                                      docker_id=None, state="error")
+            except Exception:
+                pass
+            outcome = f"container NOT restored: {err}"
+
+        try:
+            from infra import container_manager as _container_manager_module
+
+            _container_manager_module._audit(
+                "CONTAINER_RESIZE_FAILED",
+                f"workspace_id={workspace_id} record_id={record_id} "
+                f"name={record.name!r} requested={updates!r} "
+                f"previous={prev_snapshot!r} previous_docker_id={prev_docker_id!r} "
+                f"cause={cause!r} outcome={outcome}")
+        except Exception:
+            pass
+
+        return _json_error(f"resource edit failed: {cause}; {outcome}",
+                           status_code=status_code)
 
     try:
         # Ordering matters: persist the new intent FIRST so a container that
@@ -4736,21 +4815,27 @@ def workspace_container_resources(workspace_id: str, record_id: str,
         if container_id:
             # keep_record=True: the record (and the intent just written) must
             # survive the remove -- a bare remove() reaps a non-resource record.
-            pre = manager.remove(container_id, keep_record=True)
+            # audit_reason/audit_source: a resize destroy is NOT a user removal.
+            pre = manager.remove(
+                container_id, keep_record=True,
+                audit_reason="resize_recreate",
+                audit_source="server.workspace_container_resources")
             if isinstance(pre, dict) and pre.get("status") == "error":
-                return _json_error(pre.get("error", "remove failed"),
-                                   status_code=503)
+                return _resize_failed(pre.get("error", "remove failed"), 503)
         start_result = manager.start(name=record.name, note=record.notes,
                                      allow_fresh=True)
         if isinstance(start_result, dict) and start_result.get("error"):
-            return _json_error(start_result["error"], status_code=409)
+            return _resize_failed(start_result["error"], 400)
         new_docker_id = (start_result or {}).get("id") or container_id
         _cr_api.update_record(workspace_id, record_id,
                               docker_id=new_docker_id, state="running")
     except Exception as exc:
         log("ERROR", "server.workspace_container_resources",
             f"resource edit failed: {exc}")
-        return _json_error(str(exc), status_code=503)
+        # A daemon-side rejection (docker APIError 400) is a bad REQUEST, not a
+        # server fault: report 400 so clients stop retrying the same value.
+        _sc = 400 if getattr(exc, "status_code", None) == 400 else 503
+        return _resize_failed(str(exc), _sc)
 
     record_after = _cr_api.load_record(workspace_id, record_id)
     if record_after is None:

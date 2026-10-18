@@ -22,6 +22,7 @@ Sites exercised: ``ContainerManager.remove`` (destroy / absent / refused),
 
 from __future__ import annotations
 
+import inspect
 import re
 from unittest.mock import MagicMock, patch
 
@@ -276,6 +277,74 @@ def test_remove_refusal_emits_refused_event(audit, monkeypatch):
     assert message.endswith(
         f'detail="action=refuse decision_reason={decision.reason}"'
     )
+
+
+# ===========================================================================
+# ContainerManager.remove -- audit labels (source / reason)
+# ===========================================================================
+def test_remove_default_audit_labels_are_the_documented_pair(audit):
+    """A plain ``remove()`` still reports reason=explicit_remove."""
+    params = inspect.signature(ContainerManager.remove).parameters
+    assert params["keep_record"].default is False
+    assert params["audit_reason"].default == "explicit_remove"
+    assert params["audit_source"].default == "container_manager.remove"
+
+    container = FakeContainer(labels={RECORD_LABEL_KEY: RECORD_ID})
+    mgr = _manager([container])
+
+    mgr.remove(CONTAINER_ID)
+
+    message, fields = _one_destroy(audit, "container_manager.remove",
+                                   "explicit_remove")
+    assert fields["container_id"] == CONTAINER_ID
+    assert fields["record_id"] == RECORD_ID
+    _assert_field_order(message)
+
+
+def test_remove_audit_labels_can_be_overridden(audit):
+    """A caller-injected label lands verbatim on the ONE destroy event."""
+    container = FakeContainer(labels={RECORD_LABEL_KEY: RECORD_ID})
+    mgr = _manager([container])
+
+    result = mgr.remove(
+        CONTAINER_ID, keep_record=True,
+        audit_reason="resize_recreate",
+        audit_source="server.workspace_container_resources")
+
+    assert result == {"status": "removed", "container_id": CONTAINER_ID}
+    assert container.remove_calls == 1
+    message, fields = _one_destroy(audit,
+                                   "server.workspace_container_resources",
+                                   "resize_recreate")
+    assert fields["container_id"] == CONTAINER_ID
+    assert fields["record_id"] == RECORD_ID
+    assert fields["name"] == CONTAINER_NAME
+    assert fields["state"] == "running"
+    _assert_field_order(message)
+
+
+def test_remove_refusal_keeps_the_refused_reason_under_an_override(
+        audit, monkeypatch):
+    """An override relabels the SOURCE but can never claim a destroy."""
+    decision = _refuse(monkeypatch)
+    container = FakeContainer(labels={RECORD_LABEL_KEY: RECORD_ID})
+    mgr = _manager([container])
+
+    result = mgr.remove(
+        CONTAINER_ID, keep_record=True,
+        audit_reason="resize_recreate",
+        audit_source="server.workspace_container_resources")
+
+    assert result == {"status": "refused", "container_id": CONTAINER_ID,
+                      "reason": decision.reason}
+    assert container.stop_calls == 0
+    assert container.remove_calls == 0
+    message, fields = _one_destroy(audit,
+                                   "server.workspace_container_resources",
+                                   "refused")
+    _assert_field_order(message)
+    assert message.endswith(
+        f'detail="action=refuse decision_reason={decision.reason}"')
 
 
 # ===========================================================================

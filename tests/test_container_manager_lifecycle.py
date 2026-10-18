@@ -347,7 +347,8 @@ def test_site7a_dry_run_does_not_reconcile_or_remove(monkeypatch):
 # Site 7b -- sweep_orphan_container_records
 # ===========================================================================
 def _mint(workspace_id, record_id, *, docker_id="", age_days=None,
-          lifecycle_class=LIFECYCLE_PERSISTENT):
+          lifecycle_class=LIFECYCLE_PERSISTENT, created_at_days=None,
+          updated_at_days=None, state=None, intent_snapshot=None):
     create_record(
         workspace_id, lifecycle_class, OWNER_WORKSPACE,
         id=record_id, name=record_id,
@@ -359,6 +360,19 @@ def _mint(workspace_id, record_id, *, docker_id="", age_days=None,
         ts = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
         data["created_at"] = ts
         data["updated_at"] = ts
+    # Independent overrides so a record can be OLD but freshly edited (or not).
+    if created_at_days is not None:
+        data["created_at"] = (
+            datetime.now(timezone.utc)
+            - timedelta(days=created_at_days)).isoformat()
+    if updated_at_days is not None:
+        data["updated_at"] = (
+            datetime.now(timezone.utc)
+            - timedelta(days=updated_at_days)).isoformat()
+    if state is not None:
+        data["state"] = state
+    if intent_snapshot is not None:
+        data["intent_snapshot"] = intent_snapshot
     storage.write_record_file(path, data)
 
 
@@ -392,6 +406,87 @@ def test_site7b_refuse_keeps_record(monkeypatch):
 
     assert result["removed"] == 0
     assert load_record(_ORPHAN_WS, "rec-1") is not None
+
+
+def test_site7b_age_is_measured_from_created_at_not_updated_at(monkeypatch):
+    """The age clock is the IMMUTABLE ``created_at``, never ``updated_at``.
+
+    ``updated_at`` is rewritten by ``append_event`` (drift scan and every other
+    event write), so ageing from it would make an event-touched record immortal.
+    """
+    monkeypatch.setattr(container_manager, "_audit", lambda *a, **k: None)
+    # BOTH records are 40 days old by ``created_at``; the first was "touched"
+    # moments ago (``updated_at`` bumped to now).  The birth stamp is the clock,
+    # so the touched record is JUST as reap-eligible as the untouched one.
+    _mint(_ORPHAN_WS, "rec-touched", docker_id="c" * 16,
+          created_at_days=40, updated_at_days=0)
+    _mint(_ORPHAN_WS, "rec-stale", docker_id="d" * 16,
+          created_at_days=40, updated_at_days=40)
+
+    result = sweep_orphan_container_records(
+        registered_workspace_ids=[_KEPT_WS], docker_client=_FakeDocker([]),
+    )
+
+    assert result["removed"] == 2
+    assert sorted(result["removed_records"]) == ["rec-stale", "rec-touched"]
+    assert "too young" not in result["detail"]
+    assert load_record(_ORPHAN_WS, "rec-touched") is None
+    assert load_record(_ORPHAN_WS, "rec-stale") is None
+
+
+def test_site7b_record_mid_creation_is_never_an_orphan(monkeypatch):
+    """``state='creating'`` is skipped before the age gate is even consulted."""
+    monkeypatch.setattr(container_manager, "_audit", lambda *a, **k: None)
+    _mint(_ORPHAN_WS, "rec-creating", docker_id="c" * 16,
+          created_at_days=40, updated_at_days=40, state="creating")
+
+    result = sweep_orphan_container_records(
+        registered_workspace_ids=[_KEPT_WS], docker_client=_FakeDocker([]),
+    )
+
+    assert result["removed"] == 0
+    assert "state_creating" in result["detail"]
+    assert load_record(_ORPHAN_WS, "rec-creating") is not None
+
+
+def test_site7b_record_in_error_state_is_never_an_orphan(monkeypatch):
+    """``state='error'`` is exempt: reaping it would race the recovery rebuild."""
+    monkeypatch.setattr(container_manager, "_audit", lambda *a, **k: None)
+    _mint(_ORPHAN_WS, "rec-error", docker_id="c" * 16,
+          created_at_days=40, updated_at_days=40, state="error")
+
+    result = sweep_orphan_container_records(
+        registered_workspace_ids=[_KEPT_WS], docker_client=_FakeDocker([]),
+    )
+
+    assert result["removed"] == 0
+    assert "state_error" in result["detail"]
+    assert load_record(_ORPHAN_WS, "rec-error") is not None
+
+
+def test_site7b_reap_audit_carries_the_reconcile_fields(monkeypatch):
+    """RECORD_REAP names the record, its state and its last intent."""
+    captured = []
+    monkeypatch.setattr(container_manager, "_audit",
+                        lambda event, data="": captured.append((event, data)))
+    _mint(_ORPHAN_WS, "rec-1", docker_id="c" * 16, age_days=10,
+          state="running", intent_snapshot={"mem_limit": "256m"})
+
+    sweep_orphan_container_records(
+        registered_workspace_ids=[_KEPT_WS], docker_client=_FakeDocker([]),
+    )
+
+    reaps = [data for event, data in captured if event == "RECORD_REAP"]
+    assert len(reaps) == 1, reaps
+    message = reaps[0]
+    assert "workspace_id=w-orphan" in message
+    assert "record_id=rec-1" in message
+    assert "dry_run=False" in message
+    assert "name='rec-1'" in message
+    assert "state='running'" in message
+    assert "created_at=" in message
+    assert "updated_at=" in message
+    assert "intent_snapshot={'mem_limit': '256m'}" in message
 
 
 # ===========================================================================

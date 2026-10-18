@@ -172,3 +172,27 @@ def test_freshly_written_orphan_is_retained():
     assert result["skipped"] == 1
     assert "too young" in result["detail"]
     assert path.is_file()
+
+
+# ---------------------------------------------------------------------------
+# Test D -- the destroy-before-validate hotfix: a record in ``error`` is exempt.
+#   created_at = 10 days old (reap-eligible by AGE), updated_at = now, and
+#   state = "error" (a failed resize whose container is being rebuilt).
+#   The created_at clock is UNCHANGED by the hotfix; what the hotfix adds is the
+#   error-state exemption (``_SWEEP_PROTECTED_STATES``), so the record survives
+#   even though the age gate alone would have reaped it.
+# ---------------------------------------------------------------------------
+
+
+def test_old_error_state_record_with_fresh_updated_at_is_not_reaped():
+    path = _mint(_WS, "rec-1", docker_id="c" * 16,
+                 created_age_days=10, updated_age_days=0)
+    data = storage.read_record_file(path)
+    data["state"] = "error"
+    storage.write_record_file(path, data)
+
+    result = _sweep()
+    assert result["removed"] == 0
+    assert "state_error" in result["detail"]
+    assert path.is_file()
+    assert load_record(_WS, "rec-1") is not None
