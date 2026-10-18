@@ -681,7 +681,7 @@ def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
         "security_opt": ["no-new-privileges:true"],
         "stdin_open": True,
         "tmpfs": {
-            "/tmp": "rw,noexec,nosuid,size=64m",
+            "/tmp": "rw,noexec,nosuid,size=512m",
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
         },
         "tty": True,

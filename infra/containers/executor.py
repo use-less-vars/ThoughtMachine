@@ -26,7 +26,13 @@ integrity checks and container creation/recreation.
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL, LIFECYCLE_PERSISTENT
 from agent.logging import log
-from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL, host_user, _host_ids
+from agent.config.defaults import (
+    CONTAINER_TYPE_FREE_USE,
+    CONTAINER_TYPE_LABEL,
+    EXEC_TMPFS_OPTIONS,
+    host_user,
+    _host_ids,
+)
 from infra.container_create import (
     ContainerCreateSpec,
     HardeningRecipe,
@@ -47,9 +53,18 @@ import sys
 
 # ── Audit log for network_mode debugging ───────────────────────────────────
 from thoughtmachine.audit_logger import audit_event
+from infra.container_destroy_audit import CONTAINER_DESTROY, emit_destroy_audit
 
 _audit = lambda e, d: audit_event(e, d)  # module-level convenience
 _audit("MODULE_LOAD", f"file={__file__} pid={os.getpid()}")
+
+# ── Destroy-audit telemetry ─────────────────────────────────────────────
+# Every site that actually DESTROYS a container emits ONE `CONTAINER_DESTROY`
+# audit event through the shared formatter, so the destroy trail is
+# reconstructible independently of the `CONTAINER_LIFECYCLE` DECISION event.
+# The event name is re-exported here (`_DESTROY_AUDIT`) for callers/tests that
+# import it from this module.
+_DESTROY_AUDIT = CONTAINER_DESTROY
 
 
 # ── Build log cache (thread-safe) ────────────────────────────────────────────
@@ -707,7 +722,16 @@ class DockerExecutor:
             ),
         )
         if not decision.destroys:
+            # A refused reap must still be audited: the container survives, so
+            # there is no destroy to claim -- the reason records the refusal.
+            emit_destroy_audit(
+                _audit, "executor.reap", container, reason="refused",
+                detail=f"action={getattr(decision, 'action', 'unknown')} "
+                       f"decision_reason={getattr(decision, 'reason', 'unknown')}")
             return
+        # Destroy proceeds: audit BEFORE the stop so the pre-stop state is real.
+        emit_destroy_audit(_audit, "executor.reap", container,
+                           reason="ensure_container_recreate")
         try:
             container.stop()
             container.remove()
@@ -902,7 +926,7 @@ class DockerExecutor:
         if ids is not None:
             _home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
         tmpfs = {
-            "/tmp": "rw,noexec,nosuid,size=64m",
+            "/tmp": EXEC_TMPFS_OPTIONS,
             "/home/agent": _home_tmpfs,
         }
         shadow = git_shadow_for_workspace(
@@ -1105,6 +1129,9 @@ class DockerExecutor:
                 ),
             )
             if decision.destroys:
+                # Destroy proceeds: audit BEFORE the stop so the state is real.
+                emit_destroy_audit(_audit, "executor.close", self.container,
+                                   reason="executor_close")
                 try:
                     self.container.stop()
                     self.container.remove()
@@ -1115,6 +1142,12 @@ class DockerExecutor:
                 log("WARNING", "tools.docker_executor.container",
                     "Refusing to destroy container on close",
                     {"container_id": self.container.id[:12], "reason": decision.reason})
+                # Refused close is audited too, with reason="refused" so it can
+                # never be mistaken for a destroy.
+                emit_destroy_audit(
+                    _audit, "executor.close", self.container, reason="refused",
+                    detail=f"action={getattr(decision, 'action', 'unknown')} "
+                           f"decision_reason={getattr(decision, 'reason', 'unknown')}")
 
     def _exec_with_timeout(self, command, timeout=30, workdir="/workspace", environment=None):
         """Execute command with timeout support using threading."""
@@ -1385,6 +1418,9 @@ def _remove_container_by_workspace(workspace_path: str) -> None:
             ),
         )
         if decision.destroys:
+            emit_destroy_audit(
+                _audit, "executor.remove_container_by_workspace", container,
+                reason="remove_container_by_workspace")
             container.stop()
             container.remove()
             log("INFO", "tools.docker_executor.rebuild",

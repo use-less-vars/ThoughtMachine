@@ -85,6 +85,9 @@ from infra.container_create import (
     MountSpec,
     create_hardened_container as _create_hardened_container,
 )
+from infra.container_destroy_audit import emit_destroy_audit
+from thoughtmachine.audit_logger import audit_event
+
 
 # Drift event emitted when a permission change reconciles a live container's
 # network mode; recorded via the container record event log (best-effort).
@@ -799,12 +802,18 @@ class ContainerRegistry:
         container = None
         try:
             container = self._docker_client.containers.get(container_name)
+            emit_destroy_audit(
+                audit_event, "container_registry.destroy_container", container,
+                reason="destroy_container")
             container.stop(timeout=STOP_TIMEOUT)
             container.remove()
         except docker.errors.DockerException as exc:
             log.warning("destroy_container: stop/remove of %s failed: %s", container_name, exc)
             if container is not None:
                 try:
+                    emit_destroy_audit(
+                        audit_event, "container_registry.destroy_container",
+                        container, reason="destroy_container")
                     container.remove(force=True)
                     log.info("destroy_container: force-removed %s", container_name)
                 except Exception as exc2:  # noqa: BLE001 - best-effort cleanup
@@ -854,6 +863,9 @@ class ContainerRegistry:
             # Teardown: graceful stop -> remove.  Failure => quarantine.
             try:
                 container = self._docker_client.containers.get(name)
+                emit_destroy_audit(
+                    audit_event, "container_registry.on_permission_changed",
+                    container, reason="permission_change_teardown")
                 container.stop(timeout=STOP_TIMEOUT)
                 container.remove()
             except Exception as exc:  # noqa: BLE001 - one failure never blocks the rest

@@ -106,6 +106,7 @@ from agent.config.defaults import (
     CONTAINER_TYPE_LABEL,
     CONTAINER_TYPE_RESOURCE,
     RESOURCE_NAME_LABEL,
+    EXEC_TMPFS_OPTIONS,
     host_user,
     _host_ids,
 )
@@ -115,6 +116,8 @@ from agent.config.defaults import (
 # One-way dependency, no import cycle: ``infra.container_manager`` never
 # imports this module (it merely references it in comments).
 from infra.container_manager import _user_drift_axis
+from infra.container_destroy_audit import emit_destroy_audit
+from thoughtmachine.audit_logger import audit_event
 
 # Global resource images are lifecycle-protected shared infrastructure:
 # conservative cleanup/prune NEVER removes them — only an explicit global
@@ -1083,7 +1086,7 @@ class ResourceContainerManager:
         if ids is not None:
             home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
         tmpfs = {
-            "/tmp": "rw,noexec,nosuid,size=64m",
+            "/tmp": EXEC_TMPFS_OPTIONS,
             "/home/agent": home_tmpfs,
         }
         # Admission gate (site 4/4 of the terminal container-create sites):
@@ -1428,6 +1431,9 @@ class ResourceContainerManager:
                     failure_reason="fallback_used",
                     fallback_used=True,
                 )
+            emit_destroy_audit(
+                audit_event, "resource_container_manager.ensure_resource",
+                container, reason="resource_stale_removal")
             try:
                 container.remove(force=True)
             except Exception as exc:
@@ -1620,6 +1626,9 @@ class ResourceContainerManager:
                 "error": "resource stop refused by container lifecycle funnel "
                          f"({_stop_decision.reason})",
             }
+        emit_destroy_audit(
+            audit_event, "resource_container_manager.stop", container,
+            reason="resource_stop")
         try:
             container.stop(timeout=5)
             return {"status": "stopped", "container_id": container_id}
@@ -2311,6 +2320,10 @@ def sweep_stale_resource_containers(registered_workspace_ids, max_age_s=86400):
                     f"lifecycle {_orphan_decision.action}",
                 )
                 continue
+            emit_destroy_audit(
+                audit_event,
+                "resource_container_manager.sweep_stale_resource_containers",
+                container, reason="resource_orphan_sweep")
             try:
                 container.remove(force=True)
                 removed += 1

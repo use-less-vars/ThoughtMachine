@@ -107,6 +107,8 @@ try:
 except ImportError:  # pragma: no cover - docker SDK is optional to import
     docker = None
 
+from infra.container_destroy_audit import emit_destroy_audit
+from thoughtmachine.audit_logger import audit_event
 from thoughtmachine.vault import vault_root
 from thoughtmachine.workspace_lifecycle import _rmtree_one_shot, delete_workspace
 from thoughtmachine.workspace_registry import WorkspaceRegistry
@@ -616,6 +618,7 @@ def _maybe_remove_container(cat, container, now, cutoff, dry_run) -> None:
     if dry_run:
         cat["would_remove"].append(cid)
         return
+    emit_destroy_audit(audit_event, "vault_gc", container, reason="gc")
     try:
         container.remove(force=True)
     except Exception as exc:

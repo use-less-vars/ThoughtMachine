@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from agent.logging import log
+from infra.container_destroy_audit import emit_destroy_audit
+from thoughtmachine.audit_logger import audit_event
 
 
 _RESOURCE_NAME_PREFIX = "tm-res-"
@@ -144,6 +146,9 @@ class ContainerLifecycle:
             except Exception as exc:  # noqa: BLE001
                 log("WARNING", "container_lifecycle", f"container stop failed: {exc}")
         if decision.destroys and container is not None:
+            emit_destroy_audit(
+                audit_event, "container_lifecycle.apply", container,
+                reason=intent.reason or decision.action)
             try:
                 container.remove(force=bool(intent.force))
             except Exception as exc:  # noqa: BLE001
