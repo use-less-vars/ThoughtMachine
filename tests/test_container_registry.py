@@ -524,6 +524,11 @@ class TestRequestContainer:
         # container-name label so the record and container agree on identity;
         # assert it names this handle, then the rest of the labels are unchanged.
         assert run_labels.pop(CONTAINER_NAME_LABEL) == handle["name"]
+        # The record-creation hook also stamps creator attribution (§7); the
+        # registry create is session-driven, so it names the session.
+        from thoughtmachine.container_record.hook import CREATED_BY_LABEL
+
+        assert run_labels.pop(CREATED_BY_LABEL) == "agent:session:s"
         assert run_labels == {
             "a": "b",
             "thoughtmachine.container_type": "free_use",

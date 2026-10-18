@@ -1058,5 +1058,204 @@ describe('Wave — container sprint close (panel fixes)', () => {
     expect(input.closest('label')).toHaveTextContent('New limit (currently 500m)')
     expect(input).toHaveValue('500m')
   })
+
+  // ── Fix 4 ────────────────────────────────────────────────────────────────
+  // `permissions` on a WIRED record is the six-category GRANT dict and carries no
+  // `mem_limit`; the memory figure lives in `intent_snapshot`. Reading `mem` off
+  // `permissions` dropped it from every persistent row (and the staged input) even
+  // though the payload was complete.
+  it('Fix 4: the mem badge reads the INTENT snapshot, not the permissions grant dict', async () => {
+    stubFetch(
+      payload({
+        persistent: [
+          persistentEntry({
+            id: 'pers-grant',
+            // exactly what the backend emits for a wired record: a grant dict
+            intent_snapshot: { mem_limit: '500m' },
+            permissions: { network: true, git: false, filesystem: 'rw', container: true, mcp: [], host_bash: false },
+          }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const badge = await screen.findByTestId('permission-badge-pers-grant')
+    expect(badge).toHaveTextContent('net on · fs rw · mem 500m')
+
+    const input = screen.getByTestId('container-resources-mem-pers-grant')
+    expect(input.closest('label')).toHaveTextContent('New limit (currently 500m)')
+    expect(input).toHaveValue('500m')
+  })
+
+  it('Fix 4: a resource row (permissions === null) shows the numeric INTENT mem and its hint', async () => {
+    stubFetch(
+      payload({
+        resource: [resourceEntry({ id: 'res-mem', intent_snapshot: { mem_limit: 536870912 }, permissions: null })],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const badge = await screen.findByTestId('permission-badge-res-mem')
+    expect(badge).toHaveTextContent('mem 536870912')
+
+    const input = screen.getByTestId('container-resources-mem-res-mem')
+    expect(input.closest('label')).toHaveTextContent('New limit (currently 536870912)')
+    expect(input).toHaveValue('536870912')
+  })
+
+  it('Fix 4: a row with no memory figure renders `mem —` and the plain label', async () => {
+    stubFetch(
+      payload({
+        persistent: [persistentEntry({ id: 'pers-nomem', intent_snapshot: {}, permissions: null })],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const badge = await screen.findByTestId('permission-badge-pers-nomem')
+    expect(badge).toHaveTextContent('mem —')
+
+    const input = screen.getByTestId('container-resources-mem-pers-nomem')
+    expect(input.closest('label')).toHaveTextContent('New limit')
+    expect(input.closest('label')).not.toHaveTextContent('currently')
+    expect(input).toHaveValue('')
+  })
+
+  // ── Pol 2 ────────────────────────────────────────────────────────────────
+  // A mutating action takes seconds and the row used to look inert: the click
+  // landed, nothing changed, so the operator clicked again. The row now names
+  // the action immediately, marks itself busy (its own controls only), escalates
+  // to a neutral spinner when the wait drags on, and clears on completion.
+  it('Pol 2: a resize marks its own row busy, escalates to a spinner, then releases', async () => {
+    const containersBody = payload({
+      ephemeral: [ephemeralEntry({ id: 'eph-busy' }), ephemeralEntry({ id: 'eph-free' })],
+    })
+    let release
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).endsWith('/resources')) {
+        // held open so the busy state can be observed
+        return new Promise((resolve) => {
+          release = () =>
+            resolve({
+              ok: true,
+              status: 200,
+              json: async () =>
+                postActionBody({ id: 'eph-busy', intent_snapshot: { mem_limit: '1g' } }),
+            })
+        })
+      }
+      return { ok: true, status: 200, json: async () => containersBody }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.change(await screen.findByTestId('container-resources-mem-eph-busy'), {
+      target: { value: '1g' },
+    })
+
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByTestId('container-action-eph-busy-resources'))
+    fireEvent.click(screen.getByTestId('confirm-ok'))
+
+    // the click is acknowledged: the verb is named, no spinner yet
+    expect(screen.getByTestId('container-inflight-eph-busy')).toHaveTextContent('Resizing')
+    expect(screen.queryByTestId('container-spinner-eph-busy')).toBeNull()
+    // every control on THAT row is inert ...
+    expect(screen.getByTestId('container-action-eph-busy-resources')).toBeDisabled()
+    expect(screen.getByTestId('container-action-eph-busy-stop')).toBeDisabled()
+    expect(screen.getByTestId('container-action-eph-busy-restart')).toBeDisabled()
+    // ... while the neighbouring row stays usable
+    expect(screen.getByTestId('container-action-eph-free-stop')).not.toBeDisabled()
+    expect(screen.queryByTestId('container-inflight-eph-free')).toBeNull()
+
+    // one window later the wait is no longer plausibly fast: neutral + spinner
+    await advance(1600)
+    expect(screen.getByTestId('container-inflight-eph-busy')).toHaveTextContent('Working')
+    expect(screen.getByTestId('container-spinner-eph-busy')).toBeInTheDocument()
+
+    // the response lands: the row is usable again and the indicator is gone
+    await act(async () => {
+      release()
+      for (let i = 0; i < 12; i += 1) await Promise.resolve()
+    })
+    await flushMicrotasks()
+    expect(screen.queryByTestId('container-inflight-eph-busy')).toBeNull()
+    expect(screen.queryByTestId('container-spinner-eph-busy')).toBeNull()
+    expect(screen.getByTestId('container-action-eph-busy-resources')).not.toBeDisabled()
+    expect(screen.getByTestId('container-action-eph-busy-stop')).not.toBeDisabled()
+  })
+
+  it('Pol 2: a failed action still shows the message and releases the row', async () => {
+    const containersBody = payload({ ephemeral: [ephemeralEntry({ id: 'eph-busy-400' })] })
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).endsWith('/resources')) {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ error: 'mem_limit is below the Docker floor', code: 'below_floor' }),
+        }
+      }
+      return { ok: true, status: 200, json: async () => containersBody }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.change(await screen.findByTestId('container-resources-mem-eph-busy-400'), {
+      target: { value: '1m' },
+    })
+
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByTestId('container-action-eph-busy-400-resources'))
+    fireEvent.click(screen.getByTestId('confirm-ok'))
+
+    expect(screen.getByTestId('container-inflight-eph-busy-400')).toBeInTheDocument()
+
+    await flushMicrotasks()
+
+    expect(screen.getByRole('alert')).toHaveTextContent('mem_limit is below the Docker floor')
+    expect(screen.queryByTestId('container-inflight-eph-busy-400')).toBeNull()
+    expect(screen.getByTestId('container-action-eph-busy-400-resources')).not.toBeDisabled()
+  })
+
+  it('Pol 2: two Confirm clicks produce exactly ONE request', async () => {
+    const containersBody = payload({ ephemeral: [ephemeralEntry({ id: 'eph-dup' })] })
+    let release
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).endsWith('/resources')) {
+        return new Promise((resolve) => {
+          release = () => resolve({ ok: true, status: 200, json: async () => postActionBody({ id: 'eph-dup' }) })
+        })
+      }
+      return { ok: true, status: 200, json: async () => containersBody }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.change(await screen.findByTestId('container-resources-mem-eph-dup'), {
+      target: { value: '1g' },
+    })
+
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByTestId('container-action-eph-dup-resources'))
+
+    // both clicks land before React re-renders, i.e. with the modal still live
+    const ok = screen.getByTestId('confirm-ok')
+    await act(async () => {
+      ok.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      ok.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(actionCalls(fetchMock, '/resources')).toHaveLength(1)
+    expect(screen.getByTestId('container-inflight-eph-dup')).toBeInTheDocument()
+
+    // a second attempt at the row's own Resize cannot queue another write either
+    fireEvent.click(screen.getByTestId('container-action-eph-dup-resources'))
+    await flushMicrotasks()
+    expect(actionCalls(fetchMock, '/resources')).toHaveLength(1)
+
+    await act(async () => {
+      release()
+      for (let i = 0; i < 12; i += 1) await Promise.resolve()
+    })
+  })
 })
 

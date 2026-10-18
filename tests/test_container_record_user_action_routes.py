@@ -110,8 +110,8 @@ class FakeManager:
         self.calls.append(("remove", container_id))
         return dict(self._remove_result)
 
-    def start(self, name=None, note=None, allow_fresh=False):
-        self.calls.append(("start", name, note, allow_fresh))
+    def start(self, name=None, note=None, allow_fresh=False, created_by=None):
+        self.calls.append(("start", name, note, allow_fresh, created_by))
         if self._start_result is not None:
             return dict(self._start_result)
         return {"id": "docker-new", "name": name, "status": "created",

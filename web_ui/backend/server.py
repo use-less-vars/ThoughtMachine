@@ -4267,6 +4267,8 @@ def _record_user_action(record_id: str, action: str, request: Request,
 
     from thoughtmachine.container_record import api as _cr_api
 
+    from thoughtmachine.container_record.hook import operator_created_by
+
     # Guard 3 -- resolve the record. Wrong workspace -> 403, unknown -> 404.
     try:
         record = _cr_api.load_record(workspace_id, record_id)
@@ -4370,7 +4372,8 @@ def _record_user_action(record_id: str, action: str, request: Request,
             # restart/recreate start through the REAL name-index path; the
             # record_id stays stable across the whole operation.
             start_result = manager.start(name=record.name, note=record.notes,
-                                         allow_fresh=(action == "recreate"))
+                                         allow_fresh=(action == "recreate"),
+                                         created_by=operator_created_by(actor))
             if isinstance(start_result, dict) and start_result.get("error"):
                 try:
                     _audit("conflict", None)
@@ -4692,6 +4695,7 @@ def workspace_container_resources(workspace_id: str, record_id: str,
             status_code=400)
 
     from thoughtmachine.container_record import api as _cr_api
+    from thoughtmachine.container_record.hook import operator_created_by
 
     try:
         record = _cr_api.load_record(workspace_id, record_id)
@@ -4769,7 +4773,8 @@ def workspace_container_resources(workspace_id: str, record_id: str,
         # this start use the old values.
         try:
             restored = manager.start(name=record.name, note=record.notes,
-                                     allow_fresh=True)
+                                     allow_fresh=True,
+                                     created_by=operator_created_by(actor))
         except Exception as exc:
             restored = {"error": str(exc)}
         restored_id = ((restored or {}).get("id")
@@ -4826,7 +4831,8 @@ def workspace_container_resources(workspace_id: str, record_id: str,
             if isinstance(pre, dict) and pre.get("status") == "error":
                 return _resize_failed(pre.get("error", "remove failed"), 503)
         start_result = manager.start(name=record.name, note=record.notes,
-                                     allow_fresh=True)
+                                     allow_fresh=True,
+                                     created_by=operator_created_by(actor))
         if isinstance(start_result, dict) and start_result.get("error"):
             return _resize_failed(start_result["error"], 400)
         new_docker_id = (start_result or {}).get("id") or container_id

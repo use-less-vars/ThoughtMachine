@@ -46,7 +46,7 @@ from security.admission_gate import (
     admit,
 )
 from thoughtmachine.container_record import STATE_RUNNING, docker_restart_policy
-from thoughtmachine.container_record.hook import record_creation
+from thoughtmachine.container_record.hook import agent_created_by, record_creation
 
 __all__ = [
     "AdmissionContext",
@@ -452,6 +452,7 @@ def create_hardened_container(
             lifecycle_class=spec.lifecycle_class,
             labels=run_labels,
             name=spec.name,
+            created_by=agent_created_by(spec.session_id, caller="container_create"),
         ) as handle:
             container = _run()
             handle.attach(container, state=STATE_RUNNING)

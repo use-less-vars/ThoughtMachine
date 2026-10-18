@@ -165,7 +165,11 @@ from thoughtmachine.container_record.drift import (
     EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED,
 )
 from thoughtmachine.container_record import storage
-from thoughtmachine.container_record.hook import record_creation
+from thoughtmachine.container_record.hook import (
+    CREATED_BY_LABEL,
+    agent_created_by,
+    record_creation,
+)
 
 # Admission control (phase 2): the legacy (registry-inactive) fresh create is a
 # terminal container-create site, so it consults the pure admission gate before
@@ -250,6 +254,15 @@ _EXEC_DRIFT_EXIT_CODE = 126  # distinct from -2 (timeout) and -1 (generic error)
 _EXEC_OOM_EXIT_CODE = 137  # 128 + SIGKILL: the OOM-kill signature
 _EXEC_OOM_EVENT = "container.command_oom_killed"
 _EXEC_OOM_ACTOR = "infra.container_manager.exec"
+
+# Removal-path stop grace.  ``remove()`` force-removes the container immediately
+# after the stop, so a long graceful-exit wait is pure latency: the exit it waits
+# for is discarded.  ``_stop_container`` therefore takes the grace as a
+# parameter -- the full 5s SIGTERM ceiling for a user-facing ``stop`` (whose
+# container is expected to keep running) and the short one for a removal that is
+# about to destroy the container anyway.
+_STOP_GRACE_SECONDS = 5
+_REMOVE_GRACE_SECONDS = 1
 
 # Start-path drift admission (mirrors the exec-path memo above): ``start()`` no
 # longer MUTATES a drifted container (no remove/recreate).  A container whose
@@ -1392,7 +1405,8 @@ class ContainerManager:
     def start(self, image=None, name=None, note=None, worker_name=None, *,
               lifecycle_class: str = LIFECYCLE_PERSISTENT,
               allow_fresh: bool = False,
-              heal_missing: bool = False):
+              heal_missing: bool = False,
+              created_by: str | None = None):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
@@ -1431,6 +1445,12 @@ class ContainerManager:
         refuses thereafter), and on success a ``container_record_auto_recreated``
         event is emitted.  A failed heal never raises and falls through to the
         ordinary refusal.
+
+        ``created_by`` (optional) is the creator attribution stamped on the
+        container as the ``thoughtmachine.created_by`` Docker label.  Defaults
+        to ``agent:session:<self.session_id>`` (or ``system:container_manager``
+        when this manager has no session -- e.g. the web UI's operator-driven
+        recreate, which therefore passes its resolved ACTOR explicitly).
         """
         # Root-host refusal: the container user MUST match the host user so
         # bind-mounted workspace files are owned correctly. A host running as
@@ -1569,6 +1589,7 @@ class ContainerManager:
                 # default.
                 if allow_fresh:
                     return self._fresh_start(
+                        created_by=created_by,
                         image=image, name=name, note=note, worker_name=None,
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
@@ -1596,6 +1617,7 @@ class ContainerManager:
             if container is None:
                 if allow_fresh:
                     return self._fresh_start(
+                        created_by=created_by,
                         image=image, name=name, note=note, worker_name=None,
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
@@ -1693,6 +1715,7 @@ class ContainerManager:
                            f"removed_id={_removed_id} session={self.session_id} "
                            f"workspace_id={self.workspace_id}")
                     return self._fresh_start(
+                        created_by=created_by,
                         image=image, name=name, note=note, worker_name=worker_name,
                         lifecycle_class=lifecycle_class,
                         network_mode=want_network, workspace_mode=want_workspace,
@@ -1815,6 +1838,7 @@ class ContainerManager:
                                    f"session={self.session_id} "
                                    f"workspace_id={self.workspace_id}")
                             return self._fresh_start(
+                                created_by=created_by,
                                 image=image, name=name, note=note,
                                 worker_name=worker_name,
                                 lifecycle_class=lifecycle_class,
@@ -1963,6 +1987,7 @@ class ContainerManager:
                            f"removed_id={_removed_id} session={self.session_id} "
                            f"workspace_id={self.workspace_id}")
                     return self._fresh_start(
+                        created_by=created_by,
                         image=image, name=name, note=note, worker_name=worker_name,
                         lifecycle_class=lifecycle_class,
                         network_mode=network_mode, workspace_mode=workspace_mode,
@@ -2001,6 +2026,7 @@ class ContainerManager:
 
         # 3) Fresh create: one shared creation path.
         return self._fresh_start(
+            created_by=created_by,
             image=image, name=name, note=note, worker_name=worker_name,
             lifecycle_class=lifecycle_class,
             network_mode=network_mode, workspace_mode=workspace_mode,
@@ -2062,7 +2088,8 @@ class ContainerManager:
 
     def _fresh_start(self, *, image, name, note, worker_name, lifecycle_class,
                      network_mode, workspace_mode, reuse_record_id=None,
-                     permissions=None, mem_limit=None, cpu_quota=None):
+                     permissions=None, mem_limit=None, cpu_quota=None,
+                     created_by: str | None = None):
         """Create exactly one container (the single fresh-create path).
 
         With ``reuse_record_id`` unset a NEW record is minted alongside the
@@ -2072,6 +2099,13 @@ class ContainerManager:
         docker_id/state are rebound, and the name index keeps pointing at the
         same record id.
         """
+        # Creator attribution for THIS container instance.  Derived
+        # here (the ONE fresh-create path) rather than in the
+        # caller, so an explicit ``created_by`` from ``start`` and
+        # the session default can never disagree.
+        _created_by = created_by or agent_created_by(
+            self.session_id, caller="container_manager")
+
         # Route through the single host-id source of truth: on Windows
         # _host_ids() returns None (no uid concept), so there is no root host
         # to refuse.
@@ -2120,6 +2154,11 @@ class ContainerManager:
             CONTAINER_NAME_LABEL: name,
             "thoughtmachine.workspace_id": self.workspace_id,
             CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
+            # Creator attribution for THIS instance.  The recreate path reuses
+            # this same dict, so a rebuilt container is stamped with the actor
+            # that rebuilt it -- which is what the live container's labels can
+            # honestly answer (the record holds no creator field).
+            CREATED_BY_LABEL: _created_by,
         }
         if worker_name:
             # Ownership label: lets a worker reclaim the containers it created
@@ -2279,6 +2318,7 @@ class ContainerManager:
             labels=labels,
             name=name,
             permissions=permissions,
+            created_by=_created_by,
         ) as record:
             container = self._run_container(
                 image=image, name=name, labels=labels, mounts=mounts,
@@ -3404,13 +3444,19 @@ class ContainerManager:
                     "reason": decision.reason}
         return self._stop_container(container, container_id)
 
-    def _stop_container(self, container, container_id):
+    def _stop_container(self, container, container_id,
+                        grace=_STOP_GRACE_SECONDS):
         """Stop+kill ``container``; the reconcile-FREE core (NEVER raises).
 
         Shared by :meth:`stop` (which reconciles first, then calls this) and
         :meth:`remove` (which reconciles the *removal* decision once, so its
         internal stop must NOT emit a SECOND ``CONTAINER_LIFECYCLE`` event).
         Idempotent.
+
+        ``grace`` is the seconds Docker waits for a graceful exit before
+        escalating to SIGKILL.  It defaults to the full ceiling; :meth:`remove`
+        passes :data:`_REMOVE_GRACE_SECONDS` because it force-removes the
+        container on the very next line.
         """
         try:
             container.reload()
@@ -3422,7 +3468,7 @@ class ContainerManager:
             if container.status == "running":
                 _audit("CONTAINER_STOP",
                        f"container={container_id} session={self.session_id}")
-                container.stop(timeout=5)
+                container.stop(timeout=grace)
                 container.reload()
                 if container.status == "running":
                     container.kill()
@@ -3569,7 +3615,10 @@ class ContainerManager:
         # Destroy proceeds: audit BEFORE the stop so the pre-stop state is real.
         emit_destroy_audit(
             _audit, audit_source, container, reason=audit_reason)
-        stopped = self._stop_container(container, container_id)
+        # Short grace: the force-remove below destroys the container anyway, so
+        # waiting the full SIGTERM ceiling only delays the caller.
+        stopped = self._stop_container(container, container_id,
+                                       grace=_REMOVE_GRACE_SECONDS)
         if stopped.get("status") not in ("stopped", "missing"):
             return stopped
         try:

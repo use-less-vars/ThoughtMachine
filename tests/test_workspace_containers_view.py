@@ -304,8 +304,8 @@ class FakeManager:
         self._statuses.pop(container_id, None)
         return {"status": "removed", "container_id": container_id}
 
-    def start(self, name=None, note=None, allow_fresh=False):
-        self.calls.append(("start", name, note, allow_fresh))
+    def start(self, name=None, note=None, allow_fresh=False, created_by=None):
+        self.calls.append(("start", name, note, allow_fresh, created_by))
         if self._start_result is not None:
             result = dict(self._start_result)
         else:
@@ -805,10 +805,11 @@ class _CapturingManager(FakeManager):
         self._vault = vault
         self.observed_intent = None
 
-    def start(self, name=None, note=None, allow_fresh=False):
+    def start(self, name=None, note=None, allow_fresh=False, created_by=None):
         rec = cr_api.load_record("ws1", "rec-r", vault_root=self._vault)
         self.observed_intent = dict(rec.intent_snapshot or {})
-        return super().start(name=name, note=note, allow_fresh=allow_fresh)
+        return super().start(name=name, note=note, allow_fresh=allow_fresh,
+                             created_by=created_by)
 
 
 def test_patch_persists_intent_before_recreate(vault, monkeypatch):

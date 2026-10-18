@@ -548,9 +548,11 @@ class ContainerStatusTool(_ContainerControlBase):
     Returns the current state of the container identified by ``container_id``
     (running/exited/created/missing), including uptime and memory usage when
     available, plus the lifecycle/ownership description of the container: its
-    lifecycle class, owning scope, creator, remaining retention TTL, and the
-    permission grain required to remove it. This tool never raises — failures
-    are returned in the JSON response.
+    lifecycle class, owning scope, creator (the live container's
+    ``thoughtmachine.created_by`` label, falling back to a session reference
+    from the record's intent snapshot, then ``"unknown"``), remaining
+    retention TTL, and the permission grain required to remove it. This tool
+    never raises — failures are returned in the JSON response.
 
     Returns JSON with structure:
     {
@@ -623,10 +625,19 @@ class ContainerStatusTool(_ContainerControlBase):
         else:
             owner = "workspace"
 
-        # The record schema carries no session field, so the creator is only
-        # reported when a session reference happens to be present.
+        # Creator: the live container's ``thoughtmachine.created_by`` label is
+        # authoritative (the record-creation path stamps it).  Records written
+        # before that label existed fall back to a session reference in
+        # ``intent_snapshot``; a container with neither reports "unknown".
         created_by = "unknown"
-        if record is not None:
+        if container is not None:
+            try:
+                from thoughtmachine.container_record.hook import CREATED_BY_LABEL
+                labels = getattr(container, "labels", None) or {}
+                created_by = labels.get(CREATED_BY_LABEL) or "unknown"
+            except Exception:
+                created_by = "unknown"
+        if created_by == "unknown" and record is not None:
             snapshot = getattr(record, "intent_snapshot", None) or {}
             if isinstance(snapshot, dict) and snapshot.get("session_id"):
                 created_by = "session-{}".format(snapshot["session_id"])

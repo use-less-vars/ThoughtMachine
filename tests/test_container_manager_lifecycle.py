@@ -636,7 +636,7 @@ def test_u2_remove_routes_through_reconcile_once(monkeypatch):
     assert intent.reason == "explicit_remove"
 
     # Destroy proceeded: stop (via the reconcile-free core) + remove.
-    assert c.stop_calls == [{"timeout": 5}]
+    assert c.stop_calls == [{"timeout": container_manager._REMOVE_GRACE_SECONDS}]
     assert c.remove_calls == [{"force": True}]
 
     # ONE CONTAINER_LIFECYCLE event per reconcile.
@@ -644,6 +644,35 @@ def test_u2_remove_routes_through_reconcile_once(monkeypatch):
     assert len(events) == 1
     assert len(events) == len(spy.calls)
     assert events[0].data["action"] == "reap"
+
+
+def test_u2_remove_truncates_the_stop_grace(monkeypatch):
+    """remove() force-removes on the next line -- it must not burn the full 5s
+    graceful-stop ceiling; a plain ``stop()`` still gets the full grace."""
+    _capture_lifecycle(monkeypatch)
+    monkeypatch.setattr(container_manager, "_reap_bound_record",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(container_manager, "_emit_container_removed",
+                        lambda *a, **k: None)
+    _ReconcileSpy(monkeypatch)
+
+    assert container_manager._REMOVE_GRACE_SECONDS < 5
+
+    c = _LiveFakeContainer(cid="c1", name="tm-c1", status="running")
+    mgr = _mgr_with({"c1": c})
+
+    assert mgr.remove("c1") == {"status": "removed", "container_id": "c1"}
+
+    # The pre-force-remove stop is truncated ...
+    assert c.stop_calls == [{"timeout": container_manager._REMOVE_GRACE_SECONDS}]
+    assert c.remove_calls == [{"force": True}]
+
+    # ... while an agent-facing stop keeps the full grace.
+    c2 = _LiveFakeContainer(cid="c2", name="tm-c2", status="running")
+    mgr2 = _mgr_with({"c2": c2})
+
+    assert mgr2.stop("c2")["status"] == "stopped"
+    assert c2.stop_calls == [{"timeout": 5}]
 
 
 def test_u2_remove_only_fires_on_decision_destroys(monkeypatch):

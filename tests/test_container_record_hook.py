@@ -13,6 +13,7 @@ Covers the hook in isolation plus its two integration seams:
 
 import copy
 import logging
+import uuid
 
 import pytest
 
@@ -27,7 +28,13 @@ from thoughtmachine.container_record import (
     load_record,
 )
 from thoughtmachine.container_record import hook as hook_mod
-from thoughtmachine.container_record.hook import record_creation
+from thoughtmachine.container_record.hook import (
+    CREATED_BY_LABEL,
+    agent_created_by,
+    operator_created_by,
+    record_creation,
+    system_created_by,
+)
 
 WS = "ws-hook"
 
@@ -516,3 +523,105 @@ def test_registry_request_container_persists_snapshot():
     assert record.intent_snapshot["workspace_mode"] == "rw"
     assert record.intent_snapshot["hardening"]["cap_drop"] == ["ALL"]
 
+
+
+# ===========================================================================
+# H. creator attribution (``thoughtmachine.created_by`` label)
+# ===========================================================================
+
+
+def test_record_creation_stamps_created_by_label():
+    labels = {}
+    with record_creation(
+        workspace_id=WS,
+        lifecycle_class=LIFECYCLE_EPHEMERAL,
+        labels=labels,
+        created_by="agent:session:sess-7",
+    ) as rec:
+        # The attribution is stamped in place, alongside the record label.
+        assert labels[CREATED_BY_LABEL] == "agent:session:sess-7"
+        assert RECORD_LABEL_KEY in labels
+        rec.attach(_FakeCtr("d-created-by"))
+
+
+def test_record_creation_without_created_by_leaves_label_absent():
+    labels = {"thoughtmachine.container_name": "x"}
+    with record_creation(
+        workspace_id=WS,
+        lifecycle_class=LIFECYCLE_EPHEMERAL,
+        labels=labels,
+    ) as rec:
+        assert CREATED_BY_LABEL not in labels
+        rec.attach(_FakeCtr("d-no-created-by"))
+
+
+def test_created_by_helpers_forms():
+    assert agent_created_by("sess-1") == "agent:session:sess-1"
+    assert (
+        agent_created_by(None, caller="container_registry")
+        == "system:container_registry"
+    )
+    assert operator_created_by("alice") == "alice"
+    assert operator_created_by("") == "operator"
+    assert operator_created_by(None) == "operator"
+    assert system_created_by("sweeper") == "system:sweeper"
+
+
+def test_created_by_accepts_uuid_session_id():
+    """``session_id`` reaches the hook as ``UUID | str | None``; the label is a
+    string by construction, so a UUID session must be coerced, not crash."""
+    u = uuid.uuid4()
+    assert agent_created_by(u) == f"agent:session:{u}"
+
+    # The no-session fallback is unchanged by the coercion.
+    assert agent_created_by(None) == "system:container_manager"
+    assert agent_created_by("") == "system:container_manager"
+    assert agent_created_by(None) == system_created_by("container_manager")
+
+
+def test_container_manager_start_stamps_session_created_by():
+    client = _FakeDockerClient()
+    cm = _make_container_manager(client, workspace_id="ws-cm-cb", session_id="sess-42")
+    cm.start(image="agent-executor", name="agent-created-by")
+
+    run_kwargs = client.containers.run_calls[-1]["kwargs"]
+    assert run_kwargs["labels"][CREATED_BY_LABEL] == "agent:session:sess-42"
+
+
+def test_container_manager_start_honours_explicit_created_by():
+    client = _FakeDockerClient()
+    cm = _make_container_manager(client, workspace_id="ws-cm-op", session_id="sess-42")
+    cm.start(
+        image="agent-executor",
+        name="agent-op-created-by",
+        created_by=operator_created_by("alice@example.com"),
+    )
+
+    run_kwargs = client.containers.run_calls[-1]["kwargs"]
+    assert run_kwargs["labels"][CREATED_BY_LABEL] == "alice@example.com"
+
+
+def test_container_manager_start_without_session_stamps_system_caller():
+    client = _FakeDockerClient()
+    cm = _make_container_manager(client, workspace_id="ws-cm-none", session_id=None)
+    cm.start(image="agent-executor", name="agent-no-session")
+
+    run_kwargs = client.containers.run_calls[-1]["kwargs"]
+    assert run_kwargs["labels"][CREATED_BY_LABEL] == "system:container_manager"
+
+
+def test_registry_request_container_stamps_session_created_by():
+    client = _FakeDockerClient()
+    registry = ContainerRegistry(
+        docker_client=client, feature_flag_check=lambda: True
+    )
+    registry.request_container(
+        "worker-1",
+        "sess-1",
+        {},
+        image="agent-executor",
+        workspace_id="ws-reg-cb",
+    )
+
+    run_kwargs = client.containers.run_calls[-1]["kwargs"]
+    assert run_kwargs["labels"][CREATED_BY_LABEL] == "agent:session:sess-1"

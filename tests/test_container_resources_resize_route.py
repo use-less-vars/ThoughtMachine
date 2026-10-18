@@ -122,8 +122,8 @@ class _FakeManager:
         self.remove_kwargs.append(dict(kwargs))
         return self._next(self.remove_results, "remove")
 
-    def start(self, name=None, note=None, allow_fresh=False):
-        self.calls.append(("start", name, note, allow_fresh))
+    def start(self, name=None, note=None, allow_fresh=False, created_by=None):
+        self.calls.append(("start", name, note, allow_fresh, created_by))
         if self.record_probe is not None:
             record = self.record_probe()
             self.start_snapshots.append(

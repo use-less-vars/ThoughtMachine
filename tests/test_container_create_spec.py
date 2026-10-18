@@ -333,9 +333,11 @@ class TestRecording:
                 calls["attached"] = container
 
         @contextlib.contextmanager
-        def fake_record_creation(*, workspace_id, lifecycle_class, labels=None, name=""):
+        def fake_record_creation(*, workspace_id, lifecycle_class, labels=None,
+                                 name="", created_by=None):
             calls["workspace_id"] = workspace_id
             calls["labels"] = labels
+            calls["created_by"] = created_by
             if labels is not None:
                 labels["tm.record"] = "rec-1"
             yield _Handle()

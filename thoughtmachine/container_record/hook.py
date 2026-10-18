@@ -56,6 +56,42 @@ log = logging.getLogger("infra.container_record.hook")
 #: container.
 _STOP_TIMEOUT = 5
 
+#: Docker label carrying WHO created this container instance, stamped at
+#: creation time (see :func:`record_creation`'s ``created_by``).  It lives on the
+#: container, not in the record, so answering "who created this?" costs nothing
+#: on the read path and needs no schema field (and therefore no schema version
+#: bump / migration of existing records)::
+#:
+#:     agent:session:<session_id>   an agent/session-driven create
+#:     <actor>                      an operator create (the resolved actor)
+#:     system:<caller>              background/plumbing with no session
+CREATED_BY_LABEL = "thoughtmachine.created_by"
+
+_AGENT_PREFIX = "agent:session:"
+
+
+def agent_created_by(session_id: str | None, caller: str = "container_manager") -> str:
+    """``agent:session:<id>`` for a session-driven create.
+
+    Falls back to ``system:<caller>`` when no session owns the create (a
+    background sweep, or an operator path that did not thread its actor through
+    -- the caller name then says which subsystem it was).
+    """
+    sid = str(session_id or "").strip()
+    if sid:
+        return "{}{}".format(_AGENT_PREFIX, sid)
+    return system_created_by(caller)
+
+
+def operator_created_by(actor: str | None) -> str:
+    """The resolved operator actor (``_resolve_actor``'s value) as-is."""
+    return (actor or "").strip() or "operator"
+
+
+def system_created_by(caller: str | None) -> str:
+    """``system:<caller>`` for a create no session or operator drove."""
+    return "system:{}".format((caller or "").strip() or "unknown")
+
 #: Snapshot keys whose truthiness counts as "the inspect payload told us
 #: something".  A snapshot carrying none of these (and an empty ``hardening``
 #: mapping) is all-empty and must not overwrite a natively-authored snapshot.
@@ -219,6 +255,7 @@ def record_creation(
     name: str = "",
     vault_root: str | Any | None = None,
     permissions: dict | None = None,
+    created_by: str | None = None,
 ) -> Iterator[_RecordHandle]:
     """Two-phase record context manager for a fresh container creation.
 
@@ -242,6 +279,10 @@ def record_creation(
         labels: optional Docker label dict to augment with the record label.
         name: optional workspace-scoped container identity ("" = unset).
         vault_root: optional vault root override.
+        created_by: optional creator attribution (``agent:session:<id>`` /
+            ``<actor>`` / ``system:<caller>``), stamped on the container as the
+            :data:`CREATED_BY_LABEL` Docker label.  Ignored when *labels* is
+            ``None`` -- without a label dict there is no container to stamp.
     """
     # Fail closed: if the intent stub cannot be persisted, propagate and let the
     # caller abort *before* it calls ``containers.run``.  A container must never
@@ -261,6 +302,8 @@ def record_creation(
 
     if labels is not None:
         labels.update(record_label(record.id))
+        if created_by:
+            labels[CREATED_BY_LABEL] = created_by
 
     try:
         yield handle
@@ -269,4 +312,10 @@ def record_creation(
         raise
 
 
-__all__ = ["record_creation"]
+__all__ = [
+    "CREATED_BY_LABEL",
+    "agent_created_by",
+    "operator_created_by",
+    "record_creation",
+    "system_created_by",
+]

@@ -50,6 +50,7 @@ from thoughtmachine.container_record import (
     models,
     storage,
 )
+from thoughtmachine.container_record.hook import CREATED_BY_LABEL
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 WS = "ws-1"
@@ -643,7 +644,7 @@ def test_boot_shape_empty_permissions_is_silent_on_the_axis(vault, permissive_ca
 def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
     """PIN: recording the effective profile must not perturb any OTHER create
     argument.  Every value except ``labels`` is byte-identical to the observed
-    call; the label delta is exactly the record-id label."""
+    call; the label delta is exactly the record-id + creator labels."""
     # Pin the host uid/gid so the byte-exact create-args assertion is env-independent.
     monkeypatch.setattr(os, "getuid", lambda: 1000)
     monkeypatch.setattr(os, "getgid", lambda: 1000)
@@ -701,6 +702,7 @@ def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
         "thoughtmachine.workspace_id",
         CONTAINER_TYPE_LABEL,
         api.RECORD_LABEL_KEY,
+        CREATED_BY_LABEL,
     }
     pre_record = {
         CONTAINER_NAME_LABEL: name,
@@ -709,7 +711,10 @@ def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
     }
     for key, value in pre_record.items():
         assert labels[key] == value
-    assert set(labels) - set(pre_record) == {api.RECORD_LABEL_KEY}
+    assert set(labels) - set(pre_record) == {api.RECORD_LABEL_KEY,
+                                             CREATED_BY_LABEL}
+    # Creator attribution: a session-driven create names the session.
+    assert labels[CREATED_BY_LABEL] == "agent:session:s1"
 
     for key, value in expected.items():
         assert run_kwargs[key] == value, (key, run_kwargs[key], value)
