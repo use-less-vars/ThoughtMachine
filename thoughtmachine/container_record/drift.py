@@ -64,7 +64,7 @@ from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
 from .api import RECORD_LABEL_KEY, append_event, read_event_log
 from .lifecycle_policy import normalise_restart_policy, policy_for
 from .models import iso_now
-from .snapshot import snapshot_from_attrs
+from .snapshot import mem_limit_bytes, snapshot_from_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +189,33 @@ def _lookup(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
+def _runtime_axis_matches(axis: str, expected: Any, actual: Any) -> bool:
+    """Return True when the record's *expected* runtime value IS the live one.
+
+    Only ``mem_limit`` needs normalisation: the record stores the
+    operator-AUTHORED spelling (``'1g'``, written by the resources route) while
+    the live inspect payload reports ``str(HostConfig.Memory)``
+    (``'1073741824'``).  Comparing those two strings verbatim reported a
+    permanent, unfixable runtime drift for every non-byte-authored limit, so
+    ``mem_limit`` compares by BYTES whenever BOTH sides parse.  When either side
+    is unparseable it falls back to raw equality, so junk never equals a real
+    limit and two different junks still differ (pre-existing semantics).
+
+    Every other runtime axis is compared verbatim: ``network_mode`` /
+    ``workspace_mode`` are ``str`` on both sides (both produced by the same
+    derivations) and ``cpu_quota`` / ``oom_score_adj`` are raw ``int`` on both
+    sides (``snapshot_from_attrs`` emits the ``HostConfig`` int and the web
+    route validates ``isinstance(cpu_quota, int)``), so no genuine spelling or
+    type mismatch exists to normalise.
+    """
+    if axis == "mem_limit":
+        expected_bytes = mem_limit_bytes(expected)
+        actual_bytes = mem_limit_bytes(actual)
+        if expected_bytes is not None and actual_bytes is not None:
+            return expected_bytes == actual_bytes
+    return expected == actual
+
+
 def _make_finding(
     drift_class: str, event_type: str, expected: Any, actual: Any
 ) -> DriftFinding:
@@ -295,7 +322,9 @@ def classify_drift(record: Any, live: Any, config: Any) -> list[DriftFinding]:
             for axis in _RUNTIME_AXES:
                 expected = snapshot.get(axis)
                 actual = live_map.get(axis)
-                if _nonempty(expected) and expected != actual:
+                if _nonempty(expected) and not _runtime_axis_matches(
+                    axis, expected, actual
+                ):
                     findings.append(
                         _make_finding(
                             CLASS_RUNTIME,

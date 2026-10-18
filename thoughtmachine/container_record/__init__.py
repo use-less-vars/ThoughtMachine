@@ -67,6 +67,8 @@ from .lifecycle_policy import (
 )
 from .snapshot import (
     HARDENING_KEYS,
+    MEM_LIMIT_UNITS,
+    mem_limit_bytes,
     rebuild_config_from_snapshot,
     snapshot_from_attrs,
 )
@@ -100,6 +102,8 @@ __all__ = [
     "snapshot_has_evidence",
     "rebuild_config_from_snapshot",
     "HARDENING_KEYS",
+    "mem_limit_bytes",
+    "MEM_LIMIT_UNITS",
     # api (§3 / §7)
     "RECORD_LABEL_KEY",
     "record_label",

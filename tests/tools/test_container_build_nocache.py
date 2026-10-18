@@ -158,3 +158,69 @@ class TestBuildImageNocacheDefault:
 
         assert dex._run_image_build.call_count == 1
         assert captured.get("nocache") is False
+
+
+@patch("infra.container_manager.DOCKER_AVAILABLE", True)
+class TestNocacheBypassesReuseGate:
+    """``nocache=True`` must bypass the build-hash reuse gate.
+
+    The gate reuses the existing image whenever its ``thoughtmachine.build_hash``
+    label matches the freshly computed hash, so a forced rebuild has to be
+    excluded from the gate explicitly. Otherwise ``ContainerBuildTool(nocache=True)``
+    would be short-circuited on a drifted daemon cache and the rebuild silently
+    skipped.
+    """
+
+    _LABEL = "thoughtmachine.build_hash"
+
+    @staticmethod
+    def _seed_matching_image(manager, dex, tag="agent-executor-test"):
+        dex.EXECUTOR_BUILD_HASH_LABEL = TestNocacheBypassesReuseGate._LABEL
+        image = MagicMock()
+        image.labels = {TestNocacheBypassesReuseGate._LABEL: "hash-xyz"}
+        manager.client.images.get.return_value = image
+
+    def test_matching_hash_without_nocache_still_skips_build(self, tmp_path, monkeypatch):
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
+        manager = _real_manager(tmp_path)
+        captured = {}
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
+            dex = _mock_dex(captured)
+            mock_load.return_value = dex
+            self._seed_matching_image(manager, dex)
+            result = manager.build_image(tag="agent-executor-test")
+
+        assert dex._run_image_build.call_count == 0
+        assert result == {"image_tag": "agent-executor-test", "build_log": ""}
+
+    def test_matching_hash_with_nocache_actually_rebuilds(self, tmp_path, monkeypatch):
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
+        manager = _real_manager(tmp_path)
+        captured = {}
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
+            dex = _mock_dex(captured)
+            mock_load.return_value = dex
+            self._seed_matching_image(manager, dex)
+            result = manager.build_image(tag="agent-executor-test", nocache=True)
+
+        assert dex._run_image_build.call_count == 1
+        assert captured.get("nocache") is True
+        assert result["image_tag"] == "agent-executor-test"
+
+    def test_mismatched_hash_without_nocache_rebuilds(self, tmp_path, monkeypatch):
+        _seed_ws_capabilities(monkeypatch, tmp_path, "ws-1")
+        _grant_disk_container(monkeypatch)
+        manager = _real_manager(tmp_path)
+        captured = {}
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
+            dex = _mock_dex(captured)
+            mock_load.return_value = dex
+            self._seed_matching_image(manager, dex)
+            manager.client.images.get.return_value.labels = {self._LABEL: "stale-hash"}
+            manager.build_image(tag="agent-executor-test")
+
+        assert dex._run_image_build.call_count == 1
+        assert captured.get("nocache") is False
+

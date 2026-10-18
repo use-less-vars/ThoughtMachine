@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from security.security_gate import ContainerConfig
-from thoughtmachine.container_record import api, drift
+from thoughtmachine.container_record import MEM_LIMIT_UNITS, api, drift, mem_limit_bytes
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 WS = "ws-1"
@@ -401,6 +401,118 @@ def test_classify_runtime_mismatch():
     assert out[0].event_type == drift.EVENT_RUNTIME_MISMATCH
     assert out[0].expected == "512m"
     assert out[0].actual == "256m"
+
+
+# ── mem_limit: two SPELLINGS of the same limit are NOT drift ─────────────
+
+
+def test_classify_runtime_mem_limit_same_limit_different_spelling_is_not_drift():
+    """Record '1g' vs live '1073741824' is the SAME limit, not a runtime drift.
+
+    The resources route stores the operator-AUTHORED spelling on the record
+    while ``snapshot_from_attrs`` reports ``str(HostConfig.Memory)``.  A verbatim
+    string comparison reported a permanent, unfixable runtime mismatch for every
+    non-byte-authored limit; the axis is compared by BYTES instead.
+    """
+    record = _record(intent_snapshot={"mem_limit": "1g"})
+    out = drift.classify_drift(record, {"id": "x", "mem_limit": "1073741824"}, None)
+    assert out == []
+
+
+def test_classify_runtime_mem_limit_genuine_narrowing_is_drift():
+    """A DIFFERENT limit is still drift, and the finding keeps the RAW values.
+
+    Regression guard: normalisation must not silence real drift.  ``512m`` and
+    ``1073741824`` bytes differ, so exactly one runtime finding is reported and
+    it carries the authored/live spellings verbatim (only the COMPARISON is
+    normalised, never the reported values).
+    """
+    record = _record(intent_snapshot={"mem_limit": "512m"})
+    out = drift.classify_drift(record, {"id": "x", "mem_limit": "1073741824"}, None)
+    assert len(out) == 1
+    assert out[0].drift_class == drift.CLASS_RUNTIME
+    assert out[0].event_type == drift.EVENT_RUNTIME_MISMATCH
+    assert out[0].expected == "512m"
+    assert out[0].actual == "1073741824"
+
+
+def test_classify_runtime_mem_limit_unparseable_falls_back_to_raw_equality():
+    """Junk never compares equal by accident; identical junk stays equal."""
+    record = _record(intent_snapshot={"mem_limit": "junk-a"})
+    out = drift.classify_drift(record, {"id": "x", "mem_limit": "junk-b"}, None)
+    assert len(out) == 1
+    assert out[0].expected == "junk-a"
+    assert out[0].actual == "junk-b"
+
+    same = drift.classify_drift(record, {"id": "x", "mem_limit": "junk-a"}, None)
+    assert same == []
+
+    # A real limit and an unparseable value are never the same limit either.
+    mixed = drift.classify_drift(record, {"id": "x", "mem_limit": "1g"}, None)
+    assert len(mixed) == 1
+
+
+def test_classify_runtime_other_axes_compare_verbatim():
+    """ONLY ``mem_limit`` is normalised; the other runtime axes stay raw.
+
+    ``network_mode``/``workspace_mode`` are ``str`` on both sides and
+    ``cpu_quota``/``oom_score_adj`` are raw ints on both sides, so there is no
+    spelling or type mismatch to normalise -- a type disagreement therefore
+    still reports as drift (deliberate: the axes are not silently made equal).
+    """
+    record = _record(
+        intent_snapshot={
+            "network_mode": "bridge",
+            "workspace_mode": "ro",
+            "cpu_quota": 50000,
+            "oom_score_adj": 0,
+        }
+    )
+    matching = {
+        "id": "x",
+        "network_mode": "bridge",
+        "workspace_mode": "ro",
+        "cpu_quota": 50000,
+        "oom_score_adj": 0,
+    }
+    assert drift.classify_drift(record, matching, None) == []
+
+    cpu_as_str = dict(matching, cpu_quota="50000")
+    out = drift.classify_drift(record, cpu_as_str, None)
+    assert [f.expected for f in out] == [50000]
+    assert [f.actual for f in out] == ["50000"]
+
+
+# ── mem_limit_bytes (the shared parser) ────────────────────────────────────
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("1g", 1024 ** 3),
+    ("1gb", 1024 ** 3),
+    ("512m", 512 * 1024 ** 2),
+    ("512MB", 512 * 1024 ** 2),
+    ("1024", 1024),
+    ("1024b", 1024),
+    (1073741824, 1073741824),
+    ("1073741824", 1073741824),
+    ("0", 0),
+])
+def test_mem_limit_bytes_parses_known_spellings(value, expected):
+    assert mem_limit_bytes(value) == expected
+    assert len(MEM_LIMIT_UNITS) == 8
+
+
+@pytest.mark.parametrize("value", [
+    None, "", "   ", "junk", "1q", "-1g", -1, True, False, 1.5, [], {}
+])
+def test_mem_limit_bytes_returns_none_for_unusable_values(value):
+    assert mem_limit_bytes(value) is None
+
+
+def test_mem_limit_bytes_is_exported_from_the_package():
+    imported = pytest.importorskip("thoughtmachine.container_record")
+    assert imported.mem_limit_bytes is mem_limit_bytes
+    assert "mem_limit_bytes" in imported.__all__
 
 
 def test_classify_runtime_skipped_when_snapshot_blank():

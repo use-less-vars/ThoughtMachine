@@ -108,3 +108,23 @@ def test_default_image_is_shared_ssot():
     param = inspect.signature(ContainerManager.__init__).parameters["image"]
     assert param.default == DEFAULT_IMAGE
     assert ContainerStartTool().image == DEFAULT_IMAGE
+
+
+def test_resource_defaults_are_shared_ssot():
+    """The agent tool's memory/CPU defaults ARE the manager's (no drift).
+
+    Before the SSOT change the tool defaulted to ``512m``/``50000`` while the
+    manager (and the HTTP route) used ``1g``/``100000``: an agent-started
+    container silently got half a core and half a gigabyte less than the same
+    container started through the web API.
+    """
+    from agent.config.defaults import DEFAULT_CPU_QUOTA, DEFAULT_MEM_LIMIT
+    from tools.container_control import ContainerStartTool
+
+    params = inspect.signature(ContainerManager.__init__).parameters
+    assert params["mem_limit"].default == DEFAULT_MEM_LIMIT
+    assert params["cpu_quota"].default == DEFAULT_CPU_QUOTA
+
+    tool = ContainerStartTool()
+    assert tool.mem_limit == DEFAULT_MEM_LIMIT
+    assert tool.cpu_quota == DEFAULT_CPU_QUOTA

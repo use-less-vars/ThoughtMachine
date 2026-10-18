@@ -45,6 +45,52 @@ def _mapping(value: Any) -> Mapping:
     return value if isinstance(value, Mapping) else {}
 
 
+#: Memory-limit unit suffixes accepted by :func:`mem_limit_bytes`, mapped to
+#: their byte multiplier (Docker's ``mem_limit`` grammar; the trailing ``b`` is
+#: optional, so ``512m`` and ``512mb`` are the same limit).
+MEM_LIMIT_UNITS: dict[str, int] = {
+    "": 1,
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024 * 1024,
+    "mb": 1024 * 1024,
+    "g": 1024 * 1024 * 1024,
+    "gb": 1024 * 1024 * 1024,
+}
+
+
+def mem_limit_bytes(value: Any) -> int | None:
+    """Return *value* (``'512m'``, ``'1g'``, ``1073741824``) in bytes, or None.
+
+    Exists so two SPELLINGS of the same limit compare equal: a record stores
+    the operator-authored ``'1g'`` while the live inspect payload reports
+    ``str(HostConfig.Memory)`` = ``'1073741824'``, and the two are the same
+    limit, not drift.  Junk, negative values and non-scalars return ``None`` so
+    they never compare equal by accident.  Total and side-effect free.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    digits = text.rstrip("abcdefghijklmnopqrstuvwxyz")
+    unit = text[len(digits):]
+    if unit not in MEM_LIMIT_UNITS:
+        return None
+    try:
+        number = float(digits)
+    except ValueError:
+        return None
+    if number < 0:
+        return None
+    return int(number * MEM_LIMIT_UNITS[unit])
+
+
 def hardening_from_host_config(host: Any) -> dict:
     """Extract the *partial* hardening sub-mapping from a ``HostConfig``.
 
