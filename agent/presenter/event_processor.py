@@ -59,42 +59,51 @@ class EventProcessor:
                 log('DEBUG', 'presenter.event_processor', f'Skipping token_update event (handled separately)')
         else:
             log('DEBUG', 'presenter.event_processor', f'No GUI integration, skipping emission for {event_type}')
-        if event_type == 'turn':
-            self._process_turn_event(event)
-        elif event_type == 'token_update':
-            self._process_token_update_event(event)
-        elif event_type == 'agent_responded':
-            self._process_terminal_event(event, event_type)
-        elif event_type == 'user_interaction_requested':
-            self._process_user_interaction_event(event)
-        elif event_type == 'user_query':
-            self._process_user_query_event(event)
-        elif event_type == 'paused':
-            self._process_paused_event(event)
-        elif event_type == 'stop_reason':
-            self._process_stop_reason_event(event)
-        elif event_type in ['stopped', 'max_turns', 'thread_finished']:
-            self._process_terminal_event(event, event_type)
-        elif event_type == 'error':
-            self._process_error_event(event)
-        elif event_type == 'session_stop':
-            self._process_session_stop_event(event)
-        elif event_type == 'execution_state_change':
-            self._process_execution_state_change_event(event)
-        elif event_type == 'session_state_change':
-            self._process_session_state_change_event(event)
-        elif event_type in ('tool_call', 'tool_result'):
-            self._process_tool_event(event, event_type)
-        elif event_type == 'rate_limit_warning':
-            self._process_rate_limit_warning_event(event)
-        elif event_type == 'token_warning':
-            self._process_token_warning_event(event)
-        elif event_type == 'turn_warning':
-            self._process_turn_warning_event(event)
-        elif event_type == 'context_cleared':
-            self._process_context_cleared_event(event)
-        elif event_type == 'token_recovery':
-            self._process_token_recovery_event(event)
+        # The session save is a `finally` invariant for terminal events: an
+        # exception raised anywhere in the handler must not skip persisting the
+        # completed turn (a lost turn never reaches disk).  Granularity is
+        # unchanged — only the types routed to _process_terminal_event save —
+        # so non-terminal events still never trigger a session write.
+        try:
+            if event_type == 'turn':
+                self._process_turn_event(event)
+            elif event_type == 'token_update':
+                self._process_token_update_event(event)
+            elif event_type == 'agent_responded':
+                self._process_terminal_event(event, event_type)
+            elif event_type == 'user_interaction_requested':
+                self._process_user_interaction_event(event)
+            elif event_type == 'user_query':
+                self._process_user_query_event(event)
+            elif event_type == 'paused':
+                self._process_paused_event(event)
+            elif event_type == 'stop_reason':
+                self._process_stop_reason_event(event)
+            elif event_type in ['stopped', 'max_turns', 'thread_finished']:
+                self._process_terminal_event(event, event_type)
+            elif event_type == 'error':
+                self._process_error_event(event)
+            elif event_type == 'session_stop':
+                self._process_session_stop_event(event)
+            elif event_type == 'execution_state_change':
+                self._process_execution_state_change_event(event)
+            elif event_type == 'session_state_change':
+                self._process_session_state_change_event(event)
+            elif event_type in ('tool_call', 'tool_result'):
+                self._process_tool_event(event, event_type)
+            elif event_type == 'rate_limit_warning':
+                self._process_rate_limit_warning_event(event)
+            elif event_type == 'token_warning':
+                self._process_token_warning_event(event)
+            elif event_type == 'turn_warning':
+                self._process_turn_warning_event(event)
+            elif event_type == 'context_cleared':
+                self._process_context_cleared_event(event)
+            elif event_type == 'token_recovery':
+                self._process_token_recovery_event(event)
+        finally:
+            if event_type in ('agent_responded', 'stopped', 'max_turns', 'thread_finished'):
+                self.session_lifecycle.auto_save_current_session()
         if self.gui_integration:
             self.gui_integration.emit_status_message(f'Event: {event_type}')
 
@@ -205,7 +214,6 @@ class EventProcessor:
             if self.gui_integration:
                 message = 'Stopped' if event_type == 'stopped' else 'Thread finished'
                 self.gui_integration.emit_status_message(message)
-        self.session_lifecycle.auto_save_current_session()
 
     def _process_context_cleared_event(self, event: Dict[str, Any]) -> None:
         """Process context cleared event after summarization."""
