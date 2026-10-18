@@ -523,9 +523,9 @@ class AgentController:
         for cb in self._event_callbacks:
             try:
                 cb(event)
-            except Exception:
-                import traceback as _tb
-                _tb.print_exc()
+            except Exception as exc:
+                log('WARNING', 'core.controller',
+                    f"Event callback failed for {event.get('type')}: {exc}")
         # Publish to global event bus so EventLogger and other subscribers see it
         try:
             from agent.events import global_event_bus, convert_from_legacy_format

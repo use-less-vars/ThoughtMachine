@@ -21,4 +21,10 @@ export default defineConfig({
       },
     },
   },
+  // Vitest: run test files serially. The default (fileParallelism: true,
+  // pool: 'forks') spawns one forked worker per file, which OOMs (exit 137)
+  // inside the sandbox cgroup (nproc=12 but memory.max=512MiB / cpu.max=0.5).
+  test: {
+    fileParallelism: false,
+  },
 })
