@@ -202,7 +202,7 @@ from thoughtmachine.container_record import (
     docker_restart_policy,
 )
 from thoughtmachine.container_record import RESOURCE_LABEL as _SHARED_RESOURCE_LABEL
-from thoughtmachine.container_record.hook import record_creation
+from thoughtmachine.container_record.hook import agent_created_by, record_creation
 
 # Module-level image-readiness cache + single-flight lock. Only SUCCESS is
 # cached (_RESOURCE_IMAGE_READY=True); a failed check/build is retried on the
@@ -1204,6 +1204,8 @@ class ResourceContainerManager:
                 workspace_id=self.workspace_id,
                 lifecycle_class=LIFECYCLE_RESOURCE,
                 labels=ctr_labels,
+                created_by=agent_created_by(
+                    self.session_id, caller="resource_container_manager"),
             ) as record:
                 container = create_hardened_container(
                     self.client, create_spec, admission=None, record=False

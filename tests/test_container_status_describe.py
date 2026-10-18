@@ -185,3 +185,26 @@ def test_status_lookup_failure_reports_error():
 
     assert result["success"] is False
     assert "boom" in result["error"]
+
+
+def test_created_by_reads_live_container_label():
+    # The creation path stamps ``thoughtmachine.created_by`` on the container;
+    # the description must report that label verbatim.
+    manager = _manager(
+        lifecycle_class="persistent",
+        labels={"thoughtmachine.created_by": "agent:session:sess-9"},
+    )
+    result = _run(manager, session_id="sess-1")
+
+    assert result["success"] is True
+    assert result["created_by"] == "agent:session:sess-9"
+
+
+def test_created_by_reports_operator_actor_label():
+    manager = _manager(
+        lifecycle_class="resource",
+        labels={"thoughtmachine.created_by": "alice@example.com"},
+    )
+    result = _run(manager)
+
+    assert result["created_by"] == "alice@example.com"

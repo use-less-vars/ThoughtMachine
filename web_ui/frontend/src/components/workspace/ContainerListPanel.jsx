@@ -64,6 +64,19 @@ function permissionsOf(entry) {
   return null
 }
 
+// The record's INTENT snapshot -- the limits the container was actually created
+// with. This is the ONLY source for the memory figure: `permissions` is the
+// six-category GRANT dict (network / git / filesystem / container / mcp /
+// host_bash) and carries no `mem_limit`, so a wired record always has a
+// non-null `permissions` and `permissionsOf` therefore never reaches the intent
+// snapshot. Sourcing `mem` from it is exactly what dropped the badge (and the
+// `(currently X)` hint) from every persistent row while resource rows -- whose
+// record has `permissions === null` -- kept theirs.
+function intentOf(entry) {
+  const intent = entry.intent_snapshot
+  return intent && typeof intent === 'object' ? intent : null
+}
+
 // The permission BADGE's `net` / `fs` parts describe the RUNNING container: the
 // backend attaches `live_envelope` (derived from the live Docker inspect) to
 // every entry and, when present, it wins. Records that predate that wiring, or
@@ -81,24 +94,27 @@ function badgeSourceOf(entry) {
   return permissionsOf(entry)
 }
 
-// `perms` drives the net/fs parts (live first); `intent` (the record envelope)
-// supplies the mem figure unconditionally -- see the note above.
-function badgeText(perms, intent) {
+// The live envelope (when present) drives the net/fs parts; the mem part ALWAYS
+// reads the record's intent and renders `mem —` when the record genuinely has
+// no memory figure (an unwired / pre-v5 record). Never `live_envelope`: that
+// figure lags a recreate and is the drift banner's business, not a badge value.
+function badgeText(entry) {
+  const perms = badgeSourceOf(entry)
   const parts = []
   if (perms) {
     if ('network' in perms) parts.push(`net ${perms.network ? 'on' : 'off'}`)
     if ('filesystem' in perms) parts.push(`fs ${perms.filesystem}`)
   }
-  if (intent && intent.mem_limit != null) parts.push(`mem ${intent.mem_limit}`)
+  const mem = memLimitOf(entry)
+  parts.push(`mem ${mem != null ? mem : '—'}`)
   return parts.join(' · ')
 }
 
 // The input stages a NEW limit while the badge already shows the record's current
 // one, so name both numbers instead of a bare "mem" that reads as a second,
-// contradictory value.
+// contradictory value. Unknown current value -> plain `New limit`.
 function memFieldLabel(entry) {
-  const perms = permissionsOf(entry)
-  const current = perms && perms.mem_limit != null ? String(perms.mem_limit) : null
+  const current = memLimitOf(entry)
   return current ? `New limit (currently ${current})` : 'New limit'
 }
 
@@ -147,6 +163,34 @@ const REFRESH_RETRY_ATTEMPTS = 3
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+//: In-flight feedback. A mutating action is not instant -- a resize stops and
+//: re-creates the container, a remove reaps it -- and the row used to give no
+//: sign the click had landed, so the operator clicked again and queued a
+//: duplicate write. The row now names the action immediately and, if the request
+//: outlives INFLIGHT_WORKING_DELAY_MS, flips to a neutral "working" state with a
+//: spinner; INFLIGHT_SLOW_DELAY_MS adds the "still" hint for a long recreate.
+const INFLIGHT_WORKING_DELAY_MS = 1500
+const INFLIGHT_SLOW_DELAY_MS = 5000
+
+const INFLIGHT_ACTION_LABELS = {
+  resources: 'Resizing\u2026',
+  stop: 'Stopping\u2026',
+  start: 'Starting\u2026',
+  restart: 'Restarting\u2026',
+  remove: 'Removing\u2026',
+}
+const INFLIGHT_WORKING_LABEL = 'Working\u2026'
+const INFLIGHT_SLOW_LABEL = 'Still working\u2026'
+
+// The busy label for a row: the action verb while the request is still
+// plausibly fast, then a neutral one -- the backend may be reconciling, not
+// still executing the verb.
+function inflightLabel(busy) {
+  if (busy.phase === 'working') return INFLIGHT_WORKING_LABEL
+  if (busy.phase === 'slow') return INFLIGHT_SLOW_LABEL
+  return INFLIGHT_ACTION_LABELS[busy.action] || INFLIGHT_WORKING_LABEL
+}
+
 // The action / resources routes answer with the post-action container-view entry
 // (`_container_view_entry(record_after, manager, workspace_id)`) -- a FLAT entry
 // `{id, ..., kind, state, intent_snapshot, permissions, live, ...}`. `remove`
@@ -173,10 +217,16 @@ function mergePostActionEntry(prev, next) {
   return merged
 }
 
-// The record's mem_limit as the row displays it (permissions, else intent).
+// The record's mem_limit as the row displays it: the intent snapshot first (the
+// limit the container was created with, and the one a resize is gated on), then
+// a `permissions.mem_limit` for fixtures / legacy shapes that carry it there.
 function memLimitOf(entry) {
-  const perms = entry ? permissionsOf(entry) : null
-  return perms && perms.mem_limit != null ? String(perms.mem_limit) : null
+  if (!entry) return null
+  const intent = intentOf(entry)
+  if (intent && intent.mem_limit != null) return String(intent.mem_limit)
+  const perms = entry.permissions
+  if (perms && typeof perms === 'object' && perms.mem_limit != null) return String(perms.mem_limit)
+  return null
 }
 
 // What the row must look like once the action has settled. A resize is gated on
@@ -210,11 +260,10 @@ function rowsSatisfy(rows, id, expected) {
   return rowSatisfies(rows.find((e) => e.id === id), expected)
 }
 
-function ContainerRow({ entry, memValue, onMemChange, onAction }) {
+function ContainerRow({ entry, memValue, onMemChange, onAction, busy }) {
   const id = entry.id
   const state = entry.state
-  const perms = badgeSourceOf(entry)
-  const badge = badgeText(perms, permissionsOf(entry))
+  const badge = badgeText(entry)
   const drift = driftDecision(entry)
   // A record that predates the permission snapshot (`permissions === null`)
   // keeps the historical "not yet wired" neutral copy; a red notice still wins.
@@ -324,12 +373,34 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
           />
         </label>
 
+        {busy ? (
+          <span
+            className="container-inflight"
+            data-testid={`container-inflight-${id}`}
+            role="status"
+            aria-live="polite"
+          >
+            {busy.phase === 'acting' ? null : (
+              <span
+                className="container-inflight-spinner"
+                data-testid={`container-spinner-${id}`}
+                aria-hidden="true"
+              />
+            )}
+            {inflightLabel(busy)}
+          </span>
+        ) : null}
+
+        {/* Every control on THIS row is inert while its own action is in flight:
+            the record is mid-mutation, so a second click would queue a duplicate
+            write. Other rows stay live. */}
         {actions.map((action) => (
           <button
             key={action}
             type="button"
             className="container-action"
             data-testid={`container-action-${id}-${action}`}
+            disabled={Boolean(busy)}
             onClick={() => onAction(entry, action)}
           >
             {ACTION_LABELS[action]}
@@ -346,14 +417,22 @@ export default function ContainerListPanel({ workspaceId }) {
   const [error, setError] = useState(null)
   const [pending, setPending] = useState(null) // { entry, action, value }
   const [memEdits, setMemEdits] = useState({})
+  // { id, action, phase: 'acting' | 'working' | 'slow' } for the ONE row whose
+  // action is currently being written. `inflightRef` is the synchronous twin so
+  // two clicks in the same tick cannot both pass the guard.
+  const [inflight, setInflight] = useState(null)
+  const inflightRef = useRef(false)
+  const inflightTimers = useRef([])
   // Abandons an in-flight reconcile loop when the panel unmounts: the retries
   // outlive the click that started them and must not keep fetching (or write
-  // state) after teardown.
+  // state) after teardown. The busy timers are cleared here too.
   const aliveRef = useRef(true)
   useEffect(() => {
     aliveRef.current = true
     return () => {
       aliveRef.current = false
+      inflightTimers.current.forEach((timer) => clearTimeout(timer))
+      inflightTimers.current = []
     }
   }, [])
 
@@ -406,8 +485,7 @@ export default function ContainerListPanel({ workspaceId }) {
 
   const memValueFor = (entry) => {
     if (Object.prototype.hasOwnProperty.call(memEdits, entry.id)) return memEdits[entry.id]
-    const perms = permissionsOf(entry)
-    return perms && perms.mem_limit != null ? String(perms.mem_limit) : ''
+    return memLimitOf(entry) || ''
   }
 
   const handleMemChange = (id, value) => {
@@ -488,10 +566,38 @@ export default function ContainerListPanel({ workspaceId }) {
     [workspaceId, refresh]
   )
 
+  const clearInflight = useCallback(() => {
+    inflightTimers.current.forEach((timer) => clearTimeout(timer))
+    inflightTimers.current = []
+    inflightRef.current = false
+    setInflight(null)
+  }, [])
+
+  const beginInflight = useCallback((entry, action) => {
+    inflightTimers.current.forEach((timer) => clearTimeout(timer))
+    inflightRef.current = true
+    setInflight({ id: entry.id, action, phase: 'acting' })
+    inflightTimers.current = [
+      setTimeout(() => {
+        if (!aliveRef.current) return
+        setInflight((cur) => (cur ? { ...cur, phase: 'working' } : cur))
+      }, INFLIGHT_WORKING_DELAY_MS),
+      setTimeout(() => {
+        if (!aliveRef.current) return
+        setInflight((cur) => (cur ? { ...cur, phase: 'slow' } : cur))
+      }, INFLIGHT_SLOW_DELAY_MS),
+    ]
+  }, [])
+
   const confirmOk = () => {
+    // One mutation at a time: a second Confirm accepted before the first request
+    // settles would dispatch a duplicate write at the same record.
+    if (inflightRef.current) return
     const task = pending
     setPending(null)
-    if (task) dispatch(task)
+    if (!task) return
+    beginInflight(task.entry, task.action)
+    dispatch(task).then(clearInflight, clearInflight)
   }
 
   const confirmCancel = () => setPending(null)
@@ -518,6 +624,7 @@ export default function ContainerListPanel({ workspaceId }) {
             memValue={memValueFor(entry)}
             onMemChange={handleMemChange}
             onAction={requestAction}
+            busy={inflight && inflight.id === entry.id ? inflight : null}
           />
         ))
       )}

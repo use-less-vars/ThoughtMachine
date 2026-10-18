@@ -2368,6 +2368,35 @@ body {
   background: var(--border);
 }
 
+.container-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.container-inflight {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.container-inflight-spinner {
+  width: 0.7rem;
+  height: 0.7rem;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: container-inflight-spin 0.7s linear infinite;
+}
+
+@keyframes container-inflight-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .container-confirm-overlay {
   position: fixed;
   top: 0;

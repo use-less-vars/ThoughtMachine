@@ -60,7 +60,7 @@ from thoughtmachine.container_record import (
     consumes_workspace_slot,
     docker_restart_policy,
 )
-from thoughtmachine.container_record.hook import record_creation
+from thoughtmachine.container_record.hook import agent_created_by, record_creation
 
 # Admission control (phase 2): the hardened create path is the single
 # container-create chokepoint, so it consults the pure admission gate before
@@ -581,6 +581,8 @@ class ContainerRegistry:
                 lifecycle_class=lifecycle_class,
                 labels=profile.labels,
                 name=container_name,
+                created_by=agent_created_by(
+                    session_id, caller="container_registry"),
             ) as record:
                 container = create_hardened_container(
                     self._docker_client, profile, container_name,
@@ -707,6 +709,7 @@ class ContainerRegistry:
             lifecycle_class=LIFECYCLE_RESOURCE,
             labels=profile.labels,
             name=name,
+            created_by=agent_created_by(session_id, caller="container_registry"),
         ) as record:
             container = create_hardened_container(
                 self._docker_client, profile, name,
