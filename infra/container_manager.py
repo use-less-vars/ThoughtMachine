@@ -150,6 +150,7 @@ from thoughtmachine.container_record import (
     lifecycle_class_from_labels,
     list_records,
     load_record,
+    mem_limit_bytes,
     normalise_restart_policy,
     policy_for,
     rebuild_config_from_snapshot,
@@ -669,6 +670,95 @@ class _ComputedContainerConfig(tuple):
         obj = super().__new__(cls, (network_mode, workspace_mode))
         obj.effective = effective
         return obj
+
+
+# ── effective-intent re-observation ─────────────────────────────────────────
+# ``intent_snapshot`` is FILL-ONCE: the intent authored at create time (the
+# operator resize PATCH, or the hook's derived snapshot) is the truth and a
+# later observation must never overwrite it.  That rule has one blind spot: a
+# container that is RE-created keeps the authored snapshot even when what
+# actually came up differs from it (Docker normalises a value, or admission
+# rewrites ``network_mode``), leaving a record that describes a container that
+# no longer exists.  The helper below repairs only that: right after a
+# container is created/attached it re-reads the live inspect payload and
+# reconciles the observable keys, value-by-value.
+_EFFECTIVE_INTENT_KEYS = (
+    "network_mode",
+    "workspace_mode",
+    "mem_limit",
+    "cpu_quota",
+    "restart_policy",
+)
+
+
+def _mem_bytes(value):
+    """Return *value* (``'512m'``, ``'1g'``, ``1073741824``) in bytes, or None.
+
+    Thin alias for the shared parser -- ``mem_limit_bytes`` in
+    ``thoughtmachine.container_record.snapshot`` is the ONE definition of the
+    ``mem_limit`` grammar, because drift detection needs the very same
+    comparison (record ``'1g'`` vs live ``'1073741824'``) to avoid reporting a
+    permanent false runtime drift.  Junk and negative values return ``None`` so
+    they never compare equal by accident.
+    """
+    return mem_limit_bytes(value)
+
+
+def _reobserve_effective_intent(workspace_id, record_id, container):
+    """Reconcile a record's ``intent_snapshot`` with the live *container*.
+
+    Called right after a container has been created for / attached to a record.
+    For every key in :data:`_EFFECTIVE_INTENT_KEYS` that the record ALREADY
+    carries and whose live value is present in the inspect payload, the
+    snapshot keeps its current value when the two AGREE — including
+    ``mem_limit``, where ``'1g'`` and ``'1073741824'`` are the same limit and the
+    authored spelling is preserved — and takes the OBSERVED value when they
+    genuinely differ.  Keys the payload does not report (an empty
+    ``''``/``None``) are left alone, and a key the record never carried is never
+    ADDED: fill-once still decides what the record describes, this only corrects
+    a value the record claims that the live container does not implement.
+
+    This does not weaken fill-once: the snapshot is only ever reconciled
+    against the container that was just created FROM that intent, so an authored
+    value that the container actually implements is untouched.
+
+    Best-effort by construction — any storage/inspect fault is logged and
+    swallowed; this must never fail a container create.  Returns the merged
+    snapshot, or ``None`` when there was nothing to do/failed.
+    """
+    try:
+        if not workspace_id or not record_id:
+            return None
+        record = load_record(workspace_id, record_id)
+        if record is None:
+            return None
+        existing = dict(getattr(record, "intent_snapshot", None) or {})
+        live = snapshot_from_attrs(getattr(container, "attrs", None))
+        if not live:
+            return None
+        merged = dict(existing)
+        for key in _EFFECTIVE_INTENT_KEYS:
+            observed = live.get(key)
+            if observed is None or observed == "":
+                continue
+            if key not in existing:
+                # Fill-once owns the key SET: never invent a key the record's
+                # authored snapshot does not describe.
+                continue
+            current = existing.get(key)
+            if key == "mem_limit":
+                current_bytes = _mem_bytes(current)
+                if current_bytes is not None and current_bytes == _mem_bytes(observed):
+                    # Same limit, different spelling: keep the authored one.
+                    continue
+            merged[key] = observed
+        if merged != existing:
+            update_record(workspace_id, record_id, intent_snapshot=merged)
+        return merged
+    except Exception as exc:  # noqa: BLE001 - never fail a container create
+        log("WARNING", "docker.container_manager",
+            f"effective-intent re-observation skipped for record {record_id}: {exc}")
+        return None
 
 
 class ContainerManager:
@@ -2155,6 +2245,11 @@ class ContainerManager:
             attach_container(self.workspace_id, reuse_record_id, container.id,
                              **_attach_kwargs)
             container = self._cache_container(name, container)
+            # The record keeps the authored snapshot (fill-once); reconcile the
+            # observable keys against the container that was just created so a
+            # re-created record never describes a container that cannot exist.
+            _reobserve_effective_intent(
+                self.workspace_id, reuse_record_id, container)
             if note is not None:
                 self._write_note(reuse_record_id, note)
             _audit("CONTAINER_CREATE",
@@ -2191,6 +2286,11 @@ class ContainerManager:
                 lifecycle_class=lifecycle_class,
                 mem_limit=mem_limit, cpu_quota=cpu_quota)
             record.attach(container, state=STATE_RUNNING)
+            # Best-effort: reconcile the live-observable intent keys with the
+            # snapshot the attach just derived (a no-op when they agree, which
+            # is the normal case — the record is never the source of a change).
+            _reobserve_effective_intent(
+                self.workspace_id, getattr(record, "id", ""), container)
             # Record-first identity: index the freshly minted record so a
             # subsequent start(name=...) reuses it instead of re-creating.
             self._name_index_register(name, getattr(record, "id", ""))
@@ -3969,7 +4069,9 @@ class ContainerManager:
                 ``agent-executor-<hash>`` convention ``docker_executor`` uses)
                 when omitted.
             nocache: If True, force a rebuild bypassing the Docker layer cache
-                (forwarded to ``_run_image_build`` -> ``client.api.build``).
+                (forwarded to ``_run_image_build`` -> ``client.api.build``) AND
+                bypassing the build-hash reuse gate below, so an unchanged
+                build hash cannot short-circuit an explicitly forced build.
 
         Returns:
             Dict with EXACTLY ``image_tag`` and ``build_log`` (the build log,
@@ -4026,18 +4128,21 @@ class ContainerManager:
                 "(requirements.txt + default Dockerfile, via docker_executor) "
                 "must exist."
             ) from e
+        # An explicit force (nocache=True) must never be short-circuited by the
+        # build-hash reuse gate: the caller asked for a real rebuild.
+        force = bool(nocache)
         try:
             existing = self.client.images.get(tag)
         except ImageNotFound:
             existing = None
-        if existing is not None and (
+        if not force and existing is not None and (
             (getattr(existing, "labels", None) or {}).get(dex.EXECUTOR_BUILD_HASH_LABEL)
             == build_hash
         ):
             log("INFO", "docker.container_manager",
                 f"Image {tag} already matches build sources \u2014 skipping build")
             return {"image_tag": tag, "build_log": ""}
-        if existing is not None:
+        if existing is not None and not force:
             log("INFO", "docker.container_manager",
                 f"Image {tag} build sources drifted (label mismatch) \u2014 rebuilding")
 

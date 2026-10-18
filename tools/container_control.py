@@ -42,7 +42,12 @@ from pydantic import Field
 
 from .base import ToolBase
 
-from agent.config.defaults import DEFAULT_IMAGE, WORKSPACE_ID_LABEL
+from agent.config.defaults import (
+    DEFAULT_CPU_QUOTA,
+    DEFAULT_IMAGE,
+    DEFAULT_MEM_LIMIT,
+    WORKSPACE_ID_LABEL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,8 +157,8 @@ class _ContainerControlBase(ToolBase):
             workspace_id=resolved_workspace_id,
             session_permissions=getattr(self, "session_permissions", None),
             image=getattr(self, "image", None) or DEFAULT_IMAGE,
-            mem_limit=getattr(self, "mem_limit", "512m"),
-            cpu_quota=getattr(self, "cpu_quota", 50000),
+            mem_limit=getattr(self, "mem_limit", DEFAULT_MEM_LIMIT),
+            cpu_quota=getattr(self, "cpu_quota", DEFAULT_CPU_QUOTA),
         )
 
     def _respond(self, success: bool, **fields) -> str:
@@ -226,12 +231,15 @@ class ContainerStartTool(_ContainerControlBase):
         ),
     )
     mem_limit: str = Field(
-        default="512m",
-        description="Memory limit (e.g., '512m', '1g')"
+        default=DEFAULT_MEM_LIMIT,
+        description=f"Memory limit (e.g., '512m', '1g') (default: {DEFAULT_MEM_LIMIT})"
     )
     cpu_quota: int = Field(
-        default=50000,
-        description="CPU quota in microseconds (default 50000 = 50ms per 100ms period)"
+        default=DEFAULT_CPU_QUOTA,
+        description=(
+            f"CPU quota in microseconds (default {DEFAULT_CPU_QUOTA} = 100ms per "
+            "100ms period = one full core)"
+        )
     )
     worker_name: Optional[str] = Field(
         default=None,

@@ -29,7 +29,7 @@
 
 import React from 'react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within, act } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import ContainerListPanel, { driftDecision } from './ContainerListPanel'
 
@@ -819,6 +819,244 @@ describe('driftDecision', () => {
     expect(blank).toBeNull()
     const nonString = driftDecision({ id: 'c', permission_drift: [], unavailable_reason: 42 })
     expect(nonString).toBeNull()
+  })
+})
+
+
+// ── Wave: container sprint close (panel fixes, frontend lane) ───────────────
+// Fix 1: the failure body is `{error, code}` (server.py `_json_error`), not
+//        `{detail}` -- the panel must show `error` and keep the status code as
+//        the fallback only.
+// Fix 2: a successful mutating action updates the row without an F5. The
+//        response body is preferred (something the operator sees immediately);
+//        when it is missing or stale the panel re-reads the list, up to 3 times,
+//        500ms apart, until the row agrees with the action. No permanent poller.
+// Fix 3: the mem BADGE reads the record's intent (live only drives net/fs), and
+//        the input is labelled `New limit (currently X)`.
+describe('Wave — container sprint close (panel fixes)', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  // Flush the promise-only part of the dispatch chain (everything before the
+  // first backoff timer) and let React commit the state updates it produced.
+  const flushMicrotasks = async () => {
+    await act(async () => {
+      for (let i = 0; i < 12; i += 1) await Promise.resolve()
+    })
+  }
+
+  // Advance the fake clock by one backoff window, then flush what it wakes.
+  const advance = async (ms) => {
+    await act(async () => {
+      vi.advanceTimersByTime(ms)
+      for (let i = 0; i < 12; i += 1) await Promise.resolve()
+    })
+  }
+
+  const listGets = (fetchMock) =>
+    fetchMock.mock.calls.filter(
+      ([u, init]) => String(u).endsWith('/containers') && (!init || !init.method || init.method === 'GET')
+    )
+
+  // A success body exactly as the routes emit it: a container-view entry rendered
+  // WITHOUT a live inspect, i.e. `live: null` and `live_envelope: null`.
+  function postActionBody(overrides = {}) {
+    return {
+      id: 'eph-1',
+      name: 'eph-1',
+      note: '',
+      kind: 'ephemeral',
+      state: 'running',
+      intent_snapshot: { mem_limit: '512m' },
+      permissions: { network: true, filesystem: 'rw', mem_limit: '512m' },
+      permission_drift: null,
+      shared: false,
+      live: null,
+      unrecorded: false,
+      live_envelope: null,
+      ...overrides,
+    }
+  }
+
+  // ── Fix 1 ─────────────────────────────────────────────────────────────────
+  it('Fix 1: a 400 displays the body `error` text, not just the status code', async () => {
+    const containersBody = payload({ ephemeral: [ephemeralEntry({ id: 'eph-400', state: 'running' })] })
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).endsWith('/resources')) {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ error: 'mem_limit must be at least 6MB', code: 'below_floor' }),
+        }
+      }
+      return { ok: true, status: 200, json: async () => containersBody }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.change(await screen.findByTestId('container-resources-mem-eph-400'), {
+      target: { value: '1m' },
+    })
+    fireEvent.click(screen.getByTestId('container-action-eph-400-resources'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('mem_limit must be at least 6MB')
+    // the useless generic copy must NOT be what the operator reads
+    expect(alert).not.toHaveTextContent('Action failed')
+  })
+
+  it('Fix 1: a body with neither `error` nor `detail` still falls back to the status code', async () => {
+    const containersBody = payload({ ephemeral: [ephemeralEntry({ id: 'eph-400b', state: 'running' })] })
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).endsWith('/resources')) {
+        return { ok: false, status: 400, json: async () => ({ code: 'below_floor' }) }
+      }
+      return { ok: true, status: 200, json: async () => containersBody }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.click(await screen.findByTestId('container-action-eph-400b-resources'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Action failed (400)')
+  })
+
+  // ── Fix 2 ─────────────────────────────────────────────────────────────────
+  it('Fix 2: a success body that carries the new state updates the row in place, with no refetch', async () => {
+    const before = payload({
+      ephemeral: [
+        ephemeralEntry({
+          id: 'eph-direct',
+          state: 'running',
+          live: true,
+          permissions: { network: true, filesystem: 'rw', mem_limit: '512m' },
+          intent_snapshot: { mem_limit: '512m' },
+        }),
+      ],
+    })
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).endsWith('/resources')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () =>
+            postActionBody({
+              id: 'eph-direct',
+              intent_snapshot: { mem_limit: '1g' },
+              permissions: { network: true, filesystem: 'rw', mem_limit: '1g' },
+            }),
+        }
+      }
+      return { ok: true, status: 200, json: async () => before }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    fireEvent.change(await screen.findByTestId('container-resources-mem-eph-direct'), {
+      target: { value: '1g' },
+    })
+    fireEvent.click(screen.getByTestId('container-action-eph-direct-resources'))
+    fireEvent.click(await screen.findByTestId('confirm-ok'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('permission-badge-eph-direct')).toHaveTextContent('mem 1g')
+    )
+    // the response was authoritative -> no second list read was needed
+    expect(listGets(fetchMock)).toHaveLength(1)
+    // ...and its `live: null` did not overwrite the row's live marker
+    expect(screen.queryByTestId('container-missing-eph-direct')).toBeNull()
+  })
+
+  it('Fix 2: a stale success body is repaired by a 500ms backoff refetch -- no F5', async () => {
+    const stale = payload({
+      ephemeral: [
+        ephemeralEntry({
+          id: 'eph-late',
+          state: 'running',
+          permissions: { network: true, filesystem: 'rw', mem_limit: '512m' },
+          intent_snapshot: { mem_limit: '512m' },
+        }),
+      ],
+    })
+    const updated = payload({
+      ephemeral: [
+        ephemeralEntry({
+          id: 'eph-late',
+          state: 'running',
+          permissions: { network: true, filesystem: 'rw', mem_limit: '1g' },
+          intent_snapshot: { mem_limit: '1g' },
+        }),
+      ],
+    })
+    let listCalls = 0
+    const fetchMock = vi.fn(async (url) => {
+      if (String(url).endsWith('/resources')) {
+        // the route answers BEFORE the record write lands: same degraded entry,
+        // old mem_limit, live/live_envelope null
+        return { ok: true, status: 200, json: async () => postActionBody({ id: 'eph-late' }) }
+      }
+      listCalls += 1
+      // the first re-read is still stale (the write has not landed yet); the
+      // backoff retry is the first read that sees the new record
+      return { ok: true, status: 200, json: async () => (listCalls <= 2 ? stale : updated) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await screen.findByTestId('container-row-eph-late')
+
+    vi.useFakeTimers()
+    fireEvent.change(screen.getByTestId('container-resources-mem-eph-late'), {
+      target: { value: '1g' },
+    })
+    fireEvent.click(screen.getByTestId('container-action-eph-late-resources'))
+    fireEvent.click(screen.getByTestId('confirm-ok'))
+
+    // the immediate re-read happens, but the record is still stale
+    await flushMicrotasks()
+    expect(listCalls).toBe(2)
+    expect(screen.getByTestId('permission-badge-eph-late')).toHaveTextContent('mem 512m')
+
+    // the backoff retry fires one window later and the row catches up on its own
+    await advance(500)
+    expect(listCalls).toBe(3)
+    expect(screen.getByTestId('permission-badge-eph-late')).toHaveTextContent('mem 1g')
+
+    // the loop stops as soon as the row matches: no further reads pile up
+    await advance(2000)
+    expect(listCalls).toBe(3)
+  })
+
+  // ── Fix 3 ─────────────────────────────────────────────────────────────────
+  it('Fix 3: the mem badge reads the RECORD intent (500m), never the live envelope (256m)', async () => {
+    stubFetch(
+      payload({
+        ephemeral: [
+          ephemeralEntry({
+            id: 'eph-mem',
+            permissions: { network: true, filesystem: 'rw', mem_limit: '500m' },
+            intent_snapshot: { mem_limit: '500m' },
+            // mid-recreate: the live container still carries the previous limit
+            live_envelope: { network: false, filesystem: 'read', mem_limit: '256m' },
+          }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const badge = await screen.findByTestId('permission-badge-eph-mem')
+    expect(badge).toHaveTextContent('mem 500m')
+    expect(badge).not.toHaveTextContent('256m')
+    // net/fs still describe the running container (unchanged contract)
+    expect(badge).toHaveTextContent('net off · fs read')
+
+    // the input is explicitly a NEW limit, named against the record's value
+    const input = screen.getByTestId('container-resources-mem-eph-mem')
+    expect(input.closest('label')).toHaveTextContent('New limit (currently 500m)')
+    expect(input).toHaveValue('500m')
   })
 })
 

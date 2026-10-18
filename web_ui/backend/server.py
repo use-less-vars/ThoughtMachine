@@ -3503,12 +3503,15 @@ def _make_container_manager(workspace_id: str, workspace_path: str = ""):
     path = _resolve_workspace_path(workspace_id, workspace_path)
     if not path:
         return None
+    from agent.config.defaults import DEFAULT_CPU_QUOTA, DEFAULT_MEM_LIMIT
     from infra.container_manager import ContainerManager
     return ContainerManager(
         workspace_path=path,
         workspace_id=workspace_id,
         session_id=None,
         session_permissions=None,
+        mem_limit=DEFAULT_MEM_LIMIT,
+        cpu_quota=DEFAULT_CPU_QUOTA,
     )
 
 
