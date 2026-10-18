@@ -474,10 +474,22 @@ def test_host_user_is_none_on_windows(monkeypatch):
     assert defaults.host_user() is None
 
     recipe = defaults.host_tmpfs()
-    assert recipe["/tmp"] == "rw,noexec,nosuid,size=64m"
+    assert recipe["/tmp"] == "rw,noexec,nosuid,size=512m"
     assert "/home/agent" in recipe
     assert "uid=" not in recipe["/home/agent"]
     assert "gid=" not in recipe["/home/agent"]
+
+
+def test_exec_tmpfs_options_are_bounded_but_large_and_noexec():
+    """/tmp must be 512m (pytest ``tmp_path`` ENOSPCed at 64m) and stay noexec."""
+    for options in (defaults.host_tmpfs()["/tmp"], defaults.DEFAULT_TMPFS["/tmp"]):
+        assert "size=512m" in options
+        assert "noexec" in options
+        assert "nosuid" in options
+        assert options.startswith("rw,")
+    # One constant, both recipes: the literal is never respelled.
+    assert defaults.EXEC_TMPFS_OPTIONS == defaults.host_tmpfs()["/tmp"]
+    assert defaults.EXEC_TMPFS_OPTIONS == defaults.DEFAULT_TMPFS["/tmp"]
 
 
 def test_host_user_none_on_windows_without_getuid(monkeypatch):

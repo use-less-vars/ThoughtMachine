@@ -15,7 +15,10 @@
 //   * three group sections: container-group-ephemeral / -persistent / -resource
 //   * rows: container-row-{id}; state chip: container-state-{id}
 //   * permission badge: permission-badge-{id}
-//   * drift indicator: container-drift-{id} (data-drift amber|neutral, ABSENT when silent)
+//   * drift indicator: container-drift-{id} (data-drift red|neutral, ABSENT when
+//     silent). Precedence: unavailable_reason (red) > non-empty permission_drift
+//     (neutral, count) > permission_drift === null (neutral, "not verified") >
+//     silent. `driftDecision(entry)` is the pure exported decision function.
 //   * shared chip (persistent/resource only): container-shared-{id}
 //   * controls: container-action-{id}-stop|start|restart|remove|resources
 //   * size-edit input: container-resources-mem-{id}
@@ -28,7 +31,7 @@ import React from 'react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
-import ContainerListPanel from './ContainerListPanel'
+import ContainerListPanel, { driftDecision } from './ContainerListPanel'
 
 const WORKSPACE_ID = 'ws-1'
 
@@ -226,8 +229,8 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
   })
 
   // ── T10 ─────────────────────────────────────────────────────────────────
-  // T10: drift indicator is 3-state.
-  it('T10 non-empty permission_drift renders an amber indicator matching /older permissions/i', async () => {
+  // T10: drift indicator is 3-state (red | neutral | absent).
+  it('T10 non-empty permission_drift renders a neutral indicator naming the drift count', async () => {
     stubFetch(
       payload({
         ephemeral: [
@@ -241,11 +244,12 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
 
     const drift = await screen.findByTestId('container-drift-eph-drift')
-    expect(drift).toHaveAttribute('data-drift', 'amber')
-    expect(drift).toHaveTextContent(/older permissions/i)
+    expect(drift).toHaveAttribute('data-drift', 'neutral')
+    expect(drift).toHaveTextContent(/has drifted from its recorded intent/i)
+    expect(drift).toHaveTextContent(/\(1 item\(s\)\)/)
   })
 
-  it('T10 null permission_drift with permissions present renders NO drift indicator (silent)', async () => {
+  it('T10 null permission_drift with permissions present renders a neutral not-verified indicator', async () => {
     stubFetch(
       payload({
         ephemeral: [
@@ -259,8 +263,48 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     )
     render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
 
-    await screen.findByTestId('container-row-eph-silent')
-    expect(screen.queryByTestId('container-drift-eph-silent')).toBeNull()
+    const drift = await screen.findByTestId('container-drift-eph-silent')
+    expect(drift).toHaveAttribute('data-drift', 'neutral')
+    expect(drift).toHaveTextContent(/Drift not verified for this container/i)
+  })
+
+  it('T10 empty permission_drift array renders NO drift indicator (silent)', async () => {
+    stubFetch(
+      payload({
+        ephemeral: [
+          ephemeralEntry({
+            id: 'eph-clean',
+            permissions: { network: true, filesystem: 'rw', mem_limit: '512m' },
+            permission_drift: [],
+          }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await screen.findByTestId('container-row-eph-clean')
+    expect(screen.queryByTestId('container-drift-eph-clean')).toBeNull()
+  })
+
+  it('T10 unavailable_reason renders a RED drift indicator (outranks permission_drift)', async () => {
+    stubFetch(
+      payload({
+        ephemeral: [
+          ephemeralEntry({
+            id: 'eph-red',
+            permission_drift: [{ code: 'drift.permission', message: 'shape differs' }],
+            unavailable_reason: 'container grants network but this session does not.',
+          }),
+        ],
+      })
+    )
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    const drift = await screen.findByTestId('container-drift-eph-red')
+    expect(drift).toHaveAttribute('data-drift', 'red')
+    expect(drift.className).toContain('container-drift--red')
+    expect(drift).toHaveTextContent(/container grants network but this session does not\./i)
+    expect(drift).toHaveTextContent(/Rebuild to apply the current permissions/i)
   })
 
   it('T10 null permissions renders a neutral indicator whose tooltip says drift is not wired', async () => {
@@ -678,3 +722,103 @@ describe('ContainerListPanel (C.1 session-panel container view)', () => {
     expect(screen.getByTestId('container-action-pers-ctl-remove')).toBeInTheDocument()
   })
 })
+
+// ── driftDecision (pure) ──────────────────────────────────────────────────
+// `driftDecision(entry)` is exported so the precedence rule can be pinned
+// without mounting the panel. Contract:
+//   1. non-empty string `unavailable_reason`      -> { severity: 'red', body }
+//   2. non-empty `permission_drift` array         -> { severity: 'neutral', body }
+//   3. `permission_drift === null` (unknown)      -> { severity: 'neutral', body }
+//   4. otherwise                                  -> null (row renders nothing)
+// `unavailable_reason` OUTRANKS drift: it is the only signal that the running
+// container is actively MORE permissive than this session's grant.
+describe('driftDecision', () => {
+  const PERMS = { network: true, filesystem: 'rw', mem_limit: '512m' }
+
+  it('returns null when permission_drift is an empty array (no drift recorded)', () => {
+    expect(driftDecision({ id: 'a', permissions: PERMS, permission_drift: [] })).toBeNull()
+  })
+
+  it('returns null when permission_drift is a non-null non-array (shape it cannot read)', () => {
+    expect(driftDecision({ id: 'a', permissions: PERMS, permission_drift: 'nope' })).toBeNull()
+    expect(driftDecision({ id: 'a', permissions: PERMS, permission_drift: undefined })).toBeNull()
+  })
+
+  it('returns null when permission_drift is undefined and no reason is present', () => {
+    expect(driftDecision({ id: 'a', permissions: PERMS })).toBeNull()
+  })
+
+  it('is neutral (NOT red) for a non-empty permission_drift: drift alone never means red', () => {
+    const decision = driftDecision({
+      id: 'a',
+      permissions: PERMS,
+      permission_drift: [{ code: 'drift.permission' }],
+    })
+    expect(decision).not.toBeNull()
+    expect(decision.severity).toBe('neutral')
+  })
+
+  it('names the drift count in the neutral body', () => {
+    const one = driftDecision({ id: 'a', permissions: PERMS, permission_drift: [{ code: 'x' }] })
+    expect(one.body).toMatch(/has drifted from its recorded intent/)
+    expect(one.body).toContain('(1 item(s))')
+    const three = driftDecision({
+      id: 'b',
+      permissions: PERMS,
+      permission_drift: [{ code: 'x' }, { code: 'y' }, { code: 'z' }],
+    })
+    expect(three.body).toContain('(3 item(s))')
+  })
+
+  it('is neutral "not verified" when permission_drift is null but permissions were recorded', () => {
+    const decision = driftDecision({ id: 'a', permissions: PERMS, permission_drift: null })
+    expect(decision.severity).toBe('neutral')
+    expect(decision.body).toBe('Drift not verified for this container.')
+  })
+
+  it('is neutral "not verified" when permission_drift is null and permissions are also null', () => {
+    const decision = driftDecision({ id: 'a', permissions: null, permission_drift: null })
+    expect(decision.severity).toBe('neutral')
+    expect(decision.body).toBe('Drift not verified for this container.')
+  })
+
+  it('is red for a non-empty unavailable_reason and appends the rebuild instruction', () => {
+    const decision = driftDecision({
+      id: 'a',
+      permissions: PERMS,
+      permission_drift: null,
+      unavailable_reason: 'container grants a writable fs but this session does not.',
+    })
+    expect(decision.severity).toBe('red')
+    expect(decision.body).toBe(
+      'container grants a writable fs but this session does not. Rebuild to apply the current permissions.'
+    )
+  })
+
+  it('trims surrounding whitespace off unavailable_reason in the red body', () => {
+    const decision = driftDecision({ id: 'a', permission_drift: [], unavailable_reason: '  net mismatch.  ' })
+    expect(decision.severity).toBe('red')
+    expect(decision.body).toBe('net mismatch. Rebuild to apply the current permissions.')
+  })
+
+  it('red OUTRANKS a non-empty permission_drift when both are present', () => {
+    const decision = driftDecision({
+      id: 'a',
+      permissions: PERMS,
+      permission_drift: [{ code: 'drift.permission' }],
+      unavailable_reason: 'net mismatch.',
+    })
+    expect(decision.severity).toBe('red')
+    expect(decision.body).toMatch(/^net mismatch\./)
+  })
+
+  it('ignores an empty or whitespace-only unavailable_reason (falls through to drift)', () => {
+    const empty = driftDecision({ id: 'a', permission_drift: [], unavailable_reason: '' })
+    expect(empty).toBeNull()
+    const blank = driftDecision({ id: 'b', permission_drift: [], unavailable_reason: '   ' })
+    expect(blank).toBeNull()
+    const nonString = driftDecision({ id: 'c', permission_drift: [], unavailable_reason: 42 })
+    expect(nonString).toBeNull()
+  })
+})
+

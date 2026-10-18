@@ -189,6 +189,15 @@ def host_user() -> str | None:
     return f"{uid}:{gid}"
 
 
+# Mount options for the ``/tmp`` tmpfs of every exec container (single source
+# of truth -- importers must not respell the string).
+# Size is 512m rather than 64m because pytest's ``tmp_path`` defaults to /tmp
+# and a 64m tmpfs ENOSPCs part-way through a suite. 512m is still a hard
+# ceiling (a runaway writer cannot fill the host disk) and the mount stays
+# ``noexec``/``nosuid`` so /tmp can never host an executed or setuid binary.
+EXEC_TMPFS_OPTIONS = "rw,noexec,nosuid,size=512m"
+
+
 def host_tmpfs() -> dict:
     """Fresh tmpfs recipe with the live host uid/gid (resolved at call time).
 
@@ -201,7 +210,7 @@ def host_tmpfs() -> dict:
         uid, gid = ids
         home = f"{home},uid={uid},gid={gid}"
     return {
-        "/tmp": "rw,noexec,nosuid,size=64m",
+        "/tmp": EXEC_TMPFS_OPTIONS,
         "/home/agent": home,
     }
 
@@ -216,7 +225,7 @@ _HIDS = _host_ids()
 if _HIDS is not None:
     _TMPFS_HOME = f"{_TMPFS_HOME},uid={_HIDS[0]},gid={_HIDS[1]}"
 DEFAULT_TMPFS = {
-    "/tmp": "rw,noexec,nosuid,size=64m",
+    "/tmp": EXEC_TMPFS_OPTIONS,
     "/home/agent": _TMPFS_HOME,
 }
 DEFAULT_COMMAND = ["tail", "-f", "/dev/null"]

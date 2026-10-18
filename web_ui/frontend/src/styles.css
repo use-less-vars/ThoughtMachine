@@ -2309,9 +2309,9 @@ body {
   white-space: normal;
 }
 
-.container-drift--amber {
-  background: rgba(249, 226, 175, 0.15);
-  color: var(--warning);
+.container-drift--red {
+  background: rgba(243, 139, 168, 0.15);
+  color: var(--danger);
 }
 
 .container-drift--neutral {

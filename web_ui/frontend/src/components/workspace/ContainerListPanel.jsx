@@ -26,7 +26,7 @@ function sharedLineFor(action) {
 //: handler runs. Both are sent so either resolution path succeeds.
 const ACTOR = 'operator'
 
-const DRIFT_AMBER_TEXT = 'Running under older permissions — restart to apply.'
+const DRIFT_UNVERIFIED_TEXT = 'Drift not verified for this container.'
 const DRIFT_NEUTRAL_TITLE =
   'Drift check not yet wired for this container — see backend/record-create-permission-snapshot.'
 
@@ -84,22 +84,51 @@ function badgeText(perms) {
   return parts.join(' · ')
 }
 
-// Drift indicator is 3-state:
-//   * non-empty `permission_drift` array  -> amber ("running under older ...")
-//   * `permissions === null`              -> neutral ("not yet wired")
-//   * otherwise (permissions present, no drift) -> silent (no element)
-function driftState(entry) {
+// Drift notice precedence (highest first); `null` means the row renders NO drift
+// element at all. Derived from the entry alone so it is unit-testable without
+// mounting the panel:
+//   1. `unavailable_reason` set (the live container's isolation is MORE
+//      permissive than this session's grant) -> red, body names the reason
+//   2. non-empty `permission_drift` array    -> neutral, body names the count
+//   3. `permission_drift === null` (unknown) -> neutral, "not verified"
+//   4. otherwise                             -> null (silent)
+// `unavailable_reason` OUTRANKS the other branches: it is the only signal that
+// the running container is actively outside the current grant.
+// NOTE: branch 1 is LATENT -- `unavailable_reason` is session-scoped. It is
+// produced only by `ContainerManager.list_containers()` when that manager was
+// built with a `session_id` (persistent rows) and by `ContainerStatusTool`.
+// The containers view builds its manager with `session_id=None`
+// (`web_ui/backend/server.py:_make_container_manager`) and never sets the key,
+// so the red notice cannot fire until that route can compare against a session.
+export function driftDecision(entry) {
+  const reason = entry.unavailable_reason
+  if (typeof reason === 'string' && reason.trim() !== '') {
+    return { severity: 'red', body: `${reason.trim()} Rebuild to apply the current permissions.` }
+  }
   const drift = entry.permission_drift
-  if (Array.isArray(drift) && drift.length > 0) return 'amber'
-  if (entry.permissions == null) return 'neutral'
-  return 'silent'
+  if (Array.isArray(drift) && drift.length > 0) {
+    return {
+      severity: 'neutral',
+      body: `Container configuration has drifted from its recorded intent (${drift.length} item(s)). Restart to rebuild.`,
+    }
+  }
+  if (entry.permission_drift === null) {
+    return { severity: 'neutral', body: DRIFT_UNVERIFIED_TEXT }
+  }
+  return null
 }
 
 function ContainerRow({ entry, memValue, onMemChange, onAction }) {
   const id = entry.id
   const state = entry.state
   const perms = badgeSourceOf(entry)
-  const drift = driftState(entry)
+  const drift = driftDecision(entry)
+  // A record that predates the permission snapshot (`permissions === null`)
+  // keeps the historical "not yet wired" neutral copy; a red notice still wins.
+  const driftBody =
+    drift && drift.severity !== 'red' && entry.permissions == null
+      ? DRIFT_NEUTRAL_TITLE
+      : drift && drift.body
   const isOom = state === 'oom'
   const noteText = typeof entry.note === 'string' ? entry.note.trim() : ''
 
@@ -159,24 +188,14 @@ function ContainerRow({ entry, memValue, onMemChange, onAction }) {
           </span>
         ) : null}
 
-        {drift === 'amber' ? (
+        {driftBody ? (
           <span
-            className="container-drift container-drift--amber"
+            className={`container-drift container-drift--${drift.severity}`}
             data-testid={`container-drift-${id}`}
-            data-drift="amber"
+            data-drift={drift.severity}
+            title={drift.severity === 'red' ? undefined : driftBody}
           >
-            {DRIFT_AMBER_TEXT}
-          </span>
-        ) : null}
-
-        {drift === 'neutral' ? (
-          <span
-            className="container-drift container-drift--neutral"
-            data-testid={`container-drift-${id}`}
-            data-drift="neutral"
-            title={DRIFT_NEUTRAL_TITLE}
-          >
-            {DRIFT_NEUTRAL_TITLE}
+            {driftBody}
           </span>
         ) : null}
 

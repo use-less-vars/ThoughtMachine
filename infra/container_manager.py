@@ -94,6 +94,11 @@ except ImportError:
 
 from agent.logging import log
 from agent.logging.lifecycle import log_container_event
+from infra.container_destroy_audit import (
+    CONTAINER_DESTROY,
+    emit_destroy_audit,
+    record_id_from_container,
+)
 from thoughtmachine.audit_logger import audit_event
 
 _audit = lambda event, data: audit_event(event, data)
@@ -185,6 +190,7 @@ from agent.config.defaults import (
     DEFAULT_IMAGE,
     DEFAULT_MAX_CONTAINERS,
     EXEC_OUTPUT_LIMIT_BYTES,
+    EXEC_TMPFS_OPTIONS,
     host_user,
     _host_ids,
 )
@@ -1583,6 +1589,9 @@ class ContainerManager:
                 )
                 if _recreate_decision.destroys:
                     _removed_id = getattr(container, "id", None)
+                    emit_destroy_audit(
+                        _audit, "container_manager.start_recreate", container,
+                        reason="start_recreate")
                     try:
                         container.remove(force=True)
                     except Exception as exc:
@@ -1701,6 +1710,9 @@ class ContainerManager:
                         )
                         if _recreate_decision.destroys:
                             _removed_id = getattr(container, "id", None)
+                            emit_destroy_audit(
+                                _audit, "container_manager.start_recreate",
+                                container, reason="start_recreate")
                             try:
                                 container.remove(force=True)
                             except Exception as exc:
@@ -1847,6 +1859,9 @@ class ContainerManager:
                 )
                 if _recreate_decision.destroys:
                     _removed_id = getattr(container, "id", None)
+                    emit_destroy_audit(
+                        _audit, "container_manager.start_recreate", container,
+                        reason="start_recreate")
                     try:
                         container.remove(force=True)
                     except Exception as exc:
@@ -1980,7 +1995,7 @@ class ContainerManager:
         if ids is not None:
             home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
         tmpfs = {
-            "/tmp": "rw,noexec,nosuid,size=64m",
+            "/tmp": EXEC_TMPFS_OPTIONS,
             "/home/agent": home_tmpfs,
         }
         shadow = git_shadow_for_workspace(
@@ -3405,6 +3420,10 @@ class ContainerManager:
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
+            # Already gone: the destroy still happened, just not here.
+            emit_destroy_audit(
+                _audit, "container_manager.remove", None,
+                reason="explicit_remove", container_id=container_id)
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
@@ -3427,14 +3446,30 @@ class ContainerManager:
                 f"remove: lifecycle funnel refused removal of {container_id!r} "
                 f"(action={decision.action!r} reason={decision.reason!r}); "
                 f"container left in place")
+            # The refusal is audited too: a destroy that was asked for and
+            # denied must leave a trail, otherwise the history reads as if
+            # nobody ever tried.
+            emit_destroy_audit(
+                _audit, "container_manager.remove", container,
+                reason="refused",
+                detail=f"action={getattr(decision, 'action', 'unknown')} "
+                       f"decision_reason={getattr(decision, 'reason', 'unknown')}")
             return {"status": "refused", "container_id": container_id,
                     "reason": decision.reason}
+        # Destroy proceeds: audit BEFORE the stop so the pre-stop state is real.
+        emit_destroy_audit(
+            _audit, "container_manager.remove", container,
+            reason="explicit_remove")
         stopped = self._stop_container(container, container_id)
         if stopped.get("status") not in ("stopped", "missing"):
             return stopped
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
+            # Vanished between the stop and the re-get; the destroy stands.
+            emit_destroy_audit(
+                _audit, "container_manager.remove", None,
+                reason="explicit_remove", container_id=container_id)
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
@@ -4605,28 +4640,22 @@ class ContainerManager:
 
 
 # ── Module-level workspace helpers ──────────────────────────────────────────
-def _record_id_from_container(container):
-    """Return the record id carried by *container*'s labels, or None.
+# The single implementation lives in :mod:`infra.container_destroy_audit`;
+# this alias keeps the historical module-level private name importable.
+_record_id_from_container = record_id_from_container
 
-    Module-level twin of :meth:`ContainerManager._record_id_for`, for removal
-    sites without a manager instance.  Never raises.
-    """
-    if container is None:
-        return None
-    labels = getattr(container, "labels", None)
-    if not labels:
-        try:
-            attrs = getattr(container, "attrs", None) or {}
-            labels = (attrs.get("Config") or {}).get("Labels")
-        except Exception:
-            labels = None
-    try:
-        value = (labels or {}).get(RECORD_LABEL_KEY)
-    except Exception:
-        return None
-    if not value:
-        return None
-    return str(value)
+
+# ── Destroy-audit telemetry ────────────────────────────────────────────────
+# Every site that actually DESTROYS a docker container emits ONE
+# `CONTAINER_DESTROY` audit event so the destroy trail is reconstructible
+# independently of the `CONTAINER_LIFECYCLE` decision event (which records the
+# DECISION, not the destruction). `source` names the destroy site and `reason`
+# the lifecycle intent that justified it, so decision and destruction can be
+# reconciled one-for-one.
+# The formatter itself is shared (:func:`infra.container_destroy_audit.
+# emit_destroy_audit`); this module keeps the event name for backwards
+# compatibility with callers that import it.
+_DESTROY_AUDIT = CONTAINER_DESTROY
 
 
 def _reap_bound_record(workspace_id, container):
@@ -4836,6 +4865,9 @@ def cleanup_stale_worker_containers(docker_client, owner_identity):
                     f"(action={_decision.action!r} "
                     f"reason={_decision.reason!r})")
                 continue
+            emit_destroy_audit(
+                _audit, "container_manager.cleanup_stale_worker_containers",
+                container, reason="stale_worker_cleanup")
             container.remove(force=True)
             removed.append(container_id)
             short = str(container_id)[:12]
@@ -5071,6 +5103,8 @@ def sweep_exited_workspace_containers(registered_workspace_ids=None,
         if not decision.destroys:
             _note_skip(f"lifecycle {decision.action}")
             continue
+        emit_destroy_audit(_audit, "container_manager.ttl_sweep", container,
+                           reason=ttl_reason)
         try:
             container.remove(force=True)
         except Exception as exc:

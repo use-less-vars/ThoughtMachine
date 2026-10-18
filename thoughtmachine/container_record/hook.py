@@ -38,6 +38,8 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from agent.config.defaults import host_user
+from infra.container_destroy_audit import emit_destroy_audit
+from thoughtmachine.audit_logger import audit_event
 
 from .api import (
     attach_container,
@@ -173,6 +175,9 @@ def _teardown_container(container: Any) -> None:
         container.stop(timeout=_STOP_TIMEOUT)
     except Exception:  # noqa: BLE001 - teardown must never mask the original error
         pass
+    emit_destroy_audit(
+        audit_event, "container_record.teardown", container,
+        reason="create_rollback")
     try:
         container.remove(force=True)
     except Exception:  # noqa: BLE001
