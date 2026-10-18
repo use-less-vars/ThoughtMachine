@@ -294,10 +294,12 @@ class FakeManager:
         self._info(container_id)["status"] = "stopped"
         return {"status": "stopped", "container_id": container_id}
 
-    def remove(self, container_id, *, keep_record=False):
+    def remove(self, container_id, *, keep_record=False, **kwargs):
         # ``keep_record`` mirrors ContainerManager.remove(): the durable record
         # is out of scope for this fake (it lives in the vault), so the keyword
-        # is accepted and ignored here.
+        # is accepted and ignored here.  ``**kwargs`` absorbs the audit labels
+        # (``audit_reason`` / ``audit_source``) the route now passes.
+        self.remove_kwargs = dict(kwargs)
         self.calls.append(("remove", container_id))
         self._statuses.pop(container_id, None)
         return {"status": "removed", "container_id": container_id}
@@ -504,8 +506,8 @@ class _ReapingManager(FakeManager):
         super().__init__(**kwargs)
         self._record_id = record_id
 
-    def remove(self, container_id, *, keep_record=False):
-        result = super().remove(container_id, keep_record=keep_record)
+    def remove(self, container_id, *, keep_record=False, **kwargs):
+        result = super().remove(container_id, keep_record=keep_record, **kwargs)
         try:
             cr_api.delete_record(self.workspace_id, self._record_id)
         except cr_api.RecordNotFound:

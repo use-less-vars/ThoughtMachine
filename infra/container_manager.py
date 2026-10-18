@@ -3391,7 +3391,9 @@ class ContainerManager:
         new_id = (result.get("id") if isinstance(result, dict) else None) or container_id
         return {"status": "restarted", "container_id": new_id, "name": new_name}
 
-    def remove(self, container_id, *, keep_record=False):
+    def remove(self, container_id, *, keep_record=False,
+               audit_reason="explicit_remove",
+               audit_source="container_manager.remove"):
         """Remove the container. Idempotent; NEVER raises.
 
         The removal decision routes through :meth:`ContainerLifecycle.reconcile`
@@ -3416,14 +3418,22 @@ class ContainerManager:
         it removes the old container then (re)starts + rebinds the SAME record,
         so the record must survive the removal.  Every other caller keeps the
         default terminal semantics (the record is reaped, ``reason="removed"``).
+
+        ``audit_reason``/``audit_source`` (keyword-only) relabel the
+        ``CONTAINER_DESTROY`` events this removal emits, so a destroy performed
+        as part of a larger operation (e.g. the resource-edit recreate) is not
+        indistinguishable from a user pressing "remove".  Defaults preserve the
+        historical ``reason=explicit_remove source=container_manager.remove``.
+        These affect AUDIT LABELS ONLY; the ``CONTAINER_LIFECYCLE`` decision
+        event keeps its funnel vocabulary (``explicit_remove``).
         """
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
             # Already gone: the destroy still happened, just not here.
             emit_destroy_audit(
-                _audit, "container_manager.remove", None,
-                reason="explicit_remove", container_id=container_id)
+                _audit, audit_source, None,
+                reason=audit_reason, container_id=container_id)
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
@@ -3450,7 +3460,7 @@ class ContainerManager:
             # denied must leave a trail, otherwise the history reads as if
             # nobody ever tried.
             emit_destroy_audit(
-                _audit, "container_manager.remove", container,
+                _audit, audit_source, container,
                 reason="refused",
                 detail=f"action={getattr(decision, 'action', 'unknown')} "
                        f"decision_reason={getattr(decision, 'reason', 'unknown')}")
@@ -3458,8 +3468,7 @@ class ContainerManager:
                     "reason": decision.reason}
         # Destroy proceeds: audit BEFORE the stop so the pre-stop state is real.
         emit_destroy_audit(
-            _audit, "container_manager.remove", container,
-            reason="explicit_remove")
+            _audit, audit_source, container, reason=audit_reason)
         stopped = self._stop_container(container, container_id)
         if stopped.get("status") not in ("stopped", "missing"):
             return stopped
@@ -3468,8 +3477,8 @@ class ContainerManager:
         except NotFound:
             # Vanished between the stop and the re-get; the destroy stands.
             emit_destroy_audit(
-                _audit, "container_manager.remove", None,
-                reason="explicit_remove", container_id=container_id)
+                _audit, audit_source, None,
+                reason=audit_reason, container_id=container_id)
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
@@ -4885,6 +4894,11 @@ _WORKSPACE_LABEL = "thoughtmachine.workspace_id"
 _RESOURCE_LABEL = RESOURCE_LABEL
 _SWEEP_SKIP_DETAIL_CAP = 8  # keep startup log lines bounded
 
+# Record states the orphan-RECORD sweeper never reaps, whatever the age:
+# ``creating`` (still being built) and ``error`` (a failed create/resize whose
+# container may be mid-rebuild by the recovery path).
+_SWEEP_PROTECTED_STATES = ("creating", "error")
+
 
 def _container_lifecycle_class(container) -> str:
     """Best-effort lifecycle class of a live ``container`` object.
@@ -5140,9 +5154,16 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
       resource-class record (``LIFECYCLE_RESOURCE``): resource containers
       manage their own CONTAINER lifecycle, but an orphaned resource RECORD
       is still reaped; service records remain exempt;
+    - its state is not in ``_SWEEP_PROTECTED_STATES`` -- a record still being
+      created is never an orphan, and a record in ``error`` may be mid-rebuild
+      on the recovery path, so neither is ever reaped;
     - its ``docker_id`` is empty or names no LIVE container;
     - its age (from ``created_at`` else ``updated_at``) is past its retention
       window (``retention_days`` when set, else ``default_max_age_s``).
+
+    The age clock is the IMMUTABLE birth stamp ``created_at`` (written once at
+    create; see ``api._IMMUTABLE_FIELDS``), not ``updated_at``, so neither the
+    drift scan nor any event write can reset it and defeat the age gate.
 
     The record's workspace registration is NOT a reap condition: a record
     whose bound container is gone is reaped whether or not its workspace is
@@ -5261,10 +5282,25 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
                 _note_skip("container_live")
                 continue
 
+            # A record mid-creation is never an orphan.
+            if str(getattr(record, "state", "") or "") == "creating":
+                _note_skip("state_creating")
+                continue
+
+            # A record in an ``error`` state (failed create / failed resize) is
+            # not an orphan: the recovery path rebinds it to a rebuilt
+            # container, so reaping it here would race the rebuild.
+            state = str(getattr(record, "state", "") or "")
+            if state in _SWEEP_PROTECTED_STATES:
+                _note_skip(f"state_{state}")
+                continue
+
+            # Age from the record's IMMUTABLE birth stamp.  ``updated_at`` must
+            # NOT be the clock here: ``api.append_event`` rewrites it, so any
+            # event-receiving record would look perpetually young and never be
+            # reaped (an unbounded retention leak).
             timestamp_text = (
-                getattr(record, "created_at", "")
-                or getattr(record, "updated_at", "")
-                or ""
+                getattr(record, "created_at", "") or getattr(record, "updated_at", "") or ""
             )
             try:
                 ts = datetime.fromisoformat(
@@ -5325,13 +5361,20 @@ def sweep_orphan_container_records(*, registered_workspace_ids=None,
             try:
                 log("WARNING", "docker.container_manager",
                     f"reaped orphan container record: workspace_id={ws} "
-                    f"record_id={record.id} docker_id={docker_id!r}")
+                    f"record_id={record.id} docker_id={docker_id!r} "
+                    f"name={getattr(record, 'name', None)!r} "
+                    f"state={getattr(record, 'state', None)!r}")
             except Exception:
                 pass
             try:
                 _audit("RECORD_REAP",
                        f"workspace_id={ws} record_id={record.id} "
-                       f"docker_id={docker_id!r} dry_run={dry_run}")
+                       f"docker_id={docker_id!r} dry_run={dry_run} "
+                       f"name={getattr(record, 'name', None)!r} "
+                       f"state={getattr(record, 'state', None)!r} "
+                       f"created_at={getattr(record, 'created_at', None)!r} "
+                       f"updated_at={getattr(record, 'updated_at', None)!r} "
+                       f"intent_snapshot={(getattr(record, 'intent_snapshot', None) or {})!r}")
             except Exception:
                 pass
 
