@@ -13,6 +13,7 @@ Covers the hook in isolation plus its two integration seams:
 
 import copy
 import logging
+import uuid
 
 import pytest
 
@@ -564,6 +565,18 @@ def test_created_by_helpers_forms():
     assert operator_created_by("") == "operator"
     assert operator_created_by(None) == "operator"
     assert system_created_by("sweeper") == "system:sweeper"
+
+
+def test_created_by_accepts_uuid_session_id():
+    """``session_id`` reaches the hook as ``UUID | str | None``; the label is a
+    string by construction, so a UUID session must be coerced, not crash."""
+    u = uuid.uuid4()
+    assert agent_created_by(u) == f"agent:session:{u}"
+
+    # The no-session fallback is unchanged by the coercion.
+    assert agent_created_by(None) == "system:container_manager"
+    assert agent_created_by("") == "system:container_manager"
+    assert agent_created_by(None) == system_created_by("container_manager")
 
 
 def test_container_manager_start_stamps_session_created_by():

@@ -77,7 +77,7 @@ def agent_created_by(session_id: str | None, caller: str = "container_manager") 
     background sweep, or an operator path that did not thread its actor through
     -- the caller name then says which subsystem it was).
     """
-    sid = (session_id or "").strip()
+    sid = str(session_id or "").strip()
     if sid:
         return "{}{}".format(_AGENT_PREFIX, sid)
     return system_created_by(caller)
