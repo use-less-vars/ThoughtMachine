@@ -75,6 +75,21 @@ security gate at enforcement time (write-level allows the container grant,
 banned/read/ask denies it).  The ceiling keeps the wider workspace
 vocabulary (``container``, ``host_bash``, ``git_read``, ``git_write``, ...)
 and is applied by the security gate.
+
+Live (post-spawn) effect
+------------------------
+Because the gate re-reads grants through :func:`read_session_permissions` on
+every tool call, a write here is the ONLY grant authority for a session and it
+takes effect immediately -- no respawn and no in-process refresh.  This holds
+for worker sub-agents too: a worker's effective permissions are
+``min(declared worker footprint, live session grants - workspace ceiling)``,
+where the declared footprint comes from the worker DEFINITION
+(``permission_footprint`` / legacy ``worker_permissions``) and is deliberately
+NOT a snapshot of the session's grants taken at spawn.  Granting a session a
+category here therefore widens its already-running workers up to whatever each
+worker definition declared, revoking narrows them immediately, and every
+widening is recorded by the tool executor as a ``worker_permission_widened``
+audit event.
 """
 
 from __future__ import annotations

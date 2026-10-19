@@ -754,6 +754,17 @@ def _restrictive_merge(
     {'network': 'banned'}
     >>> _restrictive_merge({"container": False}, {"container": True})
     {'container': False}
+
+    Runtime note
+    ------------
+    This helper only builds the worker's *spawn-time* ``session_permissions``
+    mirror -- the ``SessionPermissions`` snapshot its ``AgentConfig`` is
+    constructed with.  It is NOT the runtime cap: the declared worker footprint
+    is passed separately to ``AgentConfig.permission_footprint`` and applied by
+    the security gate on top of the grants re-read from disk on every tool
+    call, so a grant written after spawn takes effect without respawning the
+    worker.  Never treat this function's result as the authority for what a
+    running worker may do.
     """
     result = {}
     all_keys = set(session_perms) | set(worker_perms)
@@ -802,6 +813,63 @@ def _canonicalize_session_permissions(
     for legacy in ("git_read", "git_write", "system", "execution"):
         result.pop(legacy, None)
     return result
+
+
+#: Legacy permission grains dropped from a worker definition's declared
+#: footprint (same four keys ``_canonicalize_session_permissions`` strips).
+_LEGACY_FOOTPRINT_KEYS: tuple = ("git_read", "git_write", "system", "execution")
+
+
+def _canonicalize_worker_footprint(
+    footprint: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Canonicalize a worker definition's DECLARED permission footprint.
+
+    Runs at the definition LOAD boundary (``WorkerThread.__init__``), before
+    the footprint is used as the spawn-time ``_restrictive_merge`` input or
+    handed to ``AgentConfig.permission_footprint``.  The security gate itself
+    stays strict -- it never learns the legacy vocabulary.
+
+    * the legacy ``git_read`` / ``git_write`` / ``system`` / ``execution``
+      grains are stripped, exactly as ``_canonicalize_session_permissions``
+      strips them from the merged session dict;
+    * the one documented legacy *value* form -- ``network`` persisted as a
+      boolean -- is folded onto the canonical level, mirroring
+      ``SessionPermissions.coerce_legacy_network_permission`` (``True`` ->
+      ``write``, ``False`` -> ``banned``);
+    * canonical footprints are returned unchanged (idempotent), so re-loading
+      a definition is a no-op;
+    * any other unknown category raises ``ValueError`` naming the key AND its
+      value: an unresolvable definition is a loud load error, not a silent
+      deny.
+
+    Values that are neither canonical nor the legacy bool form are passed
+    through untouched -- the gate's strict membership test still hard-denies
+    them, and callers rely on the merge-only string vocabulary (``"none"`` /
+    ``"deny"`` / ``"allow"``) surviving verbatim.
+    """
+    from security.resource_catalog import RESOURCE_CATALOG
+
+    if not footprint:
+        return {}
+    if not isinstance(footprint, dict):
+        raise ValueError(
+            "worker permission footprint must be a mapping, got "
+            f"{type(footprint).__name__}: {footprint!r}"
+        )
+    canonical: Dict[str, Any] = {}
+    for key, value in footprint.items():
+        if key in _LEGACY_FOOTPRINT_KEYS:
+            continue
+        if key not in RESOURCE_CATALOG:
+            raise ValueError(
+                f"worker permission footprint declares unknown category {key!r} "
+                f"= {value!r}; canonical categories are {sorted(RESOURCE_CATALOG)}"
+            )
+        if key == "network" and isinstance(value, bool):
+            value = "write" if value else "banned"
+        canonical[key] = value
+    return canonical
 
 
 # ---------------------------------------------------------------------------
@@ -876,8 +944,12 @@ class WorkerThread(threading.Thread):
 
         # Session permissions for gate-checking tool calls
         self._session_permissions: Dict[str, Any] = session_permissions or {}
-        # Worker-level permission footprint from definition
-        self._permission_footprint: Dict[str, Any] = definition.get("permission_footprint") or definition.get("worker_permissions", {})
+        # Worker-level permission footprint from definition.  Canonicalized
+        # once here (definition LOAD boundary): legacy bool ``network`` and
+        # legacy grains never reach the security gate.
+        self._permission_footprint: Dict[str, Any] = _canonicalize_worker_footprint(
+            definition.get("permission_footprint") or definition.get("worker_permissions", {})
+        )
 
         # Project root from the session (resolved from workspace config)
         self._project_root: Optional[str] = project_root
@@ -1669,6 +1741,18 @@ class WorkerThread(threading.Thread):
         # the canonical six-category schema, with write_on_feature_branch
         # carried on the ``git`` channel.
         worker_cfg["session_permissions"] = _canonicalize_session_permissions(merged)
+
+        # ── Inject the DECLARED worker cap separately (do NOT collapse it) ──
+        # ``permission_footprint`` is the cap written in the worker definition,
+        # unmerged and un-canonicalized.  It is passed to the worker config as
+        # its own field so the tool executor can apply it as a cap on top of the
+        # session permissions re-read from disk at every tool call.  Folding it
+        # into ``session_permissions`` here would re-freeze the session snapshot
+        # for the worker's whole lifetime: a grant written to disk after spawn
+        # could then never take effect until the worker was respawned.
+        # Copy it: the definition dict must not be shared into a live config,
+        # where a later mutation of the definition would silently change the cap.
+        worker_cfg["permission_footprint"] = dict(self._permission_footprint)
 
         # ── Safety net: inject workspace_path if missing ────────────────
         # Worker._build_agent_config (the Tool-class method) now injects

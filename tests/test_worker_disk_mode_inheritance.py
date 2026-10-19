@@ -15,18 +15,34 @@ Fix: spawn propagates the parent session_id + resolved workspace_id into
 WorkerThread/WorkerContext (and run() re-asserts them over any ids persisted
 in context.json from an older run).  The executor therefore treats worker
 executors exactly like main executors -- disk-authoritative mode engages
-whenever BOTH ids are present -- and additionally caps the disk-effective
-permissions with the worker's spawn-time restrictive-merge footprint
-(permission_footprint kwarg), so the session ceiling can never be widened by
-a stale worker mirror (session snapshot is still honoured as the *floor* of
-restrictiveness).
+whenever BOTH ids are present, and the vault record is the ONE runtime
+authority for a running worker.
+
+The worker-specific cap is NOT the spawn-time restrictive-merge snapshot
+(config.session_permissions).  That snapshot is a spawn-time MIRROR of the
+vault and is therefore allowed to be stale; treating it as a ceiling made a
+live GRANT invisible to a running worker (the sub-agent stayed locked out
+until respawn) while a live REVOCATION landed immediately -- an asymmetry
+with no security justification, since the vault is the source of truth in
+both directions.  The only legitimate worker cap is a *declared* one: the
+worker definition's `permission_footprint` (carried to the executor via the
+`permission_footprint` kwarg; empty/absent = no cap).  A declared footprint
+is authority, not staleness -- it expresses what that worker is allowed to
+do ever, so it is intersected with the live vault-derived permissions:
+
+    effective = min(declared_footprint, live_session_minus_ceiling)
+
+Consequences pinned below:
+  - a live disk grant is visible immediately to an already-running worker;
+  - the stale in-memory mirror must NOT cap a live disk grant;
+  - a declared footprint DOES cap the live disk grant.
 
 These tests pin the executor-level behaviour both ways:
   - worker executor with real parent ids + matching vault record -> allowed
   - worker ask-level request -> denied, NO SecurityPromptEvent published
   - worker disk revocation (vault read < stale mirror write) -> denied
-  - worker footprint cap still applies under disk mode (snapshot stricter
-    than the vault) -> denied
+  - stale in-memory snapshot does NOT cap a live disk grant -> allowed
+  - declared worker footprint caps the live disk grant -> denied
   - main executor ask-level -> SecurityPromptEvent published (ask path live)
   - id propagation: WorkerThread ctor attrs, WorkerContext persistable
     round-trip, and the run() override of ids persisted in context.json.
@@ -75,12 +91,18 @@ class GitWriteProbeTool(ToolBase):
 
 
 class FakeConfig:
-    """Minimal config stub (no workspace_path -> ws_id comes from the arg)."""
+    """Minimal config stub (no workspace_path -> ws_id comes from the arg).
+
+    ``permission_footprint`` mirrors AgentConfig.permission_footprint: the
+    worker definition's declared cap, empty/None meaning "no cap".
+    """
     workspace_path = None
     tool_output_token_limit = None
+    permission_footprint = None
 
-    def __init__(self, permissions=None):
+    def __init__(self, permissions=None, permission_footprint=None):
         self.session_permissions = permissions
+        self.permission_footprint = permission_footprint
 
 
 class FakeState:
@@ -157,10 +179,12 @@ def _seed_git_ask_vault(monkeypatch, tmp_path, ws_id, session_id):
     )
 
 
-def _make_executor(permissions, is_worker_context, event_bus=None):
+def _make_executor(
+    permissions, is_worker_context, event_bus=None, permission_footprint=None
+):
     return ToolExecutor(
         tool_classes=[FilesystemWriteTool],
-        config=FakeConfig(permissions),
+        config=FakeConfig(permissions, permission_footprint=permission_footprint),
         state=FakeState(),
         logger=None,
         security_available=False,
@@ -243,17 +267,21 @@ class TestWorkerDiskPureGate:
         assert "Permission denied" in result["result"], result["result"]
         assert "filesystem:write" in result["result"], result["result"]
 
-    def test_worker_footprint_cap_still_applies_under_disk(
+    def test_worker_declared_footprint_caps_live_disk_grant(
         self, gate_env, tmp_path, monkeypatch
     ):
-        """Lockdown pin: the worker's spawn-time restrictive-merge footprint
-        (session snapshot x worker footprint) still caps the disk-effective
-        permissions.  Vault grants write, but the merged snapshot only grants
-        read -> denied (min(disk, snapshot) semantics preserved under
-        disk-pure mode)."""
+        """Lockdown pin (rewritten): the worker's DECLARED footprint
+        (definition `permission_footprint`, not the spawn-time snapshot) caps
+        the live disk-derived permissions.  The vault (and the in-memory
+        mirror) both grant write, but the worker definition declares only
+        filesystem:read -> denied, min(declared_footprint, live) semantics."""
         _seed_vault(monkeypatch, tmp_path, WORKSPACE, SESSION, "write")
-        perms = SessionPermissions(filesystem="read")  # merged snapshot stricter
-        executor = _make_executor(perms, is_worker_context=True)
+        perms = SessionPermissions(filesystem="write")
+        executor = _make_executor(
+            perms,
+            is_worker_context=True,
+            permission_footprint={"filesystem": "read"},
+        )
         result = _run_write_tool(
             executor,
             session_id=SESSION,
@@ -261,6 +289,28 @@ class TestWorkerDiskPureGate:
         )
         assert "Permission denied" in result["result"], result["result"]
         assert "filesystem:write" in result["result"], result["result"]
+
+    def test_stale_snapshot_does_not_cap_live_disk_grant(
+        self, gate_env, tmp_path, monkeypatch
+    ):
+        """Grant-immediacy pin: the in-memory mirror (filesystem:read) is
+        STRICTER than the vault record (filesystem:write).  That mirror is a
+        spawn-time snapshot and may be stale -- a live grant must reach the
+        already-running worker, so the stale mirror must NOT act as a
+        ceiling.  With no declared footprint there is no cap at all: the
+        write is allowed (BEFORE the fix this asserted the opposite)."""
+        _seed_vault(monkeypatch, tmp_path, WORKSPACE, SESSION, "write")
+        perms = SessionPermissions(filesystem="read")  # stale, stricter mirror
+        executor = _make_executor(perms, is_worker_context=True)
+        result = _run_write_tool(
+            executor,
+            session_id=SESSION,
+            workspace_id=WORKSPACE,
+        )
+        assert result["result"] == "FS OK", (
+            "a stale spawn-time mirror must not cap a live disk grant: "
+            f"{result['result']}"
+        )
 
     def test_main_agent_ask_prompts_via_event_bus(
         self, gate_env, tmp_path, monkeypatch
