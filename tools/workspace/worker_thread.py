@@ -754,6 +754,17 @@ def _restrictive_merge(
     {'network': 'banned'}
     >>> _restrictive_merge({"container": False}, {"container": True})
     {'container': False}
+
+    Runtime note
+    ------------
+    This helper only builds the worker's *spawn-time* ``session_permissions``
+    mirror -- the ``SessionPermissions`` snapshot its ``AgentConfig`` is
+    constructed with.  It is NOT the runtime cap: the declared worker footprint
+    is passed separately to ``AgentConfig.permission_footprint`` and applied by
+    the security gate on top of the grants re-read from disk on every tool
+    call, so a grant written after spawn takes effect without respawning the
+    worker.  Never treat this function's result as the authority for what a
+    running worker may do.
     """
     result = {}
     all_keys = set(session_perms) | set(worker_perms)
@@ -1669,6 +1680,18 @@ class WorkerThread(threading.Thread):
         # the canonical six-category schema, with write_on_feature_branch
         # carried on the ``git`` channel.
         worker_cfg["session_permissions"] = _canonicalize_session_permissions(merged)
+
+        # ── Inject the DECLARED worker cap separately (do NOT collapse it) ──
+        # ``permission_footprint`` is the cap written in the worker definition,
+        # unmerged and un-canonicalized.  It is passed to the worker config as
+        # its own field so the tool executor can apply it as a cap on top of the
+        # session permissions re-read from disk at every tool call.  Folding it
+        # into ``session_permissions`` here would re-freeze the session snapshot
+        # for the worker's whole lifetime: a grant written to disk after spawn
+        # could then never take effect until the worker was respawned.
+        # Copy it: the definition dict must not be shared into a live config,
+        # where a later mutation of the definition would silently change the cap.
+        worker_cfg["permission_footprint"] = dict(self._permission_footprint)
 
         # ── Safety net: inject workspace_path if missing ────────────────
         # Worker._build_agent_config (the Tool-class method) now injects

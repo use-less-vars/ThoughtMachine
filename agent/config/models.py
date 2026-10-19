@@ -133,6 +133,19 @@ class AgentConfig(BaseModel):
         default_factory=SessionPermissions,
         description='Session permissions profile controlling tool access categories.',
     )
+    #: Worker-only DECLARED capability cap, exactly as written in the worker
+    #: definition (``permission_footprint`` / legacy ``worker_permissions``).
+    #: It is NOT the spawn-time snapshot of the session's permissions: the
+    #: session's live permissions are re-read from disk on every tool call, so a
+    #: later grant must take effect without respawning the worker.  This dict is
+    #: therefore the only thing the runtime may use to narrow a worker below its
+    #: session, and the effective permissions of a worker are
+    #: ``min(permission_footprint, live_session - workspace_ceiling)``.
+    #: Empty (the default) means "no declared cap" -- nothing is narrowed.
+    permission_footprint: Dict[str, Any] = Field(
+        default_factory=dict,
+        description='Worker-only declared permission cap from the worker definition (empty = no cap).',
+    )
     use_workspace_lifecycle_manager: bool = Field(
         default=False,
         description='Enable the Workspace Lifecycle Manager for worker queries (feature flag).',

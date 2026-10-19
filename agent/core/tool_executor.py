@@ -30,6 +30,16 @@ except ImportError:
 # Try to import security module
 from thoughtmachine.security import SessionPermissions
 
+# Audit emitter for the permission-widening observation below.  A missing
+# audit logger must never stop a tool call, but it is expected to be present.
+try:
+    from thoughtmachine.audit_logger import audit_event
+except ImportError:  # pragma: no cover - defensive only
+
+    def audit_event(event_type: str, details: str) -> None:  # type: ignore
+        return None
+
+
 # Worker-name context var (stdlib-only leaf module — no circular import):
 # carries the name of the worker sub-agent whose query is executing on this
 # thread, so tools can stamp ownership labels (e.g. ``thoughtmachine.worker``
@@ -64,6 +74,30 @@ except ImportError:
     WorkspaceCapabilities = None
     resolve_workspace_id = None
     _DISK_FAIL_CLOSED_SESSION = None
+
+
+def _permission_rank(value: Any) -> Optional[float]:
+    """Rank one permission value on the shared grant-level scale.
+
+    Ranks come from ``security.resource_catalog.GRANT_LEVEL_RANKS`` (the single
+    flat order used by the gate: ``banned(0) < read(1) == connect(1) < ask(2)
+    < write(3) == write_on_feature_branch(3) < outbound(3.5) < full(4)``).
+    Booleans are ranked on the same scale (``True`` = write level, ``False`` =
+    ban) because the gate may hand back boolean values for non-container
+    categories.
+
+    Returns ``None`` for any value that cannot be placed on the scale; callers
+    must treat an unrankable pair as "not comparable" and never report it.
+    """
+    if isinstance(value, bool):
+        return 3.0 if value else 0.0
+    if value is None:
+        return None
+    try:
+        from security.resource_catalog import GRANT_LEVEL_RANKS
+    except Exception:  # noqa: BLE001 - leaf module; keep the caller alive
+        return None
+    return GRANT_LEVEL_RANKS.get(str(value).strip().lower())
 
 
 def _ensure_gate_imported() -> bool:
@@ -151,6 +185,10 @@ class ToolExecutor:
         self._event_bus = event_bus
         self._is_worker_context = is_worker_context
         self._session_workspace_id_cache = {}
+        # Last observed effective permissions (worker context only), used to
+        # detect and audit per-category widening between tool calls -- i.e. an
+        # on-disk grant that took effect without respawning the worker.
+        self._last_effective_permissions: Dict[str, Any] = {}
 
     def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", workspace_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
@@ -368,6 +406,11 @@ class ToolExecutor:
                 if not _ensure_gate_imported():
                     return {'result': 'Permission denied: security gate unavailable; tool execution denied (fail-closed).', 'tool_type': 'normal'}
 
+            # Assigned by the gate branch below; pre-declared so the
+            # worker-context injection further down can tell whether a live
+            # resolution happened (instead of relying on ``locals()``).
+            effective: Optional[Dict[str, Any]] = None
+
             if GATE_AVAILABLE and session_perms_obj is not None:
                 # Resolve workspace ID to load workspace capabilities
                 workspace_path = getattr(self.config, 'workspace_path', None)
@@ -431,18 +474,53 @@ class ToolExecutor:
                     agent_id=str(agent_id),
                     session_id=session_id,
                     # Worker context: cap the disk-effective permissions with
-                    # the spawn-time restrictive-merge footprint (parent
-                    # session x worker footprint).  The gate applies the cap
-                    # in place, so the capped dict is what gets injected into
-                    # the tool below (in-tool atomic re-checks stay
-                    # consistent with the gate decision).
+                    # the DECLARED worker footprint from the worker definition
+                    # (agent_config.permission_footprint) -- never with the
+                    # spawn-time snapshot of the session's permissions
+                    # (session_perms_obj), which would pin the worker to the
+                    # permissions the session happened to hold at spawn and
+                    # make a later grant ineffective until respawn.
+                    #
+                    # Authority model:
+                    #   * the session's live on-disk record (minus the
+                    #     workspace ceiling) is the ONLY grant authority;
+                    #   * the declared footprint is the ONLY worker cap.
+                    # Composition is therefore
+                    #   effective = min(declared_footprint,
+                    #                   live_session_minus_ceiling),
+                    # so a revocation on disk still narrows the worker
+                    # immediately and a grant on disk widens it immediately,
+                    # up to whatever the worker definition declared.
+                    # An empty/absent footprint means "no declared cap": the
+                    # gate iterates ``(permission_footprint or {}).items()``,
+                    # so None/{} caps nothing and the live resolution stands.
                     permission_footprint=(
-                        session_perms_obj.to_dict()
+                        (getattr(self.config, 'permission_footprint', None) or None)
                         if self._is_worker_context
                         else None
                     ),
                     is_worker_context=self._is_worker_context,
                 )
+
+                # ── Widening observability (worker context only) ──────────
+                # Compare this call's resolution against the one observed on a
+                # previous call by this executor and audit every category that
+                # became MORE permissive.  This is the visible signature of a
+                # post-spawn GRANT: the resolution above is re-read from disk,
+                # so a grant written between two tool calls shows up here as a
+                # rank increase even though the worker was never respawned.
+                # Observe the POST-cap dict: ``check_required_categories``
+                # applies the declared footprint in place, so what comes back is
+                # what this worker can actually do.  The event reports a change
+                # in EFFECTIVE authority, therefore a grant that the declared
+                # footprint swallows is deliberately silent -- a capped grant is
+                # not a widening.  Storing the baseline from the same post-cap
+                # point keeps consecutive observations comparable.  Runs before
+                # the ``if not ok`` early return so a denied call also refreshes
+                # the baseline.
+                if self._is_worker_context:
+                    self._record_permission_widening(effective, session_id)
+
                 if not ok:
                     return {'result': error_msg, 'tool_type': 'normal'}
 
@@ -462,7 +540,16 @@ class ToolExecutor:
             # Inject session permissions dict so the tool can apply
             # fine-grained security (e.g., DockerCodeRunner uses it
             # to decide container network/filesystem modes).
-            if session_perms_obj is not None:
+            if self._is_worker_context and effective is not None:
+                # Worker context: hand the tool the SAME live resolution the
+                # gate just authorised (on-disk session permissions, capped by
+                # the workspace ceiling and the declared worker footprint --
+                # the gate applies that cap in place), not the spawn-time
+                # ``self.config.session_permissions`` snapshot.  A plain dict
+                # copy is injected so no gate-private dict attributes leak
+                # into tool code.
+                tool_args['session_permissions'] = dict(effective)
+            elif session_perms_obj is not None:
                 tool_args['session_permissions'] = session_perms_obj.to_dict()
             else:
                 tool_args['session_permissions'] = DEFAULT_SESSION_PERMISSIONS
@@ -576,6 +663,66 @@ class ToolExecutor:
             return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
         except Exception as e:
             return {'result': f'Error executing tool: {e}', 'tool_type': 'normal'}
+
+    def _record_permission_widening(self, effective: Any, session_id: str) -> None:
+        """Audit per-category permission WIDENING between tool calls (worker).
+
+        A worker's effective permissions are resolved from the session's live
+        on-disk record on every tool call, so a grant written after the worker
+        was spawned now takes effect immediately (no respawn).  That is the
+        intended behaviour, but a silent widening is exactly the kind of event
+        an operator must be able to see afterwards, so every category whose
+        rank increased since this executor's previous observation is emitted as
+        a ``worker_permission_widened`` audit record.
+
+        Rules:
+          * only categories present in BOTH observations are compared (a
+            category seen for the first time is a baseline, not a widening);
+          * a pair is skipped when either side cannot be ranked;
+          * an equal or lower rank is never reported (narrowing is already
+            recorded by the store that performed it).
+
+        ``actor`` is reported as ``"unknown"``: this executor only observes the
+        widening post-hoc and has no identity for whoever wrote the grant.  The
+        authority that knows the actor is the permission-store write path, which
+        is out of scope here; the record therefore carries the observation
+        context (``worker_id`` from the worker-name context var, ``session_id``
+        from the tool call) instead of guessing an actor.
+
+        Never raises: audit failures must not affect tool execution.
+        """
+        try:
+            previous = self._last_effective_permissions or {}
+            current = dict(effective or {})
+            for category, new_value in current.items():
+                if category not in previous:
+                    continue
+                old_value = previous[category]
+                old_rank = _permission_rank(old_value)
+                new_rank = _permission_rank(new_value)
+                if old_rank is None or new_rank is None:
+                    continue
+                if new_rank <= old_rank:
+                    continue
+                audit_event(
+                    "worker_permission_widened",
+                    json.dumps(
+                        {
+                            "worker_id": current_worker_name(),
+                            "session_id": session_id,
+                            "category": category,
+                            "old_value": old_value,
+                            "new_value": new_value,
+                            "actor": "unknown",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
+                )
+            if current:
+                self._last_effective_permissions = current
+        except Exception:  # noqa: BLE001 - observability only, never blocking
+            pass
 
     def _resolve_workspace_id_from_session(self, session_id: str) -> Optional[str]:
         """Best-effort resolve a session's workspace_id from its persisted
