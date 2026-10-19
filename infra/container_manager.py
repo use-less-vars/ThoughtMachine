@@ -1452,7 +1452,15 @@ class ContainerManager:
         container as the ``thoughtmachine.created_by`` Docker label.  Defaults
         to ``agent:session:<self.session_id>`` (or ``system:container_manager``
         when this manager has no session -- e.g. the web UI's operator-driven
-        recreate, which therefore passes its resolved ACTOR explicitly).
+        recreate, which therefore passes a value explicitly).
+
+        RECREATE CONTRACT: a caller that destroys and rebuilds an existing
+        container must pass the container's ORIGINAL creator -- read off the
+        live container's ``thoughtmachine.created_by`` label BEFORE the
+        destroy -- not the actor performing the rebuild.  The record stores no
+        creator field, so that label is the only surviving source of origin;
+        omitting it silently relabels an agent-created container as owned by
+        whoever resized it.
 
         ``network_mode`` / ``workspace_mode`` (both optional) RESTORE a recorded
         isolation envelope on the operator recreate path (``allow_fresh``).  The
@@ -2195,10 +2203,13 @@ class ContainerManager:
             CONTAINER_NAME_LABEL: name,
             "thoughtmachine.workspace_id": self.workspace_id,
             CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
-            # Creator attribution for THIS instance.  The recreate path reuses
-            # this same dict, so a rebuilt container is stamped with the actor
-            # that rebuilt it -- which is what the live container's labels can
-            # honestly answer (the record holds no creator field).
+            # Creator attribution for THIS instance.  On a healthy create this
+            # is the creating session's identity; on a RECREATE it must be the
+            # container's ORIGIN, which the recreating caller passes explicitly
+            # after reading the live container's label BEFORE destroying it (the
+            # record holds no creator field, so that label is the only surviving
+            # source -- stamping whoever performed the rebuild instead would
+            # silently rewrite the container's origin).
             CREATED_BY_LABEL: _created_by,
         }
         if worker_name:

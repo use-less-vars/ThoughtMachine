@@ -4696,7 +4696,10 @@ def workspace_container_resources(workspace_id: str, record_id: str,
 
     from thoughtmachine.container_record import api as _cr_api
     from thoughtmachine.container_record import rebuild_config_from_snapshot
-    from thoughtmachine.container_record.hook import operator_created_by
+    from thoughtmachine.container_record.hook import (
+        CREATED_BY_LABEL,
+        operator_created_by,
+    )
 
     try:
         record = _cr_api.load_record(workspace_id, record_id)
@@ -4749,6 +4752,35 @@ def workspace_container_resources(workspace_id: str, record_id: str,
                 status_code=400)
 
     container_id = _view_action_container_id(manager, record)
+
+    def _original_created_by():
+        """Attribution to stamp on the REBUILT container: its origin.
+
+        ``thoughtmachine.created_by`` is the single source of truth for who
+        created a container (the record deliberately carries no creator field),
+        and it lives ONLY on the live container -- so it must be read from the
+        container that is about to be destroyed, not re-derived from whoever is
+        performing the resize.  Otherwise one resize relabels an agent-created
+        container (``agent:session:<id>``) as the operator, and the origin is
+        lost for good (``remove`` copies no label back).  Only a genuinely
+        absent/unreadable label falls back to the acting operator.
+        """
+        if container_id:
+            try:
+                container = manager.client.containers.get(container_id)
+                label = (getattr(container, "labels", None) or {}).get(
+                    CREATED_BY_LABEL)
+            except Exception:
+                label = None
+            if isinstance(label, str) and label.strip():
+                return label.strip()
+        return operator_created_by(actor)
+
+    # Recovered ONCE, and BEFORE the destroy below: ``remove()`` drops the handle
+    # to the live container, after which the label is unreadable.  Both recreate
+    # attempts (the edit and the ``_resize_failed`` recovery) stamp this value.
+    original_created_by = _original_created_by()
+
     prev_snapshot = dict(getattr(record, "intent_snapshot", None) or {})
     prev_docker_id = getattr(record, "docker_id", "") or ""
     snapshot = dict(prev_snapshot)
@@ -4789,11 +4821,13 @@ def workspace_container_resources(workspace_id: str, record_id: str,
 
         # One best-effort rebuild with the PREVIOUS limits.  `start` re-reads
         # intent_snapshot from the record, so the restore above is what makes
-        # this start use the old values.
+        # this start use the old values.  The container this rollback replaces
+        # was created by ``original_created_by`` (recovered before the destroy),
+        # so the rebuild keeps that origin rather than the acting operator.
         try:
             restored = manager.start(name=record.name, note=record.notes,
                                      allow_fresh=True,
-                                     created_by=operator_created_by(actor),
+                                     created_by=original_created_by,
                                      **_recorded_envelope(prev_snapshot))
         except Exception as exc:
             restored = {"error": str(exc)}
@@ -4852,7 +4886,7 @@ def workspace_container_resources(workspace_id: str, record_id: str,
                 return _resize_failed(pre.get("error", "remove failed"), 503)
         start_result = manager.start(name=record.name, note=record.notes,
                                      allow_fresh=True,
-                                     created_by=operator_created_by(actor),
+                                     created_by=original_created_by,
                                      **_recorded_envelope(snapshot))
         if isinstance(start_result, dict) and start_result.get("error"):
             return _resize_failed(start_result["error"], 400)
