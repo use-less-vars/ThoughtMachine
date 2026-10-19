@@ -4695,6 +4695,7 @@ def workspace_container_resources(workspace_id: str, record_id: str,
             status_code=400)
 
     from thoughtmachine.container_record import api as _cr_api
+    from thoughtmachine.container_record import rebuild_config_from_snapshot
     from thoughtmachine.container_record.hook import operator_created_by
 
     try:
@@ -4753,6 +4754,24 @@ def workspace_container_resources(workspace_id: str, record_id: str,
     snapshot = dict(prev_snapshot)
     snapshot.update(updates)
 
+    def _recorded_envelope(snapshot_source):
+        """Return the RECORDED isolation envelope of *snapshot_source*.
+
+        The recreate below rebuilds the container from the record's persisted
+        intent, not from the current policy: this route's ContainerManager
+        carries no session (``session_permissions=None``), so a policy-computed
+        envelope resolves to the most restrictive pair and would silently
+        downgrade the rebuilt container.  Only recorded, non-empty axes are
+        returned -- an unrecorded envelope yields ``{}`` (no override), which
+        keeps the fail-closed policy apply untouched.
+        """
+        try:
+            cfg = rebuild_config_from_snapshot(snapshot_source)
+        except Exception:
+            return {}
+        return {key: cfg[key] for key in ("network_mode", "workspace_mode")
+                if cfg.get(key)}
+
     def _resize_failed(cause, status_code):
         """Restore the record to its pre-edit intent, then try to rebuild.
 
@@ -4774,7 +4793,8 @@ def workspace_container_resources(workspace_id: str, record_id: str,
         try:
             restored = manager.start(name=record.name, note=record.notes,
                                      allow_fresh=True,
-                                     created_by=operator_created_by(actor))
+                                     created_by=operator_created_by(actor),
+                                     **_recorded_envelope(prev_snapshot))
         except Exception as exc:
             restored = {"error": str(exc)}
         restored_id = ((restored or {}).get("id")
@@ -4832,7 +4852,8 @@ def workspace_container_resources(workspace_id: str, record_id: str,
                 return _resize_failed(pre.get("error", "remove failed"), 503)
         start_result = manager.start(name=record.name, note=record.notes,
                                      allow_fresh=True,
-                                     created_by=operator_created_by(actor))
+                                     created_by=operator_created_by(actor),
+                                     **_recorded_envelope(snapshot))
         if isinstance(start_result, dict) and start_result.get("error"):
             return _resize_failed(start_result["error"], 400)
         new_docker_id = (start_result or {}).get("id") or container_id
