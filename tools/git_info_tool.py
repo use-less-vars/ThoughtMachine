@@ -215,6 +215,15 @@ class GitReadTool(ToolBase):
     _last_mode: Optional[str] = None
     _last_execution_mode: Optional[str] = None
     _last_failure_reason: Optional[str] = None
+    # Per-call ``git -c`` pins for the COMMIT AUTHOR IDENTITY, resolved by
+    # ``GitWriteTool._git_commit`` from the workspace config (``git_identity``).
+    # Each entry is a ``key=value`` string; the execution backends expand it to
+    # ``-c key=value`` BEFORE the git subcommand (git accepts ``-c`` only in
+    # that position) and are cleared by the commit flow straight after the
+    # call, so a reused tool instance never leaks one commit's identity into
+    # the next. Empty/None for every other operation, so all non-commit git
+    # invocations are byte-identical to before.
+    _commit_identity_config: Optional[List[str]] = None
 
     def _host_execution_denied_reason(self) -> Optional[str]:
         """Return a deny reason when the workspace ceiling blocks host git.
@@ -831,6 +840,22 @@ class GitReadTool(ToolBase):
             f"GitReadTool: containerized git execution unavailable: {detail}"
         )
 
+    def _identity_config_args(self) -> List[str]:
+        """Return the staged ``-c`` argv pairs for the commit identity.
+
+        Reads the per-call ``_commit_identity_config`` staged by
+        ``GitWriteTool._git_commit``. Returns ``[]`` unless a commit identity
+        is in flight, so every non-commit invocation is unaffected. The pairs
+        are emitted as ``["-c", "key=value", ...]`` -- the only position git
+        accepts ``-c`` in is before the subcommand.
+        """
+        pairs = getattr(self, "_commit_identity_config", None) or []
+        identity_args: List[str] = []
+        for pair in pairs:
+            if isinstance(pair, str) and pair:
+                identity_args.extend(["-c", pair])
+        return identity_args
+
     def _exec_host_raw(
         self, repo_root: Path, args: List[str], timeout: int = 30
     ) -> tuple:
@@ -877,6 +902,12 @@ class GitReadTool(ToolBase):
         if args and args[0] == "commit":
             args = [args[0], "--no-verify"] + args[1:]
 
+        # Workspace commit-identity pins (empty unless a commit staged them).
+        # Emitted BEFORE the hardened pins above so that a hardening pin always
+        # wins on a key collision -- workspace config can never weaken the
+        # hardened invocation.
+        identity_args = self._identity_config_args()
+
         executor = SandboxedExecution(
             session_permissions=self.session_permissions,
             workspace_id=getattr(self, "workspace_id", None),
@@ -918,7 +949,7 @@ class GitReadTool(ToolBase):
             raise PermissionError(self._filesystem_read_gate_error())
 
         result = executor.run(
-            ["git"] + hardened_args + args,
+            ["git"] + identity_args + hardened_args + args,
             cwd=str(repo_root),
             timeout=timeout,
             required_category=required_category,
@@ -1036,8 +1067,12 @@ class GitReadTool(ToolBase):
         # explicitly. These -c pairs MUST precede the subcommand.
         eol_args = ["-c", "core.autocrlf=input", "-c", "core.eol=lf"]
 
+        # Workspace commit-identity pins (empty unless a commit staged them),
+        # placed before the EOL pins so the latter always win on a collision.
+        identity_args = self._identity_config_args()
+
         result = manager.exec(
-            ["git"] + eol_args + args,
+            ["git"] + identity_args + eol_args + args,
             workdir=self._to_container_path(repo_root),
             environment=environment,
             timeout=timeout,

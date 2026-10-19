@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Literal, Optional, List, Union
 from pathlib import Path
 from pydantic import Field
 from .git_info_tool import GitReadTool, resolve_git_execution_mode
+from .host_resource_policy import load_workspace_config
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
 from security.gate_helpers import _value_satisfies
 
@@ -24,6 +25,32 @@ _BRANCH_NAME_RE = re.compile(r'^[A-Za-z0-9._/\-]+$')
 _DETACHED_HEAD_ERROR = (
     "Error: refusing to commit: the workspace HEAD is detached "
     "(not on a branch); check out a branch before committing"
+)
+
+# Refusal when a commit would have to run WITHOUT any resolvable identity. The
+# tool never invents a fallback and never falls back to an operator/agent
+# identity: a commit attributed to the wrong author is worse than a refused
+# commit, because the wrong attribution is silent and permanent. Two remedies
+# are named, in order of durability: the workspace config (portable, no host
+# state) then a repo-local ``git config`` (operator action on the host).
+_NO_GIT_IDENTITY_ERROR = (
+    "Cannot commit: no git identity. Set `git_identity` in the workspace "
+    "config, or run `git config --local user.name/email`."
+)
+
+# git's own wording when it cannot resolve an author/committer identity, matched
+# case-insensitively against a FAILED commit's output. Detection is deliberately
+# post-hoc rather than a ``git config --get user.name/email`` probe: the probe
+# would refuse commits git itself accepts (auto-detected ``user@host``, the
+# ``EMAIL``/``GIT_AUTHOR_EMAIL`` env fallbacks, ``includeIf`` and ``-c`` config
+# outside the probe's view) -- a false refusal, and an extra subprocess on every
+# commit. Here a miss can only ever surface git's native message.
+_MISSING_IDENTITY_MARKERS = (
+    "please tell me who you are",
+    "unable to auto-detect email address",
+    "author identity unknown",
+    "committer identity unknown",
+    "empty ident name",
 )
 
 
@@ -51,6 +78,16 @@ class GitWriteTool(GitReadTool):
         branch: branch name for branch_create and checkout.
         message: commit message (required for commit).
         clone_url / clone_target: remote URL and target directory for clone.
+    Commit author identity: the OPTIONAL workspace config key
+        ``git_identity: {"name": ..., "email": ...}`` is pinned on every
+        commit as ``-c user.name=... -c user.email=...``. It is read from the
+        workspace config only (never from agent input), applied to that one
+        invocation only (nothing is written to ``.git/config``), and never
+        defaulted: when git itself rejects the commit for want of an identity,
+        the caller gets ``_NO_GIT_IDENTITY_ERROR`` (remedies named) instead of
+        git's own advice block. No identity probe subprocess is issued, so git's
+        native resolution (repo-local, global, env, auto-detection) is what
+        decides -- the tool only ever re-words git's own refusal.
     Explicit surface: no raw git flags are accepted from the agent. Every
     invocation is assembled from fixed argv lists and hardened internally;
     --no-verify, -c/--config/core.hooksPath, credential/filter/textconv
@@ -222,6 +259,7 @@ class GitWriteTool(GitReadTool):
         self._resolved_workspace_id = None
         self._last_execution_mode = None
         self._last_failure_reason = None
+        self._commit_identity_config = None
 
         # git permission gate (fail closed): every write requires a
         # write-capable effective session git permission (the effective git
@@ -674,6 +712,95 @@ class GitWriteTool(GitReadTool):
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)
 
+    # ------------------------------------------------------------------
+    # Commit author identity
+    # ------------------------------------------------------------------
+    def _workspace_git_identity(self) -> tuple:
+        """Return ``(identity, error)`` from the workspace ``git_identity``.
+
+        ``identity`` is ``{"name": str, "email": str}`` when the workspace
+        config supplies a usable identity, ``None`` when the key is absent (or
+        no workspace is bound), and ``error`` is a message when the key is
+        present but malformed.
+
+        A malformed value is NEVER silently ignored: falling through to the
+        repo-local/global identity would commit under the wrong author while
+        reporting success. The identity is applied as ``-c`` pins on the commit
+        invocation only -- nothing is read from, or written to, ``.git/config``.
+        """
+        workspace_id = self._resolved_workspace_id or getattr(
+            self, "workspace_id", None
+        )
+        if not workspace_id:
+            return (None, None)
+        raw = load_workspace_config(workspace_id).get("git_identity")
+        if raw is None:
+            return (None, None)
+        if not isinstance(raw, dict):
+            return (
+                None,
+                "Cannot commit: workspace `git_identity` is malformed "
+                "(expected an object with `name` and `email`).",
+            )
+        for label in ("name", "email"):
+            value = raw.get(label)
+            if not isinstance(value, str) or not value.strip():
+                return (
+                    None,
+                    f"Cannot commit: workspace `git_identity.{label}` must be a "
+                    "non-empty string.",
+                )
+            # git rejects (or silently mangles) an ident containing angle
+            # brackets or line breaks; refuse at the config boundary instead of
+            # emitting a malformed author header.
+            if any(ch in value for ch in "\r\n\x00<>"):
+                return (
+                    None,
+                    f"Cannot commit: workspace `git_identity.{label}` contains "
+                    "characters that are not allowed in a git identity "
+                    "(newline, NUL, '<' or '>').",
+                )
+        return (
+            {
+                "name": raw["name"].strip(),
+                "email": raw["email"].strip(),
+            },
+            None,
+        )
+
+    def _commit_identity_pins(self) -> tuple:
+        """Return ``(identity_config, error)`` for the in-flight commit.
+
+        ``identity_config`` is the ``-c`` pair list to pin (``None`` when the
+        commit should use git's own resolution), ``error`` a refusal message.
+
+        The workspace ``git_identity`` is pinned via ``-c``, which outranks
+        every config file for that one invocation; without one nothing is
+        pinned and git's own repo-local/global resolution stands untouched
+        (unchanged pre-existing behaviour, including auto-detection). No
+        subprocess is issued to find out: with no pins the commit runs exactly
+        as before and a missing identity is reported from the commit's own
+        failure (see ``_is_missing_identity_error``).
+        """
+        identity, error = self._workspace_git_identity()
+        if error:
+            return (None, error)
+        if not identity:
+            return (None, None)
+        return (
+            [
+                f"user.name={identity['name']}",
+                f"user.email={identity['email']}",
+            ],
+            None,
+        )
+
+    @staticmethod
+    def _is_missing_identity_error(output: str) -> bool:
+        """Whether a failed commit's output says the identity is unresolvable."""
+        text = (output or "").lower()
+        return any(marker in text for marker in _MISSING_IDENTITY_MARKERS)
+
     def _git_commit(self, repo_root: Path) -> str:
         """Run git commit (selective only).
 
@@ -764,6 +891,21 @@ class GitWriteTool(GitReadTool):
             return self._truncate_output(f"Error: {e}")
         if not rels:
             return "Error: file_path is required for commit operation (at least one path)"
+        # Commit author identity. A workspace ``git_identity`` is applied as
+        # ``-c`` pins on this one invocation (never written to .git/config,
+        # never a default identity); without one, git's own repo-local/global
+        # resolution stands. A malformed ``git_identity`` is refused here,
+        # before staging, so the index stays untouched; a commit that git itself
+        # rejects for want of any identity is re-reported as
+        # ``_NO_GIT_IDENTITY_ERROR`` after the fact (no probing subprocess).
+        identity_config, identity_error = self._commit_identity_pins()
+        if identity_error:
+            return self._truncate_output(identity_error)
+        if identity_config:
+            logger.info(
+                "GitWriteTool commit identity: workspace git_identity (%s)",
+                identity_config[0].split("=", 1)[-1],
+            )
         # Stage exactly the named paths first (never ``-A``): ``git commit --
         # <paths>`` only works for files git already knows, so an untracked
         # file (e.g. the first commit of a fresh repo) must be staged first.
@@ -771,7 +913,25 @@ class GitWriteTool(GitReadTool):
         if self._is_git_error_output(add_output):
             return self._truncate_output(add_output)
         args = ["commit", "-m", self.message, "--"] + rels
-        output = self._run_git(repo_root, args)
+        # Stage the pins for the commit call only: the backends read this while
+        # building argv, and it is cleared even when git raises, so no value
+        # survives into a later call on a reused tool instance.
+        self._commit_identity_config = identity_config
+        try:
+            output = self._run_git(repo_root, args)
+        finally:
+            self._commit_identity_config = None
+        if self._is_git_error_output(output) and self._is_missing_identity_error(
+            output
+        ):
+            # Surface the actionable remedy instead of git's advice block. The
+            # named paths stay staged (exactly as a plain ``git commit`` would
+            # leave them), so the caller re-runs the commit once identity is set.
+            logger.warning(
+                "GitWriteTool commit refused by git for missing identity: %s",
+                (output or "").strip(),
+            )
+            return self._with_mode(self._truncate_output(_NO_GIT_IDENTITY_ERROR))
         return self._with_mode(self._truncate_output(output))
 
     def _git_init(self, repo_root: Path) -> str:
