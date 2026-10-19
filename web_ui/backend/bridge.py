@@ -1333,10 +1333,19 @@ class WebAgentBridge:
                         if getattr(thread, "status", None) != "paused":
                             continue
                         try:
-                            thread.resume()
-                            log('INFO', 'server.bridge', f'Worker resumed: {wname}')
+                            # resume() returns False when a stop is already in
+                            # flight; the thread will die without ever
+                            # listening, so do not log a resume that did not
+                            # happen.
+                            outcome = thread.resume()
                         except Exception as exc:
                             log('WARNING', 'server.bridge', f'Failed to resume worker {wname}: {exc}')
+                        else:
+                            if outcome is False:
+                                log('WARNING', 'server.bridge',
+                                    f'Worker {wname} refused to resume (stop already in flight)')
+                            else:
+                                log('INFO', 'server.bridge', f'Worker resumed: {wname}')
 
     def stop(self) -> None:
         """Request the agent to stop (finishes current operation then exits)."""

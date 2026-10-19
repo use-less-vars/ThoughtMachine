@@ -1491,19 +1491,58 @@ async def resume_worker(
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
     # iterate all entries matching the worker name — optionally narrowed to
     # the requested instance.
+    # ``resume()`` returns False when the worker has a stop already in flight
+    # (a stop signalled out-of-process sets the stop event without touching
+    # ``status``, so a "paused"-looking thread may still be dying). Report that
+    # truthfully instead of unconditionally claiming "resumed".
+    resumed_threads: List[Dict[str, Any]] = []
+    refused_threads: List[Dict[str, Any]] = []
     with _registry_lock:
         for key, thread in list(_worker_registry.items()):
             wname = key[1]
             if wname != name:
                 continue
-            if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
+            tid = key[2] if len(key) > 2 else 1
+            if instance_id is not None and tid != instance_id:
                 continue
             try:
-                thread.resume()
-            except Exception:
-                pass  # File-based resume will still work
+                outcome = thread.resume()
+            except Exception as exc:
+                outcome = False
+                logger.warning(
+                    "Resume: worker '%s' instance %s raised on resume: %s",
+                    wname, tid, exc,
+                )
+            if outcome is False:
+                refused_threads.append({
+                    "worker_name": wname,
+                    "instance_id": tid,
+                    "reason": "stop already in flight",
+                })
+            else:
+                resumed_threads.append({
+                    "worker_name": wname,
+                    "instance_id": tid,
+                })
 
-    resp = {"status": "resumed", "name": name}
+    if refused_threads and not resumed_threads:
+        # Every in-memory thread we found refused: the resume command file was
+        # written, but this live instance will ignore it (its stop wins), so do
+        # not answer "resumed".
+        resp: Dict[str, Any] = {
+            "status": "refused",
+            "name": name,
+            "workers_refused": refused_threads,
+            "note": (
+                "Stop already in flight for the matching worker instance; the "
+                "resume command was written but the live instance will not "
+                "honour it. Spawn a fresh instance instead."
+            ),
+        }
+    else:
+        resp = {"status": "resumed", "name": name}
+        if refused_threads:
+            resp["workers_refused"] = refused_threads
     if target_label is not None:
         resp["instance_id"] = instance_id
         resp["instance_label"] = target_label
