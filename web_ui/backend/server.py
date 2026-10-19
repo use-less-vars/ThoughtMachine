@@ -3939,6 +3939,38 @@ def _recorded_envelope(snapshot_source):
             if cfg.get(key)}
 
 
+def _original_created_by(manager, container_id, actor):
+    """Attribution to stamp on the REBUILT container: its origin.
+
+    ``thoughtmachine.created_by`` is the single source of truth for who
+    created a container (the record deliberately carries no creator field),
+    and it lives ONLY on the live container -- so it must be read from the
+    container that is about to be destroyed, not re-derived from whoever is
+    performing the resize/rebuild.  Otherwise one resize or recreate relabels
+    an agent-created container (``agent:session:<id>``) as the operator, and
+    the origin is lost for good (``remove`` copies no label back).  Only a
+    genuinely absent/unreadable label falls back to the acting operator.
+
+    The caller MUST call this BEFORE the destroy: ``remove()`` drops the handle
+    to the live container, after which the label is unreadable.
+    """
+    from thoughtmachine.container_record.hook import (
+        CREATED_BY_LABEL,
+        operator_created_by,
+    )
+
+    if container_id:
+        try:
+            container = manager.client.containers.get(container_id)
+            label = (getattr(container, "labels", None) or {}).get(
+                CREATED_BY_LABEL)
+        except Exception:
+            label = None
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    return operator_created_by(actor)
+
+
 @app.get("/api/workspace/{workspace_id}/containers")
 def workspace_containers(workspace_id: str, workspace_path: str = ""):
     """List containers for the workspace."""
@@ -4288,8 +4320,6 @@ def _record_user_action(record_id: str, action: str, request: Request,
 
     from thoughtmachine.container_record import api as _cr_api
 
-    from thoughtmachine.container_record.hook import operator_created_by
-
     # Guard 3 -- resolve the record. Wrong workspace -> 403, unknown -> 404.
     try:
         record = _cr_api.load_record(workspace_id, record_id)
@@ -4381,6 +4411,14 @@ def _record_user_action(record_id: str, action: str, request: Request,
                                    status_code=409)
             new_docker_id = previous_docker_id
         else:
+            # Origin attribution, read ONCE and BEFORE the pre-step below: the
+            # pre-step destroys the container handle this rebuild replaces
+            # (``restart`` stops it, ``recreate`` removes it), and
+            # ``thoughtmachine.created_by`` lives ONLY on the live container --
+            # so re-deriving it afterwards would stamp the acting operator on
+            # an agent-created container and lose its origin for good.
+            preserved_created_by = _original_created_by(manager, container_id,
+                                                        actor)
             if action == "restart":
                 pre_result = manager.stop(container_id)
             else:  # recreate
@@ -4395,7 +4433,7 @@ def _record_user_action(record_id: str, action: str, request: Request,
             start_result = manager.start(
                 name=record.name, note=record.notes,
                 allow_fresh=(action == "recreate"),
-                created_by=operator_created_by(actor),
+                created_by=preserved_created_by,
                 **_recorded_envelope(getattr(record, "intent_snapshot", None)))
             if isinstance(start_result, dict) and start_result.get("error"):
                 try:
@@ -4731,10 +4769,6 @@ def workspace_container_resources(workspace_id: str, record_id: str,
 
     from thoughtmachine.container_record import api as _cr_api
     from thoughtmachine.container_record import rebuild_config_from_snapshot
-    from thoughtmachine.container_record.hook import (
-        CREATED_BY_LABEL,
-        operator_created_by,
-    )
 
     try:
         record = _cr_api.load_record(workspace_id, record_id)
@@ -4788,33 +4822,10 @@ def workspace_container_resources(workspace_id: str, record_id: str,
 
     container_id = _view_action_container_id(manager, record)
 
-    def _original_created_by():
-        """Attribution to stamp on the REBUILT container: its origin.
-
-        ``thoughtmachine.created_by`` is the single source of truth for who
-        created a container (the record deliberately carries no creator field),
-        and it lives ONLY on the live container -- so it must be read from the
-        container that is about to be destroyed, not re-derived from whoever is
-        performing the resize.  Otherwise one resize relabels an agent-created
-        container (``agent:session:<id>``) as the operator, and the origin is
-        lost for good (``remove`` copies no label back).  Only a genuinely
-        absent/unreadable label falls back to the acting operator.
-        """
-        if container_id:
-            try:
-                container = manager.client.containers.get(container_id)
-                label = (getattr(container, "labels", None) or {}).get(
-                    CREATED_BY_LABEL)
-            except Exception:
-                label = None
-            if isinstance(label, str) and label.strip():
-                return label.strip()
-        return operator_created_by(actor)
-
     # Recovered ONCE, and BEFORE the destroy below: ``remove()`` drops the handle
     # to the live container, after which the label is unreadable.  Both recreate
     # attempts (the edit and the ``_resize_failed`` recovery) stamp this value.
-    original_created_by = _original_created_by()
+    original_created_by = _original_created_by(manager, container_id, actor)
 
     prev_snapshot = dict(getattr(record, "intent_snapshot", None) or {})
     prev_docker_id = getattr(record, "docker_id", "") or ""

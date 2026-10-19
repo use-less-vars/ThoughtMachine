@@ -33,6 +33,11 @@ Coverage, by strength:
    STOPS and never removes.
 4. A destroy whose rebuild returns no container id is a 503 with the verb in
    the message, never a silent rebind to the dead handle.
+5. ``created_by``: the rebuild stamps the container's ORIGIN label (read
+   BEFORE the destroy -- ``remove`` makes the live label unreadable), not the
+   acting operator.  The record has NO creator field, so a container that is
+   already gone before the read falls back to ``operator_created_by(actor)``
+   (documented guard, not a fix proof).
 
 Run:  python3 -m pytest tests/test_restart_preserves_envelope.py -q
 """
@@ -45,6 +50,7 @@ from fastapi.testclient import TestClient
 import web_ui.backend.server as server_module
 from web_ui.backend.server import app
 from thoughtmachine.container_record import api as cr_api
+from thoughtmachine.container_record.hook import CREATED_BY_LABEL
 
 client = TestClient(app)
 
@@ -433,3 +439,214 @@ def test_real_manager_recreate_proves_the_downgrade_without_the_envelope(
     assert captured["network_mode"] == "none"
     assert captured["workspace_mode"] == "ro"
     assert captured["restored_envelope"] is False
+
+
+# ── created_by: the rebuild stamps the ORIGIN, never the acting operator ─────
+#
+# ``thoughtmachine.created_by`` is a DOCKER LABEL, not a record field: the
+# record schema carries no creator (``thoughtmachine/container_record/models.py``
+# ``SCHEMA_FIELD_NAMES`` / ``INTENT_SNAPSHOT_KEYS``), which is exactly why
+# ``hook.CREATED_BY_LABEL``'s own docstring says the label "lives on the
+# container, not in the record".  So the origin has to be read off the LIVE
+# container BEFORE the pre-step destroys it (``restart`` stops at
+# ``server.py:4423``, ``recreate`` removes at ``:4427``), otherwise the rebuild
+# is stamped with ``operator_created_by(actor)`` and an agent-created container
+# silently changes owner.  These tests fail without that read.
+
+ORIGIN = "agent:session:XYZ"
+OPERATOR = "alice@example.com"
+
+
+class _LabelledContainer:
+    """A live container: only ``labels`` is ever read off it."""
+
+    def __init__(self, labels):
+        self.labels = labels
+
+
+class _Containers:
+    """Stand-in for ``manager.client.containers``: ``get`` answers or raises.
+
+    *labels_fn* returns the live label dict, or ``None`` when the container is
+    gone (``get`` then raises, as the Docker SDK does for a removed container);
+    *error* makes the read raise instead (daemon/transport failure).
+    """
+
+    def __init__(self, labels_fn=None, error=None):
+        self._labels_fn = labels_fn
+        self._error = error
+
+    def get(self, container_id):
+        if self._error is not None:
+            raise self._error
+        labels = self._labels_fn() if self._labels_fn is not None else None
+        if labels is None:
+            raise KeyError(container_id)
+        return _LabelledContainer(labels)
+
+
+class _Client:
+    """Stand-in for the Docker client: only ``containers.get`` is used."""
+
+    def __init__(self, containers):
+        self.containers = containers
+
+
+def _origin(manager, labels, *, dies_on_remove=True):
+    """Give the double a live-container label read that DIES on ``remove``.
+
+    ``manager.remove`` is the destroy: after it runs the container is gone, so
+    the label becomes unreadable.  A route that reads the label after the
+    pre-step -- or does not read it at all -- therefore cannot return the
+    origin, which is the field behaviour this file pins.
+    """
+    live = {"alive": True}
+
+    def _labels():
+        return dict(labels) if live["alive"] else None
+
+    manager.client = _Client(_Containers(_labels))
+    if dies_on_remove:
+        inner_remove = manager.remove
+
+        def remove(container_id, keep_record=False, **kwargs):
+            result = inner_remove(container_id, keep_record=keep_record,
+                                  **kwargs)
+            live["alive"] = False
+            return result
+
+        manager.remove = remove
+    return manager
+
+
+def test_recreate_rebuilds_with_the_origin_created_by(vault, monkeypatch):
+    """The rebuild is stamped with the ORIGIN label, not the acting operator.
+
+    The lane-1 envelope assertions ride along on the SAME rebuild, so this can
+    never pass by proving the label at the cost of dropping the recorded pair.
+    """
+    _seed(vault, intent_snapshot={"network_mode": "bridge",
+                                  "workspace_mode": "rw"})
+    manager = _install(monkeypatch, _EnvelopeManager())
+    _origin(manager, {CREATED_BY_LABEL: ORIGIN})
+    _allow(monkeypatch)
+
+    resp = _post(RECREATE, actor=OPERATOR)
+
+    assert resp.status_code == 200, resp.text
+    assert manager.removes, "recreate must destroy before it rebuilds"
+    assert manager.starts[0][4] == ORIGIN                 # created_by kwarg
+    assert manager.starts[0][4] != OPERATOR               # not the operator
+    # lane-1 envelope: the recorded pair still reaches the rebuild
+    assert manager.start_kwargs == [{"network_mode": "bridge",
+                                     "workspace_mode": "rw"}]
+
+
+def test_restart_forwards_the_origin_created_by(vault, monkeypatch):
+    """``restart`` stops only, so the live label is still readable: forwarded."""
+    _seed(vault, intent_snapshot={"network_mode": "bridge"})
+    manager = _install(monkeypatch, _EnvelopeManager())
+    _origin(manager, {CREATED_BY_LABEL: ORIGIN})
+    _allow(monkeypatch)
+
+    resp = _post(RESTART, actor=OPERATOR)
+
+    assert resp.status_code == 200, resp.text
+    assert manager.removes == []
+    assert manager.starts[0][4] == ORIGIN
+    assert manager.start_kwargs == [{"network_mode": "bridge"}]
+
+
+@pytest.mark.parametrize("read", ["gone", "unreadable"])
+def test_recreate_with_the_container_already_gone_falls_back_to_the_operator(
+        vault, monkeypatch, read):
+    # guard: passes with or without the fix -- it documents the RESIDUAL gap.
+    # There is NO PERSISTED origin to prefer: the record has no creator field
+    # (models.SCHEMA_FIELD_NAMES / INTENT_SNAPSHOT_KEYS) and intent_snapshot
+    # carries no creator key, so a container that is already gone (or whose
+    # label read raises) has no surviving origin -- the documented fallback is
+    # operator_created_by(actor).  Closing this gap needs a schema field, which
+    # is out of scope here.
+    _seed(vault)
+    manager = _install(monkeypatch, _EnvelopeManager())
+    if read == "gone":
+        manager.client = _Client(_Containers(lambda: None))      # 404 on get
+    else:
+        manager.client = _Client(
+            _Containers(error=RuntimeError("500 Server Error")))
+    _allow(monkeypatch)
+
+    resp = _post(RECREATE, actor=OPERATOR)
+
+    assert resp.status_code == 200, resp.text
+    assert manager.starts[0][4] == OPERATOR
+
+
+def test_recreate_without_an_origin_label_falls_back_to_the_operator(
+        vault, monkeypatch):
+    # guard: passes with or without the fix -- a live container that carries no
+    # created_by label at all (predates the label / blank value) legitimately
+    # falls back to the acting operator.
+    _seed(vault)
+    manager = _install(monkeypatch, _EnvelopeManager())
+    _origin(manager, {})
+    _allow(monkeypatch)
+
+    resp = _post(RECREATE, actor=OPERATOR)
+
+    assert resp.status_code == 200, resp.text
+    assert manager.starts[0][4] == OPERATOR
+
+
+def test_real_manager_recreate_stamps_the_origin_created_by(vault,
+                                                           monkeypatch):
+    """Same real harness: ``_fresh_start`` receives the ORIGIN + the envelope."""
+    _seed(vault, intent_snapshot={"network_mode": "bridge",
+                                  "workspace_mode": "rw"})
+    manager, captured = _real_manager(monkeypatch, vault)
+    _origin(manager, {CREATED_BY_LABEL: ORIGIN})
+    _install(monkeypatch, manager)
+    _allow(monkeypatch)
+
+    resp = _post(RECREATE, actor=OPERATOR)
+
+    assert resp.status_code == 200, resp.text
+    assert captured["created_by"] == ORIGIN
+    assert captured["network_mode"] == "bridge"
+    assert captured["workspace_mode"] == "rw"
+    assert captured["restored_envelope"] is True
+
+
+def test_recreate_rebind_payload_carries_no_creator_field(vault, monkeypatch):
+    """WHY the label -- and not the record -- has to carry the origin.
+
+    The rebind payload the route writes is EXACTLY
+
+        {"docker_id": "docker-new", "state": "running"}
+
+    with no ``created_by`` to write: the record schema has no creator field
+    (``thoughtmachine/container_record/models.py`` ``SCHEMA_FIELD_NAMES`` and
+    ``INTENT_SNAPSHOT_KEYS`` both carry none), so the preserved origin survives
+    ONLY as the Docker label stamped by ``start``.  That is why the route must
+    read it and pass it explicitly -- it can never be re-derived later.
+    """
+    _seed(vault)
+    payloads = []
+    real_update = cr_api.update_record
+
+    def _record_update(workspace_id, record_id, **kwargs):
+        payloads.append(dict(kwargs))
+        return real_update(workspace_id, record_id, **kwargs)
+
+    monkeypatch.setattr(cr_api, "update_record", _record_update)
+    manager = _install(monkeypatch, _EnvelopeManager())
+    _origin(manager, {CREATED_BY_LABEL: ORIGIN})
+    _allow(monkeypatch)
+
+    resp = _post(RECREATE, actor=OPERATOR)
+
+    assert resp.status_code == 200, resp.text
+    assert payloads == [{"docker_id": "docker-new", "state": "running"}]
+    assert "created_by" not in payloads[0]
+    # ...and the preserved origin went to the CONTAINER instead.
+    assert manager.starts[0][4] == ORIGIN
