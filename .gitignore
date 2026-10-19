@@ -140,6 +140,8 @@ docs/*
 # contents.
 !docs/architecture/
 !docs/architecture/**
+# First-read machine model doc (wave 2026-10-20): public tier, ships with the repo.
+!docs/ARCHITECTURE_MACHINE_MODEL.md
 !docs/audit_resource_container_isolation_2026_08_13.md
 !docs/container_registry_design.md
 !docs/container_record_design.md
