@@ -1406,7 +1406,9 @@ class ContainerManager:
               lifecycle_class: str = LIFECYCLE_PERSISTENT,
               allow_fresh: bool = False,
               heal_missing: bool = False,
-              created_by: str | None = None):
+              created_by: str | None = None,
+              network_mode: str | None = None,
+              workspace_mode: str | None = None):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
@@ -1450,7 +1452,29 @@ class ContainerManager:
         container as the ``thoughtmachine.created_by`` Docker label.  Defaults
         to ``agent:session:<self.session_id>`` (or ``system:container_manager``
         when this manager has no session -- e.g. the web UI's operator-driven
-        recreate, which therefore passes its resolved ACTOR explicitly).
+        recreate, which therefore passes a value explicitly).
+
+        RECREATE CONTRACT: a caller that destroys and rebuilds an existing
+        container must pass the container's ORIGINAL creator -- read off the
+        live container's ``thoughtmachine.created_by`` label BEFORE the
+        destroy -- not the actor performing the rebuild.  The record stores no
+        creator field, so that label is the only surviving source of origin;
+        omitting it silently relabels an agent-created container as owned by
+        whoever resized it.
+
+        ``network_mode`` / ``workspace_mode`` (both optional) RESTORE a recorded
+        isolation envelope on the operator recreate path (``allow_fresh``).  The
+        record's persisted ``intent_snapshot`` is the rebuild source there, so
+        the caller passes the recorded envelope explicitly instead of letting the
+        CURRENT policy decide: the web-UI manager carries no session
+        (``session_permissions=None``), so a policy-computed envelope resolves to
+        the most restrictive pair and would silently downgrade a rebuilt
+        container.  Only the two ``allow_fresh`` fresh-create sites consume these
+        (an ordinary create ignores them entirely): they do NOT replace
+        ``_compute_config`` and are never consulted for reuse, naming, or the
+        drift comparison.  Empty/``None`` means "no recorded envelope => use the
+        resolved policy", so a create with no override is byte-for-byte
+        unchanged and stays fail-closed.
         """
         # Root-host refusal: the container user MUST match the host user so
         # bind-mounted workspace files are owned correctly. A host running as
@@ -1494,6 +1518,18 @@ class ContainerManager:
         )
         want_network, want_workspace = computed
         want_effective = getattr(computed, "effective", None)
+
+        # Envelope RESTORE for the operator recreate path (``allow_fresh``).
+        # ``_compute_config`` above stays the single policy source for the
+        # container NAME (env_hash), the cached permissions and the drift
+        # comparison; the recorded envelope below only overrides the isolation
+        # the rebuilt container is actually created with, and only when the
+        # caller supplied one (an empty/absent value keeps the computed pair).
+        _restore_network = network_mode or None
+        _restore_workspace = workspace_mode or None
+        _restored_envelope = bool(_restore_network or _restore_workspace)
+        _recreate_network = _restore_network or want_network
+        _recreate_workspace = _restore_workspace or want_workspace
 
         # Name is keyed by lifecycle class and (for ephemeral) session; the envelope (network_mode, workspace_mode) is part of the name via env_hash, not consulted separately at reuse time.
         if name is None:
@@ -1592,9 +1628,11 @@ class ContainerManager:
                         created_by=created_by,
                         image=image, name=name, note=note, worker_name=None,
                         lifecycle_class=lifecycle_class,
-                        network_mode=want_network, workspace_mode=want_workspace,
+                        network_mode=_recreate_network,
+                        workspace_mode=_recreate_workspace,
                         reuse_record_id=record_id,
                         permissions=want_effective,
+                        restored_envelope=_restored_envelope,
                         mem_limit=_reuse_mem_limit,
                         cpu_quota=_reuse_cpu_quota)
                 # (b) Record exists but names no container yet -> REFUSE.
@@ -1620,9 +1658,11 @@ class ContainerManager:
                         created_by=created_by,
                         image=image, name=name, note=note, worker_name=None,
                         lifecycle_class=lifecycle_class,
-                        network_mode=want_network, workspace_mode=want_workspace,
+                        network_mode=_recreate_network,
+                        workspace_mode=_recreate_workspace,
                         reuse_record_id=record_id,
                         permissions=want_effective,
+                        restored_envelope=_restored_envelope,
                         mem_limit=_reuse_mem_limit,
                         cpu_quota=_reuse_cpu_quota)
                 # Guardrail 5: auto-heal is reachable ONLY from this
@@ -2089,7 +2129,8 @@ class ContainerManager:
     def _fresh_start(self, *, image, name, note, worker_name, lifecycle_class,
                      network_mode, workspace_mode, reuse_record_id=None,
                      permissions=None, mem_limit=None, cpu_quota=None,
-                     created_by: str | None = None):
+                     created_by: str | None = None,
+                     restored_envelope: bool = False):
         """Create exactly one container (the single fresh-create path).
 
         With ``reuse_record_id`` unset a NEW record is minted alongside the
@@ -2098,6 +2139,14 @@ class ContainerManager:
         the operator-only recreate path: no new record is minted, the record's
         docker_id/state are rebound, and the name index keeps pointing at the
         same record id.
+
+        ``restored_envelope`` marks ``network_mode``/``workspace_mode`` as a
+        RECORDED creation intent being restored (not a value resolved by the
+        current policy).  It only affects the admission step below: a policy
+        narrowing (``Transform``) of the network mode is NOT applied, because
+        re-creating a container with the envelope it was admitted with is not a
+        new envelope request.  A ``Deny`` still refuses, and the default
+        (``False``) path is byte-for-byte unchanged.
         """
         # Creator attribution for THIS container instance.  Derived
         # here (the ONE fresh-create path) rather than in the
@@ -2154,10 +2203,13 @@ class ContainerManager:
             CONTAINER_NAME_LABEL: name,
             "thoughtmachine.workspace_id": self.workspace_id,
             CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
-            # Creator attribution for THIS instance.  The recreate path reuses
-            # this same dict, so a rebuilt container is stamped with the actor
-            # that rebuilt it -- which is what the live container's labels can
-            # honestly answer (the record holds no creator field).
+            # Creator attribution for THIS instance.  On a healthy create this
+            # is the creating session's identity; on a RECREATE it must be the
+            # container's ORIGIN, which the recreating caller passes explicitly
+            # after reading the live container's label BEFORE destroying it (the
+            # record holds no creator field, so that label is the only surviving
+            # source -- stamping whoever performed the rebuild instead would
+            # silently rewrite the container's origin).
             CREATED_BY_LABEL: _created_by,
         }
         if worker_name:
@@ -2216,7 +2268,18 @@ class ContainerManager:
         if isinstance(_decision, Deny):
             return {"error": _decision.message, "code": _decision.code}
         if isinstance(_decision, Transform):
-            network_mode = _decision.spec.network_mode
+            if restored_envelope:
+                # The create RESTORES a recorded envelope: the policy-derived
+                # narrowing would downgrade a container that was admitted with
+                # that exact envelope when the record was first created, so it is
+                # reported and NOT applied.  A Deny above still refuses, and a
+                # create with no restored envelope keeps the narrowing verbatim.
+                _audit("CONTAINER_CREATE_ENVELOPE_RESTORED",
+                       f"name={name} workspace_id={self.workspace_id} "
+                       f"network={network_mode} workspace={workspace_mode} "
+                       f"policy_narrowed_to={_decision.spec.network_mode}")
+            else:
+                network_mode = _decision.spec.network_mode
 
         if reuse_record_id is not None:
             # Operator-only recreate: bind the fresh container to the EXISTING
