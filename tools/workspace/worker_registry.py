@@ -104,10 +104,14 @@ class WorkerRegistry:
         with self._registry_lock:
             return dict(self._worker_registry)
 
-    def find_workers_by_name(self, worker_name: str) -> list[tuple[str, Any]]:
+    def find_workers_by_name(self, worker_name: str,
+                             session_id: str | None = None) -> list[tuple[str, Any]]:
         """
-        Search the entire registry for all entries matching *worker_name*,
-        regardless of session_id.
+        Search the registry for all entries matching *worker_name*.
+
+        By default the search spans the entire registry, regardless of
+        session_id.  When *session_id* is given, only entries belonging to
+        that session are returned (session-scoped lookup).
 
         Returns a list of ``(session_key, thread)`` tuples.
         """
@@ -115,8 +119,11 @@ class WorkerRegistry:
         with self._registry_lock:
             for key, thread in list(self._worker_registry.items()):
                 wname = key[1]
-                if wname == worker_name:
-                    results.append((key[0], thread))
+                if wname != worker_name:
+                    continue
+                if session_id is not None and key[0] != session_id:
+                    continue
+                results.append((key[0], thread))
         return results
 
     # -- Per-worker EventBus registry ----------------------------------------

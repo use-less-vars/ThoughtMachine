@@ -14,7 +14,8 @@ semantics end-to-end:
      the next free id;
   5. a name-only spawn when the single live instance is PAUSED auto-resumes
      it instead of spawning a duplicate;
-  6. ``force=True`` stops *all* instances of the name (across sessions) and
+  6. ``force=True`` stops all of THIS session's instances of the name (a
+     foreign session's instance of the same name survives untouched) and
      respawns a fresh instance 1;
   7. the job registry tracks jobs per ``instance_id``;
   8. the WorkerRegistry singleton API is 3-tuple aware end-to-end.
@@ -53,6 +54,15 @@ def _live_thread(status: str = "ready") -> MagicMock:
     # The check success path reads ``_worker_ctx.user_history`` for
     # conversation_length; a MagicMock would blow up on len().
     t._worker_ctx = None
+
+    def _stop(*_a, **_k):
+        # Realistic stop(): stop() + join ends the thread, so is_alive() turns
+        # False. The force-spawn block only unregisters an instance that really
+        # died (a live one is kept so it is not orphaned).
+        t.status = "stopped"
+        t.is_alive.return_value = False
+
+    t.stop.side_effect = _stop
     return t
 
 
@@ -291,6 +301,28 @@ class TestWorkerOperationSemantics(unittest.TestCase):
         self.assertEqual(result.get("instance_label"), "w3")
         # Exactly one registry entry for "w3" remains.
         self.assertEqual(self._registry_keys_for("w3"), [(SESSION, "w3", 1)])
+
+    # ── 6b. force is session-scoped ──────────────────────────────────
+
+    def test_spawn_force_does_not_stop_other_session_instance(self):
+        """force=True is session-scoped: another session's instance survives."""
+        other_session = "sess-op-semantics-other"
+        mine = self._seed_fake(SESSION, "w4", 1)
+        foreign = self._seed_fake(other_session, "w4", 1)
+
+        result = self._spawn("w4", force=True)
+
+        mine.stop.assert_called_once()
+        foreign.stop.assert_not_called()
+        self.assertTrue(result.get("spawned"), f"force spawn: {result}")
+        self.assertEqual(result.get("instance_id"), 1)
+        with self._registry._registry_lock:
+            survivors = dict(self._registry._worker_registry)
+        self.assertIs(
+            survivors.get((other_session, "w4", 1)),
+            foreign,
+            "force spawn stopped/unregistered another session's instance",
+        )
 
     # ── 7. job registry tracks jobs per instance_id ────────────────────
 

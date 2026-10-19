@@ -59,6 +59,19 @@ from agent.config.defaults import (
 WORKER_DEFAULT_MAX_RUNTIME_S: Optional[float] = None
 _NO_SESSION_KEY = "<no-session>"
 
+
+def _stop_already_pending(thread: Any) -> bool:
+    """True when *thread* has a stop request in flight.
+
+    Defensive: only a real ``Event.is_set()`` returning ``True`` counts, so
+    test doubles with attribute mocks are not mistaken for stopped workers.
+    """
+    event = getattr(thread, "_stop_event", None)
+    try:
+        return event is not None and event.is_set() is True
+    except Exception:
+        return False
+
 # Optional: WorkerContext (imported eagerly — no circular dep)
 try:
     from agent.core.worker_context import (
@@ -1495,8 +1508,22 @@ class WorkerThread(threading.Thread):
         # Unblock the input queue wait so it can check the pause event
         self._input_queue.put(None)
 
-    def resume(self) -> None:
-        """Resume a paused worker."""
+    def resume(self) -> bool:
+        """Resume a paused worker.
+
+        Returns ``False`` — without touching any state — when a stop is
+        already in progress (``_stop_event`` set, or status ``"stopping"`` /
+        ``"stopped"``).  Reviving such a thread would resurrect a worker that
+        has already been shut down: it would re-enter the main loop with the
+        stop flag set and immediately report ``{"status": "stopped"}`` to the
+        caller instead of running the query.  Callers that need a query to run
+        after a stop must spawn a fresh instance instead.
+        """
+        if self._stop_event.is_set() or self.status in ("stopping", "stopped"):
+            log("WARNING", "tools.worker",
+                f"Refusing to resume worker '{self.worker_name}': stop already "
+                f"in progress (status={self.status})")
+            return False
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
             try:
@@ -1524,6 +1551,7 @@ class WorkerThread(threading.Thread):
         self._manual_only_pause = False
         self.status = "ready"
         self._write_status_file()
+        return True
 
     def reset(self) -> Dict[str, Any]:
         """Reset per-query and persisted context state; the thread stays alive.
@@ -2217,6 +2245,22 @@ class WorkerThread(threading.Thread):
             self.status = "ready"
             self.error = None
             self._write_status_file()
+            # ── Observe-only: a stop request set before run() ─────────
+            # _stop_event is created in __init__ (see the inter-thread
+            # communication block) and is never assigned outside this file, so
+            # it cannot be inherited from a previous life of this instance id —
+            # the only way it is already set here is that something really did
+            # request this instance to stop (stop() itself, a command-file
+            # poll, or the WLM) after it was constructed. Clearing it would
+            # discard a genuine stop, so this path deliberately only reports.
+            # The main loop below honours the flag and exits; the caller sees a
+            # bounded failure, not a hang (see the spawn-side read).
+            if self._stop_event.is_set():
+                log("WARNING", "tools.worker",
+                    f"Worker '{self.worker_name}' instance {self.instance_id} "
+                    "was stopped before it started running; observed an "
+                    "already-set stop request (not cleared: it is a real "
+                    "stop for this instance)")
             # Create per-worker EventBus early so _publish_event below works
             self._event_bus = EventBus()
             register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus, instance_id=self.instance_id)
@@ -3383,10 +3427,12 @@ def get_worker_event_buses_for_session(session_id: str) -> Dict[str, Any]:
 class Worker(ToolBase):
     """Manage background or child worker processes.
 
-    When spawning a worker, set ``force=True`` to automatically stop any
-    existing instance of the same worker (across all sessions) before
-    creating a fresh one.  This is useful for recovering from stale or
-    hanging workers left behind by previous sessions.
+    When spawning a worker, set ``force=True`` to automatically stop the
+    existing instance(s) of the same worker belonging to the **current
+    session** before creating a fresh one.  This is useful for recovering
+    from a stale or hanging worker of your own.  Force is deliberately
+    session-scoped: a worker of the same name owned by another session (and
+    therefore by another workspace) is left running untouched.
     """
 
     tool: str = "Worker"
@@ -3449,7 +3495,11 @@ class Worker(ToolBase):
 
     force: bool = Field(
         default=False,
-        description="If True, stop any existing worker instance (across all sessions) before spawning a fresh one.",
+        description=(
+            "If True, stop this session's existing instance(s) of the worker "
+            "before spawning a fresh one. Workers of the same name in other "
+            "sessions/workspaces are not touched."
+        ),
     )
 
     purpose: Optional[str] = Field(
@@ -3708,14 +3758,23 @@ class Worker(ToolBase):
             return None
         return cls
 
-    def _find_all_worker_threads(self, worker_name: str) -> list[tuple[str, Any]]:
+    def _find_all_worker_threads(self, worker_name: str,
+                                 session_id: str | None = None) -> list[tuple[str, Any]]:
         """
-        Search the entire ``_worker_registry`` for all entries matching
-        *worker_name*, regardless of session_id.
+        Search the ``_worker_registry`` for all entries matching *worker_name*.
+
+        By default the search spans the entire registry, regardless of
+        session_id.  When *session_id* is given the lookup is session-scoped.
 
         Returns a list of ``(session_key, thread)`` tuples.
         """
-        return _WorkerRegistry.get_instance().find_workers_by_name(worker_name)
+        registry = _WorkerRegistry.get_instance()
+        if session_id is None:
+            # Historical call shape (name only) — kept so wrappers and test
+            # doubles that replace find_workers_by_name with a one-argument
+            # callable keep working on the unscoped path.
+            return registry.find_workers_by_name(worker_name)
+        return registry.find_workers_by_name(worker_name, session_id=session_id)
 
     def _effective_max_workers(self) -> int:
         """
@@ -3826,13 +3885,25 @@ class Worker(ToolBase):
                 "error": f"Worker '{self.worker_name}' not found in workers.json",
             }
 
-        # ── Force-respawn: stop any existing instances across all sessions ──
+        # ── Force-respawn: restart THIS session's instances only ──
+        # Force is a restart of *my* worker, never a global name sweep: a
+        # worker of the same name owned by another session (and therefore by
+        # another workspace) is not this caller's property and must survive
+        # untouched.  Session scoping is what makes force workspace-safe.
+        session_key = self.session_id or _NO_SESSION_KEY
         if self.force:
-            stale_instances = self._find_all_worker_threads(self.worker_name)
+            stale_instances = self._find_all_worker_threads(
+                self.worker_name, session_id=session_key
+            )
             stopped_info = []
             for sid, thread in stale_instances:
                 worker_label = f"{self.worker_name} (session={sid})"
                 logger.info("Force-spawn: stopping stale worker '%s'", worker_label)
+                # Only a thread that is genuinely gone may be unregistered below:
+                # popping the entry of a live thread would orphan it (alive, but
+                # invisible to every registry lookup, so it can never be stopped,
+                # checked or reaped).
+                survived_force_stop = False
                 try:
                     thread.stop()
                     # Robust join with retry (same pattern as _action_stop)
@@ -3844,26 +3915,38 @@ class Worker(ToolBase):
                         if not thread.is_alive():
                             break
                     if thread.is_alive():
-                        logger.warning(
-                            "Force-spawn: stale worker '%s' did not stop within %ds",
-                            worker_label, _budget,
-                        )
+                        survived_force_stop = True
                 except Exception as exc:
                     logger.exception("Error stopping stale worker '%s': %s", worker_label, exc)
+                    # stop() raised: the thread is only recycled if it actually died.
+                    survived_force_stop = bool(
+                        getattr(thread, "is_alive", lambda: False)()
+                    )
                 finally:
                     # F3: compact summarized history before persisting so a
                     # force-stop right after SummarizeTool does not persist ~2x.
                     if thread._worker_ctx is not None:
                         thread._worker_ctx.compact_after_summary()
                     thread._save_context()
-                    with _registry_lock:
-                        for key, t in list(_worker_registry.items()):
-                            if (
-                                key[0] == sid
-                                and key[1] == self.worker_name
-                                and t is thread
-                            ):
-                                _worker_registry.pop(key, None)
+                    if survived_force_stop:
+                        # Leave the entry in place: the instance is NOT recycled
+                        # and callers must still be able to see and stop it.
+                        logger.error(
+                            "Force-spawn: worker '%s' instance %s survived "
+                            "force-stop (still alive); its registry entry is "
+                            "kept so the instance is not orphaned",
+                            self.worker_name,
+                            getattr(thread, "instance_id", None),
+                        )
+                    else:
+                        with _registry_lock:
+                            for key, t in list(_worker_registry.items()):
+                                if (
+                                    key[0] == sid
+                                    and key[1] == self.worker_name
+                                    and t is thread
+                                ):
+                                    _worker_registry.pop(key, None)
                 stopped_info.append({"session_id": sid, "status": thread.status})
             if stopped_info:
                 logger.info(
@@ -3875,7 +3958,6 @@ class Worker(ToolBase):
         # Name-only spawns allocate a fresh instance id (1, 2, ...); the sole
         # exception is a single PAUSED instance, which is resumed so the main
         # agent can seamlessly re-query it without manual stop/resume steps.
-        session_key = self.session_id or _NO_SESSION_KEY
         resume_paused_worker = None
         spawn_iid = None
         explicit_iid = self.instance_id
@@ -3892,7 +3974,16 @@ class Worker(ToolBase):
                 match = [t for iid, t in live_same if iid == explicit_iid]
                 if match:
                     existing = match[0]
-                    if existing.status == "paused":
+                    # A paused instance is auto-resumed ONLY when it is a
+                    # legitimate continue-existing target: force means
+                    # "restart", and a thread with a stop already in flight
+                    # is dead — resuming either one resurrects a stopped
+                    # worker that then reports {"status": "stopped"}.
+                    if (
+                        existing.status == "paused"
+                        and not self.force
+                        and not _stop_already_pending(existing)
+                    ):
                         if getattr(existing, "_manual_only_pause", False):
                             return {
                                 "error": (
@@ -3905,6 +3996,14 @@ class Worker(ToolBase):
                             }
                         # Paused worker — auto-resume and re-route the new query.
                         resume_paused_worker = existing
+                    elif self.force or _stop_already_pending(existing):
+                        # Force (or a stop already in flight): never reuse or
+                        # resume. Route to the double-checked spawn at the SAME
+                        # explicit id, which re-checks the registry under the
+                        # lock and either spawns there (the old instance is
+                        # gone by then) or refuses with an explicit error (it
+                        # is still registered and alive).
+                        spawn_iid = explicit_iid
                     else:
                         # Continue-existing routing: an explicit instance that
                         # is live and not paused is reused, not rejected. Any
@@ -3921,7 +4020,13 @@ class Worker(ToolBase):
                 else:
                     spawn_iid = explicit_iid
             else:
-                if len(live_same) == 1 and live_same[0][1].status == "paused":
+                only_live = live_same[0][1] if len(live_same) == 1 else None
+                if (
+                    only_live is not None
+                    and only_live.status == "paused"
+                    and not self.force
+                    and not _stop_already_pending(only_live)
+                ):
                     if getattr(live_same[0][1], "_manual_only_pause", False):
                         return {
                             "error": (
@@ -3933,6 +4038,13 @@ class Worker(ToolBase):
                             "status": "paused",
                         }
                     resume_paused_worker = live_same[0][1]
+                elif only_live is not None and _stop_already_pending(only_live):
+                    # A live thread whose stop is already in flight is dead: it
+                    # must not be reused (the query would hang or come back as
+                    # the stale {"status": "stopped"} envelope). Allocate a
+                    # NEW id for the replacement instead of colliding with the
+                    # dying entry, which is still registered until it exits.
+                    spawn_iid = max([iid for iid, _ in live_same], default=0) + 1
                 elif len(live_same) == 1 and not self.force:
                     # Continue-existing routing: a single live (non-paused)
                     # instance is reused instead of spawning a duplicate. Any
@@ -4022,17 +4134,34 @@ class Worker(ToolBase):
                 "dispatch_duration_wall": dispatch_finished_at - dispatch_started_at,
             }
 
+        # Resume first, outside the registry lock (holding it while waiting on
+        # the output queue can take minutes).  A thread that refuses to resume
+        # has a stop already in flight: it is DEAD, so its output queue must
+        # not be replayed — that is exactly how the stale
+        # {"status": "stopped"} envelope got handed back to the caller.  Fall
+        # through to a fresh spawn instead.
+        if (
+            resume_paused_worker is not None
+            and resume_paused_worker.resume() is False
+        ):
+            logger.warning(
+                "Spawn: paused worker '%s' (session=%s) refused to resume "
+                "(stop already in flight); spawning a fresh instance instead",
+                self.worker_name, session_key,
+            )
+            resume_paused_worker = None
+            if explicit_iid is not None:
+                spawn_iid = explicit_iid
+            else:
+                spawn_iid = max([iid for iid, _ in live_same], default=0) + 1
+
         if resume_paused_worker is not None:
-            # Resume the paused worker and send the new query.
-            # We do this outside the registry lock to avoid holding it
-            # while waiting for the output queue (which can take minutes).
+            # Send the new query to the worker we just resumed.
             query = (
                 self.context.get("query", "")
                 if isinstance(self.context, dict)
                 else str(self.context or "")
             )
-            resume_paused_worker.resume()
-
             # Drain stale None signals left by pause() in the input queue.
             # If a real query was queued by someone else, keep it — but the
             # NEW spawn query runs FIRST (F4 FIFO): it is enqueued before the
@@ -4266,6 +4395,9 @@ class Worker(ToolBase):
         # spawn/query boundaries.
 
         # ── Fix 1.1A: Clean up stale command.json before starting ──
+        # TODO(ticket): command.json carries no instance/id fence — a foreign
+        # stop (e.g. another session's worker sharing the directory) can race
+        # this spawn-time cleanup and re-issue a stop to the fresh thread.
         cmd_path = thread._worker_dir / "command.json"
         if cmd_path.exists():
             cmd_path.unlink(missing_ok=True)
@@ -4278,6 +4410,30 @@ class Worker(ToolBase):
             existing = _worker_registry.get((session_key, self.worker_name, spawn_iid))
             if existing is not None and existing.is_alive():
                 # Another thread won the race — don't overwrite.
+                # With force this is not a lost race but a failed stop: the
+                # instance we asked to replace is still registered and alive
+                # (it may also have a stop already in flight, which is what
+                # routed us here from the early availability check). Say so
+                # instead of the generic "already running".
+                if self.force:
+                    _why = (
+                        "a stop already in flight"
+                        if _stop_already_pending(existing)
+                        else "could not be stopped"
+                    )
+                    return {
+                        "error": (
+                            f"Worker '{self.worker_name}' instance {spawn_iid} "
+                            f"could not be replaced: the existing instance is "
+                            f"still running ({_why}) and survived force-stop; "
+                            "it was left registered so it is not orphaned. "
+                            "Wait for it to exit before spawning this id again."
+                        ),
+                        "status": existing.status,
+                        "worker_name": self.worker_name,
+                        "instance_id": spawn_iid,
+                        "stop_pending": _stop_already_pending(existing),
+                    }
                 return {
                     "error": (
                         f"Worker '{self.worker_name}' instance {spawn_iid} "
@@ -4578,9 +4734,26 @@ class Worker(ToolBase):
                     "session_id": self.session_id or "",
                 }
             try:
-                thread.resume()
-            except Exception:
-                pass
+                _resume_outcome = thread.resume()
+            except Exception as exc:
+                _resume_outcome = False
+                logger.warning(
+                    "Query: worker '%s' raised on resume: %s", self.worker_name, exc
+                )
+            if _resume_outcome is False or _stop_already_pending(thread):
+                # A stop is already in flight: this thread is dead. Blocking in
+                # send_query() below would wait out the full query timeout and
+                # still return nothing useful, so refuse up front.
+                return {
+                    "error": (
+                        f"Worker '{self.worker_name}' has a stop in flight "
+                        f"(status: {getattr(thread, 'status', None)}) and "
+                        "refused to resume; the query was not sent."
+                    ),
+                    "status": getattr(thread, "status", None),
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                }
 
         wait = _worker_query_wait_timeout(
             getattr(thread, "_timeout_seconds", None),
@@ -4999,6 +5172,7 @@ class Worker(ToolBase):
         if want_main:
             _SESSION_MAIN_PAUSED.discard(session_key)
         resumed_workers = []
+        refused_workers = []
         with _registry_lock:
             for key, thread in list(_worker_registry.items()):
                 if key[0] != session_key:
@@ -5009,10 +5183,26 @@ class Worker(ToolBase):
                     continue
                 if not want_all:
                     continue
+                # A "paused" status is not proof the worker can be revived: a
+                # stop issued out-of-process (command.json, handled at the poll
+                # path) sets _stop_event WITHOUT touching status, so resume()
+                # legitimately refuses. Report that refusal instead of claiming
+                # a resume that did not happen.
                 try:
-                    thread.resume()
-                except Exception:
-                    pass
+                    resume_outcome = thread.resume()
+                except Exception as exc:
+                    resume_outcome = False
+                    logger.warning(
+                        "Resume: worker '%s' instance %s raised on resume: %s",
+                        key[1], key[2] if len(key) >= 3 else 1, exc,
+                    )
+                if resume_outcome is False or _stop_already_pending(thread):
+                    refused_workers.append({
+                        "worker_name": key[1],
+                        "instance_id": key[2] if len(key) >= 3 else 1,
+                        "reason": "stop already in flight",
+                    })
+                    continue
                 try:
                     thread._manual_only_pause = False
                 except Exception:
@@ -5021,12 +5211,27 @@ class Worker(ToolBase):
                     "worker_name": key[1],
                     "instance_id": key[2] if len(key) >= 3 else 1,
                 })
+        if refused_workers and not resumed_workers:
+            # Nothing was revived: do not report this as a successful resume.
+            return {
+                "status": "refused",
+                "session_id": self.session_id,
+                "scope": "all" if want_all else "main",
+                "main_agent_paused": want_main and session_key in _SESSION_MAIN_PAUSED,
+                "workers_resumed": resumed_workers,
+                "workers_refused": refused_workers,
+                "note": (
+                    "No worker was resumed: every matching worker has a stop "
+                    "already in flight. Spawn a fresh instance instead."
+                ),
+            }
         return {
             "status": "resumed",
             "session_id": self.session_id,
             "scope": "all" if want_all else "main",
             "main_agent_paused": want_main and session_key in _SESSION_MAIN_PAUSED,
             "workers_resumed": resumed_workers,
+            "workers_refused": refused_workers,
             "note": "Main agent resumed." if want_main else "Requested worker(s) resumed.",
         }
 

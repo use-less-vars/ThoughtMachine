@@ -18,6 +18,7 @@ both the module-level ``_worker_registry`` alias and
 from __future__ import annotations
 
 import json
+import threading
 import unittest
 from unittest import mock
 from unittest.mock import MagicMock
@@ -37,6 +38,16 @@ def _live_thread(status: str = "ready") -> MagicMock:
     t.is_alive.return_value = True
     t.status = status
     t._timeout_seconds = 30  # keep the force-path join loop bounded
+    t._stop_event = threading.Event()
+
+    def _stop(*_a, **_k):
+        # A real stop() + join ends the thread, so is_alive() turns False and
+        # the registry may drop the entry instead of leaving it behind.
+        t.status = "stopped"
+        t._stop_event.set()
+        t.is_alive.return_value = False
+
+    t.stop.side_effect = _stop
     return t
 
 
