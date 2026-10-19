@@ -3918,6 +3918,27 @@ def _view_action_container_id(manager, record):
     return container_id or record.docker_id or None
 
 
+def _recorded_envelope(snapshot_source):
+    """Return the RECORDED isolation envelope of *snapshot_source*.
+
+    A rebuild below recreates the container from the record's persisted
+    intent, not from the current policy: the route's ContainerManager
+    carries no session (``session_permissions=None``), so a policy-computed
+    envelope resolves to the most restrictive pair and would silently
+    downgrade the rebuilt container.  Only recorded, non-empty axes are
+    returned -- an unrecorded envelope yields ``{}`` (no override), which
+    keeps the fail-closed policy apply untouched.
+    """
+    from thoughtmachine.container_record import rebuild_config_from_snapshot
+
+    try:
+        cfg = rebuild_config_from_snapshot(snapshot_source)
+    except Exception:
+        return {}
+    return {key: cfg[key] for key in ("network_mode", "workspace_mode")
+            if cfg.get(key)}
+
+
 @app.get("/api/workspace/{workspace_id}/containers")
 def workspace_containers(workspace_id: str, workspace_path: str = ""):
     """List containers for the workspace."""
@@ -4371,9 +4392,11 @@ def _record_user_action(record_id: str, action: str, request: Request,
                 return conflict
             # restart/recreate start through the REAL name-index path; the
             # record_id stays stable across the whole operation.
-            start_result = manager.start(name=record.name, note=record.notes,
-                                         allow_fresh=(action == "recreate"),
-                                         created_by=operator_created_by(actor))
+            start_result = manager.start(
+                name=record.name, note=record.notes,
+                allow_fresh=(action == "recreate"),
+                created_by=operator_created_by(actor),
+                **_recorded_envelope(getattr(record, "intent_snapshot", None)))
             if isinstance(start_result, dict) and start_result.get("error"):
                 try:
                     _audit("conflict", None)
@@ -4381,7 +4404,19 @@ def _record_user_action(record_id: str, action: str, request: Request,
                     return _json_error(f"audit write failed: {exc}",
                                        status_code=500)
                 return _json_error(start_result["error"], status_code=409)
-            new_docker_id = (start_result or {}).get("id") or previous_docker_id
+            rebuilt_id = (start_result or {}).get("id")
+            if not rebuilt_id:
+                # The previous container is already gone: falling back to
+                # previous_docker_id would rebind the record to a dead handle
+                # and audit the operation as applied.
+                try:
+                    _audit("error", previous_docker_id)
+                except Exception as exc:
+                    return _json_error(f"audit write failed: {exc}",
+                                       status_code=500)
+                return _json_error(
+                    f"{action} did not return a container id", status_code=503)
+            new_docker_id = rebuilt_id
             # Rebind the record's container handle + observed state.
             try:
                 _cr_api.update_record(workspace_id, record_id,
@@ -4785,24 +4820,6 @@ def workspace_container_resources(workspace_id: str, record_id: str,
     prev_docker_id = getattr(record, "docker_id", "") or ""
     snapshot = dict(prev_snapshot)
     snapshot.update(updates)
-
-    def _recorded_envelope(snapshot_source):
-        """Return the RECORDED isolation envelope of *snapshot_source*.
-
-        The recreate below rebuilds the container from the record's persisted
-        intent, not from the current policy: this route's ContainerManager
-        carries no session (``session_permissions=None``), so a policy-computed
-        envelope resolves to the most restrictive pair and would silently
-        downgrade the rebuilt container.  Only recorded, non-empty axes are
-        returned -- an unrecorded envelope yields ``{}`` (no override), which
-        keeps the fail-closed policy apply untouched.
-        """
-        try:
-            cfg = rebuild_config_from_snapshot(snapshot_source)
-        except Exception:
-            return {}
-        return {key: cfg[key] for key in ("network_mode", "workspace_mode")
-                if cfg.get(key)}
 
     def _resize_failed(cause, status_code):
         """Restore the record to its pre-edit intent, then try to rebuild.
