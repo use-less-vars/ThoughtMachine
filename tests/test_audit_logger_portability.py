@@ -23,7 +23,14 @@ from pathlib import Path
 import pytest
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "thoughtmachine" / "audit_logger.py"
+REPO_ROOT = MODULE_PATH.parents[1]
 DEFAULT_NAME = "container_audit.log"
+
+# Production call sites that used to append to a hardcoded /tmp path by hand.
+AUDITED_CALL_SITES = (
+    ("tools.docker_code_runner", Path("tools") / "docker_code_runner.py"),
+    ("thoughtmachine.security", Path("thoughtmachine") / "security.py"),
+)
 
 
 def _load_module():
@@ -120,6 +127,30 @@ def test_blank_env_override_falls_back_to_default(monkeypatch, tmp_path):
     module = _load_module()
 
     assert Path(module._resolve_log_path()) == vault / "logs" / DEFAULT_NAME
+
+
+def test_no_raw_open_of_hardcoded_tmp_path():
+    """No production call site may open a hardcoded ``/tmp`` path any more.
+
+    ``tools/docker_code_runner.py`` and ``thoughtmachine/security.py`` used to
+    append audit lines with ``open("/tmp/container_audit.log", "a")``, which
+    raises ``FileNotFoundError`` on Windows (no ``C:\\tmp``).  The regex only
+    matches an ``open(`` call whose first argument is a quoted ``/tmp``/``\\tmp``
+    literal, so prose mentioning ``/tmp`` in a docstring cannot false-positive.
+    """
+    pattern = re.compile(r"""open\(\s*["'`][^"'`]*[\\/]tmp[\\/]""")
+    for _, rel_path in AUDITED_CALL_SITES:
+        source = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        assert pattern.search(source) is None, f"{rel_path} still opens a hardcoded /tmp path"
+
+
+def test_audit_writes_route_through_shared_audit_event():
+    """Both call sites use the shared rotating sink instead of a local write."""
+    sink = importlib.import_module("thoughtmachine.audit_logger").audit_event
+    for module_name, rel_path in AUDITED_CALL_SITES:
+        source = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        assert "from thoughtmachine.audit_logger import audit_event" in source, rel_path
+        assert importlib.import_module(module_name).audit_event is sink, module_name
 
 
 if __name__ == "__main__":  # pragma: no cover
