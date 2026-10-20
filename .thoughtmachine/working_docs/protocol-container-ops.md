@@ -146,3 +146,63 @@ decided it.
 not there — every claim traceable to a tool response and a runtime revision.
 A run that ends with a cleaner Docker state than it started has achieved
 nothing if the report cannot say what it observed.
+
+## Amendments 2026-10-20 (gen-47 run)
+
+Append-only corrections from the gen-47 run (`124477b7`). Where an amendment
+contradicts an earlier step or a "known bug" above, the amendment wins — the
+earlier text is left in place as history, not as current truth.
+Source: `.thoughtmachine/working_docs/report-gen47-container-ops-run-2026-10-20.md`.
+
+1. **Step 1 — the runtime criterion was wrong as written.** `runtime_commit` is
+   not a per-container fact. It is resolved lazily at serialisation time from
+   the answering server process (`tools/container_control.py:55`), and a
+   container record has no such field at all
+   (`thoughtmachine/container_record/models.py:78-107`). Record it as the run's
+   *server* identity; do **not** compare it against an earlier capture to date
+   a container, and do not treat a match across containers as evidence they
+   share an image. The per-image identity is the `thoughtmachine.build_hash`
+   Docker label (`infra/containers/executor.py:83`). See `bug/container-record-runtime-commit-server-scoped`.
+
+2. **Step 2 — ephemeral containers are pooled, not created and destroyed
+   within the call.** The observable "created then destroyed" is a pool member
+   being checked out and back in. Two consequences the step did not state:
+   `/tmp` scratch does not survive between calls, and `/workspace` plus the
+   pool's writable layer are shared across calls. See §F3 of the report.
+
+3. **Step 6 — restart never recreates, and the "restart resets confinement"
+   known bug should not be reused as written.** There is a single
+   `restart()` implementation (`infra/container_manager.py:3546-3599`); it
+   stops and re-uses the same Docker object. It re-applies **no** resource
+   limit and no isolation envelope, so its "no property change" outcome holds
+   only while the Docker object still exists — the discriminator is container
+   state, not whether an agent or the panel called it. "Confinement" in this
+   codebase names host-path confinement
+   (`web_ui/backend/server.py:3053-3082`), not container resources; do not use
+   the word for container limits. See `bug/container-restart-does-not-reassert-resource-limits`.
+
+4. **Step 7 — resize is always a recreate.** Expect the Docker container id to
+   rotate; the record uuid is the durable handle and `keep_record=True` keeps
+   it across the destroy. New limits take effect only because the route
+   persists `intent_snapshot` *before* destroying
+   (`web_ui/backend/server.py:4913` then `:4919`); `_recorded_envelope`
+   (`:3926-3944`) carries the isolation axes only, never mem/CPU. Track the
+   container by record uuid, never by Docker id. See `bug/container-resize-recreates-record-uuid-durable`.
+
+5. **Step 9 — the "List and Status must agree" criterion needs an exception,
+   and the note is mutable.** `ContainerListTool` omits resource-class
+   containers by design, so a name present in Status and absent from List is
+   not a failure — resolve by name with `ContainerStatusTool` before
+   concluding anything. Separately, the known-P1 stating the note is
+   "creation-time only" is **stale**: the note lives on the record and is
+   mutable on reuse (`infra/container_manager.py:1772-1773`); what is missing
+   is a dedicated note verb, since `set_note` (`:4576-4617`) has no production
+   caller. See `bug/container-note-is-mutable-and-on-record`.
+
+6. **Any step — never read `/proc/uptime` to judge container age.** It is the
+   host kernel's uptime, not the container's (a 45-second-old container
+   reported 726865 s). Use `uptime_seconds`, which is `now - State.StartedAt`
+   computed at read time (`infra/container_manager.py:3749-3756`,
+   `:4051-4059`). It resets on restart and on recreate, so it is time since
+   the current start, not container age — do not use it to decide whether a
+   container is the same one you saw earlier; use the record uuid.
