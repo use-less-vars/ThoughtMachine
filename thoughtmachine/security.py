@@ -19,6 +19,7 @@ import uuid
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from security.resource_catalog import RESOURCE_CATALOG
+from thoughtmachine.audit_logger import audit_event
 
 # Try to import the logging facade and types
 try:
@@ -702,8 +703,7 @@ def setup_docker_sandbox(
             force_rebuild=force_rebuild,
             idle_timeout=idle_timeout
         )
-        with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | SECURITY_SETUP_DOCKER | workspace={workspace_path} network_passed={network}\n")
+        audit_event("SECURITY_SETUP_DOCKER", f"workspace={workspace_path} network_passed={network}")
         network_mode, workspace_mode = executor._compute_container_config()
         container_name = docker_executor.build_container_name(
             workspace_path,

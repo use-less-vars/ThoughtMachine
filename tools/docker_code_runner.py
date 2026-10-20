@@ -8,6 +8,7 @@ from typing import ClassVar, List, Literal, Optional, Dict, Any
 from pydantic import Field, field_validator, model_validator
 from .base import ToolBase
 
+from thoughtmachine.audit_logger import audit_event
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 
 # Worker-name context var (stdlib-only leaf module — no circular import).
@@ -406,8 +407,7 @@ chmod +x "{script_path}"
                 # ContainerManager.build_image -> docker_executor machinery);
                 # the legacy docker/executor.Dockerfile no longer exists.
                 manager.build_image(tag=self.image)
-            with open("/tmp/container_audit.log", "a") as _f:
-                _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} via_security={SECURITY_AVAILABLE}\n")
+            audit_event("CODERUNNER_EXECUTE", f"workspace={workspace} via_security={SECURITY_AVAILABLE}")
             info = manager.start(
                 image=self.image,
                 worker_name=getattr(self, "worker_name", None) or current_worker_name(),
