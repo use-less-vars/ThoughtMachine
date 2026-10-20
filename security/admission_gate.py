@@ -67,7 +67,9 @@ from security.security_gate import (
     resolve_container_config,
 )
 from thoughtmachine.container_record import (
+    LIFECYCLE_EPHEMERAL,
     LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
     consumes_workspace_slot,
     lifecycle_class_from_labels,
 )
@@ -101,6 +103,12 @@ REASON_UNKNOWN_LIFECYCLE_CLASS = "unknown_lifecycle_class"
 REASON_CAPABILITIES_REQUIRED = "capabilities_required"
 REASON_BAD_PERMISSIONS = "bad_permissions"
 REASON_RESOLUTION_FAILED = "resolution_failed"
+
+#: Lifecycle classes whose containers do NOT consume a per-workspace ceiling
+#: slot (``consumes_workspace_slot`` returns False for both), so the persistent
+#: cap is not a constraint on creating them.  Any class NOT in this set --
+#: including an unknown/absent one -- is subject to the cap (fail-closed).
+_NON_CONSUMING_LIFECYCLE_CLASSES = frozenset({LIFECYCLE_RESOURCE, LIFECYCLE_EPHEMERAL})
 
 #: The complete, closed set of reason codes an admission decision may carry.
 REASON_CODES = frozenset(
@@ -473,21 +481,29 @@ def _admit(request: Any, probes: Optional[Any]) -> Decision:
         return Deny(code, resolved.message)
 
     # ── step 6: per-workspace container limit ──────────────────────────────
-    limit = _container_limit(getattr(request, "session_config", None))
-    count = probes.workspace_container_count(workspace_id)
-    if count is None:
-        # Fail CLOSED: the count could not be observed, so we cannot prove we
-        # are under the limit. Deny with an honest, non-numeric reason.
-        return Deny(
-            REASON_CONTAINER_LIMIT_EXCEEDED,
-            f"container count unavailable (limit {limit}); failing closed",
-        )
-    if count >= limit:
-        return Deny(
-            REASON_CONTAINER_LIMIT_EXCEEDED,
-            f"container limit reached ({count}/{limit} consuming container(s)); "
-            "remove an existing container to free a slot",
-        )
+    # CLASS-AWARE: the count below is class-FILTERED (only a persistent-class,
+    # non-terminal container occupies a slot -- see _counts_toward_ceiling), so
+    # the check must be class-filtered too.  A ``resource`` (or ``ephemeral``)
+    # container does not consume a slot, so the persistent count can never be a
+    # reason to refuse creating one -- otherwise a full persistent budget
+    # permanently blocks the workspace's own resource containers (e.g. the git
+    # resource container) on a count that their creation does not increase.
+    if lifecycle_class not in _NON_CONSUMING_LIFECYCLE_CLASSES:
+        limit = _container_limit(getattr(request, "session_config", None))
+        count = probes.workspace_container_count(workspace_id)
+        if count is None:
+            # Fail CLOSED: the count could not be observed, so we cannot prove
+            # we are under the limit. Deny with an honest, non-numeric reason.
+            return Deny(
+                REASON_CONTAINER_LIMIT_EXCEEDED,
+                f"container count unavailable (limit {limit}); failing closed",
+            )
+        if count >= limit:
+            return Deny(
+                REASON_CONTAINER_LIMIT_EXCEEDED,
+                f"container limit reached ({count}/{limit} consuming container(s)); "
+                "remove an existing container to free a slot",
+            )
 
     # ── step 7: derived-policy narrowing ───────────────────────────────────
     derived = {
