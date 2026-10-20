@@ -450,3 +450,81 @@ describe('Config reset', () => {
   });
 });
 
+// ==========================================================================
+// Permissions tab — host_bash quick action
+// One PUT of the MERGED canonical grant map to /api/session/{id}/permissions.
+// ==========================================================================
+describe('Permissions tab — grant host_bash quick action', () => {
+  const SESSION_RAW = {
+    git: 'write',
+    filesystem: 'read',
+    container: false,
+    network: 'ask',
+    mcp: 'connect',
+    host_bash: 'banned',
+  };
+
+  function stubSessionPerms(raw = SESSION_RAW) {
+    const calls = [];
+    globalThis.fetch.mockImplementation(async (url, init = {}) => {
+      const text = String(url);
+      if (text.includes('/api/session/s1/permissions')) {
+        const body = init.body ? JSON.parse(init.body) : null;
+        calls.push({ url: text, method: init.method || 'GET', body });
+        if (init.method === 'PUT') {
+          // Echo the stored sidecar back (full replace semantics).
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ raw: body, effective: { ...body }, resolved_at: '2024-01-01T00:00:00Z' }),
+            text: async () => '',
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ raw: { ...raw }, effective: { ...raw }, resolved_at: '2024-01-01T00:00:00Z' }),
+          text: async () => '',
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ tools: [] }), text: async () => '' };
+    });
+    return calls;
+  }
+
+  it('PUTs host_bash allow while preserving every other session grant', async () => {
+    const calls = stubSessionPerms();
+    renderPanel({ sessionId: 's1' });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const grantButton = await screen.findByRole('button', {
+      name: 'Grant host_bash: allow to this session',
+    });
+    // GET has not landed yet → the display fallback still says 'banned' → enabled.
+    expect(grantButton).toBeEnabled();
+    fireEvent.click(grantButton);
+    await waitFor(() => {
+      expect(calls.filter((c) => c.method === 'PUT')).toHaveLength(1);
+    });
+    const put = calls.find((c) => c.method === 'PUT');
+    expect(put.url).toEqual(expect.stringContaining('/api/session/s1/permissions'));
+    // FULL REPLACE, merged: host_bash flipped, no other grant dropped.
+    expect(put.body).toEqual({ ...SESSION_RAW, host_bash: 'allow' });
+    // Once adopted, the action is a no-op and disables itself.
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: 'Grant host_bash: allow to this session' })
+      ).toBeDisabled();
+    });
+  });
+
+  it('is disabled when the session already grants host_bash allow', async () => {
+    stubSessionPerms({ host_bash: 'allow' });
+    renderPanel({ sessionId: 's1' });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const grantButton = screen.getByRole('button', {
+      name: 'Grant host_bash: allow to this session',
+    });
+    await waitFor(() => expect(grantButton).toBeDisabled());
+  });
+});
+

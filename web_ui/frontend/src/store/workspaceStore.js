@@ -336,13 +336,21 @@ const useWorkspaceStore = create((set, get) => ({
       (activeSessionId ? `?session_id=${encodeURIComponent(activeSessionId)}` : '')
 
     try {
-      const [listData, permsData, healthData, workersData, containersData, sessionsData] = await Promise.all([
+      const [listData, permsData, healthData, workersData, containersData, sessionsData, sessionPermsData] = await Promise.all([
         tryGet(`${API_BASE}/api/workspace/list`),
         tryGet(effectivePermissionsUrl),
         tryGet(`${API_BASE}/api/health/containers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/workers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers`),
         tryGet(`${API_BASE}/api/session/list?workspace_id=${encodeURIComponent(id)}`),
+        // The session's OWN uncapped grant map. The effective_permissions
+        // envelope above carries no raw map, so it is read from the disk-pure
+        // session endpoint GET /api/session/{id}/permissions, whose envelope
+        // carries the stored grants under `raw`. Only meaningful for an active
+        // session (null otherwise, which resolves to {} below).
+        activeSessionId
+          ? tryGet(`${API_BASE}/api/session/${encodeURIComponent(activeSessionId)}/permissions`)
+          : Promise.resolve(null),
       ])
 
       // Prefer a fresh list entry over the possibly-stale store copy.
@@ -388,6 +396,17 @@ const useWorkspaceStore = create((set, get) => ({
       const permissionContradictions = Array.isArray(permsData && permsData.contradictions)
         ? permsData.contradictions
         : []
+
+      // ── Session grants (raw) ──
+      // Threaded through to the sidebar's "session grant" column AS-IS: the UI
+      // must never re-derive a grant from an effective value (the effective
+      // value is already capped by the workspace ceiling and so cannot reveal
+      // what the session itself asked for). {} when there is no active session
+      // or the endpoint returned no usable raw map.
+      const sessionPermissionGrants =
+        sessionPermsData && typeof sessionPermsData.raw === 'object' && sessionPermsData.raw !== null
+          ? sessionPermsData.raw
+          : {}
 
       // ── Docker availability (tri-state) ──
       // true only when the health payload reports Docker available; false when
@@ -451,6 +470,7 @@ const useWorkspaceStore = create((set, get) => ({
         sessionDefaults,
         permissionsSessionScoped: Boolean(activeSessionId),
         permissionContradictions,
+        sessionPermissionGrants,
       }
 
       set((state) => ({

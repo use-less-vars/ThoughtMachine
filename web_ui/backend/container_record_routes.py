@@ -70,7 +70,10 @@ def _compute_drift(record: Any, workspace_id: str) -> Optional[list[dict[str, An
         import docker
 
         from thoughtmachine.container_record import RECORD_LABEL_KEY
-        from thoughtmachine.container_record.drift import detect_record_drift
+        from thoughtmachine.container_record.drift import (
+            detect_record_drift,
+            record_permissions,
+        )
         from thoughtmachine.workspace_capabilities import (
             WorkspaceCapabilities,
             load_workspace_capabilities,
@@ -89,11 +92,14 @@ def _compute_drift(record: Any, workspace_id: str) -> Optional[list[dict[str, An
                 return list(resolved)
 
         caps = load_workspace_capabilities(workspace_id) or WorkspaceCapabilities.default()
-        # permissions={} -> framework-default SessionPermissions; no ambient SessionConfig at this site (real per-workspace grants are a separate design question)
+        # The record's OWN recorded grant (v5 ``permissions`` field) feeds the
+        # policy resolution.  Passing ``{}`` made every record resolve to the
+        # framework-default profile, so a record whose recorded intent was
+        # wider than the defaults reported phantom policy drift.
         findings = detect_record_drift(
             record,
             _ResolvedContainers(),
-            permissions={},
+            permissions=record_permissions(record),
             capabilities=caps,
         )
         return [_finding_dict(finding) for finding in findings]

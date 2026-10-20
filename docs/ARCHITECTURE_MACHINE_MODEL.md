@@ -50,9 +50,20 @@ the *result*; it must never re-derive the inputs.
 
 > *"May anything run on the host at all?"*
 
-Above all other authority. Off ⇒ nothing executes on the host. On ⇒ host execution is *possible*, not
-*granted* — Gate 1 is a prerequisite, never a permission. File tools are unaffected either way (§1).
-It has never failed in testing (operator observation; no automated test covers it).
+Above all other authority *within the workspace*. Off ⇒ nothing executes on the host. On ⇒ host
+execution is *possible*, not *granted* — Gate 1 is a prerequisite, never a permission. File tools
+are unaffected either way (§1). It has never failed in testing (operator observation; no automated
+test covers it).
+
+The reason it is per-workspace rather than global, in the operator's words:
+
+> **This is per-workspace by design.** A twitter-bot workspace runs with host execution off —
+> nothing it does can reach the host. A hardware-debugging workspace runs with it on — the agent
+> needs direct hardware access. Different workspaces, different threat models, different settings.
+> Unifying this into a single global switch would make both use cases impossible to serve at once.
+>
+> The security layer never fails to enforce this. Every host-execution surface checks it before
+> acting.
 
 In code it is the per-workspace `allow_host_resources` flag in `<vault>/workspaces/<id>/config.json`,
 read by `tools/host_resource_policy.py` (only a JSON `true` passes; any lookup error denies) and
@@ -90,6 +101,17 @@ formula is now `effective = min(declared_footprint, live_session − workspace_c
 `4e96c32c` (#137), *"Wave: worker obeys session grants (fourth gate removed)"*.
 
 Assume there are more. When you find one, remove it; do not "sync" it.
+
+### Where the gates live
+
+All three gates are workspace-scoped; only Gate 3 is additionally per session. Gate 1 is above all
+other authority *within* a workspace, not above the process: there is no server-wide kill switch, and
+one workspace's answer is never another's. Gate 2 is the same kind of object one level down — a
+workspace-scoped authority over *capability* instead of over *reachability*. Both belong to the
+workspace and are set by whoever owns it; Gate 3 is where a user's own choice lives.
+
+Reading the three as one thing — "the permissions system" — is what makes people try to unify them.
+They are three authorities at three scopes, composed in the order above.
 
 ## §3 — The three container types
 

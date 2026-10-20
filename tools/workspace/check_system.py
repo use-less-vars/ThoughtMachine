@@ -1219,13 +1219,39 @@ class CheckSystem(ToolBase):
             except Exception as exc:
                 container_status = {"status": "error", "error": str(exc)}
 
+            # Provenance of the levels above, so an ambiguous reading is
+            # traceable. Mapped from signals ``_query_permissions`` already
+            # reports -- no extra probe is run here:
+            #   * "executor-disk" -- the executor's per-call, disk-authoritative
+            #     merge (persisted session grants x ceiling) -> session_sidecar.
+            #   * a non-empty permission_fetch_error -- that method failed closed
+            #     instead of reporting the raw session mirror -> fail_closed.
+            #   * "mirror-merge" / "session-mirror" / "none" -- the in-memory
+            #     session-start mirror (or no source at all); its own provenance
+            #     (persisted sidecar vs seeded defaults) is NOT observable here,
+            #     so it reports unknown rather than guessing.
+            # Neither value carries secret material: one is a fixed vocabulary
+            # string, the other the permission resolver's exception text.
             effective_permission_levels = {}
+            permission_origin = "unavailable"
+            permission_fetch_error = None
             try:
                 perms = self._query_permissions(ws_id)
                 if isinstance(perms, dict):
                     effective_permission_levels = perms.get("effective_permissions", {}) or {}
-            except Exception:
+                    fetch_error = perms.get("permission_fetch_error")
+                    if fetch_error:
+                        permission_origin = "fail_closed"
+                        permission_fetch_error = str(fetch_error)
+                    elif perms.get("permission_origin") == "executor-disk":
+                        permission_origin = "session_sidecar"
+                    else:
+                        permission_origin = "unknown"
+                else:
+                    permission_fetch_error = "permission query returned no mapping"
+            except Exception as exc:
                 effective_permission_levels = {}
+                permission_fetch_error = str(exc)
 
             allowlist_count = len(self.allowlist) if self.allowlist is not None else 0
             enabled_tools = getattr(self, "enabled_tools", None) or []
@@ -1245,12 +1271,21 @@ class CheckSystem(ToolBase):
                 "worker_limits": worker_limits,
                 "session_sandbox_status": container_status,
                 "effective_permission_levels": effective_permission_levels,
+                "permission_origin": permission_origin,
+                "permission_fetch_error": permission_fetch_error,
                 "allowlist_count": allowlist_count,
                 "enabled_tools_count": enabled_tools_count,
                 "vault_status": vault_status,
             }
         except Exception as exc:
-            return {"status": "error", "error": str(exc)}
+            # The provenance keys are present on the error shape too: an absent
+            # key is exactly what makes a reading ambiguous.
+            return {
+                "status": "error",
+                "error": str(exc),
+                "permission_origin": "unavailable",
+                "permission_fetch_error": str(exc),
+            }
 
     def _query_mcp_servers(self, ws_id: Optional[str]) -> dict:
         """Return list of configured MCP servers."""

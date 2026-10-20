@@ -28,9 +28,11 @@ drift.  Axes are emitted in a fixed order: identity, policy, runtime, image,
 hardening, restart policy.
 
 * **identity** -- the record's ``docker_id`` vs. the live container id.
-* **policy** -- the desired ``config`` network/workspace mode vs. the recorded
-  snapshot value.  Evaluated even when the live container could not be
-  inspected (it depends only on the snapshot and the resolved config).
+* **policy** -- the record's RECORDED network/workspace mode (``expected``) vs.
+  the currently RESOLVED ``config`` value (``actual``) -- the same record-vs-now
+  direction as the permission axis.  Evaluated even when the live container
+  could not be inspected (it depends only on the snapshot and the resolved
+  config).
 * **runtime / image / hardening** -- the recorded snapshot value vs. the live
   container's current value.  These require a live container; when the live
   inspection failed they are skipped.
@@ -51,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -189,6 +192,26 @@ def _lookup(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
+def record_permissions(record: Any) -> dict[str, Any]:
+    """Return the record's recorded create-time grants (``{}`` when unset).
+
+    ``Record.permissions`` is the v5 resolved-grant snapshot and is ``None`` for
+    records that predate the field.  :func:`detect_record_drift` resolves the
+    policy from this mapping, so the record's *own* grant is the only correct
+    input: an unknown grant passes through as ``{}`` (framework defaults) rather
+    than silently substituting defaults for a grant the record really carries.
+
+    Accepts either a record-like object (``record.permissions``) or a plain
+    mapping (``record['permissions']``), so a caller holding a serialised record
+    dict still gets the real grants instead of a silent ``{}``.
+    """
+    if isinstance(record, Mapping):
+        perms = record.get("permissions")
+    else:
+        perms = getattr(record, "permissions", None)
+    return dict(perms) if isinstance(perms, Mapping) else {}
+
+
 def _runtime_axis_matches(axis: str, expected: Any, actual: Any) -> bool:
     """Return True when the record's *expected* runtime value IS the live one.
 
@@ -305,8 +328,8 @@ def classify_drift(record: Any, live: Any, config: Any) -> list[DriftFinding]:
         # ── policy (snapshot + config only; no live container required) ──
         if config is not None:
             for axis in _POLICY_AXES:
-                expected = _lookup(config, axis)
-                actual = snapshot.get(axis)
+                expected = snapshot.get(axis)  # recorded intent
+                actual = _lookup(config, axis)  # resolved policy, now
                 if _nonempty(expected) and _nonempty(actual) and expected != actual:
                     findings.append(
                         _make_finding(
@@ -638,6 +661,7 @@ __all__ = [
     "EVENT_CONTAINER_STUCK_CREATING",
     "DriftFinding",
     "signature_for",
+    "record_permissions",
     "classify_drift",
     "detect_record_drift",
     "live_state_for_record",

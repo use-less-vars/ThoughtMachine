@@ -29,6 +29,19 @@ const ACTOR = 'operator'
 const DRIFT_UNVERIFIED_TEXT = 'Drift not verified for this container.'
 const DRIFT_NEUTRAL_TITLE =
   'Drift check not yet wired for this container — see backend/record-create-permission-snapshot.'
+const DRIFT_RESTART_TEXT = 'Restart to rebuild.'
+const DRIFT_RECREATE_TEXT = 'To re-align, recreate under a session with the intended grants.'
+//: The one drift class a restart cannot repair: a `policy` finding says the GRANT
+//: ENVELOPE diverges, so a restart re-creates the container from the SAME record
+//: and reproduces the same envelope.
+const DRIFT_CLASS_POLICY = 'policy'
+//: Drift classes a restart is NOT known to repair, and which have no recreate
+//: recipe of their own either: a `permission` (grant-envelope shape) or `intent`
+//: (record-vs-live intent) mismatch has no verified restart fix, so the copy only
+//: points at the findings table (the record panel renders one row per finding)
+//: instead of prescribing an unverified repair.
+const DRIFT_CLASSES_SEE_FINDINGS = ['permission', 'intent']
+const DRIFT_SEE_FINDINGS_TEXT = 'See the findings table'
 
 const EPHEMERAL_EMPTY = 'No ephemeral containers.'
 const PERSISTENT_EMPTY = 'No persistent containers.'
@@ -118,12 +131,40 @@ function memFieldLabel(entry) {
   return current ? `New limit (currently ${current})` : 'New limit'
 }
 
+// The fix line appended to the drift body. Most classes are repaired by a restart
+// EXCEPT `policy`, which is a divergence in the grant envelope rather than in the
+// container: a restart rebuilds from the same record and reproduces it, so the
+// only re-align is a recreate under a session holding the intended grants.
+// `permission` and `intent` are not verified to be restart-repairable either and
+// have no recreate recipe of their own, so their line only points at the findings
+// table. The sentences COMPOSE: a mixed set keeps every fix it needs, emitted in
+// the order recreate -> see findings -> restart, so a set that needs a restart
+// never loses that line. No readable `drift_class` on any finding -> the plain
+// restart line; the class is what selects the fix, so nothing is invented (and
+// the see-findings line is never emitted) without one.
+function driftFixHint(drift) {
+  const classes = drift
+    .map((finding) => (finding && typeof finding === 'object' ? finding.drift_class : undefined))
+    .filter((driftClass) => typeof driftClass === 'string' && driftClass !== '')
+  const parts = []
+  if (classes.includes(DRIFT_CLASS_POLICY)) parts.push(DRIFT_RECREATE_TEXT)
+  if (classes.some((driftClass) => DRIFT_CLASSES_SEE_FINDINGS.includes(driftClass))) {
+    parts.push(DRIFT_SEE_FINDINGS_TEXT)
+  }
+  const restartRepairable = classes.some(
+    (driftClass) => driftClass !== DRIFT_CLASS_POLICY && !DRIFT_CLASSES_SEE_FINDINGS.includes(driftClass)
+  )
+  if (restartRepairable) parts.push(DRIFT_RESTART_TEXT)
+  return parts.length > 0 ? parts.join(' ') : DRIFT_RESTART_TEXT
+}
+
 // Drift notice precedence (highest first); `null` means the row renders NO drift
 // element at all. Derived from the entry alone so it is unit-testable without
 // mounting the panel:
 //   1. `unavailable_reason` set (the live container's isolation is MORE
 //      permissive than this session's grant) -> red, body names the reason
 //   2. non-empty `permission_drift` array    -> neutral, body names the count
+//      and the fix its classes call for (see `driftFixHint`)
 //   3. `permission_drift === null` (unknown) -> neutral, "not verified"
 //   4. otherwise                             -> null (silent)
 // `unavailable_reason` OUTRANKS the other branches: it is the only signal that
@@ -141,9 +182,10 @@ export function driftDecision(entry) {
   }
   const drift = entry.permission_drift
   if (Array.isArray(drift) && drift.length > 0) {
+    const counted = `Container configuration has drifted from its recorded intent (${drift.length} item(s)).`
     return {
       severity: 'neutral',
-      body: `Container configuration has drifted from its recorded intent (${drift.length} item(s)). Restart to rebuild.`,
+      body: `${counted} ${driftFixHint(drift)}`,
     }
   }
   if (entry.permission_drift === null) {

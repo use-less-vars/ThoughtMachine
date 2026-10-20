@@ -345,8 +345,8 @@ def test_classify_identity_skipped_when_docker_id_blank():
 
 
 def test_classify_policy_changed():
-    # ``expected`` is the resolved config's desired value; ``actual`` is the
-    # recorded snapshot value.  The live mapping carries no ``network_mode``,
+    # ``expected`` is the recorded snapshot value; ``actual`` is the resolved
+    # config's value.  The live mapping carries no ``network_mode``,
     # so the live ``network_mode`` runtime axis ALSO reports the snapshot value
     # against that ``None`` live value.
     record = _record(intent_snapshot={"network_mode": "none"})
@@ -354,8 +354,8 @@ def test_classify_policy_changed():
     assert [f.drift_class for f in out] == [drift.CLASS_POLICY, drift.CLASS_RUNTIME]
     policy, runtime = out
     assert policy.event_type == drift.EVENT_POLICY_CONFIG_CHANGED
-    assert policy.expected == "bridge"
-    assert policy.actual == "none"
+    assert policy.expected == "none"
+    assert policy.actual == "bridge"
     assert runtime.event_type == drift.EVENT_RUNTIME_MISMATCH
     assert runtime.expected == "none"
     assert runtime.actual is None
@@ -365,8 +365,8 @@ def test_classify_policy_evaluated_without_live():
     record = _record(intent_snapshot={"network_mode": "none"})
     out = drift.classify_drift(record, None, _config("bridge", "ro"))
     assert [f.drift_class for f in out] == [drift.CLASS_POLICY]
-    assert out[0].expected == "bridge"
-    assert out[0].actual == "none"
+    assert out[0].expected == "none"
+    assert out[0].actual == "bridge"
 
 
 def test_classify_policy_skipped_without_config():
@@ -704,14 +704,15 @@ def test_detect_valid_lifecycle_reports_policy_config_drift(caps):
     out = drift.detect_record_drift(
         record, containers, permissions={}, capabilities=caps
     )
-    # Policy: the resolved config wants "none" while the recorded snapshot says
-    # "bridge".  Runtime: the snapshot's ``network_mode`` ("bridge") differs
-    # from the live container's ("none") -- both axes are reported.
+    # Policy: expected is the recorded snapshot's "bridge"; actual is what the
+    # resolved config wants, "none".  Runtime: the snapshot's ``network_mode``
+    # ("bridge") differs from the live container's ("none") -- both axes are
+    # reported.
     assert [f.drift_class for f in out] == [drift.CLASS_POLICY, drift.CLASS_RUNTIME]
     policy, runtime = out
     assert policy.event_type == drift.EVENT_POLICY_CONFIG_CHANGED
-    assert policy.expected == "none"
-    assert policy.actual == "bridge"
+    assert policy.expected == "bridge"
+    assert policy.actual == "none"
     assert runtime.event_type == drift.EVENT_RUNTIME_MISMATCH
     assert runtime.expected == "bridge"
     assert runtime.actual == "none"

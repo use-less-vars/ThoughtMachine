@@ -144,6 +144,36 @@ def test_runtime_state_returns_no_secrets(tmp_path):
     assert '"api_key"' not in text
 
 
+def test_runtime_state_reports_permission_provenance(tmp_path):
+    """runtime_state carries the provenance of its permission levels.
+
+    ``permission_origin`` names where ``effective_permission_levels`` came
+    from, so an ambiguous reading is traceable; ``permission_fetch_error``
+    carries the resolver's error text when it failed closed (None otherwise).
+    """
+    injected = {"provider": "openai", "model": "gpt-test", "api_key": "sk-secret"}
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["runtime_state"]
+    ), patch("thoughtmachine.vault.vault_root", return_value=tmp_path / "vault"):
+        tool = CheckSystem(query="runtime_state", agent_config=injected, **BASE_KWARGS)
+        text = tool.execute()
+    result = _parse_result(text)
+    assert "permission_origin" in result
+    assert isinstance(result["permission_origin"], str)
+    assert result["permission_origin"] in {
+        "session_sidecar",
+        "session_defaults",
+        "fail_closed",
+        "unavailable",
+        "unknown",
+    }
+    assert "permission_fetch_error" in result
+    assert result["permission_fetch_error"] is None or isinstance(
+        result["permission_fetch_error"], str
+    )
+    assert "sk-secret" not in text
+
+
 def test_effective_permissions_reports_canonical_git_only():
     """executor-disk dict folds the git grains into a single canonical git level."""
     with patch.object(

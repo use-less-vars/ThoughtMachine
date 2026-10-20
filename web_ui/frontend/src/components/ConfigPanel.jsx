@@ -370,6 +370,65 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     setSessionPerms({ ...sessionPerms, raw: { ...(sessionPerms.raw ?? {}), [key]: value } });
   }
 
+  // ── Shared session-permissions save (single fetch path) ──
+  // PUTs the given raw map (the endpoint is a FULL REPLACE), then adopts the
+  // echoed effective/resolved_at without overwriting the tab's raw edits — the
+  // user may have edited the tab again while the PUT was in flight, and those
+  // newer edits must survive (stay dirty until the next save) instead of being
+  // silently swallowed by echo adoption. Used by Apply AND the host_bash quick
+  // action, so the fetch/error-decoding lives here only.
+  const putSessionPermissions = async (rawMap) => {
+    // PUT only canonical session-permission keys — the backend schema rejects
+    // any other key (legacy system/execution or gate grains).
+    const payload = canonicalPermKeySubset(rawMap)
+    const res = await fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`
+      try {
+        const errData = await res.json()
+        if (errData?.detail?.errors?.length) message = errData.detail.errors.join('; ')
+        else if (typeof errData?.detail === 'string') message = errData.detail
+        else if (errData?.detail) message = JSON.stringify(errData.detail)
+      } catch { /* non-JSON error body */ }
+      throw new Error(message)
+    }
+    const data = await res.json()
+    // Applied baseline = exactly what we PUT (canonical values the backend
+    // persists unchanged).
+    setSessionPerms((prev) => ({
+      ...prev,
+      effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : (prev?.effective ?? null),
+      resolved_at: data?.resolved_at ?? null,
+    }))
+    setLastAppliedRaw(payload)
+    return data
+  }
+
+  // ── Quick action: grant host_bash 'allow' to THIS session ──
+  // Session-sidecar write through the shared helper above, MERGED into the
+  // session's current grants so no other capability is ever dropped.
+  const [grantHostBashError, setGrantHostBashError] = useState(null)
+  const handleGrantHostBash = async () => {
+    if (!sessionId || !sessionPerms) return
+    setGrantHostBashError(null)
+    try {
+      await putSessionPermissions({ ...(sessionPerms.raw ?? {}), host_bash: 'allow' })
+      // Adopt the grant into the tab's raw map too: the PUT is a full replace,
+      // so the merged map IS now the stored sidecar — the select and the dirty
+      // baseline must agree with it.
+      setSessionPerms((prev) => ({
+        ...prev,
+        raw: { ...(prev?.raw ?? {}), host_bash: 'allow' },
+      }))
+    } catch (err) {
+      setGrantHostBashError(`Failed to save permissions: ${err.message}`)
+    }
+  }
+
   // ── Apply: PUT permissions first (when a session REST source is loaded),
   // then apply_config for the rest of the draft (never carrying permissions).
   const handleApply = async () => {
@@ -386,37 +445,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
     if (sessionId && sessionPerms) {
       try {
-        // PUT only canonical session-permission keys — the backend schema rejects
-        // any other key (legacy system/execution or gate grains).
-        const rawPerms = sessionPerms.raw ?? {};
-        const payload = canonicalPermKeySubset(rawPerms);
-        const res = await fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (!res.ok) {
-          let message = `HTTP ${res.status}`;
-          try {
-            const errData = await res.json();
-            if (errData?.detail?.errors?.length) message = errData.detail.errors.join('; ');
-            else if (typeof errData?.detail === 'string') message = errData.detail;
-            else if (errData?.detail) message = JSON.stringify(errData.detail);
-          } catch { /* non-JSON error body */ }
-          throw new Error(message);
-        }
-        const data = await res.json();
-        // Applied baseline = exactly what we PUT (canonical values the backend
-        // persists unchanged). Do NOT copy the echo over sessionPerms.raw: the
-        // user may have edited the tab again while the PUT was in flight, and
-        // those newer edits must survive (stay dirty until the next Apply)
-        // instead of being silently swallowed by echo adoption.
-        setSessionPerms((prev) => ({
-          ...prev,
-          effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : (prev?.effective ?? null),
-          resolved_at: data?.resolved_at ?? null,
-        }));
-        setLastAppliedRaw(payload);
+        await putSessionPermissions(sessionPerms.raw ?? {})
       } catch (err) {
         // PUT failed: surface the error, re-enable Apply, DO NOT touch apply_config.
         setIsApplying(false);
@@ -969,6 +998,21 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Supervised host-shell access outside the sandbox. "Ask" prompts for approval before each command.
             </small>
+            {/* Quick action: writes host_bash:'allow' into the SESSION sidecar
+                (merged into the current grants), disabled once granted. */}
+            <button
+              type="button"
+              onClick={handleGrantHostBash}
+              disabled={(permsRaw.host_bash ?? CANONICAL_PERMISSION_DEFAULTS.host_bash) === 'allow'}
+              style={{ marginTop: '0.4rem', padding: '0.3rem 0.6rem', background: '#313244', color: '#cdd6f4', border: '1px solid #45475a', borderRadius: '4px', fontSize: '0.75rem', cursor: 'pointer' }}
+            >
+              Grant host_bash: allow to this session
+            </button>
+            {grantHostBashError && (
+              <div style={{ color: '#f38ba8', fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                {grantHostBashError}
+              </div>
+            )}
           </div>
 
           <p style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>

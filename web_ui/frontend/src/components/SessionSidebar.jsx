@@ -18,10 +18,71 @@ const isRunningStatus = (status) => /^(running|active|up|started)$/i.test(status
 const renderPermissionValue = (value) =>
   typeof value === 'boolean' ? (value ? 'Enabled' : 'Disabled') : (value ?? '—')
 
+// ── Ceiling-scale rank (mirror of the backend comparison) ────────────────
+// The ceiling-vs-grant comparison uses the rank table that
+// security/security_gate.py apply_workspace_ceiling actually caps with
+// (security/resource_catalog.py WORKSPACE_CEILING_LEVELS_RANKS):
+//   banned(0) < read(1) == connect(1) == none(1) < ask(2)
+//       < write_on_feature_branch(2.5) < write(3) < outbound(4) == full(4)
+// Deliberately NOT permissionVocab.PERMISSION_RANK_ORDER: that is the *grant*
+// scale (_min_permission), where read < ask and write_on_feature_branch ties
+// write — it cannot order a ceiling (a write_on_feature_branch ceiling must sit
+// strictly between ask and write, and outbound must rank as unlimited).
+const CEILING_RANK = {
+  banned: 0,
+  read: 1,
+  connect: 1,
+  none: 1,
+  ask: 2,
+  write_on_feature_branch: 2.5,
+  write: 3,
+  outbound: 4,
+  full: 4,
+}
+
+// host_bash ranks on its OWN scale — banned(0) < ask(1) < allow(2) — not the
+// generic table above ('allow' is absent there and 'ask' means something
+// else); mirror of security/security_gate.py _HOST_BASH_CEILING_RANKS.
+const HOST_BASH_CEILING_RANK = { banned: 0, ask: 1, allow: 2 }
+
+// Rank a ceiling OR session-grant value on `name`'s ceiling scale; null when
+// the value is not on that key's scale (rank undecidable). Mirrors
+// security/security_gate.py _ceiling_scale_rank. container is boolean.
+const ceilingScaleRank = (name, value) => {
+  if (typeof value === 'boolean') {
+    return name === 'host_bash' ? (value ? 2 : 0) : (value ? 3 : 0)
+  }
+  const label = String(value).toLowerCase()
+  if (label === 'true' || label === 'false') {
+    const asBool = label === 'true'
+    return name === 'host_bash' ? (asBool ? 2 : 0) : (asBool ? 3 : 0)
+  }
+  const table = name === 'host_bash' ? HOST_BASH_CEILING_RANK : CEILING_RANK
+  const rank = table[label]
+  return rank === undefined ? null : rank
+}
+
+// "Cap only" marker condition. NOTE: the brief's original phrasing said
+// "weaker than the session default"; the mechanism-true condition is
+// "ceiling above the grant" — the workspace cap is MORE PERMISSIVE than what
+// the session itself grants, so the cap alone grants nothing and the session
+// grant has to be raised to enable the capability. A STRICTER ceiling (cap
+// below the grant) and an EQUAL one show no marker: those are real caps, not
+// an inert ceiling. Undecidable ranks (unknown value, absent ceiling, absent
+// session grant) never render the marker.
+const isCapOnly = (name, ceiling, grant) => {
+  if (ceiling === undefined || ceiling === null) return false
+  if (grant === undefined || grant === null) return false
+  const ceilingRank = ceilingScaleRank(name, ceiling)
+  const grantRank = ceilingScaleRank(name, grant)
+  if (ceilingRank === null || grantRank === null) return false
+  return ceilingRank > grantRank
+}
+
 /**
  * Slide-out session details panel (toggled from the SessionTab header).
  * Four read-only/action sections:
- *  1. Permissions  — workspace ceiling + session-default effective (read-only)
+ *  1. Permissions  — workspace ceiling + session grant + effective (read-only)
  *  2. Active Tools — session tools checkboxes, applied via apply_config
  *  3. Workers      — runtime status per worker + Stop action
  *  4. Containers   — workspace containers (kind==='resource' excluded) + Start/Stop
@@ -95,6 +156,10 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
   // Session permission values that exceed their workspace ceiling, as reported
   // by the backend (carried on the workspace by the store). [] when none.
   const permissionContradictions = wsMatch ? (currentWorkspace.permissionContradictions || []) : []
+  // The session's OWN uncapped grant map, threaded through from the GET
+  // /api/session/{id}/permissions envelope key `raw`. Never recomputed
+  // client-side from the effective values (those are already ceiling-capped).
+  const sessionGrants = wsMatch ? (currentWorkspace.sessionPermissionGrants || {}) : {}
   const workers = wsMatch ? activeWorkers : []
   const containers = (wsMatch ? (currentWorkspace.containers || []) : [])
     .filter((c) => c.kind !== 'resource')
@@ -172,18 +237,31 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
               <thead>
                 <tr>
                   <th>Permission</th>
-                  <th>Ceiling (workspace max)</th>
-                  <th>{permissionsSessionScoped ? 'Effective (active session)' : 'Effective (session default)'}</th>
+                  <th>Ceiling (workspace max — cap, cannot grant)</th>
+                  <th>Session grant (your choice within the cap)</th>
+                  <th>Effective (what the agent actually has)</th>
                 </tr>
               </thead>
               <tbody>
-                {permissions.map((p) => (
-                  <tr key={p.name}>
-                    <td>{p.name}</td>
-                    <td>{renderPermissionValue(p.ceiling)}</td>
-                    <td>{renderPermissionValue(p.effective)}</td>
-                  </tr>
-                ))}
+                {permissions.map((p) => {
+                  const grant = sessionGrants[p.name]
+                  return (
+                    <tr key={p.name}>
+                      <td>{p.name}</td>
+                      <td>
+                        {renderPermissionValue(p.ceiling)}
+                        {isCapOnly(p.name, p.ceiling, grant) && (
+                          <span
+                            className="session-sidebar-cap-only"
+                            data-testid={`cap-only-${p.name}`}
+                          >{' '}cap only — will not grant; set the session grant to enable.</span>
+                        )}
+                      </td>
+                      <td>{renderPermissionValue(grant)}</td>
+                      <td>{renderPermissionValue(p.effective)}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           )}

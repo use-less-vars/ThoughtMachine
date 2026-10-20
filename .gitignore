@@ -121,6 +121,7 @@ worker_live_test.txt
 !.thoughtmachine/working_docs/reproduce_p0.py
 !.thoughtmachine/working_docs/reproduce_p0.sh
 !.thoughtmachine/working_docs/P0_REPRODUCER_README.md
+!.thoughtmachine/working_docs/ticket-*.md
 .thoughtmachine/knowledge/project/test_protocols.md
 
 # Node.js binary distribution (vendored)
