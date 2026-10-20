@@ -66,12 +66,15 @@ def _record(**overrides):
     return SimpleNamespace(**base)
 
 
-def _attrs(*, network="none", rw=True):
+def _attrs(*, network="none", rw=True, image_hash="sha256:deadbeef", cap_drop=None):
     """Build a Docker inspect ``attrs`` payload (shape consumed by snapshot.py)."""
+    host = {"NetworkMode": network, "Memory": 536870912, "OomScoreAdj": 0}
+    if cap_drop is not None:
+        host["CapDrop"] = cap_drop
     return {
-        "HostConfig": {"NetworkMode": network, "Memory": 536870912, "OomScoreAdj": 0},
+        "HostConfig": host,
         "Config": {"Image": "python:3.12"},
-        "Image": "sha256:deadbeef",
+        "Image": image_hash,
         "Mounts": [{"Destination": "/workspace", "RW": rw}],
     }
 
@@ -139,3 +142,57 @@ def test_record_permissions_reads_every_record_shape():
     copy = drift.record_permissions(_record(permissions=grants))
     copy["network"] = "banned"
     assert grants["network"] == "write"
+
+
+# -- The emission order the display relies on --------------------------------
+
+
+def test_findings_are_emitted_in_the_documented_order():
+    """One record drifting on every axis pins the detector's emission order.
+
+    ``classify_drift`` emits identity, policy, runtime, image, hardening,
+    restart policy (the fixed order stated in its module docstring), and
+    ``detect_record_drift`` appends its permission finding AFTER that list --
+    so permission is always LAST.  Reordering the class blocks in
+    ``classify_drift``, or moving the permission append, must fail here.
+
+    The lifecycle / intent classes are deliberately NOT asserted: they are
+    built in ``state.py``, not by either of these two functions.
+    """
+    # Recorded intent vs. live container: every live axis differs (network
+    # mode, image hash, dropped caps) and the record's docker_id is the OLD
+    # container's, so all of identity..restart policy fire at once.
+    intended = _attrs(network="host", image_hash="sha256:cafe0ld", cap_drop=["ALL"])
+    live = _attrs(network="none")
+    record = _record(
+        docker_id="d1",
+        restart_policy="always",
+        intent_snapshot=snapshot_from_attrs(intended),
+        permissions=dict(WIDE_PERMS),
+    )
+    # Matched by the record-owned label (docker_id "d1" != live id "d2").
+    container = FakeContainer("d2", live, labels={drift.RECORD_LABEL_KEY: "rec-1"})
+
+    findings = drift.detect_record_drift(
+        record,
+        FakeContainers([container]),
+        permissions=drift.record_permissions(record),
+        # allow_docker=False caps the recorded ``container`` grant while leaving
+        # the resolved network/workspace modes alone -> permission drift ONLY.
+        capabilities=WorkspaceCapabilities(
+            filesystem_write=True,
+            allow_docker=False,
+            allow_network=True,
+            git_available=True,
+        ),
+    )
+
+    assert [f.drift_class for f in findings] == [
+        drift.CLASS_IDENTITY,
+        drift.CLASS_POLICY,
+        drift.CLASS_RUNTIME,
+        drift.CLASS_IMAGE,
+        drift.CLASS_HARDENING,
+        drift.CLASS_RESTART_POLICY,
+        drift.CLASS_PERMISSION,
+    ]

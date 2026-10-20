@@ -28,9 +28,11 @@ drift.  Axes are emitted in a fixed order: identity, policy, runtime, image,
 hardening, restart policy.
 
 * **identity** -- the record's ``docker_id`` vs. the live container id.
-* **policy** -- the desired ``config`` network/workspace mode vs. the recorded
-  snapshot value.  Evaluated even when the live container could not be
-  inspected (it depends only on the snapshot and the resolved config).
+* **policy** -- the record's RECORDED network/workspace mode (``expected``) vs.
+  the currently RESOLVED ``config`` value (``actual``) -- the same record-vs-now
+  direction as the permission axis.  Evaluated even when the live container
+  could not be inspected (it depends only on the snapshot and the resolved
+  config).
 * **runtime / image / hardening** -- the recorded snapshot value vs. the live
   container's current value.  These require a live container; when the live
   inspection failed they are skipped.
@@ -326,8 +328,8 @@ def classify_drift(record: Any, live: Any, config: Any) -> list[DriftFinding]:
         # ── policy (snapshot + config only; no live container required) ──
         if config is not None:
             for axis in _POLICY_AXES:
-                expected = _lookup(config, axis)
-                actual = snapshot.get(axis)
+                expected = snapshot.get(axis)  # recorded intent
+                actual = _lookup(config, axis)  # resolved policy, now
                 if _nonempty(expected) and _nonempty(actual) and expected != actual:
                     findings.append(
                         _make_finding(

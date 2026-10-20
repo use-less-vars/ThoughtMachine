@@ -737,6 +737,7 @@ describe('driftDecision', () => {
   const PERMS = { network: true, filesystem: 'rw', mem_limit: '512m' }
   const RESTART_TEXT = 'Restart to rebuild.'
   const RECREATE_TEXT = 'To re-align, recreate under a session with the intended grants.'
+  const SEE_FINDINGS_TEXT = 'See the findings table'
 
   it('returns null when permission_drift is an empty array (no drift recorded)', () => {
     expect(driftDecision({ id: 'a', permissions: PERMS, permission_drift: [] })).toBeNull()
@@ -794,6 +795,66 @@ describe('driftDecision', () => {
     })
     expect(decision.body).toContain(RESTART_TEXT)
     expect(decision.body).not.toContain(RECREATE_TEXT)
+  })
+
+  // `permission` / `intent` findings are NOT verified to be repair-by-restart:
+  // with no other kind present the copy is exactly the findings-table line (the
+  // record panel's per-finding rows) and nothing else. In a MIXED set the
+  // sentences compose (recreate -> see findings -> restart) so a set that needs a
+  // restart never loses that line.
+  it('points at the findings table, never a restart, for a permission-class finding', () => {
+    const decision = driftDecision({
+      id: 'a',
+      permissions: PERMS,
+      permission_drift: [{ drift_class: 'permission', event_type: 'drift_check' }],
+    })
+    expect(decision.body).toBe(
+      'Container configuration has drifted from its recorded intent (1 item(s)). See the findings table'
+    )
+    expect(decision.body).not.toContain(RESTART_TEXT)
+  })
+
+  it('points at the findings table, never a restart, for an intent-class finding', () => {
+    const decision = driftDecision({
+      id: 'a',
+      permissions: PERMS,
+      permission_drift: [{ drift_class: 'intent', event_type: 'drift_check' }],
+    })
+    expect(decision.body.endsWith(SEE_FINDINGS_TEXT)).toBe(true)
+    expect(decision.body).not.toContain(RESTART_TEXT)
+  })
+
+  it('keeps BOTH the see-findings line and the restart line, in that order, for permission + runtime findings', () => {
+    const decision = driftDecision({
+      id: 'a',
+      permissions: PERMS,
+      permission_drift: [
+        { drift_class: 'permission', event_type: 'drift_check' },
+        { drift_class: 'runtime', event_type: 'drift_check' },
+      ],
+    })
+    const seeFindingsAt = decision.body.indexOf(SEE_FINDINGS_TEXT)
+    const restartAt = decision.body.indexOf(RESTART_TEXT)
+    expect(seeFindingsAt).toBeGreaterThan(-1)
+    expect(restartAt).toBeGreaterThan(-1)
+    expect(seeFindingsAt).toBeLessThan(restartAt)
+    expect(decision.body).not.toContain(RECREATE_TEXT)
+  })
+
+  it('composes recreate, see findings then restart for policy + permission + runtime findings', () => {
+    const decision = driftDecision({
+      id: 'a',
+      permissions: PERMS,
+      permission_drift: [
+        { drift_class: 'permission', event_type: 'drift_check' },
+        { drift_class: 'policy', event_type: 'drift_check' },
+        { drift_class: 'runtime', event_type: 'drift_check' },
+      ],
+    })
+    expect(decision.body).toBe(
+      'Container configuration has drifted from its recorded intent (3 item(s)). ' +
+        `${RECREATE_TEXT} ${SEE_FINDINGS_TEXT} ${RESTART_TEXT}`
+    )
   })
 
   it('names BOTH fixes, recreate FIRST, when policy and restart-repairable findings coexist', () => {

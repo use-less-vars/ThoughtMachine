@@ -355,5 +355,5 @@ def test_serialise_drift_evaluates_policy_axis(vault, client, monkeypatch):
     assert drift_mod.CLASS_POLICY in classes, findings
     policy = next(f for f in findings if f["drift_class"] == drift_mod.CLASS_POLICY)
     assert policy["event_type"] == drift_mod.EVENT_POLICY_CONFIG_CHANGED
-    assert policy["expected"] == "none"
-    assert policy["actual"] == "bridge"
+    assert policy["expected"] == "bridge"
+    assert policy["actual"] == "none"

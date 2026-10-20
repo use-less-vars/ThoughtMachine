@@ -35,6 +35,13 @@ const DRIFT_RECREATE_TEXT = 'To re-align, recreate under a session with the inte
 //: ENVELOPE diverges, so a restart re-creates the container from the SAME record
 //: and reproduces the same envelope.
 const DRIFT_CLASS_POLICY = 'policy'
+//: Drift classes a restart is NOT known to repair, and which have no recreate
+//: recipe of their own either: a `permission` (grant-envelope shape) or `intent`
+//: (record-vs-live intent) mismatch has no verified restart fix, so the copy only
+//: points at the findings table (the record panel renders one row per finding)
+//: instead of prescribing an unverified repair.
+const DRIFT_CLASSES_SEE_FINDINGS = ['permission', 'intent']
+const DRIFT_SEE_FINDINGS_TEXT = 'See the findings table'
 
 const EPHEMERAL_EMPTY = 'No ephemeral containers.'
 const PERSISTENT_EMPTY = 'No persistent containers.'
@@ -124,20 +131,31 @@ function memFieldLabel(entry) {
   return current ? `New limit (currently ${current})` : 'New limit'
 }
 
-// The fix line appended to the drift body. Every class is repaired by a restart
+// The fix line appended to the drift body. Most classes are repaired by a restart
 // EXCEPT `policy`, which is a divergence in the grant envelope rather than in the
 // container: a restart rebuilds from the same record and reproduces it, so the
-// only re-align is a recreate under a session holding the intended grants. Policy
-// therefore leads, and the restart line is added only when a restart-repairable
-// finding is present alongside it. No readable `drift_class` -> the plain restart
-// line; the class is what selects the fix, so nothing is invented without one.
+// only re-align is a recreate under a session holding the intended grants.
+// `permission` and `intent` are not verified to be restart-repairable either and
+// have no recreate recipe of their own, so their line only points at the findings
+// table. The sentences COMPOSE: a mixed set keeps every fix it needs, emitted in
+// the order recreate -> see findings -> restart, so a set that needs a restart
+// never loses that line. No readable `drift_class` on any finding -> the plain
+// restart line; the class is what selects the fix, so nothing is invented (and
+// the see-findings line is never emitted) without one.
 function driftFixHint(drift) {
   const classes = drift
     .map((finding) => (finding && typeof finding === 'object' ? finding.drift_class : undefined))
     .filter((driftClass) => typeof driftClass === 'string' && driftClass !== '')
-  if (!classes.includes(DRIFT_CLASS_POLICY)) return DRIFT_RESTART_TEXT
-  const hasOther = classes.some((driftClass) => driftClass !== DRIFT_CLASS_POLICY)
-  return hasOther ? `${DRIFT_RECREATE_TEXT} ${DRIFT_RESTART_TEXT}` : DRIFT_RECREATE_TEXT
+  const parts = []
+  if (classes.includes(DRIFT_CLASS_POLICY)) parts.push(DRIFT_RECREATE_TEXT)
+  if (classes.some((driftClass) => DRIFT_CLASSES_SEE_FINDINGS.includes(driftClass))) {
+    parts.push(DRIFT_SEE_FINDINGS_TEXT)
+  }
+  const restartRepairable = classes.some(
+    (driftClass) => driftClass !== DRIFT_CLASS_POLICY && !DRIFT_CLASSES_SEE_FINDINGS.includes(driftClass)
+  )
+  if (restartRepairable) parts.push(DRIFT_RESTART_TEXT)
+  return parts.length > 0 ? parts.join(' ') : DRIFT_RESTART_TEXT
 }
 
 // Drift notice precedence (highest first); `null` means the row renders NO drift
