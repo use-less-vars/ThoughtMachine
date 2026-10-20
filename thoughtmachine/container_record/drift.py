@@ -51,6 +51,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -187,6 +188,26 @@ def _lookup(obj: Any, name: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(name)
     return getattr(obj, name, None)
+
+
+def record_permissions(record: Any) -> dict[str, Any]:
+    """Return the record's recorded create-time grants (``{}`` when unset).
+
+    ``Record.permissions`` is the v5 resolved-grant snapshot and is ``None`` for
+    records that predate the field.  :func:`detect_record_drift` resolves the
+    policy from this mapping, so the record's *own* grant is the only correct
+    input: an unknown grant passes through as ``{}`` (framework defaults) rather
+    than silently substituting defaults for a grant the record really carries.
+
+    Accepts either a record-like object (``record.permissions``) or a plain
+    mapping (``record['permissions']``), so a caller holding a serialised record
+    dict still gets the real grants instead of a silent ``{}``.
+    """
+    if isinstance(record, Mapping):
+        perms = record.get("permissions")
+    else:
+        perms = getattr(record, "permissions", None)
+    return dict(perms) if isinstance(perms, Mapping) else {}
 
 
 def _runtime_axis_matches(axis: str, expected: Any, actual: Any) -> bool:
@@ -638,6 +659,7 @@ __all__ = [
     "EVENT_CONTAINER_STUCK_CREATING",
     "DriftFinding",
     "signature_for",
+    "record_permissions",
     "classify_drift",
     "detect_record_drift",
     "live_state_for_record",

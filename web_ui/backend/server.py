@@ -844,6 +844,7 @@ async def lifespan(app: FastAPI):
             detect_record_drift,
             emit_drift_findings,
             live_state_for_record,
+            record_permissions,
         )
         from thoughtmachine.container_record.state import creating_drift_finding
         from thoughtmachine.workspace_capabilities import (
@@ -892,11 +893,15 @@ async def lifespan(app: FastAPI):
                     or WorkspaceCapabilities.default()
                 )
             caps = caps_cache[ws]
-            # permissions={} -> framework-default SessionPermissions; no ambient SessionConfig at this site (real per-workspace grants are a separate design question)
+            # The record's OWN recorded grant (v5 ``permissions`` field) feeds
+            # the policy resolution.  Passing ``{}`` pinned every record to the
+            # framework-default profile, so a record whose recorded intent was
+            # wider than the defaults reported phantom policy drift on every
+            # boot.
             findings = detect_record_drift(
                 record,
                 containers,
-                permissions={},
+                permissions=record_permissions(record),
                 capabilities=caps,
             )
             # The caller -- NOT detect_record_drift -- owns both the lifecycle
