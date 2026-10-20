@@ -303,8 +303,11 @@ describe('SessionSidebar — permissions (read-only)', () => {
     renderSidebar({ tools: [] })
     await act(async () => {})
     expect(screen.getByText('Permission')).toBeInTheDocument()
-    expect(screen.getByText('Ceiling (workspace max)')).toBeInTheDocument()
-    expect(screen.getByText('Effective (session default)')).toBeInTheDocument()
+    // Three explicit layers: the ceiling is a CAP only, the session grant is the
+    // user's choice within it, and effective is what the agent actually gets.
+    expect(screen.getByText('Ceiling (workspace max — cap, cannot grant)')).toBeInTheDocument()
+    expect(screen.getByText('Session grant (your choice within the cap)')).toBeInTheDocument()
+    expect(screen.getByText('Effective (what the agent actually has)')).toBeInTheDocument()
     expect(screen.getByText('filesystem')).toBeInTheDocument()
     // container is the one boolean resource; the sidebar renders its raw boolean
     // as the display label 'Enabled' (once for ceiling, once for effective).
@@ -331,8 +334,10 @@ describe('SessionSidebar — permissions (read-only)', () => {
     renderSidebar({ tools: [] })
     await act(async () => {})
     expect(screen.queryByText('No active session — showing defaults')).not.toBeInTheDocument()
-    // Session-scoped: the effective column is labelled for the active session.
-    expect(screen.getByText('Effective (active session)')).toBeInTheDocument()
+    // The column labels no longer depend on whether a session is active: the
+    // table always spells out ceiling → session grant → effective.
+    expect(screen.getByText('Effective (what the agent actually has)')).toBeInTheDocument()
+    expect(screen.queryByText('Effective (active session)')).not.toBeInTheDocument()
     expect(screen.queryByText('Effective (session default)')).not.toBeInTheDocument()
   })
 
@@ -369,7 +374,87 @@ describe('SessionSidebar — permissions (read-only)', () => {
       expect(row.querySelectorAll('td')[1].textContent).toBe('\u2014')
     }
     const gitRow = rows.find((r) => r.querySelectorAll('td')[0].textContent === 'git')
-    expect(gitRow.querySelectorAll('td')[2].textContent).toBe('write') // effective preserved
+    // Cell layout is now name | ceiling [1] | session grant [2] | effective [3].
+    // No session-permission route is stubbed here → the grant is unknown → em-dash.
+    expect(gitRow.querySelectorAll('td')[2].textContent).toBe('\u2014')
+    expect(gitRow.querySelectorAll('td')[3].textContent).toBe('write') // effective preserved
+  })
+
+  it('renders exactly the three layer headers: ceiling cap, session grant, effective', async () => {
+    stubBackend()
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    const section = screen.getByRole('heading', { name: 'Permissions' }).closest('section')
+    const headers = Array.from(section.querySelectorAll('thead th')).map((th) => th.textContent)
+    expect(headers).toEqual([
+      'Permission',
+      'Ceiling (workspace max — cap, cannot grant)',
+      'Session grant (your choice within the cap)',
+      'Effective (what the agent actually has)',
+    ])
+  })
+
+  it('marks a ceiling the session grant does not accept as cap-only', async () => {
+    useSessionTabsStore.setState({
+      byWorkspace: {
+        'ws-1': { tabs: [{ sessionId: 's1', title: 'T' }], activeSessionId: 's1' },
+      },
+    })
+    stubBackend({
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { host_bash: 'banned' },
+        workspace_ceiling: { host_bash: 'allow' },
+        contradictions: [],
+      }),
+      '/api/session/s1/permissions': jsonOk({
+        raw: { host_bash: 'banned' },
+        effective: { host_bash: 'banned' },
+        resolved_at: '2024-01-01T00:00:00Z',
+      }),
+    })
+    renderSidebar({ tools: [] })
+    await waitFor(() => {
+      expect(screen.getByTestId('cap-only-host_bash')).toBeInTheDocument()
+    })
+    const section = screen.getByRole('heading', { name: 'Permissions' }).closest('section')
+    const row = Array.from(section.querySelectorAll('tbody tr')).find(
+      (r) => r.querySelectorAll('td')[0].textContent === 'host_bash'
+    )
+    // ceiling 'allow' (a cap only) | session grant 'banned' | effective 'banned'
+    expect(row.querySelectorAll('td')[1].textContent).toContain('allow')
+    expect(row.querySelectorAll('td')[2].textContent).toBe('banned')
+    expect(row.querySelectorAll('td')[3].textContent).toBe('banned')
+  })
+
+  it('does not mark a ceiling the session grant already meets (let alone exceeds)', async () => {
+    useSessionTabsStore.setState({
+      byWorkspace: {
+        'ws-1': { tabs: [{ sessionId: 's1', title: 'T' }], activeSessionId: 's1' },
+      },
+    })
+    stubBackend({
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        effective_permissions: { host_bash: 'banned' },
+        workspace_ceiling: { host_bash: 'banned' },
+        contradictions: [],
+      }),
+      '/api/session/s1/permissions': jsonOk({
+        raw: { host_bash: 'allow' },
+        effective: { host_bash: 'banned' },
+        resolved_at: '2024-01-01T00:00:00Z',
+      }),
+    })
+    renderSidebar({ tools: [] })
+    // The permissive session grant renders…
+    await waitFor(() => {
+      const section = screen.getByRole('heading', { name: 'Permissions' }).closest('section')
+      const row = Array.from(section.querySelectorAll('tbody tr')).find(
+        (r) => r.querySelectorAll('td')[0].textContent === 'host_bash'
+      )
+      expect(row.querySelectorAll('td')[2].textContent).toBe('allow')
+    })
+    // …but a 'banned' ceiling is never "cap only": there is nothing to grant.
+    expect(screen.queryByTestId('cap-only-host_bash')).not.toBeInTheDocument()
   })
 
   it('surfaces permission contradictions (one <li> each) when the response reports them', async () => {
