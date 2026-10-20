@@ -122,6 +122,8 @@ worker_live_test.txt
 !.thoughtmachine/working_docs/reproduce_p0.sh
 !.thoughtmachine/working_docs/P0_REPRODUCER_README.md
 !.thoughtmachine/working_docs/ticket-*.md
+# Protocols are meant to be run by someone else — they are not scratch.
+!.thoughtmachine/working_docs/protocol-*.md
 .thoughtmachine/knowledge/project/test_protocols.md
 
 # Node.js binary distribution (vendored)
@@ -161,6 +163,9 @@ docs/*
 !docs/param_ownership_map.md
 !docs/container_p0_bug4_git_fallback.md
 !docs/container_subsystem_audit.md
+# KB policy: the three document tiers (Public docs / Internal KB / Diary).
+# Public tier ships with the repo — every docs/ file needs its own line.
+!docs/KB_POLICY.md
 
 # Hygiene cleanup (2026-08-28): vendored pytest site-packages + pytest cache
 pytest_install/
