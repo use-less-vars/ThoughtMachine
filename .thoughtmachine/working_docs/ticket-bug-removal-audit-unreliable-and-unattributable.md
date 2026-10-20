@@ -1,11 +1,13 @@
-# Ticket: bug/container-removal-audit-not-attributable
+# Ticket: bug/removal-audit-unreliable-and-unattributable
 
 **Filed:** Gen 47, 2026-10-20 at `124477b7`
-**Source:** gen-47 container-ops run (F8); code verified at `124477b7`
+**Source:** gen-47 container-ops run (F8); code verified at `124477b7`. Renamed from bug/container-removal-audit-not-attributable — the swallowed publish failure is the sharper half and the title must carry both.
 **Report cross-ref:** `.thoughtmachine/working_docs/report-gen47-container-ops-run-2026-10-20.md` §F8 under `## Findings` (line 361); run evidence `### Step 9` (line 253).
 **Status:** filed, not dispatched.
 
 ## Defect
+
+Two defects share one event. The audit trail is *unattributable* — no actor field, and `session_id` is `None` on every site that is not the manager's own remove. It is also *unreliable* — publish is wrapped in a bare `try/except: pass` (`infra/container_manager.py:4937-4945`), so an event that cannot be attributed is also an event that can vanish without trace. Either alone would be a completeness gap; together they mean the removal of a shared container can leave no durable evidence at all.
 
 The `container_removed` event cannot attribute who removed a container, and frequently cannot even name the session.
 
@@ -28,4 +30,4 @@ Fix shape: add an `actor` field to the payload and thread a real `session_id` th
 
 ## Bearing
 
-Any post-hoc attribution question about a removed container (F8 itself, and the protocol's removal step) cannot be answered from the event stream alone. Also bears on `ticket-bug-container-resize-recreates-record-uuid-durable.md`: `remove()` takes `audit_reason`/`audit_source` (`infra/container_manager.py:3613` onward) separately from the event's own `reason` argument (`:4923`), so the resize attribution lives in the audit log, not in the event stream.
+Any post-hoc attribution question about a removed container (F8 itself, and the protocol's removal step) cannot be answered from the event stream alone. Also bears on `ticket-bug-container-created-by-not-a-record-field.md`: `remove()` takes `audit_reason`/`audit_source` (`infra/container_manager.py:3613` onward) separately from the event's own `reason` argument (`:4923`), so the resize attribution lives in the audit log, not in the event stream.

@@ -20,4 +20,4 @@ Fix shape: add `ContainerResizeTool` that delegates to the same recreate sequenc
 
 ## Bearing
 
-Protocol step 7 is operator-only until this lands. It also constrains `ticket-bug-container-resize-recreates-record-uuid-durable.md`: a tool must reproduce `audit_reason="resize_recreate"` and `audit_source="server.workspace_container_resources"` (`web_ui/backend/server.py:4919-4923`) or its destroys will be indistinguishable from user removals in the audit trail.
+Protocol step 7 is operator-only until this lands. It also constrains `ticket-bug-container-created-by-not-a-record-field.md`: a tool must reproduce `audit_reason="resize_recreate"` and `audit_source="server.workspace_container_resources"` (`web_ui/backend/server.py:4919-4923`) or its destroys will be indistinguishable from user removals in the audit trail.

@@ -187,7 +187,7 @@ Source: `.thoughtmachine/working_docs/report-gen47-container-ops-run-2026-10-20.
    persists `intent_snapshot` *before* destroying
    (`web_ui/backend/server.py:4913` then `:4919`); `_recorded_envelope`
    (`:3926-3944`) carries the isolation axes only, never mem/CPU. Track the
-   container by record uuid, never by Docker id. See `bug/container-resize-recreates-record-uuid-durable`.
+   container by record uuid, never by Docker id. See `bug/container-created-by-not-a-record-field`.
 
 5. **Step 9 — the "List and Status must agree" criterion needs an exception,
    and the note is mutable.** `ContainerListTool` omits resource-class
