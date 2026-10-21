@@ -1641,10 +1641,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         #      so it opens a fresh tab. The old session+tab stays untouched.
                         #
                         #    - **Existing session with NO conversation** (empty/fresh tab):
-                        #      reuse the same tab; the session's workspace_id is immutable once
-                        #      set, so the session RECORD stays in its own workspace (the store
-                        #      redirects the save back to it) — only the tab/config switch to
-                        #      the new workspace, no new tab created.
+                        #      reuse the same tab and perform an owner-initiated rebind of
+                        #      the session's workspace stamp, so the record follows the
+                        #      session into the new workspace (the stale copy in the old
+                        #      one is deleted) — no new tab created.
                         #
                         #    - **No existing session**: create a fresh one.
                         #
@@ -1699,12 +1699,22 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 })
                             elif existing_session is not None:
                                 # No conversation (empty/fresh tab) — reuse the same tab. The
-                                # session's workspace_id is immutable once persisted, so the store
-                                # keeps the record in its recorded workspace; the tab's workspace
-                                # binding (bridge) is what moves.
+                                # workspace switch rebinds the session's workspace stamp (the
+                                # only sanctioned move) and saves the record into the NEW
+                                # workspace, then deletes the copy left behind in the old one
+                                # so no duplicate survives.
                                 bridge._loaded_session = existing_session
                                 _session_bridges[existing_session.session_id] = bridge
+                                old_workspace_id = existing_session.workspace_id
+                                existing_session.rebind_workspace(workspace_id, reason="apply_config workspace switch")
                                 session_store.save_session(existing_session, workspace_id=workspace_id)
+                                if old_workspace_id and old_workspace_id != workspace_id:
+                                    # Move semantics: the record now lives in the new workspace; drop the
+                                    # stale copy (and its _meta_ file) left in the previous one so reads
+                                    # cannot resolve the old location.
+                                    if not session_store.delete_session(existing_session.session_id, workspace_id=old_workspace_id):
+                                        # The previous copy lived in the workspace-agnostic legacy dir.
+                                        session_store.delete_session(existing_session.session_id)
                                 log('INFO', 'server',
                                     f"apply_config: updated existing session {existing_session.session_id} "
                                     f"to workspace {workspace_id} (no conversation — kept same tab)")
