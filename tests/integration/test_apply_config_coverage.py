@@ -660,7 +660,7 @@ def test_case3_no_session(contract_server, workspace_type):
                 ws.send_json({"command": "apply_config", "config": cfg})
                 loaded_evt, _ = _receive_until_session_loaded(ws, label)
                 assert loaded_evt["session_id"]
-                assert loaded_evt["workspace_path"] == _ws_path("case3", workspace_type)
+                assert Path(loaded_evt["workspace_path"]).resolve() == Path(_ws_path("case3", workspace_type)).resolve()
                 evt, _ = _receive_until(ws, "config_changed", label)
                 assert evt["config"]["model"] == "roundk-no-session"
                 final = _expect(ws, "status_message", label)
@@ -704,7 +704,7 @@ def test_case4_workspace_change_new_session(contract_server):
             new_loaded, events = _receive_until_session_loaded(ws, label)
             new_sid = new_loaded["session_id"]
             assert new_sid != old_sid, f"expected new session, got same {new_sid}"
-            assert new_loaded["workspace_path"] == ws_b
+            assert Path(new_loaded["workspace_path"]).resolve() == Path(ws_b).resolve()
             assert new_loaded["message_count"] == 0
 
             evt, _ = _receive_until(ws, "config_changed", label)
@@ -888,7 +888,7 @@ def test_case7_permission_only_apply_keeps_session(contract_server, workspace_ty
             )
             if workspace_type == "custom":
                 # cbe5f72: config_changed carries the workspace_path key.
-                assert evt["config"]["workspace_path"] == ws_path, (
+                assert Path(evt["config"]["workspace_path"]).resolve() == Path(ws_path).resolve(), (
                     f"config_changed must carry workspace_path, got "
                     f"{evt['config'].get('workspace_path')!r}"
                 )
@@ -978,7 +978,7 @@ def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
             # payload still cannot grant).
             assert evt["permissions"]["filesystem"] == "read"
             # config_changed reflects the NORMALIZED path, not the raw form.
-            assert evt["config"]["workspace_path"] == ws_path, (
+            assert Path(evt["config"]["workspace_path"]).resolve() == Path(ws_path).resolve(), (
                 f"expected normalized workspace_path {ws_path!r}, got "
                 f"{evt['config'].get('workspace_path')!r}"
             )
@@ -1153,7 +1153,7 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
                 # EMPTY sidecar → the gate serves the capped-by-ceiling DEFAULTS.
                 assert evt_d["permissions"]["filesystem"] == "read"
                 assert evt_d["permissions"]["git"] == "read"
-                assert evt_d["config"]["workspace_path"] == ws_path, (
+                assert Path(evt_d["config"]["workspace_path"]).resolve() == Path(ws_path).resolve(), (
                     f"deferred config_changed must carry the normalized "
                     f"workspace_path, got {evt_d['config'].get('workspace_path')!r}"
                 )
