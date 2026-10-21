@@ -128,7 +128,7 @@ class KnowledgeBaseTool(ToolBase):
 
     Use this tool to store and retrieve project information that persists
     across sessions. The knowledge base lives in `.thoughtmachine/knowledge/`
-    (workspace scope) or `~/.thoughtmachine/knowledge/` (global scope).
+    (workspace scope) or `~/.thoughtmachine/global/` (global scope).
     Use the ``scope`` parameter (``workspace`` or ``global``) to select which KB to use.
 
     **Workspace scope:** Local to the project, organized into domains:
@@ -234,7 +234,7 @@ class KnowledgeBaseTool(ToolBase):
         description=(
             "Which knowledge base to use: workspace (project-local, "
             ".thoughtmachine/knowledge/) or global (user-wide, "
-            "~/.thoughtmachine/knowledge/)."
+            "~/.thoughtmachine/global/)."
         ),
     )
 
@@ -395,17 +395,34 @@ class KnowledgeBaseTool(ToolBase):
         if self.scope == "global":
             # ── Global scope ────────────────────────────────────────────────
             system_path = kb_root / "system" / f"{domain_name}.md"
-            user_path = kb_root / "user" / f"{domain_name}.md"
 
             if for_write:
+                # Write-target hardening: the name must be a single path-free
+                # component, and the target is then built with the literal
+                # `user/` prefix -- so a write can never land anywhere else in
+                # the global KB (in particular never system/, which is
+                # read-only), regardless of what exists on disk.
+                if (
+                    not domain_name
+                    or "/" in domain_name
+                    or "\\" in domain_name
+                    or ".." in domain_name
+                ):
+                    raise ValueError(
+                        f"Invalid domain name '{domain_name}': the name must be "
+                        f"non-empty and must not contain '/', '\\' or '..'."
+                    )
                 if system_path.exists():
                     raise ValueError(
                         f"Domain '{domain_name}' is a system domain and is read-only. "
                         f"Use a different domain name for personal notes, or use scope=workspace."
                     )
-                # Always write to user/
+                # Always write to user/ (fixed prefix, never derived from disk)
+                user_path = kb_root / "user" / f"{domain_name}.md"
                 _assert_inside_kb(user_path)
                 return user_path, f"user/{domain_name}.md"
+
+            user_path = kb_root / "user" / f"{domain_name}.md"
 
             # Read: check system/ first, then user/
             if system_path.exists():
@@ -558,7 +575,7 @@ class KnowledgeBaseTool(ToolBase):
         Lists domains from system/ (read-only) and user/ (writable) directories.
         """
         lines = ["## Global Knowledge Base - Available Domains\n"]
-        lines.append("> **Scope:** `global` — the knowledge base at `~/.thoughtmachine/knowledge/`")
+        lines.append("> **Scope:** `global` — the knowledge base at `~/.thoughtmachine/global/`")
         lines.append("> Domains in `system/` are read-only built-in reference materials.")
         lines.append("> Domains in `user/` are writable personal notes.\n")
 
@@ -596,11 +613,8 @@ class KnowledgeBaseTool(ToolBase):
         lines.append("")
         lines.append("**Usage:**")
         lines.append("- `mode=read domain=<name> scope=global` — View a global domain")
-        lines.append("- `mode=append domain=<name> scope=global entry=\"...\"` — Add a timestamped entry to a user domain")
-        lines.append("- `mode=update domain=<name> scope=global section=\"...\" new_content=\"...\"` — Update a user domain section")
         lines.append("- `mode=search query=<term> scope=global` — Search across all global KB files")
         lines.append("- `mode=status scope=global` — Show current status and recent activity")
-        lines.append("- `mode=create_domain domain=<name> scope=global category=user` — Add a new user domain")
         return "\n".join(lines)
 
     def _mode_search(self, kb_root: Path) -> str:
@@ -749,6 +763,22 @@ class KnowledgeBaseTool(ToolBase):
                     f"Only 'user' category is supported (system/ is read-only)."
                 )
 
+            # Write-target hardening (defence in depth: the `^[a-zA-Z0-9_]+$`
+            # check above already rejects these). The write target below is
+            # built with the literal `user/` prefix so it can never be
+            # anywhere else in the global KB.
+            if (
+                not domain_name
+                or "/" in domain_name
+                or "\\" in domain_name
+                or ".." in domain_name
+            ):
+                return (
+                    f"Error: Invalid domain name '{self.domain}'. "
+                    f"Domain names must be non-empty and must not contain "
+                    f"'/', '\\' or '..'."
+                )
+
             # Check if domain already exists in system/ (read-only) or user/
             system_path = kb_root / "system" / f"{domain_name}.md"
             user_path = kb_root / "user" / f"{domain_name}.md"
@@ -757,6 +787,7 @@ class KnowledgeBaseTool(ToolBase):
             if user_path.exists():
                 return f"Domain '{domain_name}' already exists at `user/{domain_name}.md`."
 
+            # Fixed prefix: validated name only, never derived from disk state.
             rel_path = f"user/{domain_name}.md"
             file_path = user_path
         else:
@@ -898,7 +929,7 @@ class KnowledgeBaseTool(ToolBase):
 
         domain_name = self.domain.lower().replace(" ", "_")
         try:
-            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name, for_write=True)
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name)
         except ValueError as e:
             return str(e)
 
@@ -1145,7 +1176,10 @@ class KnowledgeBaseTool(ToolBase):
 
         domain_name = self.domain.lower().replace(" ", "_")
         try:
-            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name)
+            # for_write=True: resolve as a WRITE target so a system domain is
+            # refused (the read branch would hand back system/<domain>.md and
+            # the write below would overwrite a read-only system doc).
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name, for_write=True)
         except ValueError as e:
             return str(e)
 
