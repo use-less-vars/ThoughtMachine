@@ -2243,10 +2243,19 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             try:
                                 for entry in session_store.list_sessions(
                                         workspace_id=_ls_scope):
-                                    if not isinstance(entry, dict):
+                                    if isinstance(entry, dict):
+                                        row = dict(entry)
+                                        row.setdefault("workspace_id", _ls_scope)
+                                    elif hasattr(entry, "to_dict"):
+                                        # A store may hand back Session model
+                                        # objects instead of row dicts; convert
+                                        # them with the model's own serialiser
+                                        # rather than silently dropping them.
+                                        row = dict(entry.to_dict() or {})
+                                        if not row.get("workspace_id"):
+                                            row["workspace_id"] = _ls_scope
+                                    else:
                                         continue
-                                    row = dict(entry)
-                                    row.setdefault("workspace_id", _ls_scope)
                                     sessions.append(row)
                             except Exception as exc:
                                 log('WARNING', 'server.config',
@@ -3418,14 +3427,18 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         continue
 
                     # A prompt may only be answered by the connection it was
-                    # raised on.  An unknown request_id keeps the historical
-                    # behaviour (resolve_security_prompt no-ops for unknown ids).
+                    # raised on, and only if this server actually forwarded it to
+                    # a connection at all.  An unknown request_id is default-DENY:
+                    # nothing was ever asked of any socket, so no socket is
+                    # entitled to answer it (resolve_security_prompt would
+                    # otherwise honour the decision blindly).
                     _asker = _escalation_asker(request_id)
-                    if _asker is not None and _asker != id(ws):
+                    if _asker != id(ws):
                         await ws.send_json({
                             "type": "status_message",
                             "text": "⚠ security_response: this prompt was raised "
-                                    "for a different connection and cannot be "
+                                    "for a different connection (or was never "
+                                    "issued to this connection) and cannot be "
                                     "answered here.",
                         })
                         continue

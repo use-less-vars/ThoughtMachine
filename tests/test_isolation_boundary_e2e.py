@@ -38,6 +38,7 @@ import queue
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -1124,3 +1125,136 @@ def test_list_sessions_does_not_enumerate_other_workspace_sessions(iso_server, c
         f"ENUMERATION LEAK: workspace B's id {ws_b_id!r} appears in the sessions_list "
         f"payload sent to an A-bound socket: {blob[:_MAX_TEXT]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ruling 3 — a security_response for a request_id no socket was asked must be
+# refused (default-deny), never quietly resolved.
+# ---------------------------------------------------------------------------
+
+def _seed_pending_prompt(request_id):
+    """Register a response queue exactly as security.py does before a prompt."""
+    from thoughtmachine.security import _pending_requests_lock, _pending_security_requests
+
+    q = queue.Queue(maxsize=1)
+    with _pending_requests_lock:
+        _pending_security_requests[request_id] = q
+    return q
+
+
+def _drop_pending_prompt(request_id):
+    from thoughtmachine.security import _pending_requests_lock, _pending_security_requests
+
+    with _pending_requests_lock:
+        _pending_security_requests.pop(request_id, None)
+
+
+def _is_security_refusal(events):
+    """True if the server answered with a security_response refusal status."""
+    return any(
+        e.get("type") == "status_message"
+        and "security_response" in (e.get("text") or "")
+        and "cannot be" in (e.get("text") or "")
+        for e in events
+    )
+
+
+def test_unknown_security_response_request_id_refused(iso_server, capfd):
+    """A security_response no socket is entitled to answer must be refused.
+
+    Modelled on ``test_close_session_cannot_kill_other_workspace_workers``:
+    attack legs first, then a CONTROL proving the refusal is real (an entitled
+    socket's answer IS applied) — otherwise "refused" would be vacuous.
+    """
+    app, tmp_home, server_mod = iso_server
+    client = H.make_client(app)
+
+    with capfd.disabled():
+        ws_a_id, _root_a, ws_b_id, _root_b = _two_workspaces_full(
+            client, tmp_home, "secresp")
+        sid_a = H.create_session(client, workspace_id=ws_a_id)
+        sid_b = H.create_session(client, workspace_id=ws_b_id)
+
+    cm, pump = _open_bound_ws(client, sid_a, ws_a_id)
+    cm_b, pump_b = _open_bound_ws(client, sid_b, ws_b_id)
+    rid_unknown = str(uuid.uuid4())
+    rid_other = str(uuid.uuid4())
+    rid_ctl = str(uuid.uuid4())
+    q_unknown = _seed_pending_prompt(rid_unknown)
+    q_other = _seed_pending_prompt(rid_other)
+    q_ctl = _seed_pending_prompt(rid_ctl)
+    try:
+        # (1) ATTACK: a request_id that was never issued to any connection.
+        events, _cap = _cmd_captured(
+            pump,
+            {"command": "security_response", "request_id": rid_unknown,
+             "approved": True},
+            {"status_message"},
+            capfd,
+        )
+        with capfd.disabled():
+            print(f"[VERDICT] security_response(unknown rid) -> events={events!r}")
+            print(f"[VERDICT] unknown-rid queue still pending={not q_unknown.empty()}")
+        assert _is_security_refusal(events), (
+            "BREACH: the server accepted a security_response for a request_id it "
+            f"never issued to this socket (no refusal status_message); events={events!r}"
+        )
+        assert q_unknown.empty(), (
+            "BREACH: an unissued request_id was resolved — the decision reached "
+            "the pending queue, so an attacker can approve an unasked prompt"
+        )
+        from thoughtmachine.security import _pending_security_requests
+        assert rid_unknown in _pending_security_requests, (
+            "BREACH: the unissued request_id was popped from the pending registry"
+        )
+
+        # (2) SECOND ATTACK SHAPE: the same id sent on a SECOND bound socket
+        # (workspace B) is refused just the same — the refusal is not an
+        # artefact of one connection.
+        events_b, _cap_b = _cmd_captured(
+            pump_b,
+            {"command": "security_response", "request_id": rid_unknown,
+             "approved": True},
+            {"status_message"},
+            capfd,
+        )
+        with capfd.disabled():
+            print(f"[VERDICT] security_response(unknown rid) on B socket -> "
+                  f"events={events_b!r}")
+        assert _is_security_refusal(events_b), (
+            "BREACH: a B-bound socket resolved a request_id no socket was asked; "
+            f"events={events_b!r}"
+        )
+        assert q_unknown.empty(), (
+            "BREACH: the unissued request_id was resolved by a second socket"
+        )
+
+        # (3) CONTROL: the handler itself is live — the pre-existing empty-id
+        # refusal still fires, so the refusal above is a real branch and not a
+        # dropped/ignored command.
+        events_ctl, _cap_ctl = _cmd_captured(
+            pump,
+            {"command": "security_response", "request_id": "", "approved": True},
+            {"status_message"},
+            capfd,
+        )
+        with capfd.disabled():
+            print(f"[CONTROL] security_response(empty rid) -> events={events_ctl!r}")
+        assert any(
+            e.get("type") == "status_message"
+            and "request_id is required" in (e.get("text") or "")
+            for e in events_ctl
+        ), (
+            "CONTROL FAILED: the security_response handler did not answer at all, "
+            f"so the refusal above proves nothing; events={events_ctl!r}"
+        )
+        assert server_mod._escalation_asker(rid_unknown) is None, (
+            "BREACH: an unissued request_id ended up in the asker registry"
+        )
+    finally:
+        _drop_pending_prompt(rid_unknown)
+        _drop_pending_prompt(rid_other)
+        _drop_pending_prompt(rid_ctl)
+        _close_ws(cm_b)
+        _close_ws(cm)
+
