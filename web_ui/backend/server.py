@@ -2946,6 +2946,32 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
 
                 elif command == "new_session":
+                    # Ownership gate (Attack 6 / R8): a connection that already has
+                    # a workspace scope must not be re-scoped by client input. The
+                    # handler below assigns bridge._workspace_id from
+                    # msg["workspace_id"], so without this check one command would
+                    # let a socket bound to workspace A adopt workspace B's
+                    # identity and then pivot onto B's sessions through every
+                    # other gate. Nothing with a side effect may run before the
+                    # check (notably not bridge.save_session() / bridge.stop()).
+                    # A scopeless connection (bootstrap) keeps its previous
+                    # behaviour: the REST create flow and the contract tests
+                    # rely on it.
+                    _ns_cur_ws = bridge.workspace_id if bridge is not None else None
+                    _ns_req_ws = msg.get("workspace_id") or None
+                    if _ns_cur_ws and _ns_req_ws and _ns_req_ws != _ns_cur_ws:
+                        log('WARNING', 'server',
+                            f"new_session refused: connection is scoped to workspace "
+                            f"{_ns_cur_ws} and cannot switch to {_ns_req_ws}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": (
+                                f"New session refused: this connection is scoped to "
+                                f"workspace {_ns_cur_ws} and cannot switch to "
+                                f"{_ns_req_ws}."
+                            ),
+                        })
+                        continue
                     # Save current session before switching
                     if bridge is not None and bridge.session is not None:
                         bridge.save_session()
