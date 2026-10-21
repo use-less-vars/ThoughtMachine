@@ -1,7 +1,7 @@
 # Ticket: security/commit-hook-gate-not-installed
 
 **Filed:** 2026-10-21, from the session-persistence pass at `9d5ed869` (found while auditing what a `git commit` is allowed to run; the directory both execution modes resolve hooks from does not exist anywhere in the tree, and nothing in the product creates it).
-**Severity:** HIGH — both modes advertise the same gate ("hooks may only originate from `.githooks`"), but container mode points `core.hooksPath` at `<workspace>/.githooks`, which nothing ever creates, and host mode's only guard is a refusal that fires *only if* `.githooks/pre-commit` already exists. Today commits run **zero** hooks in either mode, and `thoughtmachine/security.py`'s stated reason for leaving `.git/hooks` unblocked is that absent directory.
+**Severity:** HIGH — both modes advertise the same gate ("hooks may only originate from `.githooks`"), but container mode points `core.hooksPath` at `<workspace>/.githooks`, which nothing ever creates, and host mode's only guard is a refusal that fires *only if* `.githooks/pre-commit` already exists. Today commits run **zero** hooks in either mode, and `thoughtmachine/security.py`'s stated reason for leaving `.git/hooks` unblocked is that absent directory. This ticket is also the record of that false claim: `thoughtmachine/security.py:76-80` asserts as fact that commits run only the policy-owned `.githooks` directory, which is precisely the payload that is missing (quoted in `## Circular justification`).
 **Status:** open; verified by read + `find`/`grep` at `9d5ed869`, not exercised at runtime. NOT blocking, NOT to be fixed in this wave (the actual gate is `ticket-feat-pre-commit-gate-hook.md`).
 
 ## Finding
@@ -70,9 +70,29 @@ The stated security boundary — "the resource container IS the security boundar
 
 It also mis-signals the roadmap. This ticket is not "hooks are broken" — it is "the gate was designed and its shell exists, but the payload was never installed, and two documents assert otherwise."
 
+## Circular justification
+
+`thoughtmachine/security.py:76-80`, verbatim — the block that decides `.git/hooks` stays unblocked:
+
+```
+76: # .git/hooks itself is NOT blocked because git never consults it anymore:
+77: # commits run ONLY the policy-owned workspace .githooks directory (container
+78: # path injects -c core.hooksPath=/workspace/.githooks — the container-mapped
+79: # absolute workspace path) and the host fallback neutralizes
+80: # hooks entirely via core.hooksPath=/dev/null + --no-verify.
+```
+
+(`thoughtmachine/security.py:352` repeats the smaller version of the same claim, naming `.git/hooks/pre-commit` in a docstring example of what is not consulted.)
+
+Put plainly: **the excuse for not enforcing a guard cites a guard that is not installed.** Every clause of `:76-80` is true of the code and false of the tree — the container does inject `core.hooksPath=/workspace/.githooks`, it is never repo-local `.git/hooks`, and the host fallback does neutralize hooks entirely — but the policy-owned directory those sentences rest on exists nowhere. The `find`/`grep` evidence and the `resources/MANIFEST.json` argument are in `## Finding` above and are not repeated here; what this section adds is the conclusion that block is being used to support.
+
+Consequence, for the record: a reviewer reading `security.py:76-80` concludes that repository hooks are honoured under policy control in both modes, when in fact nothing runs. The comment does not merely describe a gap — it closes off the question that would have surfaced the gap, which is why the stale audit doc (`docs/git_resource_execution_audit.md:43`) was written to agree with it rather than with the tree.
+
+This is the identical defect as `## Finding`'s missing payload, recorded from the other end: the payload is absent from the tree, and the stated reason for not blocking the alternative names that payload as though it were installed. Correcting the comment is part of disposition **C** below (item 1) — it is not a documentation nicety but the removal of the false premise the whole justification rests on.
+
 ## Disposition options
 
-- **A. Install a hook into the user's project.** Rejected for now: `<project>/.githooks` is user-owned, so the product would be writing executable content into a repository it does not own, and `resources/MANIFEST.json` cannot express that destination. This is also the wrong ticket to decide it in — it is `ticket-feat-pre-commit-gate-hook.md`, and that ticket's job is to *define* what the hook runs.
+- **A. Install a hook into the user's project.** Rejected for now: `<project>/.githooks` is user-owned, so the product would be writing executable content into a repository it does not own, and `resources/MANIFEST.json` cannot express that destination. This is also the wrong ticket to decide it in — it is `ticket-feat-pre-commit-gate-hook.md`, and that ticket's job is to *define* what the hook runs. That decision is now taken — that ticket's `## Destination (decided)` provisions the payload into `<vault>/workspaces/<id>/.githooks` and fixes the resolver, so the rejection of a hook in the user's project stands and this option stays closed.
 - **B. Delete the `core.hooksPath` wiring and rely on `.git/hooks`.** Rejected: it re-opens the `.git/hooks` surface that `security.py:76-80` deliberately closed, and it throws away the one place a policy-owned hook could be honoured once it exists.
 - **C. Leave the wiring, correct the claims, and make the absence explicit.** *This is the recommendation.* Concretely: (1) amend the `security.py:76-80` rationale so it does not assert a policy-owned hook directory that is not installed — state that repository hooks are neutralized in both modes and that the `.githooks` mount is a *reserved* location, not an active gate; (2) correct `docs/git_resource_execution_audit.md:43` and its stale `:27`/`:28`/`:36` references; (3) add one assertion that makes the reserved-location status visible — a test that asserting `Path(_resolved_workspace_path)/".githooks"` exists is expected to FAIL today, or an explicit `@pytest.mark.xfail`-style marker naming this ticket. Do not add the directory itself here; that is #2's install decision.
 
