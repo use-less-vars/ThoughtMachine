@@ -795,10 +795,15 @@ class CheckSystem(ToolBase):
 
     def _query_running_workers(self) -> dict:
         """Return list of currently running workers with status details."""
+        # The registry is process-global: scope to this session (fail-closed) so
+        # another session's worker name / current_task never leaks into the payload.
+        session_id = self.session_id or ""
         running = []
         if WORKER_REGISTRY_AVAILABLE and _worker_registry is not None and _registry_lock is not None:
             with _registry_lock:
                 for key, thread in list(_worker_registry.items()):
+                    if not isinstance(key, tuple) or key[0] != session_id:
+                        continue
                     entry = {
                         "name": key[1] if isinstance(key, tuple) else str(key),
                         "session_id": key[0] if isinstance(key, tuple) else None,
