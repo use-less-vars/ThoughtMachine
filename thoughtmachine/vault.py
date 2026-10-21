@@ -154,6 +154,111 @@ def _seed_manifest_safe_default(
     _write_file(content, root / relpath, overwrite_existing, created)
 
 
+# ── Factory-owned seed re-sync ──────────────────────────────────────────────
+
+# Seeds whose *vault* copy is re-synced from the shipped ``resources/`` file
+# whenever its content differs.  Deliberately narrow: exactly two entries.
+#
+# DELIBERATE POLICY REVERSAL (operator-directed, not an oversight).  Both the
+# drift checker -- ``agent/config/vault_drift.py:58-61``: "When a seeded file
+# exists in the vault but differs from the seed, the checker reports a warning
+# drift (never auto-fixes -- the operator may have deliberately customised
+# it)." -- and the repair engine -- ``thoughtmachine/vault_repair.py:1223-1239``:
+# "quarantined allowlist drift; not auto-fixed" -- treat a modified seed copy as
+# the operator's and leave it alone.  This helper reverses that for exactly the
+# two factory-owned files below: they are machine-owned defaults, not operator
+# configuration, so a stale vault copy surviving an upgrade silently defeats
+# the very fix it shipped (a new checksystem allowlist entry that never reaches
+# the vault; a new factory-default key that never materialises).
+#
+# Neither the drift checker nor the repair quarantine is weakened: both keep
+# reporting a mismatch if one is present when they run -- this helper only
+# removes the *cause* at bootstrap time.
+#
+# Narrower alternative considered and rejected only for now: re-sync solely
+# when the *shipped* seed changed since the last deploy.  That requires a
+# persisted record of the previously deployed hash, and no marker/manifest/hash
+# record may be added to the vault, so the content comparison below stands.
+# Narrowing it later is a one-line change (compare against a recorded hash
+# instead of against the live file).
+#
+# Deliberately NOT re-synced (behaviour unchanged):
+#   * ``system/providers.json``                - operator-owned provider profiles
+#   * ``system/default_system_prompt.txt``     - operator-editable prompt
+#   * ``system/engineer_system_prompt.txt``    - operator-editable prompt
+#   * ``system/resource_catalog.json``         - operator-editable catalog
+#   * ``docker/resource/*``                    - ``never_overwrite: true`` trust
+#                                                anchors (see bootstrap Step 2b)
+#   * ``worker_templates/*``                   - deployed only when ``dest_empty``
+_FACTORY_OWNED_SEEDS: tuple[tuple[str, str], ...] = (
+    ("checksystem_allowlist.json", _CHECKSYSTEM_ALLOWLIST_RELPATH),
+    ("factory_defaults.json", _FACTORY_DEFAULTS_RELPATH),
+)
+
+
+def _sync_factory_owned_seeds(root: Path, resources_dir: Path) -> list[str]:
+    """Re-sync factory-owned vault seed copies from the shipped ``resources/``.
+
+    Content-based, not version-based: a vault copy whose content already equals
+    the shipped seed is left completely untouched (no write, so ``st_mtime`` --
+    which :func:`get_checksystem_allowlist` caches on -- is preserved); a copy
+    whose content differs is overwritten from the seed and reported once; a
+    missing copy is simply created.  See ``_FACTORY_OWNED_SEEDS`` for the scope
+    and for the deliberate policy reversal this implements.
+
+    Idempotent: a second call with unchanged inputs writes nothing.
+
+    Args:
+        root: Absolute path to the vault root.
+        resources_dir: Absolute path to the project-level ``resources/``
+            directory holding the shipped seeds.
+
+    Returns:
+        Absolute paths of the files written (empty when everything matched).
+    """
+    written: list[str] = []
+
+    for seed_name, relpath in _FACTORY_OWNED_SEEDS:
+        src = resources_dir / seed_name
+        dst = root / relpath
+        if not src.is_file():
+            continue  # no bundled seed -> nothing to re-sync
+
+        mismatch = False
+        if dst.is_file():
+            try:
+                src_bytes = src.read_bytes()
+                dst_bytes = dst.read_bytes()
+            except OSError:
+                continue  # unreadable -> leave it alone
+            if seed_name.endswith(".json"):
+                # JSON-normalised equality (mirrors
+                # ``vault_repair._collect_seeded_files``): formatting-only
+                # differences are NOT drift.
+                try:
+                    same = json.loads(src_bytes) == json.loads(dst_bytes)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    same = False
+            else:
+                same = src_bytes == dst_bytes
+            if same:
+                continue
+            mismatch = True
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+        dst.chmod(0o644)
+        written.append(str(dst))
+
+        if mismatch:
+            logger.warning(
+                "Vault seed %s re-synced from shipped seed resources/%s "
+                "(content changed)", relpath, seed_name,
+            )
+
+    return written
+
+
 def ensure_vault_defaults(
     resources_dir: Path,
     overwrite_existing: bool = False,
@@ -185,6 +290,13 @@ def ensure_vault_defaults(
 
     created: list[str] = []
     root = vault_root()
+
+    # 0. Re-sync factory-owned seed copies whose content drifted from the
+    # shipped resource file (see ``_FACTORY_OWNED_SEEDS`` / the policy-reversal
+    # note above).  Run FIRST so the ``_copy_resource`` calls below find the
+    # destination already present and never touch the same path twice in one
+    # boot.
+    created.extend(_sync_factory_owned_seeds(root, resources_dir))
 
     # 1–2. Copy factory_defaults.json and checksystem_allowlist.json
     _copy_resource(
