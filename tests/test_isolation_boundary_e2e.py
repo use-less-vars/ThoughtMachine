@@ -924,6 +924,85 @@ def _adopted_b(events, ws_b_id, root_b):
     return out
 
 
+def _is_load_reply(evt):
+    """True for the terminal ``session_loaded`` of load_session/new_session.
+
+    Every server reply is a multi-message burst, so "the first message whose
+    type we care about" is not necessarily the answer to *this* request.  The
+    terminal message of a bind attempt is unambiguous: a refusal carries
+    ``load_error`` (server.py:2351/2371/2568), a success carries the bound
+    ``workspace_id`` and no ``load_error``.
+    """
+    if evt.get("type") != "session_loaded":
+        return False
+    return "load_error" in evt or bool(evt.get("workspace_id"))
+
+
+def _is_project_reply(evt):
+    """True for the terminal reply of a ``set_project`` request.
+
+    Refused -> a single ``status_message`` containing "refused"
+    (server.py:3249-3256); allowed -> the ``session_loaded`` of the fresh
+    session (server.py:3195).  The idle "Ready. Type a query to start."
+    status_message that closes a previous burst matches neither.
+    """
+    if evt.get("type") == "session_loaded":
+        return True
+    return (
+        evt.get("type") == "status_message"
+        and "refused" in (evt.get("text") or "").lower()
+    )
+
+
+def _await_terminal(pump, is_terminal, timeout=20.0, max_events=60):
+    """Collect events up to the terminal reply; return ``(events, reply)``.
+
+    ``WsPump.wait_for`` breaks on the FIRST event whose *type* is in the stop
+    set, so a request issued straight after another one samples that previous
+    command's tail: every ``new_session`` reply ends with
+    ``status_message "Ready. Type a query to start."`` (server.py:3187), so the
+    sample stops there and the real reply is never read (measured: a pivot
+    sampled exactly tokens_updated, context_updated, config_changed,
+    status_message(Ready) and missed its own ``session_loaded``).  This helper
+    keeps reading past every non-terminal message instead, so the verdict is
+    computed from the message that actually answers the request.  ``reply`` is
+    that terminal event (``None`` if it never arrived).
+    """
+    events = []
+    reply = None
+    deadline = time.monotonic() + timeout
+    while len(events) < max_events:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            evt = pump.q.get(timeout=remaining)
+        except queue.Empty:
+            break
+        if evt is None:
+            pump.closed = True
+            break
+        events.append(evt)
+        if is_terminal(evt):
+            reply = evt
+            break
+    return events, reply
+
+
+def _cmd_terminal(pump, payload, is_terminal, capfd, timeout=20.0):
+    """``_cmd_captured`` whose collection stops at the terminal reply."""
+    with capfd.disabled():
+        print("\n[REQUEST]  " + _brief(payload))
+    capfd.readouterr()                                  # clear
+    pump.send(payload)
+    events, reply = _await_terminal(pump, is_terminal, timeout=timeout)
+    captured = capfd.readouterr()
+    with capfd.disabled():
+        _print_events(events)
+        _print_server_refusal_lines(captured)
+    return events, reply, captured
+
+
 def test_set_project_cannot_rescope_bound_socket(iso_server, capfd):
     """ATTACK 6 residual (a): set_project must not move a bound socket to B."""
     app, tmp_home, _server_mod = iso_server
@@ -936,9 +1015,10 @@ def test_set_project_cannot_rescope_bound_socket(iso_server, capfd):
     cm, pump = _open_bound_ws(client, sid_a, ws_a_id)
     try:
         sp_payload = {"command": "set_project", "project": root_b}
-        sp_events, sp_cap = _cmd_captured(
-            pump, sp_payload, {"session_loaded", "status_message"}, capfd,
+        sp_events, sp_reply, sp_cap = _cmd_terminal(
+            pump, sp_payload, _is_project_reply, capfd,
         )
+        pump.drain(timeout=1.0)     # flush this reply's burst before the pivot
         adopted = _adopted_b(sp_events, ws_b_id, root_b)
         with capfd.disabled():
             print(f"[VERDICT] set_project(project=B) -> adopted_b_events={adopted!r}")
@@ -953,29 +1033,36 @@ def test_set_project_cannot_rescope_bound_socket(iso_server, capfd):
             "session_id": sid_b,
             "workspace_id": ws_b_id,
         }
-        events, captured = _cmd_captured(
-            pump, pivot_payload, {"session_loaded", "status_message"}, capfd,
+        events, reply, captured = _cmd_terminal(
+            pump, pivot_payload, _is_load_reply, capfd,
         )
+        pivot_reply = [reply] if reply is not None else []
         pivoted = [
-            e for e in events
+            e for e in pivot_reply
             if e.get("type") == "session_loaded"
             and e.get("workspace_id") == ws_b_id
             and not e.get("load_error")
         ]
-        blob = (captured.out or "") + (captured.err or "") + (sp_cap.out or "") + (sp_cap.err or "")
+        verdict_events = pivot_reply + ([sp_reply] if sp_reply is not None else [])
+        blob = (
+            (captured.out or "") + (captured.err or "")
+            + (sp_cap.out or "") + (sp_cap.err or "")
+        )
         refused = (
-            "load_session refused" in blob
+            # verdict from the refusal MESSAGES the requests really produced ...
+            any("refused" in (e.get("text") or "").lower() for e in verdict_events)
+            or any(e.get("load_error") for e in verdict_events)
+            # ... with the fd-captured server-side log as redundant belt-and-braces
+            or "load_session refused" in blob
             or "set_project refused" in blob
             or "Project switch refused" in blob
-            or any("refused" in (e.get("text") or "") for e in events + sp_events)
-            or any(e.get("load_error") for e in events)
         )
         with capfd.disabled():
             print(f"[VERDICT] post-set_project pivot -> pivoted={pivoted!r} refused={refused}")
         assert not pivoted and refused, (
             "BREACH (attack 6a): an A-bound socket re-scoped itself via "
             f"set_project and then pivoted onto workspace B's session {sid_b}: "
-            f"pivoted={pivoted!r} refused={refused} "
+            f"pivoted={pivoted!r} refused={refused} pivot_reply={_slim(pivot_reply)!r} "
             f"set_project_events={_slim(sp_events)!r} events={_slim(events)!r}"
         )
     finally:
@@ -1027,6 +1114,7 @@ def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
         bare_events, bare_cap = _cmd_captured(
             pump, bare_payload, {"session_loaded", "status_message"}, capfd,
         )
+        pump.drain(timeout=1.0)     # flush this reply's burst before the next request
         adopted = _adopted_b(bare_events, ws_b_id, root_b)
         with capfd.disabled():
             print(f"[VERDICT] new_session(<omitted>) on ?project=B socket -> adopted_b={adopted!r}")
@@ -1046,6 +1134,7 @@ def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
         bare2_events, captured2 = _cmd_captured(
             pump, bare2_payload, {"session_loaded", "status_message"}, capfd,
         )
+        pump.drain(timeout=1.0)     # flush this reply's burst before the pivot
         adopted2 = _adopted_b(bare2_events, ws_b_id, root_b)
         with capfd.disabled():
             print(f"[VERDICT] new_session(<omitted>) after set_project -> adopted_b={adopted2!r}")
@@ -1061,27 +1150,35 @@ def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
             "session_id": sid_b,
             "workspace_id": ws_b_id,
         }
-        events, captured = _cmd_captured(
-            pump, pivot_payload, {"session_loaded", "status_message"}, capfd,
+        events, reply, captured = _cmd_terminal(
+            pump, pivot_payload, _is_load_reply, capfd,
         )
+        pivot_reply = [reply] if reply is not None else []
         pivoted = [
-            e for e in events
+            e for e in pivot_reply
             if e.get("type") == "session_loaded"
             and e.get("workspace_id") == ws_b_id
             and not e.get("load_error")
         ]
-        blob = (captured.out or "") + (captured.err or "") + (bare_cap.out or "") + (captured2.out or "")
+        blob = (
+            (captured.out or "") + (captured.err or "")
+            + (bare_cap.out or "") + (bare_cap.err or "")
+            + (captured2.out or "") + (captured2.err or "")
+        )
         refused = (
-            "load_session refused" in blob
-            or any("refused" in (e.get("text") or "") for e in events)
-            or any(e.get("load_error") for e in events)
+            # verdict from the refusal MESSAGE the pivot really produced ...
+            any("refused" in (e.get("text") or "").lower() for e in pivot_reply)
+            or any(e.get("load_error") for e in pivot_reply)
+            # ... with the fd-captured server-side log as redundant belt-and-braces
+            or "load_session refused" in blob
         )
         with capfd.disabled():
             print(f"[VERDICT] post-fallback pivot -> pivoted={pivoted!r} refused={refused}")
         assert not pivoted and refused, (
             "BREACH (attack 6b): a socket re-scoped via the _project_path "
             f"fallback and then pivoted onto workspace B's session {sid_b}: "
-            f"pivoted={pivoted!r} refused={refused} events={_slim(events)!r}"
+            f"pivoted={pivoted!r} refused={refused} pivot_reply={_slim(pivot_reply)!r} "
+            f"events={_slim(events)!r}"
         )
     finally:
         _close_ws(cm)
