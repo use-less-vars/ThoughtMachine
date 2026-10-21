@@ -150,9 +150,21 @@ def _recv_collect_until_type(ws, target, timeout_hint="", max_events=40):
     )
 
 
+def _canonical_path(p) -> str:
+    """Canonical form the SERVER emits for a workspace path.
+
+    On macOS ``/tmp`` and ``/var`` are symlinks into ``/private``, so a
+    ``/var/folders/...`` path entered raw is emitted as
+    ``/private/var/folders/...``.  Feeding already-canonical paths into the
+    server keeps the REST create, the WS switch and the (``abspath``-keyed)
+    workspace-registry lookup all agreeing on the same string.
+    """
+    return os.path.realpath(os.path.abspath(str(p)))
+
+
 def _new_project(tmp_home, name):
     d = Path(tempfile.mkdtemp(prefix=f"seed_{name}_"))
-    return str(d)
+    return _canonical_path(d)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -497,3 +509,39 @@ def test_transport_roundtrip_ws_notice_rest_read_and_refresh_agree(seed_server):
         f"profile: ws={ws_refresh_perms!r} rest={rest_body['effective']!r}"
     )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Canary — the path canonicaliser behind _new_project
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_canonical_path_helper_resolves_symlinks(tmp_path):
+    """Guard the canonicaliser used by ``_new_project``.
+
+    ``_canonical_path`` must resolve symlinked path prefixes (macOS:
+    /tmp -> /private/tmp, /var -> /private/var) and be idempotent.  The
+    failure message records the platform's symlink layout as FACTS rather than
+    asserting a particular platform.
+    """
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to("real")
+
+    facts = (
+        f"platform={sys_mod.platform} "
+        f"islink('/tmp')={os.path.islink('/tmp')} "
+        f"islink('/var')={os.path.islink('/var')} "
+        f"_canonical_path('/tmp/x')={_canonical_path('/tmp/x')!r} "
+        f"tmp_path={str(tmp_path)!r}"
+    )
+
+    linked = _canonical_path(tmp_path / "link" / "x")
+    plain = _canonical_path(tmp_path / "real" / "x")
+    assert linked == plain, (
+        f"_canonical_path did not resolve a symlinked prefix: "
+        f"{linked!r} != {plain!r} | {facts}"
+    )
+
+    again = _canonical_path(linked)
+    assert again == linked, (
+        f"_canonical_path is not idempotent: {again!r} != {linked!r} | {facts}"
+    )

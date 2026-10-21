@@ -89,6 +89,18 @@ pytestmark = pytest.mark.integration
 _ABSENT = object()
 
 
+def _canonical_path(p) -> str:
+    """Canonical form the SERVER emits for a workspace path.
+
+    The server realpaths the incoming path (``_confine_workspace_path``), and on
+    macOS ``/tmp``/``/var`` are symlinks into ``/private`` — so e.g.
+    ``/var/folders/...`` is emitted as ``/private/var/folders/...``.  Only the
+    EXPECTED side is canonicalised, so the assertion still fails if the server
+    stops canonicalising.
+    """
+    return os.path.realpath(os.path.abspath(str(p)))
+
+
 @pytest.fixture(scope="module")
 def contract_server():
     """Temp HOME + purged modules + fresh import of web_ui.backend.server.
@@ -624,9 +636,9 @@ def test_apply_config_different_workspace_path_still_switches_session(contract_s
         f"workspace switch must create a NEW session id "
         f"(got {sw_evt.get('session_id')!r} == original {original_session_id!r})"
     )
-    assert sw_evt.get("workspace_path") == os.path.normpath(proj_b), (
+    assert sw_evt.get("workspace_path") == _canonical_path(proj_b), (
         f"session_loaded.workspace_path {sw_evt.get('workspace_path')!r} != "
-        f"{os.path.normpath(proj_b)!r}"
+        f"{_canonical_path(proj_b)!r}"
     )
 
     # --- The switch status is emitted. ---
@@ -740,3 +752,39 @@ def test_reload_does_not_reemit_session_loaded_banner(contract_server):
         f"cold load nor on a re-attach; got {len(banners)}: {banners}"
     )
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Canary — the expected-side path canonicaliser itself
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def test_canonical_path_helper_resolves_symlinks(tmp_path):
+    """Guard the helper behind the workspace_path assertion in Test D.
+
+    ``_canonical_path`` must resolve symlinked path prefixes (macOS:
+    /tmp -> /private/tmp, /var -> /private/var) and be idempotent.  The
+    failure message records the platform's symlink layout as FACTS rather than
+    asserting a particular platform.
+    """
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to("real")
+
+    facts = (
+        f"platform={sys_mod.platform} "
+        f"islink('/tmp')={os.path.islink('/tmp')} "
+        f"islink('/var')={os.path.islink('/var')} "
+        f"_canonical_path('/tmp/x')={_canonical_path('/tmp/x')!r} "
+        f"tmp_path={str(tmp_path)!r}"
+    )
+
+    linked = _canonical_path(tmp_path / "link" / "x")
+    plain = _canonical_path(tmp_path / "real" / "x")
+    assert linked == plain, (
+        f"_canonical_path did not resolve a symlinked prefix: "
+        f"{linked!r} != {plain!r} | {facts}"
+    )
+
+    again = _canonical_path(linked)
+    assert again == linked, (
+        f"_canonical_path is not idempotent: {again!r} != {linked!r} | {facts}"
+    )

@@ -434,6 +434,19 @@ def _ws_path(case_name: str, workspace_type: str) -> str:
     return _WS_PATH_CACHE[key]
 
 
+def _canonical_path(p) -> str:
+    """Canonical form the SERVER emits for a workspace path.
+
+    The server runs the incoming path through ``_confine_workspace_path``,
+    which returns ``os.path.realpath(os.path.abspath(...))``.  On macOS
+    ``/tmp`` and ``/var`` are symlinks into ``/private``, so the emitted value
+    is e.g. ``/private/tmp/round-k-...`` rather than the ``/tmp/...`` entered.
+    Only the EXPECTED side is canonicalised, so these assertions still fail if
+    the server ever stops canonicalising.
+    """
+    return os.path.realpath(os.path.abspath(str(p)))
+
+
 def _variant_config(case_name: str, workspace_type: str, **fields) -> dict:
     """Build an apply_config payload for the given variant.
 
@@ -499,7 +512,7 @@ def test_case1_permissions_change(contract_server, workspace_type):
                 assert final.get("permissions_reset") is True
                 assert final.get("permission_context") == "defaults_capped_by_ceiling"
                 assert "Permission context reset" in final.get("text", "")
-                assert _ws_path("case1", workspace_type) in final.get("text", "")
+                assert _canonical_path(_ws_path("case1", workspace_type)) in final.get("text", "")
             else:
                 # normal branch: config_changed is the ONLY reply.
                 _assert_quiet(ws, label)
@@ -660,7 +673,9 @@ def test_case3_no_session(contract_server, workspace_type):
                 ws.send_json({"command": "apply_config", "config": cfg})
                 loaded_evt, _ = _receive_until_session_loaded(ws, label)
                 assert loaded_evt["session_id"]
-                assert loaded_evt["workspace_path"] == _ws_path("case3", workspace_type)
+                assert loaded_evt["workspace_path"] == _canonical_path(
+                    _ws_path("case3", workspace_type)
+                )
                 evt, _ = _receive_until(ws, "config_changed", label)
                 assert evt["config"]["model"] == "roundk-no-session"
                 final = _expect(ws, "status_message", label)
@@ -704,7 +719,7 @@ def test_case4_workspace_change_new_session(contract_server):
             new_loaded, events = _receive_until_session_loaded(ws, label)
             new_sid = new_loaded["session_id"]
             assert new_sid != old_sid, f"expected new session, got same {new_sid}"
-            assert new_loaded["workspace_path"] == ws_b
+            assert new_loaded["workspace_path"] == _canonical_path(ws_b)
             assert new_loaded["message_count"] == 0
 
             evt, _ = _receive_until(ws, "config_changed", label)
@@ -888,7 +903,7 @@ def test_case7_permission_only_apply_keeps_session(contract_server, workspace_ty
             )
             if workspace_type == "custom":
                 # cbe5f72: config_changed carries the workspace_path key.
-                assert evt["config"]["workspace_path"] == ws_path, (
+                assert evt["config"]["workspace_path"] == _canonical_path(ws_path), (
                     f"config_changed must carry workspace_path, got "
                     f"{evt['config'].get('workspace_path')!r}"
                 )
@@ -978,9 +993,9 @@ def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
             # payload still cannot grant).
             assert evt["permissions"]["filesystem"] == "read"
             # config_changed reflects the NORMALIZED path, not the raw form.
-            assert evt["config"]["workspace_path"] == ws_path, (
-                f"expected normalized workspace_path {ws_path!r}, got "
-                f"{evt['config'].get('workspace_path')!r}"
+            assert evt["config"]["workspace_path"] == _canonical_path(ws_path), (
+                f"expected normalized workspace_path {_canonical_path(ws_path)!r}, "
+                f"got {evt['config'].get('workspace_path')!r}"
             )
             # Normal branch: config_changed ONLY — no 'Switched to project'.
             _assert_quiet(ws, label)
@@ -996,7 +1011,6 @@ def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
             probe = _get_config(ws, label)
             # Workspace was switched during setup → no seeded sidecar → deny-all.
             assert probe["permissions"]["filesystem"] == "read"
-
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1153,7 +1167,7 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
                 # EMPTY sidecar → the gate serves the capped-by-ceiling DEFAULTS.
                 assert evt_d["permissions"]["filesystem"] == "read"
                 assert evt_d["permissions"]["git"] == "read"
-                assert evt_d["config"]["workspace_path"] == ws_path, (
+                assert evt_d["config"]["workspace_path"] == _canonical_path(ws_path), (
                     f"deferred config_changed must carry the normalized "
                     f"workspace_path, got {evt_d['config'].get('workspace_path')!r}"
                 )
@@ -1684,3 +1698,39 @@ def test_apply_config_payload_cannot_write_grants(contract_server):
 
             _assert_quiet(ws, label)
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Canary — the expected-side path canonicaliser itself
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_canonical_path_helper_resolves_symlinks(tmp_path):
+    """Guard the helper behind every workspace_path assertion above.
+
+    ``_canonical_path`` must resolve symlinked path prefixes (macOS:
+    /tmp -> /private/tmp, /var -> /private/var) and be idempotent.  The
+    failure message records the platform's symlink layout as FACTS rather than
+    asserting a particular platform.
+    """
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to("real")
+
+    facts = (
+        f"platform={sys_mod.platform} "
+        f"islink('/tmp')={os.path.islink('/tmp')} "
+        f"islink('/var')={os.path.islink('/var')} "
+        f"_canonical_path('/tmp/x')={_canonical_path('/tmp/x')!r} "
+        f"tmp_path={str(tmp_path)!r}"
+    )
+
+    linked = _canonical_path(tmp_path / "link" / "x")
+    plain = _canonical_path(tmp_path / "real" / "x")
+    assert linked == plain, (
+        f"_canonical_path did not resolve a symlinked prefix: "
+        f"{linked!r} != {plain!r} | {facts}"
+    )
+
+    again = _canonical_path(linked)
+    assert again == linked, (
+        f"_canonical_path is not idempotent: {again!r} != {linked!r} | {facts}"
+    )
