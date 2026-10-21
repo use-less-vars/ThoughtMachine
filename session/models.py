@@ -441,6 +441,30 @@ class Session:
         self.context_length = data.get('context_length', 0)
         self.agent_context = []
 
+    def rebind_workspace(self, workspace_id: Optional[str], *, reason: str = "") -> Optional[str]:
+        """Move this session to a different workspace, returning the previous one.
+
+        This is the ONLY sanctioned way to move a session between workspaces.
+        ``workspace_id`` is immutable once stamped (see ``__setattr__``), which
+        protects the store from non-owner writes; but the OWNER of a session
+        (the server, when a fresh tab applies a config that switches the active
+        workspace) legitimately needs the record to follow the tab.  The
+        immutability guard stays in place for every other caller: this method
+        is a single audited escape hatch, it logs the move, and it never
+        touches the filesystem -- the caller saves and deletes afterwards.
+        """
+        current = self.workspace_id
+        if workspace_id == current:
+            return current
+        log(
+            'INFO',
+            'core.session',
+            f"Session {self.session_id} workspace rebind: {current!r} -> {workspace_id!r} "
+            f"(reason={reason or 'unspecified'})",
+        )
+        object.__setattr__(self, 'workspace_id', workspace_id)
+        return current
+
     def add_message(self, role: str, content: str, **kwargs) -> None:
         """
         Add a message to the session's user_history.

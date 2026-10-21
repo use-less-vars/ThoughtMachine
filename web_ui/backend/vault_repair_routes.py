@@ -9,7 +9,6 @@ vault or the engine.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,31 +16,19 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-router = APIRouter(prefix="/api")
+# The loopback-origin policy lives in ONE shared module (it is also used by
+# the CORS middleware and the WebSocket handshake); the names are re-exported
+# here so callers that read them off this module keep working.
+from web_ui.backend.origin_policy import (  # noqa: F401  (re-export)
+    _ORIGIN_RE,
+    _origin_allowed,
+)
 
-_ORIGIN_RE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
-                        re.I)
+router = APIRouter(prefix="/api")
 
 
 def _json_error(message: str, status_code: int = 500) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status_code)
-
-
-def _origin_allowed(request: Request) -> bool:
-    """True when the request comes from a local web origin.
-
-    Accepts a matching ``Origin`` header; falls back to the ``Referer``
-    header (scheme+host part) when Origin is absent.  No header -> False.
-    """
-    raw = request.headers.get("origin") or request.headers.get("referer") or ""
-    if not raw:
-        return False
-    if request.headers.get("referer") and not request.headers.get("origin"):
-        match = re.match(r"^https?://[^/]+", raw, re.I)
-        if not match:
-            return False
-        raw = match.group(0)
-    return bool(_ORIGIN_RE.match(raw))
 
 
 class _RepairApplyBody(BaseModel):

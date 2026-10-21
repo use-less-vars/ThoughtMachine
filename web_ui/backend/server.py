@@ -148,6 +148,43 @@ import thoughtmachine.vault as _vault
 _session_store: Optional[FileSystemSessionStore] = None
 _session_store_lock = threading.Lock()
 
+# ── Pending security escalations ──────────────────────────────────────────────
+# ``thoughtmachine.security`` keeps ONE process-wide pending map keyed by
+# request_id, so without this an approval typed on ANY connection would
+# resolve a prompt raised for a DIFFERENT connection.  The asker is recorded
+# when the forwarded ``security_prompt`` event reaches the socket that owns
+# the asking session (``event_callback`` below closes over ``ws``).
+_pending_escalation_askers: Dict[str, int] = {}
+_pending_escalation_lock = threading.Lock()
+
+
+def _record_escalation_asker(request_id: str, ws_key: int) -> None:
+    """Bind *request_id* to the WebSocket that was asked to answer it."""
+    if not request_id:
+        return
+    with _pending_escalation_lock:
+        _pending_escalation_askers[request_id] = ws_key
+
+
+def _escalation_asker(request_id: str) -> Optional[int]:
+    """The ``id(ws)`` asked to answer *request_id* (None when unknown)."""
+    with _pending_escalation_lock:
+        return _pending_escalation_askers.get(request_id)
+
+
+def _forget_escalation(request_id: str) -> None:
+    with _pending_escalation_lock:
+        _pending_escalation_askers.pop(request_id, None)
+
+
+def _forget_escalations_for(ws_key: int) -> None:
+    """Drop every escalation bound to a socket that has gone away."""
+    with _pending_escalation_lock:
+        for request_id in [
+            rid for rid, key in _pending_escalation_askers.items() if key == ws_key
+        ]:
+            del _pending_escalation_askers[request_id]
+
 def _get_session_store() -> FileSystemSessionStore:
     global _session_store
     if _session_store is None:
@@ -157,6 +194,10 @@ def _get_session_store() -> FileSystemSessionStore:
     return _session_store
 
 
+from web_ui.backend.origin_policy import (
+    allowed_origins as _cors_allowed_origins,
+    websocket_origin_allowed,
+)
 from web_ui.backend.workspace_routes import router as workspace_router
 from web_ui.backend.onboarding_routes import router as onboarding_router
 from web_ui.backend.config_routes import router as config_router
@@ -1132,13 +1173,19 @@ else:
 # Whether --serve-frontend was requested (set in main())
 _SERVE_FRONTEND = False
 
-# ── CORS (allow frontend dev server on any port) ────────────────────────────
+# ── CORS (loopback dev-server origins only, no credentials) ────────────────────────
+# The frontend is either served same-origin by this app or by the vite dev
+# server on TM_FRONTEND_PORT (default 5173).  Only those loopback spellings
+# are allowed: ``allow_origins=["*"]`` + ``allow_credentials=True`` (a) is
+# invalid per the CORS spec and (b) let ANY web page drive the local API.
+# This app authenticates with nothing (no cookie, no Authorization header),
+# so ``allow_credentials`` is off.
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_allowed_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1154,13 +1201,58 @@ app.add_middleware(
 #                       grandparent directory at import-time).
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _ws_origin(ws: WebSocket) -> Optional[str]:
+    """Read the Origin header without assuming the socket has headers.
+
+    A missing/None header container means "no Origin sent", which
+    ``websocket_origin_allowed`` treats as allowed (CLI and integration
+    clients send none).  Never raises: the guard must not be a crash surface.
+    """
+    headers = getattr(ws, "headers", None)
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    return getter("origin")
+
+
+async def _reject_websocket(ws: WebSocket, reason: str) -> None:
+    """Log and close a rejected handshake (BEFORE accept).
+
+    Closing is best-effort: rejecting a connection must never raise, and
+    duck-typed sockets (test stubs) may not implement ``close``.
+    """
+    log('WARNING', 'server.ws', f'WebSocket rejected: {reason}')
+    try:
+        await ws.close(code=1008)
+    except Exception as exc:  # noqa: BLE001 - rejection must never raise
+        log('WARNING', 'server.ws', f'ws.close failed during rejection: {exc}')
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
+    # ── Handshake guards (BEFORE accept) ────────────────────────────────
+    # Origin: a browser always sends one, so only loopback origins may open a
+    # socket.  Clients that send no Origin (CLI, integration harnesses) are
+    # allowed through.  Closing before accept rejects the handshake.
+    _origin = _ws_origin(ws)
+    if not websocket_origin_allowed(_origin):
+        await _reject_websocket(ws, f'untrusted Origin {_origin!r}')
+        return
+
+    # The ?project= value is client-supplied, so it is confined exactly like
+    # the REST browser endpoints: existing directory outside the vault.
+    _project_path = _project_root
+    if project:
+        try:
+            _project_path = _confine_workspace_path(project, require_dir=True)
+        except ValueError as exc:
+            await _reject_websocket(ws, f'project path {project!r}: {exc}')
+            return
+
     await ws.accept()
     # If the frontend provides a project query parameter, use it to resolve
     # the workspace instead of the default _project_root.  This allows the
     # web UI to serve sessions for multiple projects from a single server.
-    _project_path = project or _project_root
     log('INFO', 'server.ws', f'WebSocket connected: {ws.client} project={_project_path}')
 
     # Import bridge here (after project root is on sys.path)
@@ -1196,6 +1288,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
     def event_callback(event: Dict[str, Any]) -> None:
         """Called from agent thread.  Schedule send on the asyncio loop."""
         nonlocal _shutting_down
+        if event.get("type") == "security_prompt":
+            # This socket is the one that was asked -- remember it so a
+            # security_response from another connection cannot resolve it.
+            _record_escalation_asker(str(event.get("request_id") or ""), id(ws))
         log('INFO', 'server.ws', f'event_callback ENTRY: type={event.get("type","?")!r}')
         if _shutting_down:
             log('DEBUG', 'server.ws', f'event_callback: discarding (shutting down) type={event.get("type","?")}')
@@ -1435,6 +1531,21 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # session's own workspace should trigger the switch.
                     raw_workspace_path = config.get("workspace_path", "") or ""
                     new_workspace_path = os.path.normpath(raw_workspace_path) if raw_workspace_path else ""
+                    # Client-supplied path: confine it before it can become
+                    # _project_path (same anchor as the REST browser).
+                    # require_dir=False: apply_config legitimately accepts a
+                    # not-yet-existing path (it creates the future workspace),
+                    # unlike set_project which requires an existing one.
+                    if new_workspace_path:
+                        try:
+                            new_workspace_path = _confine_workspace_path(
+                                new_workspace_path, require_dir=False)
+                        except ValueError as exc:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Workspace path rejected: {exc}",
+                            })
+                            continue
                     session_ws = None
                     if bridge is not None:
                         _session_obj = bridge.session  # property: _session or _loaded_session (bridge.py L864-867)
@@ -1530,9 +1641,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         #      so it opens a fresh tab. The old session+tab stays untouched.
                         #
                         #    - **Existing session with NO conversation** (empty/fresh tab):
-                        #      reuse the same tab; the session's workspace_id is immutable once
-                        #      set, so the workspace switch is applied via the workspace-scoped
-                        #      save below — no new tab created.
+                        #      reuse the same tab and perform an owner-initiated rebind of
+                        #      the session's workspace stamp, so the record follows the
+                        #      session into the new workspace (the stale copy in the old
+                        #      one is deleted) — no new tab created.
                         #
                         #    - **No existing session**: create a fresh one.
                         #
@@ -1587,11 +1699,22 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 })
                             elif existing_session is not None:
                                 # No conversation (empty/fresh tab) — reuse the same tab. The
-                                # session's workspace_id is immutable once persisted, so the
-                                # workspace switch is applied via the workspace-scoped save below.
+                                # workspace switch rebinds the session's workspace stamp (the
+                                # only sanctioned move) and saves the record into the NEW
+                                # workspace, then deletes the copy left behind in the old one
+                                # so no duplicate survives.
                                 bridge._loaded_session = existing_session
                                 _session_bridges[existing_session.session_id] = bridge
+                                old_workspace_id = existing_session.workspace_id
+                                existing_session.rebind_workspace(workspace_id, reason="apply_config workspace switch")
                                 session_store.save_session(existing_session, workspace_id=workspace_id)
+                                if old_workspace_id and old_workspace_id != workspace_id:
+                                    # Move semantics: the record now lives in the new workspace; drop the
+                                    # stale copy (and its _meta_ file) left in the previous one so reads
+                                    # cannot resolve the old location.
+                                    if not session_store.delete_session(existing_session.session_id, workspace_id=old_workspace_id):
+                                        # The previous copy lived in the workspace-agnostic legacy dir.
+                                        session_store.delete_session(existing_session.session_id)
                                 log('INFO', 'server',
                                     f"apply_config: updated existing session {existing_session.session_id} "
                                     f"to workspace {workspace_id} (no conversation — kept same tab)")
@@ -2781,11 +2904,18 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
                         continue
 
-                    # Validate path exists and is a directory
-                    if not os.path.isdir(new_project):
+                    # Validate the client-supplied path: it must resolve to an
+                    # existing directory OUTSIDE the vault trust anchor (same
+                    # confinement as the REST browser/container endpoints).
+                    # require_dir=True: set_project requires an existing
+                    # directory, unlike apply_config which accepts a future one.
+                    try:
+                        new_project = _confine_workspace_path(
+                            new_project, require_dir=True)
+                    except ValueError as exc:
                         await ws.send_json({
                             "type": "status_message",
-                            "text": f"⚠ Project path does not exist or is not a directory: {new_project}",
+                            "text": f"⚠ Project path rejected: {exc}",
                         })
                         continue
 
@@ -2959,9 +3089,23 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
                         continue
 
+                    # A prompt may only be answered by the connection it was
+                    # raised on.  An unknown request_id keeps the historical
+                    # behaviour (resolve_security_prompt no-ops for unknown ids).
+                    _asker = _escalation_asker(request_id)
+                    if _asker is not None and _asker != id(ws):
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ security_response: this prompt was raised "
+                                    "for a different connection and cannot be "
+                                    "answered here.",
+                        })
+                        continue
+
                     try:
                         from thoughtmachine.security import resolve_security_prompt
                         resolve_security_prompt(request_id, approved, remember)
+                        _forget_escalation(request_id)
                         log('INFO', 'server.ws',
                             f'Security prompt resolved: request_id={request_id} '
                             f'approved={approved} remember={remember}')
@@ -3069,6 +3213,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
     finally:
         # Mark closed so pending send_event calls are silently dropped
         ws._closed = True
+        # Drop any security escalation bound to this (now dead) connection.
+        _forget_escalations_for(id(ws))
         # Unregister this WebSocket's callback so stale connections
         # don't linger (fixes multi-tab / tab-reconnect bug).
         if bridge is not None:
@@ -3164,6 +3310,27 @@ def _confine_to_home(path: str) -> str:
     if _path_is_within(resolved, vault):
         raise ValueError(
             f"Path '{path}' resolves into the protected vault directory '{vault}'"
+        )
+    return resolved
+
+
+def _confine_workspace_path(path: str, *, require_dir: bool = True) -> str:
+    """Validate a client-supplied project/workspace path.
+
+    Always applies the same trust anchor as the REST browser and
+    container-lifecycle endpoints (absolute path outside the vault root).
+
+    ``require_dir`` selects between the two distinct contracts callers need:
+    ``True`` additionally requires the resolved path to already be an
+    existing directory (``set_project``, ``?project=``); ``False`` confines
+    only and accepts a path that does not exist yet (``apply_config``, whose
+    documented behaviour is to switch to -- and create -- a future
+    workspace).  Returns the confined path; raises ``ValueError`` otherwise.
+    """
+    resolved = _confine_to_home(path)
+    if require_dir and not os.path.isdir(resolved):
+        raise ValueError(
+            f"Path '{path}' does not exist or is not a directory"
         )
     return resolved
 

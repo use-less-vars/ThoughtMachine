@@ -316,6 +316,28 @@ class FileSystemSessionStore(SessionStore):
         if workspace_id is None and session.workspace_id:
             workspace_id = session.workspace_id
 
+        # A session's workspace is immutable once stamped (session/models.py),
+        # so a caller asking to save it under a DIFFERENT workspace cannot be
+        # honoured.  Writing it into the requested workspace directory would
+        # leave the payload still naming the owner (a mislabelled copy) AND
+        # would miss the existing file, because the lookup below only scans the
+        # requested workspace's directory -- producing two copies of one
+        # session.  Point the write at the owning workspace instead: the
+        # lookup then resolves that file and this save updates it in place.
+        #
+        # This is not the cross-workspace access PR #157 forbids: the scan stays
+        # inside the session's OWN workspace directory (plus the
+        # workspace-agnostic legacy dir), exactly as every scoped lookup does.
+        # Locating a record in its own workspace in order to update it is the
+        # opposite of reading/listing another workspace's records.
+        if workspace_id and session.workspace_id and workspace_id != session.workspace_id:
+            logger.warning(
+                f"[SessionStore] Session {session.session_id} belongs to workspace "
+                f"{session.workspace_id!r} (immutable) - saving it into "
+                f"{workspace_id!r} was redirected to the owning workspace"
+            )
+            workspace_id = session.workspace_id
+
         # Invalidate caches
         self._invalidate_path_cache(session.session_id)
         self._cached_list = None

@@ -47,6 +47,7 @@ import WorkspaceDetailPage from './components/workspace/WorkspaceDetailPage'
 import LayerNav from './components/LayerNav'
 import { useRoute, useNavigate } from './router'
 import { apiUrl, wsUrl } from './apiBase'
+import { isSessionInWorkspace } from './sessionLookup'
 import './styles.css'
 
 const TABS_PREFIX = 'tm.sessionTabs.'
@@ -105,6 +106,11 @@ export default function App() {
   const panelsRestoredRef = useRef(false)        // worker-panel LS restore ran once
   const bootWsRef = useRef(null)                 // workspace hydrated at boot
   const [workspaceKnownTick, setWorkspaceKnownTick] = useState(0)  // bump when a session→workspace mapping appears
+  // Deep-link admission: `${workspaceId}:${sessionId}` → true | false |
+  // 'pending' | null (null = the probe could not answer → fail open). See the
+  // deep-link membership validation effect below.
+  const deepLinkVerdictsRef = useRef({})
+  const [deepLinkTick, setDeepLinkTick] = useState(0)  // bump when a verdict lands
 
   // ── Worker panels state per session ───────────────────────────────────
   // workerPanelsBySession: { [sessionId]: [panel, ...] } — panel = { instance_id,
@@ -955,6 +961,49 @@ export default function App() {
     }
   }, [route])
 
+  // ── Deep-link membership validation ───────────────────────────────────
+  // A bare session deep link (#/session/<id>) carries no workspace, so the
+  // activation effect below would otherwise open a tab for ANY id — including
+  // one that does not belong to the workspace we resolved. Probe
+  // /api/session/list for that workspace first (tri-state, see sessionLookup).
+  // A refusal redirects to the workspace SELECTOR, never to a workspace route:
+  // the workspace id in such a URL is itself client-supplied, so adopting it
+  // would only move the same trust problem one hop downstream.
+  useEffect(() => {
+    if (route?.view !== 'session' || !route.id) return
+    const sid = route.id
+    const ws = currentWs || bootWsRef.current || null
+    if (!ws) return   // no workspace resolved yet — nothing to validate against
+    const key = `${ws}:${sid}`
+    if (deepLinkVerdictsRef.current[key] !== undefined) return
+    // A tab already open for this session is proof of membership from an
+    // authoritative source (sessions_list / session_loaded): never re-probe it
+    // and never retract a tab the user is already looking at.
+    const openTabs = useSessionTabsStore.getState().byWorkspace?.[ws]?.tabs || []
+    if (openTabs.some(t => t.sessionId === sid)) {
+      deepLinkVerdictsRef.current[key] = true
+      return
+    }
+    deepLinkVerdictsRef.current[key] = 'pending'
+    let cancelled = false
+    isSessionInWorkspace(ws, sid).then(verdict => {
+      if (cancelled) return
+      const resolved = verdict === true ? true : verdict === false ? false : null
+      deepLinkVerdictsRef.current[key] = resolved
+      if (resolved === false) {
+        console.warn(`[App] deep link refused: session ${sid} is not in workspace ${ws}`)
+        navigate('/workspaces')
+      }
+      setDeepLinkTick(t => t + 1)
+    })
+    return () => {
+      cancelled = true
+      // Still undecided (StrictMode double-mount / deps changed): drop the
+      // marker so the next run re-probes instead of deadlocking the gate.
+      if (deepLinkVerdictsRef.current[key] === 'pending') delete deepLinkVerdictsRef.current[key]
+    }
+  }, [route, currentWs, navigate])
+
   // ── Route-driven tab activation ───────────────────────────────────────
   // The session route (#/session/<id>) is the single entry point for opening
   // a session: if a tab for that session already exists, activate it;
@@ -975,9 +1024,18 @@ export default function App() {
       // (a) Ensure the tab exists and is active in the owning workspace.
       const ws = currentWs || bootWsRef.current || null
       if (ws) {
+        // Re-read after hydrate: zustand's set() produces a NEW state object,
+        // so a snapshot taken before hydrate cannot see the newly added workspace.
+        const st0 = useSessionTabsStore.getState()
+        if (!st0.byWorkspace[ws]) st0.hydrate(ws)
         const st = useSessionTabsStore.getState()
-        if (!st.byWorkspace[ws]) st.hydrate(ws)
         if (!st.byWorkspace[ws].tabs.some(t => t.sessionId === route.id)) {
+          // (c) Deep-link admission: only CREATE a tab once the membership probe
+          // has confirmed the session belongs to this workspace. Undecidable
+          // probes (null) fail OPEN = historical behaviour; an already-open tab
+          // is never refused here (the probe is skipped for it).
+          const verdict = deepLinkVerdictsRef.current[`${ws}:${route.id}`]
+          if (verdict !== true && verdict !== null) return
           st.openTab(ws, { sessionId: route.id, title: nameFromStore(route.id) })
         }
         st.setActiveTab(ws, route.id)
@@ -985,7 +1043,7 @@ export default function App() {
     } else if (route?.view === 'workspace') {
       lastKnownWorkspaceRef.current = route.id
     }
-  }, [route, workspaceKnownTick, routeSessionConfig, currentWs])
+  }, [route, workspaceKnownTick, routeSessionConfig, currentWs, deepLinkTick])
 
   // ── Keep-mounted session deck lifecycle ───────────────────────────────
   // Sessions activated on the session layer stay mounted (hidden when not
