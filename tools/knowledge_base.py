@@ -133,7 +133,9 @@ class KnowledgeBaseTool(ToolBase):
 
     **Workspace scope:** Local to the project, organized into domains:
     **Global scope:** User-wide, shared across all projects, with ``system/`` (read-only built-in reference)
-    and ``user/`` (writable personal notes) subdirectories.
+    and ``user/`` (read-only personal notes) subdirectories. The global KB is
+    read-only for agents: append/update/create_domain are refused there; use
+    scope=workspace for writable notes.
       - **system_architecture**: Architectural decisions and component relationships
       - **development_guides**: Coding conventions and workflows
       - **roadmap**: Milestones and future plans
@@ -234,7 +236,8 @@ class KnowledgeBaseTool(ToolBase):
         description=(
             "Which knowledge base to use: workspace (project-local, "
             ".thoughtmachine/knowledge/) or global (user-wide, "
-            "~/.thoughtmachine/global/)."
+            "~/.thoughtmachine/global/, read-only for agents: writes are "
+            "refused there, use workspace for writable notes)."
         ),
     )
 
@@ -247,12 +250,14 @@ class KnowledgeBaseTool(ToolBase):
         write_modes = ("append", "update", "create_domain")
 
         # Resolve the knowledge base root directory
+        kb_root: Optional[Path] = None
         if self.scope == "global":
-            if self.mode in write_modes:
-                kb_root = _get_global_kb_root()
-            else:
-                # Read modes: resolve the root WITHOUT initializing, so no
-                # directories or files are created on a read-only operation.
+            # Read modes resolve the root WITHOUT initializing, so no
+            # directories or files are created on a read-only operation.
+            # Write modes resolve no root at all: the global KB is read-only
+            # for agents (refused right after the permission gate below), so
+            # nothing may be materialised there before that gate has run.
+            if self.mode not in write_modes:
                 from agent.knowledge.global_kb import GLOBAL_KB_DIR
                 kb_root = GLOBAL_KB_DIR
             init_result = None  # global KB is self-initialising
@@ -282,12 +287,8 @@ class KnowledgeBaseTool(ToolBase):
                 kb_root = Path(ws_path) / ".thoughtmachine" / "knowledge"
             else:
                 kb_root = Path.cwd() / ".thoughtmachine" / "knowledge"
-            if self.mode in write_modes:
-                init_result = self._initialize_kb(kb_root)
-                if init_result:
-                    self._log_debug(f"Knowledge base initialized: {init_result}")
-            else:
-                init_result = None
+            # The skeleton is materialised only AFTER the permission gate below.
+            init_result = None
 
         # Atomic permission re-check for write modes
         mode = self.mode
@@ -332,6 +333,23 @@ class KnowledgeBaseTool(ToolBase):
             ):
                 return json.dumps({"error": f"Atomic permission check failed: filesystem:write required for {mode}"})
 
+        # ── Global KB is READ-ONLY for agents ─────────────────────────────
+        # Checked AFTER the permission gate, so a genuinely unauthorised caller
+        # still receives the permission error, and BEFORE anything touches the
+        # filesystem: the refusal consults the non-initialising global root, so
+        # a refused write neither syncs nor creates `~/.thoughtmachine/global/`.
+        if self.scope == "global" and mode in write_modes:
+            return json.dumps({"error": self._global_write_refusal()})
+
+        # ── Materialise the workspace KB skeleton ─────────────────────────
+        # Only once the gate above has passed. This used to run during root
+        # resolution (i.e. BEFORE the gate), so a refused write still created
+        # the `_initialize_kb` skeleton and left fingerprints on disk.
+        if self.scope != "global" and mode in write_modes:
+            init_result = self._initialize_kb(kb_root)
+            if init_result:
+                self._log_debug(f"Knowledge base initialized: {init_result}")
+
         # Dispatch to mode handler
         try:
             if self.mode == "list":
@@ -356,6 +374,34 @@ class KnowledgeBaseTool(ToolBase):
             self._log_tool_error(f"Unexpected error in {self.mode} mode: {e}")
             return f"An unexpected error occurred: {e}. Please try again or check the knowledge base files."
 
+    def _global_write_refusal(self) -> str:
+        """Return the refusal message for a write against the GLOBAL knowledge base.
+
+        The global KB is read-only for agents: ``system/`` is built-in
+        reference material and ``user/`` is not an agent-writable area either
+        (personal notes belong to ``scope=workspace``). A domain that exists in
+        ``system/`` keeps its precise system-domain wording; every other write
+        target is refused by class, naming the ``user/`` area it would write to.
+
+        The root is read from ``GLOBAL_KB_DIR`` (imported at call time) rather
+        than ``get_global_kb_root()``, because the latter *initialises* the
+        global KB -- and a refused write must leave nothing on disk.
+        """
+        from agent.knowledge.global_kb import GLOBAL_KB_DIR
+
+        domain_name = (self.domain or "").lower().replace(" ", "_")
+        if domain_name and (GLOBAL_KB_DIR / "system" / f"{domain_name}.md").exists():
+            return (
+                f"Domain '{self.domain}' is a system domain and is read-only. "
+                f"The global knowledge base is read-only for agents; "
+                f"use scope=workspace for writable notes."
+            )
+        return (
+            f"Domain '{self.domain}' is in the global knowledge base's `user/` "
+            f"area, which is read-only for agents; '{self.mode}' is refused for "
+            f"scope=global. Use scope=workspace for writable notes."
+        )
+
     def _resolve_domain_path(self, kb_root: Path, domain_name: str, *, for_write: bool = False) -> tuple[Path, str]:
         """
         Resolve a domain name to its (file_path, rel_path).
@@ -366,8 +412,9 @@ class KnowledgeBaseTool(ToolBase):
 
         **Global scope:**
         Checks ``system/{domain}.md`` then ``user/{domain}.md``.
-        If ``for_write=True`` and the domain exists in ``system/``, raises
-        ``ValueError`` because system domains are read-only.
+        ``for_write=True`` always raises ``ValueError``: the global knowledge
+        base is read-only for agents, system domains included (a system domain
+        keeps its own precise wording).
 
         Raises ValueError if the domain cannot be found, or if the domain name
         could escape the knowledge base root (path traversal).
@@ -415,12 +462,17 @@ class KnowledgeBaseTool(ToolBase):
                 if system_path.exists():
                     raise ValueError(
                         f"Domain '{domain_name}' is a system domain and is read-only. "
-                        f"Use a different domain name for personal notes, or use scope=workspace."
+                        f"The global knowledge base is read-only for agents; "
+                        f"use scope=workspace for writable notes."
                     )
-                # Always write to user/ (fixed prefix, never derived from disk)
-                user_path = kb_root / "user" / f"{domain_name}.md"
-                _assert_inside_kb(user_path)
-                return user_path, f"user/{domain_name}.md"
+                # The global KB is read-only for agents, `user/` included:
+                # personal notes belong to scope=workspace, so there is no
+                # global write target to hand out.
+                raise ValueError(
+                    f"The global knowledge base is read-only for agents: "
+                    f"refusing to write 'user/{domain_name}.md'. "
+                    f"Use scope=workspace for writable notes."
+                )
 
             user_path = kb_root / "user" / f"{domain_name}.md"
 
@@ -498,7 +550,7 @@ class KnowledgeBaseTool(ToolBase):
 
         For workspace scope: lists built-in domains plus custom files from
         project/ and personal/ directories.
-        For global scope: lists domains from system/ (read-only) and user/ (writable) directories.
+        For global scope: lists domains from system/ and user/ (both read-only).
         """
         if self.scope == "global":
             return self._mode_list_global(kb_root)
@@ -572,16 +624,17 @@ class KnowledgeBaseTool(ToolBase):
     def _mode_list_global(self, kb_root: Path) -> str:
         """List all domains in the global knowledge base.
 
-        Lists domains from system/ (read-only) and user/ (writable) directories.
+        Lists domains from system/ and user/ (both read-only for agents).
         """
         lines = ["## Global Knowledge Base - Available Domains\n"]
         lines.append("> **Scope:** `global` — the knowledge base at `~/.thoughtmachine/global/`")
         lines.append("> Domains in `system/` are read-only built-in reference materials.")
-        lines.append("> Domains in `user/` are writable personal notes.\n")
+        lines.append("> Domains in `user/` are read-only too: the global knowledge base is **read-only for agents**.")
+        lines.append("> Use `scope=workspace` for writable notes.\n")
 
         for section_label, subdir, icon in [
             ("### System Domains (read-only)", "system", "🔒"),
-            ("### User Domains (writable)", "user", "✏️"),
+            ("### User Domains (read-only)", "user", "📄"),
         ]:
             dir_path = kb_root / subdir
             if not dir_path.exists():
@@ -615,6 +668,7 @@ class KnowledgeBaseTool(ToolBase):
         lines.append("- `mode=read domain=<name> scope=global` — View a global domain")
         lines.append("- `mode=search query=<term> scope=global` — Search across all global KB files")
         lines.append("- `mode=status scope=global` — Show current status and recent activity")
+        lines.append("- Writes (`append`, `update`, `create_domain`) are not available for `scope=global`; use `scope=workspace` instead")
         return "\n".join(lines)
 
     def _mode_search(self, kb_root: Path) -> str:
@@ -755,41 +809,11 @@ class KnowledgeBaseTool(ToolBase):
             )
 
         if self.scope == "global":
-            # Global scope: only user/ is writable
-            category = "user"
-            if self.category is not None and self.category.lower().strip() != "user":
-                return (
-                    f"Error: Invalid category '{self.category}' for global scope. "
-                    f"Only 'user' category is supported (system/ is read-only)."
-                )
-
-            # Write-target hardening (defence in depth: the `^[a-zA-Z0-9_]+$`
-            # check above already rejects these). The write target below is
-            # built with the literal `user/` prefix so it can never be
-            # anywhere else in the global KB.
-            if (
-                not domain_name
-                or "/" in domain_name
-                or "\\" in domain_name
-                or ".." in domain_name
-            ):
-                return (
-                    f"Error: Invalid domain name '{self.domain}'. "
-                    f"Domain names must be non-empty and must not contain "
-                    f"'/', '\\' or '..'."
-                )
-
-            # Check if domain already exists in system/ (read-only) or user/
-            system_path = kb_root / "system" / f"{domain_name}.md"
-            user_path = kb_root / "user" / f"{domain_name}.md"
-            if system_path.exists():
-                return f"Domain '{domain_name}' already exists in system/ (read-only). Choose a different name."
-            if user_path.exists():
-                return f"Domain '{domain_name}' already exists at `user/{domain_name}.md`."
-
-            # Fixed prefix: validated name only, never derived from disk state.
-            rel_path = f"user/{domain_name}.md"
-            file_path = user_path
+            # Global scope: the global KB is read-only for agents, so there is
+            # no creatable category or write target at all. Defence in depth:
+            # `execute()` already refuses every global write mode before
+            # dispatch, so this is a second, unconditional refusal.
+            return self._global_write_refusal()
         else:
             # Workspace scope
             category = self.category

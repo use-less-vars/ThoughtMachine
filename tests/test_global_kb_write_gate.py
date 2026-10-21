@@ -12,6 +12,9 @@ Covers the global-scope defects fixed in :class:`tools.knowledge_base.KnowledgeB
   instead of the text.
 * global write targets are validated as single path components (no ``/``,
   ``\\`` or ``..``), so a write can never escape ``user/``.
+* the global KB is READ-ONLY for agents: ``append``/``update``/``create_domain``
+  are refused even for a ``user/`` domain, whatever the caller's grant, and no
+  side effect is left on disk.
 * the global ``list`` output advertises only the read/search/status modes and
   names ``~/.thoughtmachine/global/`` (not the workspace path).
 
@@ -39,6 +42,14 @@ SYSTEM_CONTENT = (
     "## Rules\n"
     "\n"
     f"system rules body {MARKER}\n"
+)
+
+# Pinned verbatim: the system-domain class of refusal. The ``user/`` class must
+# never converge onto this wording -- the two classes stay distinguishable.
+SYSTEM_REFUSAL = (
+    f"Domain '{DOMAIN}' is a system domain and is read-only. "
+    f"The global knowledge base is read-only for agents; "
+    f"use scope=workspace for writable notes."
 )
 
 
@@ -90,6 +101,7 @@ def test_update_on_system_domain_is_refused(global_kb):
 
     result = _run(mode="update", section="Rules", new_content="POISON")
 
+    assert SYSTEM_REFUSAL in result, f"system-domain wording changed: {result}"
     assert "system domain and is read-only" in result
     assert path.read_bytes() == before, "system domain file must be byte-identical"
     assert MARKER in path.read_text(encoding="utf-8")
@@ -110,6 +122,7 @@ def test_append_on_system_domain_is_refused(global_kb):
 
     result = _run(mode="append", entry="POISON APPEND", summary="poison")
 
+    assert SYSTEM_REFUSAL in result, f"system-domain wording changed: {result}"
     assert "system domain and is read-only" in result
     assert path.read_bytes() == before, "system domain file must be byte-identical"
     assert "POISON APPEND" not in path.read_text(encoding="utf-8")
@@ -161,6 +174,42 @@ def test_global_write_target_rejects_path_names(global_kb, bad_name):
 # ---------------------------------------------------------------------------
 # 5. global list output advertises reads only.
 # ---------------------------------------------------------------------------
+
+
+def test_global_user_domain_write_refused(global_kb):
+    """The global KB is read-only for agents: writes to ``user/`` are refused.
+
+    A ``filesystem: write`` grant is not enough to make the global KB writable:
+    ``user/`` is reference material shipped with the product, not an
+    agent-writable area, so every write mode must be refused and the target
+    file must stay byte-identical (and no new domain may appear).
+    """
+    user_path = global_kb / "user" / "notes.md"
+    user_path.write_text("# Notes\n\nUSER-MARKER-7\n", encoding="utf-8")
+    before = user_path.read_bytes()
+
+    results = {
+        "update": _run(mode="update", domain="notes", section="Notes", new_content="POISON"),
+        "append": _run(mode="append", domain="notes", entry="POISON APPEND", summary="poison"),
+        "create_domain": _run(mode="create_domain", domain="fresh_domain", category="user"),
+    }
+
+    for mode, result in results.items():
+        assert "read-only for agents" in result, (
+            f"{mode} on a user/ domain must be refused as read-only: {result}"
+        )
+        assert "`user/`" in result, (
+            f"{mode} on a user/ domain must name the `user/` area as the reason: {result}"
+        )
+        assert "is a system domain and is read-only" not in result, (
+            f"{mode} on a user/ domain must not use the system-domain wording: {result}"
+        )
+
+    assert user_path.read_bytes() == before, "a refused write must leave user/ byte-identical"
+    assert "POISON" not in user_path.read_text(encoding="utf-8")
+    assert sorted(p.name for p in (global_kb / "user").iterdir()) == ["notes.md"], (
+        "a refused write must not create a user/ domain in the global KB"
+    )
 
 
 def test_global_list_output_does_not_advertise_writes(global_kb):
