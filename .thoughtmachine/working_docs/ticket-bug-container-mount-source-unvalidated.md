@@ -1,8 +1,8 @@
 # Ticket: bug/container-mount-source-unvalidated
 
-**DO NOT FIX IN THIS WAVE.** Filed as a pointer only.
+**IN WAVE — PR 3 of 4** in the sequenced landing (store layer -> boundary layer -> mount-source -> F17). Fix site is `web_ui/backend/server.py:3569`, per `## Disposition` below.
 
-**Filed:** 2026-10-21, while verifying the container-mount leg of `ticket-bug-ws-set-project-bypasses-vault-confinement.md` on the working tree of `/home/jojo/PycharmProjects/ThoughtMachine-dev` (branch `feat/workspace-panel`, HEAD `b23c26b`).
+**Filed:** 2026-10-21, isolation-audit pass (gen-47); line numbers read from the working tree of the linked worktree `ThoughtMachine-dev`, dev `9cd06b34`. Provenance in the original draft (`feat/workspace-panel`, `b23c26b`) was template-contaminated and is withdrawn.
 **Severity:** HIGH — the confinement helper that exists *specifically* to stop "container lifecycle endpoints" from mounting "arbitrary host paths (e.g. /etc, another user's home, the vault, another workspace)" is reached only when the client supplies an explicit `workspace_path`; the resolution path the endpoints actually use returns a registry `root_path` unvalidated, and nothing below the server rechecks before `Mount(source=...)`.
 **Status:** open; verified by read. No container was started and no daemon was touched — this is a static read of four hops.
 
@@ -52,6 +52,8 @@ This is the consumption half of `ticket-bug-ws-set-project-bypasses-vault-confin
 One check, placed where the value is *consumed* rather than where it is *accepted*: refuse a `root_path` that resolves inside `~/.thoughtmachine` at `server.py:3569` (the resolution step), so that no registration path — present or future — can produce a vault-backed `/workspace`. Optional defence in depth at `infra/containers/executor.py:659` and at the two `Mount` sites, which is the cheaper and more durable placement because it does not depend on the server being the only caller.
 
 Deliberately not decided here: whether `/etc` and other non-home roots deserve a check too, or whether "inside the vault" is the only invariant the project wants to enforce. That is a policy question for the owner of `_confine_to_home`'s docstring.
+
+Separate ticket, separate PR, deliberately: this was **split out of the boundary-layer item** because the fix site differs — `web_ui/backend/server.py:3569` (the resolution step that hands a registry `root_path` to `ContainerManager`) rather than the `apply_config` / `?project=` assignment sites covered by `ticket-bug-ws-set-project-bypasses-vault-confinement.md`. Keeping them in one PR would edit the same file in two unrelated regions, so they land as PR 2 (boundary) and PR 3 (mount-source) and cannot collide.
 
 ## MUST NOT TOUCH
 

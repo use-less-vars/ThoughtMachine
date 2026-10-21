@@ -2,8 +2,8 @@
 
 **DO NOT FIX IN THIS WAVE.** Filed as a pointer only.
 
-**Filed:** 2026-10-21, on the working tree of `/home/jojo/PycharmProjects/ThoughtMachine-dev` (branch `feat/workspace-panel`, HEAD `b23c26b`).
-**Severity:** LOW — no data is lost and nothing unsafe happens; the worker is running correctly and the panel simply cannot display what it is doing. Filed because it is a payload-contract mismatch between two halves of the same feature, and because the naive diagnosis ("the frontend does not render the field") is wrong and would send a fix to the wrong file.
+**Filed:** 2026-10-21, isolation-audit pass (gen-47); line numbers read from the working tree of the linked worktree `ThoughtMachine-dev`, dev `9cd06b34`. Provenance in the original draft (`feat/workspace-panel`, `b23c26b`) was template-contaminated and is withdrawn.
+**Severity:** MEDIUM — revised upward in review from the LOW filed on first pass. No data is lost and nothing unsafe happens; the worker is running correctly and the panel simply cannot display what it is doing. Filed because it is a payload-contract mismatch between two halves of the same feature, and because the naive diagnosis ("the frontend does not render the field") is wrong and would send a fix to the wrong file. Revisit at HIGH if the worker panel becomes load-bearing for supervising unattended workers in V3 — at that point the finding is absence of observability, not a missing field.
 **Status:** open; verified by read. Verdict: **SERVER-PAYLOAD** — the field the panel reads is absent from the endpoint the panel polls, while three other surfaces carry it.
 
 ## Finding

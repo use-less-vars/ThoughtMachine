@@ -2,8 +2,10 @@
 
 **DO NOT FIX IN THIS WAVE.** Filed as a pointer only.
 
-**Filed:** 2026-10-21, while checking the "a pre-commit hook runs pytest on every commit" operator report on the working tree of `/home/jojo/PycharmProjects/ThoughtMachine-dev` (branch `feat/workspace-panel`, HEAD `b23c26b`).
-**Severity:** LOW — nothing is broken; the code does exactly what it says. What is wrong is the *impression* the two execution modes jointly create: every code path that mentions hooks appears to enforce or to restrict them, and the net effect on the agent git tool is that no hook can ever run — silently, with no message, in the default mode.
+**Filed:** 2026-10-21, isolation-audit pass (gen-47); line numbers read from the working tree of the linked worktree `ThoughtMachine-dev`, dev `9cd06b34`. Provenance in the original draft (`feat/workspace-panel`, `b23c26b`) was template-contaminated and is withdrawn.
+**Severity:** HIGH — revised upward in review from the LOW filed on first pass; the rejected reasoning is kept below rather than deleted. HIGH here is not a claim that a live exploit exists. It is the audit's own standard for a control-integrity finding: a control that **reads as enforcing and is structurally unable to fire**, with *two independent mechanisms* each sufficient on its own to neutralise it. Every code path in `tools/git_info_tool.py` that mentions hooks is written as enforcement — one branch refuses the commit outright when hooks are configured, the other deliberately preserves `core.hooksPath` and documents in-source why it does not pass `--no-verify` — and the net effect on the agent git tool is that no hook can ever run: silently, with no message, in the mode the file itself calls the security boundary.
+
+**Rejected alternative, on the record:** a reviewer argued LOW on runtime-harm grounds — nothing is broken at runtime, no data is lost, no privilege is gained, git behaves as documented. Rejected because runtime harm is the wrong axis for a control-integrity finding. The defect is not that git misbehaves; it is that two mechanisms, each presented as a safety measure, jointly cannot do the thing they are presented as doing, and the only signal that would reveal this is itself gated on a file that is absent.
 **Status:** open; verified by read plus two direct filesystem checks.
 
 ## Finding

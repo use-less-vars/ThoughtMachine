@@ -2,7 +2,7 @@
 
 **DO NOT FIX THE DOC IN THIS WAVE.** Filed as a pointer only.
 
-**Filed:** 2026-10-21, on the working tree of `/home/jojo/PycharmProjects/ThoughtMachine-dev` (branch `feat/workspace-panel`, HEAD `b23c26b`).
+**Filed:** 2026-10-21, isolation-audit pass (gen-47); line numbers read from the working tree of the linked worktree `ThoughtMachine-dev`, dev `9cd06b34`. Provenance in the original draft (`feat/workspace-panel`, `b23c26b`) was template-contaminated and is withdrawn.
 **Severity:** LOW — no code behaves differently because of this. It is filed because the document is a dated audit that reads as verified observation, and the specific claim is the kind that makes an operator believe commits are gated.
 **Status:** open; verified by read plus direct filesystem checks. The doc is 11,780 B, dated 2026-08-15.
 
