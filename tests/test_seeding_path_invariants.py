@@ -215,45 +215,65 @@ def test_ws_set_project_seeds_empty_sidecar(seed_server):
 def test_ws_apply_config_workspace_switch_seeds_empty_sidecar(seed_server):
     app, vault = seed_server
     proj_a = _new_project(vault, "a")
-    proj_b = _new_project(vault, "b")
+    proj_new = _new_project(vault, "a_to_unregistered")
+    # NOTE: switching A -> B where B is ALREADY a registered workspace is
+    # REFUSED by design (bridge._ownership_refusal: a connection bound to
+    # workspace A may never move onto another registered workspace).  The
+    # seeding / notice path is therefore exercised with a brand-new
+    # UNREGISTERED path, which the switch resolves by auto-registering it.
 
     with TestClient(app) as client:
         # Bind a session to workspace A.
         r = client.post("/api/session/create", json={"mode": "custom", "workspace_path": proj_a})
         assert r.status_code == 200, r.text
         sid = r.json()["session_id"]
-
-        # Pre-register workspace B so the switch resolves it from the registry.
-        r = client.post("/api/session/create", json={"mode": "custom", "workspace_path": proj_b})
-        assert r.status_code == 200, r.text
-        ws_b = r.json()["workspace_id"]
-        assert ws_b
+        ws_a = r.json()["workspace_id"]
+        assert ws_a, f"session create must bind a workspace_id: {r.text}"
 
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"command": "load_session", "session_id": sid})
             _recv_until_type(ws, "session_loaded", "(load session A)")
 
-            # Switching the empty session's workspace A → B triggers the
-            # workspace-switch branch (workspace_changed=True).  The session had
-            # no conversation, so the SAME session id is re-bound to B and the
-            # seed runs for (ws_b, sid).
+            # Switching the empty session's workspace A -> the brand-new
+            # unregistered path triggers the workspace-switch branch
+            # (workspace_changed=True).  The session had no conversation, so
+            # the SAME session id is re-bound to the new workspace and the
+            # seed runs for (ws_new, sid).
             ws.send_json({
                 "command": "apply_config",
-                "config": {"mode": "custom", "workspace_path": proj_b},
+                "config": {"mode": "custom", "workspace_path": proj_new},
             })
-            # A follow-up command fences the switch: commands are processed in
-            # order, so its reply proves the apply_config handler completed.
+            # A follow-up command fences the switch AND records every frame it
+            # emitted: commands are processed in order, so its reply proves the
+            # apply_config handler completed.
             # NOTE: the get_open_sessions reply type is ``open_sessions`` (server.py
             # emits {"type": "open_sessions", ...}); the module docstring's
             # ``open_sessions_list`` is stale, and waiting on it blocks forever.
             ws.send_json({"command": "get_open_sessions"})
-            _recv_until_type(ws, "open_sessions", "(fence after apply_config)")
+            _fence, events = _recv_collect_until_type(
+                ws, "open_sessions", "(fence after apply_config)",
+            )
 
-    path = _sidecar_path(vault, ws_b, sid)
+    # The empty-session switch re-binds the session IN PLACE (no session_loaded
+    # is emitted), so the NEW workspace id comes from the permission-reset
+    # notice on the status_message channel.
+    notices = [
+        e for e in events
+        if e.get("type") == "status_message" and e.get("permissions_reset") is True
+    ]
+    assert notices, (
+        "apply_config workspace-switch emitted no permission-reset "
+        f"status_message; saw {[e.get('type') for e in events]}"
+    )
+    ws_new = notices[-1]["workspace_id"]
+    assert ws_new, f"switch notice must carry the new workspace_id: {notices[-1]!r}"
+    assert ws_new != ws_a, "switch must land in a NEW workspace, not the bound one"
+
+    path = _sidecar_path(vault, ws_new, sid)
     assert path.exists(), (
         f"apply_config workspace-switch did not seed a sidecar at {path}"
     )
-    assert _read_grants(vault, ws_b, sid) == {}
+    assert _read_grants(vault, ws_new, sid) == {}
 
 
 def test_ws_apply_config_workspace_switch_sends_permission_reset_notice(seed_server):
@@ -269,19 +289,20 @@ def test_ws_apply_config_workspace_switch_sends_permission_reset_notice(seed_ser
     """
     app, vault = seed_server
     proj_a = _new_project(vault, "notice_a")
-    proj_b = _new_project(vault, "notice_b")
+    proj_new = _new_project(vault, "notice_unregistered")
+    # NOTE: switching A -> B where B is ALREADY a registered workspace is
+    # REFUSED by design (bridge._ownership_refusal: a connection bound to
+    # workspace A may never move onto another registered workspace).  The
+    # seeding / notice path is therefore exercised with a brand-new
+    # UNREGISTERED path, which the switch resolves by auto-registering it.
 
     with TestClient(app) as client:
         # Bind a session to workspace A.
         r = client.post("/api/session/create", json={"mode": "custom", "workspace_path": proj_a})
         assert r.status_code == 200, r.text
         sid = r.json()["session_id"]
-
-        # Pre-register workspace B so the switch resolves it from the registry.
-        r = client.post("/api/session/create", json={"mode": "custom", "workspace_path": proj_b})
-        assert r.status_code == 200, r.text
-        ws_b = r.json()["workspace_id"]
-        assert ws_b
+        ws_a = r.json()["workspace_id"]
+        assert ws_a, f"session create must bind a workspace_id: {r.text}"
 
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"command": "load_session", "session_id": sid})
@@ -289,7 +310,7 @@ def test_ws_apply_config_workspace_switch_sends_permission_reset_notice(seed_ser
 
             ws.send_json({
                 "command": "apply_config",
-                "config": {"mode": "custom", "workspace_path": proj_b},
+                "config": {"mode": "custom", "workspace_path": proj_new},
             })
             # Fence the switch AND record every frame it emitted: commands are
             # processed in order, so the open_sessions reply proves the
@@ -314,6 +335,10 @@ def test_ws_apply_config_workspace_switch_sends_permission_reset_notice(seed_ser
     )
     assert notice.get("workspace_id"), (
         f"switch notice must carry a non-empty workspace_id: {notice!r}"
+    )
+    ws_b = notice["workspace_id"]
+    assert ws_b != ws_a, (
+        f"switch notice named the BOUND workspace {ws_a!r}, not a new one: {notice!r}"
     )
 
     text = notice["text"]
@@ -386,7 +411,12 @@ def test_transport_roundtrip_ws_notice_rest_read_and_refresh_agree(seed_server):
     """
     app, vault = seed_server
     proj_a = _new_project(vault, "rt_a")
-    proj_b = _new_project(vault, "rt_b")
+    proj_new = _new_project(vault, "rt_unregistered")
+    # NOTE: switching A -> B where B is ALREADY a registered workspace is
+    # REFUSED by design (bridge._ownership_refusal: a connection bound to
+    # workspace A may never move onto another registered workspace).  The
+    # seeding / notice path is therefore exercised with a brand-new
+    # UNREGISTERED path, which the switch resolves by auto-registering it.
 
     with TestClient(app) as client:
         # Bind a session to workspace A (empty session → the switch keeps the id).
@@ -396,24 +426,18 @@ def test_transport_roundtrip_ws_notice_rest_read_and_refresh_agree(seed_server):
         )
         assert r.status_code == 200, r.text
         sid = r.json()["session_id"]
-
-        # Pre-register workspace B so the switch resolves it from the registry.
-        r = client.post(
-            "/api/session/create",
-            json={"mode": "custom", "workspace_path": proj_b},
-        )
-        assert r.status_code == 200, r.text
-        ws_b = r.json()["workspace_id"]
-        assert ws_b
+        ws_a = r.json()["workspace_id"]
+        assert ws_a, f"session create must bind a workspace_id: {r.text}"
 
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"command": "load_session", "session_id": sid})
             _recv_until_type(ws, "session_loaded", "(load session A)")
 
-            # Workspace switch A → B on the empty session (same id re-bound).
+            # Workspace switch A -> brand-new unregistered path on the empty
+            # session (same id re-bound in place).
             ws.send_json({
                 "command": "apply_config",
-                "config": {"mode": "custom", "workspace_path": proj_b},
+                "config": {"mode": "custom", "workspace_path": proj_new},
             })
             # Fence the switch AND record every frame it emitted.
             ws.send_json({"command": "get_open_sessions"})
@@ -443,9 +467,14 @@ def test_transport_roundtrip_ws_notice_rest_read_and_refresh_agree(seed_server):
             f"WS notice carried wrong permission_context: {notice!r}"
         )
         notice_ws = notice["workspace_id"]
-        assert notice_ws == ws_b, (
-            f"WS notice workspace_id {notice_ws!r} != switched workspace {ws_b!r}"
+        assert notice_ws, f"WS notice must carry the switched workspace_id: {notice!r}"
+        assert notice_ws != ws_a, (
+            f"WS notice workspace_id {notice_ws!r} must be the NEW workspace, "
+            f"not the bound one {ws_a!r}"
         )
+        # The switch auto-registered the fresh target path, so the notice is
+        # the authority on the post-switch workspace id.
+        ws_b = notice_ws
 
         # ── Surface 2 — REST HTTP read + Surface 3 — refresh re-read ────────
         with TestClient(app) as client:
