@@ -3006,6 +3006,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             continue
                         bridge._workspace_id = workspace_id
 
+                    # ATTACK-6 (b): a connection already bound to a workspace is
+                    # sticky -- omitting workspace_id must NOT let the project
+                    # path (which the client controls via ?project= / set_project)
+                    # re-derive a different scope for it.
+                    if _ns_cur_ws:
+                        workspace_id = _ns_cur_ws
+                        bridge._workspace_id = _ns_cur_ws
+
                     # ── Fallback: resolve workspace_id from the project path ──
                     # The frontend can pass a project query param to select
                     # which workspace to use.  Fall back to _project_root.
@@ -3155,6 +3163,45 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "text": f"⚠ Project path rejected: {exc}",
                         })
                         continue
+
+                    # ATTACK-6 (a): a connection already bound to a workspace
+                    # must not be able to re-scope itself by switching project
+                    # to a DIFFERENT workspace.  The path confinement above only
+                    # proves the target exists and is outside the vault; it says
+                    # nothing about which workspace this socket belongs to.
+                    _sp_cur_ws = bridge.workspace_id if bridge is not None else None
+                    if _sp_cur_ws:
+                        try:
+                            from web_ui.backend.bridge import _resolve_workspace_id
+                            _sp_req_ws = _resolve_workspace_id(new_project)
+                        except Exception:
+                            _sp_req_ws = None
+                        _sp_same = _sp_req_ws == _sp_cur_ws
+                        if not _sp_same and _sp_req_ws is None:
+                            # Unregistered path: allowed only if it IS the root
+                            # of the workspace this socket is already bound to.
+                            try:
+                                _sp_entry = WorkspaceRegistry.get_default().get_workspace(_sp_cur_ws)
+                                _sp_own_root = getattr(_sp_entry, 'root_path', None)
+                            except Exception:
+                                _sp_own_root = None
+                            if _sp_own_root and os.path.abspath(
+                                    str(_sp_own_root)) == os.path.abspath(new_project):
+                                _sp_same = True
+                        if not _sp_same:
+                            log('WARNING', 'server',
+                                f"set_project refused: connection is scoped to workspace "
+                                f"{_sp_cur_ws} and cannot switch to {new_project} "
+                                f"(workspace {_sp_req_ws})")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": (
+                                    f"\u26a0 Project switch refused: this connection is "
+                                    f"scoped to workspace {_sp_cur_ws} and cannot switch "
+                                    f"to {_sp_req_ws or new_project}."
+                                ),
+                            })
+                            continue
 
                     log('INFO', 'server', f"Switching project to {new_project}")
 
