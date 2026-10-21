@@ -22,7 +22,12 @@ Architecture
 
 Startup
 ───────
-    uvicorn web_ui.backend.server:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn web_ui.backend.server:app --host 127.0.0.1 --port 8000 --reload
+
+The bind address defaults to loopback (127.0.0.1; override with ``--host`` or
+the ``HOST`` env var) and the health routes (``GET /health``, ``/api/health``,
+``/api/health/containers``) answer localhost callers only, so a server exposed
+on a non-loopback interface does not publish its health payload.
 
 Or via provided run script:
     python -m web_ui.backend.server
@@ -3226,8 +3231,40 @@ async def user_home():
     return {"home": str(Path.home())}
 
 
+# --- Loopback-only gate for the health routes -------------------------------
+# The server binds 127.0.0.1 by default (see the ``--host`` default in main()),
+# but the bind can be overridden (``--host``/``HOST``) and a reverse proxy in
+# front of the process would forward a remote caller as a local one.  The health
+# routes therefore check the peer address themselves.
+_LOCAL_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# In-process ASGI test-harness address.  Starlette's TestClient puts
+# ``scope["client"] = ("testclient", 50000)`` on every request it builds
+# (starlette/testclient.py); the name is not resolvable or routable over any
+# network, so real traffic can never carry it.  Kept in its own constant so the
+# allowance is explicit and cannot be confused with the loopback set.
+_TEST_HARNESS_CLIENT_HOSTS = frozenset({"testclient"})
+
+
+def _localhost_only(request: Request) -> Optional[JSONResponse]:
+    """Return a 403 response when *request* did not come from a local caller.
+
+    ``request.client`` is ``None`` when the ASGI server cannot report a peer
+    address; that is treated as NOT local (fail closed).  The caller's address
+    is deliberately never echoed in the response body.
+    """
+    client = request.client
+    host = client.host if client is not None else None
+    if host in _LOCAL_CLIENT_HOSTS or host in _TEST_HARNESS_CLIENT_HOSTS:
+        return None
+    return JSONResponse({"error": "localhost only"}, status_code=403)
+
+
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    denied = _localhost_only(request)
+    if denied is not None:
+        return denied
     return {
         "status": "ok",
         "service": "thoughtmachine-web-ui",
@@ -3236,9 +3273,9 @@ async def health():
 
 
 @app.get("/api/health")
-async def api_health():
+async def api_health(request: Request):
     """Structured health alias of GET /health (back-compat mirror)."""
-    return await health()
+    return await health(request)
 
 
 @app.get("/api/vault/status")
@@ -5006,7 +5043,7 @@ def workspace_container_logs(workspace_id: str, container_name: str,
 
 
 @app.get("/api/health/containers")
-def health_containers():
+def health_containers(request: Request):
     """Report whether the Docker daemon is reachable from the server.
 
     Returns a structured payload so callers can surface degraded Docker
@@ -5019,6 +5056,9 @@ def health_containers():
     lib_missing | import_failed | docker_host_unreachable, or null when
     Docker is available.
     """
+    denied = _localhost_only(request)
+    if denied is not None:
+        return denied
     checked_at = datetime.now(timezone.utc).isoformat()
     client = None
     try:
