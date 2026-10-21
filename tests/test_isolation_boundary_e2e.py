@@ -1260,8 +1260,12 @@ def test_unknown_security_response_request_id_refused(iso_server, capfd):
     """A security_response no socket is entitled to answer must be refused.
 
     Modelled on ``test_close_session_cannot_kill_other_workspace_workers``:
-    attack legs first, then a CONTROL proving the refusal is real (an entitled
-    socket's answer IS applied) — otherwise "refused" would be vacuous.
+    attack legs first, then a CONTROL proving the handler really answers (the
+    empty-id refusal still fires) — otherwise "refused" would be vacuous.
+    A driver socket cannot fake its own SERVER-side ``id(ws)``, so the genuine
+    "an entitled answer IS applied" leg lives in the unit module:
+    ``web_ui/backend/tests/test_boundary_layer_ingress.py``::
+    ``test_security_response_from_the_asking_connection_is_applied``.
     """
     app, tmp_home, server_mod = iso_server
     client = H.make_client(app)

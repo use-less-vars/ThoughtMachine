@@ -246,19 +246,112 @@ def test_security_response_from_other_connection_is_refused():
         server_mod._forget_escalation(request_id)
 
 
-def test_security_response_with_unknown_request_id_falls_through():
-    """Unknown ids keep the historical behaviour (no asker recorded)."""
+def test_security_response_with_unknown_request_id_is_default_denied(monkeypatch):
+    """An id no socket was asked to answer is refused, never quietly resolved.
+
+    Post-ruling behaviour (``server.py`` L3455-3470): an unissued request_id is
+    default-DENY -- nothing was ever asked of any socket, so no socket is
+    entitled to answer it (``resolve_security_prompt`` would otherwise honour
+    the decision blindly).  The resolver is stubbed so a silent fall-through
+    (the pre-ruling behaviour) fails the resolver-was-not-called assertion
+    instead of passing on the absence of a refusal.
+    """
+    request_id = "never-raised"
+    resolved = []
+
+    def _fake_resolve(rid, approved, remember=False):
+        resolved.append((rid, approved, remember))
+
+    monkeypatch.setattr(
+        "thoughtmachine.security.resolve_security_prompt", _fake_resolve
+    )
     client = TestClient(app)
     with client.websocket_connect("/ws") as ws:
         ws.send_json({
             "command": "security_response",
-            "request_id": "never-raised",
+            "request_id": request_id,
             "approved": True,
         })
-        ws.send_json({"command": "bogus-command"})
-        events = _collect(ws, "status_message")
-    assert any("Unknown command" in e.get("text", "") for e in events), events
-    assert not any("different connection" in e.get("text", "") for e in events)
+        # Fence on a later normal command: it also proves the socket survived
+        # the refusal (a dropped command would fail here, not silently pass).
+        ws.send_json({"command": "get_open_sessions"})
+        events = _collect(ws, "open_sessions")
+    texts = [e.get("text") or "" for e in events if e.get("type") == "status_message"]
+    assert any(
+        "cannot be answered here" in t and "never issued to this connection" in t
+        for t in texts
+    ), events
+    assert resolved == [], (
+        "BREACH: an unissued request_id was resolved -- resolve_security_prompt "
+        f"was called with {resolved!r}; events={events}"
+    )
+    assert server_mod._escalation_asker(request_id) is None, (
+        "an unissued request_id ended up in the asker registry"
+    )
+
+
+class _SameAsSocket:
+    """Stand-in for the SERVER-side ``id(ws)`` of the asking connection.
+
+    ``TestClient`` only exposes the CLIENT end of a connection, so the
+    server-side object id that ``_record_escalation_asker`` stores when a prompt
+    is really forwarded is unreachable here.  A stand-in that compares equal to
+    anything makes the server's ``_asker != id(ws)`` check take the "this IS the
+    asking connection" branch -- exactly the state a real prompt leaves behind.
+    """
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    def __hash__(self):
+        return id(self)
+
+
+def test_security_response_from_the_asking_connection_is_applied(monkeypatch):
+    """CONTROL -- an answer from the connection the prompt was raised on is applied.
+
+    Without this leg the refusals above would be vacuous ("refuse everything"
+    also satisfies them).  Here the answer must reach the resolver, and the
+    consumed escalation must be forgotten.
+    """
+    request_id = "rid-raised-on-this-socket"
+    resolved = []
+
+    def _fake_resolve(rid, approved, remember=False):
+        resolved.append((rid, approved, remember))
+
+    monkeypatch.setattr(
+        "thoughtmachine.security.resolve_security_prompt", _fake_resolve
+    )
+    monkeypatch.setattr(server_mod, "_escalation_asker", lambda _rid: _SameAsSocket())
+    server_mod._record_escalation_asker(request_id, -12345)
+    try:
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({
+                "command": "security_response",
+                "request_id": request_id,
+                "approved": True,
+            })
+            ws.send_json({"command": "get_open_sessions"})
+            events = _collect(ws, "open_sessions")
+        refusals = [
+            e for e in events
+            if "different connection" in (e.get("text") or "")
+        ]
+        assert not refusals, events
+        assert resolved == [(request_id, True, False)], (
+            "CONTROL FAILED: the entitled connection's answer never reached the "
+            f"resolver -- resolved={resolved!r}; events={events}"
+        )
+        assert request_id not in server_mod._pending_escalation_askers, (
+            "the resolved escalation was not forgotten; events=" + repr(events)
+        )
+    finally:
+        server_mod._forget_escalation(request_id)
 
 
 def test_escalation_registry_scopes_and_forgets():
