@@ -509,6 +509,50 @@ class TestWorkspaceScopedReadPaths:
         # And the ws-a write landed in ws-a.
         assert store._find_session_path(session_id, workspace_id="ws-a") is not None
 
+    def test_re_save_into_other_workspace_keeps_single_copy(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """D4: a re-save into another workspace never duplicates the record.
+
+        A persisted session's ``workspace_id`` is immutable, so the second save
+        cannot honour the new workspace.  It must keep updating the owner's own
+        file: writing a second copy into the requested workspace would both
+        duplicate the session and mislabel it, because the payload would still
+        carry the old workspace_id.  (The unowned/legacy case — no recorded
+        workspace_id at all — is D3 above.)
+        """
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        sample_session.workspace_id = "ws-a"
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-a")
+        ws_a_path = store._find_session_path(session_id, workspace_id="ws-a")
+        assert ws_a_path is not None, "the first save did not land in ws-a"
+
+        # Re-save the same session into a DIFFERENT workspace.
+        store.save_session(sample_session, workspace_id="ws-b")
+
+        # Exactly ONE copy of the session exists across every workspace dir.
+        copies = []
+        for ws_sessions in (tmp_path / "vault" / "workspaces").glob("*/sessions"):
+            for path in ws_sessions.glob("*.json"):
+                if path.name.startswith("_meta_"):
+                    continue
+                if json.loads(path.read_text()).get("session_id") == session_id:
+                    copies.append((ws_sessions.parent.name, path))
+        assert len(copies) == 1, (
+            f"expected exactly one copy of the session, found {copies}"
+        )
+
+        # ... it lives in the owning workspace, and its payload agrees with it.
+        owner, path = copies[0]
+        assert owner == "ws-a", f"the single copy landed in {owner!r}, not the owner's ws-a"
+        payload_workspace_id = json.loads(path.read_text()).get("workspace_id")
+        assert payload_workspace_id == owner, (
+            f"payload workspace_id {payload_workspace_id!r} disagrees with its "
+            f"directory {owner!r}"
+        )
+        assert store._find_session_path(session_id, workspace_id="ws-a") == path
+
     def test_legacy_resident_session_readable_but_never_leaks_another_workspace(
         self, store, sample_session, tmp_path, monkeypatch
     ):

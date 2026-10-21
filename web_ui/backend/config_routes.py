@@ -30,6 +30,9 @@ _CONFIG_PATH = "~/.thoughtmachine/agent_config.json"
 
 class ResetConfigBody(BaseModel):
     session_id: Optional[str] = None
+    # Optional workspace scope for the cached-bridge update below: a bridge
+    # cached for a different workspace is not this caller's to reconfigure.
+    workspace_id: Optional[str] = None
 
 
 class ModeSwitchBody(BaseModel):
@@ -77,9 +80,12 @@ async def reset_config(body: ResetConfigBody) -> Dict[str, Any]:
     revert to factory defaults on the next load.
 
     If *session_id* is provided and a bridge for that session is cached
-    in ``server._session_bridges``, the bridge's in-memory config is
-    also updated.  This is optional — the endpoint always resets the
-    config file regardless.
+    in ``server._session_bridges`` **for the workspace named by
+    *workspace_id***, the bridge's in-memory config is also updated.
+    This is optional and best-effort — the endpoint always resets the
+    config file regardless, also when the cached-bridge lookup misses
+    (unknown session, a bridge holding no session, or a bridge belonging
+    to another workspace).
 
     Returns:
         The factory-default configuration dict (with ``api_key`` excluded).
@@ -94,7 +100,14 @@ async def reset_config(body: ResetConfigBody) -> Dict[str, Any]:
         if body.session_id:
             # Import lazily to avoid circular import at module level
             import web_ui.backend.server as server_mod
-            cached = server_mod._session_bridges.get(body.session_id)
+            # Workspace-scoped lookup (PR #157 discipline): a bridge cached for
+            # ANOTHER workspace — or one that holds no session at all — is a
+            # miss.  Mutating it here would reconfigure a live session that
+            # belongs to a different workspace.  A miss is not an error: the
+            # config file above is already reset and this update is optional.
+            cached = server_mod._cached_bridge_for(
+                body.session_id, expected_workspace_id=body.workspace_id
+            )
             if cached is not None:
                 # Rebuild the bridge's in-memory AgentConfig from factory
                 from agent.config import AgentConfig

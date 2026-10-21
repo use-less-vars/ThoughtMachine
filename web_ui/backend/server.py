@@ -1531,8 +1531,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         #
                         #    - **Existing session with NO conversation** (empty/fresh tab):
                         #      reuse the same tab; the session's workspace_id is immutable once
-                        #      set, so the workspace switch is applied via the workspace-scoped
-                        #      save below — no new tab created.
+                        #      set, so the session RECORD stays in its own workspace (the store
+                        #      redirects the save back to it) — only the tab/config switch to
+                        #      the new workspace, no new tab created.
                         #
                         #    - **No existing session**: create a fresh one.
                         #
@@ -1587,8 +1588,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 })
                             elif existing_session is not None:
                                 # No conversation (empty/fresh tab) — reuse the same tab. The
-                                # session's workspace_id is immutable once persisted, so the
-                                # workspace switch is applied via the workspace-scoped save below.
+                                # session's workspace_id is immutable once persisted, so the store
+                                # keeps the record in its recorded workspace; the tab's workspace
+                                # binding (bridge) is what moves.
                                 bridge._loaded_session = existing_session
                                 _session_bridges[existing_session.session_id] = bridge
                                 session_store.save_session(existing_session, workspace_id=workspace_id)
