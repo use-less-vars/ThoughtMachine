@@ -278,6 +278,7 @@ class TestCreateHardenedContainer:
         assert kwargs["oom_score_adj"] == 42
         assert kwargs["network_mode"] == "bridge"
         assert kwargs["mem_limit"] == "2g"
+        assert kwargs["memswap_limit"] == "2g"
         assert kwargs["cpu_quota"] == 50000
         assert kwargs["cap_drop"] == HARDENED_CAP_DROP
         assert kwargs["security_opt"] == HARDENED_SECURITY_OPT
@@ -307,6 +308,7 @@ class TestCreateHardenedContainer:
         assert kwargs["oom_score_adj"] == DEFAULT_USER_OOM_SCORE_ADJ
         assert kwargs["network_mode"] == "none"
         assert kwargs["mem_limit"] == DEFAULT_MEM_LIMIT
+        assert kwargs["memswap_limit"] == DEFAULT_MEM_LIMIT
         assert kwargs["cpu_quota"] == DEFAULT_CPU_QUOTA
         assert kwargs["tmpfs"] == DEFAULT_TMPFS
         assert kwargs["mounts"] == []
@@ -510,6 +512,7 @@ class TestRequestContainer:
         kwargs = _run_kwargs(fake_client)
         assert kwargs["name"] == handle["name"]
         assert kwargs["mem_limit"] == "512m"
+        assert kwargs["memswap_limit"] == "512m"
         assert kwargs["cpu_quota"] == 50000
         assert kwargs["oom_score_adj"] == 500
         # The record-creation hook (§7) injects the record-owned label into the

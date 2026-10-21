@@ -29,6 +29,7 @@ from agent.logging import log
 from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
     CONTAINER_TYPE_LABEL,
+    DEFAULT_MEM_LIMIT,
     EXEC_TMPFS_OPTIONS,
     host_user,
     _host_ids,
@@ -647,7 +648,7 @@ class DockerExecutor:
         workspace_path: str,
         image: str = "agent-executor",
         network: str = "none",
-        mem_limit: str = "1g",
+        mem_limit: str = DEFAULT_MEM_LIMIT,
         cpu_quota: int = 100000,
         force_rebuild: bool = False,
         idle_timeout: int = IDLE_TIMEOUT_SECONDS,

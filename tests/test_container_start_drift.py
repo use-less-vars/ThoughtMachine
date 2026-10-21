@@ -962,6 +962,7 @@ def test_operator_intent_mem_cpu_honoured_by_heal_rebuild():
     # HONOURED: the operator's resource intent reaches the daemon create call.
     run_kwargs = cm.client.containers.run_calls[-1]
     assert run_kwargs["mem_limit"] == "2g"
+    assert run_kwargs["memswap_limit"] == "2g"
     assert run_kwargs["cpu_quota"] == 50000
     # SURVIVES: the operator's snapshot is never overwritten.
     rec = load_record("w1", "rec-1", vault_root=_VAULT["root"])
@@ -987,6 +988,7 @@ def test_operator_recreate_of_resource_record_honours_and_preserves_intent(monke
     assert result["id"] == _HEAL_NEW_ID
     run_kwargs = cm.client.containers.run_calls[-1]
     assert run_kwargs["mem_limit"] == "2g"
+    assert run_kwargs["memswap_limit"] == "2g"
     assert run_kwargs["cpu_quota"] == 50000
     # FILL-ONCE: the record ALREADY carries an evidence-bearing operator intent,
     # so the rebuild does NOT overwrite it (the kwarg is omitted entirely).
@@ -1035,6 +1037,7 @@ def test_rebuild_without_resource_intent_falls_back_to_instance_defaults():
     assert result.get("error") is None
     run_kwargs = cm.client.containers.run_calls[-1]
     assert run_kwargs["mem_limit"] == "1g"
+    assert run_kwargs["memswap_limit"] == "1g"
     assert run_kwargs["cpu_quota"] == 100000
 
 
@@ -1093,6 +1096,7 @@ def test_fresh_create_uses_instance_resource_values():
     assert result.get("error") is None
     run_kwargs = cm.client.containers.run_calls[-1]
     assert run_kwargs["mem_limit"] == "1g"
+    assert run_kwargs["memswap_limit"] == "1g"
     assert run_kwargs["cpu_quota"] == 100000
 
 
@@ -1111,6 +1115,7 @@ def test_fresh_create_uses_constructor_resource_overrides():
     assert result.get("error") is None
     run_kwargs = cm.client.containers.run_calls[-1]
     assert run_kwargs["mem_limit"] == "3g"
+    assert run_kwargs["memswap_limit"] == "3g"
     assert run_kwargs["cpu_quota"] == 200000
 
 

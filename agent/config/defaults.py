@@ -229,7 +229,7 @@ DEFAULT_TMPFS = {
     "/home/agent": _TMPFS_HOME,
 }
 DEFAULT_COMMAND = ["tail", "-f", "/dev/null"]
-DEFAULT_MEM_LIMIT = "1g"
+DEFAULT_MEM_LIMIT = "512m"
 DEFAULT_CPU_QUOTA = 100000
 # Graceful-stop timeout used by destroy_container / permission reconciliation.
 STOP_TIMEOUT = 10
