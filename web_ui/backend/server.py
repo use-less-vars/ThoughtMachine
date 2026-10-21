@@ -2203,19 +2203,61 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "list_sessions":
                     try:
+                        # ATTACK-5: a connection may only enumerate the sessions
+                        # of the workspace it is bound to.  The scope is the
+                        # connection's OWN (bridge.workspace_id) -- never a
+                        # client-supplied value -- and a connection with no scope
+                        # gets nothing at all: the registry is one cross-tenant
+                        # index, so "unscoped" must never degrade into "every
+                        # workspace's sessions".
+                        _ls_scope = bridge.workspace_id if bridge is not None else None
+                        if not _ls_scope:
+                            log('WARNING', 'server.config',
+                                'list_sessions refused: connection has no workspace scope')
+                            await ws.send_json({
+                                "type": "sessions_list",
+                                "sessions": [],
+                            })
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": ("⚠ list_sessions: this connection is not bound "
+                                         "to a workspace yet, so no sessions are listed."),
+                            })
+                            continue
+
                         registry = SessionRegistry.get_default()
                         all_sessions = registry.get_all()
-                        sessions = list(all_sessions.values())
-                        # Fall back to disk scan if registry is empty
+                        sessions = [
+                            entry for entry in all_sessions.values()
+                            if isinstance(entry, dict)
+                            and entry.get("workspace_id") == _ls_scope
+                        ]
+                        # An empty result may just mean this workspace was never
+                        # registered.  Fall back to the STORE's workspace-scoped
+                        # listing -- never the global registry's disk rebuild,
+                        # which indexes every workspace's directory on behalf of
+                        # one caller -- and stamp the scope on each row: the
+                        # frontend learns session->workspace ownership from that
+                        # field (App.jsx, sessions_list).
                         if not sessions:
-                            registry.rebuild_from_disk()
-                            all_sessions = registry.get_all()
-                            sessions = list(all_sessions.values())
+                            try:
+                                for entry in session_store.list_sessions(
+                                        workspace_id=_ls_scope):
+                                    if not isinstance(entry, dict):
+                                        continue
+                                    row = dict(entry)
+                                    row.setdefault("workspace_id", _ls_scope)
+                                    sessions.append(row)
+                            except Exception as exc:
+                                log('WARNING', 'server.config',
+                                    f"list_sessions: scoped store fallback failed: {exc}")
+
                         await ws.send_json({
                             "type": "sessions_list",
                             "sessions": sessions,
                         })
-                        log("INFO", "server.config", f"Listed {len(sessions)} sessions via registry")
+                        log("INFO", "server.config",
+                            f"Listed {len(sessions)} sessions for workspace {_ls_scope}")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
