@@ -2838,6 +2838,62 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "close_session":
                     session_id = msg.get("session_id", "")
+                    # Ownership gate (R8): a socket may only close a session that
+                    # lives inside its own workspace scope. The connection's
+                    # bridge is authoritative. close_session resolves its target
+                    # from the CLIENT-SUPPLIED session_id, and
+                    # bridge.close_session -> WorkerRegistry.shutdown_workers()
+                    # sweeps every registry key, so without this check a tab bound
+                    # to workspace A could kill workspace B's worker threads by
+                    # naming B's session. Nothing with a side effect may run
+                    # before this check. A scopeless connection (bootstrap) keeps
+                    # its previous behaviour.
+                    _close_scope_ws = bridge.workspace_id if bridge is not None else None
+                    if _close_scope_ws:
+                        try:
+                            from web_ui.backend.bridge import _validate_workspace_id
+                            _close_scope_ws = _validate_workspace_id(_close_scope_ws)
+                        except ValueError as exc:
+                            log('WARNING', 'server',
+                                f"close_session refused: invalid workspace_id: {exc}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"Close refused: invalid workspace_id: {exc}",
+                            })
+                            continue
+                    if _close_scope_ws and session_id:
+                        # The socket's own session is in scope by construction
+                        # (load_session already refused any cross-workspace bind),
+                        # even when it has not been persisted yet. For any other
+                        # id, a NON-DESTRUCTIVE scoped metadata lookup is the
+                        # proof of ownership: close_session must not delete
+                        # anything on the way to deciding.
+                        _close_own_sids = set()
+                        if bridge is not None:
+                            if getattr(bridge, "_session_id", None):
+                                _close_own_sids.add(bridge._session_id)
+                            for _own in (
+                                getattr(bridge, "_session", None),
+                                getattr(bridge, "_loaded_session", None),
+                            ):
+                                _own_sid = getattr(_own, "session_id", None)
+                                if _own_sid:
+                                    _close_own_sids.add(_own_sid)
+                        if session_id not in _close_own_sids:
+                            if session_store.load_session_metadata(
+                                session_id, workspace_id=_close_scope_ws
+                            ) is None:
+                                log('WARNING', 'server',
+                                    f"close_session refused: session {session_id} is not "
+                                    f"in workspace {_close_scope_ws}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": (
+                                        f"Close refused: session {session_id} does not "
+                                        f"belong to this workspace."
+                                    ),
+                                })
+                                continue
                     try:
                         if bridge is not None:
                             bridge.close_session(session_id if session_id else None)
