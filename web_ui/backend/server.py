@@ -1557,6 +1557,32 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     workspace_changed = bool(new_workspace_path) and new_workspace_path != current_path
 
                     if workspace_changed:
+                        # ── Ownership gate (narrowed operator rule) ────────────
+                        # One shared predicate (bridge._ownership_refusal) drives
+                        # both apply_config and set_project, so the rule cannot
+                        # drift between them.  A connection bound to workspace A
+                        # may move to a brand-new path outside every registered
+                        # workspace root, but never onto another registered
+                        # workspace (nor into its tree).  Roots are
+                        # realpath-normalised, so a symlink into B's root is
+                        # caught as B.
+                        from web_ui.backend.bridge import _ownership_refusal
+                        _ac_bound_ws = bridge.workspace_id if bridge is not None else None
+                        _ac_refusal = _ownership_refusal(new_workspace_path, _ac_bound_ws)
+                        if _ac_refusal is not None:
+                            log('WARNING', 'server.config',
+                                "apply_config refused: workspace mismatch — "
+                                f"connection scoped to workspace {_ac_bound_ws} "
+                                f"cannot switch to {new_workspace_path}: {_ac_refusal}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": (
+                                    "⚠ Workspace switch refused: this connection is "
+                                    f"scoped to workspace {_ac_bound_ws} and cannot "
+                                    f"switch to {new_workspace_path}."
+                                ),
+                            })
+                            continue
                         log('INFO', 'server.config',
                             "apply_config: workspace_changed=True — switching project workspace")
                         # ── Full project switch ────────────────────────────────────────────
@@ -3222,39 +3248,39 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # to a DIFFERENT workspace.  The path confinement above only
                     # proves the target exists and is outside the vault; it says
                     # nothing about which workspace this socket belongs to.
+                    #
+                    # Narrowed operator rule \u2014 the SAME shared predicate
+                    # (bridge._ownership_refusal) also gates apply_config:
+                    #   * target resolves to the bound workspace        \u2192 ALLOW
+                    #   * target resolves to a DIFFERENT workspace      \u2192 REFUSE
+                    #   * target is unregistered                        \u2192 ALLOW only
+                    #     when it is neither equal to nor inside another
+                    #     registered workspace's realpath'd root
+                    # An unscoped socket (no binding) is unrestricted.
                     _sp_cur_ws = bridge.workspace_id if bridge is not None else None
-                    if _sp_cur_ws:
-                        try:
-                            from web_ui.backend.bridge import _resolve_workspace_id
-                            _sp_req_ws = _resolve_workspace_id(new_project)
-                        except Exception:
-                            _sp_req_ws = None
-                        _sp_same = _sp_req_ws == _sp_cur_ws
-                        if not _sp_same and _sp_req_ws is None:
-                            # Unregistered path: allowed only if it IS the root
-                            # of the workspace this socket is already bound to.
-                            try:
-                                _sp_entry = WorkspaceRegistry.get_default().get_workspace(_sp_cur_ws)
-                                _sp_own_root = getattr(_sp_entry, 'root_path', None)
-                            except Exception:
-                                _sp_own_root = None
-                            if _sp_own_root and os.path.abspath(
-                                    str(_sp_own_root)) == os.path.abspath(new_project):
-                                _sp_same = True
-                        if not _sp_same:
-                            log('WARNING', 'server',
-                                f"set_project refused: connection is scoped to workspace "
-                                f"{_sp_cur_ws} and cannot switch to {new_project} "
-                                f"(workspace {_sp_req_ws})")
-                            await ws.send_json({
-                                "type": "status_message",
-                                "text": (
-                                    f"\u26a0 Project switch refused: this connection is "
-                                    f"scoped to workspace {_sp_cur_ws} and cannot switch "
-                                    f"to {_sp_req_ws or new_project}."
-                                ),
-                            })
-                            continue
+                    try:
+                        from web_ui.backend.bridge import (
+                            _ownership_refusal, _resolve_workspace_id,
+                        )
+                        _sp_refusal = _ownership_refusal(new_project, _sp_cur_ws)
+                        _sp_req_ws = _resolve_workspace_id(new_project)
+                    except Exception as exc:
+                        _sp_refusal = f"ownership check failed: {exc}"
+                        _sp_req_ws = None
+                    if _sp_refusal is not None:
+                        log('WARNING', 'server',
+                            f"set_project refused: connection is scoped to workspace "
+                            f"{_sp_cur_ws} and cannot switch to {new_project} "
+                            f"(workspace {_sp_req_ws}): {_sp_refusal}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": (
+                                f"\u26a0 Project switch refused: this connection is "
+                                f"scoped to workspace {_sp_cur_ws} and cannot switch "
+                                f"to {_sp_req_ws or new_project}."
+                            ),
+                        })
+                        continue
 
                     log('INFO', 'server', f"Switching project to {new_project}")
 
