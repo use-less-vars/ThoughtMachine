@@ -57,9 +57,21 @@ What the code actually does (this part is solid):
 
 **Honest conclusion: commits made through the agent's git tool cannot run pytest at this HEAD — in either execution mode.** That is a much narrower statement than "no commit is gated", and it says nothing about a hook the operator types by hand in their own shell, which would be governed by the common-dir `.git/hooks/` and any global `core.hooksPath` — both unreadable here (§1). The gating that demonstrably exists is CI (`.github/workflows/platform-matrix.yml`, `python-version-matrix.yml`, `first_start_ci.yml`, `cross-platform-smoke.yml`).
 
-### 5. Incidental: the failing test named in the report does not exist at this HEAD
+### 5. Incidental: the failing test named in the report — **CORRECTED, it does exist**
 
-`test_gate_import_order` has **zero matches** in any `*.py` in the tree (searched across all 670 Python files, and again across the 401 files in `tests/`). Whatever produced "1 failed, 81 passed" with that test name is not reproducible by name at `9d5ed869`; it may be renamed, deleted, or a recollection from a different tree. Recorded so nobody spends an hour looking for it.
+~~`test_gate_import_order` has **zero matches** in any `*.py` in the tree (searched across all 670 Python files, and again across the 401 files in `tests/`). Whatever produced "1 failed, 81 passed" with that test name is not reproducible by name at `9d5ed869`; it may be renamed, deleted, or a recollection from a different tree.~~
+
+**Correction, same pass.** The test exists: `tests/security/test_gate_import_order.py`, tracked at HEAD. The "zero matches" result above was a tool false negative, not a property of the tree.
+
+Direct check against the workspace root, which is the only evidence relied on now:
+
+```
+os.path.exists('tests/security/test_gate_import_order.py') -> True
+```
+
+How the wrong answer was produced, recorded because it will recur: the search was run through the code-search helper with brace-style glob filters, and that path silently returns zero results instead of erroring — including on inputs that are known to exist. "Zero matches" from that tool is therefore indistinguishable from "the pattern is unsupported", and it was read here as the former. A direct `os.path.exists` is the check that settles it, and it says the file is present. The claim above is struck rather than deleted so the failure mode is visible to the next reader.
+
+Nothing else in this ticket depends on §5 — it was filed as an incidental, and it stays one. What changes is its direction: the report's "1 failed, 81 passed" naming `test_gate_import_order` is now *consistent with* this tree rather than unexplained, so the failure — if it still reproduces — is a real failing test to look at, not a ghost to stop looking for. That is a separate investigation and not part of this hygiene ticket.
 
 ## Why it matters
 
