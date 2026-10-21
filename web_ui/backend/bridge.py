@@ -1859,19 +1859,41 @@ class WebAgentBridge:
         session_id, frontend_config = self._session_manager.create_session(
             mode=mode, workspace_path=self._workspace_path, workspace_id=workspace_id
         )
-        # Load session into in-memory state (no broadcast)
-        session = self._session_manager.load_session(session_id, workspace_id=self._workspace_id)
+        # Load session into in-memory state (no broadcast).  Scope the read to
+        # the workspace this session was just created in (falling back to the
+        # bridge's own workspace) so a same-id record from another namespace
+        # can never be adopted here.
+        _scope = workspace_id or self._workspace_id
+        session = self._session_manager.load_session(session_id, workspace_id=_scope)
+        if (
+            _scope
+            and session is not None
+            and session.workspace_id
+            and session.workspace_id != _scope
+        ):
+            log('WARNING', 'server.bridge',
+                f"create_session refused: session {session_id} belongs to workspace "
+                f"{session.workspace_id!r}, expected {_scope!r}")
+            session = None
         if session is not None:
             self._session = session
             self._loaded_session = session
             self._history_version = session.conversation_version
-            self._workspace_id = session.workspace_id
+            # A workspace-less record must not unscope the bridge: keep the
+            # existing binding when the freshly created session carries none.
+            self._workspace_id = session.workspace_id or self._workspace_id
             sc = self._session_manager.extract_session_config(session)
             if sc is not None:
                 self._session_config = sc
         return session_id, frontend_config
 
-    def load_session(self, session_id: str, limit: Optional[int] = 50, offset: int = 0) -> bool:
+    def load_session(
+        self,
+        session_id: str,
+        limit: Optional[int] = 50,
+        offset: int = 0,
+        workspace_id: Optional[str] = None,
+    ) -> bool:
         """Load a session from the store, replacing current conversation.
 
         Delegates persistence and role repair to ``SessionManager.load_session``
@@ -1887,18 +1909,47 @@ class WebAgentBridge:
         Pagination: if ``limit`` is provided, only the most recent ``limit``
         messages are emitted in ``conversation_changed``, with ``total_count``
         and ``has_more`` to let the frontend fetch older pages.
+
+        Workspace scope: a session may only be loaded into a bridge of its own
+        workspace.  ``workspace_id`` optionally names the expected workspace,
+        but the bridge's own binding always wins: a caller asking for a
+        different workspace, or a stored record carrying a different
+        ``workspace_id``, is refused with ``False`` and leaves the bridge
+        state untouched.
         """
         try:
+            # ── Workspace scope: never pivot this bridge across workspaces ──
+            # Loading adopts the session's workspace_id below, so a record from
+            # another workspace would silently re-scope every later write
+            # (session saves, containers, permission lookups).  The bridge's own
+            # binding is authoritative; a caller-supplied id may only scope a
+            # bridge that has none yet.
+            _scope: Optional[str] = self._workspace_id or workspace_id
+            if self._workspace_id and workspace_id and workspace_id != self._workspace_id:
+                log('WARNING', 'server.bridge',
+                    f"load_session refused: workspace {workspace_id!r} requested but "
+                    f"bridge is scoped to {self._workspace_id!r} (session {session_id})")
+                return False
             # Load from the bridge's current store (caller may have replaced _session_store)
-            session = self._session_store.load_session(session_id, workspace_id=self._workspace_id)
+            session = self._session_store.load_session(session_id, workspace_id=_scope)
             if session is None:
                 log('WARNING', 'server.bridge', f"Session not found: {session_id}")
+                return False
+            # The store also scans the legacy, workspace-agnostic directory,
+            # whose records can still carry a foreign workspace_id.  Refuse
+            # one here rather than pivoting the bridge into that workspace.
+            if _scope and session.workspace_id and session.workspace_id != _scope:
+                log('WARNING', 'server.bridge',
+                    f"load_session refused: session {session_id} belongs to workspace "
+                    f"{session.workspace_id!r}, expected {_scope!r}")
                 return False
             # Apply role repair, config migration, registry registration
             self._session_manager.repair_session(session)
             self._session = session
             self._history_version = session.conversation_version
-            self._workspace_id = session.workspace_id
+            # A workspace-less legacy record must not unscope the bridge: keep
+            # the existing binding when the record does not carry one.
+            self._workspace_id = session.workspace_id or self._workspace_id
 
             # ── Backfill workspace_path from the workspace registry ─────
             if self._workspace_id and not self._workspace_path:
