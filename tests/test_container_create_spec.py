@@ -268,6 +268,19 @@ class TestCreateHardenedContainer:
         assert created.expected_hardening == spec.hardening
         assert isinstance(created.container, FakeContainer)
 
+    def test_mem_limit_defaults_to_512m_and_explicit_override_wins(self, fake_client):
+        """The default create limit resolves to 512m; an explicit value wins."""
+        assert DEFAULT_MEM_LIMIT == "512m"
+        assert _spec().mem_limit == "512m"
+
+        create_hardened_container(fake_client, _spec(), record=False)
+        _, kwargs = fake_client.containers.run.call_args
+        assert kwargs["mem_limit"] == "512m"
+
+        create_hardened_container(fake_client, _spec(mem_limit="2g"), record=False)
+        _, kwargs = fake_client.containers.run.call_args
+        assert kwargs["mem_limit"] == "2g"
+
     def test_identity_env_is_merged(self, fake_client):
         spec = _spec(workspace_id="ws-1", session_id="sess-1", environment={"A": "B"})
         create_hardened_container(fake_client, spec, record=False)
