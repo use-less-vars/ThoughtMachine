@@ -2271,6 +2271,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # shared _project_path is deliberately NOT consulted: no caller
                     # sends ?project=, so it stays at the server root and names the
                     # wrong (or no) workspace — refusing valid loads, admitting bad ones.
+                    # The connection's own scope is authoritative. A socket that
+                    # already has a workspace may never be re-scoped by a
+                    # client-supplied workspace_id: doing so lets any socket pivot
+                    # into another workspace simply by naming it.
+                    _socket_ws = bridge.workspace_id if bridge is not None else None
                     _expected_ws: Optional[str] = None
                     _msg_ws = msg.get("workspace_id") or None
                     if _msg_ws:
@@ -2285,12 +2290,38 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "text": f"⚠ Invalid workspace_id: {exc}",
                             })
                             continue
-                        _expected_ws = _msg_ws
-                    elif bridge is not None:
-                        _expected_ws = bridge.workspace_id
+                        if _socket_ws and _msg_ws != _socket_ws:
+                            log('WARNING', 'server',
+                                f"load_session refused: workspace mismatch "
+                                f"(socket={_socket_ws}, requested={_msg_ws}, "
+                                f"session={session_id})")
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "load_error": True,
+                                "workspace_id": None,
+                                "workspace_path": "",
+                            })
+                            continue
+                        _expected_ws = _socket_ws or _msg_ws
+                    else:
+                        _expected_ws = _socket_ws
 
                     # Check if we already have a cached bridge for this session
                     existing = _cached_bridge_for(session_id, _expected_ws)
+                    if (_socket_ws and existing is not None
+                            and existing.workspace_id
+                            and existing.workspace_id != _socket_ws):
+                        log('WARNING', 'server',
+                            f"load_session refused: cached bridge workspace mismatch "
+                            f"(socket={_socket_ws}, cached={existing.workspace_id}, "
+                            f"session={session_id})")
+                        await ws.send_json({
+                            "type": "session_loaded",
+                            "load_error": True,
+                            "workspace_id": None,
+                            "workspace_path": "",
+                        })
+                        continue
                     if existing is not None and existing._controller is not None:
                         # Reuse cached bridge — register the new WS callback but DON'T
                         # call bridge.load_session() (which would reload from disk,
@@ -2353,6 +2384,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         from agent.controller import AgentController
                         controller = AgentController()
                         bridge = WebAgentBridge(session_store=session_store)
+                        # WebAgentBridge.__init__ takes no workspace argument, so
+                        # the scope must be pinned here; otherwise _workspace_id
+                        # stays None and bridge.py's mismatch guard can never fire.
+                        if _expected_ws:
+                            bridge._workspace_id = _expected_ws
                         bridge.set_event_callback(event_callback, key=id(ws))
                         bridge.register()
                         bridge.set_controller(controller)
@@ -2567,7 +2603,126 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
                     try:
-                        session_store.delete_session(session_id, workspace_id=workspace_id)
+                        # Ownership gate: a socket may only delete a session that
+                        # lives inside its own workspace scope. The connection's
+                        # bridge is authoritative; a client-supplied workspace_id
+                        # may bootstrap a scopeless connection but must never
+                        # redirect one that already has a scope.
+                        _del_socket_ws = bridge.workspace_id if bridge is not None else None
+                        _del_scope_ws = _del_socket_ws or workspace_id
+                        if _del_scope_ws:
+                            try:
+                                from web_ui.backend.bridge import _validate_workspace_id
+                                _del_scope_ws = _validate_workspace_id(_del_scope_ws)
+                            except ValueError as exc:
+                                log('WARNING', 'server',
+                                    f"delete_session refused: invalid workspace_id: {exc}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"Delete refused: invalid workspace_id: {exc}",
+                                })
+                                continue
+                        if not _del_scope_ws:
+                            log('WARNING', 'server',
+                                f"delete_session refused: no workspace scope on this "
+                                f"connection (session={session_id})")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "Delete refused: no workspace scope on this connection.",
+                            })
+                            continue
+                        # A scoped delete only ever touches the socket's own
+                        # workspace directory, so on its own it can never destroy
+                        # another workspace's copy. Try it first: for a session
+                        # this workspace owns, it is simultaneously the delete and
+                        # the proof of ownership.
+                        _deleted = session_store.delete_session(
+                            session_id, workspace_id=_del_scope_ws
+                        )
+                        if not _deleted:
+                            # Not in this workspace. Two possibilities remain:
+                            # (i) the session belongs to ANOTHER workspace, whose
+                            # copy still sits in workspaces/<other>/sessions/;
+                            # (ii) it is a legacy session saved before workspaces
+                            # existed and carries no owner at all. Only (ii) may
+                            # be deleted here.
+                            _other_owner = None
+                            try:
+                                _base = getattr(session_store, "_base_dir", None)
+                                _ws_root = (_base / "workspaces") if _base else None
+                                if _ws_root is not None and _ws_root.exists():
+                                    _meta_name = f"_meta_{session_id}.json"
+                                    for _ws_dir in _ws_root.iterdir():
+                                        if not _ws_dir.is_dir():
+                                            continue
+                                        if _ws_dir.name == _del_scope_ws:
+                                            continue
+                                        if (_ws_dir / "sessions" / _meta_name).exists():
+                                            _other_owner = _ws_dir.name
+                                            break
+                                        # No sibling meta file. The store locates
+                                        # sessions by CONTENT, not by filename, so a
+                                        # foreign copy may sit here under an arbitrary
+                                        # name. Mirror the store's scan so this probe
+                                        # sees exactly what the unscoped sweep would
+                                        # delete.
+                                        _other_sess_dir = _ws_dir / "sessions"
+                                        if not _other_sess_dir.is_dir():
+                                            continue
+                                        for _other_file in _other_sess_dir.glob("*.json"):
+                                            if _other_file.name.startswith("_meta_"):
+                                                continue
+                                            try:
+                                                with open(_other_file, "r") as _oh:
+                                                    _other_data = json.load(_oh)
+                                            except Exception:
+                                                # Unparsable file: the store skips
+                                                # these too, so skip it here.
+                                                continue
+                                            if isinstance(_other_data, dict) and _other_data.get("session_id") == session_id:
+                                                _other_owner = _ws_dir.name
+                                                break
+                                        if _other_owner:
+                                            break
+                            except Exception as exc:
+                                # Fail CLOSED: if ownership cannot be established,
+                                # the delete must not proceed.
+                                log('WARNING', 'server',
+                                    f"delete_session refused: ownership probe failed "
+                                    f"for {session_id}: {exc}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": "Delete refused: could not verify workspace ownership.",
+                                })
+                                continue
+                            if _other_owner:
+                                log('WARNING', 'server',
+                                    f"delete_session refused: session {session_id} belongs "
+                                    f"to workspace {_other_owner}, not {_del_scope_ws}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": "Delete refused: session belongs to another workspace.",
+                                })
+                                continue
+                            # Legacy session with no owning workspace: keep the
+                            # pre-existing behaviour (unscoped sweep).
+                            _deleted = session_store.delete_session(session_id)
+                        if not _deleted:
+                            log('WARNING', 'server',
+                                f"delete_session refused: session {session_id} not found in "
+                                f"workspace {_del_scope_ws}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "Delete refused: session not found in this workspace.",
+                            })
+                            continue
+                        # Ownership is proven; sweep any duplicate copies of this id
+                        # left in legacy/unscoped locations so it cannot resurrect.
+                        try:
+                            session_store.delete_session(session_id)
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"delete_session: legacy sweep failed for {session_id}: {exc}")
                         session_store.remove_open_session(session_id)
                         # Remove from global session registry
                         registry = SessionRegistry.get_default()
