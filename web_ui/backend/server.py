@@ -22,7 +22,13 @@ Architecture
 
 Startup
 ───────
-    uvicorn web_ui.backend.server:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn web_ui.backend.server:app --host 127.0.0.1 --port 8000 --reload
+
+The bind address defaults to loopback (127.0.0.1; override with ``--host`` or
+the ``HOST`` env var), the server refuses to start on a non-loopback host
+unless ``--allow-remote-bind`` is passed, and the health routes (``GET /health``,
+``/api/health``, ``/api/health/containers``) answer localhost callers only, so a
+server exposed on a non-loopback interface does not publish its health payload.
 
 Or via provided run script:
     python -m web_ui.backend.server
@@ -3226,8 +3232,72 @@ async def user_home():
     return {"home": str(Path.home())}
 
 
+# --- Loopback-only gate for the health routes -------------------------------
+# The server binds 127.0.0.1 by default (see the ``--host`` default in main()),
+# but the bind can be overridden (``--host``/``HOST``) and a reverse proxy in
+# front of the process would forward a remote caller as a local one.  The health
+# routes therefore check the peer address themselves.
+_LOCAL_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# In-process ASGI test-harness address.  Starlette's TestClient puts
+# ``scope["client"] = ("testclient", 50000)`` on every request it builds
+# (starlette/testclient.py); the name is not resolvable or routable over any
+# network, so real traffic can never carry it.  Kept in its own constant so the
+# allowance is explicit and cannot be confused with the loopback set.
+_TEST_HARNESS_CLIENT_HOSTS = frozenset({"testclient"})
+
+
+def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> Optional[str]:
+    """Return the refusal message for a bind *host*, or ``None`` when it is safe.
+
+    Accepted values are exactly the local-caller literals in
+    ``_LOCAL_CLIENT_HOSTS`` — one notion of "local", shared with the health gate
+    below — plus their bracketed IPv6 CLI spelling (``[::1]``), which is how a
+    scoped IPv6 host is written on a command line.
+
+    An empty or whitespace-only host is refused even when *allow_remote* is set:
+    uvicorn reads ``""`` as "all interfaces", the exact exposure this check
+    exists to prevent, and nobody types it on purpose.
+
+    *allow_remote* is the ``--allow-remote-bind`` escape hatch; it waives the
+    loopback requirement and nothing else.  Pure function: no printing, no
+    exiting, no argparse — the caller decides how loud to be and how to fail.
+    """
+    raw = "" if host is None else str(host).strip()
+    if not raw:
+        return ("Refusing to start: the bind host is empty, and an empty host means "
+                "'all interfaces'. Use --host or the HOST env var to name a loopback "
+                "address (127.0.0.1, ::1, localhost).")
+    if allow_remote:
+        return None
+    literal = raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
+    if literal in _LOCAL_CLIENT_HOSTS:
+        return None
+    return (f"Refusing to start: bind host {raw} is not a loopback address. Use a "
+            f"loopback host (127.0.0.1, ::1, localhost) via --host or the HOST env "
+            f"var, or pass --allow-remote-bind to expose the unauthenticated API "
+            f"knowingly.")
+
+
+def _localhost_only(request: Request) -> Optional[JSONResponse]:
+    """Return a 403 response when *request* did not come from a local caller.
+
+    ``request.client`` is ``None`` when the ASGI server cannot report a peer
+    address; that is treated as NOT local (fail closed).  The caller's address
+    is deliberately never echoed in the response body.
+    """
+    client = request.client
+    host = client.host if client is not None else None
+    if host in _LOCAL_CLIENT_HOSTS or host in _TEST_HARNESS_CLIENT_HOSTS:
+        return None
+    return JSONResponse({"error": "localhost only"}, status_code=403)
+
+
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    denied = _localhost_only(request)
+    if denied is not None:
+        return denied
     return {
         "status": "ok",
         "service": "thoughtmachine-web-ui",
@@ -3236,9 +3306,9 @@ async def health():
 
 
 @app.get("/api/health")
-async def api_health():
+async def api_health(request: Request):
     """Structured health alias of GET /health (back-compat mirror)."""
-    return await health()
+    return await health(request)
 
 
 @app.get("/api/vault/status")
@@ -5006,7 +5076,7 @@ def workspace_container_logs(workspace_id: str, container_name: str,
 
 
 @app.get("/api/health/containers")
-def health_containers():
+def health_containers(request: Request):
     """Report whether the Docker daemon is reachable from the server.
 
     Returns a structured payload so callers can surface degraded Docker
@@ -5019,6 +5089,9 @@ def health_containers():
     lib_missing | import_failed | docker_host_unreachable, or null when
     Docker is available.
     """
+    denied = _localhost_only(request)
+    if denied is not None:
+        return denied
     checked_at = datetime.now(timezone.utc).isoformat()
     client = None
     try:
@@ -5254,6 +5327,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Host to bind to (default: 127.0.0.1; override with HOST env var)",
     )
     parser.add_argument(
+        "--allow-remote-bind",
+        action="store_true",
+        help=(
+            "INSECURE: accept a non-loopback --host/HOST. The Web UI API is "
+            "unauthenticated, so anything that can reach the port can drive this "
+            "machine's agent. Use only on a network you already trust."
+        ),
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=int(os.environ.get("PORT", "8000")),
@@ -5282,6 +5364,27 @@ def main():
     import uvicorn
 
     args = build_parser().parse_args()
+
+    # F30(d): refuse to publish an unauthenticated API on a non-loopback
+    # interface.  A blanket refusal with no escape hatch gets deleted the first
+    # time someone needs a LAN demo; an explicit, greppable, loudly announced
+    # opt-in keeps that exception visible in the source and on stderr.
+    host_error = _validate_bind_host(args.host, allow_remote=args.allow_remote_bind)
+    if host_error is not None:
+        print(host_error, file=sys.stderr)
+        print(
+            "ThoughtMachine serves an unauthenticated local API; binding to a "
+            "non-loopback address is refused by default.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if args.allow_remote_bind:
+        print(
+            f"WARNING: --allow-remote-bind is set — binding to {args.host}, so the "
+            f"unauthenticated Web UI API is reachable from every host that can "
+            f"route to this port.",
+            file=sys.stderr,
+        )
 
     # Rebuild global session registry from disk
     registry = SessionRegistry.get_default()
