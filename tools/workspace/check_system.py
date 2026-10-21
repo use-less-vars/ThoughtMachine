@@ -1020,28 +1020,128 @@ class CheckSystem(ToolBase):
         except Exception as e:
             return {"error": f"Failed to get event bus status: {e}"}
 
+    # Event types whose ``data`` carries a human-readable message body.  Their
+    # free text is redacted to a length/shape marker before the log is shown;
+    # ``container_lifecycle`` is deliberately absent -- see _redact_event_body.
+    _MESSAGE_BODY_EVENT_TYPES: ClassVar[frozenset] = frozenset({"user_query", "tool_result", "turn"})
+
+    @staticmethod
+    def _event_belongs_to_session(record: dict, session_id: str) -> bool:
+        """True when *record* is attributable to *session_id*.
+
+        Three shapes are in play today, so a record may match on any of them:
+
+        1. ``record["session_id"]`` -- top level, written by EventLogger for
+           every event (the write-side half of this scoping).
+        2. ``record["data"]["session_id"]`` -- how ``container_lifecycle``
+           events carry it (infra/container_lifecycle.py::_build_event).
+        3. ``record["data"]["conversation_id"]`` -- how ``user_query`` /
+           ``turn`` / ``tool_result`` carry it (agent/core/agent.py::
+           _get_conversation_data_for_event).
+
+        A record matching none of them is unattributed: it belongs to nobody
+        and is therefore excluded for every caller.
+        """
+        if not session_id:
+            return False
+        if record.get("session_id") == session_id:
+            return True
+        data = record.get("data")
+        if not isinstance(data, dict):
+            return False
+        if data.get("session_id") == session_id:
+            return True
+        return data.get("conversation_id") == session_id
+
+    @classmethod
+    def _redact_event_body(cls, event_type: Any, data: Any) -> Any:
+        """Return a shallow copy of *data* with message bodies redacted.
+
+        Only the message-carrying types (``user_query`` / ``tool_result`` /
+        ``turn``) are touched.  ``container_lifecycle`` is NEVER redacted: its
+        payload is the destroy/restart audit record (action, reason,
+        contributing_source, container identity) and is also the only
+        session/workspace scoping key for those events.
+        """
+        if not isinstance(data, dict):
+            return data
+        if not isinstance(event_type, str) or event_type not in cls._MESSAGE_BODY_EVENT_TYPES:
+            return data
+        redacted = dict(data)
+        for key in ("content", "assistant_content", "result"):
+            value = redacted.get(key)
+            if value is None:
+                continue
+            try:
+                size = len(value)
+            except TypeError:
+                size = len(str(value))
+            redacted[key] = f"[content: {size} chars, type: {type(value).__name__}]"
+        tool_calls = redacted.get("tool_calls")
+        # Tool arguments and results ride inside tool_calls, so leaving it whole
+        # would be a half-redaction.
+        if isinstance(tool_calls, (list, tuple, dict)) and len(tool_calls):
+            redacted["tool_calls"] = f"[tool_calls: {len(tool_calls)} items]"
+        return redacted
+
     def _query_event_log(self) -> str:
-        """Tail the EventLogger JSONL file and return a formatted string."""
+        """Tail the EventLogger JSONL file, scoped to the calling session.
+
+        The event log is ONE vault-global file shared by every session, so it is
+        never served unfiltered: the caller's session id is required (fail
+        closed, per _query_running_workers), the read is widened so a busy
+        neighbour cannot starve the caller, and only attributable records are
+        shown -- with message bodies redacted.
+        """
         try:
+            # Fail closed: without a session scope there is no safe view.  A
+            # global tail must never be the fallback.
+            sid = self.session_id or ""
+            if not sid:
+                return (
+                    "[event_log] No session scope on this call; refusing to "
+                    "return the global event log."
+                )
+
             from agent.logging.event_logger import EventLogger
             file_path = EventLogger.instance().file_path
             if not os.path.exists(file_path):
                 return f"[event_log] No log file found at: {file_path}"
 
             import subprocess
+            # Widened read (500 lines) so that filtering by owner still leaves a
+            # useful window for this caller on a busy machine.
             result = subprocess.run(
-                ["tail", "-n", "50", file_path],
+                ["tail", "-n", "500", file_path],
                 capture_output=True, text=True, timeout=5,
             )
             lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
-            parts = [f"Event log ({len(lines)} recent entries):", f"Path: {file_path}", ""]
-            for i, line in enumerate(lines, 1):
+            owned: list = []
+            for line in lines:
                 try:
                     parsed = json.loads(line)
-                    parts.append(f"  #{i}: [{parsed.get('event_type', '?')}] {parsed.get('source', '?')} \u2014 {json.dumps(parsed.get('data', {}), default=str)[:200]}")
                 except json.JSONDecodeError:
-                    parts.append(f"  #{i}: {line[:200]}")
+                    # Unparseable line: cannot be attributed to any session.
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                if self._event_belongs_to_session(parsed, sid):
+                    owned.append(parsed)
+            shown = owned[-50:]
+
+            parts = [
+                f"Event log ({len(shown)} recent entries, scoped to this session):",
+                f"Path: {file_path}",
+                "",
+            ]
+            for i, parsed in enumerate(shown, 1):
+                event_type = parsed.get("event_type", "?")
+                data = self._redact_event_body(event_type, parsed.get("data", {}))
+                parts.append(
+                    f"  #{i}: [{event_type}] {parsed.get('source', '?')} — "
+                    f"{json.dumps(data, default=str)[:200]}"
+                )
 
             return "\n".join(parts)
         except Exception as e:
