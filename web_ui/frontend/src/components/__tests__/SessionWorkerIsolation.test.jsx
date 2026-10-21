@@ -124,7 +124,9 @@ function stubBackend(entry = ENTRY, extra = {}) {
     '/api/health/containers': jsonOk({ docker: 'reachable' }),
     [`/api/workspace/${id}/workers`]: jsonOk(WORKERS),
     [`/api/workspace/${id}/containers`]: jsonOk({ containers: [] }),
-    [`/api/session/list?workspace_id=${id}`]: jsonOk([]),
+    // The app now verifies the URL-derived session id against this list, so the
+    // listing must actually contain the session these tests deep-link to.
+    [`/api/session/list?workspace_id=${id}`]: jsonOk([{ session_id: 'sess-1' }]),
     '/api/session/create': jsonOk({ session_id: 's-1', mode: 'engineer', name: 'Fix bug' }),
     '/api/resource-catalog': jsonOk({ items: [] }),
     ...extra,

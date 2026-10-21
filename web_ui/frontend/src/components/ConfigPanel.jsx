@@ -598,9 +598,16 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               className="btn"
               style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
               onClick={async () => {
-                // Destructive + global: POST once; only carry session_id when known.
+                // Destructive: POST once. The reset is global, but carry the
+                // scope it is applied in (workspace_id + session_id) whenever we
+                // know it, so the backend does not have to guess the session's
+                // workspace from the session id alone. Absent keys are omitted,
+                // which keeps the historical body shape exactly.
                 setConfirmReset(false);
-                const body = sessionId ? { session_id: sessionId } : {};
+                const body = {
+                  ...(workspaceId ? { workspace_id: workspaceId } : {}),
+                  ...(sessionId ? { session_id: sessionId } : {}),
+                };
                 try {
                   const res = await fetch(apiUrl('/api/config/reset'), {
                     method: 'POST',
