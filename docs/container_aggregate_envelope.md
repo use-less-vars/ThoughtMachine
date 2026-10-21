@@ -212,7 +212,10 @@ What the tree does instead, when the bill arrives:
 - **Swap is unbounded per container.** No `memswap_limit` / `memory_swap` appears anywhere in
   `infra/` (grep: no matches), so a container with `mem_limit=1g` may swap past its limit
   without a per-container cap. This is the second half of "*held at 92% swap*", and no option
-  in §4 catches it unless swap is also capped.
+  in §4 catches it unless swap is also capped. *(Fixed off this branch:*
+  `infra/container_create.py:439-440` *on* `fix/container-default-mem-limit`, *commit*
+  `fed55868` *—* `memswap_limit = mem_limit`*, derived from the limit, deliberately not a stored
+  spec/record field.)*
 - Detection is post-hoc and mis-attributing. Exit 137 raises the OOM event
   (`infra/container_manager.py:2519-2525`, `_EXEC_OOM_EVENT = "container.command_oom_killed"`),
   and the event carries the container's **declared** memory budget, not the host condition
@@ -293,9 +296,32 @@ sum-and-reserve is atomic, and it bounds *declared* values, not residency (page 
 daemon itself, and the app are outside).
 
 **Bypass route:** edit `max_memory` in workspace `config.json` upward — a legitimate, silent,
-one-line bypass. `tools/docker_code_runner.py` creates containers with
-`mem_limit=self.mem_limit` (`:400`) and **never calls `admit`** (grep: no admission import in
-`tools/docker_code_runner.py`), so every cap in this ticket is bypassed by that path today.
+one-line bypass.
+
+**Not a bypass route (corrected v0.1.2):** `tools/docker_code_runner.py` does not create
+containers itself. `:394-402` is a `ContainerManager(` *constructor* call — `mem_limit=` at
+`:400` is a ctor kwarg, and the file contains no `containers.run(` at all — and the create runs
+through `manager.start(...)` (`:411-417`) → `infra/container_manager.py:2068` →
+`_fresh_start()` (`:2129`), which builds a full `AdmissionRequest` (`:2245-2266`) and calls
+`admit(_admission_request, probes=ClientProbes(self.client))` at `:2267`, returning an error
+dict on `Deny` (`:2268-2269`). Admission therefore runs on that path, and a step 6b added here
+is enforced for `DockerCodeRunner` unchanged. The earlier "never calls `admit`" reading was a
+grep artefact: the file imports no admission symbol because it never reaches the create
+primitive at all.
+
+**The real defect next door — a dead admission branch:** the gate is duplicated. Every
+production path admits *before* the primitive — `infra/container_manager.py:2267`,
+`infra/container_registry.py:303`, `infra/containers/executor.py:994`,
+`infra/resource_container_manager.py:1127` — and then calls `create_hardened_container(...)`
+with `admission=None` (`infra/container_manager.py:2114-2116`,
+`infra/container_registry.py:339`, `infra/resource_container_manager.py:1210-1212`,
+`infra/containers/executor.py:1063-1065`). The primitive's own gate at
+`infra/container_create.py:407` therefore sits behind `if admission is not None:` (`:387`) and
+is unreachable: `AdmissionContext(` is constructed **nowhere in production** — only in
+`tests/test_container_create_spec.py:159`, `:294`, `:314`. One fact, four sites. Disposition:
+wire `AdmissionContext` through those four callers (one gate in one place, which is what the
+target arch asks for) or delete the branch. Keeping both is what produced the misreading
+above.
 
 ### 4.2 Option B — Per-host memory cap (declared sum, all workspaces)
 
@@ -317,14 +343,14 @@ daemon is briefly unobservable — which, following `:494-500`, means denying *a
 a daemon hiccup. Needs the same new reason code.
 
 **What it fails to catch:** still declared, never actual — and swap is unbounded per container
-(no `memswap_limit` anywhere in `infra/`), so a host cap over declared RAM does not bound the
-swap pool that the incident actually exhausted. It is also a static number: a cap chosen when the
-host was idle is wrong when the host is busy, and the wrongness is invisible because nothing
-measures.
+(no `memswap_limit` anywhere in `infra/`, since fixed — see §2.4), so a host cap over declared
+RAM does not bound the swap pool that the incident actually exhausted. It is also a static
+number: a cap chosen when the host was idle is wrong when the host is busy, and the wrongness is
+invisible because nothing measures.
 
 **Bypass route:** the single host-wide number is easy to raise, and it has no per-workspace
-legibility — an operator cannot tell whose containers ate the budget. Same `DockerCodeRunner`
-gap as A (§4.1).
+legibility — an operator cannot tell whose containers ate the budget. (`DockerCodeRunner` adds
+no bypass of its own: it admits through `_fresh_start` — §4.1, corrected v0.1.2.)
 
 ### 4.3 Option C — Admission driven by live host pressure *(operator's lean)*
 
@@ -354,12 +380,15 @@ already built for exactly that (`:211-217`), so the testing story exists.
 check at the moment of create; nine containers admitted into a healthy host, each later growing
 to its full 1 GB, reproduce the incident exactly. It answers "is there room right now", not "may
 this workspace ever commit another gigabyte". It also does not bound swap growth (again: no
-`memswap_limit`), and it makes an identical create succeed or fail depending on unrelated
-neighbours' page cache — deterministic-looking but not deterministic.
+`memswap_limit`, since fixed — see §2.4), and it makes an identical create succeed or fail
+depending on unrelated neighbours' page cache — deterministic-looking but not deterministic.
 
-**Bypass route:** anything that creates containers without passing the gate —
-`tools/docker_code_runner.py:400` today; and, more subtly, timing: a create that lands while the
-host is momentarily quiet is admitted, and the pressure arrives afterwards.
+**Bypass route:** anything that creates containers without passing the gate — today only
+`live_smoke_docker.py:233` and `:244`, a standalone host-runnable smoke script that calls
+`client.containers.run(...)` directly, passes no `mem_limit`, is imported by nothing and is not
+a security boundary (the `DockerCodeRunner` site named here before v0.1.2 does admit — §4.1);
+and, more subtly, timing: a create that lands while the host is momentarily quiet is admitted,
+and the pressure arrives afterwards.
 
 ### 4.4 Option D — Scheduler against a capacity model
 
@@ -424,10 +453,17 @@ State it plainly, because this is the crux and it should not be softened:
 **Disposition:** recommend C now; treat B as the natural second layer *only* if a static
 commitment bound is also wanted for legibility, and explicitly not as a substitute for C. Three
 follow-ups should be opened as separate tickets rather than folded in here, because each is a
-different failure: (i) `memswap_limit` is unset on every create path (§2.4), so swap — the axis
-the incident actually exhausted — is unbounded per container and no option above catches it;
-(ii) `tools/docker_code_runner.py` never calls `admit` (§4.1), which bypasses *every* envelope
-this ticket could add; (iii) drift never compares `mem_limit` (`infra/container_manager.py:4109`),
+different failure: (i) `memswap_limit` was unset on every create path (§2.4), so swap — the axis
+the incident actually exhausted — is unbounded per container and no option above catches it
+(fixed off this branch: `infra/container_create.py:439-440` on
+`fix/container-default-mem-limit`, commit `fed55868` — `memswap_limit = mem_limit`, zero swap
+headroom, deliberately: with `oom_score_adj=1000` the container is already the designated OOM
+victim, so it dies fast and observably (exit 137 / `container.command_oom_killed`) instead of
+the host thrashing);
+(ii) the create primitive's admission branch is dead plumbing — `admission=None` at all four
+`create_hardened_container` call sites, so `infra/container_create.py:407` is unreachable (§4.1,
+corrected v0.1.2: `DockerCodeRunner` is not the ungated path it was recorded as); (iii) drift
+never compares `mem_limit` (`infra/container_manager.py:4109`),
 so a memory envelope cannot safely be built on drift state.
 
 ---
@@ -439,7 +475,8 @@ so a memory envelope cannot safely be built on drift state.
    requires polling, and admission is a request-time decision. C can only plausibly use headroom
    (a third thing); A/B use declared. This choice must be made before any option is implemented.
 2. **Is unbounded per-container swap in scope?** No `memswap_limit` exists on any create path
-   (§2.4). If swap is out of scope, C is defeatable by exactly the mechanism in the incident.
+   (§2.4 — since fixed there). If swap is out of scope, C is defeatable by exactly the mechanism
+   in the incident.
 3. **Where does the reserve threshold live, and who commits to the number?** Disk has
    `ADMISSION_DISK_*` constants (`agent/config/defaults.py:147-155`) chosen by someone; memory
    needs the same, and the value matters more than the machinery.
@@ -449,8 +486,11 @@ so a memory envelope cannot safely be built on drift state.
 5. **Did the incident's nine containers span one workspace or several?** Determines whether A
    would have prevented it at all. *unverified — needs runtime check.*
 6. **Does the envelope apply to resource containers (512m) and `DockerCodeRunner` (512m)?** They
-   are containers; today two of those paths differ in admission (resource containers admit,
-   `infra/resource_container_manager.py:1127`; `DockerCodeRunner` does not admit at all).
+   are containers and both admit — resource containers at
+   `infra/resource_container_manager.py:1127`, `DockerCodeRunner` via `_fresh_start`
+   (`infra/container_manager.py:2267`). The only ungated creates in the tree are the two direct
+   `containers.run` calls in `live_smoke_docker.py` (§4.3). Corrected v0.1.2 — this entry
+   previously said `DockerCodeRunner` "does not admit".
 7. **Refuse or wait?** Every existing denial is an immediate refusal (`AdmissionDenied`, e.g.
    `infra/container_create.py:409`). A queue-with-timeout is a much larger design and would grow
    the controller the target arch forbids.
@@ -481,8 +521,10 @@ so a memory envelope cannot safely be built on drift state.
 - **The stale audit numbers.** `docs/container_subsystem_audit.md:65-83` says
   `DEFAULT_MAX_CONTAINERS = 4`; the tree says 6 (`agent/config/defaults.py:137`). Separate docs
   patch.
-- **The `DockerCodeRunner` admission gap** (§4.1) and **`memswap_limit`** (§2.4) — both named as
-  follow-ups in §5, neither resolved here.
+- **The dead admission branch in the create primitive** (§4.1, corrected v0.1.2 — the
+  `DockerCodeRunner` "never admits" claim it replaces was wrong) and **`memswap_limit`** (fixed
+  off this branch — see §2.4) — both named as follow-ups in §5; the admission branch is still
+  open.
 - **Per-container limits and the hardening recipe.** Unchanged; that part of the envelope works.
 
 ---
@@ -495,3 +537,12 @@ so a memory envelope cannot safely be built on drift state.
   code changed.
 - **v0.1.1** (2026-10-21) — Forward note in 2.1: per-container default lowered to 512m under
   separate change `fix/container-default-mem-limit`; no argument changed.
+- **v0.1.2** (2026-10-21) — §4.1/§4.2/§4.3/§5(ii)/§6(6)/§7: the "`tools/docker_code_runner.py`
+  creates containers and never calls `admit`" claim is refuted by direct read — `:394-402` is a
+  `ContainerManager(` ctor call (`mem_limit=` at `:400` is a ctor kwarg, no `containers.run(` in
+  the file) and the create admits at `infra/container_manager.py:2267` — so it is replaced, in
+  place, with the defect that is real: the primitive's admission branch
+  (`infra/container_create.py:387-409`) is dead plumbing (`admission=None` at all four callers;
+  `AdmissionContext(` constructed only in tests), and the only creates outside the gate are
+  `live_smoke_docker.py:233`/`:244` (dev smoke script). No option, price or recommendation
+  changed; §2.1's `:400` row left as written (it names the same ctor kwarg).
