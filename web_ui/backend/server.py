@@ -1031,6 +1031,38 @@ _shutdown_event: Any = None  # asyncio.Event, set lazily
 _explicitly_closed_sessions: Set[str] = set()  # session_ids closed via close_session command
 
 
+def _cached_bridge_for(
+    session_id: str, expected_workspace_id: Optional[str] = None
+) -> Any:
+    """Return the cached bridge for *session_id*, workspace-scoped.
+
+    A cached bridge may only be re-attached when it belongs to the workspace
+    the caller expects: reusing it otherwise would hand the tab the live
+    session, controller and container of a different workspace — and every
+    subsequent write would land there.  ``expected_workspace_id=None`` means
+    "no expectation" and returns whatever is cached.
+    """
+    cached = _session_bridges.get(session_id)
+    if cached is None:
+        return None
+    # A bridge is put in the cache BEFORE its load_session() runs, so a refused
+    # or failed load leaves an entry that owns a controller but no session.  The
+    # reuse branch never calls load_session(), so handing that entry back would
+    # give the caller an empty session instead of loading from disk — a miss.
+    if cached.session is None:
+        log('WARNING', 'server',
+            f"load_session: cached bridge for {session_id} holds no session "
+            f"(refused or failed load) — ignoring cached bridge")
+        return None
+    cached_ws = cached.workspace_id
+    if expected_workspace_id and cached_ws and cached_ws != expected_workspace_id:
+        log('WARNING', 'server',
+            f"load_session: cached bridge for {session_id} belongs to workspace "
+            f"{cached_ws!r}, not {expected_workspace_id!r} — ignoring cached bridge")
+        return None
+    return cached
+
+
 def _get_shutdown_event() -> Any:
     """Return the global shutdown asyncio.Event, creating it if needed."""
     global _shutdown_event
@@ -2109,8 +2141,33 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     if bridge is not None and bridge.session is not None:
                         bridge.save_session()
 
+                    # ── Resolve the workspace scope this load must obey ──
+                    # An explicit, validated workspace_id from the client is the
+                    # only authority for a load into another workspace; otherwise
+                    # the connection's current bridge workspace applies.  The
+                    # shared _project_path is deliberately NOT consulted: no caller
+                    # sends ?project=, so it stays at the server root and names the
+                    # wrong (or no) workspace — refusing valid loads, admitting bad ones.
+                    _expected_ws: Optional[str] = None
+                    _msg_ws = msg.get("workspace_id") or None
+                    if _msg_ws:
+                        try:
+                            from web_ui.backend.bridge import _validate_workspace_id
+                            _msg_ws = _validate_workspace_id(_msg_ws)
+                        except ValueError as exc:
+                            log('WARNING', 'server',
+                                f"load_session: invalid workspace_id rejected: {exc}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Invalid workspace_id: {exc}",
+                            })
+                            continue
+                        _expected_ws = _msg_ws
+                    elif bridge is not None:
+                        _expected_ws = bridge.workspace_id
+
                     # Check if we already have a cached bridge for this session
-                    existing = _session_bridges.get(session_id)
+                    existing = _cached_bridge_for(session_id, _expected_ws)
                     if existing is not None and existing._controller is not None:
                         # Reuse cached bridge — register the new WS callback but DON'T
                         # call bridge.load_session() (which would reload from disk,
@@ -2184,7 +2241,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # fall through to the fallback, which reports load_error instead
                         # of pretending the session loaded.
                         _bridge_loaded_session = bool(
-                            bridge.load_session(session_id, limit=page_limit, offset=page_offset)
+                            bridge.load_session(
+                                session_id,
+                                limit=page_limit,
+                                offset=page_offset,
+                                workspace_id=_expected_ws,
+                            )
                         )
 
                     # ── Fallback: resolve workspace_id from project path ──
