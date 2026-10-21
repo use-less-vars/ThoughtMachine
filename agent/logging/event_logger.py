@@ -159,6 +159,14 @@ class EventLogger:
                     if hasattr(event.metadata, "source")
                     else None
                 ),
+                # Write-side half of session scoping for the event log: readers
+                # (CheckSystem's event_log query) must be able to attribute a
+                # record to a session instead of serving one global tail.
+                # ``workspace_id`` is always None for now -- EventMetadata has
+                # no such field today; the getattr keeps the key present so
+                # readers can rely on it once the model grows one.
+                "session_id": getattr(event.metadata, "session_id", None),
+                "workspace_id": getattr(event.metadata, "workspace_id", None),
                 "data": event.data if hasattr(event, "data") else {},
             }
             self._event_queue.put(record)
