@@ -17,6 +17,24 @@ logger = logging.getLogger(__name__)
 from agent.logging.lifecycle import log_worker_event
 
 
+class _AllSessionsSentinel:
+    """Type of the :data:`ALL_SESSIONS` sentinel (never instantiated by callers)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "ALL_SESSIONS"
+
+
+ALL_SESSIONS = _AllSessionsSentinel()
+"""Scope marker for :meth:`WorkerRegistry.shutdown_workers`.
+
+Means "every session" and belongs to the process-exit (``atexit``) path only.
+Session-scoped callers must pass a session id so that closing one session
+cannot stop another session's worker threads.
+"""
+
+
 class WorkerRegistry:
     """Thread-safe singleton registry for worker threads and per-worker EventBuses.
 
@@ -44,8 +62,10 @@ class WorkerRegistry:
         self._worker_event_bus_registry: Dict[Tuple[str, str, int], Any] = {}
         self._bus_registry_lock = threading.Lock()
 
-        # Register the shutdown handler once
-        atexit.register(self.shutdown_workers)
+        # Register the shutdown handler once. The whole-registry sweep is the
+        # process-exit semantics, so the handler passes the ALL_SESSIONS
+        # sentinel explicitly instead of relying on the default.
+        atexit.register(self.shutdown_workers, session_id=ALL_SESSIONS)
 
     # -- Singleton -----------------------------------------------------------
 
@@ -171,16 +191,31 @@ class WorkerRegistry:
 
     # -- Shutdown ------------------------------------------------------------
 
-    def shutdown_workers(self, timeout: float = 5.0) -> None:
+    def shutdown_workers(self, timeout: float = 5.0, *, session_id) -> None:
         """
-        Gracefully stop all registered worker threads and persist their context.
+        Gracefully stop registered worker threads and persist their context.
+
+        Session-scoped: only keys whose session component matches *session_id*
+        are swept. ``session_id`` is keyword-only and required: per-session
+        callers MUST pass their id so one session cannot stop another's worker
+        threads. The :data:`ALL_SESSIONS` sentinel sweeps the whole registry
+        and is the process-exit path only. ``None`` is rejected.
 
         Called from an ``atexit`` handler and from the bridge's ``close_session``
         so that partial conversation state is not lost when the process exits or
         a session is closed with active workers.
         """
+        if session_id is None:
+            raise ValueError(
+                "shutdown_workers requires an explicit session_id; pass "
+                "ALL_SESSIONS only for process-wide shutdown"
+            )
         with self._registry_lock:
-            keys = list(self._worker_registry.keys())
+            if session_id is ALL_SESSIONS:
+                keys = list(self._worker_registry.keys())
+            else:
+                keys = [k for k in self._worker_registry.keys()
+                        if isinstance(k, tuple) and k and (k[0] or "") == session_id]
         for key in keys:
             with self._registry_lock:
                 thread = self._worker_registry.get(key)

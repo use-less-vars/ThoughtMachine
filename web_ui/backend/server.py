@@ -1557,6 +1557,32 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     workspace_changed = bool(new_workspace_path) and new_workspace_path != current_path
 
                     if workspace_changed:
+                        # ── Ownership gate (narrowed operator rule) ────────────
+                        # One shared predicate (bridge._ownership_refusal) drives
+                        # both apply_config and set_project, so the rule cannot
+                        # drift between them.  A connection bound to workspace A
+                        # may move to a brand-new path outside every registered
+                        # workspace root, but never onto another registered
+                        # workspace (nor into its tree).  Roots are
+                        # realpath-normalised, so a symlink into B's root is
+                        # caught as B.
+                        from web_ui.backend.bridge import _ownership_refusal
+                        _ac_bound_ws = bridge.workspace_id if bridge is not None else None
+                        _ac_refusal = _ownership_refusal(new_workspace_path, _ac_bound_ws)
+                        if _ac_refusal is not None:
+                            log('WARNING', 'server.config',
+                                "apply_config refused: workspace mismatch — "
+                                f"connection scoped to workspace {_ac_bound_ws} "
+                                f"cannot switch to {new_workspace_path}: {_ac_refusal}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": (
+                                    "⚠ Workspace switch refused: this connection is "
+                                    f"scoped to workspace {_ac_bound_ws} and cannot "
+                                    f"switch to {new_workspace_path}."
+                                ),
+                            })
+                            continue
                         log('INFO', 'server.config',
                             "apply_config: workspace_changed=True — switching project workspace")
                         # ── Full project switch ────────────────────────────────────────────
@@ -2203,19 +2229,70 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "list_sessions":
                     try:
+                        # ATTACK-5: a connection may only enumerate the sessions
+                        # of the workspace it is bound to.  The scope is the
+                        # connection's OWN (bridge.workspace_id) -- never a
+                        # client-supplied value -- and a connection with no scope
+                        # gets nothing at all: the registry is one cross-tenant
+                        # index, so "unscoped" must never degrade into "every
+                        # workspace's sessions".
+                        _ls_scope = bridge.workspace_id if bridge is not None else None
+                        if not _ls_scope:
+                            log('WARNING', 'server.config',
+                                'list_sessions refused: connection has no workspace scope')
+                            await ws.send_json({
+                                "type": "sessions_list",
+                                "sessions": [],
+                            })
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": ("⚠ list_sessions: this connection is not bound "
+                                         "to a workspace yet, so no sessions are listed."),
+                            })
+                            continue
+
                         registry = SessionRegistry.get_default()
                         all_sessions = registry.get_all()
-                        sessions = list(all_sessions.values())
-                        # Fall back to disk scan if registry is empty
+                        sessions = [
+                            entry for entry in all_sessions.values()
+                            if isinstance(entry, dict)
+                            and entry.get("workspace_id") == _ls_scope
+                        ]
+                        # An empty result may just mean this workspace was never
+                        # registered.  Fall back to the STORE's workspace-scoped
+                        # listing -- never the global registry's disk rebuild,
+                        # which indexes every workspace's directory on behalf of
+                        # one caller -- and stamp the scope on each row: the
+                        # frontend learns session->workspace ownership from that
+                        # field (App.jsx, sessions_list).
                         if not sessions:
-                            registry.rebuild_from_disk()
-                            all_sessions = registry.get_all()
-                            sessions = list(all_sessions.values())
+                            try:
+                                for entry in session_store.list_sessions(
+                                        workspace_id=_ls_scope):
+                                    if isinstance(entry, dict):
+                                        row = dict(entry)
+                                        row.setdefault("workspace_id", _ls_scope)
+                                    elif hasattr(entry, "to_dict"):
+                                        # A store may hand back Session model
+                                        # objects instead of row dicts; convert
+                                        # them with the model's own serialiser
+                                        # rather than silently dropping them.
+                                        row = dict(entry.to_dict() or {})
+                                        if not row.get("workspace_id"):
+                                            row["workspace_id"] = _ls_scope
+                                    else:
+                                        continue
+                                    sessions.append(row)
+                            except Exception as exc:
+                                log('WARNING', 'server.config',
+                                    f"list_sessions: scoped store fallback failed: {exc}")
+
                         await ws.send_json({
                             "type": "sessions_list",
                             "sessions": sessions,
                         })
-                        log("INFO", "server.config", f"Listed {len(sessions)} sessions via registry")
+                        log("INFO", "server.config",
+                            f"Listed {len(sessions)} sessions for workspace {_ls_scope}")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -2271,6 +2348,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # shared _project_path is deliberately NOT consulted: no caller
                     # sends ?project=, so it stays at the server root and names the
                     # wrong (or no) workspace — refusing valid loads, admitting bad ones.
+                    # The connection's own scope is authoritative. A socket that
+                    # already has a workspace may never be re-scoped by a
+                    # client-supplied workspace_id: doing so lets any socket pivot
+                    # into another workspace simply by naming it.
+                    _socket_ws = bridge.workspace_id if bridge is not None else None
                     _expected_ws: Optional[str] = None
                     _msg_ws = msg.get("workspace_id") or None
                     if _msg_ws:
@@ -2285,12 +2367,38 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "text": f"⚠ Invalid workspace_id: {exc}",
                             })
                             continue
-                        _expected_ws = _msg_ws
-                    elif bridge is not None:
-                        _expected_ws = bridge.workspace_id
+                        if _socket_ws and _msg_ws != _socket_ws:
+                            log('WARNING', 'server',
+                                f"load_session refused: workspace mismatch "
+                                f"(socket={_socket_ws}, requested={_msg_ws}, "
+                                f"session={session_id})")
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "load_error": True,
+                                "workspace_id": None,
+                                "workspace_path": "",
+                            })
+                            continue
+                        _expected_ws = _socket_ws or _msg_ws
+                    else:
+                        _expected_ws = _socket_ws
 
                     # Check if we already have a cached bridge for this session
                     existing = _cached_bridge_for(session_id, _expected_ws)
+                    if (_socket_ws and existing is not None
+                            and existing.workspace_id
+                            and existing.workspace_id != _socket_ws):
+                        log('WARNING', 'server',
+                            f"load_session refused: cached bridge workspace mismatch "
+                            f"(socket={_socket_ws}, cached={existing.workspace_id}, "
+                            f"session={session_id})")
+                        await ws.send_json({
+                            "type": "session_loaded",
+                            "load_error": True,
+                            "workspace_id": None,
+                            "workspace_path": "",
+                        })
+                        continue
                     if existing is not None and existing._controller is not None:
                         # Reuse cached bridge — register the new WS callback but DON'T
                         # call bridge.load_session() (which would reload from disk,
@@ -2353,6 +2461,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         from agent.controller import AgentController
                         controller = AgentController()
                         bridge = WebAgentBridge(session_store=session_store)
+                        # WebAgentBridge.__init__ takes no workspace argument, so
+                        # the scope must be pinned here; otherwise _workspace_id
+                        # stays None and bridge.py's mismatch guard can never fire.
+                        if _expected_ws:
+                            bridge._workspace_id = _expected_ws
                         bridge.set_event_callback(event_callback, key=id(ws))
                         bridge.register()
                         bridge.set_controller(controller)
@@ -2567,7 +2680,126 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
                     try:
-                        session_store.delete_session(session_id, workspace_id=workspace_id)
+                        # Ownership gate: a socket may only delete a session that
+                        # lives inside its own workspace scope. The connection's
+                        # bridge is authoritative; a client-supplied workspace_id
+                        # may bootstrap a scopeless connection but must never
+                        # redirect one that already has a scope.
+                        _del_socket_ws = bridge.workspace_id if bridge is not None else None
+                        _del_scope_ws = _del_socket_ws or workspace_id
+                        if _del_scope_ws:
+                            try:
+                                from web_ui.backend.bridge import _validate_workspace_id
+                                _del_scope_ws = _validate_workspace_id(_del_scope_ws)
+                            except ValueError as exc:
+                                log('WARNING', 'server',
+                                    f"delete_session refused: invalid workspace_id: {exc}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"Delete refused: invalid workspace_id: {exc}",
+                                })
+                                continue
+                        if not _del_scope_ws:
+                            log('WARNING', 'server',
+                                f"delete_session refused: no workspace scope on this "
+                                f"connection (session={session_id})")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "Delete refused: no workspace scope on this connection.",
+                            })
+                            continue
+                        # A scoped delete only ever touches the socket's own
+                        # workspace directory, so on its own it can never destroy
+                        # another workspace's copy. Try it first: for a session
+                        # this workspace owns, it is simultaneously the delete and
+                        # the proof of ownership.
+                        _deleted = session_store.delete_session(
+                            session_id, workspace_id=_del_scope_ws
+                        )
+                        if not _deleted:
+                            # Not in this workspace. Two possibilities remain:
+                            # (i) the session belongs to ANOTHER workspace, whose
+                            # copy still sits in workspaces/<other>/sessions/;
+                            # (ii) it is a legacy session saved before workspaces
+                            # existed and carries no owner at all. Only (ii) may
+                            # be deleted here.
+                            _other_owner = None
+                            try:
+                                _base = getattr(session_store, "_base_dir", None)
+                                _ws_root = (_base / "workspaces") if _base else None
+                                if _ws_root is not None and _ws_root.exists():
+                                    _meta_name = f"_meta_{session_id}.json"
+                                    for _ws_dir in _ws_root.iterdir():
+                                        if not _ws_dir.is_dir():
+                                            continue
+                                        if _ws_dir.name == _del_scope_ws:
+                                            continue
+                                        if (_ws_dir / "sessions" / _meta_name).exists():
+                                            _other_owner = _ws_dir.name
+                                            break
+                                        # No sibling meta file. The store locates
+                                        # sessions by CONTENT, not by filename, so a
+                                        # foreign copy may sit here under an arbitrary
+                                        # name. Mirror the store's scan so this probe
+                                        # sees exactly what the unscoped sweep would
+                                        # delete.
+                                        _other_sess_dir = _ws_dir / "sessions"
+                                        if not _other_sess_dir.is_dir():
+                                            continue
+                                        for _other_file in _other_sess_dir.glob("*.json"):
+                                            if _other_file.name.startswith("_meta_"):
+                                                continue
+                                            try:
+                                                with open(_other_file, "r") as _oh:
+                                                    _other_data = json.load(_oh)
+                                            except Exception:
+                                                # Unparsable file: the store skips
+                                                # these too, so skip it here.
+                                                continue
+                                            if isinstance(_other_data, dict) and _other_data.get("session_id") == session_id:
+                                                _other_owner = _ws_dir.name
+                                                break
+                                        if _other_owner:
+                                            break
+                            except Exception as exc:
+                                # Fail CLOSED: if ownership cannot be established,
+                                # the delete must not proceed.
+                                log('WARNING', 'server',
+                                    f"delete_session refused: ownership probe failed "
+                                    f"for {session_id}: {exc}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": "Delete refused: could not verify workspace ownership.",
+                                })
+                                continue
+                            if _other_owner:
+                                log('WARNING', 'server',
+                                    f"delete_session refused: session {session_id} belongs "
+                                    f"to workspace {_other_owner}, not {_del_scope_ws}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": "Delete refused: session belongs to another workspace.",
+                                })
+                                continue
+                            # Legacy session with no owning workspace: keep the
+                            # pre-existing behaviour (unscoped sweep).
+                            _deleted = session_store.delete_session(session_id)
+                        if not _deleted:
+                            log('WARNING', 'server',
+                                f"delete_session refused: session {session_id} not found in "
+                                f"workspace {_del_scope_ws}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "Delete refused: session not found in this workspace.",
+                            })
+                            continue
+                        # Ownership is proven; sweep any duplicate copies of this id
+                        # left in legacy/unscoped locations so it cannot resurrect.
+                        try:
+                            session_store.delete_session(session_id)
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"delete_session: legacy sweep failed for {session_id}: {exc}")
                         session_store.remove_open_session(session_id)
                         # Remove from global session registry
                         registry = SessionRegistry.get_default()
@@ -2683,6 +2915,64 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "close_session":
                     session_id = msg.get("session_id", "")
+                    # Ownership gate (R8): a socket may only close a session that
+                    # lives inside its own workspace scope. The connection's
+                    # bridge is authoritative. close_session takes its target
+                    # from the CLIENT-SUPPLIED session_id, and
+                    # bridge.close_session -> WorkerRegistry.shutdown_workers()
+                    # sweeps the worker threads of THAT session id only: the sweep
+                    # is session-scoped, not process-wide. This gate is therefore
+                    # what guarantees the id being closed belongs to this socket's
+                    # own workspace, and hence that only this workspace's worker
+                    # threads can be stopped. Nothing with a side effect may run
+                    # before this check. A scopeless connection (bootstrap) keeps
+                    # its previous behaviour.
+                    _close_scope_ws = bridge.workspace_id if bridge is not None else None
+                    if _close_scope_ws:
+                        try:
+                            from web_ui.backend.bridge import _validate_workspace_id
+                            _close_scope_ws = _validate_workspace_id(_close_scope_ws)
+                        except ValueError as exc:
+                            log('WARNING', 'server',
+                                f"close_session refused: invalid workspace_id: {exc}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"Close refused: invalid workspace_id: {exc}",
+                            })
+                            continue
+                    if _close_scope_ws and session_id:
+                        # The socket's own session is in scope by construction
+                        # (load_session already refused any cross-workspace bind),
+                        # even when it has not been persisted yet. For any other
+                        # id, a NON-DESTRUCTIVE scoped metadata lookup is the
+                        # proof of ownership: close_session must not delete
+                        # anything on the way to deciding.
+                        _close_own_sids = set()
+                        if bridge is not None:
+                            if getattr(bridge, "_session_id", None):
+                                _close_own_sids.add(bridge._session_id)
+                            for _own in (
+                                getattr(bridge, "_session", None),
+                                getattr(bridge, "_loaded_session", None),
+                            ):
+                                _own_sid = getattr(_own, "session_id", None)
+                                if _own_sid:
+                                    _close_own_sids.add(_own_sid)
+                        if session_id not in _close_own_sids:
+                            if session_store.load_session_metadata(
+                                session_id, workspace_id=_close_scope_ws
+                            ) is None:
+                                log('WARNING', 'server',
+                                    f"close_session refused: session {session_id} is not "
+                                    f"in workspace {_close_scope_ws}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": (
+                                        f"Close refused: session {session_id} does not "
+                                        f"belong to this workspace."
+                                    ),
+                                })
+                                continue
                     try:
                         if bridge is not None:
                             bridge.close_session(session_id if session_id else None)
@@ -2735,6 +3025,32 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
 
                 elif command == "new_session":
+                    # Ownership gate (Attack 6 / R8): a connection that already has
+                    # a workspace scope must not be re-scoped by client input. The
+                    # handler below assigns bridge._workspace_id from
+                    # msg["workspace_id"], so without this check one command would
+                    # let a socket bound to workspace A adopt workspace B's
+                    # identity and then pivot onto B's sessions through every
+                    # other gate. Nothing with a side effect may run before the
+                    # check (notably not bridge.save_session() / bridge.stop()).
+                    # A scopeless connection (bootstrap) keeps its previous
+                    # behaviour: the REST create flow and the contract tests
+                    # rely on it.
+                    _ns_cur_ws = bridge.workspace_id if bridge is not None else None
+                    _ns_req_ws = msg.get("workspace_id") or None
+                    if _ns_cur_ws and _ns_req_ws and _ns_req_ws != _ns_cur_ws:
+                        log('WARNING', 'server',
+                            f"new_session refused: connection is scoped to workspace "
+                            f"{_ns_cur_ws} and cannot switch to {_ns_req_ws}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": (
+                                f"New session refused: this connection is scoped to "
+                                f"workspace {_ns_cur_ws} and cannot switch to "
+                                f"{_ns_req_ws}."
+                            ),
+                        })
+                        continue
                     # Save current session before switching
                     if bridge is not None and bridge.session is not None:
                         bridge.save_session()
@@ -2768,6 +3084,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             })
                             continue
                         bridge._workspace_id = workspace_id
+
+                    # ATTACK-6 (b): a connection already bound to a workspace is
+                    # sticky -- omitting workspace_id must NOT let the project
+                    # path (which the client controls via ?project= / set_project)
+                    # re-derive a different scope for it.
+                    if _ns_cur_ws:
+                        workspace_id = _ns_cur_ws
+                        bridge._workspace_id = _ns_cur_ws
 
                     # ── Fallback: resolve workspace_id from the project path ──
                     # The frontend can pass a project query param to select
@@ -2916,6 +3240,45 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Project path rejected: {exc}",
+                        })
+                        continue
+
+                    # ATTACK-6 (a): a connection already bound to a workspace
+                    # must not be able to re-scope itself by switching project
+                    # to a DIFFERENT workspace.  The path confinement above only
+                    # proves the target exists and is outside the vault; it says
+                    # nothing about which workspace this socket belongs to.
+                    #
+                    # Narrowed operator rule \u2014 the SAME shared predicate
+                    # (bridge._ownership_refusal) also gates apply_config:
+                    #   * target resolves to the bound workspace        \u2192 ALLOW
+                    #   * target resolves to a DIFFERENT workspace      \u2192 REFUSE
+                    #   * target is unregistered                        \u2192 ALLOW only
+                    #     when it is neither equal to nor inside another
+                    #     registered workspace's realpath'd root
+                    # An unscoped socket (no binding) is unrestricted.
+                    _sp_cur_ws = bridge.workspace_id if bridge is not None else None
+                    try:
+                        from web_ui.backend.bridge import (
+                            _ownership_refusal, _resolve_workspace_id,
+                        )
+                        _sp_refusal = _ownership_refusal(new_project, _sp_cur_ws)
+                        _sp_req_ws = _resolve_workspace_id(new_project)
+                    except Exception as exc:
+                        _sp_refusal = f"ownership check failed: {exc}"
+                        _sp_req_ws = None
+                    if _sp_refusal is not None:
+                        log('WARNING', 'server',
+                            f"set_project refused: connection is scoped to workspace "
+                            f"{_sp_cur_ws} and cannot switch to {new_project} "
+                            f"(workspace {_sp_req_ws}): {_sp_refusal}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": (
+                                f"\u26a0 Project switch refused: this connection is "
+                                f"scoped to workspace {_sp_cur_ws} and cannot switch "
+                                f"to {_sp_req_ws or new_project}."
+                            ),
                         })
                         continue
 
@@ -3090,14 +3453,18 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         continue
 
                     # A prompt may only be answered by the connection it was
-                    # raised on.  An unknown request_id keeps the historical
-                    # behaviour (resolve_security_prompt no-ops for unknown ids).
+                    # raised on, and only if this server actually forwarded it to
+                    # a connection at all.  An unknown request_id is default-DENY:
+                    # nothing was ever asked of any socket, so no socket is
+                    # entitled to answer it (resolve_security_prompt would
+                    # otherwise honour the decision blindly).
                     _asker = _escalation_asker(request_id)
-                    if _asker is not None and _asker != id(ws):
+                    if _asker != id(ws):
                         await ws.send_json({
                             "type": "status_message",
                             "text": "⚠ security_response: this prompt was raised "
-                                    "for a different connection and cannot be "
+                                    "for a different connection (or was never "
+                                    "issued to this connection) and cannot be "
                                     "answered here.",
                         })
                         continue

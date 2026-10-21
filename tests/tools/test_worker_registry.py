@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tools.workspace.worker_registry import WorkerRegistry
+from tools.workspace.worker_registry import ALL_SESSIONS, WorkerRegistry
 
 
 class TestWorkerRegistrySingleton:
@@ -166,8 +166,10 @@ class TestWorkerRegistryIntegration:
             mock_registry = MagicMock()
             mock_get.return_value = mock_registry
 
-            w.shutdown_workers(timeout=3.0)
-            mock_registry.shutdown_workers.assert_called_once_with(timeout=3.0)
+            w.shutdown_workers(timeout=3.0, session_id=ALL_SESSIONS)
+            mock_registry.shutdown_workers.assert_called_once_with(
+                timeout=3.0, session_id=ALL_SESSIONS
+            )
 
             w.register_worker_event_bus("s", "w", "bus")
             mock_registry.register_event_bus.assert_called_once_with(

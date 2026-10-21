@@ -178,12 +178,36 @@ def _worker_instance_parts(label: str) -> Tuple[str, int]:
     return label, 1
 
 
+def _normalise_workspace_root(path: Optional[str]) -> str:
+    """Normalise a workspace path for ownership comparison.
+
+    Both sides of every comparison (the requested target and the registered
+    root) MUST go through this function, otherwise the comparison is
+    meaningless.  It:
+
+      * ``os.path.abspath`` to make the path absolute (CWD-relative input),
+      * ``os.path.realpath`` to collapse symlinks, ``..`` and macOS-style
+        ``/tmp`` -> ``/private/tmp`` indirection,
+      * converts backslashes to forward slashes,
+      * strips the trailing separator.
+
+    ``os.path.realpath`` does NOT raise for a path that does not exist yet
+    (strict=False on every supported Python) \u2014 a brand-new project path
+    still comes back normalised, so callers never need to guard it.
+    """
+    if not path:
+        return ""
+    return os.path.realpath(os.path.abspath(path)).replace("\\", "/").rstrip("/")
+
+
 def _build_workspace_id_cache() -> Dict[str, str]:
     """
     Build an in-memory cache mapping project roots to workspace IDs
     by reading from the centralised workspace registry.
 
     Called once on first resolution; subsequent calls return the cached dict.
+    Roots are keyed through ``_normalise_workspace_root`` so that a request
+    path and a registered root are compared after the *same* normalisation.
     """
     with _workspace_cache_lock:
         if _workspace_id_cache:
@@ -191,7 +215,9 @@ def _build_workspace_id_cache() -> Dict[str, str]:
         try:
             registry = WorkspaceRegistry.get_default()
             for entry in registry.list_workspaces():
-                normalised = os.path.abspath(entry.root_path).replace("\\", "/").rstrip("/")
+                normalised = _normalise_workspace_root(entry.root_path)
+                if not normalised:
+                    continue
                 _workspace_id_cache[normalised] = entry.id
         except Exception:
             pass
@@ -202,6 +228,11 @@ def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
     """
     Resolve a workspace *workspace_path* to its workspace ID.
 
+    The request path is realpath-normalised *before* it can fail to match, so
+    a symlink pointing at workspace B's root resolves to B (it must never
+    fall through as a "brand-new path").  The registered roots are normalised
+    the same way via ``_build_workspace_id_cache``.
+
     Checks the in-memory cache first (built from the registry on first call),
     then falls back to a direct registry lookup.  Returns the workspace ID
     or ``None`` if no match is found.
@@ -209,7 +240,9 @@ def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
     if not workspace_path:
         return None
 
-    normalised = os.path.abspath(workspace_path).replace("\\", "/").rstrip("/")
+    normalised = _normalise_workspace_root(workspace_path)
+    if not normalised:
+        return None
 
     # Check cache first (builds it on first call)
     cache = _build_workspace_id_cache()
@@ -217,15 +250,115 @@ def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
     if cached is not None:
         return cached
 
-    # Fall back to direct registry lookup (handles race with newly-registered workspaces)
+    # Fall back to direct registry lookup (handles race with newly-registered
+    # workspaces).  Hand the registry the realpath-normalised path: its own
+    # ``_normalize_path`` only does abspath, so the caller must realpath.
     try:
         registry = WorkspaceRegistry.get_default()
-        entry = registry.resolve_by_root(workspace_path)
+        entry = registry.resolve_by_root(normalised)
         if entry is not None:
             _workspace_id_cache[normalised] = entry.id
             return entry.id
     except Exception:
         pass
+
+    return None
+
+
+def _registered_workspace_roots() -> Optional[List[Tuple[str, str]]]:
+    """Return ``[(realpath_normalised_root, workspace_id), ...]``.
+
+    Same source of truth as ``_resolve_workspace_id``:
+    ``WorkspaceRegistry.get_default().list_workspaces()``.  Returns ``None``
+    when the registry is unavailable/corrupt \u2014 callers treat that as
+    fail-closed (refuse), never as "no other workspaces exist".
+    """
+    try:
+        registry = WorkspaceRegistry.get_default()
+        roots: List[Tuple[str, str]] = []
+        for entry in registry.list_workspaces():
+            normalised = _normalise_workspace_root(entry.root_path)
+            if normalised:
+                roots.append((normalised, entry.id))
+        return roots
+    except Exception:
+        return None
+
+
+def _path_is_same_or_inside(path: str, root: str) -> bool:
+    """True when *path* equals *root* or is contained by it.
+
+    Component-aware: uses ``os.path.commonpath`` so ``/root-b-sibling`` is
+    NOT considered inside ``/root-b`` (a bare string-prefix test would).
+    Both arguments are expected to be already normalised via
+    ``_normalise_workspace_root``.
+    """
+    if not path or not root:
+        return False
+    if path == root:
+        return True
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        # Mixed absolute/relative, or different drives on Windows.
+        return False
+
+
+def _ownership_refusal(target_path: str, bound_workspace_id: Optional[str]) -> Optional[str]:
+    """Single source of truth for the workspace-ownership rule.
+
+    Returns ``None`` when the target is ALLOWED, otherwise a human-readable
+    refusal reason.  Both ``apply_config`` and ``set_project`` call this, so
+    the rule cannot drift between them.
+
+    Rule (``bound_workspace_id`` None = unscoped connection, nothing to
+    violate \u2192 ALLOW):
+      1. ``resolved = _resolve_workspace_id(target_path)``
+      2. ALLOW when ``resolved == bound_workspace_id`` (same workspace).
+      3. REFUSE when ``resolved is not None`` (a *different* registered
+         workspace).
+      4. ``resolved is None`` (not a registered workspace root): ALLOW iff the
+         realpath'd target is neither equal to nor inside the realpath'd root
+         of ANY OTHER registered workspace.  A brand-new path outside every
+         root is allowed; a path inside \u2014 or symlinked into \u2014 another
+         workspace's tree is refused.
+    """
+    if bound_workspace_id is None:
+        # No ownership claim on this connection (bootstrap / unscoped socket):
+        # there is nothing that could be violated.
+        return None
+
+    resolved = _resolve_workspace_id(target_path)
+
+    if resolved == bound_workspace_id:
+        return None
+
+    if resolved is not None:
+        return (
+            f"target {target_path!r} belongs to workspace {resolved!r}, "
+            f"not the bound workspace {bound_workspace_id!r}"
+        )
+
+    # Unregistered target \u2014 allow only if it cannot reach another workspace.
+    roots = _registered_workspace_roots()
+    if roots is None:
+        return (
+            "workspace registry unavailable \u2014 cannot prove "
+            f"{target_path!r} is outside every other workspace"
+        )
+
+    target_norm = _normalise_workspace_root(target_path)
+    if not target_norm:
+        return f"target path {target_path!r} is empty or unresolvable"
+
+    for other_root, other_id in roots:
+        if other_id == bound_workspace_id:
+            continue
+        if _path_is_same_or_inside(target_norm, other_root):
+            return (
+                f"target {target_path!r} is inside workspace {other_id!r} "
+                f"(root {other_root!r}), not outside every other workspace"
+            )
 
     return None
 
@@ -2239,9 +2372,10 @@ class WebAgentBridge:
             # TTL, and any container still left is reclaimed on decommission.
 
         # Gracefully stop any worker threads spawned during this session
-        if shutdown_workers is not None:
+        # scoped to this session only; without a resolvable id we stop nothing rather than everything
+        if shutdown_workers is not None and sid:
             try:
-                shutdown_workers(timeout=5.0)
+                shutdown_workers(timeout=5.0, session_id=sid)
             except Exception:
                 log('WARNING', 'server.bridge', 'Error shutting down workers during session close')
 

@@ -3403,9 +3403,12 @@ def _get_tool_registry() -> dict[str, type["ToolBase"]]:
 # Shutdown helper  (exposed for bridge integration)
 # ---------------------------------------------------------------------------
 
-def shutdown_workers(timeout: float = 5.0) -> None:
-    """Delegate to WorkerRegistry singleton (backward compat)."""
-    _WorkerRegistry.get_instance().shutdown_workers(timeout=timeout)
+def shutdown_workers(timeout: float = 5.0, *, session_id) -> None:
+    """Delegate to WorkerRegistry singleton (backward compat).
+    *session_id* is keyword-only and required: the caller must state whose
+    workers it is stopping. ``ALL_SESSIONS`` is the process-exit path only.
+    """
+    _WorkerRegistry.get_instance().shutdown_workers(timeout=timeout, session_id=session_id)
 
 def get_worker_event_bus(session_id: str, worker_name: str, instance_id: int = 1) -> Any:
     """Delegate to WorkerRegistry singleton (backward compat)."""
