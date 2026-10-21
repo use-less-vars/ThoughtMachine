@@ -1,6 +1,6 @@
 # Ticket: hygiene/macos-preflight-proves-launcher-not-start
 
-**Filed:** Gen 47. Line numbers read from `.github/workflows/cross-platform-smoke.yml` (358 lines), `.github/workflows/platform-matrix.yml` (467 lines) and `scripts/smoke_windows.ps1` at time of writing.
+**Filed:** 2026-10-22, bookkeeping chunk C. Line numbers read from `.github/workflows/cross-platform-smoke.yml` (358 lines), `.github/workflows/platform-matrix.yml` (467 lines) and `scripts/smoke_windows.ps1` at time of writing.
 **Verified at:** the workflow files themselves, read in full for this ticket. No CI run was inspected; every claim below is a claim about what the YAML asserts, checked against the YAML.
 **Source:** cross-platform-smoke.yml header comment (L21-24) and the `macos-launcher` job (L252-358); the `windows-smoke` job (L123-231); platform-matrix.yml macOS jobs (L222-467) and `linux-install-smoke` (L92-122).
 **Severity:** MEDIUM — process, not product. The cost is that the only gating macOS signal cannot observe whether the application starts, so a macOS start-up regression has no RED to land on.
