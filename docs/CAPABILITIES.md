@@ -242,16 +242,18 @@ These are factual, present-tense limitations — not roadmap items.
      (`tools/docker_executor.py:475`–`:476`, `agent/config/defaults.py::host_user`).
    - `docs/installation_guide.md` contains **duplicate `## Updating` headings** and a
      truncated sentence.
-   - `tests/test_installation_guide.py` asserts the guide declares macOS
-     **"Not supported"**, which is **out of sync** with the current guide (macOS is now
-     listed as supported). This is a doc/test inconsistency, left as-is.
+   - `tests/test_installation_guide.py` enforces the **"Supported"** polarity, not the
+     reverse: `test_platform_surface_covered` asserts the guide contains the row
+     ``| macOS (Docker Desktop) | `./install.sh` | `./start_thoughtmachine.sh` | Supported |``.
+     There is no doc/test inconsistency — demoting macOS in the guide turns the test red.
    - `SECURITY.md` covers only secret-handling; `docs/security_layer.md` is obsolete.
    - Per `docs/testing/test_inventory.md`, some areas are not covered by tests (e.g. the
      Respond tool, ToolPreset, and Vault).
-8. **macOS support is declared but not gated in CI.** macOS is documented as supported
-   (`README.md`, `docs/installation_guide.md`) and `install.sh` handles Darwin, but the
-   macOS CI jobs are **advisory** (`continue-on-error`), so macOS is not a gating
-   target.
+8. **Only one macOS CI job gates.** `macos-launcher` (`cross-platform-smoke.yml`) gates
+   since commit `b2203217` ("...add a gating macOS launcher preflight"); the other three
+   — `macos-suite`, `macos-install-smoke`, `macos-docker-probe` (`platform-matrix.yml`) —
+   are still **advisory** (`continue-on-error`). No transition date is recorded here; the
+   gating job proves the launcher paths, not that the application starts.
 
 ---
 
