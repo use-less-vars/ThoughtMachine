@@ -14,6 +14,7 @@ real app), with the reset target file redirected into ``tmp_path``.
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 
@@ -33,16 +34,45 @@ client = TestClient(server.app)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _live_server():
+    """Resolve ``web_ui.backend.server`` from ``sys.modules`` at CALL time.
+
+    ``reset_config`` imports the server module lazily inside the handler, so
+    the route always reads the *live* module object.  A peer test in the
+    top-level ``tests/`` tree purges and re-imports
+    ``web_ui.backend.server``, which replaces the ``sys.modules`` entry with a
+    new module object; the module-level ``import ... as server`` above keeps
+    pointing at the pre-purge object.  Patching the registry through this
+    resolver keeps our fixture and the route on the same object regardless of
+    test order.  (Observed, not inferred: without it the full-suite run fails
+    with "a bridge cached for the requested workspace was not updated".)
+    """
+    return importlib.import_module("web_ui.backend.server")
+
+
 @pytest.fixture(autouse=True)
 def isolated_config_file(monkeypatch, tmp_path):
     """Point the reset target files at ``tmp_path``.
 
-    ``reset_config`` expands and rewrites ``_CONFIG_PATH`` and also removes
-    ``custom_system_prompt.txt`` from the vault, so both are redirected into
-    the pytest temp dir: the test never touches a real vault.
+    ``reset_config`` expands and rewrites ``_CONFIG_PATH`` and also unlinks
+    ``custom_system_prompt.txt`` from ``_vault.vault_root()``, so BOTH are
+    redirected into the pytest temp dir: the test never touches a real vault.
+
+    The vault-root redirect is not optional.  ``_vault.vault_root()`` is a
+    process-global resolver, and whether the resulting unlink is allowed
+    depends on whatever vault root is in force at call time -- in the
+    full-suite run the top-level ``tests/conftest.py`` hermetic setup makes
+    ``vault_root()`` point at a real temp vault, the unlink is blocked by the
+    hermetic vault guard, and the endpoint turns that into a 500.  This module
+    therefore pins the root itself instead of inheriting it.  (The hermetic
+    fixture in ``tests/conftest.py`` is not visible from
+    ``web_ui/backend/tests``, so the resolver is patched here.)
     """
     vault = tmp_path / "vault"
     vault.mkdir(parents=True, exist_ok=True)
+    # Patch the shared resolver the handler itself calls
+    # (``_vault.vault_root()``), which also covers ``_get_custom_prompt_path``.
+    monkeypatch.setattr(config_routes._vault, "vault_root", lambda: vault)
     # The prompt file lives in the real vault, which the hermetic guard forbids
     # test code to unlink: stub the state bridge so the reset stays local.
     target = tmp_path / "agent_config.json"
@@ -80,7 +110,9 @@ def _cache_bridge(monkeypatch, session_id, workspace_id, has_session=True):
         session=Session(workspace_id=workspace_id) if has_session else None,
         workspace_id=workspace_id,
     )
-    monkeypatch.setitem(server._session_bridges, session_id, bridge)
+    # Patch the registry on the LIVE server module (see ``_live_server``), not
+    # on the collection-time object, which a peer test's purge can orphan.
+    monkeypatch.setitem(_live_server()._session_bridges, session_id, bridge)
     return bridge
 
 
