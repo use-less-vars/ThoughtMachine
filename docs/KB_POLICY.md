@@ -95,8 +95,27 @@ This is **drift, not policy**. Two resolutions, one decision:
   KB and say so here. Cost: they become public claims that must be maintained,
   which is exactly what the Internal tier exists to avoid.
 
-Until that decision is made, treat a tracked KB file as an **accident**, never
-as a precedent. Do not add more.
+### The ruling (2026-10-21, Gen 47)
+
+**`git rm --cached` is DROPPED.** Untracking ten files so that a sentence in this
+document becomes true would alter what every future reader inherits, in exchange
+for a documentation consistency. Wrong weight class for a hygiene finding. The
+option is off the table; it is not deferred.
+
+**The public/private split is DEFERRED, not decided.** Until it is decided:
+
+- The ten tracked files listed above are **drift**, not a precedent, and not
+  policy. The question of *what they should be* lives in
+  `hygiene/kb-public-private-split`, which owns it.
+- **Do not add more.** A new file under `.thoughtmachine/knowledge/` stays
+  untracked. No exceptions, no "it's useful for PR review".
+- **Do not cite the tracked set as evidence of intent** in any document,
+  including this one. It is residue from before the ignore rules, not a decision
+  anyone made.
+
+This replaces the earlier "treat a tracked KB file as an accident, never as a
+precedent" formulation. The conclusion is unchanged; the resolution is now
+recorded instead of pending.
 
 ## Rules of thumb
 
