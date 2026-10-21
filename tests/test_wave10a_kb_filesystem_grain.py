@@ -65,6 +65,24 @@ def test_workspace_write_refused_when_filesystem_read(tmp_path):
     assert ENTRY not in _notes_file(tmp_path).read_text(encoding="utf-8")
 
 
+def test_workspace_refused_write_leaves_no_kb_skeleton(tmp_path):
+    """A refused workspace write must not materialise the KB skeleton.
+
+    The skeleton (``project/``, ``personal/`` and the six template files) used
+    to be created during root resolution, i.e. BEFORE the grain gate, so an
+    unauthorised write still left fingerprints on disk.
+    """
+    kb = tmp_path / ".thoughtmachine" / "knowledge"
+    tool = _workspace_tool(
+        tmp_path, mode="append", domain="notes", entry=ENTRY,
+        effective_permissions={"filesystem": "read"},
+    )
+    result = tool.execute()
+
+    assert "filesystem:write" in result
+    assert not kb.exists(), "a refused write must not create the KB skeleton"
+
+
 def test_workspace_read_and_write_allowed_when_filesystem_full(tmp_path):
     _make_kb(tmp_path)
     read = _workspace_tool(
