@@ -111,8 +111,11 @@ class FileSystemSessionStore(SessionStore):
 
         # In-memory caches to reduce disk I/O
         self._cached_list: Optional[Tuple[float, List[Dict[str, Any]]]] = None  # (timestamp, list)
-        self._cached_paths: Dict[str, Optional[Path]] = {}  # session_id -> path (None = not found)
-        self._cached_paths_ts: Dict[str, float] = {}  # when each path entry was cached
+        # Path cache keyed on (workspace_id, session_id); workspace_id is None
+        # for the unscoped lookup.  Keying on session_id alone would serve a
+        # path resolved in one workspace to a caller asking about another.
+        self._cached_paths: Dict[Tuple[Optional[str], str], Optional[Path]] = {}  # (workspace_id, session_id) -> path (None = not found)
+        self._cached_paths_ts: Dict[Tuple[Optional[str], str], float] = {}  # when each path entry was cached
         self._cache_ttl = 60.0  # seconds — session list changes infrequently
 
         # Resolve state directory
@@ -172,27 +175,54 @@ class FileSystemSessionStore(SessionStore):
         """Get the file path for a session's lightweight metadata file."""
         return self.sessions_dir / f"_meta_{session_id}.json"
 
-    def _find_session_path(self, session_id: str) -> Optional[Path]:
+    def _find_session_path(self, session_id: str,
+                           workspace_id: Optional[str] = None) -> Optional[Path]:
         """Find the actual file path for a session ID by scanning JSON files.
-        Uses an in-memory cache (TTL: 5s) that is invalidated on save/delete.
+        Uses an in-memory cache (TTL: 60s) that is invalidated on save/delete.
 
-        Scans both the legacy sessions_dir and any workspace-scoped directories
-        under ~/.thoughtmachine/workspaces/<ws_id>/sessions/.
+        With *workspace_id*, exactly two directories are scanned, in this
+        order: this workspace's own sessions directory
+        (~/.thoughtmachine/workspaces/<ws_id>/sessions/) and then the legacy
+        ``sessions_dir``.  The legacy directory is workspace-agnostic: records
+        there carry no workspace_id at all (that is what a plain
+        ``create_session`` produces), so reading one through a scoped call is
+        not a cross-workspace read.  No OTHER workspace's directory is ever
+        enumerated or scanned.
+
+        Without *workspace_id* the legacy behaviour is preserved: the legacy
+        sessions_dir plus every workspace-scoped directory under
+        ~/.thoughtmachine/workspaces/<ws_id>/sessions/ is scanned.
+
+        The cache is keyed on ``(workspace_id, session_id)`` (``None`` for the
+        unscoped lookup), so a path resolved unscoped or in another workspace
+        is never served to a scoped caller.
         """
+        cache_key: Tuple[Optional[str], str] = (workspace_id or None, session_id)
+
         # Check cache first (with TTL)
-        if session_id in self._cached_paths:
-            ts = self._cached_paths_ts.get(session_id, 0)
+        if cache_key in self._cached_paths:
+            ts = self._cached_paths_ts.get(cache_key, 0)
             if time.time() - ts < self._cache_ttl:
-                return self._cached_paths[session_id]
+                return self._cached_paths[cache_key]
 
         # Collect all candidate directories
-        candidates = [self.sessions_dir]
-        workspaces_root = self._base_dir / "workspaces"
-        if workspaces_root.exists():
-            for ws_dir in workspaces_root.iterdir():
-                ws_sessions = ws_dir / "sessions"
-                if ws_sessions.is_dir():
-                    candidates.append(ws_sessions)
+        if workspace_id:
+            candidates = [
+                # This workspace's own records first ...
+                self._base_dir / "workspaces" / workspace_id / "sessions",
+                # ... then the legacy, workspace-agnostic namespace.  Never
+                # another workspace's directory: workspace dirs are the
+                # isolation boundary, the legacy dir is shared by construction.
+                self.sessions_dir,
+            ]
+        else:
+            candidates = [self.sessions_dir]
+            workspaces_root = self._base_dir / "workspaces"
+            if workspaces_root.exists():
+                for ws_dir in workspaces_root.iterdir():
+                    ws_sessions = ws_dir / "sessions"
+                    if ws_sessions.is_dir():
+                        candidates.append(ws_sessions)
 
         # Scan files across all candidate directories
         for sess_dir in candidates:
@@ -204,14 +234,30 @@ class FileSystemSessionStore(SessionStore):
                     with open(file_path, 'r') as f:
                         data = json.load(f)
                     if data.get('session_id') == session_id:
-                        self._cached_paths[session_id] = file_path
-                        self._cached_paths_ts[session_id] = time.time()
+                        self._cached_paths[cache_key] = file_path
+                        self._cached_paths_ts[cache_key] = time.time()
                         return file_path
                 except Exception:
                     continue
-        self._cached_paths[session_id] = None  # cache as not found
-        self._cached_paths_ts[session_id] = time.time()
+        self._cached_paths[cache_key] = None  # cache as not found
+        self._cached_paths_ts[cache_key] = time.time()
         return None
+
+    def _invalidate_path_cache(self, session_id: str) -> None:
+        """Drop every cached path entry for *session_id*, in every workspace.
+
+        The path cache is keyed on ``(workspace_id, session_id)``, so one
+        session can be cached under several keys at once (unscoped, plus once
+        per workspace it was resolved in).  Invalidation must therefore sweep
+        all of them: dropping only one key would leave a stale path behind for
+        the other callers.
+        """
+        stale = [key for key in self._cached_paths if key[1] == session_id]
+        for key in stale:
+            self._cached_paths.pop(key, None)
+        stale_ts = [key for key in self._cached_paths_ts if key[1] == session_id]
+        for key in stale_ts:
+            self._cached_paths_ts.pop(key, None)
 
     def _get_friendly_path(self, session: Session) -> Path:
         """Get friendly filename path for a session."""
@@ -271,8 +317,7 @@ class FileSystemSessionStore(SessionStore):
             workspace_id = session.workspace_id
 
         # Invalidate caches
-        self._cached_paths.pop(session.session_id, None)
-        self._cached_paths_ts.pop(session.session_id, None)
+        self._invalidate_path_cache(session.session_id)
         self._cached_list = None
         logger.debug(f"[SessionStore] Saving session {session.session_id}")
         # Update the updated_at timestamp
@@ -329,8 +374,12 @@ class FileSystemSessionStore(SessionStore):
             new_path = self._get_friendly_path(session)
             old_path_raw = None
 
-        # Find existing file (if any, for rename logic)
-        old_path = self._find_session_path(session.session_id)
+        # Find existing file (if any, for rename logic).  Scoped to this
+        # workspace when one is in play: an unscoped lookup could resolve to
+        # ANOTHER workspace's copy and the shutil.move below would then pivot
+        # that file into this workspace.
+        old_path = self._find_session_path(session.session_id,
+                                          workspace_id=workspace_id)
 
         # If there's an existing file and it's different from new_path, rename it
         if old_path is not None and old_path != new_path:
@@ -354,8 +403,7 @@ class FileSystemSessionStore(SessionStore):
                 temp_path.replace(new_path)
             logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
             # Invalidate path cache so subsequent _find_session_path re-scans
-            self._cached_paths.pop(session.session_id, None)
-            self._cached_paths_ts.pop(session.session_id, None)
+            self._invalidate_path_cache(session.session_id)
             # Write/update the lightweight metadata file for fast listing
             self._save_session_metadata(session, workspace_id=workspace_id)
         except Exception:
@@ -378,8 +426,11 @@ class FileSystemSessionStore(SessionStore):
             if ws_path.exists():
                 path = ws_path
             else:
-                # Fall back to finding by scanning (handles friendly filenames)
-                path = self._find_session_path(session_id)
+                # Fall back to finding by scanning (handles friendly filenames).
+                # Scoped: a caller that named a workspace must never resolve to
+                # a session file owned by a different workspace.
+                path = self._find_session_path(session_id,
+                                              workspace_id=workspace_id)
         else:
             path = self._find_session_path(session_id)
         if path is None or not path.exists():
@@ -549,9 +600,10 @@ class FileSystemSessionStore(SessionStore):
         and returns the int field, or None when the session file is not found
         or the field is absent (e.g. sessions saved before this feature).
         The file is located via ``_find_session_path``, which scans the
-        legacy sessions dir and every workspace-scoped sessions dir.
+        legacy sessions dir and every workspace-scoped sessions dir — or, when
+        ``workspace_id`` is given, that workspace's sessions dir only.
         """
-        path = self._find_session_path(session_id)
+        path = self._find_session_path(session_id, workspace_id=workspace_id)
         if path is None or not path.exists():
             return None
         try:
@@ -781,8 +833,7 @@ class FileSystemSessionStore(SessionStore):
         self._ensure_dirs()
 
         # Invalidate caches
-        self._cached_paths.pop(session_id, None)
-        self._cached_paths_ts.pop(session_id, None)
+        self._invalidate_path_cache(session_id)
         self._cached_list = None
 
         # Collect candidate directories: the workspace's own directory when a
@@ -834,9 +885,15 @@ class FileSystemSessionStore(SessionStore):
 
         return found
 
-    def get_session_path(self, session_id: str) -> Path:
-        """Get the file path for a given session ID."""
-        path = self._find_session_path(session_id)
+    def get_session_path(self, session_id: str,
+                         workspace_id: Optional[str] = None) -> Path:
+        """Get the file path for a given session ID.
+
+        When *workspace_id* is given the lookup is scoped to that workspace's
+        sessions directory, so the returned path never points into a different
+        workspace.
+        """
+        path = self._find_session_path(session_id, workspace_id=workspace_id)
         if path is not None:
             return path
         # Session not saved yet, return the default path (for compatibility)
