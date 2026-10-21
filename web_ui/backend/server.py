@@ -25,9 +25,10 @@ Startup
     uvicorn web_ui.backend.server:app --host 127.0.0.1 --port 8000 --reload
 
 The bind address defaults to loopback (127.0.0.1; override with ``--host`` or
-the ``HOST`` env var) and the health routes (``GET /health``, ``/api/health``,
-``/api/health/containers``) answer localhost callers only, so a server exposed
-on a non-loopback interface does not publish its health payload.
+the ``HOST`` env var), the server refuses to start on a non-loopback host
+unless ``--allow-remote-bind`` is passed, and the health routes (``GET /health``,
+``/api/health``, ``/api/health/containers``) answer localhost callers only, so a
+server exposed on a non-loopback interface does not publish its health payload.
 
 Or via provided run script:
     python -m web_ui.backend.server
@@ -3246,6 +3247,38 @@ _LOCAL_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _TEST_HARNESS_CLIENT_HOSTS = frozenset({"testclient"})
 
 
+def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> Optional[str]:
+    """Return the refusal message for a bind *host*, or ``None`` when it is safe.
+
+    Accepted values are exactly the local-caller literals in
+    ``_LOCAL_CLIENT_HOSTS`` — one notion of "local", shared with the health gate
+    below — plus their bracketed IPv6 CLI spelling (``[::1]``), which is how a
+    scoped IPv6 host is written on a command line.
+
+    An empty or whitespace-only host is refused even when *allow_remote* is set:
+    uvicorn reads ``""`` as "all interfaces", the exact exposure this check
+    exists to prevent, and nobody types it on purpose.
+
+    *allow_remote* is the ``--allow-remote-bind`` escape hatch; it waives the
+    loopback requirement and nothing else.  Pure function: no printing, no
+    exiting, no argparse — the caller decides how loud to be and how to fail.
+    """
+    raw = "" if host is None else str(host).strip()
+    if not raw:
+        return ("Refusing to start: the bind host is empty, and an empty host means "
+                "'all interfaces'. Use --host or the HOST env var to name a loopback "
+                "address (127.0.0.1, ::1, localhost).")
+    if allow_remote:
+        return None
+    literal = raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
+    if literal in _LOCAL_CLIENT_HOSTS:
+        return None
+    return (f"Refusing to start: bind host {raw} is not a loopback address. Use a "
+            f"loopback host (127.0.0.1, ::1, localhost) via --host or the HOST env "
+            f"var, or pass --allow-remote-bind to expose the unauthenticated API "
+            f"knowingly.")
+
+
 def _localhost_only(request: Request) -> Optional[JSONResponse]:
     """Return a 403 response when *request* did not come from a local caller.
 
@@ -5294,6 +5327,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Host to bind to (default: 127.0.0.1; override with HOST env var)",
     )
     parser.add_argument(
+        "--allow-remote-bind",
+        action="store_true",
+        help=(
+            "INSECURE: accept a non-loopback --host/HOST. The Web UI API is "
+            "unauthenticated, so anything that can reach the port can drive this "
+            "machine's agent. Use only on a network you already trust."
+        ),
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=int(os.environ.get("PORT", "8000")),
@@ -5322,6 +5364,27 @@ def main():
     import uvicorn
 
     args = build_parser().parse_args()
+
+    # F30(d): refuse to publish an unauthenticated API on a non-loopback
+    # interface.  A blanket refusal with no escape hatch gets deleted the first
+    # time someone needs a LAN demo; an explicit, greppable, loudly announced
+    # opt-in keeps that exception visible in the source and on stderr.
+    host_error = _validate_bind_host(args.host, allow_remote=args.allow_remote_bind)
+    if host_error is not None:
+        print(host_error, file=sys.stderr)
+        print(
+            "ThoughtMachine serves an unauthenticated local API; binding to a "
+            "non-loopback address is refused by default.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if args.allow_remote_bind:
+        print(
+            f"WARNING: --allow-remote-bind is set — binding to {args.host}, so the "
+            f"unauthenticated Web UI API is reachable from every host that can "
+            f"route to this port.",
+            file=sys.stderr,
+        )
 
     # Rebuild global session registry from disk
     registry = SessionRegistry.get_default()

@@ -222,3 +222,106 @@ def test_api_health_allows_test_client(contract_server):
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5 — startup refuses a non-loopback bind host (F30(d))
+# ════════════════════════════════════════════════════════════════════════════
+
+ACCEPTED_BIND_HOSTS = ["127.0.0.1", "::1", "[::1]", "localhost"]
+REFUSED_BIND_HOSTS = ["0.0.0.0", "::", "10.0.0.5", "example.com", "", "   ", None]
+
+
+@pytest.mark.parametrize("host", ACCEPTED_BIND_HOSTS)
+def test_validate_bind_host_accepts_loopback(contract_server, host):
+    """Loopback literals (and the bracketed IPv6 CLI spelling) are bindable."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    assert server_mod._validate_bind_host(host) is None
+
+
+@pytest.mark.parametrize("host", REFUSED_BIND_HOSTS)
+def test_validate_bind_host_refuses_non_loopback(contract_server, host):
+    """Wildcard/remote/empty hosts are refused, and the message names the host."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    message = server_mod._validate_bind_host(host)
+    assert message is not None
+    if host is not None and host.strip():
+        assert host in message
+
+
+def test_validate_bind_host_refusal_points_at_the_host_env_var(contract_server):
+    """The refusal must name a knob the operator can actually turn."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    assert "HOST" in server_mod._validate_bind_host("0.0.0.0")
+
+
+def test_validate_bind_host_allow_remote_waives_loopback_requirement(contract_server):
+    """--allow-remote-bind is an explicit opt-in: 0.0.0.0 then passes."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    assert server_mod._validate_bind_host("0.0.0.0", allow_remote=True) is None
+
+
+def test_validate_bind_host_allow_remote_still_refuses_empty_host(contract_server):
+    """The opt-in waives loopback only: an empty host still means 'all interfaces'."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    assert server_mod._validate_bind_host("", allow_remote=True) is not None
+
+
+def test_parser_allow_remote_bind_is_off_by_default(contract_server):
+    """The escape hatch exists, and defaults to off."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    assert server_mod.build_parser().parse_args([]).allow_remote_bind is False
+    assert server_mod.build_parser().parse_args(["--allow-remote-bind"]).allow_remote_bind is True
+
+
+def test_main_exits_2_on_non_loopback_host(contract_server, monkeypatch, capsys):
+    """main() refuses to boot on 0.0.0.0: exit code 2, reason on stderr."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    class _Args:
+        host = "0.0.0.0"
+        allow_remote_bind = False
+
+    class _Parser:
+        @staticmethod
+        def parse_args():
+            return _Args()
+
+    monkeypatch.setattr(server_mod, "build_parser", lambda: _Parser())
+
+    with pytest.raises(SystemExit) as excinfo:
+        server_mod.main()
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "0.0.0.0" in err
+    assert "unauthenticated" in err
+
+
+def test_main_exits_2_on_empty_host(contract_server, monkeypatch, capsys):
+    """An empty HOST env var (uvicorn's 'all interfaces') is refused too."""
+    server_mod = importlib.import_module("web_ui.backend.server")
+
+    class _Args:
+        host = ""
+        allow_remote_bind = False
+
+    class _Parser:
+        @staticmethod
+        def parse_args():
+            return _Args()
+
+    monkeypatch.setattr(server_mod, "build_parser", lambda: _Parser())
+
+    with pytest.raises(SystemExit) as excinfo:
+        server_mod.main()
+
+    assert excinfo.value.code == 2
+    assert "HOST" in capsys.readouterr().err
+
