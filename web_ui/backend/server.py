@@ -3779,10 +3779,13 @@ def _validate_workspace_path(workspace_path: str, workspace_id: str) -> str:
 def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
     """Resolve the workspace root path for a container manager.
 
-    The explicit ``workspace_path`` query param wins and is validated to be
-    an existing absolute directory outside the vault root (raises
-    WorkspacePathError); otherwise fall back to the workspace registry.
-    Returns None when the workspace is unknown or the path cannot be resolved.
+    Both branches are validated.  The explicit ``workspace_path`` query param
+    wins when supplied; otherwise the workspace registry is consulted and its
+    ``root_path`` is validated the same way, because either value ends up as a
+    container bind-mount source.  Either branch raises WorkspacePathError
+    (HTTP 400) / WorkspacePathForbiddenError (HTTP 403) for a path that is
+    missing, inside the vault, or otherwise unusable.  Returns None when the
+    workspace is unknown or the path cannot be resolved.
     """
     if workspace_path:
         return _validate_workspace_path(workspace_path, workspace_id)
@@ -3795,7 +3798,20 @@ def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
         # swallowing the fault into the misleading 404
         # "workspace '<id>' not found or path unresolvable".
         raise
-    return entry.root_path if entry is not None else None
+    if entry is None:
+        return None
+    if not entry.root_path:
+        # A registered entry with no root is unresolvable rather than
+        # forbidden: fall through to the caller's None -> 404 handling.
+        return None
+    # ``entry.root_path`` is server-owned but not server-chosen -- it is
+    # whatever path was registered, and the container layer bind-mounts it at
+    # /workspace verbatim.  Returning it raw let a vault-rooted (or otherwise
+    # unusable) entry reach ContainerManager without ever passing the guard
+    # that the explicit ``workspace_path`` branch already runs, so the
+    # registry fallback gets the same validation before it can become a
+    # mount source.
+    return _validate_workspace_path(entry.root_path, workspace_id)
 
 
 def _make_container_manager(workspace_id: str, workspace_path: str = ""):
@@ -4921,6 +4937,10 @@ def workspace_container_action(workspace_id: str, record_id: str,
 
     try:
         manager = _make_container_manager(workspace_id)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
     except Exception as exc:
         log("ERROR", "server.workspace_container_action",
             f"ContainerManager construction failed: {exc}")
@@ -5088,6 +5108,10 @@ def workspace_container_resources(workspace_id: str, record_id: str,
 
     try:
         manager = _make_container_manager(workspace_id)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
     except Exception as exc:
         log("ERROR", "server.workspace_container_resources",
             f"ContainerManager construction failed: {exc}")
