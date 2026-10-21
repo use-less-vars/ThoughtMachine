@@ -2239,9 +2239,10 @@ class WebAgentBridge:
             # TTL, and any container still left is reclaimed on decommission.
 
         # Gracefully stop any worker threads spawned during this session
-        if shutdown_workers is not None:
+        # scoped to this session only; without a resolvable id we stop nothing rather than everything
+        if shutdown_workers is not None and sid:
             try:
-                shutdown_workers(timeout=5.0)
+                shutdown_workers(timeout=5.0, session_id=sid)
             except Exception:
                 log('WARNING', 'server.bridge', 'Error shutting down workers during session close')
 

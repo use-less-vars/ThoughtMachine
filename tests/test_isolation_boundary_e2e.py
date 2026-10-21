@@ -703,6 +703,87 @@ def test_close_session_cannot_kill_other_workspace_workers(iso_server, capfd):
             worker_module._worker_registry.pop((sid_b, name, 1), None)
 
 
+def test_a_legit_close_does_not_stop_b_workers(iso_server, capfd):
+    """A legit close of A's OWN session must succeed and spare B's workers.
+
+    Modelled on ``test_close_session_cannot_kill_other_workspace_workers``
+    (line ~644), but inverted: there the A-bound socket names B's session and
+    must be refused, so a refusing-but-also-sweeping implementation could still
+    pass. Here A closes its own session legitimately, which MUST succeed and
+    stop A's own worker — the only shape that proves the sweep is session
+    scoped rather than merely gated.
+    """
+    app, tmp_home, _server_mod = iso_server
+    client = H.make_client(app)
+
+    from tools.workspace import worker as worker_module
+
+    ws_a_id, _root_a, ws_b_id, _root_b = _two_workspaces_full(
+        client, tmp_home, "legitclose"
+    )
+    sid_a = H.create_session(client, workspace_id=ws_a_id)
+    sid_b = H.create_session(client, workspace_id=ws_b_id)
+    name = "iso-legit-close-worker"
+    fake_a = _FakeLiveWorker(name, sid_a)
+    fake_b = _FakeLiveWorker(name, sid_b)
+    with worker_module._registry_lock:
+        worker_module._worker_registry[(sid_a, name, 1)] = fake_a
+        worker_module._worker_registry[(sid_b, name, 1)] = fake_b
+    try:
+        # (1) LEGITIMATE close: the A-bound socket closes A's OWN session.
+        cm, pump = _open_bound_ws(client, sid_a, ws_a_id)
+        try:
+            events, captured = _cmd_captured(
+                pump, {"command": "close_session", "session_id": sid_a},
+                {"session_closed", "status_message"},
+                capfd,
+            )
+            with capfd.disabled():
+                print(f"[VERDICT] legit close_session(own) -> events={events!r}")
+                print(
+                    f"[VERDICT] A stop_calls={fake_a.stop_calls} "
+                    f"B stop_calls={fake_b.stop_calls}"
+                )
+        finally:
+            _close_ws(cm)
+
+        # (2) The legitimate close SUCCEEDED: yes-verdict, no refusal anywhere.
+        assert any(e.get("type") == "session_closed" for e in events), (
+            "a socket could not close its own session: "
+            f"events={events!r}"
+        )
+        refusals = [
+            e.get("text") for e in events
+            if e.get("type") == "status_message"
+            and "refused" in str(e.get("text", "")).lower()
+        ]
+        assert not refusals, f"LEGIT close was refused: {refusals!r}"
+        assert "Close refused" not in captured.out, (
+            "LEGIT close was refused server-side: "
+            f"captured={captured.out!r}"
+        )
+
+        # (3) CONTROL: the close really swept A's own worker.
+        assert fake_a.stop_calls == 1, (
+            "CONTROL FAILED: closing A's own session did not stop A's own worker, "
+            f"so 'B was spared' proves nothing: events={events!r}"
+        )
+
+        # (4) DISCRIMINATOR: B's worker was never touched and is still registered.
+        assert fake_b.stop_calls == 0, (
+            "BREACH: A's own close_session stopped workspace B's worker "
+            f"(stop_calls={fake_b.stop_calls}, events={events!r})"
+        )
+        with worker_module._registry_lock:
+            assert (sid_b, name, 1) in worker_module._worker_registry, (
+                "BREACH: A's own close_session removed workspace B's worker entry"
+            )
+    finally:
+        with worker_module._registry_lock:
+            worker_module._worker_registry.pop((sid_a, name, 1), None)
+            worker_module._worker_registry.pop((sid_b, name, 1), None)
+
+
 # ---------------------------------------------------------------------------
 # T5 / ATTACK 6 — re-scoping: can a bound socket switch its own workspace?
 # ---------------------------------------------------------------------------

@@ -2882,12 +2882,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     session_id = msg.get("session_id", "")
                     # Ownership gate (R8): a socket may only close a session that
                     # lives inside its own workspace scope. The connection's
-                    # bridge is authoritative. close_session resolves its target
+                    # bridge is authoritative. close_session takes its target
                     # from the CLIENT-SUPPLIED session_id, and
                     # bridge.close_session -> WorkerRegistry.shutdown_workers()
-                    # sweeps every registry key, so without this check a tab bound
-                    # to workspace A could kill workspace B's worker threads by
-                    # naming B's session. Nothing with a side effect may run
+                    # sweeps the worker threads of THAT session id only: the sweep
+                    # is session-scoped, not process-wide. This gate is therefore
+                    # what guarantees the id being closed belongs to this socket's
+                    # own workspace, and hence that only this workspace's worker
+                    # threads can be stopped. Nothing with a side effect may run
                     # before this check. A scopeless connection (bootstrap) keeps
                     # its previous behaviour.
                     _close_scope_ws = bridge.workspace_id if bridge is not None else None
