@@ -271,6 +271,27 @@ class TestDeleteSession:
         """Verify deleting a non-existent session returns False."""
         assert store.delete_session('nonexistent') is False
 
+    def test_delete_scoped_to_workspace_leaves_other_workspace_intact(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """Verify a workspace-scoped delete cannot reach another workspace.
+
+        Workspace-scoped session files live under vault_root()/workspaces, so
+        the vault root is redirected into tmp_path for isolation.
+        """
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-b")
+        assert store.load_session(session_id, workspace_id="ws-b") is not None
+
+        # Deleting under a different workspace must not touch the session.
+        assert store.delete_session(session_id, workspace_id="ws-a") is False
+        assert store.load_session(session_id, workspace_id="ws-b") is not None
+
+        # The owning workspace can still delete it.
+        assert store.delete_session(session_id, workspace_id="ws-b") is True
+        assert store.load_session(session_id, workspace_id="ws-b") is None
+
 
 # --- Get Session Path Tests ---
 

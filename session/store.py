@@ -763,12 +763,18 @@ class FileSystemSessionStore(SessionStore):
         return cls._instance
 
     def delete_session(self, session_id: str, workspace_id: Optional[str] = None) -> bool:
-        """Delete a session file from ALL locations.
+        """Delete a session file.
 
-        Scans both the legacy sessions_dir and every workspace-scoped
-        sessions directory.  Deletes every session JSON file and every
-        associated _meta_ file found — this prevents session resurrection
-        on server restart when duplicate copies exist across directories.
+        When workspace_id is provided, only that workspace's sessions
+        directory is searched, so a delete can never reach a session owned by
+        another workspace — such a call returns False, the same shape used for
+        a non-existent session.
+
+        Without a workspace_id the legacy behaviour is preserved: scans both
+        the legacy sessions_dir and every workspace-scoped sessions directory.
+        Deletes every session JSON file and every associated _meta_ file found
+        — this prevents session resurrection on server restart when duplicate
+        copies exist across directories.
 
         Returns True if at least one file was deleted.
         """
@@ -779,14 +785,20 @@ class FileSystemSessionStore(SessionStore):
         self._cached_paths_ts.pop(session_id, None)
         self._cached_list = None
 
-        # Collect ALL candidate directories (legacy + every workspace)
-        candidates = [self.sessions_dir]
-        workspaces_root = self._base_dir / "workspaces"
-        if workspaces_root.exists():
-            for ws_dir in workspaces_root.iterdir():
-                ws_sessions = ws_dir / "sessions"
-                if ws_sessions.is_dir():
-                    candidates.append(ws_sessions)
+        # Collect candidate directories: the workspace's own directory when a
+        # workspace is given, otherwise legacy + every workspace (sweep).
+        if workspace_id:
+            candidates = [
+                self._base_dir / "workspaces" / workspace_id / "sessions"
+            ]
+        else:
+            candidates = [self.sessions_dir]
+            workspaces_root = self._base_dir / "workspaces"
+            if workspaces_root.exists():
+                for ws_dir in workspaces_root.iterdir():
+                    ws_sessions = ws_dir / "sessions"
+                    if ws_sessions.is_dir():
+                        candidates.append(ws_sessions)
 
         found = False
         deleted_files = []

@@ -2099,9 +2099,13 @@ class WebAgentBridge:
         session = self._session or self._loaded_session
         return self._session_manager.load_more_messages(session, offset, limit=limit)
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session — delegates to SessionManager."""
-        return self._session_manager.delete_session(session_id)
+    def delete_session(
+        self, session_id: str, workspace_id: Optional[str] = None
+    ) -> bool:
+        """Delete a session — delegates to SessionManager (workspace-scoped)."""
+        return self._session_manager.delete_session(
+            session_id, workspace_id=workspace_id
+        )
 
     def rename_session(self, session_id: str, new_name: str) -> bool:
         """Rename a session — delegates to SessionManager, then syncs in-memory state."""
