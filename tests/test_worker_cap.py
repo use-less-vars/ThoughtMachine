@@ -33,6 +33,7 @@ from tests.test_worker_sync_query_timeout_containment import (
 )
 
 SID = "sess-cap-1"
+OTHER_SID = "sess-cap-2"
 
 
 def _def(name):
@@ -176,6 +177,72 @@ def test_reset_does_not_touch_other_workers_or_resources(tmp_path, monkeypatch):
     assert [c.id for c in cm.containers] == ["c2", "rc1"]
     with worker_module._registry_lock:
         assert (SID, "w2", 1) in worker_module._worker_registry
+        assert (SID, "w1", 1) not in worker_module._worker_registry
+
+
+def test_reset_fallback_is_session_scoped(tmp_path, monkeypatch):
+    """The reset fallback sweep must stay inside the caller's session.
+
+    ``_resolve_worker_thread`` cannot see a worker that is live only in
+    ANOTHER session, so resolution raises "is not running" and the fallback
+    sweep runs.  That sweep used to be registry-wide: it reset (stopped and
+    DELETED the persisted context of) the other session's worker of the same
+    name \u2014 a cross-session and cross-workspace destruction.
+    """
+    (tmp_path / "foreign").mkdir()
+    foreign = _spawn_worker(
+        tmp_path / "foreign", monkeypatch, name="w1", session_id=OTHER_SID
+    )
+    with worker_module._registry_lock:
+        assert (OTHER_SID, "w1", 1) in worker_module._worker_registry
+
+    result = Worker(action="reset", worker_name="w1", session_id=SID)._action_reset(
+        workers=[_def("w1")]
+    )
+
+    assert result["status"] == "reset"
+    assert "nothing to reset" in result["message"]
+    assert result["freed_slot"] is False
+    # The foreign session's worker and its registry entry both survive.
+    assert foreign.is_alive()
+    assert worker_module._worker_registry[(OTHER_SID, "w1", 1)] is foreign
+
+
+def test_stop_fallback_is_session_scoped(tmp_path, monkeypatch):
+    """Same contract for stop: a foreign-session worker of the same name is
+    never stopped, joined or unregistered by the fallback sweep."""
+    (tmp_path / "foreign").mkdir()
+    foreign = _spawn_worker(
+        tmp_path / "foreign", monkeypatch, name="w1", session_id=OTHER_SID
+    )
+
+    result = Worker(action="stop", worker_name="w1", session_id=SID)._action_stop(
+        workers=[_def("w1")]
+    )
+
+    assert result["status"] == "stopped"
+    assert "was not running" in result["message"]
+    assert foreign.is_alive()
+    assert worker_module._worker_registry[(OTHER_SID, "w1", 1)] is foreign
+
+
+def test_reset_fallback_still_resets_own_dead_instance(tmp_path, monkeypatch):
+    """Session scoping must not disable the fallback: a registered but dead
+    instance in the caller's OWN session is still swept and reset."""
+    thread = _spawn_worker(tmp_path, monkeypatch, name="w1", session_id=SID)
+    thread.stop()
+    assert _wait_until(lambda: not thread.is_alive(), timeout=10.0)
+    with worker_module._registry_lock:
+        assert (SID, "w1", 1) in worker_module._worker_registry
+
+    result = Worker(action="reset", worker_name="w1", session_id=SID)._action_reset(
+        workers=[_def("w1")]
+    )
+
+    assert result["status"] == "reset"
+    assert result["freed_slot"] is True
+    assert [i["session_id"] for i in result["reset_instances"]] == [SID]
+    with worker_module._registry_lock:
         assert (SID, "w1", 1) not in worker_module._worker_registry
 
 

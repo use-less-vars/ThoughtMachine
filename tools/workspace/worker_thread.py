@@ -5238,8 +5238,10 @@ class Worker(ToolBase):
     def _action_stop(self, workers: list) -> dict:
         """Stop a running worker and persist its context.
 
-        First tries the current session; if not found, searches across all
-        sessions and stops any matching instances.
+        First tries the current session; if not found, falls back to a
+        same-session sweep for any remaining instances of the name.  A live
+        worker of the same name owned by ANOTHER session is never stopped:
+        session scoping is what makes stop workspace-safe.
         """
         from tools.workspace.worker import _registry_lock, _worker_registry
         session_key = self.session_id or _NO_SESSION_KEY
@@ -5253,8 +5255,15 @@ class Worker(ToolBase):
             msg = str(exc)
             all_instances = []
             if self.instance_id is None and "is not running" in msg:
-                # ── Not found in current session → search across all sessions ──
-                all_instances = self._find_all_worker_threads(self.worker_name)
+                # ── Not found in current session → sweep THIS session only ──
+                # Never sweep the whole registry: a worker of the same name
+                # owned by another session (and therefore another workspace)
+                # is not this caller's property and must survive untouched.
+                # ``self.session_id or None`` keeps the historical unscoped
+                # lookup for a falsy session_id.
+                all_instances = self._find_all_worker_threads(
+                    self.worker_name, session_id=self.session_id or None
+                )
             if "ambiguous" in msg:
                 # Name maps to multiple live instances — the caller must pass
                 # an explicit instance_id to disambiguate.
@@ -5263,7 +5272,7 @@ class Worker(ToolBase):
                     "worker_name": self.worker_name,
                 }
             if not all_instances:
-                # No instances anywhere — report as not running
+                # No instances in this session — report as not running
                 entry = self._find_worker(workers, self.worker_name)
                 if entry:
                     return {
@@ -5275,11 +5284,11 @@ class Worker(ToolBase):
                     "error": f"Worker '{self.worker_name}' not found",
                 }
 
-            # Found in another session — stop all instances
+            # Found in this session (non-live leftovers) — stop all instances
             stopped_info = []
             for sid, t in all_instances:
                 worker_label = f"{self.worker_name} (session={sid})"
-                logger.info("Cross-session stop: stopping worker '%s'", worker_label)
+                logger.info("Same-session stop: stopping worker '%s'", worker_label)
                 try:
                     t.stop()
                     # Robust join with retry (same pattern as _action_stop)
@@ -5292,7 +5301,7 @@ class Worker(ToolBase):
                             break
                     if t.is_alive():
                         logger.warning(
-                            "Cross-session stop: worker '%s' did not stop within %ds",
+                            "Same-session stop: worker '%s' did not stop within %ds",
                             worker_label, _budget,
                         )
                 except Exception as exc:
@@ -5319,7 +5328,7 @@ class Worker(ToolBase):
                 "status": "stopped",
                 "message": (
                     f"Stopped {len(stopped_info)} instance(s) of worker "
-                    f"'{self.worker_name}' across sessions."
+                    f"'{self.worker_name}' in this session."
                 ),
                 "stopped_instances": stopped_info,
             }
@@ -5393,7 +5402,8 @@ class Worker(ToolBase):
         """Stop a worker, DROP its persisted context, and free its spawn slot.
 
         Mirrors ``_action_stop`` resolution (current session first, then a
-        cross-session fallback), but instead of persisting the final context
+        same-session fallback — another session's worker is never touched),
+        but instead of persisting the final context
         the worker's state files (context.json / status.json / command.json)
         are DELETED so the next spawn starts completely fresh.  Other
         workers and resource containers are never touched.
@@ -5457,8 +5467,15 @@ class Worker(ToolBase):
             msg = str(exc)
             all_instances = []
             if self.instance_id is None and "is not running" in msg:
-                # Not found in current session → search across all sessions.
-                all_instances = self._find_all_worker_threads(self.worker_name)
+                # Not found in current session → sweep THIS session only.
+                # Never sweep the whole registry: a worker of the same name
+                # owned by another session (and therefore another workspace)
+                # is not this caller's property and must survive untouched.
+                # ``self.session_id or None`` keeps the historical unscoped
+                # lookup for a falsy session_id.
+                all_instances = self._find_all_worker_threads(
+                    self.worker_name, session_id=self.session_id or None
+                )
             if "ambiguous" in msg:
                 return {
                     "error": msg,
@@ -5480,10 +5497,10 @@ class Worker(ToolBase):
                     "error": f"Worker '{self.worker_name}' not found",
                 }
 
-            # Found in another session — reset all matching instances.
+            # Found in this session (non-live leftovers) — reset all of them.
             reset_info = []
             for sid, t in all_instances:
-                logger.info("Cross-session reset: resetting worker '%s'", self.worker_name)
+                logger.info("Same-session reset: resetting worker '%s'", self.worker_name)
                 info = _reset_one(t, sid)
                 if info not in reset_info:
                     reset_info.append(info)
@@ -5492,7 +5509,7 @@ class Worker(ToolBase):
                 "status": "reset",
                 "message": (
                     f"Reset {len(reset_info)} instance(s) of worker "
-                    f"'{self.worker_name}' across sessions."
+                    f"'{self.worker_name}' in this session."
                 ),
                 "reset_instances": reset_info,
                 "freed_slot": True,
