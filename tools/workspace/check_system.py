@@ -38,6 +38,12 @@ from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 # Vault-relative prefix for per-workspace entries in a vault_status report.
 _VAULT_WORKSPACE_PREFIX = "workspaces/"
 
+# Queries that are always permitted regardless of the workspace allowlist.
+# These are read-only facts about the caller's own machine/workspace (revision,
+# own container list) and must not be deniable: the tool schema advertises them
+# unconditionally, so a runtime denial is displayed != enforced.
+SAFE_QUERIES = frozenset({"version", "containers"})
+
 # ---------------------------------------------------------------------------
 # Optional dependencies
 # ---------------------------------------------------------------------------
@@ -265,6 +271,9 @@ class CheckSystem(ToolBase):
         Returns True if allowed or if vault is unavailable (degraded mode).
         Logs a warning if the query is denied.
         """
+        if query_name in SAFE_QUERIES:
+            # Always allowed: own revision / own container list (see SAFE_QUERIES).
+            return True
         if self.allowlist is None:
             return True  # degraded mode: vault not available, assume allowed
         if query_name in self.allowlist:
