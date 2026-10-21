@@ -660,6 +660,7 @@ def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
         },
         "extra_hosts": {},
         "mem_limit": "1g",
+        "memswap_limit": "1g",
         "mounts": [
             {
                 "Target": "/workspace",

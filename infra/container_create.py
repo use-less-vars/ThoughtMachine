@@ -437,6 +437,7 @@ def create_hardened_container(
             oom_score_adj=spec.oom_score_adj,
             network_mode=spec.network_mode,
             mem_limit=spec.mem_limit,
+            memswap_limit=spec.mem_limit,
             cpu_quota=spec.cpu_quota,
             tmpfs=dict(spec.tmpfs),
             labels=run_labels,

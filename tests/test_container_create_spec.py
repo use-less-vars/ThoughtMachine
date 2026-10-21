@@ -256,6 +256,7 @@ class TestCreateHardenedContainer:
         assert kwargs["user"] == spec.hardening.user
         assert kwargs["oom_score_adj"] == DEFAULT_USER_OOM_SCORE_ADJ
         assert kwargs["mem_limit"] == DEFAULT_MEM_LIMIT
+        assert kwargs["memswap_limit"] == DEFAULT_MEM_LIMIT
         assert kwargs["cpu_quota"] == DEFAULT_CPU_QUOTA
         assert kwargs["mounts"] == []
         assert kwargs["restart_policy"] == {"Name": "no", "MaximumRetryCount": 0}
