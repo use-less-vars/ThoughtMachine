@@ -7,6 +7,7 @@ import threading
 from typing import Dict, Any, Optional, Callable
 from datetime import datetime
 from agent.logging import log
+from thoughtmachine.vault import vault_root
 
 class ConfigService:
     """
@@ -276,7 +277,7 @@ def create_agent_config_service(config_path: str = None) -> ConfigService:
         ConfigService instance with agent defaults
     """
     if config_path is None:
-        config_path = os.path.expanduser('~/.thoughtmachine/agent_config.json')
+        config_path = str(vault_root() / 'agent_config.json')
 
     from agent.config import AgentConfig
     default_agent_config = AgentConfig()

@@ -2,7 +2,8 @@
 Credential injection system for secure tool dispatch.
 
 Provides ``{{credential:<key>}}`` placeholder resolution in tool arguments
-using files stored in ``~/.thoughtmachine/credentials/<workspace_id>/``.
+using files stored in ``<vault_root>/credentials/<workspace_id>/`` and, failing
+that, ``<vault_root>/credentials/global/``.
 
 One file per credential key — plain text, no JSON wrapper.
 """
@@ -13,6 +14,9 @@ import copy
 import os
 import re
 from pathlib import Path
+from typing import Optional
+
+from thoughtmachine.vault import vault_root
 
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
@@ -54,17 +58,24 @@ class CredentialInjector:
 
     Args:
         workspace_id: Identifies the subdirectory under
-            ``~/.thoughtmachine/credentials/`` that holds credential files.
+            ``<vault_root>/credentials/`` that holds credential files.
     """
 
     def __init__(self, workspace_id: str) -> None:
         self.workspace_id = workspace_id
-        self.credentials_dir = Path.home() / ".thoughtmachine" / "credentials" / workspace_id
+        # One function owns "where is the vault" (design Decision 2, Inv.6):
+        # both the writer and this reader call ``vault_root()``.
+        self.credentials_dir = vault_root() / "credentials" / workspace_id
+        self.global_credentials_dir = vault_root() / "credentials" / "global"
 
     # ── Public API ──────────────────────────────────────────────────────────
 
     def resolve(self, key: str) -> Secret:
         """Read a single credential file and return its contents as a ``Secret``.
+
+        Resolution order (design Decision 2): ``credentials/<workspace_id>/<key>``
+        first, then ``credentials/global/<key>``.  The workspace scope is the
+        binding; the global scope is the vault-wide library.
 
         Args:
             key: A bare filename (no path separators, no traversal).
@@ -73,39 +84,19 @@ class CredentialInjector:
             ``Secret`` containing the file contents (trailing newline stripped).
 
         Raises:
-            CredentialError: If the key is invalid, the file is missing,
-                or a symlink-traversal attack is detected.
+            CredentialError: If the key is invalid, the file is missing from both
+                scopes, or a symlink-traversal attack is detected.
         """
         # 1. Validate the key — must be a single filename component
         self._validate_key(key)
 
-        # 2. Construct the path
-        cred_path = self.credentials_dir / key
+        # 2. Workspace scope first, then the global scope
+        for directory in (self.credentials_dir, self.global_credentials_dir):
+            value = self._read_scoped_credential(directory, key)
+            if value is not None:
+                return Secret(value)
 
-        # 3. Symlink-traversal protection: resolve and verify prefix
-        try:
-            resolved = os.path.realpath(str(cred_path))
-        except OSError:
-            raise CredentialError(f"Credential key '{key}' not found")
-
-        resolved_cred_dir = os.path.realpath(str(self.credentials_dir))
-        if not resolved.startswith(resolved_cred_dir + os.sep) and resolved != resolved_cred_dir:
-            raise CredentialError(f"Invalid credential key: '{key}' — path traversal detected")
-
-        # 4. Check it exists and is a regular file
-        path_obj = Path(resolved)
-        if not path_obj.exists():
-            raise CredentialError(f"Credential '{key}' not found")
-        if not path_obj.is_file():
-            raise CredentialError(f"Credential file for '{key}' is not a regular file")
-
-        # 5. Read the file, strip final trailing newline
-        try:
-            value = path_obj.read_text(encoding="utf-8").rstrip("\n")
-        except OSError as exc:
-            raise CredentialError(f"Failed to read credential '{key}': {exc}")
-
-        return Secret(value)
+        raise CredentialError(f"Credential '{key}' not found")
 
     def inject(self, tool_args: dict) -> dict:
         """Replace ``{{credential:<key>}}`` placeholders in string values.
@@ -135,6 +126,37 @@ class CredentialInjector:
         return result
 
     # ── Internal helpers ────────────────────────────────────────────────────
+
+    def _read_scoped_credential(self, directory: Path, key: str) -> Optional[str]:
+        """Read *key* from *directory*; ``None`` when it is absent there.
+
+        Symlink-traversal protection is per-scope: a resolved path that escapes
+        *directory* is refused outright, never silently skipped in favour of the
+        next scope.
+
+        Raises:
+            CredentialError: If a symlink-traversal attack is detected, or the
+                path exists but is not a regular file.
+        """
+        try:
+            resolved = os.path.realpath(str(directory / key))
+        except OSError:
+            return None
+
+        resolved_dir = os.path.realpath(str(directory))
+        if not resolved.startswith(resolved_dir + os.sep) and resolved != resolved_dir:
+            raise CredentialError(f"Invalid credential key: '{key}' — path traversal detected")
+
+        path_obj = Path(resolved)
+        if not path_obj.exists():
+            return None
+        if not path_obj.is_file():
+            raise CredentialError(f"Credential file for '{key}' is not a regular file")
+
+        try:
+            return path_obj.read_text(encoding="utf-8").rstrip("\n")
+        except OSError as exc:
+            raise CredentialError(f"Failed to read credential '{key}': {exc}")
 
     def _validate_key(self, key: str) -> None:
         """Validate that *key* is a safe filename (no path traversal, no separators).
