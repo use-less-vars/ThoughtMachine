@@ -23,11 +23,7 @@ trigger the bridge through a real ``global_event_bus.publish(WORKER_SPAWNED)``,
 so the guard under test is exercised exactly as in production.
 """
 
-import sys
 import uuid
-
-sys.path.insert(0, '/workspace/pytest_install')
-
 from unittest import mock
 
 import pytest
@@ -44,9 +40,6 @@ from tools.workspace.worker import (
 )
 from web_ui.backend import bridge as bridge_module
 from web_ui.backend.bridge import WebAgentBridge
-
-
-
 
 
 @pytest.fixture()
