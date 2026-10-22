@@ -21,6 +21,7 @@ _EXPECTED_NAMES = {
     "network",
     "mcp",
     "ci",
+    "credential",
 }
 _EXPECTED_KEYS = {
     "name",
@@ -80,7 +81,7 @@ def test_resource_catalog_returns_bare_array(client):
     assert resp.status_code == 200
     body = resp.json()
     assert isinstance(body, list)
-    assert len(body) == 9
+    assert len(body) == 10
 
 
 def test_resource_catalog_nine_resources_with_exact_keys(client):

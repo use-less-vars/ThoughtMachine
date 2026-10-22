@@ -31,6 +31,7 @@ _CANONICAL_PERMISSION_FIELDS = {
     "mcp",
     "host_bash",
     "ci",
+    "credential",
 }
 
 

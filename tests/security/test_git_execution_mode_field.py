@@ -29,6 +29,7 @@ _EXPECTED_NAMES = {
     "network",
     "mcp",
     "ci",
+    "credential",
 }
 _EXECUTION_MODES = {"container", "host"}
 

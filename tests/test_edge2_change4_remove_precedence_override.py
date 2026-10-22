@@ -51,6 +51,7 @@ ALL_BANNED = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "credential": "banned",
 }
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +148,7 @@ def test_fail_closed_sentinels_intact_and_still_imported():
         "network": "banned",
         "mcp": "banned",
         "ci": "banned",
+        "credential": "banned",
     }
 
     # config_manager must still import both sentinels from security.security_gate
