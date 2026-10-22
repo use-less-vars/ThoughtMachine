@@ -23,10 +23,11 @@ import logging
 import os
 import re
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
-from agent.logging import lifecycle
+from agent.logging import AgentLogger, lifecycle
 from agent.logging.redaction import redact
 from agent.logging.streams import (
     DEFAULT_KEEP_BACKUPS,
@@ -513,3 +514,87 @@ class TestHermeticity:
         new_entries = after - before
         assert "logs" not in new_entries, f"repo-root logs/ created: {new_entries}"
         assert new_entries == set(), f"new entries at repo root: {new_entries}"
+
+
+# ---------------------------------------------------------------------------
+# (e) session log sink - redaction on both of its physical write paths
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSinkRedaction:
+    """The session sink (agent.logging._AgentLogger) does not go through
+    JsonlStreamWriter; it must still redact secrets on BOTH paths that put
+    event bytes on disk: the primary self._file_handle.write and the
+    agent_fallback.jsonl fallback."""
+
+    SECRET = "ghp_" + "A" * 40
+
+    @staticmethod
+    def _stub_config() -> SimpleNamespace:
+        """Minimal logger config (same shape as agent/config/models.py)."""
+        return SimpleNamespace(
+            enable_logging=True,
+            enable_file_logging=True,
+            jsonl_format=True,
+            max_file_size_mb=10,
+            log_level="INFO",
+            file_log_level="DEBUG",
+            log_categories=["SESSION", "LLM", "TOOLS"],
+        )
+
+    def test_session_sink_redacts_both_write_paths(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("AGENT_LOG_CATEGORIES", raising=False)
+        log_dir = tmp_path / "logs"
+
+        class _ExplodingHandle:
+            """Stands in for the primary sink; fails every write."""
+
+            closed = False
+
+            def write(self, _line):
+                raise IOError("primary sink unavailable")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        logger = AgentLogger(
+            self._stub_config(),
+            log_dir=str(log_dir),
+            enable_file_logging=True,
+            jsonl_format=True,
+            session_id="redact-sink-1",
+        )
+        try:
+            # 1) primary path: self._file_handle.write(json_line)
+            logger._write_jsonl(
+                {"type": "session_test", "level": "INFO",
+                 "data": {"token": self.SECRET}}
+            )
+            with open(logger.log_file_path, encoding="utf-8") as fh:
+                primary = fh.read()
+            assert self.SECRET not in primary
+            assert "<REDACTED>" in primary
+
+            # 2) fallback path: the `with open(fallback_path, ...)` block
+            if logger._file_handle is not None:
+                logger._file_handle.close()
+            logger._file_handle = _ExplodingHandle()
+            logger._write_jsonl(
+                {"type": "session_test", "level": "INFO",
+                 "data": {"token": self.SECRET}}
+            )
+            fallback_path = os.path.join(logger.log_dir, "agent_fallback.jsonl")
+            assert os.path.isfile(fallback_path)
+            with open(fallback_path, encoding="utf-8") as fh:
+                fallback = fh.read()
+            assert self.SECRET not in fallback
+            assert "<REDACTED>" in fallback
+        finally:
+            handle = getattr(logger, "_file_handle", None)
+            if handle is not None and not handle.closed:
+                handle.close()
+            logger._file_handle = None
+
