@@ -387,8 +387,9 @@ class ToolExecutor:
                 except Exception:
                     return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
             # Now inject infrastructure fields (safe because validation passed)
-            if self.config.workspace_path:
-                tool_args['workspace_path'] = self.config.workspace_path
+            # workspace_path is ALWAYS taken from the executor config: it is an
+            # infrastructure field, so a caller-supplied value must never win.
+            tool_args['workspace_path'] = self.config.workspace_path
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
             # Check permission categories using the unified security gate

@@ -145,6 +145,55 @@ class TestToolExecutorPermissions:
 
 
 # ---------------------------------------------------------------------------
+# workspace_path is an infrastructure field: the executor config always wins
+# ---------------------------------------------------------------------------
+
+class _WorkspaceEchoTool(ToolBase):
+    """Echoes the workspace_path it was instantiated with."""
+    tool: str = "WorkspaceEchoTool"
+    required_categories: ClassVar[List[str]] = []
+
+    def execute(self) -> str:
+        return self.workspace_path or "<none>"
+
+
+class TestWorkspacePathInjection:
+    """A caller-supplied workspace_path must never win over the config."""
+
+    def _make_executor(self, workspace_path):
+        config = FakeConfig(None)
+        config.workspace_path = workspace_path
+        return ToolExecutor(
+            tool_classes=[_WorkspaceEchoTool],
+            config=config,
+            state=FakeState(),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+
+    @pytest.mark.parametrize(
+        "configured, expected",
+        [("/tmp/real", "/tmp/real"), (None, "<none>")],
+    )
+    def test_executor_overwrites_caller_workspace_path(self, configured, expected):
+        # The caller (LLM) asks for '/' in both cases; the executor config wins,
+        # including when it is unset -- then the tool must see no workspace, not
+        # the caller's arbitrary path.
+        executor = self._make_executor(configured)
+        result = executor._execute_single_tool(
+            _WorkspaceEchoTool,
+            {"workspace_path": "/"},
+            "WorkspaceEchoTool",
+            0,
+            lambda: False,
+            lambda: None,
+            lambda: 0,
+        )
+        assert result["result"] == expected
+
+
+# ---------------------------------------------------------------------------
 # Dynamic category resolution (get_required_categories with params)
 # ---------------------------------------------------------------------------
 
