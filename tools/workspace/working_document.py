@@ -106,6 +106,27 @@ class WorkingDocument(ToolBase):
         except Exception as e:
             return self._truncate_output(f"WorkingDocument error: {e}")
 
+    # ── Path containment ───────────────────────────────────────────────────
+
+    def _resolve_doc_path(self, doc_id: str, docs_dir: Path) -> Path:
+        """Resolve ``<doc_id>.json`` strictly inside ``docs_dir``.
+
+        ``doc_id`` is caller-supplied and is used as a path component, so it
+        must never be able to address a file outside the working-docs
+        directory (``../`` traversal, absolute paths, symlink escapes).
+
+        Raises:
+            ValueError: if the resolved document path escapes ``docs_dir``.
+        """
+        docs_root = docs_dir.resolve()
+        candidate = (docs_dir / f"{doc_id}.json").resolve()
+        if not candidate.is_relative_to(docs_root):
+            raise ValueError(
+                f"Invalid doc_id '{doc_id}': working documents live in "
+                f"'{docs_dir}'; paths outside it are not accessible."
+            )
+        return candidate
+
     # ── Create ────────────────────────────────────────────────────────
 
     def _handle_create(self, docs_dir: Path) -> str:
@@ -125,7 +146,7 @@ class WorkingDocument(ToolBase):
             "updated_at": now,
         }
 
-        filepath = docs_dir / f"{doc_id}.json"
+        filepath = self._resolve_doc_path(doc_id, docs_dir)
         docs_dir.mkdir(parents=True, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(document, f, indent=2, ensure_ascii=False)
@@ -142,7 +163,7 @@ class WorkingDocument(ToolBase):
         if not self.content:
             return "Error: 'content' is required for append action."
 
-        filepath = docs_dir / f"{self.doc_id}.json"
+        filepath = self._resolve_doc_path(self.doc_id, docs_dir)
         if not filepath.exists():
             return f"Error: Document '{self.doc_id}' not found."
 
@@ -178,7 +199,7 @@ class WorkingDocument(ToolBase):
         if not self.doc_id:
             return "Error: 'doc_id' is required for read action."
 
-        filepath = docs_dir / f"{self.doc_id}.json"
+        filepath = self._resolve_doc_path(self.doc_id, docs_dir)
         if not filepath.exists():
             return f"Error: Document '{self.doc_id}' not found."
 

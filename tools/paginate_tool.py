@@ -45,6 +45,54 @@ class PaginateTool(ToolBase):
         description="Number of results per page (0 = all results, no pagination)"
     )
 
+    # Context fields forwarded to the wrapped tool when it declares them.
+    # ToolBase uses ``extra="forbid"``, so a field the wrapped class does not
+    # declare must never be passed through.
+    _CONTEXT_FIELDS: ClassVar[tuple] = (
+        "workspace_path",
+        "token_limit",
+        "is_docker",
+        "container_workspace_path",
+        "session_permissions",
+        "effective_permissions",
+        "agent_config",
+        "session_id",
+        "is_worker_context",
+        "worker_name",
+    )
+
+    def _build_params(self, tool_class: type) -> dict:
+        """Build the wrapped tool's kwargs from tool_params + injected context.
+
+        Pagination (``page``/``per_page``) is added only for tools that
+        actually declare those fields; injecting them unconditionally made
+        every non-paginating tool fail with ``extra_forbidden``.
+        """
+        field_names = set(tool_class.model_fields)
+
+        # Injected context is authoritative: a caller must not be able to forge
+        # it through ``tool_params`` (e.g. ``workspace_path``) and thereby
+        # re-open the containment the wrapped tool applies.  Colliding caller
+        # keys are dropped silently, mirroring the executor, which also strips
+        # infrastructure keys instead of rejecting the call.
+        params = {
+            name: value
+            for name, value in self.tool_params.items()
+            if name not in self._CONTEXT_FIELDS
+        }
+        for name in self._CONTEXT_FIELDS:
+            if name not in field_names:
+                continue
+            value = getattr(self, name, None)
+            if value is not None:
+                params[name] = value
+
+        if "page" in field_names:
+            params["page"] = self.page
+        if "per_page" in field_names:
+            params["per_page"] = self.per_page
+        return params
+
     def execute(self) -> str:
         """Execute the wrapped tool with pagination applied."""
         from tools import TOOL_CLASSES
@@ -60,9 +108,7 @@ class PaginateTool(ToolBase):
             return f"Error: Tool '{self.target_tool_name}' not found. Available tools: {[c.__name__ for c in TOOL_CLASSES]}"
 
         # Execute the wrapped tool with merged pagination params
-        params = self.tool_params.copy()
-        params['page'] = self.page
-        params['per_page'] = self.per_page
+        params = self._build_params(tool_class)
 
         try:
             # Instantiate and run
