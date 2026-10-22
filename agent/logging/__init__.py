@@ -8,6 +8,7 @@ import os
 import threading
 
 from agent._log_root import get_log_root
+from agent.logging.redaction import redact
 
 
 def _safe_err_print(message: str) -> None:
@@ -231,7 +232,9 @@ class _AgentLogger:
                 event['timestamp'] = datetime.now().isoformat()
                 event['session_id'] = self.session_id
                 event['version'] = CURRENT_SESSION_VERSION
-                json_line = json.dumps(event, ensure_ascii=False) + '\n'
+                # Redact before serialising to disk: secrets must never hit
+                # the session log file.
+                json_line = redact(json.dumps(event, ensure_ascii=False)) + '\n'
                 self._file_handle.write(json_line)
                 self._file_handle.flush()
                 self._current_file_size += len(json_line.encode('utf-8'))
@@ -262,7 +265,8 @@ class _AgentLogger:
                     fallback_path = os.path.join(fallback_dir, 'agent_fallback.jsonl')
                     with open(fallback_path, 'a', encoding='utf-8') as f:
                         event['timestamp'] = datetime.now().isoformat()
-                        f.write(json.dumps(event, ensure_ascii=False) + '\n')
+                        # Same rule as the primary path: no raw secrets on disk.
+                        f.write(redact(json.dumps(event, ensure_ascii=False)) + '\n')
                         f.flush()
                 except Exception:
                     pass
