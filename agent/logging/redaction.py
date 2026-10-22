@@ -17,8 +17,10 @@ import re
 REDACT_PATTERNS: list[re.Pattern] = [
     # OpenAI-style keys: sk-..., sk-or-..., sk-ant-...
     re.compile(r"(sk-(?:or-|ant-)?)[A-Za-z0-9_\-]{8,}"),
-    # GitHub PATs: classic (ghp_, gho_, ghu_, ghs_, ghr_) and fine-grained (gh2_)
-    re.compile(r"(gh[pousr2]_)[A-Za-z0-9]{20,}"),
+    # GitHub PATs: classic (ghp_, gho_, ghu_, ghs_, ghr_) and fine-grained
+    # (github_pat_).  The legacy gh2_ prefix stays in the alternation for
+    # compatibility even though it is not a real GitHub prefix.
+    re.compile(r"(gh[pousr2]_|github_pat_)[A-Za-z0-9_]{20,}"),
     # Authorization header: "Bearer <token>"
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-._~+/]+=*"),
     # Bare Bearer token (no trailing space in the preserved prefix)

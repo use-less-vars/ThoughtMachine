@@ -352,12 +352,16 @@ class TestRedaction:
         )
 
     def test_redact_github_pats(self):
-        for prefix in ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "gh2_"):
+        for prefix in ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "gh2_", "github_pat_"):
             token = prefix + "A" * 40
             assert redact(token) == prefix + "<REDACTED>", prefix
         assert redact("token ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ end") == (
             "token ghp_<REDACTED> end"
         )
+
+    def test_redacts_github_fine_grained_pat(self):
+        token = "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abc"
+        assert redact(token) == "github_pat_<REDACTED>"
 
     def test_redact_bearer_tokens(self):
         assert redact("Authorization: Bearer abcdefghijklmnopqrstuvwxyz.123456") == (
