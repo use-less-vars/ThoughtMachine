@@ -76,3 +76,8 @@ Decide what container mode should do when `core.hooksPath` points at a directory
 - `tools/git_info_tool.py:868-878` — the refuse-if-hooks-configured branch. It is the one place that would make the neutralisation visible; weakening it removes the only signal.
 - `tools/git_info_tool.py:989-996`, `:1049-1052` — the container-mode `core.hooksPath` restriction. Even with no `.githooks` present, this is what prevents a committed/global hook from executing inside the container.
 - `.github/workflows/*` — the real gate; untouched by anything above.
+
+## Update
+
+The deletion of `.githooks/pre-commit` (`85035605`) rested on a false premise — `core.hooksPath` read from a bare shell where it is unset; the container path sets it. Recorded in `personal/bugs_and_fixes.md`.
+
