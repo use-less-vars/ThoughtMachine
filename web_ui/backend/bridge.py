@@ -1222,6 +1222,10 @@ class WebAgentBridge:
         """
         self._forward_worker_event(event)
         data = event.data or {}
+        # The global bus is process-global: only tear down per-worker
+        # subscriptions for a worker belonging to THIS bridge's session.
+        if data.get('session_id') and data['session_id'] != self._session_id:
+            return
         worker_name = data.get('worker_name', '')
         if worker_name:
             self._unsubscribe_worker_bus(
@@ -1235,6 +1239,10 @@ class WebAgentBridge:
         """
         self._forward_worker_event(event)
         data = event.data or {}
+        # The global bus is process-global: only tear down per-worker
+        # subscriptions for a worker belonging to THIS bridge's session.
+        if data.get('session_id') and data['session_id'] != self._session_id:
+            return
         worker_name = data.get('worker_name', '')
         if worker_name:
             self._unsubscribe_worker_bus(
