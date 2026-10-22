@@ -2901,11 +2901,18 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         for sid in open_ids:
                             meta = all_meta.get(sid)
                             if meta:
+                                # ``open_ids`` is GLOBAL (open_sessions.json lists
+                                # sessions from every workspace), so each entry
+                                # MUST carry the workspace it belongs to.  Without
+                                # it the UI cannot bucket the tab and dumps the
+                                # whole list into whichever workspace is on
+                                # screen.
                                 open_sessions.append({
                                     "session_id": meta["session_id"],
                                     "name": meta["name"],
                                     "updated_at": meta["updated_at"],
                                     "message_count": meta["message_count"],
+                                    "workspace_id": meta.get("workspace_id") or "",
                                 })
                         response = {"type": "open_sessions", "sessions": open_sessions}
                         await ws.send_json(response)

@@ -559,26 +559,37 @@ class FileSystemSessionStore(SessionStore):
         workspace-scoped directories (mirroring _find_session_path logic).
 
         Returns a dict mapping session_id -> metadata dict (or None if not found)
-        with metadata keys: session_id, name, updated_at, message_count, preview
+        with metadata keys: session_id, name, updated_at, message_count, preview,
+        session_size_bytes, workspace_id.
+
+        ``workspace_id`` is derived from the directory the session file was
+        found in (``workspaces/<ws>/sessions/``) and is ``None`` for sessions
+        still living in the legacy flat ``sessions_dir``.  Callers that render
+        cross-workspace lists need it: without it they cannot tell which
+        workspace a session belongs to.
         """
         wanted = set(session_ids)
         if not wanted:
             return {}
         results: Dict[str, Optional[Dict[str, Any]]] = {sid: None for sid in session_ids}
 
-        # Build list of candidate directories to scan
+        # Build list of candidate directories to scan, each paired with the
+        # workspace that directory encodes (None for the legacy flat dir).
+        candidates: List[Tuple[Path, Optional[str]]] = []
         if workspace_id:
-            candidates = [self._base_dir / "workspaces" / workspace_id / "sessions"]
+            candidates.append(
+                (self._base_dir / "workspaces" / workspace_id / "sessions", workspace_id)
+            )
         else:
-            candidates = [self.sessions_dir]
+            candidates.append((self.sessions_dir, None))
             workspaces_root = self._base_dir / "workspaces"
             if workspaces_root.exists():
                 for ws_dir in workspaces_root.iterdir():
                     ws_sessions = ws_dir / "sessions"
                     if ws_sessions.is_dir():
-                        candidates.append(ws_sessions)
+                        candidates.append((ws_sessions, ws_dir.name))
 
-        for target_dir in candidates:
+        for target_dir, dir_workspace_id in candidates:
             try:
                 if not target_dir.exists():
                     continue
@@ -604,6 +615,7 @@ class FileSystemSessionStore(SessionStore):
                                 'message_count': message_count,
                                 'preview': self._extract_preview(user_history),
                                 'session_size_bytes': data.get('session_size_bytes'),
+                                'workspace_id': dir_workspace_id,
                             }
                     except Exception:
                         continue
