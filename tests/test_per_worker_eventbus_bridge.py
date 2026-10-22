@@ -159,5 +159,105 @@ def test_bridge_subscribes_to_per_worker_bus_on_spawn():
     print("\n=== TEST COMPLETED SUCCESSFULLY ===")
 
 
+def _bridge_with_worker(session_id, worker_name, received):
+    """Build a bridge bound to *session_id* and drive a real WORKER_SPAWNED
+    publish so it subscribes to that worker's per-worker EventBus."""
+
+    def event_callback(event_dict):
+        received.append(event_dict)
+
+    bridge = WebAgentBridge(event_callback=event_callback)
+    # Manually set session_id since we're not going through start()
+    bridge._session_id = session_id
+
+    worker_bus = EventBus()
+    register_worker_event_bus(session_id, worker_name, worker_bus)
+    global_event_bus.publish(create_event(
+        EventType.WORKER_SPAWNED,
+        data={"session_id": session_id, "worker_name": worker_name},
+        source=f"worker:{worker_name}",
+        session_id=session_id,
+    ))
+    return bridge, worker_bus
+
+
+def _release(bridge, session_id, worker_name):
+    """Detach a test bridge from every bus it subscribed to."""
+    bridge._unsubscribe_worker_events()
+    global_event_bus.unsubscribe(EventType.WORKER_SPAWNED, bridge._on_worker_spawned)
+    global_event_bus.unsubscribe(EventType.WORKER_COMPLETED, bridge._on_worker_completed)
+    global_event_bus.unsubscribe(EventType.WORKER_ERROR, bridge._on_worker_error)
+    unregister_worker_event_bus(session_id, worker_name)
+    bridge.unregister()
+
+
+def test_completed_event_from_foreign_session_preserves_subscriptions():
+    """A WORKER_COMPLETED published by ANOTHER session must not tear down this
+    bridge's per-worker subscriptions.
+
+    ``global_event_bus`` is process-global, so every bridge sees every worker
+    completion.  Two sessions each running a worker labelled ``default`` share
+    nothing but that label; the foreign completion must be ignored here, while
+    the owning bridge still unsubscribes its own worker.
+    """
+    worker_name = 'default'
+    session_a, session_b = 'sess-A', 'sess-B'
+    received_a, received_b = [], []
+
+    bridge_a, bus_a = _bridge_with_worker(session_a, worker_name, received_a)
+    bridge_b, bus_b = _bridge_with_worker(session_b, worker_name, received_b)
+    try:
+        # Precondition: both bridges hold a subscription for worker 'default'.
+        assert worker_name in bridge_a._worker_bus_subs, bridge_a._worker_bus_subs
+        assert worker_name in bridge_b._worker_bus_subs, bridge_b._worker_bus_subs
+        assert bus_a is not bus_b
+
+        # Session A's worker completes -> published on the shared global bus.
+        global_event_bus.publish(create_event(
+            EventType.WORKER_COMPLETED,
+            data={
+                "session_id": session_a,
+                "worker_name": worker_name,
+                "status": "completed",
+            },
+            source=f"worker:{worker_name}",
+            session_id=session_a,
+        ))
+        time.sleep(0.05)
+
+        # The owning bridge MUST drop its own subscription ...
+        assert worker_name not in bridge_a._worker_bus_subs, (
+            "bridge A did not unsubscribe its own completed worker"
+        )
+        # ... and the foreign bridge MUST keep it.
+        assert worker_name in bridge_b._worker_bus_subs, (
+            "a WORKER_COMPLETED from another session unsubscribed this "
+            "bridge's per-worker bus"
+        )
+
+        # Observable consequence: session B still receives its worker's
+        # streaming tool-call events after A's worker finished.
+        received_b.clear()
+        bus_b.publish(create_event(
+            EventType.TOOL_CALL_START,
+            data={
+                "session_id": session_b,
+                "worker_name": worker_name,
+                "tool_name": "Thought",
+                "arguments": "{}",
+            },
+            source=f"worker:{worker_name}",
+            session_id=session_b,
+        ))
+        time.sleep(0.05)
+        assert any(
+            e.get('type') == 'worker:tool_call_start' for e in received_b
+        ), f"bridge B lost the worker's tool_call_start after A completed: {received_b}"
+    finally:
+        _release(bridge_a, session_a, worker_name)
+        _release(bridge_b, session_b, worker_name)
+
+
 if __name__ == '__main__':
     test_bridge_subscribes_to_per_worker_bus_on_spawn()
+    test_completed_event_from_foreign_session_preserves_subscriptions()
