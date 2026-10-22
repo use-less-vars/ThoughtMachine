@@ -15,12 +15,16 @@ drift when those recorded grants differ from the current effective grants:
   (schema_version 4 -> 5, ``permissions`` left UNKNOWN == ``None``), idempotently.
 * ``drift`` gains a ``CLASS_PERMISSION`` axis / ``EVENT_PERMISSION_CHANGED``
   event: the *expected* value is the record's stored ``permissions`` snapshot,
-  the *actual* value is the CURRENT effective six-category grants resolved by
+  the *actual* value is the CURRENT effective eight-grain grants resolved by
   the SSOT (``security.security_gate.resolve_container_config`` provides
-  ``ContainerConfig.effective``).  The axis is quiet when the two are equal, and
-  is compared ONLY when BOTH sides are known: the recorded snapshot is not
-  ``None`` AND the current resolved profile is not the framework-default
-  ("unknown") profile.
+  ``ContainerConfig.effective``).  The axis is quiet when the two agree on
+  every grain the record actually recorded, and is compared ONLY when BOTH
+  sides are known: the recorded snapshot is not ``None`` AND the current
+  resolved profile is not the framework-default ("unknown") profile.
+* The permission axis tolerates a recorded profile that PREDATES a grain:
+  comparison is over ``set(recorded) & set(effective)``, so a grain the record
+  never recorded cannot report drift (and is never read as ``banned``).  See
+  the tolerant-read trio at the end of section 4.
 
 NOTE: the charter for this feature was unavailable when these tests were
 authored; the API names above (``permissions`` field, ``migration.migrate_records``,
@@ -55,7 +59,7 @@ from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 WS = "ws-1"
 
-#: Seven-key effective-permission grants (``security.get_effective_permissions``).
+#: Eight-key effective-permission grants (``security.get_effective_permissions``).
 _PERMISSION_KEYS = (
     "filesystem",
     "network",
@@ -64,6 +68,7 @@ _PERMISSION_KEYS = (
     "mcp",
     "host_bash",
     "ci",
+    "credential",
 )
 
 #: Framework-default profile == "current side UNKNOWN" (what ``permissions={}``
@@ -93,9 +98,10 @@ STORED_PERMS = {
     # against ``config.effective``.
     "host_bash": "banned",
     "ci": "banned",
+    "credential": "use",
 }
 
-#: The same seven keys, later NARROWED (still not the all-default unknown profile).
+#: The same eight keys, later NARROWED (still not the all-default unknown profile).
 CURRENT_PERMS = {
     "filesystem": "read",
     "network": "write",
@@ -104,6 +110,7 @@ CURRENT_PERMS = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "credential": "banned",
 }
 
 
@@ -379,6 +386,119 @@ def test_detect_record_drift_quiet_when_recorded_unknown(permissive_caps):
         record, _live(), permissions=dict(CURRENT_PERMS), capabilities=permissive_caps
     )
     assert findings == []
+
+
+# -- 4b. Tolerant read: a profile that PREDATES a grain -----------------------
+#
+# ``Record.permissions`` is a SNAPSHOT of the permission grains that existed
+# when the record was written.  ``credential`` was added after the seven-grain
+# profile, so a record written before that release stores seven keys against
+# today's eight.  ``drift`` compares the INTERSECTION of the two key sets: an
+# absent key means "this profile predates the grain", NOT "banned", and is
+# never padded from the defaults (padding would fabricate a finding on every
+# legacy record whose current level for that grain is above the assumed one).
+# The three tests below pin the whole contract: quiet on the upgrade, no signal
+# lost on recorded grains, and coverage restored once the record is re-written.
+
+#: The pre-``credential`` shape: what a record written before that grain stores.
+_LEGACY_PERMS = {k: v for k, v in STORED_PERMS.items() if k != "credential"}
+
+
+def test_legacy_profile_quiet_against_effective_that_gained_a_grain(permissive_caps):
+    """(a) The UPGRADE case: a seven-key record reports NO phantom drift.
+
+    Covers both directions of the new grain: an effective level of ``banned``
+    (the default) and an effective level ABOVE it.  The second is the case that
+    padding the absent key would have turned into a permanent, unclearable
+    finding on every legacy record.
+    """
+    assert "credential" not in _LEGACY_PERMS
+
+    # GUARD: the effective profile really does carry the grain the record
+    # lacks, else this test cannot fail for the reason it claims to cover.
+    default_effective = resolve_container_config(
+        dict(_LEGACY_PERMS), permissive_caps, "ephemeral"
+    ).effective
+    assert set(default_effective) - set(_LEGACY_PERMS) == {"credential"}
+
+    # (a1) the new grain resolves to its default on the current side.
+    findings = drift.detect_record_drift(
+        _record(docker_id="d1", permissions=dict(_LEGACY_PERMS)),
+        _live(),
+        permissions=dict(_LEGACY_PERMS),
+        capabilities=permissive_caps,
+    )
+    assert findings == []
+
+    # (a2) the new grain resolves ABOVE its default on the current side: still
+    # quiet, because the record never recorded it (NOT "it was banned").
+    elevated = {**dict(_LEGACY_PERMS), "credential": "use"}
+    elevated_effective = resolve_container_config(
+        elevated, permissive_caps, "ephemeral"
+    ).effective
+    assert elevated_effective["credential"] != default_effective["credential"]
+    findings = drift.detect_record_drift(
+        _record(docker_id="d1", permissions=dict(_LEGACY_PERMS)),
+        _live(),
+        permissions=elevated,
+        capabilities=permissive_caps,
+    )
+    assert findings == []
+
+
+def test_legacy_profile_still_fires_on_a_recorded_grain(permissive_caps):
+    """(b) No signal lost: narrowing a grain the legacy profile DID record fires."""
+    assert "credential" not in _LEGACY_PERMS
+    narrowed = {**dict(_LEGACY_PERMS), "filesystem": "read", "mcp": "banned"}
+
+    findings = drift.detect_record_drift(
+        _record(docker_id="d1", permissions=dict(_LEGACY_PERMS)),
+        _live(),
+        permissions=narrowed,
+        capabilities=permissive_caps,
+    )
+
+    expected_actual = resolve_container_config(
+        narrowed, permissive_caps, "ephemeral"
+    ).effective
+    assert [f.drift_class for f in findings] == [drift.CLASS_PERMISSION]
+    finding = findings[0]
+    assert finding.event_type == drift.EVENT_PERMISSION_CHANGED
+    assert finding.expected == _LEGACY_PERMS
+    assert finding.actual == expected_actual
+
+
+def test_rewritten_record_restores_coverage_of_the_new_grain(permissive_caps):
+    """(c) The blind spot SELF-HEALS: after a re-write, the new grain fires.
+
+    This is the test that stops the tolerant read from becoming a silent
+    coverage hole: once the record is re-written with the current full profile
+    (as the create/update paths do), narrowing the new grain IS reported.
+    """
+    rewritten = dict(STORED_PERMS)
+    assert set(rewritten) == set(_PERMISSION_KEYS)
+    assert "credential" in rewritten
+
+    narrowed = {**rewritten, "credential": "banned"}
+    expected_actual = resolve_container_config(
+        narrowed, permissive_caps, "ephemeral"
+    ).effective
+    # GUARD: ONLY the new grain differs, so the finding can come from it alone.
+    assert {k for k in rewritten if rewritten[k] != expected_actual[k]} == {
+        "credential"
+    }
+
+    findings = drift.detect_record_drift(
+        _record(docker_id="d1", permissions=dict(rewritten)),
+        _live(),
+        permissions=narrowed,
+        capabilities=permissive_caps,
+    )
+
+    assert [f.drift_class for f in findings] == [drift.CLASS_PERMISSION]
+    assert findings[0].event_type == drift.EVENT_PERMISSION_CHANGED
+    assert findings[0].expected == rewritten
+    assert findings[0].actual == expected_actual
 
 
 # -- 6. End-to-end scan emits the permission-drift event ----------------------

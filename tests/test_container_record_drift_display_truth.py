@@ -19,6 +19,14 @@ from thoughtmachine.container_record.snapshot import snapshot_from_attrs
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 #: A grant wide enough to resolve to "bridge" / "rw" (needs permissive caps).
+#:
+#: Deliberately the SEVEN-grain shape a record written before the ``credential``
+#: grain stores: the permission axis compares only the grains a record actually
+#: recorded (see ``drift._permission_drift_finding``), which is exactly why the
+#: honoured-record case below is quiet against today's eight-key effective
+#: profile.  Leaving it at seven keys keeps this file on the legacy path; the
+#: full eight-key / re-write path is pinned in
+#: ``tests/test_container_record_permission_drift.py``.
 WIDE_PERMS = {
     "filesystem": "write",
     "network": "write",

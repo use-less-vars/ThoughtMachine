@@ -257,9 +257,41 @@ def _permission_drift_finding(record: Any, config: Any) -> DriftFinding | None:
 
     Silent (``None``) when the record carries no recorded grant (``None``), the
     effective grant is unknown/non-mapping/empty, the effective grant equals
-    the framework default, or the effective grant is unchanged.  ``expected``
-    is the grant recorded on the record; ``actual`` is the currently effective
-    grant.
+    the framework default, or the two agree on every key the record recorded.
+    ``expected`` is the grant recorded on the record; ``actual`` is the
+    currently effective grant.
+
+    Tolerant read -- why this is an INTERSECTION and not a whole-dict ``==``
+    -----------------------------------------------------------------------
+    ``Record.permissions`` is a SNAPSHOT of the permission grains that existed
+    when the record was written.  When the framework later GAINS a grain, every
+    record written before that release carries a profile with FEWER keys than
+    ``resolve_container_config(...).effective`` now yields (``credential`` was
+    added after ``ci``, so pre-``credential`` records hold seven keys against
+    today's eight).  Comparing the two mappings whole reported
+    ``drift.permission_changed`` on every such record forever -- an alarm that
+    cannot be cleared, because the stored profile only changes when the record
+    is re-written.
+
+    So only keys present on BOTH sides are compared
+    (``set(recorded) & set(effective)``): drift is reported for a difference on
+    a grain the record actually recorded, and nothing else.  An ABSENT key
+    means "this profile predates the grain" -- it is NOT read as ``banned`` and
+    is deliberately NOT padded from the defaults: padding would FABRICATE a
+    finding on every legacy record whose current level for that grain sits
+    above the assumed level, which is the very spurious alarm this read exists
+    to remove.  ``expected``/``actual`` still carry the two mappings verbatim,
+    so the finding payload is unchanged.
+
+    Known, deliberately bounded blind spot: a grain the record predates cannot
+    report drift until the record is re-written.  It self-heals -- every
+    create/update path persists the CURRENT full effective profile
+    (``record_permissions`` returns the record's stored profile; the create path
+    writes ``resolve_container_config(...).effective``), so the next container
+    start or any re-save stores all canonical keys and coverage of the new
+    grain resumes from that write onward.  Contract pinned by
+    ``tests/test_container_record_permission_drift.py``'s legacy-profile live /
+    legacy-profile-narrowed / self-heal-after-rewrite trio.
     """
     recorded = getattr(record, "permissions", None)
     if recorded is None or not isinstance(recorded, dict):
@@ -269,8 +301,10 @@ def _permission_drift_finding(record: Any, config: Any) -> DriftFinding | None:
         not isinstance(effective, dict)
         or not effective
         or effective == _FRAMEWORK_DEFAULT_PERMISSIONS
-        or effective == recorded
     ):
+        return None
+    # INTERSECTION comparison: only a grain the record recorded can drift.
+    if all(recorded[key] == effective[key] for key in set(recorded) & set(effective)):
         return None
     return _make_finding(
         CLASS_PERMISSION, EVENT_PERMISSION_CHANGED, recorded, effective
