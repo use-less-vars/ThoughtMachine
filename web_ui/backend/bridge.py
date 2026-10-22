@@ -67,6 +67,7 @@ import os
 import re
 import threading
 import queue
+import time
 import traceback
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -468,8 +469,18 @@ class WebAgentBridge:
         self._worker_partial_result_sub = None
         self._worker_token_warning_sub = None
         self._worker_message_sub = None
-        # Per-worker EventBus subscriptions (worker_name -> {event_type: sub_handle})
-        self._worker_bus_subs: Dict[str, Dict[Any, Any]] = {}
+        # Per-worker EventBus subscriptions, keyed by instance label:
+        #   worker_label -> {
+        #       'bus': <the EventBus object the handlers were registered on>,
+        #       'session_id': <session id used at subscribe time>,
+        #       'instance_id': <int>,
+        #       'subs': {event_type: (event_type, handler_fn)},
+        #   }
+        # The bus object is stored so unsubscription always targets the bus the
+        # handlers actually live on — the registry may already hold a NEW bus
+        # after a worker respawn, and unsubscribing from that one would silently
+        # no-op while leaving the bridge bound to the dead bus.
+        self._worker_bus_subs: Dict[str, Dict[str, Any]] = {}
         # Track last context_length sent per worker for context_updated dedup
         self._last_context_updated: Dict[str, str] = {}
         self._subscribe_to_security_events()
@@ -634,6 +645,51 @@ class WebAgentBridge:
         if self._session_id:
             self._discover_existing_workers(self._session_id)
 
+    # Bounded retry for resolving a worker's per-worker EventBus right after
+    # WORKER_SPAWNED.  Deliberately bounded (5 x 250 ms ~= 1.25 s worst case):
+    # this runs on the event-bus publishing thread and must never block it
+    # indefinitely when a worker's bus genuinely never appears.
+    _WORKER_BUS_RESOLVE_ATTEMPTS = 5
+    _WORKER_BUS_RESOLVE_DELAY = 0.25
+
+    @staticmethod
+    def _stored_entry_is_stale(entry: Any, current_bus: Any) -> bool:
+        """True only when *current_bus* is a different bus than the stored one.
+
+        A missing/undeterminable *current_bus* (``None``) counts as "not stale"
+        so a live subscription is never torn down on a mere lookup miss.
+        """
+        if current_bus is None:
+            return False
+        if not isinstance(entry, dict) or 'bus' not in entry:
+            return False
+        return entry.get('bus') is not current_bus
+
+    def _worker_bus_is_stale(self, worker_label: str) -> bool:
+        """True when the registry now holds a *different* bus for this worker.
+
+        Only a positive mismatch (the registry has a bus object that is not the
+        one we subscribed on) counts as stale; if the registry has no bus at all
+        we cannot tell, so the existing subscription is kept as-is.
+        """
+        entry = self._worker_bus_subs.get(worker_label)
+        if not isinstance(entry, dict) or 'bus' not in entry:
+            return False
+        if not (WORKER_BUS_AVAILABLE and get_worker_event_bus is not None):
+            return False
+        base_name, _ = _worker_instance_parts(worker_label)
+        if not base_name:
+            return False
+        session_id = entry.get('session_id') or self._session_id or ''
+        instance_id = entry.get('instance_id') or 1
+        try:
+            current_bus = get_worker_event_bus(
+                session_id, base_name, instance_id=instance_id
+            )
+        except Exception:
+            return False
+        return self._stored_entry_is_stale(entry, current_bus)
+
     def _discover_existing_workers(self, session_id: str) -> None:
         """Discover and subscribe to per-worker EventBuses for already-running workers.
 
@@ -647,13 +703,25 @@ class WebAgentBridge:
             from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
             buses = _WorkerRegistry.get_instance().get_event_buses_for_session(session_id)
             for worker_label, bus in buses.items():
-                if worker_label in self._worker_bus_subs:
-                    log('DEBUG', 'pipeline.bridge',
-                        f"[DISCOVERY] Already subscribed to {worker_label}, skipping")
-                    continue
+                stored_entry = self._worker_bus_subs.get(worker_label)
+                if stored_entry is not None:
+                    if not self._stored_entry_is_stale(stored_entry, bus):
+                        log('DEBUG', 'pipeline.bridge',
+                            f"[DISCOVERY] Already subscribed to {worker_label}, skipping")
+                        continue
+                    # The registry now holds a different bus for this worker
+                    # (respawn) — detach from the dead bus before re-binding.
+                    log('INFO', 'server.bridge',
+                        f"[DISCOVERY] Per-worker bus for {worker_label} was replaced "
+                        f"\u2014 re-binding to the current bus")
+                    self._unsubscribe_worker_bus(worker_label)
                 log('INFO', 'server.bridge',
                     f"[DISCOVERY] Found existing worker: {worker_label} \u2014 subscribing to per-worker bus")
-                self._subscribe_to_worker_bus(worker_label, bus)
+                self._subscribe_to_worker_bus(
+                    worker_label, bus,
+                    session_id=session_id,
+                    instance_id=_worker_instance_parts(worker_label)[1],
+                )
         except ImportError:
             log('DEBUG', 'server.bridge',
                 "[DISCOVERY] get_worker_event_buses_for_session not available")
@@ -770,6 +838,16 @@ class WebAgentBridge:
                 f"_on_worker_spawned: SKIPPING (session mismatch)")
             return
 
+        # A respawned worker gets a brand-new per-worker EventBus, while our
+        # stored subscriptions still live on the dead one.  Detect that and
+        # detach (from the stored bus, never the registry's new one) before the
+        # duplicate-subscription guard below, so we re-bind to the current bus.
+        if self._worker_bus_is_stale(worker_label):
+            log('INFO', 'server.bridge',
+                f"_on_worker_spawned: per-worker bus for {worker_label} was replaced "
+                f"— re-binding to the current bus")
+            self._unsubscribe_worker_bus(worker_label)
+
         # Guard against duplicate subscriptions — if already subscribed for this
         # worker, skip re-subscribing to avoid duplicate events on the frontend.
         if worker_label in self._worker_bus_subs:
@@ -781,12 +859,17 @@ class WebAgentBridge:
             # This must happen regardless of _event_callbacks to avoid
             # a race where the event arrives before any WebSocket client connects.
             if worker_name and WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
-                worker_bus = get_worker_event_bus(session_id, worker_name, instance_id=instance_id)
+                worker_bus = self._resolve_worker_bus_with_retry(
+                    session_id, worker_name, instance_id
+                )
                 if worker_bus is not None:
                     log('DEBUG', 'pipeline.bridge',
                         f"_on_worker_spawned: found per-worker bus for {worker_label}, "
                         f"subscribing to detailed events")
-                    self._subscribe_to_worker_bus(worker_label, worker_bus)
+                    self._subscribe_to_worker_bus(
+                        worker_label, worker_bus,
+                        session_id=session_id, instance_id=instance_id,
+                    )
                 else:
                     log('WARNING', 'server.bridge',
                         f'Per-worker EventBus for {worker_name} (session={session_id}) not found '
@@ -798,6 +881,11 @@ class WebAgentBridge:
                         f"_on_worker_spawned: worker_bus is None for {worker_name} "
                         f"(session_id={session_id!r}). Check that register_worker_event_bus() "
                         f"was called BEFORE the WORKER_SPAWNED event was published.")
+                    # Degrade visibly: one notification so the panel is not
+                    # silently missing this worker's tool calls.
+                    self._notify_worker_events_unavailable(
+                        worker_name, instance_id, worker_label, session_id
+                    )
 
         # Build the event dict and buffer it BEFORE the no-callback drop gate so
         # a worker spawned during the F5 reconnect gap is replayed on next connect.
@@ -823,12 +911,18 @@ class WebAgentBridge:
                 log('ERROR', 'server.bridge',
                     f'Failed to forward worker event: {exc}')
 
-    def _subscribe_to_worker_bus(self, worker_label: str, worker_bus: Any) -> None:
+    def _subscribe_to_worker_bus(self, worker_label: str, worker_bus: Any,
+                                session_id: Optional[str] = None,
+                                instance_id: Optional[int] = None) -> None:
         """
         Subscribe to a worker instance's per-worker EventBus for detailed
         real-time events (tool_call, tool_result, token_warning, worker_message,
         etc.).  *worker_label* is the instance label (``<name>`` or ``<name>#<N>``)
         that this bridge uses to key per-worker subscriptions.
+
+        The bus object, the session id and the instance id are stored alongside
+        the subscriptions so ``_unsubscribe_worker_bus`` can detach from exactly
+        the bus it subscribed on (see ``_worker_bus_subs``).
         """
         if not EVENT_SYSTEM_AVAILABLE or EventType is None:
             log('DEBUG', 'pipeline.bridge',
@@ -986,7 +1080,16 @@ class WebAgentBridge:
                 log('DEBUG', 'server.bridge',
                     f'Could not subscribe to {evt_type} for {worker_label}: {exc}')
 
-        self._worker_bus_subs[worker_label] = subs
+        if session_id is None:
+            session_id = self._session_id or ''
+        if instance_id is None:
+            instance_id = _worker_instance_parts(worker_label)[1]
+        self._worker_bus_subs[worker_label] = {
+            'bus': worker_bus,
+            'session_id': session_id,
+            'instance_id': instance_id,
+            'subs': subs,
+        }
         log('INFO', 'server.bridge',
             f'Subscribed to per-worker bus for {worker_label} ({len(subs)} event types)')
         log('DEBUG', 'pipeline.bridge',
@@ -1005,24 +1108,112 @@ class WebAgentBridge:
         *worker_label* is the instance label (``<name>`` or ``<name>#<N>``) that
         ``_subscribe_to_worker_bus`` keyed the subscriptions under.
         """
-        subs = self._worker_bus_subs.pop(worker_label, {})
+        entry = self._worker_bus_subs.pop(worker_label, None)
         # Clean up context_updated dedup tracking
         self._last_context_updated.pop(worker_label, None)
+        if not entry:
+            return
+        # Tolerate the legacy value shape (a plain {event_type: (event_type, cb)}
+        # dict) for bridges that keyed subscriptions before the entry format.
+        if isinstance(entry, dict) and 'subs' in entry:
+            worker_bus = entry.get('bus')
+            subs = entry.get('subs') or {}
+        else:
+            worker_bus = None
+            subs = entry
         if not subs:
             return
-        base_name, instance_id = _worker_instance_parts(worker_label)
-        for evt_type_key, (stored_evt_type, callback_fn) in subs.items():
-            try:
-                if WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
+        if worker_bus is None:
+            # Legacy entry without a stored bus: best-effort registry lookup.
+            base_name, instance_id = _worker_instance_parts(worker_label)
+            if WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
+                try:
                     worker_bus = get_worker_event_bus(
                         self._session_id or '', base_name, instance_id=instance_id
                     )
-                    if worker_bus is not None and hasattr(worker_bus, 'unsubscribe'):
-                        worker_bus.unsubscribe(stored_evt_type, callback_fn)
+                except Exception:
+                    worker_bus = None
+        for evt_type_key, (stored_evt_type, callback_fn) in subs.items():
+            try:
+                if worker_bus is not None and hasattr(worker_bus, 'unsubscribe'):
+                    worker_bus.unsubscribe(stored_evt_type, callback_fn)
             except Exception:
                 pass
         log('INFO', 'server.bridge',
             f'Unsubscribed from per-worker bus for {worker_label}')
+
+    def _resolve_worker_bus_with_retry(
+        self, session_id: str, worker_name: str, instance_id: int
+    ) -> Any:
+        """Resolve a worker's per-worker EventBus, retrying a bounded number of times.
+
+        The bus is normally registered *before* WORKER_SPAWNED is published, but
+        on a fast respawn there is a window where the registry entry is still
+        missing.  A single lookup would then leave the worker's detailed events
+        dropped for its whole lifetime, so retry — but strictly bounded
+        (``_WORKER_BUS_RESOLVE_ATTEMPTS`` x ``_WORKER_BUS_RESOLVE_DELAY``, ~1.25 s)
+        because this runs on the event-bus publishing thread and must never block
+        it indefinitely.
+        """
+        for attempt in range(1, self._WORKER_BUS_RESOLVE_ATTEMPTS + 1):
+            try:
+                worker_bus = get_worker_event_bus(
+                    session_id, worker_name, instance_id=instance_id
+                )
+            except Exception as exc:
+                worker_bus = None
+                log('DEBUG', 'pipeline.bridge',
+                    f"_resolve_worker_bus_with_retry: lookup raised for "
+                    f"{worker_name}: {exc}")
+            if worker_bus is not None:
+                if attempt > 1:
+                    log('INFO', 'server.bridge',
+                        f"_resolve_worker_bus_with_retry: per-worker bus for "
+                        f"{_worker_instance_label(worker_name, instance_id)} appeared on "
+                        f"attempt {attempt}/{self._WORKER_BUS_RESOLVE_ATTEMPTS}")
+                return worker_bus
+            if attempt < self._WORKER_BUS_RESOLVE_ATTEMPTS:
+                time.sleep(self._WORKER_BUS_RESOLVE_DELAY)
+        return None
+
+    def _notify_worker_events_unavailable(
+        self, worker_name: str, instance_id: int, worker_label: str, session_id: str
+    ) -> None:
+        """Tell the frontend once that a worker's detailed events are not forwarded.
+
+        Reuses the existing ``worker:system_notification`` envelope (no new event
+        type, no new field) so the worker panel renders the degradation instead of
+        silently missing that worker's tool calls.
+        """
+        event_dict = {
+            'type': 'worker:system_notification',
+            'worker_name': worker_name,
+            'instance_id': instance_id,
+            'instance_label': worker_label,
+            'session_id': session_id,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'response': {
+                'type': 'system_notification',
+                'message': (
+                    f"Detailed events for worker '{worker_label}' are unavailable: "
+                    f"its per-worker event bus could not be found. Tool calls, tool "
+                    f"results and messages from this worker are not shown."
+                ),
+            },
+        }
+        self._buffer_worker_event(event_dict)
+        if not self._forwarder._callbacks:
+            log('DEBUG', 'pipeline.bridge',
+                f"_notify_worker_events_unavailable: no event_callbacks, buffered "
+                f"notification for {worker_label}")
+            return
+        for cb in list(self._forwarder._callbacks.values()):
+            try:
+                cb(event_dict)
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f'Failed to forward worker bus-missing notification: {exc}')
+                continue
 
     def _on_worker_completed(self, event: WorkerCompletedEvent) -> None:
         """
