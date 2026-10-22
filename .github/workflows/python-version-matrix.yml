@@ -42,9 +42,92 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
+    # ── Docker Hub rate limiting (anonymous pulls) ─────────────────────────
+    # Docker Hub limits ANONYMOUS pulls to 100 per 6 hours per source IP.
+    # GitHub-hosted runners share their egress IP with other jobs (and other
+    # customers), so a bare `docker pull` can fail with
+    # `toomanyrequests: You have reached your unauthenticated pull rate limit`
+    # through no fault of this repo. Authenticating the daemon against a
+    # Docker Hub account raises that ceiling; the DOCKERHUB_USERNAME guard
+    # below makes the login step a NO-OP until the secrets exist, so this
+    # workflow stays green before the account is wired up and simply falls
+    # back to the old anonymous behaviour.
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      # Images this job's tests pull from Docker Hub. ONE place to edit when a
+      # test starts using a new image. Provenance:
+      #   alpine:3.19      tests/docker/test_reuse_isolation.py:98 (default IMAGE)
+      #   alpine:latest    tests/docker/test_restart_policy_live.py:57 (_IMAGE)
+      #   python:3.11-slim build base of tests/docker/test_persistence.py:75 and
+      #                    tests/docker/test_container_lifecycle.py:85
+      # Deliberately NOT listed: agent-executor / tm-workspace-runtime /
+      # tm-resource-git (built locally), python:3.12(-slim) (only ever written
+      # into a Dockerfile string with a faked client), and alpine:3.19 in
+      # tests/test_worker_sync_query_timeout_containment.py (behind the
+      # WORKER_LIVE_DOCKER gate, so it never pulls in CI).
+      TM_DOCKER_IMAGES: "alpine:3.19 alpine:latest python:3.11-slim"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The directory must exist before actions/cache validates the path, but
+      # the tarball itself must NOT exist yet -- creating it here would make
+      # every run restore a cache hit over an empty/partial archive.
+      - name: Ensure image-cache directory exists
+        run: mkdir -p "$HOME/.cache"
+
+      # A real image cache means caching the IMAGES, not a directory that
+      # Docker happens to fill: `docker pull` writes to /var/lib/docker (root
+      # owned, not restorable on a hosted runner), so caching a custom path
+      # would cache nothing. Instead the warm step below saves every needed
+      # image into ONE tarball and this action caches that tarball. The key
+      # tracks the docker tests (hashFiles) with a restore-keys prefix so an
+      # edited test file still gets the previous run's images as a fallback
+      # and only pulls the delta.
+      - name: Restore cached Docker images
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tm-docker-images.tar
+          key: tm-docker-images-${{ runner.os }}-${{ hashFiles('tests/docker/**') }}
+          restore-keys: |
+            tm-docker-images-${{ runner.os }}-
+
+      # Guarded so it is a no-op today: with no DOCKERHUB_USERNAME secret the
+      # step is skipped and pulls stay anonymous (old behaviour).
+      - name: Log in to Docker Hub (authenticated pulls)
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Load the cached tarball (if any), then pull ONLY what is still
+      # missing. The pull is deliberately NOT `|| true`: if the account is
+      # still rate-limited we want the real daemon error in the log, not a
+      # silent skip that resurfaces as a confusing test failure later.
+      - name: Warm Docker images (load cache, pull what is missing)
+        run: |
+          set -euo pipefail
+          TAR="$HOME/.cache/tm-docker-images.tar"
+          if [ -f "$TAR" ]; then
+            echo "restored cache: $TAR ($(du -h "$TAR" | cut -f1))"
+            docker load -i "$TAR"
+          else
+            echo "no cached tarball: every image below will be pulled"
+          fi
+          for img in $TM_DOCKER_IMAGES; do
+            if docker image inspect "$img" >/dev/null 2>&1; then
+              echo "already present: $img"
+            else
+              echo "pulling: $img"
+              docker pull "$img"
+            fi
+          done
+          if [ ! -f "$TAR" ]; then
+            echo "saving $(echo $TM_DOCKER_IMAGES | wc -w) image(s) to $TAR for the next run"
+            docker save -o "$TAR" $TM_DOCKER_IMAGES
+            ls -lh "$TAR"
+          fi
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
