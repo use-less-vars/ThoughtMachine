@@ -236,6 +236,23 @@
           "risk_level": "low",
           "ui_category": "host",
           "required_workspace_switch": "allow_host_resources"
+        },
+        {
+          "name": "credential",
+          "display_name": "Credential",
+          "description": "Stored credentials: list names (read) and inject values (use).",
+          "permission_grain_set": [
+            "banned",
+            "read",
+            "use"
+          ],
+          "execution_mode": "host",
+          "container_image": null,
+          "dockerfile_reference": null,
+          "tools": [],
+          "risk_level": "high",
+          "ui_category": "integrations",
+          "required_workspace_switch": null
         }
       ],
       "root_type": "list",

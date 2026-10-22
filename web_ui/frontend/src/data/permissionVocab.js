@@ -17,6 +17,7 @@ export const SESSION_RESOURCE_VOCAB = {
   network: ['banned', 'ask', 'write', 'outbound'],
   mcp: ['banned', 'connect', 'full'],
   host_bash: ['banned', 'ask', 'allow'],
+  credential: ['banned', 'read', 'use'],
 };
 
 export const PERMISSION_RANK_ORDER = {
@@ -29,6 +30,8 @@ export const PERMISSION_RANK_ORDER = {
   write: 3,
   // Same write tier as the security-gate rank — not a separate level.
   write_on_feature_branch: 3,
+  // credential value-injection grant: same tier as write.
+  use: 3,
   full: 4,
 };
 

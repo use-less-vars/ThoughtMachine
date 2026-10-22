@@ -94,6 +94,10 @@ class EventType(enum.Enum):
     # Container lifecycle events (routed to the tenant event log)
     CONTAINER_REMOVED = 'container_removed'
     CONTAINER_LIFECYCLE = 'container_lifecycle'
+    # Credential events (audit trail: credential names only, never values)
+    CREDENTIAL_USE = 'credential_use'
+    CREDENTIAL_ROTATED = 'credential_rotated'
+    CREDENTIAL_DELETED = 'credential_deleted'
 
 
 class EventMetadata(BaseModel):

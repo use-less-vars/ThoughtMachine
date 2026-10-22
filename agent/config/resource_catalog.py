@@ -74,6 +74,7 @@ _RESIDUAL_DEFAULT_PERMISSIONS: Dict[str, Any] = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "credential": "banned",
 }
 
 #: R13 step 6: the former ``_RESIDUAL_RESOURCES`` block (R2) is RETIRED.

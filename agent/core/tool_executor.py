@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Try to import event system for security prompts
 try:
-    from agent.events import global_event_bus
+    from agent.events import create_event, global_event_bus, EventType
     _EVENT_SYSTEM_AVAILABLE = True
 except ImportError:
     _EVENT_SYSTEM_AVAILABLE = False
@@ -605,8 +605,10 @@ class ToolExecutor:
 
             # Credential injection: resolve {{credential:...}} placeholders in tool args
             if tool_args:
+                credential_names: List[str] = []
                 try:
                     from agent.credentials import CredentialInjector
+                    from agent.credentials.injector import _PLACEHOLDER_RE
                     # Get workspace_id from the session context already available
                     ws_id = None
                     if 'session_permissions' in tool_args and isinstance(tool_args['session_permissions'], dict):
@@ -614,11 +616,42 @@ class ToolExecutor:
                     if not ws_id and 'workspace_id' in tool_args:
                         ws_id = tool_args['workspace_id']
                     if ws_id:
+                        # Collect the credential NAMES before injection: inject()
+                        # replaces every placeholder with its secret value, so
+                        # the names are unrecoverable afterwards.
+                        for value in tool_args.values():
+                            if isinstance(value, str):
+                                match = _PLACEHOLDER_RE.fullmatch(value)
+                                if match:
+                                    credential_names.append(match.group(1))
                         injector = CredentialInjector(ws_id)
                         tool_args = injector.inject(tool_args)
                 except Exception as exc:
                     log('ERROR', 'core.credentials', "Credential injection failed for tool '%s': %s", tool_name, exc)
                     return {'result': f"Credential injection failed: {exc}", 'tool_type': 'normal'}
+
+                # Audit trail: one CREDENTIAL_USE event per injected credential
+                # name.  Names only -- values are never placed on the bus.
+                if _EVENT_SYSTEM_AVAILABLE:
+                    for credential_name in dict.fromkeys(credential_names):
+                        try:
+                            event_bus = self._event_bus or global_event_bus
+                            if event_bus is None:
+                                continue
+                            event_bus.publish(
+                                create_event(
+                                    EventType.CREDENTIAL_USE,
+                                    {
+                                        'credential_name': credential_name,
+                                        'tool_name': tool_name,
+                                        'session_id': session_id,
+                                    },
+                                    source='tool_executor',
+                                    session_id=session_id or None,
+                                )
+                            )
+                        except Exception as exc:
+                            log('ERROR', 'core.credentials', "Credential audit event failed for tool '%s': %s", tool_name, exc)
 
             try:
                 tool_instance = tool_class(**tool_args)
