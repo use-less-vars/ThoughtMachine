@@ -6,6 +6,18 @@
 **Method:** anchor docs read in full; index entries skimmed (head/anchors) unless marked FULL.
 
 ---
+<!--
+READER'S GUIDE — which sections are load-bearing (added Gen 38, 2026-10-11)
+- §0 (Index) + §0b (Documentation sweep) — the file listing. Orientation.
+- §2 (Container subsystem deep dive) — origin of the container defects.
+- §3 (Duplication survey) — the "one fact, N sites" evidence base.
+- §4 (God objects) — growth risks.
+- §8 (Risk register) — the R-rows. THE load-bearing table.
+- §9 (Migration plan) — the sequence.
+- §10 (Open questions) — what the audit could not resolve.
+- §1, §5, §6, §7 — background; read on question.
+- §11 (Audit metadata) — provenance.
+-->
 
 ## Table of contents
 
