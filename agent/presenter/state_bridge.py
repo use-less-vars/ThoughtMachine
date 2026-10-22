@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 from agent.logging import log
+from thoughtmachine.vault import vault_root
 from agent.config import AgentConfig, load_default_config, load_factory_config, load_config, save_config
 from agent.config.loader import _compute_config_diff
 from agent.config import loader as config_loader
@@ -24,7 +25,7 @@ class StateBridge:
     """Bridge between configuration, session state, and token tracking."""
 
     def __init__(self, config_path: Optional[str]=None):
-        self.config_path = config_path or str(Path.home() / '.thoughtmachine' / 'agent_config.json')
+        self.config_path = config_path or str(vault_root() / 'agent_config.json')
         # Start with factory defaults, not model defaults — ensures the
         # initial state matches exactly what load_factory_config() returns,
         # so that save_config() computes a clean diff against factory.

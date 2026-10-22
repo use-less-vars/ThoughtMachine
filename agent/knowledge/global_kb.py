@@ -21,11 +21,13 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+from thoughtmachine.vault import vault_root
+
 logger = logging.getLogger(__name__)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-GLOBAL_KB_DIR = Path.home() / ".thoughtmachine" / "global"
+GLOBAL_KB_DIR = vault_root() / "global"
 SYSTEM_DIR = GLOBAL_KB_DIR / "system"
 USER_DIR = GLOBAL_KB_DIR / "user"
 

@@ -41,6 +41,13 @@ class WorkspaceRegistryUnavailable(RuntimeError):
     """
 
 
+#: Workspace ids the vault claims for its own namespaces.  ``global`` is the
+#: vault-wide scope (``<vault_root>/credentials/global/``,
+#: ``<vault_root>/global/``): a workspace with that id would resolve the global
+#: store as if it were its own scope.  Same shape as ``HEAD`` in git.
+RESERVED_WORKSPACE_IDS: frozenset = frozenset({"global"})
+
+
 def generate_human_id() -> str:
     """Generate a short, human-readable workspace ID using random words + digits.
 
@@ -305,9 +312,18 @@ class WorkspaceRegistry:
     ) -> WorkspaceRegistryEntry:
         """Register a new workspace.
 
-        Raises ``ValueError`` if *workspace_id* already exists.
+        Raises ``ValueError`` if *workspace_id* is reserved by the vault or
+        already exists.
         """
         with self._lock:
+            if workspace_id in RESERVED_WORKSPACE_IDS:
+                raise ValueError(
+                    f"Workspace id {workspace_id!r} is reserved: the vault already "
+                    f"uses 'global' for its vault-wide scope "
+                    f"(credentials/global, global/), so a workspace with that id "
+                    f"would read the global store as if it were its own."
+                )
+
             raw = self._load()
             if workspace_id in raw:
                 raise ValueError(
