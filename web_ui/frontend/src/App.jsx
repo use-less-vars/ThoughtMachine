@@ -428,19 +428,48 @@ export default function App() {
           const sessions = Array.isArray(msg.sessions) ? msg.sessions : []
           const openIds = new Set(sessions.map(s => s.session_id))
           let changed = false
-          sessions.forEach(s => {
-            // open_sessions carries no workspace_id — fall back to the mapping
-            // learned from sessions_list / session_loaded / previous events.
-            const knownWs = useStore.getState().sessions.find(x => x.session_id === s.session_id)?.workspace_id
-            const ws = s.workspace_id || knownWs || sessionWorkspacesRef.current[s.session_id] || lastKnownWorkspaceRef.current || currentWsRef.current
-            if (!ws) return
-            if (s.workspace_id || knownWs) {
-              if (sessionWorkspacesRef.current[s.session_id] !== ws) {
-                sessionWorkspacesRef.current[s.session_id] = ws
-                changed = true
+          let removedStrayTabs = false
+          // Candidate strips for the repair pass below: everything currently in
+          // memory plus every strip persisted in localStorage (hydrated on
+          // demand so a strip we have never visited can still be cleaned).
+          const stripWs = (() => {
+            const keys = new Set(Object.keys(useSessionTabsStore.getState().byWorkspace))
+            try {
+              for (let i = 0; i < localStorage.length; i += 1) {
+                const k = localStorage.key(i)
+                if (k && k.startsWith(TABS_PREFIX)) keys.add(k.slice(TABS_PREFIX.length))
               }
-              lastKnownWorkspaceRef.current = ws
+            } catch { /* ignore */ }
+            keys.forEach(w => { if (w) useSessionTabsStore.getState().hydrate(w) })
+            return [...keys]
+          })()
+          sessions.forEach(s => {
+            // ``open_sessions`` is GLOBAL — it lists every open session from
+            // EVERY workspace. Resolve the owning workspace from authoritative
+            // sources only: the workspace_id the server sends, the
+            // sessions_list mapping held in the store, or the mapping learned
+            // from earlier session events.
+            const knownWs = useStore.getState().sessions.find(x => x.session_id === s.session_id)?.workspace_id
+            const ws = s.workspace_id || knownWs || sessionWorkspacesRef.current[s.session_id]
+            // FAIL CLOSED. Guessing "whatever workspace is on screen" (the old
+            // lastKnownWorkspaceRef || currentWsRef tail) is exactly what piled
+            // every workspace's open sessions into a single strip.
+            if (!ws) return
+            if (sessionWorkspacesRef.current[s.session_id] !== ws) {
+              sessionWorkspacesRef.current[s.session_id] = ws
+              changed = true
             }
+            // Repair: a session belongs to exactly one workspace, so drop any
+            // tab for it that an earlier (guessing) build filed under another
+            // strip — including strips restored from localStorage.
+            stripWs.forEach(other => {
+              if (other === ws) return
+              const stray = useSessionTabsStore.getState().byWorkspace[other]
+              if (stray?.tabs.some(t => t.sessionId === s.session_id)) {
+                useSessionTabsStore.getState().closeTab(other, s.session_id)
+                removedStrayTabs = true
+              }
+            })
             const st = useSessionTabsStore.getState()
             const entry = st.byWorkspace[ws]
             if (!entry?.tabs.some(t => t.sessionId === s.session_id)) {
@@ -474,7 +503,7 @@ export default function App() {
               }
             }
           }
-          if (changed) setWorkspaceKnownTick(t => t + 1)
+          if (changed || removedStrayTabs) setWorkspaceKnownTick(t => t + 1)
         }
         break
       case 'session_loaded':
