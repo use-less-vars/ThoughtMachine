@@ -78,7 +78,10 @@ def stub_registry(monkeypatch):
 def test_non_paginating_tool_is_wrapped_without_extra_forbidden(stub_registry):
     stub_registry(_NonPaginatingStub)
 
-    result = PaginateTool(target_tool_name="_NonPaginatingStub").execute()
+    result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
+        target_tool_name="_NonPaginatingStub",
+    ).execute()
 
     assert result == "stub-ok"
     assert "extra_forbidden" not in result
@@ -92,6 +95,7 @@ def test_paginating_tool_receives_page_and_per_page(stub_registry):
     stub_registry(_PaginatingStub)
 
     result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="_PaginatingStub", page=2, per_page=5
     ).execute()
 
@@ -132,6 +136,7 @@ def test_tool_params_still_reach_the_wrapped_tool(stub_registry):
     stub_registry(_PaginatingStub)
 
     PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="_PaginatingStub",
         tool_params={"page": 9, "per_page": 9},
         page=3,
@@ -146,7 +151,10 @@ def test_tool_params_still_reach_the_wrapped_tool(stub_registry):
 def test_unknown_tool_is_reported(stub_registry):
     stub_registry(_NonPaginatingStub)
 
-    result = PaginateTool(target_tool_name="NoSuchTool").execute()
+    result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
+        target_tool_name="NoSuchTool",
+    ).execute()
 
     assert result.startswith("Error: Tool 'NoSuchTool' not found.")
 
@@ -159,6 +167,7 @@ def test_real_non_paginating_tool_resolves_its_workspace(tmp_path):
     (tmp_path / "inside.txt").write_text("inside-content", encoding="utf-8")
 
     result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="ReadFile",
         tool_params={"file_path": "inside.txt"},
         workspace_path=str(tmp_path),
@@ -176,6 +185,7 @@ def test_real_non_paginating_tool_refuses_path_outside_workspace(tmp_path):
     (tmp_path / "outside.txt").write_text("OUTSIDE-SECRET", encoding="utf-8")
 
     result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="ReadFile",
         tool_params={"file_path": "../outside.txt"},
         workspace_path=str(workspace),
@@ -192,6 +202,7 @@ def test_real_paginating_tool_still_paginates(tmp_path):
         (tmp_path / name).write_text("", encoding="utf-8")
 
     first = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="GlobTool",
         tool_params={"directory": str(tmp_path), "pattern": "*.py"},
         page=1,
@@ -211,6 +222,7 @@ def test_context_cannot_be_forged_through_tool_params(stub_registry):
     stub_registry(_NonPaginatingStub)
 
     PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="_NonPaginatingStub",
         tool_params={"workspace_path": "/home/jojo"},
         workspace_path="/tmp/real-ws",
@@ -233,6 +245,7 @@ def test_forged_workspace_path_cannot_widen_glob_containment(tmp_path):
     (outside / "outside-secret.txt").write_text("x", encoding="utf-8")
 
     result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="GlobTool",
         tool_params={"workspace_path": str(outside), "directory": str(outside)},
         workspace_path=str(workspace),
@@ -251,6 +264,7 @@ def test_glob_refuses_outside_directory_when_context_is_forwarded(tmp_path):
     (outside / "outside-secret.txt").write_text("x", encoding="utf-8")
 
     result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="GlobTool",
         tool_params={"directory": str(outside)},
         workspace_path=str(workspace),
@@ -267,6 +281,7 @@ def test_glob_still_lists_inside_the_workspace(tmp_path):
     (workspace / "inside.py").write_text("", encoding="utf-8")
 
     result = PaginateTool(
+        effective_permissions={"filesystem": "read", "container": False},
         target_tool_name="GlobTool",
         tool_params={"directory": str(workspace), "pattern": "*.py"},
         workspace_path=str(workspace),
