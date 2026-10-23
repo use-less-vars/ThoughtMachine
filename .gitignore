@@ -165,6 +165,7 @@ docs/*
 !docs/container_p0_bug4_git_fallback.md
 !docs/container_subsystem_audit.md
 !docs/workspace_isolation_matrix.md
+!docs/vault_ownership_manifest.md
 # KB policy: the three document tiers (Public docs / Internal KB / Diary).
 # Public tier ships with the repo — every docs/ file needs its own line.
 !docs/KB_POLICY.md
