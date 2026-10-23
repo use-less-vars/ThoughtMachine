@@ -1723,8 +1723,8 @@ class WorkerThread(threading.Thread):
         if worker_tools:
             enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
         else:
-            from tools import SIMPLIFIED_TOOL_CLASSES
-            enabled_tools = [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES
+            from tools import simplified_tool_classes
+            enabled_tools = [cls.__name__ for cls in simplified_tool_classes()
                              if cls.__name__ not in _WORKER_BLOCKLIST]
         # Intersect with parent's enabled_tools — worker cannot exceed parent
         if parent_enabled_tools is not None:
@@ -3385,8 +3385,8 @@ except ImportError:
 # with tools.__init__ — that module imports this file (Worker) before
 # TOOL_CLASSES is fully populated, so we resolve on first use).
 def _build_tool_registry() -> dict[str, type["ToolBase"]]:
-    from tools import TOOL_CLASSES
-    return {cls.__name__: cls for cls in TOOL_CLASSES}
+    from tools import iter_tool_classes
+    return {cls.__name__: cls for cls in iter_tool_classes()}
 
 _TOOL_REGISTRY: dict[str, type["ToolBase"]] = {}
 def _get_tool_registry() -> dict[str, type["ToolBase"]]:
