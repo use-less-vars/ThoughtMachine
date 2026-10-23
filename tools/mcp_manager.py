@@ -357,15 +357,12 @@ def register_mcp_tools(timeout: float = 5.0) -> None:
         """Perform actual MCP tool registration in background."""
         try:
             manager = get_mcp_manager()
-            from . import TOOL_CLASSES
+            from . import register_tool_class
             tool_classes = manager.get_tool_classes()
             count = 0
             for cls in tool_classes:
-                if cls not in TOOL_CLASSES:
-                    TOOL_CLASSES.append(cls)
+                if register_tool_class(cls):
                     count += 1
-            from . import _update_simplified_toolset
-            _update_simplified_toolset()
             logger.info(f"Registered {count} MCP tool(s) in background")
         except Exception as e:
             logger.warning(f"Background MCP tool registration failed: {e}")

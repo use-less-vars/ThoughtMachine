@@ -93,7 +93,25 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+def _find_repo_root() -> Path:
+    """Nearest ancestor of this file that contains both ``tools/`` and ``tests/``.
+
+    Found by walking up from ``__file__`` instead of a fixed ``parents[N]`` hop:
+    this guard is parked under ``.thoughtmachine/working_docs/`` and is meant to
+    move back to ``tests/`` once the burn-down lands, so its depth below the
+    repository root is not a constant.
+    """
+    start = Path(__file__).resolve()
+    for candidate in start.parents:
+        if (candidate / "tools").is_dir() and (candidate / "tests").is_dir():
+            return candidate
+    raise RuntimeError(
+        "hygiene/no-tool-wrapping: cannot locate the repository root (a directory "
+        f"containing both tools/ and tests/) above {start}"
+    )
+
+
+REPO_ROOT = _find_repo_root()
 TOOLS_DIR = REPO_ROOT / "tools"
 REGISTRY_FILE = TOOLS_DIR / "__init__.py"
 REGISTRY_NAMES = frozenset({"TOOL_CLASSES", "SIMPLIFIED_TOOL_CLASSES"})
@@ -275,6 +293,22 @@ def test_rule_c_no_dynamic_module_resolution_by_string():
     """(c) No ``importlib.import_module`` / ``__import__`` call inside ``tools/``."""
     violations, scanned, tool_modules, _ = _collect("c")
     _assert_clean("c", violations, scanned, tool_modules)
+
+
+def test_scan_is_not_vacuous():
+    """The pin must actually see the tree -- an empty scan is never a pass.
+
+    ``_assert_clean`` already refuses ``scanned == 0`` and an empty
+    ``tool_modules`` for each letter, but only as a side condition of a letter
+    rule.  This test pins non-vacuity on its own, so a broken scan (e.g. a
+    ``REPO_ROOT`` that resolves somewhere with no ``tools/`` tree) fails as its
+    own finding instead of showing up as three vacuous green letter tests.
+    """
+    scanned_files = _iter_tool_files()
+    assert len(scanned_files) > 0, f"scanned no files under {TOOLS_DIR} -- {RULE} pin is vacuous"
+    tool_modules, tool_classes = _tool_modules_and_classes()
+    assert len(tool_modules) > 0, "detected no tool modules -- the detector is broken, not the tree"
+    assert len(tool_classes) > 0, "detected no tool classes -- the detector is broken, not the tree"
 
 
 def test_scanner_flags_a_wrapping_tool():

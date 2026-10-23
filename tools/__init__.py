@@ -1,6 +1,6 @@
 # tools/__init__.py - Explicit tool registration to avoid circular imports
 import logging
-from typing import List, Dict, Type, Set
+from typing import List, Dict, Type, Set, Optional, Tuple
 from .base import ToolBase
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,42 @@ def register_tool(cls: Type[ToolBase]) -> Type[ToolBase]:
         TOOL_CLASSES.append(cls)
         _update_simplified_toolset()
     return cls
+
+
+# ── registry accessors ──────────────────────────────────────────────────────
+# The registry lists above are module state with one writer (this module) and
+# no lock; everything outside tools/__init__.py goes through these accessors
+# instead of naming TOOL_CLASSES / SIMPLIFIED_TOOL_CLASSES itself
+# (hygiene/no-tool-wrapping, letter (b)).
+def register_tool_class(cls: Type[ToolBase]) -> bool:
+    """Add *cls* to the registry; return True when it was not already there.
+
+    Keeps registration order identical to a plain ``TOOL_CLASSES.append`` and
+    refreshes SIMPLIFIED_TOOL_CLASSES afterwards.
+    """
+    added = cls not in TOOL_CLASSES
+    if added:
+        TOOL_CLASSES.append(cls)
+    _update_simplified_toolset()
+    return added
+
+
+def iter_tool_classes() -> Tuple[Type[ToolBase], ...]:
+    """All registered tool classes, in registration order (immutable snapshot)."""
+    return tuple(TOOL_CLASSES)
+
+
+def simplified_tool_classes() -> List[Type[ToolBase]]:
+    """The current simplified toolset as a fresh copy -- the live list is not exposed."""
+    return list(SIMPLIFIED_TOOL_CLASSES)
+
+
+def get_tool_class(name: str) -> Optional[Type[ToolBase]]:
+    """The registered tool class whose ``__name__`` is *name*, or None if absent."""
+    for cls in TOOL_CLASSES:
+        if cls.__name__ == name:
+            return cls
+    return None
 
 # Import all tool modules explicitly
 # Note: Import order matters for potential dependencies
@@ -274,4 +310,6 @@ except ImportError as e:
 # Initialize SIMPLIFIED_TOOL_CLASSES
 _update_simplified_toolset()
 
-__all__ = ['TOOL_CLASSES', 'SIMPLIFIED_TOOL_CLASSES', 'IMPORT_FAILURES', 'get_import_failures', 'register_tool', 'ToolBase']
+__all__ = ['TOOL_CLASSES', 'SIMPLIFIED_TOOL_CLASSES', 'IMPORT_FAILURES', 'get_import_failures',
+           'register_tool', 'register_tool_class', 'iter_tool_classes',
+           'simplified_tool_classes', 'get_tool_class', 'ToolBase']

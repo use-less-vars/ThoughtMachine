@@ -22,6 +22,7 @@ network_diagnostics:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -433,7 +434,7 @@ class CheckSystem(ToolBase):
                 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
                 caps_obj = WorkspaceCapabilities(**{
                     k: v for k, v in workspace_capabilities.items()
-                    if k in [f.name for f in __import__('dataclasses').fields(WorkspaceCapabilities)]
+                    if k in [f.name for f in dataclasses.fields(WorkspaceCapabilities)]
                 })
                 effective = get_effective_permissions(session_obj, caps_obj)
                 permission_origin = "mirror-merge"
