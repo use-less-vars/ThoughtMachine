@@ -122,6 +122,8 @@ worker_live_test.txt
 !.thoughtmachine/working_docs/reproduce_p0.sh
 !.thoughtmachine/working_docs/P0_REPRODUCER_README.md
 !.thoughtmachine/working_docs/ticket-*.md
+# The parked hygiene/no-tool-wrapping guard source: real code, not scratch.
+!.thoughtmachine/working_docs/tool_no_wrapping_guard.py
 # Protocols are meant to be run by someone else — they are not scratch.
 !.thoughtmachine/working_docs/protocol-*.md
 .thoughtmachine/knowledge/project/test_protocols.md
