@@ -78,3 +78,49 @@ This is orthogonal to `design/workspace-isolation-matrix` (which is about HTTP/W
 ## Filed
 
 Filed 2026-10-23 by the main agent. Base: dev @ 5abd2e47. Evidence gathered first-hand (file reads + one runtime instantiation probe); no end-to-end pytest repro, stated plainly rather than implied.
+
+## Residuals — added post-#182 (verified at dev @ 9ef9cfd0)
+
+The body above is unchanged: it was read first-hand at `5abd2e47` and its claims still hold at `9ef9cfd0` except where noted here. PR #182 (`0c125856`) closed Defect 2 by *refusing to forward* `workspace_id` rather than by *injecting* it, which leaves two residuals.
+
+### Residual A — `workspace_id` is dropped, not injected; the wrapped tool sees `None`
+
+`tools/paginate_tool.py:53` adds a blocklist:
+
+```
+48:     # Fields the executor owns and that a paginated call can therefore never
+49:     # legitimately supply.  ``workspace_id`` is overwritten by the executor on
+50:     # the direct path (agent/core/tool_executor.py) *after* the model is
+51:     # built, so a caller may never provide it; a paginated call cannot stand
+52:     # in for the executor, so the field is dropped instead of forwarded.
+53:     _NEVER_FORWARD: ClassVar[tuple] = ("workspace_id",)
+```
+
+`_build_params` strips it at `:117-122` (`dropped = self._CONTEXT_FIELDS + self._NEVER_FORWARD`). `workspace_id` remains **absent from `_CONTEXT_FIELDS`** (`:87-98`), and the authoritative-injection loop iterates `_CONTEXT_FIELDS` only (`:123-128`). Three independent paths therefore guarantee the wrapped tool is constructed without the field, so **the pydantic default applies: `None`, not `""`.** (The brief that prompted this residual said `""`; the code says `None`. Same falsiness, different evidence — and `None` is the honest quote.)
+
+The consequence is **per-tool, not uniform**, which is the part worth keeping:
+
+| Wrapped tool | Behaviour on the paginated path | Evidence |
+|---|---|---|
+| `CiReadTool` | **fails closed, hard** — `workspace_allows_host_resources(None)` → `False` → `ValueError`; a paginated CI read loses remote-origin provenance outright | `tools/ci_read_tool.py:245-258`; `tools/host_resource_policy.py:72-73` (`if not workspace_id: return False`) |
+| `ContainerRemoveTool` | OK — derives from `workspace_path`, which paginate *does* forward | `tools/container_control.py:974` → `:147-153` |
+| `GitReadTool` | mostly self-heals via the registry — **but fabricates `"default"`** for `ResourceContainerManager` when empty, contradicting its own comment *"Never fabricate a 'default' workspace id"* | `tools/git_info_tool.py:1236-1243`, `:1262-1270` |
+| `MCPServerConnect` | **silently unattributed** — no truthiness guard; the empty id flows into `SandboxedExecution` | `tools/mcp_server_connect.py:65-68`, `:93-97` |
+| `GitWriteTool` | fails closed: `if not workspace_id: return (None, None)` | `tools/git_write_tool.py:731-735` |
+| `Glob` / `DirectoryTree` / `FileSearch` / `FileEditor` / `FilePreview` / `FileMover` / `ReadFile` / `ToolBase` | no `workspace_id` field at all — unaffected either way | six files searched, zero matches |
+
+So fix direction item 3 is still the right fix, and it should be read as an *injection* fix, not a forwarding fix: dropping the field is a denial, and at least one of those denials (`ci_read`) is a silent loss of provenance that nobody would think to look for. `_NEVER_FORWARD` should shrink to empty once `workspace_id` is treated the way `workspace_path` already is.
+
+Two things found while checking the above. Neither is this ticket; both are recorded so they are not lost:
+
+- **Doc defect.** The comment at `:49-52` says the executor overwrites `workspace_id` "after the model is built". It does the opposite: `agent/core/tool_executor.py:561` sets `tool_args['workspace_id'] = ws_id` **before** `tool_class(**tool_args)` at `:657`, and no post-construction overwrite exists anywhere. The constant behaves correctly; its stated rationale is wrong. A reader who checks the claim will conclude the blocklist is unnecessary.
+- **`MCPServerConnect` treats an absent `workspace_id` as "no scope"** (`:93-97`) — exactly the class of defect this residual was asked to surface, and the same shape as `bug/session-workspace-attribution-unresolved`: absence rendered as silence rather than refusal.
+
+### Residual B — the re-gate borrows a ceiling it never computes, and `ci` is missing from the map
+
+1. **`check_required_categories` does not apply a workspace ceiling.** `apply_workspace_ceiling` has exactly one non-test call site in the tree: `security/security_gate.py:435`, `return apply_workspace_ceiling(ceiling_map, session_grants)` inside `def cap(...)` (`:416-435`). That funnel is reached only from `get_effective_permissions` (`:1030-1032`), which the executor calls at `agent/core/tool_executor.py:449-455` and injects at `:560`. `check_required_categories` (`:1483+`) merely reads the `effective` dict it is handed (`:1558+`) and mentions a ceiling only when formatting denial text (`:1593-1601`). PaginateTool's re-gate (`tools/paginate_tool.py:198-216`) is therefore capped **only because the dict it validates was capped upstream**. There is no second line of defence: hand it an un-capped `effective` and the re-gate goes silently un-capped too. That is Defect 1 with a seatbelt, not a fix.
+2. **`ci` is absent from `_WORKSPACE_RESOURCE_MAP`.** The map (`security/security_gate.py:201-210`) carries `filesystem, docker, container, host_bash, git, network, mcp, credential` — no `ci` — while `_WORKSPACE_CEILING_KEYS` is derived from `RESOURCE_CATALOG`, which does contain `ci` (`security/resource_catalog.py:123`; `WORKSPACE_CEILING_VOCAB = {"ci": ("banned", "read")}` at `:200`). A `ci:` ceiling thus passes the known-key check at `:289` and dies at `:297-299`: `key = _WORKSPACE_RESOURCE_MAP.get("ci")` → `None` → `continue`. It does not even reach the fail-open warning at `:292-295`, because that branch is for resources absent from the catalog. A workspace `ci: banned` ceiling is silently inert; the only control actually gating `CiReadTool` is the separate `allow_host_resources` flag (`tools/host_resource_policy.py`).
+
+**Consequence for this ticket:** the paginate path cannot diverge from a `ci` fix. The drop happens *inside* `apply_workspace_ceiling`, upstream of both the executor and the re-gate, and both consume the same already-capped dict — so adding `"ci": "ci"` to the map corrects direct and paginated calls in one edit, with no paginate-side change and no divergence to document. The inverse risk is the one to note: because the re-gate computes nothing, any future change to the ceiling funnel reaches the paginate path by data flow alone, unobserved and untested.
+
+**Premise correction on the `ci` defect.** It is **not filed.** The only recorded ruling is `"Known-harmless: security_gate._WORKSPACE_CEILING_KEYS auto-gains ci while _WORKSPACE_RESOURCE_MAP has none -> ceiling no-ops for ci; record, do not fix."` — `.thoughtmachine/working_docs/a5ef12e56abd.json:7` (`brief_turn2`, 2026-10-14, branch `feat/agent-ci-monitor-read-only`). Zero `ticket-*.md` files mention `_WORKSPACE_RESOURCE_MAP` or the `ci` grain; the nearest neighbours by shape are `bug/capabilities-undeclared-fields-silently-inert` (shipped, different subject) and this ticket. The "do not fix" ruling is defensible only while nothing can set the key — the frontend vocabulary has no `ci` entry, so a workspace map carrying `ci:` must be hand-written to disk. If that reachability argument is still accepted this entry is documentation; if not, it wants its own ticket with the `credential` precedent copied whole (`security_gate.py:209` plus `tests/test_credential_resource_grain.py:277-292`, `test_credential_workspace_ceiling_is_not_inert`). Recorded here so that `test_ci_workspace_ceiling_is_not_inert` is not written for the first time by someone who assumed the ceiling already worked.
