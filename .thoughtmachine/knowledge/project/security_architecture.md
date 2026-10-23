@@ -6,6 +6,30 @@
 
 ---
 
+## Escape-to-host is catastrophic failure (Gen 48, 2026-10-23)
+
+**Principle.** The machine exists to prevent the agent from reaching host resources it was not granted. Every other property — capability, efficiency, extensibility — is subordinate to this. A tool that reaches host outside its envelope is not a bug; it is the failure the machine exists to prevent. It is a "black day" in TM history when one is found, and the finding is severe even when unexercised.
+
+**Four boundaries, not one.** The seat's job is to hold each precisely and never collapse them into a single "the security boundary held" claim:
+
+| Boundary | What it prevents | Owner |
+|---|---|---|
+| Container boundary | Code inside a container escaping to host (docker escape, kernel escape, mount trick) | `infra/container_manager.py`, `security/security_gate.py::resolve_container_config` |
+| Permission layer (disk-purity) | A session acting beyond its disk-persisted grants | `thoughtmachine/security.py::get_effective_permissions` (disk-pure, fail-closed) |
+| Envelope | A resource used for what it wasn't granted | `security/security_gate.py::resolve_container_config` (fail-closed 3 ways) |
+| **Tool-call dispatch** | A session calling a tool it wasn't granted | `agent/core/tool_executor.py::_execute_single_tool` |
+
+A claim that "the security boundary held" that collapses these four is itself the bug class: one fact (can a default session reach host shell?), multiple authorities (the permission layer said no; PaginateTool said yes), they disagreed, and the narrative said the wrong one won.
+
+**The class rule:** no tool may invoke another tool. Tools are leaves of the permission model, not nodes. A wrapper is a second authority on "can this session call this tool" — Inv.6 (one fact, one authority) violation by construction. If a tool needs a capability another tool has, extract a shared internal function — not the tool class.
+
+**The class pattern:** "structural blocklist ≠ call-time gate." If a mechanism exists only at construction/spawn, a wrapper that calls a different object at runtime is a bypass. Every tool named in a construction-time filter should also have a call-time refusal, or explain why not.
+
+**Instance history:**
+- `2026-10-23` — `PaginateTool` bypassed the executor's category gate: a default-permission session could call `PaginateTool(target="HostBashTool", ...)` and get host shell execution. Fixed in #182, deleted entirely in `fix/delete-paginate-tool`. Class rule above added; census of remaining tool-wrapping violations filed as `hygiene/no-tool-wrapping`.
+- `2026-10-23` — `WorkingDocument` path traversal via `../` in `doc_id`; read any `.json` outside workspace. Fixed in #175 (`_resolve_doc_path`).
+- `2026-09-22` (`85035605`) — `.githooks/pre-commit` deleted on false premise (`.githooksPath` read from bare shell; container path sets it). Restore ticket `fix/restore-precommit-gate`.
+
 ## 1. Philosophy: Resource-Centric Security
 
 ThoughtMachine does not protect "the hard disk" or "the internet port." It protects **resources** — packaged capabilities the agent can access. Each resource is an independent trust domain.

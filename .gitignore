@@ -220,3 +220,24 @@ venv*
 .thoughtmachine/gate_log.txt
 web_ui/frontend/.npmrc
 web_ui/frontend/.npmrc
+
+# --- KB onboarding contract (Gen 48, 2026-10-23) --------------------------
+# KB_POLICY says "all KB is gitignored". That left MANDATORY_STOP.md -- the
+# entry file every new seat is told to read FIRST -- outside the repository, so
+# it did not survive clone. The KB is the machine's memory; memory must survive
+# the machine. These seven files are the onboarding contract set and are
+# tracked deliberately. Everything else under knowledge/ stays ignored.
+#
+# Order matters: negations must follow the ignores they override, and git
+# cannot re-include a file whose parent DIRECTORY is excluded. Hence the
+# directory negation + re-ignore + re-include shape for personal/ (the same
+# shape as the .thoughtmachine/working_docs/ block above).
+!.thoughtmachine/knowledge/project/MANDATORY_STOP.md
+!.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md
+!.thoughtmachine/knowledge/project/working_agreements.md
+!.thoughtmachine/knowledge/project/security_architecture.md
+!.thoughtmachine/knowledge/project/status.md
+!.thoughtmachine/knowledge/project/operator_observations.md
+!.thoughtmachine/knowledge/personal/
+.thoughtmachine/knowledge/personal/*
+!.thoughtmachine/knowledge/personal/handoffs.md
