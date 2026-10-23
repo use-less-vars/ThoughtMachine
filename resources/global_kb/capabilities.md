@@ -166,11 +166,6 @@ Get current date/time, format timestamps, parse strings, calculate differences.
 
 **When to use**: Any time-related operation.
 
-### PaginateTool
-Wrap another tool's execution with pagination for large result sets.
-
-**When to use**: Getting more results from GlobTool, DirectoryTreeTool, etc.
-
 ### ProgressReport
 Write a timestamped progress report during long-running tasks without stopping
 agent execution.

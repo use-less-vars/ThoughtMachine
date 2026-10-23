@@ -70,7 +70,6 @@ HIDDEN_IMPORTS = [
     "tools.git_info_tool",
     "tools.knowledge_base",
     "tools.mcp_validator",
-    "tools.paginate_tool",
     "tools.progress_report",
     "tools.respond",
     "tools.summarize_tool",
