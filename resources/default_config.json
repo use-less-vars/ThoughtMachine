@@ -59,7 +59,6 @@
     "FileSummaryTool",
     "GitInfoTool",
     "KnowledgeBaseTool",
-    "PaginateTool",
     "ProgressReport",
     "SummarizeTool",
     "Thought",

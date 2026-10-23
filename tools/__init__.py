@@ -221,11 +221,7 @@ try:
 except ImportError as e:
     _record_import_failure("KnowledgeBaseTool", e)
 
-try:
-    from .paginate_tool import PaginateTool
-    TOOL_CLASSES.append(PaginateTool)
-except ImportError as e:
-    _record_import_failure("PaginateTool", e)
+# Removed Gen 48 - tool-wrapping pattern banned as a class (see hygiene/no-tool-wrapping).
 
 try:
     from .progress_report import ProgressReport

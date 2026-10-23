@@ -153,7 +153,6 @@ if "%ONE_FILE%"=="1" (
         --hidden-import "tools.git_info_tool" ^
         --hidden-import "tools.knowledge_base" ^
         --hidden-import "tools.mcp_validator" ^
-        --hidden-import "tools.paginate_tool" ^
         --hidden-import "tools.progress_report" ^
         --hidden-import "tools.respond" ^
         --hidden-import "tools.summarize_tool" ^

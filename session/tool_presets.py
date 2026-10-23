@@ -63,7 +63,6 @@ _ALL_TOOLS = [
     # Worker & advanced
     "Worker",
     "FieldViewer",
-    "PaginateTool",
     "WorkingDocument",
 ]
 
@@ -98,7 +97,6 @@ AGENT_TOOLS = [
     "GlobTool",
     "host_bash",
     "KnowledgeBaseTool",
-    "PaginateTool",
     "ReadFile",
     "Respond",
     "SummarizeTool",
