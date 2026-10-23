@@ -39,6 +39,7 @@ from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 from tools.host_resource_policy import workspace_allows_host_resources
 from agent.config.provider_profile import ProviderManager
+from agent.events import EventType, create_event, global_event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +354,24 @@ def _credentials_dir() -> Path:
     return vault_root() / "credentials" / "global"
 
 
+def _emit_credential_event(event_type: EventType, name: str) -> None:
+    """Publish a credential audit event.
+
+    Credential names and the scope only — values are never placed on the bus.
+    A failing event bus must never fail the credential operation itself.
+    """
+    try:
+        global_event_bus.publish(
+            create_event(
+                event_type,
+                {"credential_name": name, "scope": "global"},
+                source="web_ui.global_routes",
+            )
+        )
+    except Exception as exc:  # pragma: no cover - defensive only
+        logger.warning("credential audit event failed: %s", exc)
+
+
 def _write_credential(name: str, value: str) -> bool:
     """Persist a credential file with mode 0600; returns True when created.
 
@@ -418,6 +437,7 @@ def upsert_credential(payload: CredentialPayload):
         return _json_error(str(exc), status_code=500)
     if created:
         return {"created": True}
+    _emit_credential_event(EventType.CREDENTIAL_ROTATED, name)
     return {"updated": True}
 
 
@@ -429,9 +449,13 @@ def delete_credential(name: str):
     if error:
         return _json_error(error, status_code=400)
     target = _credentials_dir() / name
+    existed = False
     try:
         if target.exists() and not target.is_dir():
+            existed = True
             target.unlink()
     except OSError as exc:
         return _json_error(str(exc), status_code=500)
+    if existed:
+        _emit_credential_event(EventType.CREDENTIAL_DELETED, name)
     return {"deleted": True}

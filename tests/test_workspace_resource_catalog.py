@@ -36,6 +36,7 @@ _CANONICAL_RESOURCES = [
     "mcp",
     "host_bash",
     "ci",
+    "credential",
 ]
 
 # On-disk array entries (the endpoint's resource list).
@@ -49,6 +50,7 @@ _ON_DISK_NAMES = {
     "network",
     "mcp",
     "ci",
+    "credential",
 }
 
 
@@ -105,7 +107,7 @@ def test_resource_catalog_json_matches_loader():
 
     # Array shape: 9 entries, each with exactly the 11 canonical keys.
     assert isinstance(raw, list)
-    assert len(raw) == 9
+    assert len(raw) == 10
     assert {entry["name"] for entry in raw} == _ON_DISK_NAMES
     for entry in raw:
         assert set(entry.keys()) == {

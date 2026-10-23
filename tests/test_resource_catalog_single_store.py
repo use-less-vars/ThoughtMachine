@@ -143,7 +143,7 @@ def test_network_mcp_now_present_in_b():
     view = _legacy_view()["resources"]
     assert set(view) == {
         "git", "filesystem", "container", "network", "mcp", "host_bash",
-        "ci",
+        "ci", "credential",
     }
     assert view["network"]["default_permission"] == "banned"
     assert view["mcp"]["default_permission"] == "banned"

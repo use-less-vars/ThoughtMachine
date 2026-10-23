@@ -38,6 +38,7 @@ ALL_BANNED = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "credential": "banned",
 }
 
 BACKUP_RE = re.compile(r"^config\.json\.bak-(\d{14})$")

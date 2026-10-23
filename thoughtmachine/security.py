@@ -111,8 +111,9 @@ class SessionPermissions(BaseModel):
     Maps to the permission system used by
     ``tool_executor._check_permissions()``:
 
-    The canonical session permission categories are exactly seven:
-    ``container | network | filesystem | git | mcp | host_bash | ci``.
+    The canonical session permission categories are exactly eight:
+    ``container | network | filesystem | git | mcp | host_bash | ci |
+    credential``.
 
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
@@ -120,6 +121,8 @@ class SessionPermissions(BaseModel):
     - **git**:        ``'banned' | 'read' | 'write' | 'ask' | 'write_on_feature_branch'``
     - **mcp**:        ``'banned' | 'connect' | 'full'``
     - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
+    - **credential**: ``'banned' | 'read' | 'use'`` (``read`` lists credential
+      names only; ``use`` injects credential values)
 
     The legacy ``system``/``execution`` permission categories and the split
     ``git_read``/``git_write`` grains were removed in the permission-schema
@@ -156,6 +159,10 @@ class SessionPermissions(BaseModel):
     ci: Literal['banned', 'read'] = Field(
         default='banned',
         description='CI monitoring (read-only) access level.',
+    )
+    credential: Literal['banned', 'read', 'use'] = Field(
+        default='banned',
+        description='Credential access level (read = names only, use = values).',
     )
 
     @field_validator('network', mode='before')
@@ -220,6 +227,7 @@ _SAFE_DEFAULT_LEVELS: Dict[str, Any] = {
     "mcp": "banned",
     "network": "banned",
     "ci": "banned",
+    "credential": "banned",
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
     key: _SAFE_DEFAULT_LEVELS[key] for key in RESOURCE_CATALOG

@@ -89,6 +89,7 @@ class TestCeilingCausedFilesystemDenial:
             "mcp": "banned",
             "host_bash": "banned",
             "ci": "banned",
+            "credential": "banned",
         }
         assert json.loads(json.dumps(eff)) == dict(eff)  # JSON-safe subclass
         # … and it carries ceiling provenance for the capped category.

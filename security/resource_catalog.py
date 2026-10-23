@@ -121,6 +121,7 @@ RESOURCE_CATALOG = {
     "mcp": ["banned", "connect", "full"],
     "host_bash": ["banned", "ask", "allow"],
     "ci": ["banned", "read"],
+    "credential": ["banned", "read", "use"],
 }
 
 #: Set of canonical resource keys (for membership checks / introspection).
@@ -145,6 +146,7 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
     "connect": 1,
     "write": 3,
     "write_on_feature_branch": 3,
+    "use": 3,
     "outbound": 3.5,
     "full": 4,
 }
@@ -169,6 +171,7 @@ WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
     "ask": 2.0,
     "write_on_feature_branch": 2.5,  # ceiling value: caps write -> branch-write
     "write": 3.0,
+    "use": 3.0,  # credential value-injection grant: the write tier
     "outbound": 4.0,  # ceiling value: unlimited (above plain write)
     "full": 4.0,  # ceiling value: unlimited
 }
@@ -195,6 +198,7 @@ WORKSPACE_CEILING_VOCAB: Dict[str, tuple] = {
     "mcp": ("banned", "connect", "full"),
     "host_bash": ("banned", "ask", "allow"),
     "ci": ("banned", "read"),
+    "credential": ("banned", "read", "use"),
 }
 
 #: Git-grain *breadth* ranks (broader grant = SMALLER number), consumed by

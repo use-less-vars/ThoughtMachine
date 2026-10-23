@@ -292,7 +292,7 @@ def test_effective_branch_write_session_grains():
         "read",
         "write_on_feature_branch",
     )
-    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci"}
+    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci", "credential"}
 
 
 def test_outer_gate_branch_write_allows_write_and_read():
@@ -354,7 +354,7 @@ def test_disk_mode_branch_write_grant_capped_by_ceiling(hermetic_vault):
         workspace_id=ws_id,
     )
     assert eff["git"] == "read"
-    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci"}
+    assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci", "credential"}
 
     # Control: a write-level ceiling leaves the branch-write grant standing.
     _write_config(hermetic_vault, ws_id, {"git": "write"})
@@ -405,6 +405,7 @@ def test_disk_mode_non_catalog_grant_keys_dropped(
         "mcp": "banned",  # session default
         "host_bash": "banned",  # session default
         "ci": "banned",  # session default
+        "credential": "banned",  # session default
     }
     assert "system" not in eff
     assert "execution" not in eff

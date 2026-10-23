@@ -160,7 +160,7 @@ class TestEffectivePermissionsMerge:
         assert eff["git"] == "write"
         assert eff["mcp"] == "banned"  # session default
         assert eff["host_bash"] == "banned"  # session default
-        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci"}
+        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci", "credential"}
 
     def test_network_workspace_denied(self):
         """Workspace allow_network=False → effective network=False."""
@@ -238,7 +238,7 @@ class TestEffectivePermissionsMerge:
         eff = get_effective_permissions(session, workspace)
         assert "system" not in eff
         assert "execution" not in eff
-        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci"}
+        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci", "credential"}
 
 
 # ══════════════════════════════════════════════════════════════════════════

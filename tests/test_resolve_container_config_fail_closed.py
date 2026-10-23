@@ -45,6 +45,7 @@ _ALL_BANNED = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "credential": "banned",
 }
 
 

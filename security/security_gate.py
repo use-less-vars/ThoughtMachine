@@ -94,6 +94,7 @@ _DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
     "network": "banned",
     "mcp": "banned",
     "ci": "banned",
+    "credential": "banned",
 }
 
 
@@ -205,6 +206,7 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "git": "git",
     "network": "network",
     "mcp": "mcp",
+    "credential": "credential",
 }
 
 #: Recognised workspace-ceiling resource names: the canonical catalog
@@ -583,6 +585,7 @@ def _merge_with_capabilities(
         "mcp": session.mcp,
         "host_bash": session.host_bash,
         "ci": getattr(session, "ci", "banned"),
+        "credential": getattr(session, "credential", "banned"),
     }
 
 
