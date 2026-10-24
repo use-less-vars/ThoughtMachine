@@ -37,6 +37,7 @@ from pydantic import BaseModel
 from thoughtmachine.vault import vault_root
 from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
+from thoughtmachine.validation import validate_single_path_segment
 from tools.host_resource_policy import workspace_allows_host_resources
 from agent.config.provider_profile import ProviderManager
 from agent.events import EventType, create_event, global_event_bus
@@ -338,15 +339,9 @@ _MAX_CREDENTIAL_NAME_LEN = 128
 
 def _validate_credential_name(name: str) -> Optional[str]:
     """Return an error message for an invalid credential name, else None."""
-    if not name:
-        return "credential name must not be empty"
-    if name == "." or ".." in name or "/" in name or "\\" in name:
-        return "credential name must be a single path segment"
-    if len(name) > _MAX_CREDENTIAL_NAME_LEN:
-        return (
-            f"credential name must be at most {_MAX_CREDENTIAL_NAME_LEN} characters"
-        )
-    return None
+    return validate_single_path_segment(
+        name, kind="credential name", max_length=_MAX_CREDENTIAL_NAME_LEN
+    )
 
 
 def _credentials_dir() -> Path:

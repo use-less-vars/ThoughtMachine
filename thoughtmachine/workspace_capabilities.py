@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional
 
 from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
 from thoughtmachine.vault import _copy_resource, vault_root
-from thoughtmachine.workspace_registry import _normalize_path
+from thoughtmachine.workspace_registry import RESERVED_WORKSPACE_IDS, _normalize_path
+from thoughtmachine.validation import validate_single_path_segment
 
 # Minimal validation for template workers (avoids circular import via agent.__init__)
 _REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "permission_footprint"}
@@ -173,9 +174,30 @@ def git_shadow_mask_path(workspace_id: str) -> Path:
     return _workspace_dir(workspace_id) / GIT_SHADOW_MASK_FILENAME
 
 
+def _validate_workspace_id(workspace_id: str) -> str:
+    """Return *workspace_id* unchanged, or raise ``ValueError`` if unusable.
+
+    A workspace id becomes a single directory name under
+    ``<vault>/workspaces/``.  An id that is not one segment escapes that
+    namespace, and a reserved id (``global``) names a namespace the vault
+    owns for itself, so neither may be turned into a path.
+
+    The check lives here and nowhere else: every workspace path in the tree is
+    built from :func:`_workspace_dir`, so this is the one place that can
+    enforce it (Inv.6 -- one fact, one authority).  Call sites deliberately do
+    not repeat it.
+    """
+    error = validate_single_path_segment(workspace_id, kind="workspace id")
+    if error:
+        raise ValueError(error)
+    if workspace_id in RESERVED_WORKSPACE_IDS:
+        raise ValueError(f"workspace id {workspace_id!r} is reserved")
+    return workspace_id
+
+
 def _workspace_dir(workspace_id: str) -> Path:
     """Return the filesystem path for a given workspace ID."""
-    return _user_dir() / "workspaces" / workspace_id
+    return _user_dir() / "workspaces" / _validate_workspace_id(workspace_id)
 
 
 def _capabilities_path(workspace_id: str) -> Path:
