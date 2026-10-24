@@ -2180,3 +2180,5 @@ The guard was written to enforce "no tool may invoke another tool", parked in `.
 3. **The parked-guard activation procedure must include this lesson**: before un-parking a guard, run it once from the unparked location AND confirm its scan counts are non-zero.
 
 **Instance:** 2026-10-23, Gen 48, `tool_no_wrapping_guard.py`. Caught during phase-2 burn-down; fixed in `fix/census-burn-down-no-tool-wrapping` (`d4bc1e35`).
+
+**Status today:** the guard is still parked and unactivated — nothing in CI runs it. Its census is a point-in-time figure: 13 sites at park, 8 of those (letters (b) and (c)) burned down in `cf10c358` (#189), the residual being letter (a).

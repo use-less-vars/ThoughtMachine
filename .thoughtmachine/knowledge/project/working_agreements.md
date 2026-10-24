@@ -540,13 +540,13 @@ WA-3 (CORPUS NAMING, added 2026-10-23 after the W2 CI break): a "full suite" cla
 
 WA-4 (WORKING-DOC FILING NAMING, added 2026-10-23 after a filing was silently gitignored). `.thoughtmachine/working_docs/*` is IGNORED by default (`.gitignore` L118-120) and re-included only by explicit negations — `ticket-*.md`, `protocol-*.md`, `reproduce_p0.py/.sh`, `P0_REPRODUCER_README.md`, plus the WorkingDocument `*.json` files. Consequence: a ticket written as `design-<slug>.md` or `hygiene-<slug>.md` lands on disk, `git status` reports CLEAN, and the file never reaches the repo — every subsequent reader assumes it was never filed. **Rule: any filed ticket MUST be named `ticket-<category>-<slug>.md` (or created via WorkingDocument, which yields the tracked `.json`). Verify a filing with `git status` — a clean status after writing files means they are ignored, not that they are committed.** Internal cross-references between clustered tickets must carry the new filename, so sed for the bare name with a `(^|[^-])` guard to avoid `ticket-ticket-` double-prefixing. There is already a standing ticket for this exact trap (`ticket-hygiene-working-docs-cluster-reports-gitignored.md`) — a prior cluster report was lost the same way, so this is a recurrence, not a one-off.
 
-## 2026-10-23 — No tool may invoke another tool (class rule, CI-enforced)
+## 2026-10-23 — No tool may invoke another tool (class rule, not CI-enforced)
 
 **Rule.** No file under `tools/` may import another tool class or look up `TOOL_CLASSES` at runtime. Tools are leaves of the permission model, not nodes.
 
 **Why.** A wrapper is a second authority on "can this session call this tool" — one fact (may this session run host_bash?), multiple authorities (the executor says no; the wrapper says yes), they disagree. Inv.6 violation by construction, and it's the class of bug `PaginateTool` exhibited on 2026-10-23: a default-permission session could reach `host_bash` through `PaginateTool(target="HostBashTool", ...)`.
 
-**Enforcement.** `tests/test_tool_no_wrapping.py` — AST-based scan, fails on any import of another tool class or runtime registry lookup. No whitelist, no `xfail`, no `skip`. **The guard must not be vacuous** — it walks up to find the repo root (a parked-location `parents[1]` resolves to `.thoughtmachine/` and scans 0 files; that failure mode was caught in this session and the fix is `_find_repo_root()` + `test_scan_is_not_vacuous`).
+**Enforcement.** Review time, by humans — not a test. `tests/test_tool_no_wrapping.py` does not exist and never has on this branch. A guard does exist — `.thoughtmachine/working_docs/tool_no_wrapping_guard.py`, AST-based, fails on any import of another tool class or runtime registry lookup, no whitelist, no `xfail`, no `skip` — but it is **parked and unactivated**: no test module imports it and no workflow runs it. **The guard must not be vacuous** — it walks up to find the repo root (a parked-location `parents[1]` resolves to `.thoughtmachine/` and scans 0 files; that failure mode was caught in this session and the fix is `_find_repo_root()` + `test_scan_is_not_vacuous`).
 
 **Exception: none.** If a tool needs a capability another tool has, extract a shared internal function — not the tool class. Sequencing is the agent loop's job (plan → dispatch → observe), not a tool's.
 
@@ -554,4 +554,4 @@ WA-4 (WORKING-DOC FILING NAMING, added 2026-10-23 after a filing was silently gi
 
 **The seat's share of the miss.** Gen 48 briefed the paginate fix as "category bypass" — accurate but understated. The operator read "host access" from it, which was the correct framing, and Main named it before the seat did. The lesson: **briefs name the mechanism, not the class of the check.** "Authority laundering" and "host access" are the true names; "category bypass" is the check that failed.
 
-**Filed:** `hygiene/no-tool-wrapping` (doctrine + census + guard).
+**Filed:** `hygiene/no-tool-wrapping` (doctrine + census + guard). The guard named above is the **parked, unactivated** one. The census is a point-in-time figure, attributed and not measured today: 13 sites at park, 8 of those burned down in `cf10c358` (#189), the residual letter (a) recounted by nothing in CI.
