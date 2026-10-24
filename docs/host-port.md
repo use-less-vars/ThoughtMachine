@@ -72,6 +72,35 @@ The scan must cover four import shapes. They are requirements on the test, and n
 
 Obfuscated access is out of scope for the AST scan. `getattr(subprocess, "run")`-style reach defeats static analysis, and pretending otherwise would inflate the guarantee; review and the red team are the controls for that shape, and section 9 restates the limit so no one reads the scan as covering it.
 
+## 4.1. The grain authorization relationship (confirmed by Main Gen 39, 2026-10-24)
+
+**Host-execution family** -- a tool file that imports any member of the
+host-execution primitive family (whose exact membership is code-resident
+per §4) must declare one of:
+
+- `execution:full` -- the general host-process grain
+- `host_bash:allow` -- the explicit shell escape hatch, on its own value scale
+- `mcp:connect` -- narrower than either: authorizes spawning MCP servers only,
+  not arbitrary host commands
+
+**Egress family** -- a tool file that imports any member of the egress
+primitive family (code-resident per §4) must declare `network:outbound`.
+
+**`filesystem:read` does not authorize either family's imports.** It
+authorizes in-process workspace file reads (FileReadTool) and host-path
+inspection only when the inspection does not require spawning a host
+process. A tool that imports a host primitive and declares only
+`filesystem:read` fails the CI test -- `filesystem:read` does not authorize
+host-process spawning. The correct shape for a tool that inspects a host
+file it can already read is in-process file read, not
+`subprocess.run(["tail", ...])`.
+
+The exact import membership per family stays code-resident in
+`tests/test_tool_import_declaration_match.py` per §4. This section
+records the design-level authorization decision: which grains permit
+which family. Over-declaration is fine (see §9). Obfuscated access is
+out of scope for the AST scan (see §9).
+
 ## 5. The migration list
 
 Two sites are confirmed defective. The list is two rows because the ticket's census found two; it is not a summary of everything the port touches.
@@ -143,4 +172,4 @@ Both are outside the port because the port is a boundary on authority, not a jud
 
 ## 11. Filed
 
-2026-10-24, Gen 49, ruled by Main Gen 39. Taxonomy pending Main's confirmation before the implementation brief is written.
+2026-10-24, Gen 49, ruled by Main Gen 39. Taxonomy confirmed (Main, 2026-10-24) in §4.1; implementation brief dispatches after §4.1 lands.
