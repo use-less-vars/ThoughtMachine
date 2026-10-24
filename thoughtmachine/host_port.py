@@ -85,9 +85,9 @@ AUTHORIZED_VALUES: Dict[str, frozenset] = {
     "network": frozenset({"outbound", "write"}),
 }
 
-#: Env keys that look like credentials.  The port never forwards them: live
-#: credential values must arrive through W3's ``credential_inject`` path, not
-#: through a process environment.
+#: Env keys that look credential-shaped.  Check (7) refuses a CALLER-SUPPLIED
+#: key matching this pattern; keys inherited from the parent environment are
+#: forwarded as-is -- closing that is W3's ``credential_inject``, not this file.
 CREDENTIAL_SHAPED = re.compile(r"(TOKEN|SECRET|PASSWORD|KEY|PAT|CREDENTIAL)", re.I)
 
 #: Audit trail filename (documented contract; the tests pin it).
