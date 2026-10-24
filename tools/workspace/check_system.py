@@ -1109,14 +1109,40 @@ class CheckSystem(ToolBase):
             if not os.path.exists(file_path):
                 return f"[event_log] No log file found at: {file_path}"
 
-            import subprocess
             # Widened read (500 lines) so that filtering by owner still leaves a
             # useful window for this caller on a busy machine.
-            result = subprocess.run(
-                ["tail", "-n", "500", file_path],
-                capture_output=True, text=True, timeout=5,
-            )
-            lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+            #
+            # In-process filesystem read (migration category 2), not host
+            # execution: the log is a local append-only file this process owns,
+            # so it needs no host process and no host bridge.  Only the tail
+            # window is loaded -- the file itself is unbounded -- by seeking
+            # from EOF backwards in growing chunks until enough newlines are
+            # buffered (or the start of the file is reached).  Encoding matches
+            # EventLogger's writer (utf-8); errors="replace" keeps a torn
+            # multibyte sequence from making the whole query fail.
+            max_lines = 500
+            chunk_size = 8192
+            newlines = 0
+            chunks: list = []
+            with open(file_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                pos = fh.tell()
+                # max_lines + 1: the window typically starts mid-line, and that
+                # leading fragment is dropped, so one spare newline is needed to
+                # still end up with 500 whole records.
+                while pos > 0 and newlines <= max_lines + 1:
+                    read_size = min(chunk_size, pos)
+                    pos -= read_size
+                    fh.seek(pos)
+                    data = fh.read(read_size)
+                    chunks.append(data)
+                    newlines += data.count(b"\n")
+                    chunk_size *= 2
+            text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+            if pos > 0 and "\n" in text:
+                # The read window opened mid-line: that fragment is not a record.
+                text = text.split("\n", 1)[1]
+            lines = [line for line in text.split("\n") if line.strip()][-max_lines:]
 
             owned: list = []
             for line in lines:
