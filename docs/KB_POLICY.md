@@ -117,6 +117,37 @@ This replaces the earlier "treat a tracked KB file as an accident, never as a
 precedent" formulation. The conclusion is unchanged; the resolution is now
 recorded instead of pending.
 
+### Carve-out: the onboarding contract set (2026-10-24, Gen 49, ruled by Main Gen 39)
+
+The section above says the public/private split is DEFERRED, and that the
+tracked KB files are drift, not intent. That remains true of the accidental
+tracking. It is not true of the seven files below, which are a deliberate
+decision.
+
+**The onboarding contract set is tracked, by intent, so a seat can be
+onboarded from a clone.** The KB is the machine's memory. Memory must survive
+the machine, or the machine forgets every time the tree is cloned.
+
+The seven files:
+
+- `.thoughtmachine/knowledge/project/MANDATORY_STOP.md`
+- `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md`
+- `.thoughtmachine/knowledge/project/working_agreements.md`
+- `.thoughtmachine/knowledge/project/security_architecture.md`
+- `.thoughtmachine/knowledge/project/status.md`
+- `.thoughtmachine/knowledge/personal/handoffs.md`
+- `.thoughtmachine/knowledge/project/operator_observations.md`
+
+The rest of `.thoughtmachine/knowledge/` remains untracked, and the
+public/private split remains deferred for it.
+
+The set carries a size discipline: files in it are read on entry, so they
+carry a size budget. A growing file splits into a dated file or moves closed
+sections to an archive rather than appending indefinitely. The onboarding
+contract is memory that migrates across seats, and a memory that grows
+without bound does not migrate. A seat that hands off a 500 kB entry set is
+not carrying the memory; it is burying it.
+
 ## Rules of thumb
 
 - **Dated findings → Internal.** Anything that will be wrong in three months
