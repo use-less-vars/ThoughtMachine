@@ -74,6 +74,69 @@ def _migrate_legacy_git_execution_mode(agent_config: Optional[dict]) -> None:
         )
 
 
+#: Environment variables EVERY git invocation pins, on BOTH execution paths.
+#: They are the hardening floor, not configuration: a session-supplied
+#: ``git_environment`` entry is layered UNDER them by
+#: :func:`merge_git_environment`, so the seam can never disable e.g. the null
+#: system gitconfig.
+GIT_ENV_PINS: dict = {
+    "GIT_PAGER": "cat",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+}
+
+
+def normalize_git_environment(git_environment: Any) -> dict:
+    """Return a validated ``{plain str: plain str}`` copy of a seam mapping.
+
+    One normaliser for the whole seam: the setter writes through it and BOTH
+    read paths (host and container) read through it, so an entry is either
+    accepted everywhere or dropped everywhere -- the two backends cannot drift
+    on what a session is allowed to configure.
+
+    A non-mapping value (``None``, a string, a list) yields ``{}``.  An entry
+    whose key or value is not an exact ``str`` is dropped rather than
+    stringified: this dict becomes part of a child process environment, and
+    ``str(Secret)`` is a mask, so coercing a ``Secret`` would hand git ``***``.
+    Only the offending key NAME is logged, never a value.
+
+    Args:
+        git_environment: The raw seam value, typically
+            ``agent_config["git_environment"]``.
+
+    Returns:
+        A new ``dict``; never the caller's mapping.
+    """
+    if not isinstance(git_environment, dict):
+        return {}
+    normalized: dict = {}
+    for key, value in git_environment.items():
+        # ``type(...) is str``, not ``isinstance``: ``Secret`` IS a str subclass
+        # and forwards cleanly here, only to collapse to its mask inside the
+        # child environment. Exact type keeps the seam mask-free.
+        if type(key) is str and type(value) is str:
+            normalized[key] = value
+        else:
+            logger.warning(
+                "Ignoring invalid git_environment entry (key=%r, type=%s); "
+                "only plain str keys and values are forwarded to git",
+                key if isinstance(key, str) else type(key).__name__,
+                type(value).__name__,
+            )
+    return normalized
+
+
+def merge_git_environment(git_environment: Any) -> dict:
+    """Return the child-env additions: the seam layered UNDER the pins.
+
+    ``GIT_ENV_PINS`` are applied LAST, so a session-supplied entry for the same
+    key loses.  This is the single place the composition rule lives; both
+    ``_exec_host_raw`` and ``_exec_container_raw`` call it.
+    """
+    merged = normalize_git_environment(git_environment)
+    merged.update(GIT_ENV_PINS)
+    return merged
+
+
 def resolve_git_execution_mode(
     agent_config: Optional[dict],
     workspace_metadata: Optional[dict],
@@ -840,6 +903,52 @@ class GitReadTool(ToolBase):
             f"GitReadTool: containerized git execution unavailable: {detail}"
         )
 
+    def _git_environment(self) -> dict:
+        """Read half of the ``git_environment`` seam.
+
+        Reads ``agent_config["git_environment"]`` -- the key the container path
+        has always consulted -- through :func:`normalize_git_environment`.  A
+        missing ``agent_config`` (legacy/direct callers) or a non-mapping seam
+        reads as ``{}``, so no entry is ever guessed at.
+        """
+        config = getattr(self, "agent_config", None)
+        if not isinstance(config, dict):
+            return {}
+        return normalize_git_environment(config.get("git_environment"))
+
+    def set_git_environment(self, git_environment: Optional[dict]) -> dict:
+        """Write half of the ``git_environment`` seam (W3b).
+
+        ``git_environment`` stops being inert here (design L63): the setter
+        stores the mapping under ``agent_config["git_environment"]``, the same
+        key ``_exec_container_raw`` already read, so a value set once is seen
+        by both the host and the container path.
+
+        Entries are normalised BEFORE they are stored, so an invalid entry (a
+        ``Secret`` value, a non-``str`` key) is refused at write time instead of
+        becoming a silent no-op -- or a mask -- at read time.  An empty/absent
+        mapping clears the seam.  The hardening pins are applied at READ time by
+        :func:`merge_git_environment` and always win, so this seam can never
+        weaken the git invocation.
+
+        Args:
+            git_environment: Mapping of extra env vars for the git process, or
+                ``None``/empty to clear the seam.
+
+        Returns:
+            The normalised mapping that is now stored (``{}`` when cleared).
+        """
+        config = getattr(self, "agent_config", None)
+        if not isinstance(config, dict):
+            config = {}
+            self.agent_config = config
+        normalized = normalize_git_environment(git_environment)
+        if normalized:
+            config["git_environment"] = normalized
+        else:
+            config.pop("git_environment", None)
+        return dict(normalized)
+
     def _identity_config_args(self) -> List[str]:
         """Return the staged ``-c`` argv pairs for the commit identity.
 
@@ -953,10 +1062,10 @@ class GitReadTool(ToolBase):
             cwd=str(repo_root),
             timeout=timeout,
             required_category=required_category,
-            extra_env={
-                "GIT_PAGER": "cat",
-                "GIT_CONFIG_SYSTEM": "/dev/null",
-            },
+            # The git_environment seam, merged UNDER the hardening pins (W3b):
+            # the host path used to hardcode these two keys and ignore the
+            # seam entirely, which is exactly the inert gap design L63 names.
+            extra_env=merge_git_environment(self._git_environment()),
         )
         return (result.returncode, result.stdout, result.stderr)
 
@@ -1050,16 +1159,9 @@ class GitReadTool(ToolBase):
         # boundary; hooks are restricted to the workspace .githooks dir via
         # the core.hooksPath override above (unlike the host path, which
         # neutralizes hooks entirely).
-        environment = {
-            "GIT_PAGER": "cat",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-        }
-        agent_config = getattr(self, "agent_config", None) or {}
-        git_env = agent_config.get("git_environment")
-        if isinstance(git_env, dict):
-            for key, value in git_env.items():
-                if isinstance(key, str) and isinstance(value, str):
-                    environment[key] = value
+        # Same seam, same normaliser and same hardening pins as the host path
+        # (W3b): the two backends must not drift on what a session may set.
+        environment = merge_git_environment(self._git_environment())
 
         # EOL policy: system gitconfig is nulled (GIT_CONFIG_SYSTEM=/dev/null),
         # so on Windows a system core.autocrlf=true would be silently dropped and
