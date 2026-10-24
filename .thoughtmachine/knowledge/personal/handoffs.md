@@ -539,3 +539,166 @@ STATE 2026-10-23 (post-#179-merge). **PR #179 MERGED.** `dev = 5abd2e47` = "Merg
 - Ticket `.thoughtmachine/working_docs/ticket-bug-paginate-tool-bypasses-required-categories.md` lives on branch `docs/gen48-paginate-gate-bypass` (`400b7de4`), NOT on the fix branch. Both branches still need operator push/PR/merge.
 
 **#153 / `d776f454` ("refuse to start on non-loopback bind") — VERIFIED first-hand, with a correction to prior belief:** it is a **refusal-by-default with an escape hatch**, not an invariant. `_validate_bind_host()` runs in `main()` after parse and `SystemExit(2)`s on a non-loopback `--host`/`HOST`, but `--allow-remote-bind` (default off) waives it and prints a stderr WARNING. Same commit added a *peer-address* gate (`_localhost_only`) on `/health`, `/api/health`, `/api/health/containers` only — its own commit body concedes this cannot stop proxied exposure, and `/api/system/health` was left untouched. So the localhost-only claim still needs the entry-point test before it can be doctrine (Block D / ruling 3).
+
+## 2026-10-23 — GEN 48 → GEN 49 HANDOFF
+
+**Read this first, then `project/status.md`.** Unlike Gen 47 there is no continuity gap to
+declare: the entry immediately above this one is Gen 47's handoff and it is still accurate
+about Gen 47. What it is not accurate about is anything after `75f51e25`, which is all of
+Gen 48. Treat its *Where the tree actually is* section as history.
+
+### Where the tree actually is
+
+`dev` = **`cf10c358`** (#189). Working branches, all local, none pushed, none reviewed:
+`docs/gen48-onboarding-contract-tracked` @ `65aac9e2`, `docs/gen48-container-base-ticket`
+@ `11782051` (stacks on the first), `docs/gen48-status-and-handoffs` (this commit).
+
+**`git rev-parse dev`, every time.** Gen 47 wrote that rule down because a note in this file
+had carried the *branch* tip as `dev HEAD` for hours. Gen 48 hit the same trap from the
+other side: while these close-out branches were checked out, `git log`'s first line was the
+branch, not `dev`. The rule did not stop the mistake from being available; it only stopped
+it from being written down.
+
+Two facts about the merge sequence that look like errors and are not. **No commit carries
+#167** — the same gap Gen 47 recorded for #160. And **merge order is not PR order**: #176
+landed before #175, #186 landed after #188. Both were read off the first-parent chain, so
+the status table is in true merge order, not numeric order.
+
+### What landed (Gen 48)
+
+Twenty-two PRs, #168 → #189. The three that changed the shape of the codebase:
+
+- **The wrapper class is gone** (#181, #182, #184, #185, #189). `PaginateTool` declared
+  `required_categories = ["filesystem:read"]` and then constructed and ran *any* class in
+  `tools.TOOL_CLASSES` on the caller's behalf — the executor gated the wrapper and never
+  the tool the wrapper ran. RED evidence before the fix: a filesystem-only profile really
+  did construct `ContainerRemoveTool` and `HostBashTool`. Two controls were written first
+  (`0c125856`); then the wave concluded the controls were the wrong shape and deleted the
+  tool (`4a4bd692`). The census that followed found thirteen more sites (#185); letters
+  (b) and (c) are burned down in `d4bc1e35`.
+- **`credential` is the eighth permission grain** (#171, #179, #177). Store reconciled onto
+  `vault_root` with a global scope, grain added with three audit events, stale permission
+  literals swept. Read the caveat in this entry's *What is broken* before describing it as
+  audited.
+- **The `workspace_id` scope leaks closed** (#172, #175, #178, #177). Open-session tabs
+  bucketed by owning workspace; `WorkingDocument` `doc_id` contained; the per-worker
+  unsubscribe guarded against foreign-session completions; executor config made to always
+  win over a caller-supplied `workspace_path`.
+
+Then the documents, which are the rest of the list and are not filler: #180 filed the tool
+resource contract, the worker job lifecycle and the agent role control as **one cluster** —
+what runs, how it returns, who calls it, converging on one handle-state-timeout model —
+because three separate tickets would have produced three incompatible answers. #170 is the
+workspace isolation matrix. #173 and #169 closed two logging and eventing leaks found while
+reading something else.
+
+### What this seat learned — five relay errors
+
+1. **A ticket title is a load-bearing artifact, and the operator's premise can be false.**
+   Task 2 arrived as "`_ContainerControlBase` is registered as a tool". It is not — 37
+   registry members, `get_tool_class` → `None`, `ImportError` on the direct import. The
+   ticket was filed with its **title amended before commit**, because a title asserting a
+   fact gets quoted later as the fact. Rule: verify a premise before writing the document
+   that will be cited as its proof, and if the premise is wrong, say so in the artifact
+   itself, not only in the covering note that nobody re-reads.
+2. **A `.gitignore` negation can be vacuous and still look correct.** The literal
+   instruction `!.thoughtmachine/knowledge/personal/handoffs.md` would have added nothing:
+   `personal/` is a *directory* exclusion, git never descends, the negated line matches no
+   path, and the file stays untracked. Three lines were needed (negate the directory,
+   re-ignore its contents, re-include the file). This is the **same failure shape** as the
+   guard that scanned zero files while its tests passed. Rule: after any ignore-rule
+   change, `git status` must be **empty** — a rule that changes nothing is the bug.
+3. **A file pattern and a directory pattern are not the same negation problem.**
+   `project/**/*.md` is a *file* pattern, so a bare `!file` works and git still descends
+   into `project/`. `personal/` is a *directory* exclusion and nothing under it can be
+   re-included. Two visually similar rules, one requiring a directory negation and one not.
+   One rule, two shapes, decided by a character.
+4. **A generic class name matches everywhere.** Grepping `TOOL_CLASSES` hits
+   `.thoughtmachine/working_docs/tool_no_wrapping_guard.py` and a multi-hundred-KB `.json`;
+   grepping `_ContainerControlBase` hits the base, its import block and nine subclasses.
+   Rule: exclude `working_docs/*.py` and `*.json` from registry greps, or you will "find"
+   mutation sites that are string literals.
+5. **The cheapest independent verification is a second worker told to break the first.**
+   The claim being checked was going to contradict the operator's own instruction, so one
+   read was not enough. The second worker's entire brief was *"your job is to try to break
+   it"*. Two agreeing reads — one ordinary, one adversarial — are what made it safe to
+   report the premise false rather than quietly widen the ticket to fit it.
+
+### What this seat got right — three patterns to keep
+
+1. **Prove the edit was surgical, with an oracle the edit did not touch.** A 1195-byte
+   `.gitignore` append and a one-line title amendment were both verified by reporting line
+   count before and after, the single changed line, and an independent reconstruction of
+   the diff. For Task 3 the insertion is provable the same way: `wc -l`, byte delta equal
+   to the byte length of the inserted block, `head -1` unchanged, and `grep -c '^---$'`
+   still 2.
+2. **An empty `git status` is an assertion, and it was the only one available.** Task 1 had
+   two claims to make — the seven files are tracked, and the rest of `personal/` is still
+   ignored. Staging proves the first; only an empty status proves **both**, because a
+   residual `??` would have meant the re-ignore did not hold. Reach for the strongest
+   single command, not the pile of weak ones.
+3. **Write the contradiction into the artifact instead of around it.** Task 1 makes
+   `docs/KB_POLICY.md` false as written. It would have been easy to leave that for the PR
+   conversation. It is in the commit message, in the status block, and in this entry,
+   because the next seat reads files and does not read PR threads.
+
+### What the next seat inherits
+
+**Blocked on the operator, do not attempt:** pushing the three branches, opening PRs,
+reading CI. The agent has no `push`, no `gh`, no CI access. `git write` here has no branch
+delete, no reset and no amend, and `branch_create` always bases on the *current* HEAD — so
+creating a branch off an earlier commit means checking that branch out first.
+
+**Needs an operator ruling before anyone acts:** the `docs/KB_POLICY.md` amendment. As
+written, L110-111 forbids exactly what `65aac9e2` did, and L112-114 forbids citing the
+tracked set as evidence of intent in any document *including that one*. The minimal
+amendment is a decided carve-out naming the seven files, replacing the "DEFERRED, not
+decided" block. Do not edit `KB_POLICY.md` unilaterally; it is a policy document, and a
+seat that rewrites policy to match its own commit has inverted the order of authority.
+
+**Open and unowned:** the registry membership invariant (nothing iterates `TOOL_CLASSES` to
+assert every member overrides `execute` or that no underscore class is a member — a base
+class could be appended tomorrow with a green suite); census phase 3 (B1 `GitWriteTool` into
+a non-tool module, 39 of 91 closures call no `super()`; B2 `code_modifier_utils.py` into 11
+free functions, 0 self-writes); eleven non-test modules that import `TOOL_CLASSES` directly;
+eleven client-claim findings awaiting a keep-or-delete ruling, one of which
+(`--allow-remote-bind`) is now partly answered by `d776f454`.
+
+**Standing disciplines, and the new ones:**
+- `host_bash` is unavailable in this session. Workers reach the tree through the Docker
+  code runner against the `/workspace` mount. The worker **cannot run git** — git is not in
+  the runner image either, so every git answer must come from the orchestrator's own read
+  tools. Design worker briefs accordingly: they can edit and grep, they cannot diff against
+  HEAD.
+- Never `git ls-tree -r` on this repo. `status` and `diff --cached` are cheap and decisive;
+  the recursive tree listing is tens of thousands of tokens for a question you did not ask.
+- Never grep `.thoughtmachine` unscoped, and never grep the registry without excluding
+  `working_docs/*.py` and `*.json`.
+- `personal/*` is append-only. Correct by appending a dated correction. This entry follows
+  that rule and so must yours.
+- A tool-interface quirk worth knowing before it costs you a turn: multi-path staging and
+  commit reject a **one-element** path array; passing the same path twice works, because
+  git dedupes pathspecs.
+
+### What is broken
+
+- **`docs/KB_POLICY.md` contradicts the tree.** Not "stale" — contradictory. It forbids the
+  seven files that now ship. Ruling owed.
+- **Ten accidentally-tracked KB blobs remain tracked.** `gitignore` does not untrack, and
+  `git rm --cached` was deliberately dropped in Gen 47 and stays dropped. They are drift;
+  the seven are intent; the difference is not visible in `git ls-files`.
+- **No registry invariant test.** The container-base ticket files this at severity LOW and
+  proposes the test; the test does not exist yet.
+- **A filed ticket cites a deleted file.** `ticket-bug-paginate-tool-bypasses-required-categories.md`
+  points at `tools/paginate_tool.py:98/102-105/115-116`, deleted in `4a4bd692`. Recorded in
+  the container-base ticket rather than silently repaired, because a filed ticket is a
+  historical document.
+- **Credential events are observed, not audited.** `CREDENTIAL_USE/ROTATED/DELETED` emit,
+  are tested, and are not in `event_class_map`, have no subscriber, and do not reach the
+  tenant event log. Say "observed".
+- **A pre-existing pydantic warning** at `tools/container_control.py:169` — the field name
+  `name` shadows an attribute in the parent. Unrelated to anything above; noted so it is
+  not re-discovered as new.
+- Everything else not already ticketed lives in `brain_pour_2026-10-21.md`. If you close one
+  of its thoughts, close it there too, so the next seat's reading gets shorter instead of
+  longer.

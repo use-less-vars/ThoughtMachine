@@ -1,5 +1,155 @@
 # ThoughtMachine -- Status
 
+Updated: 2026-10-23, Gen 48 close-out seat. **Gen 48 is closed. Everything this generation produced after `cf10c358` is local, unpushed and unreviewed.**
+
+**dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
+  burn down census letters (b) and (c), add registry accessors, fix the guard's
+  vacuous scan)
+**Landed since the Gen-47 reading, in merge order:** `75f51e25` (#166) →
+  `cb5d2279` (#168) → `75d992cb` (#169) → `f24648e6` (#170) → `2fde54f8` (#171) →
+  `6b392f44` (#172) → `4d6c608d` (#173) → `12fe3bbc` (#174) → `892d2780` (#176) →
+  `a5dadaaa` (#175) → `b6382aeb` (#177) → `bc8c7700` (#178) → `5abd2e47` (#179) →
+  `e7ff09b8` (#180) → `f08ae63a` (#181) → `9ef9cfd0` (#182) → `5ad00aec` (#183) →
+  `09a06495` (#184) → `c0749fc7` (#185) → `3379d68c` (#187) → `531da1e2` (#188) →
+  `b519532d` (#186) → `cf10c358` (#189).
+  Two things about that chain are recorded rather than smoothed: **no commit on
+  `dev` carries #167** (Gen 47 recorded the same shape for #160), and **merge order
+  is not PR order** — #176 landed before #175, and #186 landed after #188.
+**In flight:** none on `dev`. Three branches sit on top of it, all unpushed, all
+  awaiting the operator's host terminal: `docs/gen48-onboarding-contract-tracked`
+  @ `65aac9e2`; `docs/gen48-container-base-ticket` @ `11782051` (created on top of
+  the first, so it stacks); `docs/gen48-status-and-handoffs` (this commit).
+**Verified how:** `git rev-parse dev` = `cf10c35892c0145f2b00fb52c2296b668952b116`.
+  Every SHA above was read from the local object DB of the `dev` first-parent
+  chain, in the order the merges appear on that chain. No `fetch` was run from this
+  seat — remote-tracking refs are last-fetch state, not a live probe of `origin`.
+
+*(2026-10-22 reading, kept because it was true when written: updated 2026-10-22,
+bookkeeping seat (chunk B) — "The isolation wave is merged; the long tail is still
+indexed"; **dev HEAD** `75f51e25` (#166, gen-47 KB write); **in flight** none.)*
+
+## The generation in one line
+
+Gen 48 **deleted a tool instead of patching it.** `PaginateTool` declared
+`required_categories = ["filesystem:read"]` and then constructed and ran any class
+in `tools.TOOL_CLASSES` on the caller's behalf, because the executor gated the
+wrapper and never the tool the wrapper ran. Two controls were written first
+(`0c125856`). Then the wave concluded the controls were the wrong shape and removed
+the tool (`4a4bd692`), and the census that followed found the same wrapper pattern
+in thirteen more places (#185, burned down in #189). Around that: `credential`
+became the eighth permission grain (#179), and the last of the `workspace_id` scope
+leaks closed (#171, #172, #175, #177, #178).
+
+## Waves merged this generation (#168 → #189)
+
+Twenty-two PRs. No commit carries **#167**, the same gap Gen 47 recorded for #160.
+
+| PR | Branch | Merge SHA |
+|---|---|---|
+| #168 | `docs/gen48-bookkeeping` — macOS preflight coverage gap; `CAPABILITIES` §6 CI polarity corrections; `host_bash` asks twice under `ask`; worker panel drops tool calls (stale bus subscription, never retried); cross-test pollution | `cb5d2279` |
+| #169 | `fix/worker-panel-payload-drop` — re-bind the per-worker event bus on respawn, bounded retry, visible degradation; carries the `EventBus.subscribe()` listener-leak ticket | `75d992cb` |
+| #170 | `design/workspace-isolation-matrix` — design pass, doc only, not a gate | `f24648e6` |
+| #171 | `fix/w0-credential-store-reconciliation` — credential store reconciled onto `vault_root`, global scope added | `2fde54f8` |
+| #172 | `fix/open-sessions-workspace-bucketing` — open-session tabs bucketed by owning workspace | `6b392f44` |
+| #173 | `fix/w1-session-sink-redaction` — GitHub fine-grained PATs redacted; secrets redacted on both session-sink write paths | `4d6c608d` |
+| #174 | `docs/gen48-kb-carryover` — Gen-47 audit readers guide, corrections, stub-heading repairs | `12fe3bbc` |
+| #176 | `fix/ci-docker-hub-rate-limit` — anonymous Docker Hub limits no longer break `unit-tests` | `892d2780` |
+| #175 | `fix/w1-w2-working-doc-and-paginate-scope` — `WorkingDocument` `doc_id` contained; `PaginateTool` stops dropping tool context | `a5dadaaa` |
+| #177 | `fix/w8-executor-workspace-path-authority` — executor config always wins over a caller-supplied `workspace_path` | `b6382aeb` |
+| #178 | `fix/worker-panel-cross-session-unsubscribe` — per-worker unsubscribe guarded against foreign-session completions | `bc8c7700` |
+| #179 | `feat/w2-credential-resource` — `credential` as the eighth permission grain, plus three audit events | `5abd2e47` |
+| #180 | `docs/gen48-job-primitive-cluster` — tool-resource contract, worker job lifecycle, agent role control filed as **one cluster**, plus `hygiene/worker-silent-timeout` | `e7ff09b8` |
+| #181 | `docs/gen48-paginate-gate-bypass` — the CRITICAL `required_categories` bypass ticket | `f08ae63a` |
+| #182 | `fix/paginate-tool-gate-bypass` — wrapped tool authority re-gated; control-plane targets refused | `9ef9cfd0` |
+| #183 | `docs/gen48-vault-ownership-manifest` — vault ownership manifest | `5ad00aec` |
+| #184 | `fix/delete-paginate-tool` — **`PaginateTool` deleted**; the wrapper pattern is the defect | `09a06495` |
+| #185 | `docs/gen48-no-tool-wrapping` — the no-tool-wrapping ticket with its 13-site census | `c0749fc7` |
+| #187 | `docs/gen48-workspace-id-validation` — the unvalidated `workspace_id` ticket | `3379d68c` |
+| #188 | `docs/gen48-session-attribution` — session/workspace attribution unresolved | `531da1e2` |
+| #186 | `docs/gen48-paginate-residuals` — two residuals added to the paginate ticket | `b519532d` |
+| #189 | `fix/census-burn-down-no-tool-wrapping` — census letters (b) and (c) burned down, registry accessors added, the guard's vacuous scan fixed | `cf10c358` |
+
+## In flight (local, unpushed): the three close-out branches
+
+All three are on top of `cf10c358`. None has a PR. None has been through CI.
+
+1. **`docs/gen48-onboarding-contract-tracked` @ `65aac9e2`** — nine `.gitignore`
+   lines and seven newly tracked KB files, so a seat can be onboarded from a clone.
+   `MANDATORY_STOP.md` had never been in git. **The PR body must disclose that this
+   contradicts `docs/KB_POLICY.md` as written** — see *Ruled this generation*, item 3.
+2. **`docs/gen48-container-base-ticket` @ `11782051`** — a 76-line ticket. It was
+   created at `65aac9e2`, so it **stacks on branch 1**; its PR should target branch 1
+   or wait for branch 1 to merge.
+3. **`docs/gen48-status-and-handoffs`** — this block and the Gen 48 → Gen 49 handoff.
+
+## Next (Gen 49)
+
+1. **Push the three branches.** Nothing else in this section can be verified until
+   they exist on `origin`. The agent cannot push, open a PR, or read CI.
+2. **Amend `docs/KB_POLICY.md`** — operator ruling needed, see item 3 under *Ruled*.
+   Until it lands, the policy document forbids the tree.
+3. **Add the registry membership invariant** — the one thing the container-base
+   ticket actually asks for. Nothing today iterates `TOOL_CLASSES` to assert that
+   every member overrides `execute` and that no underscore-prefixed class is a
+   member. `_ContainerControlBase` is not abstract and would be accepted silently.
+4. **Census phase 3** — B1: `GitWriteTool` into a non-tool module (39 of 91 closures
+   call no `super()`); B2: `code_modifier_utils.py` into 11 free functions (0
+   self-writes). Eleven non-test modules still import `TOOL_CLASSES` directly.
+5. **The operator's 2026-10-23 dispatch shape**, already on record in
+   `personal/handoffs.md`: scoping wave → credential/env/push waves → **the CI loop**
+   (the first shape where the agent builds without the operator in the per-step
+   loop) → job primitive → overnight runs. The CI loop depends on push capability
+   landing; the waves before it are not optional.
+6. **Client-claim corpus** — 11 findings still awaiting a keep-or-delete ruling.
+   One of them (`--allow-remote-bind`) is now partly answered; see *Ruled*, item 5.
+
+## Ruled this generation (do not re-litigate)
+
+- **The wrapper pattern is the defect, not the wrapper's gate.** `PaginateTool` was
+  deleted (`4a4bd692`) rather than gated a third time. A meta-tool that constructs
+  from the registry on the caller's behalf is the shape, and the shape is wrong. The
+  13-site census of the same pattern is #185; letters (b) and (c) are burned down in
+  `d4bc1e35`.
+- **Credential events are observed, not audited.** `CREDENTIAL_USE`, `CREDENTIAL_ROTATED`
+  and `CREDENTIAL_DELETED` emit and are tested, but are **not** in `event_class_map`,
+  have **no subscriber**, and are **not** routed to the tenant event log. Do not
+  soften this to "audited" in any document until a subscriber exists.
+- **The onboarding contract set is tracked deliberately — and the policy is now the
+  stale document.** Seven KB files are tracked on purpose so a seat can be onboarded
+  from a clone. `docs/KB_POLICY.md` still says the opposite in as many words: L110-111
+  reads "**Do not add more.** A new file under `.thoughtmachine/knowledge/` stays
+  untracked. No exceptions, no 'it's useful for PR review'", and the tier table marks
+  both Internal and Diary as `.gitignore`. **This is a written-policy contradiction
+  created on 2026-10-23 and it needs an operator amendment, not silent drift.** This
+  also partly supersedes the Gen-47 ruling below it ("tracked KB files are drift, not
+  policy"): the ten accidentally-tracked blobs are still drift, but the seven
+  contract files are now intent. `git rm --cached` of the ten remains **dropped** —
+  that half of the Gen-47 ruling stands.
+- **`_ContainerControlBase` is not a registered tool.** The premise that prompted
+  its ticket is false, verified twice by independent reads (one of them adversarial):
+  `len(TOOL_CLASSES)` = `len(SIMPLIFIED_TOOL_CLASSES)` = 37, membership `False` in
+  both, `get_tool_class('_ContainerControlBase')` → `None`,
+  `from tools import _ContainerControlBase` → `ImportError`. No dynamic registration
+  exists anywhere (`__subclasses__`, `inspect.getmembers`, `getmembers_static`,
+  `pkgutil`, `entry_points`, `iter_modules`, bare `import *` — all zero hits). The
+  real defect is that the base is **not abstract** (`__abstractmethods__` is
+  `frozenset()`, `execute()` is a plain `raise NotImplementedError` with an empty
+  message) and that **no registry invariant test exists**. Severity LOW.
+- **`--allow-remote-bind` is a refusal-by-default with an escape hatch, not an
+  invariant** (`d776f454`, #153). `_validate_bind_host()` exits 2 on a non-loopback
+  host, but the flag waives it and prints a warning. The commit's own peer-address
+  gate covers `/health`, `/api/health` and `/api/health/containers` only, and its body
+  concedes it cannot stop proxied exposure. `/api/system/health` was left untouched.
+- **The turn limit is orthogonal to run duration** (operator directive, 2026-10-23).
+  The turn limit is operator-controlled and raisable. What the operator cannot
+  control is run duration, and the cause is the **blocking tool call**, not the turn
+  count. Raising the turn limit fixes nothing. The job primitive targets run
+  duration. Two cheap partials first: name the return reason in the worker return
+  path (`hygiene/worker-silent-timeout`), and on this side treat
+  `elapsed_seconds ≈ timeout_seconds` as the signal to shrink scope.
+
+# Previous session (Gen 47)
+
 Updated: 2026-10-22, bookkeeping seat (chunk B). **The isolation wave is merged; the long tail is still indexed.**
 
 **dev HEAD:** `75f51e25` (merge of #166 — docs: gen-47 KB write: KB_POLICY ruling
