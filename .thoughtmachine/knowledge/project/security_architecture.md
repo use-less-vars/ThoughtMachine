@@ -26,7 +26,7 @@ A claim that "the security boundary held" that collapses these four is itself th
 **The class pattern:** "structural blocklist ≠ call-time gate." If a mechanism exists only at construction/spawn, a wrapper that calls a different object at runtime is a bypass. Every tool named in a construction-time filter should also have a call-time refusal, or explain why not.
 
 **Instance history:**
-- `2026-10-23` — `PaginateTool` bypassed the executor's category gate: a default-permission session could call `PaginateTool(target="HostBashTool", ...)` and get host shell execution. Fixed in #182, deleted entirely in `fix/delete-paginate-tool`. Class rule above added; census of remaining tool-wrapping violations filed as `hygiene/no-tool-wrapping`.
+- `2026-10-23` — `PaginateTool` bypassed the executor's category gate: a default-permission session could call `PaginateTool(target="HostBashTool", ...)` and get host shell execution. Fixed in #182, deleted entirely in `fix/delete-paginate-tool`. Class rule above added; census of remaining tool-wrapping violations filed as `hygiene/no-tool-wrapping`. **No CI test enforces the rule today** — the guard is parked at `.thoughtmachine/working_docs/tool_no_wrapping_guard.py`, and the census is 13 at park, with letters (b) and (c) burned down in `cf10c358` (#189).
 - `2026-10-23` — `WorkingDocument` path traversal via `../` in `doc_id`; read any `.json` outside workspace. Fixed in #175 (`_resolve_doc_path`).
 - `2026-09-22` (`85035605`) — `.githooks/pre-commit` deleted on false premise (`.githooksPath` read from bare shell; container path sets it). Restore ticket `fix/restore-precommit-gate`.
 

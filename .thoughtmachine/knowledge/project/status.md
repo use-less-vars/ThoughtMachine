@@ -82,6 +82,22 @@ All three are on top of `cf10c358`. None has a PR. None has been through CI.
    or wait for branch 1 to merge.
 3. **`docs/gen48-status-and-handoffs`** — this block and the Gen 48 → Gen 49 handoff.
 
+## In flight: `fix/workspace-id-validation-and-d2-doctrine` @ `31d8b4c6`
+
+Two things on one branch, neither reviewed nor in CI.
+
+1. **The `workspace_id` validation fix.** `workspace_id` is validated at the
+   `_workspace_dir` choke point; the single-segment rule is extracted to
+   `thoughtmachine/validation.py` and shared with the credential validator; 52 new
+   tests.
+2. **The no-tool-wrapping correction.** The class rule is standing doctrine, but it
+   is **not CI-enforced**, and there is no `tests/test_tool_no_wrapping.py` — there
+   never was on this branch. The guard exists, parked and unactivated, at
+   `.thoughtmachine/working_docs/tool_no_wrapping_guard.py`, wired into no test run
+   and no workflow. The census is a point-in-time figure: 13 sites at park, 8 of
+   those (letters (b) and (c)) burned down in `cf10c358` (#189); the residual is
+   letter (a), recounted by nothing in CI.
+
 ## Next (Gen 49)
 
 1. **Push the three branches.** Nothing else in this section can be verified until
