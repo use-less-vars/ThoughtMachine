@@ -243,7 +243,7 @@ class TestHostBashFlagGate:
         from unittest import mock
         from tools.host_bash_tool import HostBashTool
 
-        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+        with mock.patch("tools.host_bash_tool.host_run") as mock_host_run:
             tool = HostBashTool(
                 command="echo hi",
                 effective_permissions={},  # no host_bash grain
@@ -257,13 +257,13 @@ class TestHostBashFlagGate:
         assert result["outcome"] == "denied"
         assert "not allowed (requires ask or allow)" in result["error"]
         assert result["permission_level"] == "banned"
-        mock_subprocess.run.assert_not_called()
+        mock_host_run.assert_not_called()
 
     def test_denied_when_grain_banned(self, tmp_path):
         from unittest import mock
         from tools.host_bash_tool import HostBashTool
 
-        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+        with mock.patch("tools.host_bash_tool.host_run") as mock_host_run:
             tool = HostBashTool(
                 command="echo hi",
                 effective_permissions={"host_bash": "banned"},
@@ -277,16 +277,23 @@ class TestHostBashFlagGate:
         assert result["outcome"] == "denied"
         assert "not allowed (requires ask or allow)" in result["error"]
         assert result["permission_level"] == "banned"
-        mock_subprocess.run.assert_not_called()
+        mock_host_run.assert_not_called()
 
     def test_executes_when_grain_allow(self, tmp_path):
-        from types import SimpleNamespace
         from unittest import mock
+        from thoughtmachine.host_port import HostRunResult
         from tools.host_bash_tool import HostBashTool
 
-        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
-            mock_subprocess.run.return_value = SimpleNamespace(
-                returncode=0, stdout="", stderr="")
+        with mock.patch("tools.host_bash_tool.host_run") as mock_host_run:
+            mock_host_run.return_value = HostRunResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=0,
+                timed_out=False,
+                argv=["bash", "-c", "echo hi"],
+                grain="host_bash",
+            )
             tool = HostBashTool(
                 command="echo hi",
                 effective_permissions={"host_bash": "allow"},
@@ -298,7 +305,7 @@ class TestHostBashFlagGate:
             result = json.loads(tool.execute())
         assert result["success"] is True
         assert result["outcome"] == "executed"
-        mock_subprocess.run.assert_called_once()
+        mock_host_run.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────
