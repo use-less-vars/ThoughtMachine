@@ -34,6 +34,7 @@ import pytest
 
 from thoughtmachine.host_port import (
     AUTHORIZED_VALUES,
+    CREDENTIAL_SHAPED,
     HostRunHandle,
     HostRunResult,
     host_run,
@@ -63,6 +64,9 @@ PRE_FIELDS = {
     "timeout",
     "cwd",
     "decision",
+    # W3a: the credential boundary is auditable from the PRE line alone.
+    "credential_inject",
+    "stripped_env_keys",
 }
 
 #: POST line fields, exactly as the contract lists them.
@@ -454,8 +458,13 @@ def test_host_run_timeout_writes_exit_code_minus_nine_to_audit(permitted):
 
 
 # ---------------------------------------------------------------------------
-# 12: credential-shaped env is refused (deferred to W3 credential injection)
+# 12: caller-supplied credential-shaped env is refused unless W3a opts in
 # ---------------------------------------------------------------------------
+#
+# With ``credential_inject=False`` (the default) this refusal is unchanged,
+# message included -- check (7) still stops a caller from smuggling a
+# credential-shaped key in by omission.  See section 19 for the opt-in path and
+# for the F-A closure (INHERITED credential-shaped keys).
 
 
 @pytest.mark.parametrize("key", CREDENTIAL_ENV_KEYS)
@@ -497,14 +506,21 @@ def test_host_run_rejects_empty_identity(permitted):
 
 
 # ---------------------------------------------------------------------------
-# 15: the async surface is a signature-only stub (W3)
+# 15: the async surface is a signature-only stub (no owning wave)
 # ---------------------------------------------------------------------------
+#
+# This test used to pin ``"W3" in str(excinfo)``.  That assertion encoded the
+# same wrong ownership claim the stub itself made: W3 is the credential env
+# plumbing (design_credential_resource.md L63), not async execution.  The pin
+# is now on the stub's own words instead of a wave label.
 
 
 def test_host_run_async_is_signature_only(permitted):
     with pytest.raises(NotImplementedError) as excinfo:
         host_run_async(_noop(), **permitted.kwargs())
-    assert "W3" in str(excinfo.value)
+    msg = str(excinfo.value)
+    assert "not implemented yet" in msg
+    assert "owned by W3" in msg
 
     assert isinstance(HostRunHandle, type)
     handle = HostRunHandle.__new__(HostRunHandle)  # bypass the unknown __init__
@@ -512,7 +528,9 @@ def test_host_run_async_is_signature_only(permitted):
         assert callable(getattr(handle, method))
         with pytest.raises(NotImplementedError) as excinfo:
             getattr(handle, method)()
-        assert "W3" in str(excinfo.value), method
+        msg = str(excinfo.value)
+        assert "not implemented yet" in msg
+        assert "owned by W3" in msg, method
 
 
 # ---------------------------------------------------------------------------
@@ -599,3 +617,206 @@ def test_host_run_writes_refusal_to_audit_log(permitted, monkeypatch):
     assert line["decision"] == "deny"
     assert line["grain"] == "host_bash"
     assert isinstance(line["reason"], str) and line["reason"]
+
+
+# ---------------------------------------------------------------------------
+# 19: W3a -- credential_inject and the F-A closure
+# ---------------------------------------------------------------------------
+#
+# F-A was ``merged_env = os.environ.copy()``: check (7) only ever inspected
+# CALLER-supplied keys, so a credential-shaped key inherited from the parent
+# environment reached the child unscanned.  ``credential_inject=False`` (the
+# default) now strips those keys and audits their NAMES; ``True`` forwards
+# them and records the bypass.
+
+#: A deliberately fake, non-functional credential value.  It is never a real
+#: secret and it is never printed: the probe child reports KEY NAMES only, so
+#: no env value can surface in a test failure message (addendum A4).
+FAKE_TOKEN_VALUE = "ghp_this_is_a_fake_value_0000"
+
+#: Child probe: prints the child's env KEY NAMES plus the names of any key
+#: whose VALUE looks like a token.  Names only -- no value is ever emitted.
+_ENV_PROBE = (
+    "import json, os\n"
+    "print(json.dumps({\n"
+    "    'names': sorted(os.environ),\n"
+    "    'tokenish': sorted(k for k, v in os.environ.items() if 'ghp_' in v),\n"
+    "}))\n"
+)
+
+
+def _child_env(sandbox, env=None, **overrides):
+    """Run the probe child; return ``(env key names, keys holding a token)``."""
+    result = sandbox.run(
+        [sys.executable or "python3", "-c", _ENV_PROBE], env=env, **overrides
+    )
+    assert result.exit_code == 0, result.stderr
+    probe = json.loads(result.stdout)
+    return set(probe["names"]), probe["tokenish"]
+
+
+#: Names the anchored ``CREDENTIAL_SHAPED`` pattern MUST match.  These are the
+#: shapes that actually carry a credential, including the plural
+#: ``CREDENTIALS`` form (``GOOGLE_APPLICATION_CREDENTIALS``) that the optional
+#: ``S?`` keeps covered.
+CREDENTIAL_SHAPED_MUST_MATCH = (
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_PAT",
+    "AWS_SECRET_ACCESS_KEY",
+    "GPG_KEY",
+    "MY_PASSWORD",
+    "CREDENTIALS_DIR",
+    "X_API_KEY",
+)
+
+#: Names it MUST NOT match.  ``PATH`` is the motivating regression: with the
+#: first cut -- the unanchored ``(TOKEN|SECRET|PASSWORD|KEY|PAT|CREDENTIAL)`` --
+#: the ``PAT`` alternative matched ``PATH``, so the W3a strip deleted ``PATH``
+#: from every child environment (``PYTHONPATH``, ``KEYBOARD_LAYOUT``,
+#: ``HOMEPATH`` and ``PATHEXT`` fell to the same false positives).  The pattern
+#: is now segment-anchored, so an alternative only matches a whole ``_``-or
+#: boundary-delimited segment.
+CREDENTIAL_SHAPED_MUST_NOT_MATCH = (
+    "PATH",
+    "PYTHONPATH",
+    "HOME",
+    "GIT_ASKPASS",
+    "GIT_CONFIG_COUNT",
+    "TMPDIR",
+    "KEYBOARD_LAYOUT",
+    "HOMEPATH",
+    "PWD",
+    "PATHEXT",
+)
+
+
+@pytest.mark.parametrize("key", CREDENTIAL_SHAPED_MUST_MATCH)
+def test_credential_shaped_matches_secret_names(key):
+    """Segment-anchoring must not lose any real credential name."""
+    assert CREDENTIAL_SHAPED.search(key)
+
+
+@pytest.mark.parametrize("key", CREDENTIAL_SHAPED_MUST_NOT_MATCH)
+def test_credential_shaped_does_not_match_path_or_common_vars(key):
+    """No false positives on ordinary variables (``PATH`` above all)."""
+    assert not CREDENTIAL_SHAPED.search(key)
+
+
+def test_host_run_strips_inherited_credential_shaped_env(permitted, monkeypatch):
+    """F-A closure: an INHERITED credential-shaped key never reaches the child."""
+    monkeypatch.setenv("GITHUB_TOKEN", FAKE_TOKEN_VALUE)
+
+    names, tokenish = _child_env(permitted)
+
+    assert "GITHUB_TOKEN" not in names
+    assert tokenish == []
+
+
+def test_host_run_preserves_path_for_the_child(permitted):
+    """The F-A strip must not cost the child its ``PATH``.
+
+    Regression: ``PAT`` inside the unanchored pattern matched ``PATH``, so the
+    strip removed it and every ``host_run`` child started with an empty ``PATH``.
+    """
+    probe = (
+        "import os, sys\n"
+        "sys.stdout.write(os.environ.get('PATH', '<unset>'))\n"
+    )
+
+    result = permitted.run(
+        [sys.executable or "python3", "-c", probe], credential_inject=False
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == os.environ.get("PATH", "<unset>")
+    assert result.stdout != "<unset>"
+
+
+def test_host_run_forwards_inherited_credential_shaped_env_when_injecting(
+    permitted, monkeypatch
+):
+    """The opt-in forwards the inherited key, so git can authenticate."""
+    monkeypatch.setenv("GITHUB_TOKEN", FAKE_TOKEN_VALUE)
+
+    names, tokenish = _child_env(permitted, credential_inject=True)
+
+    assert "GITHUB_TOKEN" in names
+    assert tokenish == ["GITHUB_TOKEN"]
+
+
+def test_host_run_forwards_caller_supplied_credential_env_when_injecting(permitted):
+    """A caller-supplied key refused under ``False`` is forwarded under ``True``."""
+    names, tokenish = _child_env(
+        permitted, env={"GITHUB_TOKEN": FAKE_TOKEN_VALUE}, credential_inject=True
+    )
+
+    assert "GITHUB_TOKEN" in names
+    assert tokenish == ["GITHUB_TOKEN"]
+
+
+def test_pre_audit_records_stripped_env_keys_and_credential_inject(
+    permitted, monkeypatch
+):
+    """The strip is auditable from the PRE line -- by NAME, never by value."""
+    monkeypatch.setenv("GITHUB_TOKEN", FAKE_TOKEN_VALUE)
+    expected_names = sorted(k for k in os.environ if CREDENTIAL_SHAPED.search(k))
+
+    permitted.run(_noop())
+
+    pre = permitted.audit_lines()[0]
+    assert pre["event"] == "pre"
+    assert pre["credential_inject"] is False
+    assert pre["stripped_env_keys"] == expected_names
+    assert "GITHUB_TOKEN" in pre["stripped_env_keys"]
+    assert FAKE_TOKEN_VALUE not in permitted.audit_path.read_text(encoding="utf-8")
+
+
+def test_pre_audit_records_credential_inject_true_and_no_strip(permitted, monkeypatch):
+    """``credential_inject: true`` is what makes the bypass auditable."""
+    monkeypatch.setenv("GITHUB_TOKEN", FAKE_TOKEN_VALUE)
+
+    permitted.run(_noop(), credential_inject=True)
+
+    pre = permitted.audit_lines()[0]
+    assert pre["credential_inject"] is True
+    assert pre["stripped_env_keys"] == []
+    assert FAKE_TOKEN_VALUE not in permitted.audit_path.read_text(encoding="utf-8")
+
+
+def test_secret_is_a_masked_str_subclass():
+    """A5's TRAP, pinned: ``Secret`` IS a ``str`` whose ``str()`` is ``***``.
+
+    There is no reveal accessor in ``agent/credentials/injector.py``; the value
+    survives only as the underlying ``str`` (``str.__str__(secret)``), which is
+    why ``host_run`` must refuse a ``Secret`` instead of coercing it.
+    """
+    from agent.credentials.injector import Secret
+
+    secret = Secret(FAKE_TOKEN_VALUE)
+
+    assert isinstance(secret, str)
+    assert str(secret) == "***"
+    assert repr(secret) == "***"
+    assert f"{secret}" == "***"
+    # The value is still there for programmatic use -- and for str.__str__().
+    assert secret == FAKE_TOKEN_VALUE
+    assert str.__str__(secret) == FAKE_TOKEN_VALUE
+
+
+def test_host_run_rejects_secret_env_values_under_credential_inject(permitted):
+    """Coercing a ``Secret`` would hand ``***`` to the child; refuse instead."""
+    from agent.credentials.injector import Secret
+
+    with pytest.raises(TypeError) as excinfo:
+        permitted.run(
+            _noop(), env={"GITHUB_TOKEN": Secret(FAKE_TOKEN_VALUE)},
+            credential_inject=True,
+        )
+
+    message = str(excinfo.value)
+    assert "plain str" in message
+    assert "GITHUB_TOKEN" in message
+    assert FAKE_TOKEN_VALUE not in message
+    assert "***" in message
+
