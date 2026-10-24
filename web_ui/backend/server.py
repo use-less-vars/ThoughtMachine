@@ -30,6 +30,15 @@ unless ``--allow-remote-bind`` is passed, and the health routes (``GET /health``
 ``/api/health``, ``/api/health/containers``) answer localhost callers only, so a
 server exposed on a non-loopback interface does not publish its health payload.
 
+Passing ``--allow-remote-bind`` is an auth decision, not a deployment
+setting.  This app has no auth layer -- no cookie, no Authorization header --
+so the auth boundary is the network boundary: with the flag off the only
+client is the operator's browser on loopback, and with it on every client
+that can route to the port is treated as the operator, which is false.  The
+loopback refusal exists to make that boundary an explicit decision rather
+than an assumption.  The localhost health gate covers three read-only routes
+only; it is not an auth layer and does not substitute for one.
+
 Or via provided run script:
     python -m web_ui.backend.server
 
@@ -3863,8 +3872,11 @@ def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> O
     exists to prevent, and nobody types it on purpose.
 
     *allow_remote* is the ``--allow-remote-bind`` escape hatch; it waives the
-    loopback requirement and nothing else.  Pure function: no printing, no
-    exiting, no argparse — the caller decides how loud to be and how to fail.
+    loopback requirement and nothing else.  Waiving it is an auth decision
+    rather than a deployment convenience: with the flag on there is no auth
+    layer, so every client that can route to the port is treated as the
+    operator, which is false.  Pure function: no printing, no exiting, no
+    argparse — the caller decides how loud to be and how to fail.
     """
     raw = "" if host is None else str(host).strip()
     if not raw:
@@ -5993,9 +6005,13 @@ def main():
     args = build_parser().parse_args()
 
     # F30(d): refuse to publish an unauthenticated API on a non-loopback
-    # interface.  A blanket refusal with no escape hatch gets deleted the first
-    # time someone needs a LAN demo; an explicit, greppable, loudly announced
-    # opt-in keeps that exception visible in the source and on stderr.
+    # interface.  Flipping the flag is an auth decision, not a deployment
+    # convenience: the auth boundary is the network boundary, and with the flag
+    # on there is no auth layer, so every client that can route to the port is
+    # treated as the operator, which is false.  The hatch exists anyway because
+    # a blanket refusal with no exception gets deleted the first time someone
+    # needs a LAN demo; an explicit, greppable, loudly announced opt-in keeps
+    # that decision visible in the source and on stderr.
     host_error = _validate_bind_host(args.host, allow_remote=args.allow_remote_bind)
     if host_error is not None:
         print(host_error, file=sys.stderr)
