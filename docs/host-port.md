@@ -2,11 +2,13 @@
 
 **Status: shipped, with one deferral and one known gap.** `thoughtmachine/host_port.py`
 exists, exports `host_run`, `host_run_async`, `HostRunResult`, `HostRunHandle`,
-`AUTHORIZED_VALUES` and `CREDENTIAL_SHAPED`, and is the only module in the tree allowed
-to spawn a host process. `tools/host_bash_tool.py` and the `event_log` read in
-`tools/workspace/check_system.py` are migrated. One stdio spawn in `tools/mcp_client.py`
-is deferred on the async primitive (section 11). One real hole -- inherited environment
-variables -- is described in section 7 and deliberately not fixed here.
+`AUTHORIZED_VALUES` and `CREDENTIAL_SHAPED`, and is the only module in `thoughtmachine/`
+and `tools/` permitted to spawn a host process -- a rule enforced by an AST scan over
+those two roots, with modules in other roots not yet covered. `tools/host_bash_tool.py`
+and the `event_log` read in `tools/workspace/check_system.py` are migrated. One stdio
+spawn in `tools/mcp_client.py` is deferred on the async primitive (section 11). One real
+hole -- inherited environment variables -- is described in section 7 and deliberately
+not fixed here.
 
 This document describes what the code does today. Where it disagrees with a comment in
 the source, the code and this document win, and the comment is a bug.
@@ -183,6 +185,10 @@ The scan's rules, as pinned today:
    so the exception cannot outlive its explanation.
 4. `tools/host_bash_tool.py` and `tools/workspace/check_system.py` -- the two modules
    migrated in this wave -- must import no `subprocess` at all.
+
+The scan's roots are `thoughtmachine/` and `tools/`; modules in other roots are outside
+it, and `import subprocess` exists today in `tests/`, `scripts/`, `infra/`, `security/`,
+`web_ui/`, `mcp_examples/` and the project root, so the gap is named rather than implied.
 
 That last rule is the reason the migration is checkable rather than merely claimed: the
 scan fails if a migrated module regrows the import.
