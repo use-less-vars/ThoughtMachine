@@ -3,8 +3,10 @@
 **Status: shipped, with one deferral and one known gap.** `thoughtmachine/host_port.py`
 exists, exports `host_run`, `host_run_async`, `HostRunResult`, `HostRunHandle`,
 `AUTHORIZED_VALUES` and `CREDENTIAL_SHAPED`, and is the only module in `thoughtmachine/`
-and `tools/` permitted to spawn a host process -- a rule enforced by an AST scan over
-those two roots, with modules in other roots not yet covered. `tools/host_bash_tool.py`
+and `tools/` that may import `subprocess` without a pinned exception; every other
+importer in those roots is on the scan's exception list (section 5), each with a
+named reason. The scan's roots are those two directories; modules in other roots
+are not yet covered. `tools/host_bash_tool.py`
 and the `event_log` read in `tools/workspace/check_system.py` are migrated. One stdio
 spawn in `tools/mcp_client.py` is deferred on the async primitive (section 11). One real
 hole -- inherited environment variables -- is described in section 7 and deliberately
