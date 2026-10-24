@@ -86,9 +86,23 @@ AUTHORIZED_VALUES: Dict[str, frozenset] = {
 }
 
 #: Env keys that look credential-shaped.  Check (7) refuses a CALLER-SUPPLIED
-#: key matching this pattern; keys inherited from the parent environment are
-#: forwarded as-is -- closing that is W3's ``credential_inject``, not this file.
-CREDENTIAL_SHAPED = re.compile(r"(TOKEN|SECRET|PASSWORD|KEY|PAT|CREDENTIAL)", re.I)
+#: key matching this pattern unless ``credential_inject=True``; inherited keys
+#: are stripped from the child environment under the same flag (W3a, the F-A
+#: closure: ``os.environ.copy()`` used to forward them unscanned).
+#:
+#: The alternatives are SEGMENT-anchored (``(?:^|_)`` ... ``(?:_|$)``) on
+#: purpose.  The first cut was the unanchored
+#: ``(TOKEN|SECRET|PASSWORD|KEY|PAT|CREDENTIAL)``: its substring semantics made
+#: ``PAT`` match ``PATH`` (also ``PYTHONPATH``, ``HOMEPATH``, ``PATHEXT``) and
+#: ``KEY`` match any ``*KEY*`` word (``KEYBOARD_LAYOUT``), so the strip
+#: silently deleted ``PATH`` from every child environment.  Anchoring to the
+#: ``_``/string boundary keeps the real shapes (``GITHUB_TOKEN``,
+#: ``X_API_KEY``, ``GITHUB_PAT``) without those false positives.  The trailing
+#: ``S?`` is load-bearing as well: it keeps the plural ``CREDENTIALS`` matching
+#: (``GOOGLE_APPLICATION_CREDENTIALS``, ``CREDENTIALS_DIR``).
+CREDENTIAL_SHAPED = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|KEY|PAT|CREDENTIAL)S?(?:_|$)", re.I
+)
 
 #: Audit trail filename (documented contract; the tests pin it).
 AUDIT_FILENAME = "host_port_audit.jsonl"
@@ -132,7 +146,7 @@ class HostRunResult:
 
 
 class HostRunHandle:
-    """Handle for an asynchronous host run -- **not implemented yet** (W3).
+    """Handle for an asynchronous host run -- **not implemented yet**.
 
     The synchronous :func:`host_run` is complete; the asynchronous surface is
     deliberately a signature-only stub so callers can be written against the
@@ -142,19 +156,22 @@ class HostRunHandle:
     def poll(self) -> "HostRunResult":
         raise NotImplementedError(
             "HostRunHandle.poll is not implemented yet: asynchronous host "
-            "execution lands in W3"
+            "execution is not owned by W3 (W3 is the credential env "
+            "plumbing) and has no owning wave yet"
         )
 
     def wait(self, timeout: Optional[float] = None) -> "HostRunResult":
         raise NotImplementedError(
             "HostRunHandle.wait is not implemented yet: asynchronous host "
-            "execution lands in W3"
+            "execution is not owned by W3 (W3 is the credential env "
+            "plumbing) and has no owning wave yet"
         )
 
     def kill(self) -> None:
         raise NotImplementedError(
             "HostRunHandle.kill is not implemented yet: asynchronous host "
-            "execution lands in W3"
+            "execution is not owned by W3 (W3 is the credential env "
+            "plumbing) and has no owning wave yet"
         )
 
 
@@ -532,6 +549,7 @@ def host_run(
     timeout: float = 60,
     cwd: Any = None,
     env: Optional[Mapping] = None,
+    credential_inject: bool = False,
     client_type: Optional[str] = None,
     effective_permissions: Optional[Mapping] = None,
     audit_dir: Any = None,
@@ -546,9 +564,27 @@ def host_run(
     4. the workspace operator kill switch ``allow_host_resources`` is JSON ``true``;
     5. the effective grant for ``grain`` is one of its authorized values;
     6. ``grain == "mcp"`` requires ``client_type == "mcp"``;
-    7. no supplied ``env`` key looks credential-shaped;
+    7. no supplied ``env`` key looks credential-shaped, unless
+       ``credential_inject=True``;
+    7b. every supplied ``env`` value is a plain ``str`` when
+       ``credential_inject=True`` (``TypeError``, not a refusal);
     8. ``cwd`` (default: the workspace root) resolves inside the workspace root;
     9. ``shell``/``command`` are a sane pair (``TypeError``, not a refusal).
+
+    ``credential_inject`` is the credential path's explicit opt-in, and it
+    gates BOTH sides of the credential boundary:
+
+    * caller-supplied credential-shaped keys are refused by check (7) when it
+      is ``False`` (unchanged behaviour, unchanged reason) and forwarded when
+      it is ``True``;
+    * INHERITED credential-shaped keys -- the ones check (7) never looked at --
+      are stripped from the child environment when it is ``False`` and their
+      NAMES are recorded in the PRE audit line under ``stripped_env_keys``;
+      when it is ``True`` they are forwarded and the PRE line records
+      ``credential_inject: true`` so the bypass is auditable.
+
+    Env VALUES are never written to the audit trail, a log, or an exception
+    message -- key NAMES only.
 
     Permitted calls are audited PRE/POST around the execution.  ``shell`` is
     off by default; a timed-out call kills the whole process group (SIGTERM,
@@ -658,7 +694,12 @@ def host_run(
         )
 
     # (7) no credential-shaped env ---------------------------------------
-    if env:
+    # ``credential_inject=True`` is the credential path's explicit opt-in: the
+    # caller has resolved the value from the vault (``CredentialInjector``)
+    # and passes it as a plain ``str``.  With the default ``False`` this
+    # refusal keeps its historical behaviour and message -- a caller cannot
+    # smuggle a credential-shaped key in by omission.
+    if env and not credential_inject:
         for key in env:
             if CREDENTIAL_SHAPED.search(str(key)):
                 _refuse(
@@ -669,6 +710,22 @@ def host_run(
                     grain=grain,
                     argv=preview,
                     audit_dir=audit_dir,
+                )
+
+    # (7b) credential_inject demands plain-str env values ----------------
+    # ``Secret`` is a ``str`` SUBCLASS whose ``__str__`` returns ``***``, so a
+    # bare ``isinstance(value, str)`` check would pass and the ``str(value)``
+    # coercion below would hand the mask to the child.  Reject anything that is
+    # not an exact ``str`` so the caller must unwrap deliberately.
+    if credential_inject and env:
+        for key, value in env.items():
+            if type(value) is not str:
+                raise TypeError(
+                    f"env value for key {key!r} must be a plain str when "
+                    f"credential_inject=True; got {type(value).__name__}. A "
+                    "Secret (a str subclass) stringifies to '***', so coercing "
+                    "it would send the mask instead of the credential -- "
+                    "unwrap it at the call site first."
                 )
 
     # (8) cwd containment -------------------------------------------------
@@ -685,6 +742,22 @@ def host_run(
     # (9) argv typing -----------------------------------------------------
     argv = _build_argv(command, shell)
 
+    # ── environment: the F-A closure (W3a) ───────────────────────────────
+    # ``os.environ.copy()`` forwards every INHERITED key to the child.  Check
+    # (7) only ever inspected CALLER-supplied keys, so a credential-shaped
+    # variable already present in the parent environment (an exported API
+    # token, a CI job token, a cloud secret key) reached the child unscanned.
+    # With ``credential_inject=False`` those keys are now removed from the
+    # copy and only their NAMES are audited; ``True`` forwards them and
+    # records the bypass in the PRE line.
+    merged_env = os.environ.copy()
+    stripped_env_keys: List[str] = []
+    if not credential_inject:
+        for inherited_key in [k for k in merged_env if CREDENTIAL_SHAPED.search(k)]:
+            del merged_env[inherited_key]
+            stripped_env_keys.append(inherited_key)
+        stripped_env_keys.sort()
+
     # ── permitted: audit PRE, execute, audit POST ─────────────────────────
     started = time.monotonic()
     _write_audit(
@@ -700,10 +773,11 @@ def host_run(
             "timeout": timeout,
             "cwd": cwd_resolved,
             "decision": "allow",
+            "credential_inject": credential_inject,
+            "stripped_env_keys": stripped_env_keys,
         },
     )
 
-    merged_env = os.environ.copy()
     if env:
         merged_env.update({str(key): str(value) for key, value in env.items()})
 
@@ -772,16 +846,21 @@ def host_run_async(
     timeout: float = 60,
     cwd: Any = None,
     env: Optional[Mapping] = None,
+    credential_inject: bool = False,
     client_type: Optional[str] = None,
     effective_permissions: Optional[Mapping] = None,
     audit_dir: Any = None,
 ) -> HostRunHandle:
-    """Asynchronous variant of :func:`host_run` -- **not implemented yet** (W3).
+    """Asynchronous variant of :func:`host_run` -- **not implemented yet**.
 
-    The signature is final so callers can be written against it; the body lands
-    together with W3's credential injection.
+    The signature is final so callers can be written against it, including
+    ``credential_inject`` (which the eventual body must apply exactly as
+    :func:`host_run` does).  ASYNC EXECUTION IS NOT W3: W3 is the credential
+    env plumbing, which ships without it.  No wave owns async execution yet,
+    so the ``(W3)`` ownership claim this docstring used to carry was wrong.
     """
     raise NotImplementedError(
-        "host_run_async is not implemented yet: asynchronous host execution "
-        "lands in W3 (credential injection)"
+        "host_run_async is not implemented yet: asynchronous host execution is "
+        "NOT owned by W3 (W3 is the credential env plumbing shipped in this "
+        "wave); it has no owning wave yet"
     )
