@@ -11,7 +11,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, create_model, model_validator
 import logging
 
-from .mcp_client import create_mcp_client, MCPClientBase, HTTPMCPClient, SSEMCPClient
+from .mcp_client import create_mcp_client, MCPClientBase, HTTPMCPClient, SSEMCPClient, StdioMCPClient
 from .base import ToolBase
 
 logger = logging.getLogger(__name__)
@@ -219,6 +219,12 @@ def create_tool_class(
             return f"Error calling MCP tool {tool_name}: {str(e)}"
     
     ToolModel.execute = execute
+
+    # Add get_required_categories — stdio clients launch a host process, so the
+    # gate asks for the mcp:connect grain (same ClassVar MCPServerConnect uses,
+    # see tools/mcp_server_connect.py).
+    if isinstance(client, StdioMCPClient):
+        ToolModel.required_categories = ["mcp:connect"]
 
     # Add get_required_categories — HTTP/SSE clients need network:outbound
     if isinstance(client, (HTTPMCPClient, SSEMCPClient)):
