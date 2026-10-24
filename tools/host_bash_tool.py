@@ -44,13 +44,14 @@ Audit mapping (``outcome``, ``reason``):
 import json
 import os
 import queue
-import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from pydantic import Field
+
+from thoughtmachine.host_port import host_run
 
 from .base import ToolBase
 
@@ -89,20 +90,27 @@ class HostBashTool(ToolBase):
 
     # -- helpers -----------------------------------------------------------
 
-    def _effective_grain(self) -> Optional[str]:
-        """Return the effective host_bash permission grain (fail closed).
+    def _audit_dir(self) -> Optional[Path]:
+        """Return the directory the host_bash audit trail is written to.
 
-        Reads ONLY the executor-injected ``effective_permissions`` (the
-        per-call disk-authoritative merge); the session-start mirror in
-        ``session_permissions`` is never consulted, so a stale session
-        mirror can never re-open host execution.  Absent / missing
-        ``host_bash`` resolves to ``"banned"``.
+        Shared with the host port, so both trails (this tool's
+        ``host_bash_audit.jsonl`` and the port's own
+        ``host_port_audit.jsonl``) land in the same operator-visible
+        location.  ``None`` means "unresolvable": the port then falls back
+        to its own default.  Never raises.
         """
-        perms = self.effective_permissions or {}
-        grain = perms.get("host_bash")
-        if grain is None:
-            return "banned"
-        return grain
+        try:
+            if self.audit_log_path:
+                return Path(self.audit_log_path).expanduser().parent
+            log_dir = (self.agent_config or {}).get("log_dir")
+            if log_dir:
+                return Path(log_dir).expanduser()
+            from agent._log_root import get_log_root
+
+            root = get_log_root()
+            return Path(root).expanduser() if root is not None else None
+        except (OSError, TypeError, ValueError, ImportError):
+            return None
 
     def _workspace_id(self) -> str:
         """Best-effort workspace id for audit/flag context ('' when unknown).
@@ -138,19 +146,14 @@ class HostBashTool(ToolBase):
         command (redacted), outcome, reason.
         """
         try:
+            directory = self._audit_dir()
+            if directory is None:
+                return
+            directory.mkdir(parents=True, exist_ok=True)
             if self.audit_log_path:
                 path = Path(self.audit_log_path).expanduser()
-                path.parent.mkdir(parents=True, exist_ok=True)
             else:
-                log_dir = (self.agent_config or {}).get("log_dir")
-                if log_dir:
-                    root = Path(log_dir).expanduser()
-                else:
-                    from agent._log_root import get_log_root
-
-                    root = get_log_root()
-                root.mkdir(parents=True, exist_ok=True)
-                path = root / "host_bash_audit.jsonl"
+                path = directory / "host_bash_audit.jsonl"
             record = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "workspace_id": self._workspace_id(),
@@ -257,7 +260,14 @@ class HostBashTool(ToolBase):
         # tools.host_resource_policy).  The workspace check runs first, so a
         # workspace denial precedes the grain/approval flow; when no
         # workspace is resolvable the grain gate alone applies.
-        grain = self._effective_grain()
+        # The grain is read ONLY from the executor-injected
+        # ``effective_permissions`` (the per-call disk-authoritative merge);
+        # the session-start mirror in ``session_permissions`` is never
+        # consulted, so a stale session mirror can never re-open host
+        # execution.  Absent / missing ``host_bash`` resolves to "banned".
+        grain = (self.effective_permissions or {}).get("host_bash")
+        if grain is None:
+            grain = "banned"
         ws_id = self._workspace_id()
         if ws_id:
             try:
@@ -299,8 +309,37 @@ class HostBashTool(ToolBase):
                 return denied_json("host_bash: security approval timed out", grain, outcome="approval_timeout")
 
         timeout = int(os.environ.get("HOST_BASH_TIMEOUT", str(HOST_BASH_TIMEOUT)))
+        # Execution is delegated to the shared host port
+        # (``thoughtmachine/host_port.py``), which re-checks identity, grain and
+        # workspace policy, writes its own PRE/POST ``host_port_audit.jsonl``
+        # trail and raises PermissionError for anything it cannot authorize.
+        # This tool keeps its own independent six-field audit record on top.
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            result = host_run(
+                cmd,
+                workspace_id=ws_id,
+                session_id=self.session_id or "",
+                grain="host_bash",
+                shell=True,
+                timeout=timeout,
+                effective_permissions=self.effective_permissions,
+                audit_dir=self._audit_dir(),
+            )
+            if result.timed_out:
+                self._audit_log("timeout", f"subprocess timeout after {timeout}s", cmd)
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"host_bash: command timed out after {timeout}s",
+                        "command": cmd,
+                        "stdout": result.stdout or "",
+                        "stderr": result.stderr or "",
+                        "exit_code": None,
+                        "permission_level": grain,
+                        "outcome": "error",
+                    },
+                    default=str,
+                )
             self._audit_log("allow", "", cmd)
             return json.dumps(
                 {
@@ -308,27 +347,16 @@ class HostBashTool(ToolBase):
                     "command": cmd,
                     "stdout": result.stdout or "",
                     "stderr": result.stderr or "",
-                    "exit_code": result.returncode,
+                    "exit_code": result.exit_code,
                     "permission_level": grain,
                     "outcome": "executed",
                 },
                 default=str,
             )
-        except subprocess.TimeoutExpired as exc:
-            self._audit_log("timeout", f"subprocess timeout after {timeout}s", cmd)
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"host_bash: command timed out after {timeout}s",
-                    "command": cmd,
-                    "stdout": getattr(exc, "stdout", "") or "",
-                    "stderr": getattr(exc, "stderr", "") or "",
-                    "exit_code": None,
-                    "permission_level": grain,
-                    "outcome": "error",
-                },
-                default=str,
-            )
+        except PermissionError as exc:
+            msg = f"host_bash: host port refused execution: {exc}"
+            self._audit_log("deny", msg, cmd)
+            return denied_json(msg, grain)
         except Exception as exc:
             self._audit_log("allow", f"execution error: {exc}", cmd)
             return json.dumps(

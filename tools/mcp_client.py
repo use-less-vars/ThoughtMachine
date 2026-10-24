@@ -223,6 +223,19 @@ class StdioMCPClient(MCPClientBase):
         if self.env:
             env.update(self.env)
         
+        # DEFERRED HOST EXECUTION — DO NOT MIGRATE YET (see
+        # tests/test_mcp_client_uses_host_port.py, which pins this deferral).
+        # This stdio spawn still calls subprocess.Popen directly and therefore
+        # bypasses the thoughtmachine/host_port.py chokepoint.  The migration is
+        # blocked on the *asynchronous* port entry point, not on the sync one:
+        # an MCP stdio child is long-lived (its stdin/stdout stay open for the
+        # whole session), so it needs host_run_async -- the async twin of
+        # host_run -- which hands back a long-lived HostRunHandle.  Neither is
+        # real code today: host_run_async is a signature-only stub that raises
+        # NotImplementedError, and every HostRunHandle method (poll/wait/kill)
+        # raises NotImplementedError too.  When that async primitive lands,
+        # this call migrates to host_run_async(..., grain="mcp",
+        # client_type=<mcp transport>) and this comment is deleted.
         self.process = subprocess.Popen(
             [self.command] + self.args,
             stdin=subprocess.PIPE,
