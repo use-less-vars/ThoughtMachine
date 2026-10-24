@@ -535,17 +535,7 @@ def test_authorized_values_use_real_categories():
         assert isinstance(values, frozenset), grain
         for level in values:
             assert level in known_levels, (grain, level)
-            if (grain, level) == ("network", "full"):
-                # Documented divergence: the PORT authorizes network "full"
-                # even though ``RESOURCE_CATALOG["network"]`` has no such
-                # level ("full" exists only on mcp).  The two assertions
-                # below make the exception self-checking: it is provably
-                # needed, and cannot silently outlive the conflict.
-                continue
             assert level in RESOURCE_CATALOG[grain], (grain, level)
-
-    assert "full" in known_levels
-    assert "full" not in RESOURCE_CATALOG["network"]
 
     for name in FORBIDDEN_GRAIN_NAMES:
         assert name not in AUTHORIZED_VALUES, name
@@ -584,3 +574,28 @@ def test_host_port_kill_switch_agrees_with_host_resource_policy(
     assert policy_verdict is expected, case
     assert port_verdict is expected, case
     assert port_verdict == policy_verdict, case
+
+
+# ---------------------------------------------------------------------------
+# 18: a refused call is audited before the PermissionError escapes
+# ---------------------------------------------------------------------------
+
+
+def test_host_run_writes_refusal_to_audit_log(permitted, monkeypatch):
+    import subprocess
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("Popen must not be called for a refused host_run")
+
+    monkeypatch.setattr(subprocess, "Popen", _explode)
+
+    with pytest.raises(PermissionError):
+        permitted.run(_noop(), effective_permissions={"host_bash": "banned"})
+
+    lines = permitted.audit_lines()
+    assert len(lines) == 1
+    line = lines[0]
+    assert line["event"] == "refused"
+    assert line["decision"] == "deny"
+    assert line["grain"] == "host_bash"
+    assert isinstance(line["reason"], str) and line["reason"]
