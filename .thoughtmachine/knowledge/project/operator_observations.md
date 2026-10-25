@@ -2199,3 +2199,11 @@ The guard was written to enforce "no tool may invoke another tool", parked in `.
 
 **R — names the shape; the read finds the mechanism.** A brief or ticket can name the *shape* of a defect without naming its mechanism, and the mechanism is only ever established by reading the code. Taking a named shape for a located mechanism is how a fix lands at the wrong altitude (see C). Nearest recorded instance: the Gen 48 paginate brief named the failing check ("category bypass"); the mechanism — authority laundering reaching host access — was found by reading, and was the true name (`working_agreements.md:555`). *(Mapping of that entry onto R is the seat's, unruled.)*
 
+
+## 2026-10-25 — Gen 50 seat: the front chokepoint closes (design phase)
+
+The client-claim red team, wave 2, found the thing it was built to find: an auth layer's absence, mapped across seven surfaces. The 5 CRITICAL are one missing abstraction — no route can learn who is calling. Seven tickets filed (F1–F12 plus SSRF, logging-config, provider apikey read). The class `verification-pins-wrong-contract` named with three live instances.
+
+The auth-layer design pass answered D1–D4 in one return. The conclusion is small: the Web UI's security boundary is the network boundary, the one decision is what an unscoped connection means, and the design's deliverable is to make "no workspace claimed yet" an explicit transition state rather than an absent field. That is the shape of the design — not a token scheme, not middleware, one state transition made explicit.
+
+The session's own corrections are recorded in `working_agreements.md`: silent edits to verbatim claims, a brief carrying a stale citation, five terminal-paste corruptions. Each was small. Together they are what the seat learned.

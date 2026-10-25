@@ -4,7 +4,7 @@ Updated: 2026-10-23, Gen 48 close-out seat. **Gen 48 is closed. Everything this 
 
 **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
-  vacuous scan)
+  vacuous scan) *(superseded 2026-10-25 by §Current state below — kept as historical record; see also the 2026-10-22 reading at lines 27–29 for the same convention.)*
 **Landed since the Gen-47 reading, in merge order:** `75f51e25` (#166) →
   `cb5d2279` (#168) → `75d992cb` (#169) → `f24648e6` (#170) → `2fde54f8` (#171) →
   `6b392f44` (#172) → `4d6c608d` (#173) → `12fe3bbc` (#174) → `892d2780` (#176) →
@@ -39,6 +39,28 @@ injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
 
+
+## Current state — 2026-10-25, Gen 50 close
+
+**dev HEAD:** `f69761b4` (merge of PR 205, `docs(gen50): design-auth-layer + manifest-revision ticket`).
+
+**Merged this session, five PRs:**
+- #201 — Gen 49 housekeeping (class-shapes, seat disciplines, MANDATORY_STOP 1c)
+- #202 — conftest child-interpreter probe + pydantic layering ticket
+- #203 — red-team wave 2: seven tickets (3 CRITICAL, 1 HIGH, 3 MEDIUM)
+- #204 — two hygiene tickets (working-docs re-include, venv disclosure)
+- #205 — `docs/design-auth-layer.md` + manifest-revision ticket + `.gitignore` negation
+
+**Design pass closed.** `design/auth-layer` — D1 DECLARED, D2 MUST-BIND (transition), D3 `_ownership_refusal` wins, D4 design note. All four accepted by Main 40. **First code wave is D3:** collapse three re-spellings to `_ownership_refusal`, add id-shaped stub, invert three tests, defer `test_browse_root_allowed` to D1's wave.
+
+**On disk only (gitignored, not committed):**
+- `.thoughtmachine/working_docs/redteam-surface-complete.md` — 112 rows, C1–C10 errata, 3 new findings
+- `.thoughtmachine/working_docs/vault-ownership-sites.md` — 46 rows, D1–D8
+- `.thoughtmachine/working_docs/ticket-bug-onboarding-ssrf-ambient-credentials.md` — CRITICAL draft, awaits Main 40 review
+- `.thoughtmachine/working_docs/ticket-bug-logging-config-unauthenticated-write.md` — HIGH draft, awaits Main 40 review
+- `.thoughtmachine/working_docs/brief-d3-ownership-refusal.md` — D3 brief, awaits Main 40 review
+
+**Open holds:** Main 40 reviews the D3 brief and the two draft tickets before they commit or dispatch.
 
 ## The generation in one line
 

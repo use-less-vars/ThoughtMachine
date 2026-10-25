@@ -570,3 +570,46 @@ WA-4 (WORKING-DOC FILING NAMING, added 2026-10-23 after a filing was silently gi
 
 **T — four test shapes, none substituting for another.** unit / two-sided / red team / adversarial gate. Each answers a different question: does the unit do what it says; do the two sides agree; does an attacker with intent get through; does the boundary hold when someone is trying. Two of the four exist in practice under other names (two-sided: the same passage P cites); the *set* is not written down anywhere, which is how a wave can report "tested" having done one of them.
 
+
+## 2026-10-25 — Class: `verification-pins-wrong-contract` (Gen 50)
+
+A test that asserts the current (wrong) behavior as intended. It is `verification-written-by-author` at the test layer — the test is a fact owner that owns the wrong fact.
+
+Three live instances as of this filing: `test_unscoped_bridge_still_loads_any_workspace` (`tests/test_bridge_load_session_workspace_scope.py`), `test_browse_root_allowed` (`tests/test_host_api_hardening.py:188`), `tests/test_providers_crud.py:79`.
+
+**Discipline:** before a hardening wave is graded, list the tests that must be inverted. Not "run the suite" — "list the inversions." A wave that doesn't name its inversions isn't gradable; it will pass on a green suite that pins the contract the wave is meant to change.
+
+## 2026-10-25 — Class: `undisclosed-edit-to-a-verbatim-claim` (Gen 50)
+
+The fifth boundary (narrative) at the document layer. A document that claims to quote carries exactly one promise: those are the characters. Editing them silently — even to correct a typo, even to improve the prose — destroys the only property quotation has.
+
+Three instances in Gen 50, all mine: the `design-*` ignore rule collapsed into `docs/*`; a `construction-bound` vocabulary value retrofitted onto rows that didn't hold it; `for no` read as `for now` in the operator's second-client ruling.
+
+**Rule:** when a document claims verbatim, the only correct edit is a disclosed one. The disclosure costs one line; the silent correction costs the quote's authority.
+
+## 2026-10-25 — `read-beats-ruling` at the brief-author layer (Gen 50)
+
+A brief that names a mechanism must name it from a source the author read, not from a source another document cited. The Gen 50 auth-layer brief carried "CORSMiddleware is wildcard (`server.py:1183-1185`)" — copied from the corpus, never re-read. The dispatched agent read the code: `add_middleware(CORSMiddleware, allow_origins=_cors_allowed_origins(), allow_credentials=False, …)` at `server.py:1194-1200`, narrowed to two loopback origins at `origin_policy.py:42-45`. The corpus's `:1183-1185` is stale — those lines are `_SERVE_FRONTEND = False` and a blank.
+
+The design pass's conclusion survived (D1 → DECLARED on two prongs); one prong died. The correction is recorded in `docs/design-auth-layer.md` §Corrections, naming every carrier.
+
+**Rule:** every brief that names a mechanism names it from a source the author read. A citation inherited from another document is a hypothesis, not a fact, until read.
+
+## 2026-10-25 — Terminal-paste corruption, five instances (Gen 50)
+
+Five heredoc corruptions in one session, all mine, all the same discipline violated: heredoc + trailing command in one block, or heredoc over ~15 lines. The agent's own file writes never corrupted once; only terminal paste did. Every corrupted artifact was caught by `wc -l` before use, but the pattern costs turns.
+
+**Rule:** a heredoc is a block on its own, ≤10 lines, nothing before or after. Longer content — PR bodies, tickets, letters — is written by the agent to disk, verified by `wc -l` and `head`/`tail`, then used by path. `gh pr create` and `gh pr edit` never sit behind a heredoc. `gh pr edit` is additionally blocked by a GraphQL Projects-classic deprecation on this repo; use `gh api -X PATCH repos/.../pulls/<N> -F body=@<file>` instead.
+
+## 2026-10-25 — Caller-binding vocabulary (Gen 50, from the surface inventory)
+
+For rows in a surface adjudication, two columns, not one verdict:
+
+| Column | Values |
+|---|---|
+| **Guard** | `scoped-by-construction` / `scoped-by-convention` / `not-scoped` / `UNOWNED` |
+| **Caller binding** | `shape-only` / `origin-only` / `construction-bound` / `ownership-predicate` / `NONE` |
+
+`construction-bound` means the caller cannot name the target at all. Currently unpopulated in the surface inventory — the agent refused the retrofit on source grounds because each candidate row let a client-supplied identifier through a shape gate. An empty value is allowed; a value that doesn't hold is not.
+
+`NONE` means no check binds the caller to the target. That is the honest value for the whole auth-layer surface as of `f69761b4` — no route can learn who is calling.
