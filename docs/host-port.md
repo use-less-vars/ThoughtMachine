@@ -1,6 +1,6 @@
 # Host Port: the single chokepoint for host access
 
-**Status: shipped, with one deferral and one known gap.** `thoughtmachine/host_port.py`
+**Status: shipped, with one deferral and the async primitive still a stub.** `thoughtmachine/host_port.py`
 exists, exports `host_run`, `host_run_async`, `HostRunResult`, `HostRunHandle`,
 `AUTHORIZED_VALUES` and `CREDENTIAL_SHAPED`, and is the only module in `thoughtmachine/`
 and `tools/` that may import `subprocess` without a pinned exception; every other
@@ -8,9 +8,10 @@ importer in those roots is on the scan's exception list (section 5), each with a
 named reason. The scan's roots are those two directories; modules in other roots
 are not yet covered. `tools/host_bash_tool.py`
 and the `event_log` read in `tools/workspace/check_system.py` are migrated. One stdio
-spawn in `tools/mcp_client.py` is deferred on the async primitive (section 11). One real
-hole -- inherited environment variables -- is described in section 7 and deliberately
-not fixed here.
+spawn in `tools/mcp_client.py` is deferred on the async primitive (section 11). The
+inherited-environment hole is closed in the default path: with `credential_inject=False`
+the port strips credential-shaped keys inherited from the parent environment and audits
+their names only (section 7).
 
 This document describes what the code does today. Where it disagrees with a comment in
 the source, the code and this document win, and the comment is a bug.
@@ -32,14 +33,23 @@ The port is one function that every command leaving the sandbox for the host mus
 through, so the check happens at the point of action instead of at the point where each
 tool's author remembered to write it.
 
+The port's guarantee is: every site is either through the chokepoint or enumerated in ALLOWED_EXCEPTIONS with a named reason. Not 'every site is through the port.' The pinning is the win; the migration is the follow-up.
+
 Two qualifications belong here rather than in a footnote, because both are things a
 reader will otherwise overestimate:
 
 1. **CI enforces the convention in the honest case only.** `tests/test_tool_import_declaration_match.py`
    is an AST scan: any `import subprocess` outside `thoughtmachine/host_port.py` fails
-   unless the module is on a pinned exception list (today: exactly one entry,
-   `tools/mcp_client.py`, the deferral in section 11). It catches the four static import
-   forms -- module-level, `as`-aliased, `from subprocess import ...`, and function-local.
+   unless the module is on a pinned exception list. That list holds seven entries today:
+   one documented deferral (`tools/mcp_client.py`, section 11) and six pre-existing
+   importers marked out of scope for this wave -- `thoughtmachine/doctor.py`,
+   `tools/ci_read_tool.py`, `tools/git_info_tool.py`, `tools/git_write_tool.py`,
+   `tools/mcp_server_connect.py` and `tools/workspace/worker_execution.py`. Six of the
+   seven spawn a host process; `tools/mcp_server_connect.py` imports the module only to
+   catch `subprocess.TimeoutExpired` and launches nothing. `PINNED_IMPORTERS` pins the
+   literal set of eight modules that import `subprocess` anywhere in the scanned roots.
+   It catches the four static import forms -- module-level, `as`-aliased,
+   `from subprocess import ...`, and function-local.
    It cannot catch reach built at runtime (`getattr(subprocess, "run")`,
    `importlib.import_module("subprocess")`); section 12 says so plainly.
 2. **The port checks authority, not intent.** A caller that legitimately holds
@@ -50,8 +60,8 @@ reader will otherwise overestimate:
 
 ```
 host_run(command, *, workspace_id, session_id, grain, shell=False, timeout=60,
-         cwd=None, env=None, client_type=None, effective_permissions=None,
-         audit_dir=None) -> HostRunResult
+         cwd=None, env=None, credential_inject=False, client_type=None,
+         effective_permissions=None, audit_dir=None) -> HostRunResult
 
 host_run_async(command, *, workspace_id, session_id, grain, ...) -> HostRunHandle
 ```
@@ -82,8 +92,14 @@ and the port checks that statement against the session's effective permissions.
 
 `cwd` is the working directory on the host; `None` means the workspace root (section 6).
 `env` is merged over the inherited environment and is the only point at which a caller can
-add variables; it is the credential-injection surface, and the one place where the port is
-weaker than it looks (section 7).
+add variables (section 7).
+
+`credential_inject` (default `False`) is the credential path's explicit opt-in, and it
+gates **both** sides of the credential boundary. At the default, a caller-supplied
+credential-shaped `env` key is refused (step 7) and credential-shaped keys *inherited*
+from the parent environment are stripped before the child is spawned (section 7). When it
+is `True` both are forwarded instead, every `env` value must be an exact `str` (step 7b),
+and the PRE audit line records `credential_inject: true` so the bypass is auditable.
 
 `client_type` is only consulted for `grain="mcp"` (step 6). `effective_permissions` is the
 test/executor injection point that lets a caller supply its own authority map instead of
@@ -129,10 +145,16 @@ Everything before step 9 is a refusal or a raise, never a silent widening.
    never authorise a host command.
 6. **`mcp` calls must come from an MCP client.** `grain="mcp"` with `client_type != "mcp"`
    -> refuse. Otherwise `mcp:connect` would be a general host-execution grain.
-7. **No credential-shaped key in caller-supplied `env`.** Any key matching
-   `CREDENTIAL_SHAPED` (`TOKEN|SECRET|PASSWORD|KEY|PAT|CREDENTIAL`, case-insensitive) ->
-   refuse, with a message pointing at `credential_inject=True` (W3). See section 7 for
-   what this does *not* cover.
+7. **No credential-shaped key in caller-supplied `env`** -- unless
+   `credential_inject=True`. Any key matching `CREDENTIAL_SHAPED`
+   (`TOKEN|SECRET|PASSWORD|KEY|PAT|CREDENTIAL`, case-insensitive) -> refuse, with a
+   message pointing at the opt-in. The opt-in does not weaken the default: with it
+   `False` the refusal is unconditional, so no caller can smuggle a credential-shaped key
+   past the check by omission. Section 7 covers the inherited half of the boundary.
+7b. **`credential_inject=True` demands plain-`str` `env` values.** Anything that is not an
+   exact `str` raises `TypeError`, because `Secret` is a `str` subclass whose `__str__`
+   returns `***` -- coercing it would hand the mask to the child. A raise, not a refusal,
+   so it writes no audit line.
 8. **cwd must be inside the workspace root.** `_resolve_cwd` returns the workspace root
    for `cwd=None`, and for an explicit `cwd` resolves symlinks and requires the result to
    equal the root or sit beneath it; otherwise refuse (section 6).
@@ -225,16 +247,28 @@ What is enforced today, exactly:
 - A **caller-supplied** `env` key matching `CREDENTIAL_SHAPED` is refused (step 7). No tool
   can hand a secret-value-shaped variable to a host child through `env=` and have it look
   routine.
-- The child environment is `os.environ.copy()` merged with the caller's `env`. Keys
-  **inherited from the parent environment are forwarded as-is and are not scanned**. If the
-  agent process itself is running with `GITHUB_TOKEN` set, the host child sees it.
+- The child environment is `os.environ.copy()` merged with the caller's `env`. With
+  `credential_inject=False` (the default), keys **inherited from the parent environment**
+  that match `CREDENTIAL_SHAPED` are **stripped before the child is spawned**, and only
+  their *names* are recorded in the PRE audit line under `stripped_env_keys`. If the agent
+  process itself is running with `GITHUB_TOKEN` set, the host child no longer sees it.
+- With `credential_inject=True` both halves are forwarded instead -- the caller's
+  credential-shaped keys and the inherited ones. The PRE line records
+  `credential_inject: true`, so the bypass is auditable rather than invisible.
 
-That second point is a real, named hole and it is not closed here. `CREDENTIAL_SHAPED` is a
-filter on what the *caller* adds, not a filter on what the port *forwards*. Closing it
-means the real `credential_inject` path (W3) -- an allowlist of variables a host child may
-receive, rather than a name-shaped regex over the ones it may not -- and that is a
-different piece of work. Anyone reading the constant as "the port never forwards
-credentials" is reading a claim the code does not make.
+The inherited-environment hole was real and it is closed in the default path; the code
+labels the fix "the F-A closure" (W3a). Two limits belong next to that claim so it is not
+overread. First, `CREDENTIAL_SHAPED` is a name-shaped regex, not an allowlist: a credential
+exported under a name that matches nothing in it -- a connection string like
+`DATABASE_URL`, whose *value* embeds a password -- is still forwarded and is not stripped.
+Second, this covers environment variables only: a credential passed in `argv` is still
+visible in `ps`, in the audit line and in whatever the child logs, which is why the rule at
+the top of this section is about `env`. Anyone reading the constant as "the port never
+forwards credentials" is reading a claim the code does not make; the accurate claim is
+"the port does not forward credential-*shaped* names unless the caller opts in, and audits
+the opt-in when it happens."
+
+The port covers every host execution path that has been migrated to it. Git's `_exec_host_raw` is not yet migrated; the credential strip, kill switch, and audit do not govern git today. Git's git:read / git:write authorization continues on SandboxedExecution, unchanged. Container execution (`_exec_container_raw`) is likewise on its own path — filed as hygiene/git-exec-container-raw-not-port-audited.
 
 ## 8. Timeout semantics
 
@@ -296,6 +330,22 @@ directory the port uses when `audit_log_path` is supplied, so an operator sees b
 side by side -- but they are separate records written by separate code. The tool's line
 says what the tool decided; the port's lines say what the boundary permitted.
 
+### 9.3 Named exclusions -- execution paths outside the port's audit
+
+Two execution paths are named exclusions from the port's coverage, so neither writes a
+`host_port_audit.jsonl` record:
+
+- **Git remote transport.** `GitReadTool._exec_host_raw` (`tools/git_info_tool.py`) runs git
+  on the host through `SandboxedExecution`, not through `host_run`: git's remote traffic is
+  not port-audited, and the port's credential strip, kill switch and audit do not govern it
+  (section 7). Git's own `git:read` / `git:write` authorization is unchanged.
+- **Container execution.** `GitReadTool._exec_container_raw` runs git inside the workspace
+  resource container, likewise on its own path — filed as
+  `hygiene/git-exec-container-raw-not-port-audited`.
+
+Both are enumerated exclusions with a named reason, which is exactly the guarantee the port
+makes (section 1); they are not oversights.
+
 ## 10. Error surfaces
 
 - Refusal: `PermissionError`, message = reason, one `refused` audit line.
@@ -323,8 +373,13 @@ says what the tool decided; the port's lines say what the boundary permitted.
 The deferral is documented in a comment at the Popen site and pinned twice: the import scan
 requires the deferral markers to stay while the import stays, and
 `tests/test_mcp_client_uses_host_port.py` pins both the markers and the continued presence
-of the `subprocess` import and the `Popen` call. The effect today is that the one unaudited
-host launch left in the tree is a known, listed, tested exception -- not an oversight.
+of the `subprocess` import and the `Popen` call. The effect today is that this deferral is
+a known, listed, tested exception -- not an oversight. It is not the only unaudited host
+launch in the tree: five of the six pre-existing importers listed in section 1 also launch
+outside the port, and section 9.3 names the execution paths the port does not audit at all.
+(The sixth, `tools/mcp_server_connect.py`, imports `subprocess` only to catch
+`subprocess.TimeoutExpired`; it never spawns a process. Counting all seven
+`ALLOWED_EXCEPTIONS` entries plus `host_port.py` itself, `PINNED_IMPORTERS` holds eight.)
 
 **Behaviour changes introduced by the migration.**
 
@@ -336,8 +391,10 @@ host launch left in the tree is a known, listed, tested exception -- not an over
 
 **Known gaps, not fixed in this wave.**
 
-1. Inherited environment variables are forwarded unscanned (section 7). Closing it is W3's
-   `credential_inject`.
+1. The inherited environment is filtered by **name shape**, not by an allowlist
+   (section 7): `credential_inject=False` strips credential-shaped inherited keys and
+   audits their names, but a credential exported under a non-matching name is still
+   forwarded.
 2. `host_run_async` and every `HostRunHandle` method raise `NotImplementedError`.
 3. Runtime-obfuscated reach defeats the import scan (section 12).
 
@@ -372,22 +429,29 @@ intent.
    outside a test.
 4. **Do not assume the inherited cwd.** Ask for `cwd=` explicitly if you need a directory,
    and expect the workspace root if you do not.
-5. **Do not assume the inherited environment is safe.** The port refuses credential-shaped
-   keys *you* pass and forwards everything it inherited; if a secret is in your own
-   environment, the child sees it. Pass nothing sensitive through `env` until W3's
-   `credential_inject` lands.
+5. **Do not assume the inherited environment is safe.** At the default
+   (`credential_inject=False`) the port refuses credential-shaped keys *you* pass and
+   strips credential-shaped keys it *inherited*, auditing their names. That is a filter on
+   name shape, not an allowlist, so a credential whose variable name matches nothing in
+   `CREDENTIAL_SHAPED` is still forwarded. Pass secrets as credentials through
+   `credential_inject=True`, never as ordinary `env` values (section 7).
 6. **A long-lived child is the async gap.** `host_run` is synchronous: it waits, enforces
    the timeout and returns. A child whose pipes stay open for the session (an MCP stdio
    server, an interactive process) needs `host_run_async` + `HostRunHandle`, which do not
    work yet.
 7. **Do not copy the `mcp_client` deferral pattern.** A comment explaining why a direct
    spawn is temporarily acceptable, plus two tests pinning the comment, is what the
-   exception list looks like when it is honest -- it is not a template for adding the
-   second exception. If your call blocks on the async primitive, say so in the wave that
-   owns the async primitive rather than spawning directly.
+   exception list looks like when it is honest. `ALLOWED_EXCEPTIONS` is not a fix -- it is
+   a register of exceptions that already exist: seven entries, six of them pre-existing
+   importers marked out of scope for the host-execution wave (section 1). Adding an eighth
+   is a regression against the migration, not a way to ship. If your call blocks on the
+   async primitive, say so in the wave that owns the async primitive rather than spawning
+   directly.
 
 ## 14. Filed
 
 2026-10-24, Gen 49, ruled by Main Gen 39. Taxonomy confirmed (Main, 2026-10-24).
-`host_port.py` and the two migrations shipped after the design pass; `host_run_async`, the
-stdio MCP spawn and `credential_inject` remain W3 work.
+`host_port.py` and the two migrations shipped after the design pass. `credential_inject`
+shipped in W3, including the inherited-environment strip (W3a) that section 7 used to
+describe as an open hole. `host_run_async`, every `HostRunHandle` method and the stdio MCP
+spawn remain W3 work; that deferral is the one still live.

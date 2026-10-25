@@ -1455,13 +1455,16 @@ class GitReadTool(ToolBase):
         """Return the permission level ('read'/'write') for a git invocation.
 
         Derived from the declared operation: anything that mutates repository
-        state (commit/init/clone/branch_create/checkout/stage/unstage) requires
-        ``git:write``; everything else is ``git:read``. ``args`` is accepted for
-        future operation-level granularity (e.g. write detection for internal
-        helper invocations).
+        state (commit/init/clone/push/branch_create/checkout/stage/unstage)
+        requires ``git:write``; everything else is ``git:read``. A push mutates
+        the REMOTE repository (and writes remote-tracking refs locally), so it
+        is a write-level operation like every other mutating verb. ``args`` is
+        accepted for future operation-level granularity (e.g. write detection
+        for internal helper invocations).
         """
         if self.operation in (
-            "commit", "init", "clone", "branch_create", "checkout", "stage", "unstage",
+            "commit", "init", "clone", "push", "branch_create", "checkout",
+            "stage", "unstage",
         ):
             return "write"
         return "read"

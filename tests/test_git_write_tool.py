@@ -1240,18 +1240,32 @@ from tools.git_info_tool import GitReadTool  # noqa: E402
 
 _C_LIST = {"push", "fetch", "reset", "clean", "config", "cherry-pick", "rebase"}
 
+#: C-list ops that ARE deliberately exposed on the WRITE surface. ``push`` is
+#: exposed under credential design Decision 1, in a narrowed form only
+#: (``git push origin <branch>``: the remote is fixed, refspecs and force are
+#: refused, a protected branch is never pushed, and the credential travels
+#: through the environment only). It is excluded from the write-side check
+#: below exactly like the pre-existing READ-ONLY ``config`` inspection op is
+#: excluded from the read-side check.
+_WRITE_EXPOSED_C_LIST = {"push"}
+
 
 def test_operation_literals_exclude_c_list():
-    """§E6: the C-list ops must never appear in the WRITE Literal; they must
-    also stay out of the READ Literal EXCEPT ``config``, which is a
-    pre-existing READ-ONLY inspection op (``git config --list`` /
-    ``git config --get <key>``). §C prohibits config *mutation*, not
-    inspection, so ``config`` is excluded from the read-side check.
+    """§E6: the C-list ops must never appear in the WRITE Literal -- except
+    ``push``, deliberately exposed in the narrowed form described above (see
+    ``_WRITE_EXPOSED_C_LIST``). They must also stay out of the READ Literal
+    EXCEPT ``config``, which is a pre-existing READ-ONLY inspection op
+    (``git config --list`` / ``git config --get <key>``). §C prohibits config
+    *mutation*, not inspection, so ``config`` is excluded from the read-side
+    check.
     """
     read_ops = set(typing.get_args(GitReadTool.model_fields["operation"].annotation))
     write_ops = set(typing.get_args(GitWriteTool.model_fields["operation"].annotation))
-    assert _C_LIST.isdisjoint(write_ops)
+    assert (_C_LIST - _WRITE_EXPOSED_C_LIST).isdisjoint(write_ops)
+    # ``push`` is a WRITE-level operation, so it must never appear on the READ
+    # surface either.
     assert (_C_LIST - {"config"}).isdisjoint(read_ops)
+    assert "push" in write_ops
 
 
 # --- §E3-A: _run_git records hook output on a successful commit ----------

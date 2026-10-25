@@ -33,21 +33,32 @@ the askpass script and never creates it.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
+import thoughtmachine
 from thoughtmachine.git_auth_env import (
     ASKPASS_SECRET_ENV,
+    askpass_path,
     build_git_auth_env,
 )
 
 from agent.credentials.injector import Secret
+from security.sandboxed_execution import SandboxedExecution
 
 
 #: A syntactically plausible, obviously fake token.  Never a real credential.
 FAKE_TOKEN_VALUE = "ghp_this_is_a_fake_value_1111"
 
-#: Path handed to the builder in every test (never created, never executed).
-ASKPASS_PATH = "/opt/thoughtmachine/libexec/tm_git_askpass.sh"
+#: Directory of the package, computed WITHOUT ``askpass_path()`` so that the
+#: helper test below cannot agree with a buggy helper by construction.
+PACKAGE_DIR = Path(thoughtmachine.__file__).parent
+
+#: Path of the askpass script that ships in the package, computed the same way.
+#: The builder only *references* this path; it never creates or runs anything.
+ASKPASS_PATH = str(PACKAGE_DIR / "git_askpass.sh")
 
 
 def _config_pairs(env):
@@ -195,7 +206,74 @@ def test_build_git_auth_env_rejects_empty_token():
     assert "token" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("askpass_path", ["", None, 7])
-def test_build_git_auth_env_rejects_unusable_askpass_path(askpass_path):
+@pytest.mark.parametrize("bad_askpass_path", ["", None, 7])
+def test_build_git_auth_env_rejects_unusable_askpass_path(bad_askpass_path):
     with pytest.raises((TypeError, ValueError)):
-        build_git_auth_env(FAKE_TOKEN_VALUE, askpass_path=askpass_path)
+        build_git_auth_env(FAKE_TOKEN_VALUE, askpass_path=bad_askpass_path)
+
+
+# ---------------------------------------------------------------------------
+# 5: the shipped askpass script -- the program git actually runs
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_askpass_script_exists_and_is_executable():
+    path = PACKAGE_DIR / "git_askpass.sh"
+
+    assert path.is_file()
+    assert os.access(path, os.X_OK)
+    assert path.read_text(encoding="utf-8").splitlines()[0] == "#!/bin/sh"
+
+
+def test_shipped_askpass_script_carries_the_secret_env_name():
+    content = (PACKAGE_DIR / "git_askpass.sh").read_text(encoding="utf-8")
+
+    assert ASKPASS_SECRET_ENV in content
+    # read from the environment at run time, never baked in as a literal
+    assert "${" + ASKPASS_SECRET_ENV in content
+    assert FAKE_TOKEN_VALUE not in content
+
+
+def test_askpass_path_helper_points_at_shipped_script():
+    assert askpass_path() == ASKPASS_PATH
+    assert os.path.isabs(askpass_path())
+    assert Path(askpass_path()).is_file()
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/sh"), reason="/bin/sh is unavailable")
+def test_shipped_askpass_script_answers_password_prompt_from_the_env():
+    completed = SandboxedExecution(None).run(
+        ["/bin/sh", askpass_path(), "Password for 'https://github.com': "],
+        timeout=30,
+        extra_env={ASKPASS_SECRET_ENV: FAKE_TOKEN_VALUE},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == FAKE_TOKEN_VALUE
+    # git reads the answer from stdout; it must not leak onto stderr as well
+    assert FAKE_TOKEN_VALUE not in completed.stderr
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/sh"), reason="/bin/sh is unavailable")
+def test_shipped_askpass_script_answers_username_prompt_without_the_secret():
+    completed = SandboxedExecution(None).run(
+        ["/bin/sh", askpass_path(), "Username for 'https://github.com': "],
+        timeout=30,
+        extra_env={ASKPASS_SECRET_ENV: FAKE_TOKEN_VALUE},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "x-access-token"
+    assert FAKE_TOKEN_VALUE not in completed.stdout
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/sh"), reason="/bin/sh is unavailable")
+def test_shipped_askpass_script_fails_closed_without_the_secret():
+    completed = SandboxedExecution(None).run(
+        ["/bin/sh", askpass_path(), "Password for 'https://github.com': "],
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert ASKPASS_SECRET_ENV in completed.stderr

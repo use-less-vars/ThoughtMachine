@@ -22,6 +22,11 @@ do that -- see ``tests/test_tool_import_declaration_match.py``).  Writing the
 askpass script, choosing the grain and calling ``host_run`` belong to the
 caller; this function only answers "what should the child's environment be".
 
+The environment names an askpass program but does not supply one;
+:func:`askpass_path` returns the path of the script that ships in this package
+(``thoughtmachine/git_askpass.sh``) for callers that have no better candidate.
+It is a path computation only -- no file is opened or created here.
+
 Resolution is not done here either (design A5): the caller resolves the
 credential with ``agent.credentials.injector.CredentialInjector`` and must
 UNWRAP the returned ``Secret`` first, because ``Secret`` is a ``str`` subclass
@@ -31,9 +36,10 @@ rather than silently handing git the mask.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
 
-__all__ = ["ASKPASS_SECRET_ENV", "build_git_auth_env"]
+__all__ = ["ASKPASS_SECRET_ENV", "askpass_path", "build_git_auth_env"]
 
 
 #: Environment variable the askpass program reads the credential from.  One
@@ -44,6 +50,23 @@ ASKPASS_SECRET_ENV = "TM_GIT_ASKPASS_SECRET"
 #: ``-c``-shaped form the design explicitly forbids (L63); it is refused even
 #: via ``extra_config`` so the invariant cannot be re-introduced by a caller.
 FORBIDDEN_CONFIG_KEYS: Tuple[str, ...] = ("http.extraheader",)
+
+
+def askpass_path() -> str:
+    """Return the path of the askpass script shipped inside this package.
+
+    The script sits next to this module and is installed as package data
+    (``pyproject.toml`` ``[tool.setuptools.package-data]``) and, for the frozen
+    build, as a ``DATA_FILES`` entry in ``thoughtmachine.spec``.
+
+    Only the path is computed: the file is never opened, created or executed
+    here, so this module keeps the "pure" promise made in the module docstring
+    and the path is correct for an installed wheel as well as for the source
+    tree.
+    """
+    import thoughtmachine
+
+    return str(Path(thoughtmachine.__file__).parent / "git_askpass.sh")
 
 
 def build_git_auth_env(
