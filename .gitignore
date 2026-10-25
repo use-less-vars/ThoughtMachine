@@ -243,3 +243,6 @@ web_ui/frontend/.npmrc
 !.thoughtmachine/knowledge/personal/
 .thoughtmachine/knowledge/personal/*
 !.thoughtmachine/knowledge/personal/handoffs.md
+
+# Gen 50 design pass: auth layer — re-included because docs/* is a catch-all.
+!docs/design-auth-layer.md
