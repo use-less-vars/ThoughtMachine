@@ -11,6 +11,8 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import subprocess
+import warnings
 
 import pytest
 
@@ -402,4 +404,51 @@ def _reset_container_manager_memos():
     yield
     for memo in memos:
         memo.clear()
+
+# ---------------------------------------------------------------------------
+# Child-interpreter probe (Gen 50, hook-robustness wave).
+#
+# tests/security/test_gate_import_order.py spawns a child interpreter to
+# verify import-order independence. A parent-side find_spec cannot catch the
+# case where the parent imports a module only because PYTHONPATH carries it --
+# the child spawned with PYTHONPATH stripped loses it, and the test fails as
+# if the import order were wrong. This probe runs the child check itself.
+# ---------------------------------------------------------------------------
+
+_REQUIRED_CHILD_MODULES = ("pydantic",)
+
+
+def _probe_child_import(module, env):
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            env=env, capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def pytest_configure(config):
+    if os.environ.get("THOUGHTMACHINE_SKIP_CHILD_PROBE") == "1":
+        return
+    env_with = os.environ.copy()
+    env_without = {k: v for k, v in env_with.items() if k != "PYTHONPATH"}
+    for module in _REQUIRED_CHILD_MODULES:
+        if _probe_child_import(module, env_without):
+            continue
+        if _probe_child_import(module, env_with):
+            warnings.warn(
+                f"{module!r} is importable in a child interpreter only via "
+                f"PYTHONPATH. Tests that strip PYTHONPATH will fail. "
+                f"Run the suite under a venv interpreter ({sys.prefix}).",
+                stacklevel=1,
+            )
+        else:
+            raise pytest.UsageError(
+                f"{module!r} is not importable in the child interpreter "
+                f"({sys.executable}). The test suite requires it. "
+                f"Activate the venv or install dev deps."
+            )
+
 
