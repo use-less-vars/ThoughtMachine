@@ -28,6 +28,18 @@ Updated: 2026-10-23, Gen 48 close-out seat. **Gen 48 is closed. Everything this 
 bookkeeping seat (chunk B) — "The isolation wave is merged; the long tail is still
 indexed"; **dev HEAD** `75f51e25` (#166, gen-47 KB write); **in flight** none.)*
 
+
+**Gen 49 W4-minimal — ruled, not yet shipped (2026-10-24).** Push
+verb will ship on `SandboxedExecution`; `credential_inject=True` is NOT used
+and git does NOT route through `host_run`. Decision 1 L33 amended:
+"The plumbing is built; the population of `git_environment` is a separate
+wave (`feat/credential-resolution`), which is the next thing dispatched
+after W4 merges." Status line for this wave, verbatim: "Credential
+injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
+port migration filed as `design/host-port-git-authorization`."
+**Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+
 ## The generation in one line
 
 Gen 48 **deleted a tool instead of patching it.** `PaginateTool` declared
