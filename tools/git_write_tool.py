@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Literal, Optional, List, Union
 from pathlib import Path
 from pydantic import Field
 from .git_info_tool import GitReadTool, resolve_git_execution_mode
+from thoughtmachine.git_auth_env import ASKPASS_SECRET_ENV
 from .host_resource_policy import load_workspace_config
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
 from security.gate_helpers import _value_satisfies
@@ -56,8 +57,8 @@ _MISSING_IDENTITY_MARKERS = (
 
 class GitWriteTool(GitReadTool):
     """
-    Git write operations tool (commit, init, clone, branch_create, checkout,
-    stage, unstage).
+    Git write operations tool (commit, init, clone, push, branch_create,
+    checkout, stage, unstage).
     Every write is gated (fail closed) on the effective session git
     permission (the effective ``git`` grain, session x workspace, injected by
     the ToolExecutor) being write-capable (``write``, ``full`` or
@@ -75,7 +76,7 @@ class GitWriteTool(GitReadTool):
         working_dir: repository root (defaults to workspace root).
         file_path: single path or list of paths, used by stage, unstage and
             commit (selective commit; always required, never ``-A``).
-        branch: branch name for branch_create and checkout.
+        branch: branch name for branch_create, checkout and push.
         message: commit message (required for commit).
         clone_url / clone_target: remote URL and target directory for clone.
     Commit author identity: the OPTIONAL workspace config key
@@ -115,32 +116,40 @@ class GitWriteTool(GitReadTool):
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
         """Return dynamic permission categories based on the git operation.
         Every write operation requires ``git:write`` and ``filesystem:write``
-        (a git write mutates the working tree); ``clone`` additionally needs
-        network egress to reach the remote.
+        (a git write mutates the working tree); ``clone`` and ``push``
+        additionally need network egress to reach the remote.
         """
         if params:
             op = params.get("operation", "")
-            if op == "clone":
+            if op in ("clone", "push"):
                 return ["git:write", "filesystem:write", "network:outbound"]
             return ["git:write", "filesystem:write"]
         return ["git:write"]
 
     tool: Literal["GitWriteTool"] = "GitWriteTool"
 
-    # Deliberately NOT exposed on the WRITE surface (design §C, §E6): push,
-    # fetch, reset, clean, config, cherry-pick, rebase, and any ref/branch
-    # deletion. The READ surface likewise exposes no C-list op, except the
-    # pre-existing READ-ONLY `config` inspection op (git config --list /
-    # --get), which cannot mutate config. Policy for a future delete op (§E4):
-    # it MUST refuse to delete a checked-out or protected branch AND require
-    # explicit confirmation for a non-merged ref.
+    # Deliberately NOT exposed on the WRITE surface (design §C, §E6): fetch,
+    # reset, clean, config, cherry-pick, rebase, and any ref/branch deletion.
+    # The READ surface likewise exposes no C-list op, except the pre-existing
+    # READ-ONLY `config` inspection op (git config --list / --get), which
+    # cannot mutate config. Policy for a future delete op (§E4): it MUST
+    # refuse to delete a checked-out or protected branch AND require explicit
+    # confirmation for a non-merged ref.
+    #
+    # ``push`` IS exposed, under credential design Decision 1: the credential
+    # travels through the ENVIRONMENT (GIT_ASKPASS + GIT_CONFIG_COUNT, see
+    # thoughtmachine/git_auth_env.py and thoughtmachine/git_askpass.sh), never
+    # through ``-c http.extraheader``, so argv stays credential-free and
+    # ``/proc``-safe. It is narrowed to ``git push origin <branch>``: the
+    # remote is fixed, refspecs and force are refused, and a protected branch
+    # is never pushed.
     operation: Literal[
-        "commit", "init", "clone", "branch_create", "checkout", "stage",
-        "unstage", "worktree_add", "worktree_remove", "stash_push",
+        "commit", "init", "clone", "push", "branch_create", "checkout",
+        "stage", "unstage", "worktree_add", "worktree_remove", "stash_push",
         "stash_pop",
     ] = Field(
         description="Git write operation to perform: commit, init, clone, "
-        "branch_create, checkout, stage, unstage, worktree_add, "
+        "push, branch_create, checkout, stage, unstage, worktree_add, "
         "worktree_remove, stash_push, stash_pop"
     )
 
@@ -148,7 +157,9 @@ class GitWriteTool(GitReadTool):
         default=False,
         description="Force a destructive worktree operation. worktree_remove "
         "refuses a locked worktree or one with local changes unless this is "
-        "true (maps to git worktree remove --force)."
+        "true (maps to git worktree remove --force). Inert for every other "
+        "operation: push refuses force=True outright, because a force-push "
+        "rewrites shared history that other checkouts may already have."
     )
 
     paths: Optional[List[str]] = Field(
@@ -284,7 +295,7 @@ class GitWriteTool(GitReadTool):
         # permissions still read 'ask'. Missing/banned/False stay fail-closed
         # (the atomic check runs and denies).
         operation = self.operation
-        network_ops = {"clone"}
+        network_ops = {"clone", "push"}
         if operation in network_ops:
             effective = self.effective_permissions or {}
             if effective.get("network") != "ask":
@@ -422,6 +433,8 @@ class GitWriteTool(GitReadTool):
                 return self._git_worktree_remove(repo_root)
             elif self.operation == "stash_push":
                 return self._git_stash_push(repo_root)
+            elif self.operation == "push":
+                return self._git_push(repo_root)
             elif self.operation == "stash_pop":
                 return self._git_stash_pop(repo_root)
             else:
@@ -974,6 +987,69 @@ class GitWriteTool(GitReadTool):
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
 
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_push(self, repo_root: Path) -> str:
+        """Push ONE branch to ``origin`` (``git push origin <branch>``).
+
+        The remote is hard-coded to ``origin``: the agent cannot invent a new
+        egress target, and the atomic ``network:outbound`` check cannot be
+        bypassed by pointing the push somewhere else. The refspec is a plain
+        branch name -- a ``src:dst`` form could rewrite or delete remote refs,
+        so it is refused -- force is refused outright, and a protected branch
+        is never pushed.
+
+        The credential reaches git ONLY through the environment
+        (``GIT_ASKPASS`` + ``GIT_CONFIG_COUNT``, W3): argv stays
+        credential-free, which is what makes push safe to expose at all
+        (credential design Decision 1). A session with no credential in the
+        git environment is refused HERE, before git runs, instead of letting
+        git fall back to a terminal prompt that a host with no interactive
+        user behind it can never answer.
+        """
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        # Filesystem grain: push writes no working-tree file, but it does write
+        # repository state (remote-tracking refs) and execute() requires a
+        # write-capable filesystem grain for every write op; direct callers get
+        # the same refusal here.
+        if not self._filesystem_write_allowed():
+            return self._filesystem_grain_gate_error()
+        branch = self.branch
+        if not branch or not branch.strip():
+            return "Error: branch is required for push operation"
+        # A refspec («src»:«dst») or a fully-qualified ref can rewrite or delete
+        # remote refs; only a plain branch name is accepted.
+        if ":" in branch or branch.startswith("refs/"):
+            return self._truncate_output(
+                f"Error: push takes a branch name, not a refspec: {branch!r}"
+            )
+        try:
+            self._validate_branch_name(branch)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        if branch in self._PROTECTED_BRANCHES:
+            return self._truncate_output(
+                f"Error: refusing to push protected branch {branch!r} "
+                f"(protected: {', '.join(self._PROTECTED_BRANCHES)})"
+            )
+        if self.force:
+            return self._truncate_output(
+                "Error: push refuses force=True: a force-push rewrites shared "
+                "history that other checkouts may already have"
+            )
+        if ASKPASS_SECRET_ENV not in self._git_environment():
+            return self._truncate_output(
+                "Error: push refused: no git credential is configured. Push "
+                "authenticates through the environment ("
+                f"{ASKPASS_SECRET_ENV} via thoughtmachine.git_auth_env), never "
+                "through argv or a terminal prompt."
+            )
+        # Remote is fixed (design Decision 1): no URL, no refspec, no flags.
+        args = ["push", "origin", branch]
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
 
