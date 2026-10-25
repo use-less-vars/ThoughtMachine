@@ -555,3 +555,18 @@ WA-4 (WORKING-DOC FILING NAMING, added 2026-10-23 after a filing was silently gi
 **The seat's share of the miss.** Gen 48 briefed the paginate fix as "category bypass" — accurate but understated. The operator read "host access" from it, which was the correct framing, and Main named it before the seat did. The lesson: **briefs name the mechanism, not the class of the check.** "Authority laundering" and "host access" are the true names; "category bypass" is the check that failed.
 
 **Filed:** `hygiene/no-tool-wrapping` (doctrine + census + guard). The guard named above is the **parked, unactivated** one. The census is a point-in-time figure, attributed and not measured today: 13 sites at park, 8 of those burned down in `cf10c358` (#189), the residual letter (a) recounted by nothing in CI.
+
+## 2026-10-25 — The seat's disciplines (added by housekeeping)
+
+*Added by the Gen 49 housekeeping pass from the brief's own list. These are disciplines the seat owes Main, as distinct from the agreements between operator and Main that fill most of this file. Two items the brief also listed already live here under their own names and are deliberately **not** duplicated: `read-beats-ruling` (`## 2026-10-17 — Named pattern: read-beats-ruling`, `:165`) and "a ticket that names a code site cites a symbol" (`:409`).*
+
+**M — every "verified" names the test that verified it.** "Verified" is a claim about a check, so it is incomplete without the check's name. If no test can be named, the sentence is "I believe" and should be written that way. An unnamed verification is `verification-written-by-author` one review away from being found.
+
+**N — a test that only fails by racing stderr is not a test.** If the only path to red is losing a race for stderr, the test measures the scheduler, not the rule. Assert on the artifact the rule produces — the argv, the environment, the returned struct — not on interleaved output.
+
+**Q / QQ — the proposal gate.** Before proposing, verify the premise; if the premise is false, stop and say so rather than building a proposal on top of it. Five catches came from checking a premise before building on it: pagination, `vault_root`, restart-P1, the `HostBashTool` migration, and the push-verb layer — and two more inside the fixes themselves, fetch+reset and `_get_operation_level` omitted. **Its failure mode is cost:** the gate spends a turn, and it must not become a licence to stall. A proposal gate that never proposes is the same defect as a guard that never looks (see E, `operator_observations.md`).
+
+**P — the adversarial gate is a process, not an artifact.** Before a boundary merge, something must try to cross the boundary and be expected to fail. This is distinct from the one-time DOUBLE-LOCK artifact: that was an event, the gate is what is owed every time. Where the practice already exists it is filed as "two-sided protocol + parallel audit" (`status.md`, Gen 48 close-out — search the phrase; the line number moves as this file is edited). The brief's point is that it should be *called* a gate and be owed rather than volunteered.
+
+**T — four test shapes, none substituting for another.** unit / two-sided / red team / adversarial gate. Each answers a different question: does the unit do what it says; do the two sides agree; does an attacker with intent get through; does the boundary hold when someone is trying. Two of the four exist in practice under other names (two-sided: the same passage P cites); the *set* is not written down anywhere, which is how a wave can report "tested" having done one of them.
+

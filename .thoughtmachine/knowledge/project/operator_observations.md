@@ -2182,3 +2182,20 @@ The guard was written to enforce "no tool may invoke another tool", parked in `.
 **Instance:** 2026-10-23, Gen 48, `tool_no_wrapping_guard.py`. Caught during phase-2 burn-down; fixed in `fix/census-burn-down-no-tool-wrapping` (`d4bc1e35`).
 
 **Status today:** the guard is still parked and unactivated — nothing in CI runs it. Its census is a point-in-time figure: 13 sites at park, 8 of those (letters (b) and (c)) burned down in `cf10c358` (#189), the residual being letter (a).
+
+## Class-shape notes (as of Gen 49, 2026-10-25) — six added by housekeeping
+
+*Added by the Gen 49 housekeeping pass from the brief's own nomenclature. These are definitions, not rulings: none of the six was findable in the KB by its name or by the obvious variants, and each is recorded here so the next reader does not have to re-derive it. Where an entry says "instance: none recorded", the shape is awaiting its first written instance — writing it is a separate task, not this one.*
+
+**B — the five boundaries.** container / permission / envelope / tool-dispatch / narrative. One action can be wrong at any one of the five while being right at the other four, so "the agent was contained" is only a whole claim when all five are named; the fifth is the one that gets skipped, because it is the account given afterwards rather than a mechanism. **Open question, not a ruling:** the boundary material currently lives in `security_architecture.md` (three-layer framing at `:43`), and the five-boundary cut does not appear there under any name or variant. Whether the five refine that three or are a different cut of the same thing is unruled.
+
+**C — class-below / class-above.** A fix applied at the wrong altitude. *Class-below* patches the instance that failed and leaves the class open; *class-above* patches the symptom that was seen and leaves the mechanism open. Both read as fixes at review time and neither closes a fact. Instance: none recorded in the KB — definition only, so the next one to spot it has a name.
+
+**E — mechanism-complete, surface-incomplete (both directions).** A mechanism can be finished while its surface is missing (nothing calls it), and a surface can be finished while its mechanism is missing (a green check that looks at nothing). Both are one defect seen from opposite ends, and both leave one fact with two answers. Instance of the second direction: the no-tool-wrapping guard that scanned zero files and passed (`:2171`–`:2180`, above). Instance of the first: `tests/test_tool_no_wrapping.py` "does not exist and never has on this branch" while the rule it would enforce has (`working_agreements.md:549`). *(The pairing of those two entries is the seat's reading, not a ruling.)*
+
+**F — prompt-asserted guard.** The artifact that enforces the rule is a document — a brief, a prompt, a review instruction — rather than a check. It is not necessarily a weak guard, but its whole mechanism is that someone reads and remembers, so it fails silently when readership changes. The honest form names the check that would go red, or says plainly that the enforcement is human. Instance: `working_agreements.md:549` — "Enforcement. Review time, by humans — not a test."
+
+**K — the workspace-isolation boundary is `workspace_id`.** Isolation between workspaces is structural exactly where the store keys on `workspace_id`, and narrative everywhere else, however the code is arranged. This is live rather than hypothetical because the vault is shared across workspaces (`~/.thoughtmachine`). Instance: none recorded in the KB — definition only.
+
+**R — names the shape; the read finds the mechanism.** A brief or ticket can name the *shape* of a defect without naming its mechanism, and the mechanism is only ever established by reading the code. Taking a named shape for a located mechanism is how a fix lands at the wrong altitude (see C). Nearest recorded instance: the Gen 48 paginate brief named the failing check ("category bypass"); the mechanism — authority laundering reaching host access — was found by reading, and was the true name (`working_agreements.md:555`). *(Mapping of that entry onto R is the seat's, unruled.)*
+
