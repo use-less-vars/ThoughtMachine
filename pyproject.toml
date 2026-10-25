@@ -29,6 +29,7 @@ packages = { find = { include = ["thoughtmachine*", "agent*", "tools*", "securit
 [tool.setuptools.package-data]
 thoughtmachine = [
     "py.typed",
+    "git_askpass.sh",
 ]
 # Include the top-level resources directory as data files
 # accessible via importlib.resources when thoughtmachine is installed.
