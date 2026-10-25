@@ -702,3 +702,23 @@ eleven client-claim findings awaiting a keep-or-delete ruling, one of which
 - Everything else not already ticketed lives in `brain_pour_2026-10-21.md`. If you close one
   of its thoughts, close it there too, so the next seat's reading gets shorter instead of
   longer.
+
+## 2026-10-25 — GEN 50 → GEN 51 HANDOFF
+
+You inherit `dev = f69761b4`, five PRs and one design pass closed, one code wave waiting on Main 40's review.
+
+**Read first:** `MANDATORY_STOP.md`, then `working_agreements.md` (four new classes at the end — they are the session's output), then `docs/design-auth-layer.md` (the design you'll implement), then the D3 brief at `.thoughtmachine/working_docs/brief-d3-ownership-refusal.md`. The two analysis documents on disk (`redteam-surface-complete.md`, `vault-ownership-sites.md`) are pointers, not reads — open them when the wave needs a row.
+
+**What closed:** the client-claim red team. Seven tickets on `dev` (F1–F12 plus three new: SSRF, logging-config, provider apikey read). The auth-layer design pass — D1 DECLARED, D2 MUST-BIND, D3 `_ownership_refusal` wins, D4 note. The front chokepoint now has a design.
+
+**What's queued:** D3 code wave first (brief on disk, awaiting Main 40). Then D2, then D1, then D4 is a doc edit. Then credential-delivery, credential-resolution, CI loop. Overnight run is 2–3 waves out.
+
+**What Main 40 holds:** the D3 brief review, the SSRF + logging-config drafts before they commit. Do not dispatch D3 before his go.
+
+**What I got wrong — the corrections you inherit:**
+1. Silent corrections, three times. The rule is now in `working_agreements.md`: verbatim edits are disclosed.
+2. A stale citation carried into a brief (wildcard CORS). The agent's read disproved it. The rule is now in `working_agreements.md`: briefs name mechanisms from sources the author read.
+3. Five terminal-paste corruptions. The rule is now in `working_agreements.md`: heredoc ≤10 lines, agent writes the rest.
+4. Two state-claims to Main 40 that were wrong (hygiene tickets "uncommitted", design doc path). Both corrected in the relay. Verify state against disk before relaying it — the agent's claims and mine both need the same check.
+
+**The one thing to carry:** the machine's honesty is in the naming of the gaps, not the absence of them. Every status you write names which boundary and what read verified it. When you don't know, say so.
