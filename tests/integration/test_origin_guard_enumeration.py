@@ -64,7 +64,11 @@ EXPECTED_METHOD_BY_SHAPE = {
     "DELETE": "DELETE",
 }
 
-_Route = namedtuple("_Route", "method path handler module line predicates")
+# ``predicates`` is every origin predicate the handler calls anywhere in its body
+# (presence).  ``first_statement_predicates`` holds only those called by the
+# handler's first non-docstring statement, so that the ordering (the guard gates
+# the work) can be asserted separately from presence.
+_Route = namedtuple("_Route", "method path handler module line predicates first_statement_predicates")
 
 
 def _callee_name(call):
@@ -127,6 +131,28 @@ def _guard_calls(function):
     return found
 
 
+def _first_statement_predicates(function):
+    """Return the origin predicates called by the first non-docstring statement.
+
+    Presence (``_guard_calls``) walks the whole function, so it cannot tell a
+    guard that gates the work from one that follows it.  This returns the
+    predicates reachable from ``body[0]`` after any docstring, so ordering can
+    be asserted: the check must come before the side effects it protects.
+    """
+    statements = list(function.body)
+    if statements and ast.get_docstring(function, clean=False) is not None:
+        statements = statements[1:]
+    if not statements:
+        return frozenset()
+    found = set()
+    for node in ast.walk(statements[0]):
+        if isinstance(node, ast.Call):
+            name = _callee_name(node)
+            if name in ORIGIN_PREDICATES:
+                found.add(name)
+    return frozenset(found)
+
+
 def _enumerate_routes():
     """Enumerate the routes declared in ``web_ui/backend/*.py`` from the AST alone.
 
@@ -165,6 +191,7 @@ def _enumerate_routes():
                         module=source.name,
                         line=node.lineno,
                         predicates=frozenset(_guard_calls(node)),
+                        first_statement_predicates=_first_statement_predicates(node),
                     )
                 )
     return routes, un_addable_handlers
@@ -246,6 +273,30 @@ def test_5a_presence_every_non_get_route_calls_the_origin_guard():
     assert unpinned_strict == [], (
         "non-GET routes that call _origin_allowed but are missing from STRICT_ORIGIN_NON_GET: "
         + "; ".join(unpinned_strict)
+    )
+
+    # (6) Ordering: the guard must gate the work, not follow it. Presence alone
+    # cannot see the difference - a handler that writes something and then checks
+    # the origin carries the guard without being protected by it. Scoped to
+    # _origin_check_request sites: the two _origin_allowed sites (vault-repair)
+    # deliberately run function-local lazy imports before their guard, so the
+    # ordering rule does not apply to them.
+    misordered = [
+        "{method} {path} -> {handler} ({module}:{line}) first statement calls {calls}".format(
+            method=route.method,
+            path=route.path,
+            handler=route.handler,
+            module=route.module,
+            line=route.line,
+            calls=sorted(route.first_statement_predicates) or "nothing",
+        )
+        for route in non_get
+        if "_origin_check_request" in route.predicates
+        and "_origin_check_request" not in route.first_statement_predicates
+    ]
+    assert misordered == [], (
+        "non-GET routes whose _origin_check_request call is not the first statement after the docstring "
+        "(the guard must gate the work, not follow it): " + "; ".join(misordered)
     )
 
     # FILESYSTEM_GET_MUST_GUARD is a "these GETs must be guarded" list, not an
