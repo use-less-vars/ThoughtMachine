@@ -110,6 +110,7 @@ class TestSessionLoadCeiling:
 
         # ── load: the stored write must be capped to banned ──────────────────
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = "ws-ceiling-regression"
         assert bridge2.load_session(session_id), "load_session returned False"
         cfg = bridge2.get_config()
         assert cfg is not None
@@ -141,6 +142,7 @@ class TestSessionLoadCeiling:
         )
 
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = "ws-ceiling-control"
         assert bridge2.load_session(session_id), "load_session returned False"
         cfg = bridge2.get_config()
         assert cfg is not None
@@ -208,6 +210,7 @@ class TestSessionLoadCeiling:
         session_id = saved.session_id
 
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = "ws-p1-deny"
         assert bridge2.load_session(session_id), "load_session returned False"
         cfg = bridge2.get_config()
         assert cfg is not None

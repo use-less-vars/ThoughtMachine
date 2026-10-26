@@ -150,6 +150,7 @@ class TestSessionPermissionsRestartFix:
 
         # ── restart (new bridge, same store): effective capped, storage intact ─
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = WS
         assert bridge2.load_session(session_id), "load_session returned False"
         # security invariant: the effective config is capped
         effective = _effective_permissions(WS, session_id)
@@ -184,10 +185,12 @@ class TestSessionPermissionsRestartFix:
 
         # restart 1
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = WS
         assert bridge2.load_session(session_id), "load_session returned False"
 
         # restart 2 (simulates another server start after the fix)
         bridge3 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge3._workspace_id = WS
         assert bridge3.load_session(session_id), "load_session returned False"
 
         stored = _stored_permissions(WS, session_id)
