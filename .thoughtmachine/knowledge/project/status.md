@@ -1,8 +1,8 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-26, Gen 51 close. **Gen 48 is closed. Everything this generation produced after `cf10c358` is local, unpushed and unreviewed.**
+Updated: 2026-10-26, Gen 51 close.
 
-**dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
+**Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
   vacuous scan) *(superseded 2026-10-25 by §Current state below — kept as historical record; see also the 2026-10-22 reading at lines 27–29 for the same convention.)*
 **Landed since the Gen-47 reading, in merge order:** `75f51e25` (#166) →
