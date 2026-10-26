@@ -246,3 +246,11 @@ web_ui/frontend/.npmrc
 
 # Gen 50 design pass: auth layer — re-included because docs/* is a catch-all.
 !docs/design-auth-layer.md
+
+# --- Source module re-include (Gen 51, 2026-10-26) -----------------------
+# `*secret*` above is a deliberate guard against committing secret MATERIAL,
+# but it also silently swallowed `agent/config/secret.py` — the redaction
+# wrapper module — so a commit of its importers would have shipped a broken
+# tree while every test stayed green locally. Re-include the source file only;
+# the guard above stays exactly as it is.
+!agent/config/secret.py
