@@ -1,8 +1,8 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-23, Gen 48 close-out seat. **Gen 48 is closed. Everything this generation produced after `cf10c358` is local, unpushed and unreviewed.**
+Updated: 2026-10-26, Gen 51 close.
 
-**dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
+**Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
   vacuous scan) *(superseded 2026-10-25 by §Current state below — kept as historical record; see also the 2026-10-22 reading at lines 27–29 for the same convention.)*
 **Landed since the Gen-47 reading, in merge order:** `75f51e25` (#166) →
@@ -38,6 +38,23 @@ after W4 merges." Status line for this wave, verbatim: "Credential
 injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+## Current state — 2026-10-26, Gen 51 close
+
+**Supersedes the 2026-10-26 Gen 51 mid-session block and the 2026-10-25 Gen 50 close (both kept below as historical record).**
+
+**dev HEAD:** `392e6b7a` — merge of PR 211 (`docs/d4-caller-identity`); tree clean, nothing in flight.
+
+**Auth Arc complete (D1–D4).**
+- **D3 (PR 207):** `_ownership_refusal_ids` primitive + adapters.
+- **D2 (PR 209):** `_bind_workspace` authority + WS handshake binding + 2 unaudited site closes.
+- **D1 (PR 210):** `_origin_check_request` on all 37 non-GET routes + enumeration test + `/api/browse` guard.
+- **D4 (PR 211):** Design note — caller identity as predicate's first operand.
+
+**Delivery Wave queued.** The friend incident proved Layer 5 (fresh install) is the sharpest gap. Ruled: `feat/fresh-install-diagnostic` (startup banner + doctor) queues behind auth arc. `host_bash` default-off must surface at install time. Provider URL validation is partial.
+
+**Tickets filed (PR 208):** SSRF (CRITICAL), logging-config (HIGH), macOS advisory (LOW).
+**Hygiene filed:** `route-workspace-mutations-through-bind-authority`, `site-2543-bootstrap-bypass`.
 
 ## Current state — 2026-10-26, Gen 51 mid-session
 

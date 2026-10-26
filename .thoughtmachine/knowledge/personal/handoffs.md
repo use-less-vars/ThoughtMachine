@@ -722,3 +722,22 @@ You inherit `dev = f69761b4`, five PRs and one design pass closed, one code wave
 4. Two state-claims to Main 40 that were wrong (hygiene tickets "uncommitted", design doc path). Both corrected in the relay. Verify state against disk before relaying it — the agent's claims and mine both need the same check.
 
 **The one thing to carry:** the machine's honesty is in the naming of the gaps, not the absence of them. Every status you write names which boundary and what read verified it. When you don't know, say so.
+
+## 2026-10-26 — GEN 51 → GEN 52 HANDOFF
+
+You inherit `dev = 392e6b7a` with the tree clean: the auth arc is complete, D1 through D4 merged, nothing in flight. The next wave is not another auth round — it is delivery.
+
+**Read first:** `MANDATORY_STOP.md`, then `working_agreements.md` (the nine Gen 51 classes at the end — they are this session's actual output), then `docs/design-auth-layer.md` (§D4 closed the arc by naming caller identity as the predicate's first operand). The four D-briefs in `.thoughtmachine/working_docs/` are done; do not re-dispatch them.
+
+**What closed:** D3 (#207) `_ownership_refusal_ids` and its adapters; D2 (#209) `_bind_workspace` as sole authority, WS handshake binding, two unaudited sites closed; D1 (#210) `_origin_check_request` on all 37 non-GET routes plus the enumeration test and the `/api/browse` guard; D4 (#211) the design note. Four PRs, one arc, zero open threads inside it.
+
+**What's queued:** `feat/fresh-install-diagnostic` first — startup banner plus `install-doctor` — because the friend incident showed the sharpest gap is the one no gate covers. Then credential-delivery, credential-resolution, the CI loop. `host_bash` default-off must surface its state at install time, not fail silently.
+
+**Tickets waiting, unfixed:** #208 filed SSRF (CRITICAL), logging-config (HIGH), the macOS advisory (LOW). Hygiene queued: `route-workspace-mutations-through-bind-authority`, `site-2543-bootstrap-bypass` (the slug names a comment — the real site is `server.py:2582–2587`, see the anchor note in `project/operator_observations.md`), and `hygiene/enable-pr-auto-merge`, which is a repo setting rather than code: `gh pr merge --auto` cannot be used while it is off, which is why verification stays manual.
+
+**What I got wrong — the corrections you inherit:**
+1. Two counts asserted in briefs that were wrong, and both times the worker was right. `asserted-count-in-brief` is in `working_agreements.md`.
+2. A worker reported PASS on a byte-identical comparison whose expected string carried the same corruption as the file. `self-comparison-assertion` is in `working_agreements.md`.
+3. Four Gen 51 entries went into the KB mid-session and five more at close. If you find the close entries missing, the close was interrupted, not skipped.
+
+**The one thing to carry:** verify the claim, not the conclusion. Every PASS this session that turned out wrong was honest. The gates held; what failed was the construction of the check.

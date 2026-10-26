@@ -27,6 +27,9 @@ Tags: `[intent]` wanted feature/direction · `[finding]` observed problem · `[p
 > This badge is the remedy; keep it here permanently. Canonical entry:
 > `project/working_agreements.md` → "Named pattern: `log-reads-as-backlog`".
 
+- `[intent]` `feat/fresh-install-diagnostic` (queued, Gen 51 close). Fresh install issues: missing vault, provider schema errors, `host_bash` silent fail. Needs startup banner + `install-doctor`.
+- `[finding]` `hygiene/enable-pr-auto-merge` (infra, Gen 51 close). Repo setting `enablePullRequestAutoMerge` is off; requires manual `gh pr merge`, which defeats the structural fix for `verification-accepted-without-reading` (`working_agreements.md`, Gen 51).
+
 ## 2026-10-17 — Gen 45 seat, operator intent (token-restriction surface)
 
 ### [intent] Critical token warning must re-appear on EVERY tool-call attempt while critical
