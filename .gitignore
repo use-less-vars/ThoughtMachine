@@ -254,3 +254,8 @@ web_ui/frontend/.npmrc
 # tree while every test stayed green locally. Re-include the source file only;
 # the guard above stays exactly as it is.
 !agent/config/secret.py
+
+# Gen 51 logging design pass: sink inventory, redaction truth, deletion
+# decidability and the per-call-site keep/delete/unclear marking. Public tier,
+# ships with the repo (`docs/*` is a catch-all, so the negation is required).
+!docs/design-logging-audit.md
