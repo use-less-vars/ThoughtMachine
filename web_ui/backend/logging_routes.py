@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
 from agent.logging.unified import (
@@ -19,6 +19,8 @@ from agent.logging.unified import (
     set_log_tags,
     set_truncation_limits,
 )
+
+from web_ui.backend.origin_policy import _origin_check_request
 
 router = APIRouter(prefix="/api/logging")
 
@@ -51,7 +53,7 @@ async def get_logging_config(session_id: Optional[str] = None) -> Dict[str, Any]
 
 
 @router.put("/config")
-async def update_logging_config(body: LoggingConfigBody) -> Dict[str, Any]:
+async def update_logging_config(request: Request, body: LoggingConfigBody) -> Dict[str, Any]:
     """Update runtime logging configuration.
 
     Accepts JSON body with optional fields:
@@ -63,6 +65,8 @@ async def update_logging_config(body: LoggingConfigBody) -> Dict[str, Any]:
     Returns the previous and new config values, and broadcasts the update
     to all active WebSocket bridges.
     """
+    if not _origin_check_request(request, route_name="update_logging_config"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     result: Dict[str, Any] = {
         "status": "ok",
         "config": {},

@@ -14,11 +14,14 @@ guards cannot drift apart.  Only loopback spellings (``localhost`` /
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import List, Optional
 
 from fastapi import Request
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_FRONTEND_PORT = 5173
 FRONTEND_PORT_ENV = "TM_FRONTEND_PORT"
@@ -78,3 +81,49 @@ def _origin_allowed(request: Request) -> bool:
             return False
         raw = match.group(0)
     return origin_is_loopback(raw)
+
+
+def _origin_check_request(request: Request, route_name: str) -> bool:
+    """Request-time origin guard for HTTP non-GET routes.
+
+    A SEMANTIC mirror of :func:`websocket_origin_allowed`'s three branches
+    (absent / same / foreign) -- NOT a signature mirror: that function takes
+    an ``Optional[str]`` origin, this one takes a :class:`Request`.
+
+    Deliberately differs from :func:`_origin_allowed` in exactly ONE way:
+    an absent ``Origin``/``Referer`` pair is a **data condition**, not a
+    refusal.  Non-browser clients (the CLI, integration harnesses, native
+    tooling) send no ``Origin`` and are not a CSRF vector, so they are
+    allowed -- and logged, so the assumption stays falsifiable: a
+    browser-sent ``User-Agent: Mozilla/...`` on a state-changing route with
+    an absent ``Origin`` is the trigger to revisit the option.
+
+    Returns True on allow, False on refuse.  Never raises -- callers raise
+    ``HTTPException(403)`` on False.  Every branch logs exactly one ``INFO``
+    line, greppable form::
+
+        origin_check: route=<name> result=<...> origin=<...>
+    """
+    raw = request.headers.get("origin") or request.headers.get("referer") or ""
+    if not raw:
+        logger.info(
+            "origin_check: route=%s result=allow_absent origin=<absent>",
+            route_name,
+        )
+        return True
+    if request.headers.get("referer") and not request.headers.get("origin"):
+        match = re.match(r"^https?://[^/]+", raw, re.I)
+        raw = match.group(0) if match else raw
+    if origin_is_loopback(raw):
+        logger.info(
+            "origin_check: route=%s result=allow_same origin=%s",
+            route_name,
+            raw,
+        )
+        return True
+    logger.info(
+        "origin_check: route=%s result=refuse_foreign origin=%s",
+        route_name,
+        raw,
+    )
+    return False

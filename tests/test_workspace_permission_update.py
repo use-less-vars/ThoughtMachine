@@ -15,11 +15,19 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request as StarletteRequest
 
 from web_ui.backend import workspace_routes
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+
+def _no_origin_request() -> StarletteRequest:
+    """A real Starlette Request with no Origin header."""
+    return StarletteRequest(
+        {"type": "http", "method": "POST", "path": "/", "headers": []}
+    )
 
 
 def _use_tmp_workspace(monkeypatch, tmp_path):
@@ -53,7 +61,11 @@ def _put(ws_id, permissions, allow_host_resources=None):
         **({"allow_host_resources": allow_host_resources}
            if allow_host_resources is not None else {}),
     )
-    return asyncio.run(workspace_routes.put_workspace_permissions(ws_id, body))
+    return asyncio.run(
+        workspace_routes.put_workspace_permissions(
+            ws_id=ws_id, body=body, request=_no_origin_request()
+        )
+    )
 
 
 def _patch_registry(monkeypatch, ws_id="ws-1"):

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ValidationError
 
 from session.store import FileSystemSessionStore
@@ -44,6 +44,7 @@ from thoughtmachine.workspace_capabilities import (
 )
 
 from web_ui.backend.config_manager import ConfigManager
+from web_ui.backend.origin_policy import _origin_check_request
 from web_ui.backend.session_manager import SessionManager
 
 # ── Router ──────────────────────────────────────────────────────────────────
@@ -104,12 +105,14 @@ def _get_store() -> FileSystemSessionStore:
 
 
 @router.post("/create", response_model=CreateSessionResponse)
-async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
+async def create_session(request: Request, body: CreateSessionBody) -> Dict[str, Any]:
     """Create a new session and persist it immediately.
 
     Optionally accepts a ``name`` and ``workspace_id``.
     Returns the created session's metadata.
     """
+    if not _origin_check_request(request, route_name="create_session"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         store = _get_store()
         session_manager = SessionManager(store, ConfigManager())
@@ -295,6 +298,7 @@ async def get_session(session_id: str) -> Dict[str, Any]:
 
 @router.delete("/{session_id}")
 async def delete_session(
+    request: Request,
     session_id: str,
     workspace_id: Optional[str] = Query(None, description="Workspace ID for scoped deletion"),
 ) -> Dict[str, Any]:
@@ -303,6 +307,8 @@ async def delete_session(
     Optionally accepts ``workspace_id`` for scoped deletion.
     Returns ``{\"success\": true}`` if found and deleted.
     """
+    if not _origin_check_request(request, route_name="delete_session"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         store = _get_store()
         found = store.delete_session(session_id, workspace_id=workspace_id)
@@ -476,6 +482,7 @@ async def get_session_permissions(session_id: str) -> Dict[str, Any]:
 
 @router.put("/{session_id}/permissions")
 async def put_session_permissions(
+    request: Request,
     session_id: str,
     body: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -495,6 +502,8 @@ async def put_session_permissions(
     and return {"raw": normalized, "effective": ..., "resolved_at": ...}.
     An empty object {} clears explicit grants (all-defaults profile).
     """
+    if not _origin_check_request(request, route_name="put_session_permissions"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         _store, session = _load_permission_session(session_id)
         ws_id = session.workspace_id or ""

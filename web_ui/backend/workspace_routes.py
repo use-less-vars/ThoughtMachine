@@ -46,6 +46,8 @@ from tools.host_resource_policy import load_workspace_config
 
 from agent.models.worker_definition import WorkerDefinition
 
+from web_ui.backend.origin_policy import _origin_check_request
+
 # Module-level reference for monkeypatchability in tests; the import is
 # guarded so a failing worker module can never break router import.
 try:
@@ -111,7 +113,9 @@ def _confine_to_home(path: str) -> str:
 
 
 @router.post("/resolve")
-async def resolve_workspace_path(body: ResolvePathBody) -> Dict[str, Any]:
+async def resolve_workspace_path(
+    request: Request, body: ResolvePathBody
+) -> Dict[str, Any]:
     """Resolve a filesystem path to a workspace ID.
 
     If the path is already registered, returns the existing workspace ID.
@@ -126,6 +130,8 @@ async def resolve_workspace_path(body: ResolvePathBody) -> Dict[str, Any]:
     code (bootstrap, server startup, or this same confined endpoint), so they
     are trusted.
     """
+    if not _origin_check_request(request, route_name="resolve_workspace_path"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         if not body.path or not body.path.strip():
             raise HTTPException(
@@ -389,8 +395,10 @@ async def get_domain_allowlist(ws_id: str):
 # ── PUT /api/workspace/{ws_id}/domain_allowlist ──────────────────────────────
 
 @router.put("/{ws_id}/domain_allowlist")
-async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
+async def put_domain_allowlist(request: Request, ws_id: str, body: DomainAllowlistBody):
     """Atomically replace the workspace's domain allowlist."""
+    if not _origin_check_request(request, route_name="put_domain_allowlist"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     ensure_workspace_dirs(ws_id)
     path = _workspace_dir(ws_id) / "domain_allowlist.json"
     _atomic_write_json(body.domains, path)
@@ -746,6 +754,8 @@ async def patch_worker_blueprint(
     atomically.  Every other entry is preserved verbatim and the file is never
     created when it is missing.
     """
+    if not _origin_check_request(request, route_name="patch_worker_blueprint"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         body = await request.json()
     except Exception as exc:
@@ -805,6 +815,8 @@ async def create_worker(ws_id: str, request: Request):
     Validates the request body against ``WorkerDefinition``, checks for
     duplicate names, and appends to ``workers.json`` atomically.
     """
+    if not _origin_check_request(request, route_name="create_worker"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     # 1. Parse and validate request body
     try:
         body = await request.json()
@@ -841,6 +853,8 @@ async def update_worker(ws_id: str, name: str, request: Request):
     Validates the request body, finds the matching worker, replaces it
     in ``workers.json`` atomically, and returns the updated definition.
     """
+    if not _origin_check_request(request, route_name="update_worker"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     # 1. Parse and validate request body
     try:
         body = await request.json()
@@ -875,12 +889,14 @@ async def update_worker(ws_id: str, name: str, request: Request):
 # ── DELETE /api/workspace/{ws_id}/workers/{name} ───────────────────────────
 
 @router.delete("/{ws_id}/workers/{name}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_worker(ws_id: str, name: str):
+async def delete_worker(request: Request, ws_id: str, name: str):
     """Delete a worker definition by name from ``workers.json``.
 
     Removes the matching worker and writes the remaining list atomically.
     Returns 204 with no content on success.
     """
+    if not _origin_check_request(request, route_name="delete_worker"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     ws_dir = _workspace_dir(ws_id)
     path = ws_dir / "workers.json"
     if not path.exists():
@@ -907,6 +923,8 @@ async def put_dockerfile(ws_id: str, request: Request):
     Reads the request body as UTF-8 text and writes it to the workspace's
     ``Dockerfile`` using the same atomic-write pattern as other endpoints.
     """
+    if not _origin_check_request(request, route_name="put_dockerfile"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     body = await request.body()
     text = body.decode("utf-8")
     ensure_workspace_dirs(ws_id)
@@ -1202,7 +1220,9 @@ def _enumerate_worker_instances(
 
 
 @router.post("/{ws_id}/workers/stop_all")
-async def stop_all_workers(ws_id: str, body: Optional[StopAllWorkersBody] = None):
+async def stop_all_workers(
+    request: Request, ws_id: str, body: Optional[StopAllWorkersBody] = None
+):
     """Cooperatively stop every worker instance in the workspace.
 
     Enumerates instances from the same on-disk layout the per-worker ``stop``
@@ -1223,6 +1243,8 @@ async def stop_all_workers(ws_id: str, body: Optional[StopAllWorkersBody] = None
             [{"worker_name": ..., "instance_id": ...,
               "status": "ok" | "not_found" | "error", "error": ...|None}, ...]
     """
+    if not _origin_check_request(request, route_name="stop_all_workers"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
     session_filter = body.session_id if body is not None else None
@@ -1260,6 +1282,7 @@ async def stop_all_workers(ws_id: str, body: Optional[StopAllWorkersBody] = None
 
 @router.post("/{ws_id}/workers/{name}/stop")
 async def stop_worker(
+    request: Request,
     ws_id: str,
     name: str,
     instance_id: Optional[int] = Query(
@@ -1294,6 +1317,8 @@ async def stop_worker(
         200 with ``{"status": "ok", "name": name}`` on success.
         404 if the worker directory does not exist.
     """
+    if not _origin_check_request(request, route_name="stop_worker"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
     instance_id = _query_default(instance_id)
@@ -1303,6 +1328,7 @@ async def stop_worker(
 
 @router.post("/{ws_id}/workers/{name}/pause")
 async def pause_worker(
+    request: Request,
     ws_id: str,
     name: str,
     instance_id: Optional[int] = Query(
@@ -1336,6 +1362,8 @@ async def pause_worker(
         200 with ``{"status": "pausing", "name": name}`` on success.
         404 if the worker directory does not exist.
     """
+    if not _origin_check_request(request, route_name="pause_worker"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
     workers_dir = ws_dir / "workers"
@@ -1415,6 +1443,7 @@ async def pause_worker(
 
 @router.post("/{ws_id}/workers/{name}/resume")
 async def resume_worker(
+    request: Request,
     ws_id: str,
     name: str,
     instance_id: Optional[int] = Query(
@@ -1444,6 +1473,8 @@ async def resume_worker(
         200 with ``{"status": "resumed", "name": name}`` on success.
         404 if the worker directory does not exist.
     """
+    if not _origin_check_request(request, route_name="resume_worker"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
     workers_dir = ws_dir / "workers"
@@ -1646,6 +1677,7 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
 
 @router.put("/{ws_id}/permissions")
 async def put_workspace_permissions(
+    request: Request,
     ws_id: str,
     body: WorkspacePermissionsBody,
 ) -> Dict[str, Any]:
@@ -1657,6 +1689,8 @@ async def put_workspace_permissions(
     assessment. ``allow_host_resources`` is updated only when explicitly
     provided in the body (None leaves the saved value untouched).
     """
+    if not _origin_check_request(request, route_name="put_workspace_permissions"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     from agent.config.resource_catalog import validate_workspace_permissions
     from agent.config.risk_model import compute_workspace_risk
 
@@ -1697,7 +1731,9 @@ async def put_workspace_permissions(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_workspace(body: WorkspaceCreateBody) -> Dict[str, Any]:
+async def create_workspace(
+    request: Request, body: WorkspaceCreateBody
+) -> Dict[str, Any]:
     """Register a new workspace rooted at *path* with a purpose preset.
 
     Validates the purpose (422), confines the path to $HOME minus the vault
@@ -1707,6 +1743,8 @@ async def create_workspace(body: WorkspaceCreateBody) -> Dict[str, Any]:
     resource→level overrides) and ``settings.allow_host_resources`` (bool)
     are layered on top of the purpose preset.
     """
+    if not _origin_check_request(request, route_name="create_workspace"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     from agent.config.workspace_purpose import WORKSPACE_PURPOSES, apply_purpose_preset
     from agent.config.risk_model import compute_workspace_risk
 
