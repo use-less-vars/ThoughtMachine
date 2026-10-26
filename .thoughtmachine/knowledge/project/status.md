@@ -1,6 +1,6 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-23, Gen 48 close-out seat. **Gen 48 is closed. Everything this generation produced after `cf10c358` is local, unpushed and unreviewed.**
+Updated: 2026-10-26, Gen 51 close. **Gen 48 is closed. Everything this generation produced after `cf10c358` is local, unpushed and unreviewed.**
 
 **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's

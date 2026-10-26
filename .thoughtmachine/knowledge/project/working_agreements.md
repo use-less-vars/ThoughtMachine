@@ -671,7 +671,7 @@ A criterion that names its members invites being audited by its members. "These 
 
 **Boundary:** criterion-authorship sibling of `audit-names-guards-flow-has-more-assignments` — same error one layer up; that one says grep the invariant's target, not the named guards.
 
-**Instance: not recorded this session.** The name is carried from the Gen 51 close list; the body above is the defensible generalisation and must not be cited as evidence-backed until an instance is attached.
+**Instance:** D1's `FILESYSTEM_GET_MUST_GUARD` list. The list's rationale is "GETs whose response discloses filesystem facts." It initially contained only `vault_repair_status`. `/api/browse` discloses strictly more filesystem fact (arbitrary path, permits `/`, permits outside `$HOME`), but was omitted. Main 40 ruled to add it, naming the omission an incompleteness of the criterion, not a decision.
 
 ## 2026-10-26 — Class: `self-comparison-assertion` (Gen 51)
 
