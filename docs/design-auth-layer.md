@@ -121,3 +121,5 @@ The wildcard-CORS premise was carried in two documents before it was disproved a
 The stale line citation `server.py:1183-1185` (the corpus's) is the instance of `cite a symbol, not a line` already named in `working_agreements.md` §2026-10-17. Those lines are `_SERVE_FRONTEND = False` and a blank; the actual `add_middleware` is at `:1194-1200`. Corpus citation to be amended in the same follow-up dispatch.
 
 No wave-2 ticket depends on the false premise — none was filed CORS-shaped.
+
+**`bridge.py:308` symbol-naming drift in §D3 and §6.** Both sections call `bridge.py:308` `_ownership_refusal` (path-shaped, `(target_path, bound_workspace_id)`). In the tree, `:308` is `_ownership_refusal_ids` (id-shaped, two workspace ids); the path-shaped `_ownership_refusal` is at `:372`, and the session-shaped `_ownership_refusal_by_id` at `:349`. §D4 cites all three correctly, so the doc is internally inconsistent on this one pairing. The historical sections are left unedited (they record what the D3 design pass saw); this entry names the carrier. Sibling to the CORS-premise correction above — same discipline: corrections name every carrier, sections keep their text.
