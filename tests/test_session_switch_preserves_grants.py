@@ -171,6 +171,7 @@ class TestSessionSwitchPreservesGrants:
 
         # Operator switches to the session: fresh bridge, fresh load.
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = ws_id
         assert bridge2.load_session(session_id), "load_session returned False"
         # Security invariant: live effective config is capped.
         _assert_perms(_effective_permissions(ws_id, session_id), TIGHTENED_CEILING,
@@ -199,6 +200,7 @@ class TestSessionSwitchPreservesGrants:
 
         # Load under tightened ceiling (live capped).
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = ws_id
         assert bridge2.load_session(session_id), "load_session returned False"
         _assert_perms(_effective_permissions(ws_id, session_id), TIGHTENED_CEILING,
                       "live effective after load")
@@ -216,6 +218,7 @@ class TestSessionSwitchPreservesGrants:
 
         # Switch back: fresh bridge, fresh load.
         bridge3 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge3._workspace_id = ws_id
         assert bridge3.load_session(session_id), "load_session returned False"
         _assert_perms(_effective_permissions(ws_id, session_id), TIGHTENED_CEILING,
                       "live effective after switch-back")

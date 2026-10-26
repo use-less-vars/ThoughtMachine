@@ -1278,6 +1278,7 @@ class TestBridgePermissionSync:
         write_session_permissions(vroot, ws, session_id, {"filesystem": "write"})
 
         bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
+        bridge2._workspace_id = ws
         assert bridge2.load_session(session_id)
         # The reloaded bridge's CANONICAL config projection (gate disk mode:
         # sidecar grants capped by the workspace ceiling) reports the grant --

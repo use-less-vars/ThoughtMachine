@@ -1577,7 +1577,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # caught as B.
                         from web_ui.backend.bridge import _ownership_refusal
                         _ac_bound_ws = bridge.workspace_id if bridge is not None else None
-                        _ac_refusal = _ownership_refusal(new_workspace_path, _ac_bound_ws)
+                        # D3: bootstrap is the transition; it cannot require the
+                        # transition.  An unbound connection may establish scope
+                        # here (that is the only thing allowed on ``None``); a
+                        # bound one is still checked by the path predicate.
+                        if _ac_bound_ws is None:
+                            _ac_refusal = None
+                        else:
+                            _ac_refusal = _ownership_refusal(new_workspace_path, _ac_bound_ws)
                         if _ac_refusal is not None:
                             log('WARNING', 'server.config',
                                 "apply_config refused: workspace mismatch — "
@@ -2366,7 +2373,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     _msg_ws = msg.get("workspace_id") or None
                     if _msg_ws:
                         try:
-                            from web_ui.backend.bridge import _validate_workspace_id
+                            from web_ui.backend.bridge import (
+                                _ownership_refusal_ids,
+                                _validate_workspace_id,
+                            )
                             _msg_ws = _validate_workspace_id(_msg_ws)
                         except ValueError as exc:
                             log('WARNING', 'server',
@@ -2376,7 +2386,16 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "text": f"⚠ Invalid workspace_id: {exc}",
                             })
                             continue
-                        if _socket_ws and _msg_ws != _socket_ws:
+                        # D3: the id-form primitive owns the comparison. It is
+                        # consulted only when the socket ALREADY has a scope: for
+                        # an unscoped socket a named workspace_id is a first bind,
+                        # not a switch, and a None-fails-closed reading here would
+                        # refuse every open-by-workspace load (caller divergence).
+                        _load_refusal = (
+                            _ownership_refusal_ids(_msg_ws, _socket_ws)
+                            if _socket_ws is not None else None
+                        )
+                        if _load_refusal is not None:
                             log('WARNING', 'server',
                                 f"load_session refused: workspace mismatch "
                                 f"(socket={_socket_ws}, requested={_msg_ws}, "
@@ -2473,6 +2492,26 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # WebAgentBridge.__init__ takes no workspace argument, so
                         # the scope must be pinned here; otherwise _workspace_id
                         # stays None and bridge.py's mismatch guard can never fire.
+                        if _expected_ws is None:
+                            # D3: a scopeless bridge now REFUSES to load anything
+                            # (bridge.load_session). A bare load_session —
+                            # session_id only, no workspace_id — is the frontend's
+                            # open-by-id and the REST-create → WS-load contract,
+                            # so the session's OWN workspace has to be resolved
+                            # here, at the adapter, and pinned before the load.
+                            try:
+                                _probe = session_store.load_session(session_id)
+                            except Exception as exc:  # noqa: BLE001
+                                log('WARNING', 'server.ws',
+                                    f'load_session: could not resolve the workspace '
+                                    f'of session {session_id}: {exc}')
+                                _probe = None
+                            _probe_ws = (
+                                getattr(_probe, 'workspace_id', None)
+                                if _probe is not None else None
+                            )
+                            if _probe_ws:
+                                _expected_ws = _probe_ws
                         if _expected_ws:
                             bridge._workspace_id = _expected_ws
                         bridge.set_event_callback(event_callback, key=id(ws))
@@ -3052,9 +3091,20 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # A scopeless connection (bootstrap) keeps its previous
                     # behaviour: the REST create flow and the contract tests
                     # rely on it.
+                    from web_ui.backend.bridge import _ownership_refusal_ids
                     _ns_cur_ws = bridge.workspace_id if bridge is not None else None
                     _ns_req_ws = msg.get("workspace_id") or None
-                    if _ns_cur_ws and _ns_req_ws and _ns_req_ws != _ns_cur_ws:
+                    # D3: the id-form primitive owns the comparison, consulted
+                    # when both ids exist. Absent means "bootstrap" (both None)
+                    # or "bare new_session" (the frontend sends no workspace_id),
+                    # not "unowned", so None-fails-closed would refuse the UI's
+                    # own New Chat (caller divergence).
+                    _ns_refusal = (
+                        _ownership_refusal_ids(_ns_req_ws, _ns_cur_ws)
+                        if _ns_cur_ws is not None and _ns_req_ws is not None
+                        else None
+                    )
+                    if _ns_refusal is not None:
                         log('WARNING', 'server',
                             f"new_session refused: connection is scoped to workspace "
                             f"{_ns_cur_ws} and cannot switch to {_ns_req_ws}")
@@ -3278,7 +3328,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         from web_ui.backend.bridge import (
                             _ownership_refusal, _resolve_workspace_id,
                         )
-                        _sp_refusal = _ownership_refusal(new_project, _sp_cur_ws)
+                        # D3: bootstrap is the transition; it cannot require the
+                        # transition.  An unbound connection may establish scope
+                        # here and nowhere else; the resolution below still runs
+                        # so the binding can happen on this path.
+                        _sp_refusal = (
+                            None if _sp_cur_ws is None
+                            else _ownership_refusal(new_project, _sp_cur_ws)
+                        )
                         _sp_req_ws = _resolve_workspace_id(new_project)
                     except Exception as exc:
                         _sp_refusal = f"ownership check failed: {exc}"

@@ -305,6 +305,70 @@ def _path_is_same_or_inside(path: str, root: str) -> bool:
         return False
 
 
+def _ownership_refusal_ids(
+    target_workspace_id: Optional[str],
+    bound_workspace_id: Optional[str],
+) -> Optional[str]:
+    """Single source of truth for the workspace-ownership rule, over IDs.
+
+    Returns ``None`` when the target is ALLOWED, otherwise a human-readable
+    refusal reason.  ``_ownership_refusal`` (path in) and
+    ``_ownership_refusal_by_id`` (session id in) are adapters that resolve
+    their input to a workspace ID and delegate here, so the rule cannot drift
+    between call sites.
+
+    Rule (D3: ``None`` fails closed \u2014 a side that cannot name its workspace
+    proves nothing, so it is refused instead of waved through):
+      1. REFUSE when ``bound_workspace_id`` is None (no ownership claim).
+      2. REFUSE when ``target_workspace_id`` is None (nothing to compare).
+      3. ALLOW when the two IDs are equal (same workspace).
+      4. REFUSE otherwise (a different workspace).
+
+    The comparison is identity, not location.  A workspace keeps its ID when
+    its root path is renamed, so the rule survives a rename by construction;
+    no registry lookup happens here (resolution belongs to the adapters).
+    """
+    if bound_workspace_id is None:
+        return (
+            "connection has no workspace scope, so target workspace "
+            f"{target_workspace_id!r} cannot be proven to belong to it"
+        )
+
+    if target_workspace_id is None:
+        return f"target workspace is unspecified, expected {bound_workspace_id!r}"
+
+    if target_workspace_id == bound_workspace_id:
+        return None
+
+    return (
+        f"target workspace {target_workspace_id!r} is not the bound workspace "
+        f"{bound_workspace_id!r}"
+    )
+
+
+def _ownership_refusal_by_id(
+    session_id: str,
+    bound_workspace_id: Optional[str],
+) -> Optional[str]:
+    """Session-shaped adapter over ``_ownership_refusal_ids``.
+
+    Resolves ``session_id`` to the workspace its stored record belongs to, then
+    applies the id-form rule.  An unreadable or missing record is refused (fail
+    closed): a session that cannot be found proves nothing about ownership.
+
+    No D3 call site uses this \u2014 it is D2's (binding-step) hook.
+    """
+    try:
+        session = FileSystemSessionStore().load_session(session_id)
+    except Exception as exc:  # noqa: BLE001 - refusal, not an exception, is the contract
+        return f"session {session_id!r} could not be read: {exc}"
+
+    if session is None:
+        return f"session {session_id!r} not found, so its workspace cannot be proven"
+
+    return _ownership_refusal_ids(session.workspace_id, bound_workspace_id)
+
+
 def _ownership_refusal(target_path: str, bound_workspace_id: Optional[str]) -> Optional[str]:
     """Single source of truth for the workspace-ownership rule.
 
@@ -312,12 +376,12 @@ def _ownership_refusal(target_path: str, bound_workspace_id: Optional[str]) -> O
     refusal reason.  Both ``apply_config`` and ``set_project`` call this, so
     the rule cannot drift between them.
 
-    Rule (``bound_workspace_id`` None = unscoped connection, nothing to
-    violate \u2192 ALLOW):
+    Rule (D3: an unscoped side is refused, never waved through):
       1. ``resolved = _resolve_workspace_id(target_path)``
-      2. ALLOW when ``resolved == bound_workspace_id`` (same workspace).
-      3. REFUSE when ``resolved is not None`` (a *different* registered
-         workspace).
+      2. ``resolved is not None`` (a registered workspace): the id-form rule
+         decides \u2014 ``_ownership_refusal_ids(resolved, bound_workspace_id)``,
+         so a different workspace \u2014 and an unscoped connection \u2014 is refused.
+      3. REFUSE when ``bound_workspace_id`` is None (no claim, no allow).
       4. ``resolved is None`` (not a registered workspace root): ALLOW iff the
          realpath'd target is neither equal to nor inside the realpath'd root
          of ANY OTHER registered workspace.  A brand-new path outside every
@@ -325,20 +389,18 @@ def _ownership_refusal(target_path: str, bound_workspace_id: Optional[str]) -> O
          workspace's tree is refused.
     """
     if bound_workspace_id is None:
-        # No ownership claim on this connection (bootstrap / unscoped socket):
-        # there is nothing that could be violated.
-        return None
+        # D3: None fails closed.  This branch used to return None (ALLOW): an
+        # unscoped connection passed every target through the gate.
+        return (
+            "connection has no workspace scope, so target "
+            f"{target_path!r} cannot be proven to belong to it"
+        )
 
     resolved = _resolve_workspace_id(target_path)
 
-    if resolved == bound_workspace_id:
-        return None
-
     if resolved is not None:
-        return (
-            f"target {target_path!r} belongs to workspace {resolved!r}, "
-            f"not the bound workspace {bound_workspace_id!r}"
-        )
+        # Registered target: the id-form primitive decides (identity, not path).
+        return _ownership_refusal_ids(resolved, bound_workspace_id)
 
     # Unregistered target \u2014 allow only if it cannot reach another workspace.
     roots = _registered_workspace_roots()
@@ -2257,7 +2319,13 @@ class WebAgentBridge:
             # binding is authoritative; a caller-supplied id may only scope a
             # bridge that has none yet.
             _scope: Optional[str] = self._workspace_id or workspace_id
-            if self._workspace_id and workspace_id and workspace_id != self._workspace_id:
+            # D3: the id-form primitive decides who may be loaded.  A caller that
+            # NAMES a workspace must match the bridge's binding, and an unscoped
+            # bridge can no longer be scoped by naming one (it now REFUSES; the
+            # caller id used to scope it).  A bare call is decided after the read,
+            # below, where the record's own workspace_id is known.
+            if workspace_id is not None and _ownership_refusal_ids(
+                    workspace_id, self._workspace_id) is not None:
                 log('WARNING', 'server.bridge',
                     f"load_session refused: workspace {workspace_id!r} requested but "
                     f"bridge is scoped to {self._workspace_id!r} (session {session_id})")
@@ -2270,7 +2338,13 @@ class WebAgentBridge:
             # The store also scans the legacy, workspace-agnostic directory,
             # whose records can still carry a foreign workspace_id.  Refuse
             # one here rather than pivoting the bridge into that workspace.
-            if _scope and session.workspace_id and session.workspace_id != _scope:
+            # D3: the same primitive.  A record that carries a workspace must
+            # match the settled scope, and an ABSENT scope now REFUSES (the
+            # inversion this wave lands: an unscoped bridge used to load any
+            # workspace's session).  A workspace-less legacy record has no
+            # identity to compare, so there is nothing to enforce for it.
+            if session.workspace_id is not None and _ownership_refusal_ids(
+                    session.workspace_id, _scope) is not None:
                 log('WARNING', 'server.bridge',
                     f"load_session refused: session {session_id} belongs to workspace "
                     f"{session.workspace_id!r}, expected {_scope!r}")

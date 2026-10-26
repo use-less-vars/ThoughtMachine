@@ -885,9 +885,11 @@ def _open_ws_with_project(client, project_path):
 
     ``?project=`` is client-supplied and only confined for existence/outside-
     vault (server.py:1244-1247); it does NOT bind a workspace.  A socket opened
-    this way is still *scopeless*, so it is a legitimate bootstrap - and it is
-    exactly how an attacker parks a foreign ``_project_path`` on a socket that
-    later binds itself to workspace A.
+    this way is *unbound*, which D3 defines as the bootstrap class: exactly one
+    scope transition is allowed, nothing else.  That is why the setups below may
+    still spend that one transition on an explicit ``new_session(workspace_id)``
+    - and it is exactly how an attacker parks a foreign ``_project_path`` on a
+    socket that then makes that one transition into workspace A.
     """
     cm = client.websocket_connect("/ws?project=" + quote(str(project_path), safe=""))
     ws = cm.__enter__()
@@ -1074,12 +1076,20 @@ def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
 
     Two phases, both asserting the same invariant:
 
-      A. isolated fallback: a socket bootstraps with ``?project=<B root>``
-         (scopeless, legitimate), binds itself to A with an explicit
-         ``workspace_id``, then sends ``new_session`` with the field OMITTED.
-         Pre-fix the fallback resolves ``_project_path`` -> B and re-scopes.
+      A. isolated fallback: a socket opens with ``?project=<B root>`` while
+         unbound (D3: the bootstrap class - exactly one transition, nothing
+         else), spends that one transition binding itself to A with an
+         explicit ``workspace_id``, then sends ``new_session`` with the field
+         OMITTED.  Pre-fix the fallback resolves ``_project_path`` -> B and
+         re-scopes.
       B. the sequence from the brief: bound socket, ``set_project`` to B's
          path (mover), then ``new_session`` with the field omitted.
+
+    Both phases assert two things about the bare ``new_session``: that it is
+    ALLOWED and that it stays scoped to A.  "Not adopted B" on its own would
+    also pass if the request were refused, which is the opposite of the D3
+    class rule - a mint inside the current scope must not hit the ownership
+    gate (the gate is a scope-CHANGE check, not a scopeless-request check).
     """
     app, tmp_home, _server_mod = iso_server
     client = H.make_client(app)
@@ -1116,8 +1126,27 @@ def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
         )
         pump.drain(timeout=1.0)     # flush this reply's burst before the next request
         adopted = _adopted_b(bare_events, ws_b_id, root_b)
+        still_a = [
+            e for e in bare_events
+            if e.get("type") == "session_loaded"
+            and e.get("workspace_id") == ws_a_id
+            and not e.get("load_error")
+        ]
+        refused_text = [
+            (e.get("text") or "")[:120] for e in bare_events
+            if "refused" in (e.get("text") or "").lower()
+        ]
         with capfd.disabled():
-            print(f"[VERDICT] new_session(<omitted>) on ?project=B socket -> adopted_b={adopted!r}")
+            print(
+                f"[VERDICT] new_session(<omitted>) on ?project=B socket -> "
+                f"adopted_b={adopted!r} still_a={len(still_a)} refused={refused_text!r}"
+            )
+        assert still_a and not refused_text, (
+            "CLASS RULE (attack 6b): a bare new_session on an A-bound socket must "
+            "be allowed and mint inside A - it must neither be refused nor lose "
+            f"its scope: still_a={len(still_a)} refused={refused_text!r} "
+            f"events={_slim(bare_events)!r}"
+        )
         assert not adopted, (
             "RESCOPE: an A-bound socket re-scoped itself to workspace B by "
             "omitting workspace_id and letting the _project_path fallback "
@@ -1136,8 +1165,27 @@ def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
         )
         pump.drain(timeout=1.0)     # flush this reply's burst before the pivot
         adopted2 = _adopted_b(bare2_events, ws_b_id, root_b)
+        still_a2 = [
+            e for e in bare2_events
+            if e.get("type") == "session_loaded"
+            and e.get("workspace_id") == ws_a_id
+            and not e.get("load_error")
+        ]
+        refused_text2 = [
+            (e.get("text") or "")[:120] for e in bare2_events
+            if "refused" in (e.get("text") or "").lower()
+        ]
         with capfd.disabled():
-            print(f"[VERDICT] new_session(<omitted>) after set_project -> adopted_b={adopted2!r}")
+            print(
+                f"[VERDICT] new_session(<omitted>) after set_project -> "
+                f"adopted_b={adopted2!r} still_a={len(still_a2)} refused={refused_text2!r}"
+            )
+        assert still_a2 and not refused_text2, (
+            "CLASS RULE (attack 6b): after a REFUSED set_project the socket is "
+            "still scoped to A, so a bare new_session must be allowed and stay "
+            f"in A: still_a={len(still_a2)} refused={refused_text2!r} "
+            f"events={_slim(bare2_events)!r}"
+        )
         assert not adopted2, (
             "RESCOPE: an A-bound socket re-scoped itself to workspace B via "
             "set_project(_project_path) + new_session(<omitted>): "

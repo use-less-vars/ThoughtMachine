@@ -112,16 +112,29 @@ class TestLoadSessionWorkspaceScope:
         assert reads == [], f"store must not be read on a scope mismatch, got {reads}"
         assert bridge._workspace_id == "ws-a"
 
-    def test_unscoped_bridge_still_loads_any_workspace(
+    def test_unscoped_bridge_refuses_any_workspace(
         self, temp_store, tmp_path, monkeypatch
     ):
-        """No bridge binding and no caller scope -> the session loads (control)."""
+        """No bridge binding and no caller scope -> the load is REFUSED.
+
+        D3 inversion: this used to be the control case (an unscoped bridge loaded
+        any workspace's session and adopted its ``workspace_id``).  Nothing can be
+        proven to belong to a scopeless connection, so it fails closed; the
+        adapter (server load gate) resolves the session's own workspace and pins
+        the bridge before calling, so legitimate bare loads still work.
+        """
         monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
         session_id = _write_legacy_session(temp_store, "ws-b")
 
         bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
-        assert bridge.load_session(session_id) is True, "load_session returned False"
-        assert bridge._workspace_id == "ws-b"
+        assert bridge.load_session(session_id) is False, (
+            "a scopeless bridge must refuse to load a workspace-scoped session"
+        )
+        assert bridge._workspace_id is None, (
+            f"bridge workspace became {bridge._workspace_id!r}"
+        )
+        assert bridge._session is None
+        assert bridge._loaded_session is None
 
     def test_workspaceless_record_keeps_bridge_binding(
         self, temp_store, tmp_path, monkeypatch
