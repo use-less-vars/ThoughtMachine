@@ -613,3 +613,44 @@ For rows in a surface adjudication, two columns, not one verdict:
 `construction-bound` means the caller cannot name the target at all. Currently unpopulated in the surface inventory — the agent refused the retrofit on source grounds because each candidate row let a client-supplied identifier through a shape gate. An empty value is allowed; a value that doesn't hold is not.
 
 `NONE` means no check binds the caller to the target. That is the honest value for the whole auth-layer surface as of `f69761b4` — no route can learn who is calling.
+
+## 2026-10-26 — Class: `contract-change-fixture-ripple` (Gen 51)
+
+A contract change has two surfaces: the **named inversions** (explicit, in the brief, one per test asserting the old contract) and the **incidental fixtures** (implicit, ~4× the named count — tests whose stated intent is unrelated but whose *fixtures* relied on the old permissive behavior). D3's brief named 2 inversions and CI found 8. The 6 ripple tests tested permission ceilings, restart, switch, permission roundtrip — none was *about* unscoped-bridge loading, but every one constructed a second `WebAgentBridge` without a `_workspace_id`, which under D3's fail-closed contract refuses.
+
+The sandbox pytest covers the named inversions; only CI's full corpus covers the ripple. Detection is not a targeted-pytest problem; it's a corpus problem, and CI is the corpus authority (WA-3).
+
+**Rule:** a contract-change brief lists both — `Inversions:` and `Ripple (est.):` — even when the ripple is a guess. A guess that directs the read. The grain-addition ripple factor (`§2026-10-23`, `:519`) is the same class from grain changes; this generalizes it to any contract tightening.
+
+**Boundary — inversions, not additions.** D2 measured zero ripple while D3 measured 4×. The difference: D3 *inverted* an existing contract; D2 *added* a routing method. The rule is `contract-change-fixture-ripple`, not `site-change-fixture-ripple`. Only a change that turns an existing permission into a refusal ripples.
+
+## 2026-10-26 — Class: `audit-names-guards-flow-has-more-assignments` (Gen 51)
+
+D3's brief said "collapse three re-spellings to `_ownership_refusal`" — the three *guards*. The load-session flow has **five** `_workspace_id` mutation sites; two of them were never guards. D3 collapsed to one guard; the two unguarded writes were never in scope because they weren't re-spellings.
+
+**Rule:** the audit lists the guards; the flow has more assignments than guards; the assignments outside the guard set are the unaudited ones. Same family as `contract-change-fixture-ripple` — the named surface is not the actual surface.
+
+**Two sub-classes observed in D2's read:**
+
+- **`inverted-guard`** — comparison present, semantic is "if different, do it" (assign-on-different), not "if different, refuse." Reads as a guard, greps as a guard, doesn't refuse like one. D2 site 1, `server.py:2575` (pre-fix): `if resolved and resolved != bridge.workspace_id: bridge._workspace_id = resolved` — a live cross-bind today.
+- **`bootstrap-bypass`** — direct write, correctly gated by "only when unbound," not routed through the authority. Behavior-preserving today, unauditable tomorrow. D2 site 2, `bridge.py:2460` (pre-fix): `if self._workspace_id is None and self._workspace_path: self._workspace_id = resolved` — cannot rebind a bound bridge, but bypasses `_bind_workspace`'s contract.
+
+**Discipline:** an audit that enumerates "guards" is incomplete. Grep for *all* mutations of the invariant's target (`_workspace_id =`), classify each as guard / inverted-guard / bootstrap-bypass / direct-write, and name the unauthorized sites in the brief before dispatching.
+
+## 2026-10-26 — Pattern: `verification-accepted-without-reading` (Gen 51)
+
+The operator said "CI green," the seat relayed it, the PR merged on `UNSTABLE` — a red macOS advisory check. The merge was *authorized* by branch protection; the failure is that a state claim was accepted without a `gh pr checks` verify. Same shape recurred on PR 209: a block put the check command and the merge command in one paste, the check showed pending/`BLOCKED`, and the merge ran.
+
+**Rule:** every "CI green" (from operator, agent report, or comment) is verified by `gh pr checks <N> --required` before it is relayed or used as a merge gate. Corollary: when required checks are green but `mergeStateStatus` is `UNSTABLE`, name the failing non-required check — `UNSTABLE` is not `CLEAN`. **Structural fix:** use `gh pr merge --auto` where possible; it removes the paste-order problem and self-gates on required checks.
+
+**Relationship to `read-beats-ruling`:** same family. A report is a hypothesis until read; a state claim is a hypothesis until verified.
+
+## 2026-10-26 — Pattern: `sha-pinned-blocks-go-stale-on-correction` (Gen 51)
+
+A host block that hard-codes a commit SHA is a block that goes stale the instant the SHA changes. When a correction arrives saying "the tip moved," any in-flight block must be re-issued, not merely noted.
+
+**Instance (D2, this session):** the agent reported the amendment at `82200114`; a pre-correction host block pinned `52fbcb0d`. Between issue and paste, the amendment landed locally; the block ran against the pre-amendment SHA and the PR body file (not yet synced), and failed with `no pull requests found` + `no such file`. The corrected block was in the same message as the block it replaced; the block ran and failed in 3 seconds; the diagnostic recovered in 30.
+
+**Rule:** a host block with a hard-coded SHA is preceded by a `git log -1` or `git rev-parse` on the same command that names it, OR uses the branch name and lets git resolve. Where it must be a SHA, the block's first line reads it and the second references it.
+
+**Cost:** one round-trip. **Not the same as terminal-paste corruption** — the block was not corrupt; it was stale. Two different classes.
