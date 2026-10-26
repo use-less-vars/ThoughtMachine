@@ -2207,3 +2207,48 @@ The client-claim red team, wave 2, found the thing it was built to find: an auth
 The auth-layer design pass answered D1–D4 in one return. The conclusion is small: the Web UI's security boundary is the network boundary, the one decision is what an unscoped connection means, and the design's deliverable is to make "no workspace claimed yet" an explicit transition state rather than an absent field. That is the shape of the design — not a token scheme, not middleware, one state transition made explicit.
 
 The session's own corrections are recorded in `working_agreements.md`: silent edits to verbatim claims, a brief carrying a stale citation, five terminal-paste corruptions. Each was small. Together they are what the seat learned.
+
+### hygiene/route-workspace-mutations-through-bind-authority
+**Filed:** 2026-10-26, from D2 scope ruling (Main 40).
+**Severity:** LOW — consistency, not security. Does not block D1.
+Main 40 called these "the 12 already-guarded sites"; the actual count needs
+re-verification at dispatch (D2's read found 14 mutation sites total; D2
+routed 5, leaving 9 residual direct `_workspace_id` writes). Route the
+residual writes through `_bind_workspace(workspace_id, mode)`. They call D3's
+`_ownership_refusal_ids` guards or are idempotent-equal — safe *today*, but
+every direct write is a fact owner. Consistency is the hygiene, not security.
+Read D2's classification table (`brief-d2-binding-authority.md` §Corrections,
+PR 209 body) as input.
+### hygiene/site-2543-bootstrap-bypass
+**Filed:** 2026-10-26, from D2 read.
+**Severity:** LOW — narrow edge. Does not block D1.
+`server.py:2543` — the fallback that fires only when both `_handshake_ws_id`
+and `_expected_ws` are None (bare WS, probe failed). Direct assignment
+`bridge._workspace_id = resolved`, no `_bind_workspace`. No caller controls
+the state that reaches it; unauditable tomorrow.
+Route through `_bind_workspace(resolved, "bootstrap")`. Behavior-preserving.
+
+**Anchor re-verification — Gen 51 KB close, 2026-10-26 (post-merge read, not
+part of the filed ticket text).** Both tickets above cite line numbers that
+are now stale: `web_ui/backend/server.py` is 6198 lines in the merged tree,
+and D2's own insertions moved everything below them down. Verified anchors:
+**2516** `if _handshake_ws_id:` (guard) / **2517**
+`bridge._bind_workspace(_handshake_ws_id, "bootstrap")` / **2521–2540** the
+cold-load probe (`if _expected_ws is None:` → `session_store.load_session` →
+`_probe_ws`) / **2547**
+`_switch_refusal = bridge._bind_workspace(_expected_ws, "switch")` with
+refusal branch **2548–2560** / **2582–2587** the bootstrap-bypass fallback
+(`if not bridge.workspace_id:` →
+`resolved = _resolve_workspace_id(_project_path)` → `if resolved:` at 2586 →
+direct `bridge._workspace_id = resolved` at **2587**, no `_bind_workspace`).
+Lines 2543 and 2546 are comment prose inside D2's block at 2542–2546, not code
+— so `site-2543-bootstrap-bypass` names a comment; the site it describes is
+2582–2587 and the assignment is 2587. The slug is kept as filed so existing
+references (status.md, PR bodies) do not dangle; **this note is the authority
+for dispatch.**
+
+Residual direct `bridge._workspace_id = ...` writes in server.py alone,
+post-merge: **1669, 2587, 3225, 3233, 3244, 3290, 3464** (7 sites). The count
+in the ticket above (9 residual) was a bridge.py + server.py total taken
+before the merge; re-count from the tree at dispatch. Class:
+`working_agreements.md §sha-pinned-blocks-go-stale-on-correction`.

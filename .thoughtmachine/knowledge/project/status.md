@@ -39,6 +39,39 @@ injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
 
+## Current state — 2026-10-26, Gen 51 mid-session
+
+**Supersedes the 2026-10-25 Gen 50 close (kept below as historical record).**
+
+**dev HEAD:** `23a57a61` (merge of PR 209, D2 bind-authority).
+
+**Merged since Gen 50 close:** #206 (KB close), #207 (D3), #208 (three tickets), #209 (D2).
+
+**D3 (PR 207):** id-form primitive `_ownership_refusal_ids` at `bridge.py:308` — identity comparison, no registry lookup, None fails closed both sides. Path adapter `_ownership_refusal` at `:372`; session adapter `_ownership_refusal_by_id` at `:349` (D2's hook, zero call sites). Three collapses: `bridge.py:2327/:2346`, `server.py:2388`, `server.py:3096`. Two commits: `16e79d68` (code) + `fd9050f1` (ripple, 4 test files, +10/−0).
+
+**D2 (PR 209):** `_bind_workspace(workspace_id, mode)` at `bridge.py:575` — central binding authority (None refused, unknown mode refused, both modes bootstrap unbound, equal no-op, bootstrap refuses rebind, switch delegates to `_ownership_refusal_ids`, never resets). WS handshake binding; three `register_by_root` bootstraps routed; site 1 (`server.py:2627`, inverted-guard) closed with reordered path-update; site 2 (`bridge.py:2506`, bootstrap-bypass) routed; seven tests (`86 passed` on fresh-worker re-run). Two commits: `52fbcb0d` (code) + `82200114` (four comments naming the unreachable-refusal assumption).
+
+**Tickets filed (PR 208):** `bug/onboarding-ssrf-ambient-credentials` (CRITICAL), `bug/logging-config-unauthenticated-write` (HIGH), `hygiene/macos-advisory-check-triage` (LOW, triage in delivery wave).
+
+**Hygiene tickets filed at this KB close, not dispatched:** `hygiene/route-workspace-mutations-through-bind-authority`, `hygiene/site-2543-bootstrap-bypass`. Both read D2's §Corrections classification as input.
+
+**Classes and patterns earned (this PR, `working_agreements.md`):** `contract-change-fixture-ripple`, `audit-names-guards-flow-has-more-assignments`, `verification-accepted-without-reading`, `sha-pinned-blocks-go-stale-on-correction` — all Gen 51.
+
+**Next: D1** — request-time form of the `--allow-remote-bind` boot-time declaration, with `origin_policy._origin_allowed` as default for state-changing routes. Then D4-note. Then credential-delivery.
+
+**On disk only (gitignored):** `redteam-surface-complete.md`, `vault-ownership-sites.md`, `brief-d3-ownership-refusal.md` (§Corrections 13 items), `brief-d2-binding-authority.md`, `pr-body-d2.md`, `pr-body-three-tickets.md`, `pr-body-kb-close.md`.
+
+### D1 wave — branch `feat/d1-origin-guard` (2026-10-26, Gen 51)
+
+**Commit:** `f00aebe9` — `feat(security): refuse foreign-origin calls on all 37 non-GET routes` (15 files, +828/-46). Branched from dev `23a57a61`. Not yet pushed or PR'd at the time of writing.
+
+**Mechanism:** `origin_policy._origin_check_request(request, route_name)` at `:86`, additive — `_origin_allowed` is untouched. absent origin/referer -> allow + log; loopback -> allow + log; anything else -> refuse + log. `route_name` has no default on purpose. 36 non-GET sites call it inline; `/api/vault/repair/apply` keeps the fail-closed `_origin_allowed`. `GET /api/browse` is guarded as well (filesystem read). Census: 81 routes = 44 GET + 37 non-GET; 39 guard sites = 37 non-GET + 2 guarded GETs.
+
+**Tests:** `tests/integration/test_origin_guard_enumeration.py` — 5a AST presence 37/37, 5b OpenAPI parity (81 operations / 37 non-GET), 5c pinned-tuple resolution to source decorators, 5d four-route behavioural sample (POST-with-body / POST-no-body / PUT / DELETE -> 403). `4 passed`. `web_ui/backend/tests` unchanged at 153 passed / 5 xfailed. 12 pre-existing tests updated for the new calling convention across 3 files (keyword-form `request=` with a real Starlette Request; no MagicMock, whose truthy `headers.get()` would trigger a misleading 403).
+
+**Disclosed, not fixed:** FastAPI validates the body before the handler runs, so a malformed body paired with a foreign Origin answers 422 rather than 403. Refusal is proven behaviourally on 4 of 37 routes; the other 33 are presence-only by design. 5a proves presence, not guard position — a separate read-only audit confirmed 37 of 39 guard sites are the first statement after the docstring, the 2 exceptions being vault-repair's deliberate lazy-import sites.
+
+**Next: D4-note, then credential-delivery.**
 
 ## Current state — 2026-10-25, Gen 50 close
 

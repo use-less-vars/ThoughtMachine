@@ -12,11 +12,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
 from agent.presenter.state_bridge import StateBridge
 import thoughtmachine.vault as _vault
+
+from web_ui.backend.origin_policy import _origin_check_request
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
@@ -72,7 +74,7 @@ def _is_engineer_mode() -> bool:
 
 
 @router.post("/reset")
-async def reset_config(body: ResetConfigBody) -> Dict[str, Any]:
+async def reset_config(request: Request, body: ResetConfigBody) -> Dict[str, Any]:
     """Reset active configuration to factory defaults.
 
     Writes an empty overlay to ``agent_config.json`` and removes the
@@ -90,6 +92,8 @@ async def reset_config(body: ResetConfigBody) -> Dict[str, Any]:
     Returns:
         The factory-default configuration dict (with ``api_key`` excluded).
     """
+    if not _origin_check_request(request, route_name="reset_config"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         import os
         config_path = os.path.expanduser(_CONFIG_PATH)
@@ -123,7 +127,7 @@ async def reset_config(body: ResetConfigBody) -> Dict[str, Any]:
 
 
 @router.post("/mode")
-async def set_mode(body: ModeSwitchBody) -> Dict[str, str]:
+async def set_mode(request: Request, body: ModeSwitchBody) -> Dict[str, str]:
     """Switch the system prompt mode.
 
     Accepts ``{"mode": "agent"}``, ``{"mode": "engineer"}``, or
@@ -145,6 +149,8 @@ async def set_mode(body: ModeSwitchBody) -> Dict[str, str]:
 
     Returns ``{"status": "ok", "mode": "..."}``.
     """
+    if not _origin_check_request(request, route_name="set_mode"):
+        raise HTTPException(status_code=403, detail="origin not permitted")
     mode = body.mode.strip().lower()
 
     # Map legacy "full" to "agent"

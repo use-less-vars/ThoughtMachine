@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request as StarletteRequest
 
 from agent.events import EventBus, EventType, create_event
 
@@ -79,6 +80,13 @@ def _registry_teardown():
             t.join(timeout=5)
         except Exception:
             pass
+
+
+def _no_origin_request() -> StarletteRequest:
+    """A real Starlette Request with no Origin header."""
+    return StarletteRequest(
+        {"type": "http", "method": "POST", "path": "/", "headers": []}
+    )
 
 
 def _use_tmp_workspace(monkeypatch, tmp_path):
@@ -194,7 +202,11 @@ def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monke
         workspace_routes._worker_registry[("sess-x", "default", 2)] = t2 = MagicMock()
     _write_json(tmp_path / "workers" / "default#2" / "status.json", {})
 
-    resp = asyncio.run(workspace_routes.stop_worker("ws-1", "default", instance_id=2))
+    resp = asyncio.run(
+        workspace_routes.stop_worker(
+            ws_id="ws-1", name="default", instance_id=2, request=_no_origin_request()
+        )
+    )
     assert resp["status"] == "ok"
     assert resp["name"] == "default"
     assert resp["instance_id"] == 2
@@ -218,7 +230,11 @@ def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
     with workspace_routes._registry_lock:
         workspace_routes._worker_registry[("sess-x", "default", 1)] = t1 = MagicMock()
 
-    resp = asyncio.run(workspace_routes.pause_worker("ws-1", "default"))
+    resp = asyncio.run(
+        workspace_routes.pause_worker(
+            ws_id="ws-1", name="default", request=_no_origin_request()
+        )
+    )
     assert resp["status"] == "pausing"
     assert resp["name"] == "default"
     assert "instance_id" not in resp
@@ -229,7 +245,11 @@ def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
     assert status["runtime_status"] == "pausing"
     t1.pause.assert_called_once()
 
-    resp2 = asyncio.run(workspace_routes.resume_worker("ws-1", "default"))
+    resp2 = asyncio.run(
+        workspace_routes.resume_worker(
+            ws_id="ws-1", name="default", request=_no_origin_request()
+        )
+    )
     assert resp2["status"] == "resumed"
     assert resp2["name"] == "default"
     assert "instance_id" not in resp2
@@ -243,7 +263,11 @@ def test_stop_unknown_worker_404(tmp_path, monkeypatch):
     worker."""
     _use_tmp_workspace(monkeypatch, tmp_path)
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(workspace_routes.stop_worker("ws-1", "default"))
+        asyncio.run(
+            workspace_routes.stop_worker(
+                ws_id="ws-1", name="default", request=_no_origin_request()
+            )
+        )
     assert exc.value.status_code == 404
     assert "default" in str(exc.value.detail)
 
@@ -254,7 +278,11 @@ def test_pause_with_instance_id_resolves_instance_dir(tmp_path, monkeypatch):
     _use_tmp_workspace(monkeypatch, tmp_path)
     (tmp_path / "workers" / "default#2").mkdir(parents=True, exist_ok=True)
 
-    resp = asyncio.run(workspace_routes.pause_worker("ws-1", "default", instance_id=2))
+    resp = asyncio.run(
+        workspace_routes.pause_worker(
+            ws_id="ws-1", name="default", instance_id=2, request=_no_origin_request()
+        )
+    )
     assert resp["status"] == "pausing"
     assert resp["name"] == "default"
     assert resp["instance_id"] == 2
@@ -275,7 +303,11 @@ def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
     _use_tmp_workspace(monkeypatch, tmp_path)
 
     thread._manual_only_pause = True
-    resp = asyncio.run(workspace_routes.pause_worker("ws-1", "w1"))
+    resp = asyncio.run(
+        workspace_routes.pause_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
     assert resp["status"] == "pausing"
     assert resp["name"] == "w1"
     # The route writes command.json synchronously (proven by the response
@@ -308,7 +340,11 @@ def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
     assert paused["status"] == "paused"
     assert "manually paused" in paused["message"]
 
-    resp2 = asyncio.run(workspace_routes.resume_worker("ws-1", "w1"))
+    resp2 = asyncio.run(
+        workspace_routes.resume_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
     assert resp2["status"] == "resumed"
     assert thread._manual_only_pause is False
     assert _wait_until(lambda: thread.status == "ready", timeout=10.0), (
@@ -574,7 +610,9 @@ def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
     for sub in ("default", "default#2", "sess-a/alpha", "sess-b/beta"):
         _write_json(tmp_path / "workers" / sub / "status.json", {})
 
-    results = asyncio.run(workspace_routes.stop_all_workers("ws-1"))
+    results = asyncio.run(
+        workspace_routes.stop_all_workers(ws_id="ws-1", request=_no_origin_request())
+    )
     assert isinstance(results, list)
     assert len(results) == 4
     for res in results:
@@ -597,9 +635,13 @@ def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
     # Session filter: only sess-a's workers are touched; other sessions
     # (existing and a freshly added one) are left alone.
     _write_json(tmp_path / "workers" / "sess-c" / "gamma" / "status.json", {})
-    results = asyncio.run(workspace_routes.stop_all_workers(
-        "ws-1", workspace_routes.StopAllWorkersBody(session_id="sess-a")
-    ))
+    results = asyncio.run(
+        workspace_routes.stop_all_workers(
+            ws_id="ws-1",
+            body=workspace_routes.StopAllWorkersBody(session_id="sess-a"),
+            request=_no_origin_request(),
+        )
+    )
     assert len(results) == 1
     assert results[0]["worker_name"] == "alpha"
     assert results[0]["instance_id"] == 1
@@ -632,7 +674,9 @@ def test_stop_all_returns_per_worker_results_and_continues_on_failure(tmp_path, 
 
     monkeypatch.setattr(workspace_routes, "_stop_worker_instance", fake_stop)
 
-    results = asyncio.run(workspace_routes.stop_all_workers("ws-1"))
+    results = asyncio.run(
+        workspace_routes.stop_all_workers(ws_id="ws-1", request=_no_origin_request())
+    )
     assert isinstance(results, list)
     assert len(results) == 2
     by_name = {r["worker_name"]: r for r in results}
@@ -655,5 +699,10 @@ def test_stop_all_returns_per_worker_results_and_continues_on_failure(tmp_path, 
 
     # No workers dir at all -> empty list, no error.
     monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path / "empty")
-    assert asyncio.run(workspace_routes.stop_all_workers("ws-1")) == []
+    assert (
+        asyncio.run(
+            workspace_routes.stop_all_workers(ws_id="ws-1", request=_no_origin_request())
+        )
+        == []
+    )
 

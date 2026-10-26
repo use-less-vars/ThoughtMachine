@@ -18,6 +18,7 @@ import asyncio
 import os
 
 import pytest
+from starlette.requests import Request as StarletteRequest
 
 import infra.resource_container_manager as rcm
 import setup_workspace as setup_workspace
@@ -28,6 +29,13 @@ try:
     from docker.errors import ImageNotFound
 except Exception:  # pragma: no cover - docker SDK absent
     ImageNotFound = Exception
+
+
+def _no_origin_request() -> StarletteRequest:
+    """A real Starlette Request with no Origin header."""
+    return StarletteRequest(
+        {"type": "http", "method": "POST", "path": "/", "headers": []}
+    )
 
 
 # ------------------------------------------------------------------ fakes
@@ -240,7 +248,8 @@ def test_register_by_root_provisions(monkeypatch, tmp_path):
 
     result = asyncio.run(
         workspace_routes.resolve_workspace_path(
-            workspace_routes.ResolvePathBody(path=str(tmp_path))
+            body=workspace_routes.ResolvePathBody(path=str(tmp_path)),
+            request=_no_origin_request(),
         )
     )
     assert result == {"workspace_id": "ws-1", "root": str(tmp_path)}
@@ -253,7 +262,8 @@ def test_register_by_root_provisions(monkeypatch, tmp_path):
     monkeypatch.setattr(rcm, "provision_workspace_resource", _boom_provision)
     result2 = asyncio.run(
         workspace_routes.resolve_workspace_path(
-            workspace_routes.ResolvePathBody(path=str(tmp_path))
+            body=workspace_routes.ResolvePathBody(path=str(tmp_path)),
+            request=_no_origin_request(),
         )
     )
     assert result2 == {"workspace_id": "ws-1", "root": str(tmp_path)}
