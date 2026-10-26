@@ -1258,6 +1258,19 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
             await _reject_websocket(ws, f'project path {project!r}: {exc}')
             return
 
+    # D2: resolve the connection's DECLARED workspace once, at handshake, and
+    # pin it for the life of the socket.  Every bridge built for this connection
+    # bootstraps from this id, so a load can never re-derive a different
+    # workspace from the same request (the cross-bind D2 closes).
+    _handshake_ws_id: Optional[str] = None
+    if project:
+        from web_ui.backend.bridge import _resolve_workspace_id
+        try:
+            _handshake_ws_id = _resolve_workspace_id(_project_path)
+        except Exception as exc:  # noqa: BLE001 - unresolvable declaration stays unbound
+            log('WARNING', 'server.ws',
+                f'handshake: could not resolve a workspace for {_project_path}: {exc}')
+
     await ws.accept()
     # If the frontend provides a project query parameter, use it to resolve
     # the workspace instead of the default _project_root.  This allows the
@@ -1666,7 +1679,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
                                 entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
                                 workspace_id = entry.id
-                                bridge._workspace_id = entry.id
+                                # D2 (bootstrap binding): registration is the
+                                # workspace-creation transition -- the connection
+                                # adopts the new id through the bind authority.
+                                _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
+                                if _bind_refusal:
+                                    log('WARNING', 'server',
+                                        f"apply_config: binding to workspace {entry.id} refused: {_bind_refusal}")
                                 bridge._workspace_path = _project_path
                                 ensure_workspace_dirs(entry.id)
                                 log('INFO', 'server',
@@ -2489,6 +2508,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         from agent.controller import AgentController
                         controller = AgentController()
                         bridge = WebAgentBridge(session_store=session_store)
+                        # D2: bind the connection's DECLARED workspace first.  A
+                        # fresh bridge is unbound, so this bootstrap always
+                        # succeeds; it exists so the load below cannot resolve a
+                        # DIFFERENT workspace and quietly adopt it.
+                        if _handshake_ws_id:
+                            bridge._bind_workspace(_handshake_ws_id, "bootstrap")
                         # WebAgentBridge.__init__ takes no workspace argument, so
                         # the scope must be pinned here; otherwise _workspace_id
                         # stays None and bridge.py's mismatch guard can never fire.
@@ -2513,7 +2538,25 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             if _probe_ws:
                                 _expected_ws = _probe_ws
                         if _expected_ws:
-                            bridge._workspace_id = _expected_ws
+                            # D2: the load's own workspace is a scope CHANGE for
+                            # this bridge, not a write.  When the probe resolves a
+                            # workspace that differs from the handshake binding,
+                            # the bind authority refuses and the load refuses with
+                            # it -- the cross-bind has nowhere left to hide.
+                            _switch_refusal = bridge._bind_workspace(_expected_ws, "switch")
+                            if _switch_refusal:
+                                log('WARNING', 'server.ws',
+                                    "load_session refused: cannot bind workspace "
+                                    f"{_expected_ws} for session {session_id}: {_switch_refusal}")
+                                bridge._unsubscribe_security_events()
+                                bridge._unsubscribe_worker_events()
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": (
+                                        f"\u26a0 load_session refused: {_switch_refusal}"
+                                    ),
+                                })
+                                continue
                         bridge.set_event_callback(event_callback, key=id(ws))
                         bridge.register()
                         bridge.set_controller(controller)
@@ -2560,6 +2603,40 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 ws_data = _json.loads(ws_config_path.read_text(encoding="utf-8"))
                                 ws_project_path = ws_data.get("root", "")
                                 if ws_project_path and os.path.abspath(ws_project_path) != os.path.abspath(_project_path):
+                                    # D2 (site 1, inverted-guard): resolve and BIND
+                                    # first; the path update happens only on success.
+                                    # Both comparisons here used to be assignment
+                                    # triggers, and the path moved before anything
+                                    # was decided -- so a refused bind leaked a
+                                    # half-switched _project_path /
+                                    # bridge._workspace_path.  The reorder closes it.
+                                    from web_ui.backend.bridge import _resolve_workspace_id
+                                    resolved = _resolve_workspace_id(ws_project_path)
+                                    if not resolved:
+                                        log('WARNING', 'server',
+                                            "load_session: cannot resolve a workspace for "
+                                            f"{ws_project_path}; project path left at {_project_path}")
+                                        await ws.send_json({
+                                            "type": "status_message",
+                                            "text": (
+                                                f"\u26a0 load_session: workspace for {ws_project_path} "
+                                                f"could not be resolved; project path unchanged."
+                                            ),
+                                        })
+                                        continue
+                                    _switch_refusal = bridge._bind_workspace(resolved, "switch")
+                                    if _switch_refusal:
+                                        log('WARNING', 'server',
+                                            f"load_session refused: project switch to "
+                                            f"{ws_project_path} ({resolved}): {_switch_refusal}")
+                                        await ws.send_json({
+                                            "type": "status_message",
+                                            "text": (
+                                                f"\u26a0 load_session: project switch refused: "
+                                                f"{_switch_refusal}"
+                                            ),
+                                        })
+                                        continue
                                     old_path = _project_path
                                     _project_path = ws_project_path
                                     log('INFO', 'server',
@@ -2568,13 +2645,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     # frontend_config_from_bridge sends the correct path
                                     # to the frontend (instead of falling back to _project_root).
                                     bridge._workspace_path = _project_path
-                                    # Re-resolve workspace_id for the new project path
-                                    from web_ui.backend.bridge import _resolve_workspace_id
-                                    resolved = _resolve_workspace_id(_project_path)
-                                    if resolved and resolved != bridge.workspace_id:
-                                        bridge._workspace_id = resolved
-                                        log('INFO', 'server',
-                                            f"load_session: re-resolved workspace_id to {resolved} for {_project_path}")
+                                    log('INFO', 'server',
+                                        f"load_session: bound workspace_id {resolved} for {_project_path}")
                         except Exception as exc:
                             log('WARNING', 'server',
                                 f"load_session: auto-switch project path error: {exc}")
@@ -3184,7 +3256,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
                             entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
                             workspace_id = entry.id
-                            bridge._workspace_id = entry.id
+                            # D2 (bootstrap binding): registration is the
+                            # workspace-creation transition -- the connection
+                            # adopts the new id through the bind authority.
+                            _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
+                            if _bind_refusal:
+                                log('WARNING', 'server',
+                                    f"new_session: binding to workspace {entry.id} refused: {_bind_refusal}")
                             ensure_workspace_dirs(entry.id)
                             log('INFO', 'server',
                                 f"Auto-registered workspace {entry.id} for {_project_path}")
@@ -3393,7 +3471,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
                             entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
                             workspace_id = entry.id
-                            bridge._workspace_id = entry.id
+                            # D2 (bootstrap binding): registration is the
+                            # workspace-creation transition -- the connection
+                            # adopts the new id through the bind authority.
+                            _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
+                            if _bind_refusal:
+                                log('WARNING', 'server',
+                                    f"set_project: binding to workspace {entry.id} refused: {_bind_refusal}")
                             ensure_workspace_dirs(entry.id)
                             log('INFO', 'server',
                                 f"set_project: registered workspace {entry.id} for {_project_path}")
