@@ -259,3 +259,10 @@ web_ui/frontend/.npmrc
 # decidability and the per-call-site keep/delete/unclear marking. Public tier,
 # ships with the repo (`docs/*` is a catch-all, so the negation is required).
 !docs/design-logging-audit.md
+
+# Gen 51 artifacts published by operator ruling (tier: public, 2026-10-26):
+# the agent-core spec and the provider-compatibility findings. Both lived in
+# ignored space (docs/* catch-all, .thoughtmachine/working_docs/* re-ignore),
+# so `git clean -xdf` would have destroyed them.
+!docs/agent-core-spec.md
+!docs/provider-compat-findings-2026-10-26.md
