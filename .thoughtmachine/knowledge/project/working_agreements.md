@@ -654,3 +654,47 @@ A host block that hard-codes a commit SHA is a block that goes stale the instant
 **Rule:** a host block with a hard-coded SHA is preceded by a `git log -1` or `git rev-parse` on the same command that names it, OR uses the branch name and lets git resolve. Where it must be a SHA, the block's first line reads it and the second references it.
 
 **Cost:** one round-trip. **Not the same as terminal-paste corruption** — the block was not corrupt; it was stale. Two different classes.
+
+## 2026-10-26 — Class: `design-default-excludes-ordinary-callers` (Gen 51)
+
+A default can be correct-as-safety and still exclude the ordinary caller. `host_bash` default-off is the right default — the sandbox should not hand out a host shell unasked — but the ordinary user never asks, never learns a grant was on offer, and experiences the result as "this tool does not work." Same shape on the socket side: an unscoped socket means *unchecked*, not *safe*, and the caller who never named a scope is excluded by a default nobody showed them.
+
+**Rule:** a default is designed twice — once for what it permits, and once for what the caller meets when it fires. The second design is the one that gets skipped. Where the exclusion is intended, it must surface its own state at the point the caller meets it: the tool refuses with the reason and the grant name, not with silence; the install prints the default; the banner names what is off.
+
+**Instance (Gen 51, fresh install):** `host_bash` default-off contributed to the friend's fresh-install failure — the tool failed silently rather than reporting a permission state, so "off by default" and "broken" were indistinguishable from outside. Grounded in the incident, not in a code read: the class is sound, the instance is the install experience.
+
+## 2026-10-26 — Class: `criterion-lists-members-rationale-covers-more` (Gen 51)
+
+A criterion that names its members invites being audited by its members. "These 37 non-GET routes are guarded" invites checking 37 routes; the rationale that produced it ("no state-changing route is reachable without an origin check") covers a set to which the next route added will silently belong. The list is a snapshot of the rationale's output, not the rationale.
+
+**Rule:** when reviewing a criterion that enumerates members, recover the principle that generated the list and enumerate by the principle. The test of a criterion is not "are the named members covered" but "what would have to be added to the codebase for this criterion to become vacuously true." Where the criterion cannot be restated without the list, it is a census, and a census goes stale by construction.
+
+**Boundary:** criterion-authorship sibling of `audit-names-guards-flow-has-more-assignments` — same error one layer up; that one says grep the invariant's target, not the named guards.
+
+**Instance: not recorded this session.** The name is carried from the Gen 51 close list; the body above is the defensible generalisation and must not be cited as evidence-backed until an instance is attached.
+
+## 2026-10-26 — Class: `self-comparison-assertion` (Gen 51)
+
+An assertion of the form `written == expected`, where both sides originate in the same script, proves transcription and not conformance. If the script's own literal is wrong, both sides are wrong together and the assertion cannot fail: it reports PASS with total confidence and zero information.
+
+**Rule:** a "byte-identical" claim is only meaningful against the *spec* — the brief's literal, the ruling's text, the design note as ruled — never against the checking script's own copy of it. Where the artifact is prose, the check that works is reading the artifact back character-by-character and reporting codepoints. A passing self-comparison is evidence that nothing was mangled in transit *within* the script; it is not evidence about the script.
+
+**Instance (Gen 51, D4, `d0b93cd6`):** the worker returned PASS including "written D4 block is byte-identical to the specified text", while §D4's four arrows had come out as em dashes — the expected string carried the same corruption, so the comparison was true and the file was wrong. Caught by a codepoint read against the spec, repaired, re-verified with a line-excluded sha256. Second-order cost: because the PASS was honest, `verification-accepted-without-reading` would not have caught it either. The defect is in how the assertion was constructed, not in how it was reported.
+
+## 2026-10-26 — Class: `asserted-count-in-brief` (Gen 51)
+
+Do not put an expected count into a worker brief unless that count was derived from a printed listing in the same session. A line like "there must be 4 arrows" is a second unverified claim wearing a verification's clothes: a compliant worker either reports a failure against a correct file, or edits the file until it matches the number. Both outcomes destroy the check they were meant to be.
+
+**Rule:** state the requirement, ask for the count, compare the answer to the artifact yourself. "Report the codepoint of every separator you wrote" is a check; "there must be 4" is a guess that has been promoted.
+
+**Instances (Gen 51 — both times the worker was right and the brief was wrong):** (a) "the four terms need 4 arrows and +4 characters" — four terms separated pairwise have three separators, and U+2014 to U+2192 is one-for-one, so the edit is length-neutral; (b) "the section sign must appear once" — the ruled Corrections entry contains three of them (`§D3`, `§6`, `§D4`).
+
+**Relationship to the older `operator's count estimates run high` agreement:** that one describes the *operator's* estimates; this one describes the *brief author's*, and they are different failures — the seat applies the caution to the operator and to itself least of all. This is a brief-writing property, not an operator property.
+
+## 2026-10-26 — Delivery gap: `fresh-install-only failures` (Gen 51)
+
+CI tests the code. The sandbox tests the boundaries. Nothing tests the environment. A defect that exists only on a machine that has never run the product before is invisible to every gate this project has, because every gate runs on a machine that already has.
+
+**Rule:** for any user-facing path, "does this work from zero" is a separate gate from "does this pass", and the first cannot be inferred from the second. Map Layer 5 is not a nice-to-have; it is the only layer at which installation state is under test.
+
+**Instance:** the friend incident, Gen 51. A fresh install produced a missing vault, provider schema errors and a silent `host_bash` failure — none of which any existing check would have raised, all of which a startup banner and an `install-doctor` would have named. Ruled at Gen 51 close: `feat/fresh-install-diagnostic` is the first wave of the Delivery arc (see `project/operator_observations.md`, `[intent] feat/fresh-install-diagnostic`).
