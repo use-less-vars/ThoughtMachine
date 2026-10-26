@@ -60,9 +60,27 @@ Path for `load_session` to become a caller — two honest options, and the choic
 | `test_parser_allow_remote_bind_is_off_by_default` | `tests/integration/test_health_localhost_binding.py:275-280` | D1's declared position is already pinned: the hatch exists and defaults off. Not inverted by this design — it is the evidence for D1. |
 | `test_validate_bind_host_allow_remote_waives_loopback_requirement` | `tests/integration/test_health_localhost_binding.py:261-265` | `allow_remote=True` waives the loopback requirement — pinned, and the reason "enforced" is a decision reversal rather than a patch. |
 
-### D4 — What changes the day a second client arrives
+### D4 — What changes the day a second client arrives: **caller identity becomes the ownership predicate's first operand**
 
-The day a second client arrives, nothing in the route layer changes — the whole design changes, because every route in `web_ui/backend` currently has no way to learn who is calling (no `Depends(` anywhere in the package: 0 matches across 31 files; app-level `include_router` is bare, `server.py:3641`), so a second client forces the one thing this design deliberately does not build — a **caller identity** that the ownership predicate can take as its first operand instead of trusting the connection.
+**What changes.** The rule's arity, not the rule. `_ownership_refusal_ids(target_workspace_id, bound_workspace_id)` (`bridge.py:308`) compares two workspace ids — the one a call names and the one the connection was bound to. Neither is *who called*. With one client that is exact rather than accidental: the connection and the caller are the same principal, so the binding *is* the identity and a third operand would only restate it. A second client, arriving with its own workspace provenance, its own credential and its own binding, breaks that coincidence and forces the operand the predicate has never needed: `(caller_id, target_id, bound_id)` — `caller_id` names the calling principal, `bound_id` keeps deciding what that principal may reach. No caller-identity type, field or parameter exists anywhere in `web_ui/backend` today: `caller_id` is 0 hits, and all 62 `caller` hits are prose.
+
+**One home for the change.** D3 collapsed the rule into an ids-shaped function with two resolving adapters — `_ownership_refusal_by_id` (`bridge.py:349`, session id in) and `_ownership_refusal` (`bridge.py:372`, path in) both resolve and delegate. That is what keeps D4 small: the operand is added once, in the primitive, and both adapters inherit it. The one outcome to avoid is a partial arity change — the 7 call sites today (`server.py:2424`, `:3185`; `bridge.py:369`, `:403`, `:617`, `:2370`, `:2389`) either all pass a caller or none do, because a predicate that sometimes trusts the connection and sometimes demands a named principal is weaker than either spelling alone.
+
+**What D1/D2/D3 leave in place.** D4 composes on top; it replaces nothing.
+
+| Primitive | What it decides today | Under D4 |
+|---|---|---|
+| `_ownership_refusal_ids(target, bound)` — `bridge.py:308` | whether two ids name the same workspace, `None` failing closed | gains `caller_id` as first operand; the rule itself is unchanged |
+| `_bind_workspace(id, mode)` — `bridge.py:575` | the only way a bridge acquires a scope (`bootstrap` / `switch`) | unchanged — identity changes *who may ask*, never *how a scope is acquired* |
+| `_origin_check_request(request, route)` — `origin_policy.py:86` | whether the asking *browser context* is a trusted local one | unchanged — a different question, and it composes first: a credential-less cross-site call is caught here and is invisible to a caller identity |
+
+**Positions considered.** (a) App-level `dependencies=[...]` on each `include_router` — one line per router, but it makes identity all-or-nothing per router, and several routers mix routes that need different scopes. (b) A per-route `Depends(...)` — explicit, greppable, and the same shape D1 has just taken for origin: one predicate, judged route by route, pinnable by the same AST test. (c) Middleware stamping `request.state` — invisible at the route, and it cannot refuse without duplicating the route table. (d) An explicit per-route call — no new surface, so no enforcement either. **Recommendation: (b)**, the only position that both creates the surface and leaves the judge where D1 put it.
+
+**What a second client forces structurally.** There is no injection surface to hang identity on: `Depends(` and `Security(` appear zero times across `web_ui/backend/`, and the app-level mounts carry no `dependencies=` (`server.py:3784-3796`, of the form `app.include_router(workspace_router)`). So every route must acquire a caller-identity dependency or make the per-route call — a wave, not a doc-level change, and one that cannot begin before **credential-delivery**: a second client must be able to present a credential before anything can name it. Naming a caller is the last link of a chain, not the first.
+
+**What it is not.** Not a token scheme, not cookies, not OAuth, not a session store. Credential issuance, transport, rotation and storage are credential-delivery's design; D4 decides only what the ownership predicate does once a caller *can* be named. Out of scope for D1—D4.
+
+**Sequence.** credential-delivery → credential-resolution → **D4 design pass** → D4 code. This note prepares the reader for that pass; it does not authorise the wave. Until credential-delivery lands, the predicate keeps two operands, and every route keeps its connection-shaped answer to *who is asking*.
 
 ## 4. What this design does not cover
 
@@ -103,3 +121,5 @@ The wildcard-CORS premise was carried in two documents before it was disproved a
 The stale line citation `server.py:1183-1185` (the corpus's) is the instance of `cite a symbol, not a line` already named in `working_agreements.md` §2026-10-17. Those lines are `_SERVE_FRONTEND = False` and a blank; the actual `add_middleware` is at `:1194-1200`. Corpus citation to be amended in the same follow-up dispatch.
 
 No wave-2 ticket depends on the false premise — none was filed CORS-shaped.
+
+**`bridge.py:308` symbol-naming drift in §D3 and §6.** Both sections call `bridge.py:308` `_ownership_refusal` (path-shaped, `(target_path, bound_workspace_id)`). In the tree, `:308` is `_ownership_refusal_ids` (id-shaped, two workspace ids); the path-shaped `_ownership_refusal` is at `:372`, and the session-shaped `_ownership_refusal_by_id` at `:349`. §D4 cites all three correctly, so the doc is internally inconsistent on this one pairing. The historical sections are left unedited (they record what the D3 design pass saw); this entry names the carrier. Sibling to the CORS-premise correction above — same discipline: corrections name every carrier, sections keep their text.
