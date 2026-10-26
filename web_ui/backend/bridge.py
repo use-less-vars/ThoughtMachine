@@ -572,6 +572,49 @@ class WebAgentBridge:
         # Track session conversation version for efficient history sync
         self._history_version: int = 0
 
+    def _bind_workspace(self, workspace_id: Optional[str], mode: str) -> Optional[str]:
+        """The ONE authority that may set ``self._workspace_id``.
+
+        Every workspace binding in the load / create / switch flow routes here,
+        so the rule is auditable in one place instead of scattered writes.
+
+        Modes (the only two that exist):
+          ``bootstrap`` \u2014 first bind only.  An unbound bridge adopts the id; an
+              already-bound bridge is left alone when the ids match and REFUSED
+              otherwise, because a bootstrap is not a scope change.
+          ``switch``    \u2014 an explicit scope change.  Unbound adopts (a switch can
+              bootstrap), equal is idempotent, and a real change is decided by
+              ``_ownership_refusal_ids`` so switch mode inherits whatever the
+              ownership authority allows (today: always refuse).
+
+        Returns ``None`` on success, otherwise a human-readable refusal reason.
+        ``self._workspace_id`` is never reset to ``None`` here: a refusal leaves
+        the existing binding untouched (fail closed, not fail open).
+        """
+        if workspace_id is None:
+            return "cannot bind workspace: no workspace id was supplied"
+
+        if mode not in ("bootstrap", "switch"):
+            return (
+                f"cannot bind workspace {workspace_id!r}: unknown mode {mode!r} "
+                f"(expected 'bootstrap' or 'switch')"
+            )
+
+        # Both modes bootstrap an unbound bridge and no-op on the same id.
+        if self._workspace_id is None:
+            self._workspace_id = workspace_id
+            return None
+        if self._workspace_id == workspace_id:
+            return None
+
+        if mode == "bootstrap":
+            return (
+                f"bootstrap cannot rebind: already bound to "
+                f"{self._workspace_id!r}, refusing to rebind to {workspace_id!r}"
+            )
+
+        # mode == "switch": the ownership authority owns the verdict.
+        return _ownership_refusal_ids(workspace_id, self._workspace_id)
 
     # ── Security event subscription ───────────────────────────────────────────
 
@@ -2457,9 +2500,17 @@ class WebAgentBridge:
                 try:
                     resolved = _resolve_workspace_id(self._workspace_path)
                     if resolved:
-                        self._workspace_id = resolved
-                        log('INFO', 'server.bridge',
-                            f"Resolved workspace_id from config.workspace_path: {resolved}")
+                        # D2 (site 2, bootstrap-bypass): route the write through
+                        # the bind authority.  The surrounding guard is exactly
+                        # what `bootstrap` mode does, now named and auditable.
+                        # bootstrap from unbound: refusal is structurally unreachable today.
+                        _bind_refusal = self._bind_workspace(resolved, "bootstrap")
+                        if _bind_refusal:
+                            log('WARNING', 'server.bridge',
+                                f"Could not bind workspace_id from config.workspace_path: {_bind_refusal}")
+                        else:
+                            log('INFO', 'server.bridge',
+                                f"Resolved workspace_id from config.workspace_path: {resolved}")
                 except Exception as exc:
                     log('WARNING', 'server.bridge',
                         f"Could not resolve workspace_id from workspace_path: {exc}")
