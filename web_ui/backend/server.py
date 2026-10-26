@@ -1682,6 +1682,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 # D2 (bootstrap binding): registration is the
                                 # workspace-creation transition -- the connection
                                 # adopts the new id through the bind authority.
+                                # bootstrap from unbound: refusal is structurally unreachable today.
                                 _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
                                 if _bind_refusal:
                                     log('WARNING', 'server',
@@ -3259,6 +3260,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             # D2 (bootstrap binding): registration is the
                             # workspace-creation transition -- the connection
                             # adopts the new id through the bind authority.
+                            # bootstrap from unbound: refusal is structurally unreachable today.
                             _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
                             if _bind_refusal:
                                 log('WARNING', 'server',
@@ -3474,6 +3476,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             # D2 (bootstrap binding): registration is the
                             # workspace-creation transition -- the connection
                             # adopts the new id through the bind authority.
+                            # bootstrap from unbound: refusal is structurally unreachable today.
                             _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
                             if _bind_refusal:
                                 log('WARNING', 'server',

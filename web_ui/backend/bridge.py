@@ -2503,6 +2503,7 @@ class WebAgentBridge:
                         # D2 (site 2, bootstrap-bypass): route the write through
                         # the bind authority.  The surrounding guard is exactly
                         # what `bootstrap` mode does, now named and auditable.
+                        # bootstrap from unbound: refusal is structurally unreachable today.
                         _bind_refusal = self._bind_workspace(resolved, "bootstrap")
                         if _bind_refusal:
                             log('WARNING', 'server.bridge',
