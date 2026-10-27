@@ -98,7 +98,7 @@ class Agent:
     SAFETY_MARGIN = 1000
     DEFAULT_RESPONSE_TOKENS = DEFAULT_RESPONSE_TOKENS
 
-    def __init__(self, config: AgentConfig, session=None, session_id: str=None, event_bus=None):
+    def __init__(self, config: AgentConfig, session=None, session_id: str=None, event_bus=None, streaming: bool = False):
         """
         Initialize modular agent.
         
@@ -106,6 +106,8 @@ class Agent:
             config: Agent configuration.
             session: Optional session object.
             session_id: Session ID if no session provided.
+            streaming: Enable the streaming path. Inert for now - a turn still
+                runs the sync path regardless of this flag.
         """
         self.config = config
         self._session = session
@@ -150,7 +152,8 @@ class Agent:
         self._conversation_start_time = time.time()
         self.token_counter = TokenCounter(config)
         self._resolve_credential_placeholder(config)
-        self.llm_client = LLMClient(config, session, self.logger)
+        self.streaming = streaming
+        self.llm_client = LLMClient(config, session, self.logger, streaming=streaming)
         self.conversation_manager = ConversationManager(session, None, self.logger)
         self.debug_context = DebugContext(self.logger)
         self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
@@ -554,7 +557,7 @@ class Agent:
 
             # Re-initialise LLM client and provider from new_config
             self._resolve_credential_placeholder(new_config)
-            self.llm_client = LLMClient(new_config, self._session, old_logger)
+            self.llm_client = LLMClient(new_config, self._session, old_logger, streaming=self.streaming)
             self.provider = self.llm_client.provider
 
             # Rebuild tool_classes and tool_definitions
@@ -597,7 +600,7 @@ class Agent:
             if old_config is not None and old_logger is not None:
                 try:
                     self._resolve_credential_placeholder(old_config)
-                    self.llm_client = LLMClient(old_config, self._session, old_logger)
+                    self.llm_client = LLMClient(old_config, self._session, old_logger, streaming=self.streaming)
                     self.provider = self.llm_client.provider
                 except Exception as restore_error:
                     log('CRITICAL', 'core.agent', f'Failed to restore old LLM client after restart failure: {restore_error}')

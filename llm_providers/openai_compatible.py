@@ -2,11 +2,13 @@
 OpenAI-compatible provider implementation.
 Works with OpenAI, DeepSeek, OpenCode/Big Pickle, and any OpenAI-compatible API.
 """
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, AsyncIterator
+import asyncio
+import json
 import time
 import os
 import sys
-from openai import OpenAI, APIError, RateLimitError, APIConnectionError
+from openai import OpenAI, AsyncOpenAI, APIError, RateLimitError, APIConnectionError
 try:
     from openai import APITimeoutError
 except ImportError:  # pragma: no cover - SDK < 1.0
@@ -16,6 +18,8 @@ import tiktoken
 from .base import LLMProvider, ProviderConfig, LLMResponse, _redact_headers
 from agent.config.secret import reveal_secret
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
+from agent.core.ir import CanonicalToolCall
+from agent.core.stream_events import TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgumentsDelta, ToolCallComplete, UsageUpdate, Interrupted, Done, StreamEvent
 from agent.logging import log
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -436,6 +440,187 @@ class OpenAICompatibleProvider(LLMProvider):
             if 'response' in locals():
                 provider_error.raw_response = response
             raise provider_error
+
+    def _ensure_async_client(self) -> Any:
+        """Return the async SDK client, creating it on first use.
+
+        ``__init__`` is deliberately left untouched: a provider that never
+        streams should not pay for a second HTTP client. NOTE: nothing closes
+        this client yet - it lives as long as the provider object and is
+        reclaimed with it.
+        """
+        if getattr(self, '_async_client', None) is None:
+            client_kwargs = {'api_key': reveal_secret(self.config.api_key), 'timeout': self.config.timeout, 'max_retries': self.config.max_retries}
+            if self.config.base_url:
+                client_kwargs['base_url'] = self.config.base_url
+            if self.config.extra_headers:
+                client_kwargs['default_headers'] = self.config.extra_headers
+            self._async_client = AsyncOpenAI(**client_kwargs)
+            log('DEBUG', 'llm.openai', f"async client created with base_url={(self._async_client.base_url if hasattr(self._async_client, 'base_url') else 'default')}")
+        return self._async_client
+
+    async def stream_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> AsyncIterator[StreamEvent]:
+        """Stream a chat completion as provider-neutral events.
+
+        The terminal event is exactly one of ``Done`` (normal end) or
+        ``Interrupted`` (the provider failed mid-stream); each tool call is
+        reported as ``ToolCallStart`` / ``ToolCallArgumentsDelta`` /
+        ``ToolCallComplete``, and at most one ``UsageUpdate`` is emitted before
+        ``Done`` when the provider reports token counts.
+        """
+        # Message normalisation is deliberately the same as chat_completion's:
+        # the same providers need the same fixups on the streaming path.
+        if 'deepseek' in self.config.model.lower() or (self.config.base_url and 'deepseek' in self.config.base_url.lower()):
+            messages_with_ids = []
+            for i, msg in enumerate(messages):
+                msg_copy = msg.copy()
+                if 'id' not in msg_copy or msg_copy['id'] is None or (not isinstance(msg_copy['id'], str)):
+                    msg_copy['id'] = str(i)
+                messages_with_ids.append(msg_copy)
+            messages = self._normalize_deepseek_tool_calls(messages_with_ids)
+        is_stepfun = 'stepfun' in self.config.model.lower()
+        is_openrouter = self.config.base_url and 'openrouter' in self.config.base_url.lower()
+        if is_stepfun or (is_openrouter and is_stepfun):
+            messages = self._normalize_stepfun_tool_calls(messages, is_openrouter=is_openrouter)
+        # Same request shape as chat_completion, plus streaming.
+        completion_kwargs = {'model': self.config.model, 'messages': messages}
+        completion_kwargs.update(kwargs)
+        if 'temperature' not in completion_kwargs:
+            completion_kwargs['temperature'] = self.config.temperature
+        if 'top_p' not in completion_kwargs and getattr(self.config, 'top_p', None) is not None:
+            completion_kwargs['top_p'] = self.config.top_p
+        if tools:
+            completion_kwargs['tools'] = self.format_tools(tools)
+            completion_kwargs['tool_choice'] = kwargs.get('tool_choice', 'auto')
+        completion_kwargs['stream'] = True
+        # include_usage is what makes the provider send the final usage-only
+        # chunk; set only when the caller has not chosen stream_options itself,
+        # so an explicit opt-out (or a provider that rejects the field) is not
+        # silently overridden.
+        if 'stream_options' not in kwargs:
+            completion_kwargs['stream_options'] = {'include_usage': True}
+        log('DEBUG', 'llm.openai', f"[STREAM REQUEST] model={self.config.model}, tools_count={len(tools) if tools else 0}, tool_choice={completion_kwargs.get('tool_choice', 'NOT SET')}, base_url={self.config.base_url}")
+
+        # index -> {'id': str|None, 'name': str|None, 'raw': str,
+        #           'emitted': int, 'started': bool}
+        pending: Dict[int, Dict[str, Any]] = {}
+
+        def _state(index: int) -> Dict[str, Any]:
+            if index not in pending:
+                pending[index] = {'id': None, 'name': None, 'raw': '', 'emitted': 0, 'started': False}
+            return pending[index]
+
+        def _start_events(state: Dict[str, Any]) -> List[StreamEvent]:
+            # A ToolCallStart needs both id and name. Arguments that arrive
+            # before both are known are buffered and flushed here, never emitted
+            # against an empty id.
+            if state['started'] or not state['id'] or not state['name']:
+                return []
+            state['started'] = True
+            events: List[StreamEvent] = [ToolCallStart(id=state['id'], name=state['name'])]
+            buffered = state['raw'][state['emitted']:]
+            if buffered:
+                state['emitted'] = len(state['raw'])
+                events.append(ToolCallArgumentsDelta(id=state['id'], arguments_delta=buffered))
+            return events
+
+        def _complete_event(state: Dict[str, Any]) -> StreamEvent:
+            raw = state['raw']
+            arguments: Dict[str, Any] = {}
+            parse_error: Optional[str] = None
+            if not state['name']:
+                parse_error = 'incomplete tool call: no function name received'
+            elif raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                except ValueError as exc:
+                    parse_error = str(exc)
+                else:
+                    if isinstance(parsed, dict):
+                        arguments = parsed
+                    else:
+                        parse_error = f'tool call arguments are {type(parsed).__name__}, not an object'
+            # §2 inv 6: a malformed call carries no partial arguments. The error
+            # is reported both on the IR object and on the event, so the turn
+            # loop can read whichever it looks at first.
+            return ToolCallComplete(
+                tool_call=CanonicalToolCall(id=state['id'] or '', name=state['name'] or '', arguments=arguments, raw_arguments=(raw or None), parse_error=parse_error),
+                parse_error=parse_error,
+            )
+
+        stream = None
+        try:
+            stream = await self._ensure_async_client().chat.completions.create(**completion_kwargs)
+            async for chunk in stream:
+                usage = getattr(chunk, 'usage', None)
+                if usage is not None:
+                    yield UsageUpdate(input_tokens=getattr(usage, 'prompt_tokens', 0) or 0, output_tokens=getattr(usage, 'completion_tokens', 0) or 0)
+                choices = getattr(chunk, 'choices', None) or []
+                if not choices:
+                    # usage-only chunk
+                    continue
+                choice = choices[0]
+                delta = getattr(choice, 'delta', None)
+                if delta is not None:
+                    reasoning = getattr(delta, 'reasoning_content', None)
+                    if reasoning:
+                        yield ReasoningDelta(text=reasoning)
+                    content = getattr(delta, 'content', None)
+                    if content:
+                        yield TextDelta(text=content)
+                    for fragment in getattr(delta, 'tool_calls', None) or []:
+                        state = _state(getattr(fragment, 'index', 0) or 0)
+                        fragment_id = getattr(fragment, 'id', None)
+                        if fragment_id:
+                            state['id'] = fragment_id
+                        function = getattr(fragment, 'function', None)
+                        if function is not None:
+                            name = getattr(function, 'name', None)
+                            if name:
+                                state['name'] = name
+                            arguments_delta = getattr(function, 'arguments', None)
+                            if arguments_delta:
+                                state['raw'] += arguments_delta
+                                if state['started']:
+                                    state['emitted'] = len(state['raw'])
+                                    yield ToolCallArgumentsDelta(id=state['id'], arguments_delta=arguments_delta)
+                        for event in _start_events(state):
+                            yield event
+                if getattr(choice, 'finish_reason', None) == 'tool_calls':
+                    for index in sorted(pending):
+                        state = pending[index]
+                        for event in _start_events(state):
+                            yield event
+                        yield _complete_event(state)
+                    pending.clear()
+            # The stream can end without finish_reason == 'tool_calls' (some
+            # providers report 'stop' for tool calls), so finalise anything left.
+            for index in sorted(pending):
+                state = pending[index]
+                for event in _start_events(state):
+                    yield event
+                yield _complete_event(state)
+            pending.clear()
+            yield Done()
+        except (GeneratorExit, asyncio.CancelledError):
+            # Both derive from BaseException, so the clause below cannot swallow
+            # them; spelled out so a future widening of that clause cannot turn a
+            # cancellation into an Interrupted event.
+            raise
+        except Exception as exc:
+            # Broad by design, mirroring chat_completion's own final except:
+            # the event carries only the failure's type and the turn loop
+            # classifies it, so a provider that answers with a non-stream object
+            # (AttributeError/TypeError here) must not escape as a crash.
+            log('WARNING', 'llm.openai', f'Stream failed mid-flight: {type(exc).__name__}: {exc}')
+            yield Interrupted(reason=f'provider_error: {type(exc).__name__}')
+            return
+        finally:
+            if stream is not None:
+                try:
+                    await stream.close()
+                except Exception as exc:
+                    log('DEBUG', 'llm.openai', f'Closing stream failed: {exc}')
 
     def parse_response(self, raw_response: Any, start_time: float) -> LLMResponse:
         """Parse OpenAI-compatible response"""
