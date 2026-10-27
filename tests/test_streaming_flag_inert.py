@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from datetime import datetime as _real_datetime
 
@@ -38,6 +39,7 @@ from agent.core.agent import Agent
 from agent.core.llm_client import LLMClient
 from agent.core.stream_events import __all__ as STREAM_EVENT_EXPORTS
 from agent.core import stream_events as stream_events_module
+from agent.core.token_counter import TokenCounter
 from tests.mocks.puppet_agent import PuppetLLM
 from tests.assertions.event_assertions import (
     assert_event_sequence,
@@ -147,19 +149,57 @@ def _frozen_clock(instant=FROZEN_INSTANT):
         def now(cls, tz=None):
             return _real_datetime.fromtimestamp(instant, tz)
 
+        @classmethod
+        def utcnow(cls):
+            return _real_datetime.utcfromtimestamp(instant)
+
+        @classmethod
+        def today(cls):
+            return _real_datetime.fromtimestamp(instant)
+
     real_time = time.time
+    real_time_ns = time.time_ns
     patched_modules = (conversation_manager_module, agent_module)
     original_datetimes = {module: module.datetime for module in patched_modules}
 
     time.time = lambda: instant
+    time.time_ns = lambda: int(instant * 1_000_000_000)
     for module in patched_modules:
         module.datetime = _FrozenDatetime
     try:
         yield instant
     finally:
         time.time = real_time
+        time.time_ns = real_time_ns
         for module, original in original_datetimes.items():
             module.datetime = original
+
+
+@contextlib.contextmanager
+def _record_estimator_input(sink):
+    """Record the exact string ``TokenCounter.estimate_tokens`` encodes.
+
+    The estimator hands non-``str`` messages through ``json.dumps`` before
+    encoding, so the sink records that serialised form: two runs agreeing here
+    must agree on ``context_length`` under any encoder -- the local
+    ``len(json)//4`` fallback and CI's ``cl100k_base`` alike.
+    """
+    original = TokenCounter.estimate_tokens
+
+    def recording_estimate(self, text, *args, **kwargs):
+        if not isinstance(text, str):
+            try:
+                text = json.dumps(text)
+            except (TypeError, ValueError):
+                text = repr(text)
+        sink.append(text)
+        return original(self, text, *args, **kwargs)
+
+    TokenCounter.estimate_tokens = recording_estimate
+    try:
+        yield sink
+    finally:
+        TokenCounter.estimate_tokens = original
 
 
 def _normalise(obj):
@@ -201,9 +241,13 @@ class TestStreamingFlagInert:
     def test_turn_output_is_identical_with_flag_off_and_on(self, scenario_key):
         # Both runs share one frozen instant, so any OFF/ON token difference can
         # only come from the flag -- not from the wall clock inside the payload.
+        off_payloads = []
+        on_payloads = []
         with _frozen_clock():
-            off_events, off_puppet = _run_scenario(streaming=False, scenario_key=scenario_key)
-            on_events, on_puppet = _run_scenario(streaming=True, scenario_key=scenario_key)
+            with _record_estimator_input(off_payloads):
+                off_events, off_puppet = _run_scenario(streaming=False, scenario_key=scenario_key)
+            with _record_estimator_input(on_payloads):
+                on_events, on_puppet = _run_scenario(streaming=True, scenario_key=scenario_key)
 
         # The puppet really drove both turns (this is not an empty comparison).
         assert off_puppet.call_count == 1, "the puppet must have answered"
@@ -218,6 +262,43 @@ class TestStreamingFlagInert:
         assert [_normalise(event) for event in off_events] == [
             _normalise(event) for event in on_events
         ]
+
+        # The event comparison above runs on *event* payloads; this one runs on
+        # the estimator's own input, which is what the token count is computed
+        # from. It is encoder-route independent, so it holds on the local
+        # ``len//4`` fallback and on CI's ``cl100k_base`` alike: a real BPE
+        # encoder can turn a same-length string change into a +/-1 token delta
+        # that ``len//4`` cannot see, which is why the event-level comparison
+        # alone cannot prove determinism.
+        assert len(off_payloads) == len(on_payloads), (
+            "the estimator was called "
+            f"{len(off_payloads)}x with the streaming flag off but "
+            f"{len(on_payloads)}x with it on -- the estimator input differed "
+            "between runs, so this is a payload leak rather than a flag effect: "
+            f"off={off_payloads!r} on={on_payloads!r}"
+        )
+        for index, (off_payload, on_payload) in enumerate(zip(off_payloads, on_payloads)):
+            if off_payload == on_payload:
+                continue
+            offset = next(
+                (
+                    position
+                    for position, (left, right) in enumerate(zip(off_payload, on_payload))
+                    if left != right
+                ),
+                min(len(off_payload), len(on_payload)),
+            )
+            window = slice(max(0, offset - 80), offset + 80)
+            pytest.fail(
+                f"estimator input #{index} differed between the off and on runs "
+                f"(first difference at character {offset}; lengths "
+                f"{len(off_payload)} vs {len(on_payload)}): "
+                f"off{window.start}:{window.stop}={off_payload[window]!r} vs "
+                f"on{window.start}:{window.stop}={on_payload[window]!r}. "
+                "The estimator input differed between runs, so this is a payload "
+                "leak rather than a flag effect. If this fails on CI as a bare "
+                "+/-1 context_length, the field quoted above is the culprit."
+            )
 
         # Both turns satisfy the same behavioural assertions.
         for events in (off_events, on_events):
