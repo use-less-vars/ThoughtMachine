@@ -42,7 +42,7 @@ class LLMError(ProviderError):
 class LLMClient:
     """Handles LLM provider communication, context building, and system prompts."""
 
-    def __init__(self, config, session=None, logger=None):
+    def __init__(self, config, session=None, logger=None, streaming: bool = False):
         """
         Initialize LLM client.
 
@@ -50,10 +50,13 @@ class LLMClient:
             config: AgentConfig instance.
             session: Optional Session object.
             logger: Optional logger instance.
+            streaming: Whether the caller intends to use the streaming path.
+                Stored only - the sync path is unchanged and still does the work.
         """
         self.config = config
         self.session = session
         self.logger = logger
+        self.streaming = streaming
         pc = dict(getattr(config, 'provider_config', None) or {})
         timeout = _resolve_timeout_setting(pc, 'timeout', 'LLM_TIMEOUT', 120)
         max_retries = _resolve_timeout_setting(pc, 'max_retries', 'LLM_MAX_RETRIES', 3)
@@ -158,6 +161,26 @@ class LLMClient:
                     error_type = generic_type
                     break
             raise LLMError(error_type=error_type, message=str(e), original_exception=e)
+
+    async def stream_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]=None, **kwargs):
+        """
+        Stream a completion from the provider as provider-neutral events.
+
+        A thin delegate: the events come straight from the provider adapter,
+        which is duck-typed here (anything exposing ``stream_completion``
+        qualifies). Errors are not mapped - a failing stream ends with an
+        ``Interrupted`` event rather than an exception.
+
+        Raises:
+            NotImplementedError: If the provider has no streaming support.
+                Because this is an async generator, that surfaces on first
+                iteration, not at call time.
+        """
+        provider = getattr(self, 'provider', None)
+        if provider is None or not hasattr(provider, 'stream_completion'):
+            raise NotImplementedError(f'Provider {type(provider).__name__} does not support stream_completion')
+        async for event in provider.stream_completion(messages=messages, tools=tools, **kwargs):
+            yield event
 
     def _provider_meta(self, response) -> Dict[str, Any]:
         """Best-effort extraction of provider-specific metadata from a response.
