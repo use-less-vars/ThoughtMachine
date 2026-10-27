@@ -741,3 +741,31 @@ You inherit `dev = 392e6b7a` with the tree clean: the auth arc is complete, D1 t
 3. Four Gen 51 entries went into the KB mid-session and five more at close. If you find the close entries missing, the close was interrupted, not skipped.
 
 **The one thing to carry:** verify the claim, not the conclusion. Every PASS this session that turned out wrong was honest. The gates held; what failed was the construction of the check.
+
+## 2026-10-27 — GEN 52 → GEN 53 HANDOFF
+
+You inherit `dev = 45b0ca68` with the tree clean. The core is fundamentally different from the one Gen 51 left. **The synchronous loop is dead. The core is streaming-only.**
+
+**Read first:**
+1. `docs/design-streaming-canonical-ir.md` — The design pass that drove this sprint. Read §4 (The turn loop under streaming), §5 (Cancellation), and **§7 (What does not change)**.
+2. `agent/core/ir.py` and `agent/core/stream_events.py` — The Canonical IR and StreamEvent types.
+3. `agent/core/agent.py` (`process_query`) — The new streaming turn loop. It consumes `StreamEvent`s. D1 (Respond+Summary) and D2 (token re-arm) are structurally fixed.
+
+**What closed:**
+- **Wave 0:** API-key redaction (`Secret[str]`), Anthropic `tool_result` blocks, ConfigService delegation.
+- **Wave 2:** The Canonical IR layer, OpenAI streaming adapter.
+- **Wave 3:** The streaming turn loop rewrite. D1 is dissolved via `final_pending` deferral. D2 is fixed via `UsageUpdate`. E2E test stub updated to SSE.
+
+**What we deliberately dropped:**
+- **Mid-stream cancellation:** `controller.should_stop()` returns the string `'PAUSED'`, which is truthy. Polling it mid-stream conflated pause with halt. We reverted to checkpoint [1] (between turns). A `should_halt()` boolean is a future ticket.
+- **The `streaming=False` flag:** Deleted in Wave 3. It gated nothing.
+
+**What is next (The Horizon):**
+- `fix/tool-refusal-structure`: The UI currently reports rejected tools as `success=True` because the classifier uses string matching. Fix it to use structured fields.
+- **Wave 4:** Responses API Adapter (GPT-6 compatibility).
+- **Wave 5:** Sysprompt addendum, external injection, multimodal (vision).
+
+**Corrections inherited:**
+- **The Worker Self-Correction:** The workers in this session routinely caught their own errors (and ours). Trust their retractions.
+- **The Stacked PR Footgun:** If you base a PR on a feature branch, and that feature branch merges first, your PR might merge into a branch that is already dead. Verify with `git log origin/dev` after merging.
+- **The Mock OOM:** Async mocks that lack a `StopAsyncIteration` will spin forever, OOM, and be reported by CI as `The operation was canceled`. Check the mocks before blaming the infrastructure.

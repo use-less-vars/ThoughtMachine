@@ -1,6 +1,6 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-26, Gen 51 close.
+Updated: 2026-10-27, Gen 52 close.
 
 **Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
@@ -38,6 +38,26 @@ after W4 merges." Status line for this wave, verbatim: "Credential
 injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+## Current state — 2026-10-27, Gen 52 close
+
+**Supersedes the 2026-10-26 Gen 51 close (kept below as historical record).**
+
+**dev HEAD:** `45b0ca68`
+
+**The core is streaming-only.** The synchronous turn loop has been deleted.
+- **Wave 0:** API-key redaction (`Secret[str]`), Anthropic `tool_result` blocks, ConfigService delegation.
+- **Wave 2:** Canonical IR types (`agent/core/ir.py`), OpenAI streaming adapter (`stream_completion`).
+- **Wave 3:** The streaming turn loop rewrite (`process_query`). D1 (Respond+Summary) dissolved via `final_pending`. D2 (first tool call) fixed via `UsageUpdate`. E2E stub updated to SSE.
+
+**What was deliberately dropped:**
+- **Mid-stream cancellation:** `should_stop()` returns `'PAUSED'`. Checkpoint [1] cancellation remains. A `should_halt()` boolean is a future ticket.
+- **The `streaming` flag:** Deleted. Zero production call sites.
+
+**What is next:**
+- `fix/tool-refusal-structure` (Fix the classifier to use structured fields, not string matching).
+- Wave 4 (Responses API adapter for GPT-6).
+- Wave 5 (Sysprompt addendum, multimodal).
 
 ## Current state — 2026-10-26, Gen 51 close
 

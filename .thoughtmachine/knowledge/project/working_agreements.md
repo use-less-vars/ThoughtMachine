@@ -698,3 +698,15 @@ CI tests the code. The sandbox tests the boundaries. Nothing tests the environme
 **Rule:** for any user-facing path, "does this work from zero" is a separate gate from "does this pass", and the first cannot be inferred from the second. Map Layer 5 is not a nice-to-have; it is the only layer at which installation state is under test.
 
 **Instance:** the friend incident, Gen 51. A fresh install produced a missing vault, provider schema errors and a silent `host_bash` failure — none of which any existing check would have raised, all of which a startup banner and an `install-doctor` would have named. Ruled at Gen 51 close: `feat/fresh-install-diagnostic` is the first wave of the Delivery arc (see `project/operator_observations.md`, `[intent] feat/fresh-install-diagnostic`).
+
+## 2026-10-27 — Class: `the-stacked-pr-footgun` (Gen 52)
+A PR based on a feature branch that merges *after* that feature branch has already merged to `dev` will merge into the dead branch. The commits never reach `dev`. Detection: `git log origin/dev` shows the feature branch's commits missing. Fix: rebase the PR onto `dev` and open a fresh PR.
+
+## 2026-10-27 — Class: `the-mock-oom-loop` (Gen 52)
+An async mock (e.g., `MagicMock()`) called in a new async seam (`stream_completion`) returns a fresh `AsyncMock` forever, never raising `StopAsyncIteration`. This creates an infinite busy loop that eats memory until the runner OOMs (Exit 137). CI reports this as `The operation was canceled`. Detection: run the test locally with a memory limit; it dies in 10s. Fix: give the mock a `StopAsyncIteration` or update the test stub.
+
+## 2026-10-27 — Pattern: `transcription-is-not-transcription` (Gen 52)
+A worker transcribing a design doc reads the doc to understand it, catching structural errors (e.g., missing context, wrong line numbers) and reporting them rather than silently fixing them. This is a high-reliability signal. Trust the report.
+
+## 2026-10-27 — Pattern: `reader-self-correction` (Gen 52)
+The adversarial reader retracted its own prior findings three times when confronted with source evidence. A reader whose retractions merit as much weight as its findings is more trustworthy than one that has never self-corrected.
