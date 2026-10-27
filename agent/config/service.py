@@ -6,6 +6,7 @@ import json
 import threading
 from typing import Dict, Any, Optional, Callable
 from datetime import datetime
+from pydantic import ValidationError
 from agent.logging import log
 from thoughtmachine.vault import vault_root
 
@@ -144,10 +145,19 @@ class ConfigService:
             notify: Whether to notify listeners
             save: Whether to trigger save (debounced)
             validate: Whether to validate against schema before setting
+
+        Raises:
+            pydantic.ValidationError: If ``validate`` is True and the resulting
+                configuration would not validate against ``AgentConfig``.
         """
         with self._lock:
             old_value = self._config.get(key)
             if old_value != value:
+                if validate:
+                    # Validate the *candidate* mapping before touching live state:
+                    # a rejected value is therefore never applied, never notified
+                    # and never persisted - the mutation is atomic w.r.t. validation.
+                    self._validate_candidate({key: value})
                 self._config[key] = value
                 if notify:
                     self._notify_listeners(key, old_value, value)
@@ -163,10 +173,24 @@ class ConfigService:
             notify: Whether to notify listeners
             save: Whether to trigger save (debounced)
             validate: Whether to validate against schema before updating
+
+        Raises:
+            pydantic.ValidationError: If ``validate`` is True and the resulting
+                configuration would not validate against ``AgentConfig``.
         """
         changed = False
         changes = {}
         with self._lock:
+            if validate:
+                pending = {
+                    key: value
+                    for key, value in updates.items()
+                    if self._config.get(key) != value
+                }
+                if pending:
+                    # Same atomicity guarantee as ``set()``: validate the whole
+                    # candidate mapping first, apply and notify only on success.
+                    self._validate_candidate(pending)
             for key, value in updates.items():
                 old_value = self._config.get(key)
                 if old_value != value:
@@ -222,18 +246,49 @@ class ConfigService:
                 except Exception as e:
                     log('ERROR', 'config.service', f'Error in listener: {e}')
 
+    def _validate_candidate(self, updates: Dict[str, Any]) -> bool:
+        """
+        Validate the config that *would* result from applying ``updates``.
+
+        Never mutates ``self._config`` - callers use this to reject a write
+        before it reaches live state.
+
+        Raises:
+            pydantic.ValidationError: If the candidate does not validate.
+        """
+        with self._lock:
+            candidate = self._config.copy()
+        candidate.update(updates)
+        return self._validate_mapping(candidate)
+
+    @staticmethod
+    def _validate_mapping(config: Dict[str, Any]) -> bool:
+        """Validate a plain config mapping against the ``AgentConfig`` schema."""
+        from agent.config import AgentConfig
+        try:
+            AgentConfig.model_validate(config)
+        except ValidationError as exc:
+            # Loud, never a silent False: the caller must see invalid config.
+            log('ERROR', 'config.service', f'Config validation failed: {exc}')
+            raise
+        return True
+
     def validate(self, schema: Optional[Dict[str, Any]]=None, strict: bool=True) -> bool:
         """
-        Validate configuration (no-op - validation handled by AgentConfig).
-        
+        Validate the live configuration against the ``AgentConfig`` schema.
+
         Args:
             schema: Ignored (kept for compatibility)
             strict: Ignored (kept for compatibility)
-            
+
         Returns:
-            Always True
+            True when the configuration validates.
+
+        Raises:
+            pydantic.ValidationError: If the configuration is invalid. Failures
+                are raised (after logging), never reported as a silent False.
         """
-        return True
+        return self._validate_mapping(self.get_all())
 
     def reset_to_defaults(self) -> None:
         """Reset configuration to defaults."""
