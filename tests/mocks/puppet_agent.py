@@ -6,6 +6,14 @@ import json
 from typing import Any, Dict, List, Optional
 
 from llm_providers.base import LLMResponse
+from agent.core.llm_client import _to_canonical_tool_call
+from agent.core.stream_events import (
+    Done,
+    ReasoningDelta,
+    TextDelta,
+    ToolCallComplete,
+    UsageUpdate,
+)
 
 
 class PuppetLLM:
@@ -87,3 +95,30 @@ class PuppetLLM:
 
         else:
             raise ValueError(f"Unknown turn type: {turn_type}")
+
+    async def stream_completion(self, messages, tools=None, **kwargs):
+        """Replay this puppet's next canned response as stream events.
+
+        The same fake, the same scenario, the same ``chat_completion`` call -
+        only the seam moved. The event order mirrors LLMClient.stream_completion's
+        synthesis: UsageUpdate (only when the response reports usage), TextDelta,
+        ReasoningDelta (only when non-empty), one ToolCallComplete per tool call,
+        then Done.
+        """
+        response = self.chat_completion(messages=messages, tools=tools, **kwargs)
+        usage = getattr(response, "usage", None)
+        if usage:
+            yield UsageUpdate(
+                input_tokens=usage.get("prompt_tokens", 0) or 0,
+                output_tokens=usage.get("completion_tokens", 0) or 0,
+            )
+        content = getattr(response, "content", None)
+        if content:
+            yield TextDelta(text=content)
+        reasoning = getattr(response, "reasoning", None)
+        if reasoning:
+            yield ReasoningDelta(text=reasoning)
+        for tool_call in getattr(response, "tool_calls", None) or []:
+            canonical = _to_canonical_tool_call(tool_call)
+            yield ToolCallComplete(tool_call=canonical, parse_error=canonical.parse_error)
+        yield Done()

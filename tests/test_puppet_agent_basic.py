@@ -25,7 +25,7 @@ class TestPuppetAgentBasic:
         puppet = PuppetLLM(scenario=[
             {"type": "assistant", "content": "Hello from the puppet!"},
         ])
-        agent.llm_client.chat_completion = puppet.chat_completion
+        agent.llm_client.stream_completion = puppet.stream_completion
 
         events = list(agent.process_query("Say hello"))
         assert_event_sequence(events, ["turn", "agent_responded"])
@@ -44,7 +44,7 @@ class TestPuppetAgentBasic:
                 "confidence": "high",
             },
         ])
-        agent.llm_client.chat_completion = puppet.chat_completion
+        agent.llm_client.stream_completion = puppet.stream_completion
 
         events = list(agent.process_query("Do the thing"))
         assert_event_sequence(events, ["turn", "tool_call", "agent_responded"])

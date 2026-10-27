@@ -11,6 +11,7 @@ This is the main Agent class that delegates to specialized modules:
 The original Agent class (1972 lines) is reduced to a coordinator.
 """
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
 import os
@@ -35,6 +36,7 @@ from agent import events as ev
 from agent.events import global_event_bus
 from .token_counter import TokenCounter
 from .llm_client import LLMClient, LLMError
+from .stream_events import Done, Interrupted, ReasoningDelta, TextDelta, ToolCallComplete, UsageUpdate
 from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor
 from .turn_transaction import TurnTransaction
@@ -93,12 +95,110 @@ def _audit_config_change(old_config, new_config, restart_required: bool) -> None
         pass
 
 
+#: One cached private event loop, used to drive streaming LLM adapters from
+#: synchronous code. Created lazily by :func:`_iter_stream_events`; never closed
+#: (the agent is a long-lived singleton per worker thread).
+_STREAM_LOOP = None
+
+
+def _iter_stream_events(agen):
+    """Drive an async-generator stream from synchronous code, one event at a time.
+
+    ``agen`` is an ``AsyncIterator`` (today: ``LLMClient.stream_completion``).
+    Each ``__anext__()`` is run to completion on a single cached private event
+    loop, so the caller can stay a plain sync generator (``process_query``) and
+    keep yielding dict events to its own consumers.
+
+    Termination: ``StopAsyncIteration`` is the normal end of the stream, not an
+    error. An exception raised by ``agen`` propagates to the caller.
+
+    Reentrancy: if ``asyncio.get_running_loop()`` succeeds in the calling thread
+    there is already a running loop, and ``run_until_complete()`` would raise
+    ``RuntimeError: This event loop is already running`` - the stream could never
+    be driven from here. A dedicated-thread fallback is deliberately NOT
+    provided (it would silently reorder events / hide cancellation); instead a
+    clear ``RuntimeError`` is raised immediately. The only supported caller is
+    the synchronous controller worker thread, so this is a programming error,
+    not a runtime condition.
+
+    Closing: the ``finally`` block guarantees ``agen.aclose()`` - an abandoned
+    async generator would otherwise leak the provider's HTTP stream. It is a
+    no-op when the stream was already exhausted (the ``exhausted`` flag skips it
+    entirely) and idempotent when the generator is already closed; errors raised
+    *while* closing are logged rather than propagated, so they can never mask
+    the caller's own exception or a ``GeneratorExit``.
+    """
+    global _STREAM_LOOP
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError('_iter_stream_events() must be called from synchronous code: this thread already has a running event loop, so the stream cannot be driven with run_until_complete().')
+    if _STREAM_LOOP is None:
+        _STREAM_LOOP = asyncio.new_event_loop()
+    loop = _STREAM_LOOP
+    exhausted = False
+    try:
+        while True:
+            try:
+                event = loop.run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                exhausted = True
+                break
+            yield event
+    finally:
+        # Guarantee the stream is closed even on cancellation,
+        # GeneratorExit or an exception from the consumer.
+        if not exhausted:
+            try:
+                loop.run_until_complete(agen.aclose())
+            except (StopAsyncIteration, GeneratorExit):
+                pass
+            except RuntimeError as close_error:
+                log('WARNING', 'core.agent', f'_iter_stream_events: could not close stream: {close_error}')
+
+
+#: Provider exception class names an adapter may report through
+#: ``Interrupted.reason`` (``'provider_error: <ClassName>'``) mapped to the
+#: error the synchronous ``chat_completion()`` path would have raised for the
+#: same failure. ``llm_providers/openai_compatible.py`` raises those mapped
+#: errors from ``chat_completion`` and only names the raw class in the event,
+#: so the class name is the whole discrimination the event carries.
+_INTERRUPTED_ERROR_TYPES = {
+    'ratelimiterror': ('rate_limit_exceeded', 'Rate limit exceeded'),
+    'apitimeouterror': ('timeout', 'Request timed out'),
+    'timeouterror': ('timeout', 'Request timed out'),
+    'authenticationerror': ('authentication_error', 'Authentication failed'),
+    'modelnotfounderror': ('model_not_found', 'Model not found'),
+    'tokenlimitexceedederror': ('token_limit_exceeded', 'Token limit exceeded'),
+}
+
+
+def _exception_for_interrupted(reason: str):
+    """Turn an ``Interrupted`` reason into the exception the turn loop handles.
+
+    The stream cannot raise across the adapter boundary, so an ``Interrupted``
+    event stands in for the exception ``chat_completion()`` used to raise. The
+    caller re-raises this inside the ``try`` that owns the LLMError /
+    RateLimitExceeded / ProviderError handlers, so retry, backoff and the
+    user-facing error event stay reachable. An unrecognised (or empty) reason
+    falls back to a generic provider error rather than a silent empty turn.
+    """
+    detail = reason.split(':', 1)[1].strip() if ':' in reason else ''
+    error_type, label = _INTERRUPTED_ERROR_TYPES.get(detail.lower(), ('provider_error', 'Provider error'))
+    message = f'{label} during streaming: {reason or "stream interrupted"}'
+    if error_type == 'rate_limit_exceeded':
+        return RateLimitExceeded(message)
+    return LLMError(error_type=error_type, message=message)
+
+
 class Agent:
     """Modular agent coordinating specialized components."""
     SAFETY_MARGIN = 1000
     DEFAULT_RESPONSE_TOKENS = DEFAULT_RESPONSE_TOKENS
 
-    def __init__(self, config: AgentConfig, session=None, session_id: str=None, event_bus=None, streaming: bool = False):
+    def __init__(self, config: AgentConfig, session=None, session_id: str=None, event_bus=None):
         """
         Initialize modular agent.
         
@@ -106,8 +206,6 @@ class Agent:
             config: Agent configuration.
             session: Optional session object.
             session_id: Session ID if no session provided.
-            streaming: Enable the streaming path. Inert for now - a turn still
-                runs the sync path regardless of this flag.
         """
         self.config = config
         self._session = session
@@ -152,8 +250,7 @@ class Agent:
         self._conversation_start_time = time.time()
         self.token_counter = TokenCounter(config)
         self._resolve_credential_placeholder(config)
-        self.streaming = streaming
-        self.llm_client = LLMClient(config, session, self.logger, streaming=streaming)
+        self.llm_client = LLMClient(config, session, self.logger)
         self.conversation_manager = ConversationManager(session, None, self.logger)
         self.debug_context = DebugContext(self.logger)
         self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
@@ -557,7 +654,7 @@ class Agent:
 
             # Re-initialise LLM client and provider from new_config
             self._resolve_credential_placeholder(new_config)
-            self.llm_client = LLMClient(new_config, self._session, old_logger, streaming=self.streaming)
+            self.llm_client = LLMClient(new_config, self._session, old_logger)
             self.provider = self.llm_client.provider
 
             # Rebuild tool_classes and tool_definitions
@@ -600,7 +697,7 @@ class Agent:
             if old_config is not None and old_logger is not None:
                 try:
                     self._resolve_credential_placeholder(old_config)
-                    self.llm_client = LLMClient(old_config, self._session, old_logger, streaming=self.streaming)
+                    self.llm_client = LLMClient(old_config, self._session, old_logger)
                     self.provider = self.llm_client.provider
                 except Exception as restore_error:
                     log('CRITICAL', 'core.agent', f'Failed to restore old LLM client after restart failure: {restore_error}')
@@ -889,6 +986,7 @@ class Agent:
         """Process a user query, appending it to conversation and running the agent.
         Yields events as dicts."""
         self._emergency_retries = 0
+        final_pending = False
         try:
             log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
@@ -1121,17 +1219,78 @@ class Agent:
                         f"last_user={'present' if any(m['role']=='user' for m in messages[-2:]) else 'MISSING'}")
                     log('DEBUG', 'core.pause', 'LLM CALL START')
                     llm_start_time = time.time()
-                    response = self.llm_client.chat_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
+                    # Token truth vs. estimate: current_conversation_tokens holds the
+                    # pre-call ESTIMATE, so capture it BEFORE the stream reports
+                    # provider truth or the drift log below loses its baseline.
+                    previous_tokens = self.state.current_conversation_tokens
+                    content = ''
+                    reasoning = None
+                    tool_calls = []
+                    input_tokens = 0
+                    output_tokens = 0
+                    final_pending = False
+                    stream_agen = self.llm_client.stream_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
+                    for stream_event in _iter_stream_events(stream_agen):
+                        # NO in-stream stop interception. A hard stop is handled by
+                        # PAUSE CHECKPOINT [1] (turn_start) exactly as it was before
+                        # streaming: the turn finishes and the next checkpoint emits
+                        # the 'stopped' lifecycle event. Breaking out mid-stream here
+                        # would skip that producer, invent a second stop terminal, and
+                        # could act on a partially received tool call.
+                        if isinstance(stream_event, TextDelta):
+                            content += stream_event.text or ''
+                        elif isinstance(stream_event, ReasoningDelta):
+                            reasoning = (reasoning or '') + (stream_event.text or '')
+                        elif isinstance(stream_event, ToolCallComplete):
+                            canonical = stream_event.tool_call
+                            raw_arguments = canonical.raw_arguments
+                            if raw_arguments is None:
+                                raw_arguments = json.dumps(canonical.arguments or {})
+                            wire_call = {'id': canonical.id, 'type': 'function', 'function': {'name': canonical.name, 'arguments': raw_arguments}}
+                            if stream_event.parse_error is not None:
+                                wire_call['parse_error'] = stream_event.parse_error
+                            tool_calls.append(wire_call)
+                            if canonical.name == 'Respond':
+                                # Terminal is emitted further down, after tool results
+                                # are committed - keep consuming the stream.
+                                final_pending = True
+                        elif isinstance(stream_event, UsageUpdate):
+                            # Provider truth replaces the estimate.
+                            input_tokens = stream_event.input_tokens or 0
+                            output_tokens = stream_event.output_tokens or 0
+                            self.state.current_conversation_tokens = input_tokens
+                            log('DEBUG', 'core.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
+                            for token_event in self.state.update_token_state(input_tokens):
+                                if token_event['type'] == 'token_warning':
+                                    warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + token_event.get('warning_message', token_event.get('message', token_event.get('warning', ''))), is_system_notification=True, metadata={'warning_id': str(uuid.uuid4())})
+                                    self._add_to_conversation(warning_msg)
+                                    warning_tokens = self._estimate_tokens(warning_msg)
+                                    self.state.current_conversation_tokens += warning_tokens
+                                    log('DEBUG', '**pipeline.token_update**', f"Token update after token_warning: tokens={self.state.current_conversation_tokens}")
+                                    yield self._create_token_update_event()
+                                # Yield the original event (not reconstructed) to preserve all fields
+                                self._add_conversation_data_to_event(token_event)
+                                yield token_event
+                        elif isinstance(stream_event, Done):
+                            break
+                        elif isinstance(stream_event, Interrupted):
+                            # The adapter closed the stream because the provider
+                            # failed (it cannot raise across the async boundary),
+                            # so this event stands in for the exception the
+                            # non-streaming path raised. Re-raise it here - still
+                            # inside the try that owns the LLMError /
+                            # RateLimitExceeded / ProviderError handlers below -
+                            # so retry, rate-limit backoff, the token-limit
+                            # emergency retry and the user-facing error event all
+                            # stay reachable. Swallowing it would end the turn as
+                            # an empty "success" and loop to max_turns.
+                            raise _exception_for_interrupted(stream_event.reason or '')
+                        # ToolCallStart / ToolCallArgumentsDelta are progress signals
+                        # only (no UI event).
                     llm_duration_ms = (time.time() - llm_start_time) * 1000
                     log('DEBUG', 'core.pause', f'LLM CALL END (duration_ms={llm_duration_ms:.0f})')
                     if self.logger:
                         self.logger.log_latency('llm_call', llm_duration_ms, {'turn': turn, 'model': self.config.model, 'has_tools': bool(tools)})
-                    input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
-                    output_tokens = response.usage.get('completion_tokens', 0) if response.usage else 0
-                    # Use LLM-reported prompt_tokens as ground truth for conversation token count
-                    previous_tokens = self.state.current_conversation_tokens
-                    self.state.current_conversation_tokens = input_tokens
-                    log('DEBUG', 'core.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
                     # Token drift detection: compare pre-call estimate vs LLM-reported
                     if previous_tokens is not None and previous_tokens > 0 and input_tokens > 0:
                         drift = abs(input_tokens - previous_tokens)
@@ -1235,9 +1394,6 @@ class Agent:
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
                     return
-                content = response.content or ''
-                reasoning = response.reasoning
-                tool_calls = response.tool_calls
                 # Log raw tool call arguments at the closest point to the LLM response
                 if tool_calls:
                     log('DEBUG', 'core.agent', 'RAW TOOL CALL ARGUMENTS from LLM response',
@@ -1357,9 +1513,40 @@ class Agent:
                     self._pending_warnings.clear()
                     self._pending_warning_events.clear()
                     log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
-                    if final_detected:
+                    if summary_text is not None:
+                        log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
+                        recovery_events = self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after summary pruning: tokens={self.state.current_conversation_tokens}")
+                        yield self._create_token_update_event()
+                        # Yield ONLY a context_summarized event — the canonical notification.
+                        # The old token_recovery + context_summarized double-emit caused
+                        # duplicate "Token usage has returned to safe levels" + "Context has been
+                        # summarized" messages in the worker panel.  context_summarized alone
+                        # is sufficient: it carries the meaningful user-facing message, while
+                        # (context_cleared was already removed for the same reason)
+                        summarized_event = {'type': 'context_summarized', 'message': 'Context has been summarized. You now have a fresh context window and full access to tools.'}
+                        yield summarized_event
+
+                        # Continue the turn loop — summary frees context, agent keeps working
+                        turn_duration = time.time() - turn_start_time
+                        if self.logger:
+                            self.logger.log_system_resources()
+                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                        # Skip the 'if not tool_calls' check since we had tools (SummarizeTool)
+                        # D1: Respond AND SummarizeTool in the SAME batch. Pruning has
+                        # happened, but a terminal is still owed — so fall through to
+                        # the deferred `if final_pending:` block below (which emits the
+                        # agent_responded terminal and returns) instead of continuing
+                        # the loop, which would drop the terminal entirely.
+                        if not final_pending:
+                            continue
+                    if final_pending:
                         # Unified respond event — carries response_type so consumers
                         # can distinguish 'answer' (no reply needed) from 'question' (waiting for user).
+                        # Emitted only here: after the Respond tool result has been
+                        # committed above and after the summary branch, so a Respond
+                        # tool call never produces a terminal before its own result
+                        # is in history (and never twice).
                         respond_event = {
                             'type': 'agent_responded',
                             'response_type': respond_result['response_type'] if respond_result else 'answer',
@@ -1382,27 +1569,6 @@ class Agent:
                             self.logger.log_system_resources()
                             self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                         return
-                    if summary_text is not None:
-                        log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
-                        recovery_events = self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
-                        log('DEBUG', '**pipeline.token_update**', f"Token update after summary pruning: tokens={self.state.current_conversation_tokens}")
-                        yield self._create_token_update_event()
-                        # Yield ONLY a context_summarized event — the canonical notification.
-                        # The old token_recovery + context_summarized double-emit caused
-                        # duplicate "Token usage has returned to safe levels" + "Context has been
-                        # summarized" messages in the worker panel.  context_summarized alone
-                        # is sufficient: it carries the meaningful user-facing message, while
-                        # (context_cleared was already removed for the same reason)
-                        summarized_event = {'type': 'context_summarized', 'message': 'Context has been summarized. You now have a fresh context window and full access to tools.'}
-                        yield summarized_event
-
-                        # Continue the turn loop — summary frees context, agent keeps working
-                        turn_duration = time.time() - turn_start_time
-                        if self.logger:
-                            self.logger.log_system_resources()
-                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                        # Skip the 'if not tool_calls' check since we had tools (SummarizeTool)
-                        continue
                 pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [3] after_turn: _pause_requested={self._pause_requested}')
                 if self._pause_requested:
@@ -1451,6 +1617,25 @@ class Agent:
 
             # Max turns reached - loop exhausted naturally
             log('WARNING', 'core.agent', f'Max turns ({self.config.max_turns}) reached - loop exhausted')
+            if final_pending:
+                # A Respond tool call arrived in the final turn but the loop ran out
+                # before the terminal could be emitted (the summary branch continues).
+                # Emit it now, before the max_turns stop_reason, so the answer is not lost.
+                final_pending_event = {
+                    'type': 'agent_responded',
+                    'response_type': 'answer',
+                    'content': content,
+                    'status': None,
+                    'confidence': None,
+                    'meta': None,
+                    'turn': self._display_turn,
+                    'context_length': self.state.current_conversation_tokens,
+                    'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
+                }
+                if reasoning is not None:
+                    final_pending_event['reasoning'] = reasoning
+                self._add_conversation_data_to_event(final_pending_event)
+                yield final_pending_event
             if self.logger:
                 self.logger.log_agent_end('max_turns_reached', f'Max turns ({self.config.max_turns}) reached')
                 self.logger.close()
