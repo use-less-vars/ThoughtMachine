@@ -13,7 +13,8 @@ except ImportError:  # pragma: no cover - SDK < 1.0
     class APITimeoutError(APIError):  # never raised by old SDKs
         pass
 import tiktoken
-from .base import LLMProvider, ProviderConfig, LLMResponse
+from .base import LLMProvider, ProviderConfig, LLMResponse, _redact_headers
+from agent.config.secret import reveal_secret
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
 from agent.logging import log
 
@@ -26,13 +27,15 @@ class OpenAICompatibleProvider(LLMProvider):
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
-        client_kwargs = {'api_key': config.api_key, 'timeout': config.timeout, 'max_retries': config.max_retries}
-        log('DEBUG', 'llm.openai', f'client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}')
+        # REVEAL SITE: the raw key crosses into the OpenAI SDK here (it becomes
+        # the ``Authorization: Bearer ...`` header inside the SDK).
+        client_kwargs = {'api_key': reveal_secret(config.api_key), 'timeout': config.timeout, 'max_retries': config.max_retries}
+        log('DEBUG', 'llm.openai', f'client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={_redact_headers(config.extra_headers)}')
         if config.base_url:
             client_kwargs['base_url'] = config.base_url
         if config.extra_headers:
             client_kwargs['default_headers'] = config.extra_headers
-        log('DEBUG', 'llm.openai', f"client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
+        log('DEBUG', 'llm.openai', f"client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={_redact_headers(client_kwargs.get('default_headers'))}")
         self.client = OpenAI(**client_kwargs)
         log('DEBUG', 'llm.openai', f"client created with base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}")
         self.encoding = None

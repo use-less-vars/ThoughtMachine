@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - SDK < 1.0
     class APITimeoutError(APIError):  # never raised by old SDKs
         pass
 from .base import LLMProvider, ProviderConfig, LLMResponse
+from agent.config.secret import reveal_secret
 from .tool_converter import ToolFormatConverter
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
 from agent.logging import log
@@ -28,7 +29,9 @@ class AnthropicProvider(LLMProvider):
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
-        self.client = anthropic.Anthropic(api_key=config.api_key, timeout=config.timeout, max_retries=config.max_retries)
+        # REVEAL SITE: the raw key crosses into the Anthropic SDK here (it
+        # becomes the ``x-api-key`` header inside the SDK).
+        self.client = anthropic.Anthropic(api_key=reveal_secret(config.api_key), timeout=config.timeout, max_retries=config.max_retries)
         self.converter = ToolFormatConverter()
 
     def chat_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> LLMResponse:

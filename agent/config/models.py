@@ -5,6 +5,7 @@ from typing import ClassVar, Optional, Callable, List, Any, Dict, Literal
 from pathlib import Path
 from pydantic import BaseModel, Field, field_validator, model_validator, model_serializer, ConfigDict
 from agent.logging import log
+from agent.config.secret import Secret
 from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
@@ -70,6 +71,23 @@ class AgentConfig(BaseModel):
     }
 
     api_key: str = Field(default='', exclude=True)
+
+    @field_validator('api_key', mode='after')
+    def _wrap_api_key_as_secret(cls, v):
+        """Wrap the key in :class:`~agent.config.secret.Secret`.
+
+        The wrapper's ``__str__``/``__repr__``/``__format__`` render
+        ``<secret>``, so interpolating ``config.api_key`` into any log line,
+        f-string, ``print()`` or container ``repr()`` cannot leak it.
+
+        The field stays annotated as ``str`` (``Secret`` *is* a ``str``) so
+        equality, truthiness, membership and every existing ``isinstance(v,
+        str)`` check keep working unchanged.  The empty default is left as a
+        plain ``""`` so "no key configured" behaves exactly as before.
+        """
+        if v == '' or isinstance(v, Secret):
+            return v
+        return Secret(v)
     worker_mode: bool = False
     base_url: str = 'https://api.deepseek.com'
     model: str = 'deepseek-reasoner'
