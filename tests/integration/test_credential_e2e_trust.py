@@ -81,6 +81,9 @@ class TestCredentialE2ETrust:
                 {"type": "respond", "content": "All done", "status": "final"},
             ])
             agent.llm_client.chat_completion = puppet.chat_completion
+            # The agent loop drives the stream seam, so the MagicMock client
+            # needs the puppet's terminating replay too (it ends with Done).
+            agent.llm_client.stream_completion = puppet.stream_completion
             agent.llm_client.format_tools = lambda x: []
 
             # Run the agent loop
@@ -152,6 +155,9 @@ class TestCredentialE2ETrust:
                 {"type": "respond", "content": "Write attempt finished", "status": "final"},
             ])
             agent.llm_client.chat_completion = puppet.chat_completion
+            # The agent loop drives the stream seam, so the MagicMock client
+            # needs the puppet's terminating replay too (it ends with Done).
+            agent.llm_client.stream_completion = puppet.stream_completion
             agent.llm_client.format_tools = lambda x: []
 
             events = list(agent.process_query("Write to a file"))
@@ -203,7 +209,12 @@ class TestCredentialE2ETrust:
             mock_llm_instance.ensure_system_prompt.side_effect = lambda x: x
             mock_llm_instance.close.return_value = None
             mock_llm_instance.format_tools.return_value = []
+            # The agent loop drives the stream seam; the puppet replays the
+            # captured chat_completion as stream events and terminates on Done.
+            puppet = PuppetLLM(scenario=[])
+            puppet.chat_completion = capturing_chat_completion
             mock_llm_instance.chat_completion = capturing_chat_completion
+            mock_llm_instance.stream_completion = puppet.stream_completion
             mock_llm_cls.return_value = mock_llm_instance
 
             from agent.core.agent import Agent
