@@ -25,9 +25,14 @@ is not installed).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
+from datetime import datetime as _real_datetime
 
 import pytest
 
+import agent.core.agent as agent_module
+import agent.core.conversation_manager as conversation_manager_module
 from agent.config.models import AgentConfig
 from agent.core.agent import Agent
 from agent.core.llm_client import LLMClient
@@ -110,6 +115,53 @@ def _run_scenario(streaming, scenario_key):
     return list(agent.process_query("Do the thing")), puppet
 
 
+#: The one instant both runs are frozen to -- a realistic 18-character float.
+#: A round value such as ``1761600000.0`` reprs as 12 characters and shifts the
+#: token estimate for reasons unrelated to the code under test.
+FROZEN_INSTANT = 1793115664.7395215
+
+
+@contextlib.contextmanager
+def _frozen_clock(instant=FROZEN_INSTANT):
+    """Freeze every wall-clock read the turn path stamps into the payload.
+
+    Patches ``time.time`` (the source of ``created_at``:
+    ``agent.core.conversation_manager:46``) and the *module-level* ``datetime``
+    name in ``agent.core.conversation_manager`` and ``agent.core.agent``
+    (``session.updated_at``). ``datetime.datetime`` itself is immutable and is
+    deliberately not touched.
+
+    Frozen because ``created_at`` is inside the tokenized payload -- without a
+    freeze, OFF and ON runs differ by wall-clock instant, not by flag. The flag
+    is inert on the estimate path; the input is not. See diagnosis doc
+    (``.thoughtmachine/working_docs/diagnosis-streaming-flag-inert-2026-10-27.md``).
+    Environment note: the local sandbox has no tiktoken vocab and no network, so
+    it estimates via the ``len(json)//4`` fallback while CI uses
+    ``cl100k_base``; the observed flake rate therefore differs between
+    environments even though the root cause is the same, and a future reader
+    must not expect identical rates.
+    """
+
+    class _FrozenDatetime(_real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _real_datetime.fromtimestamp(instant, tz)
+
+    real_time = time.time
+    patched_modules = (conversation_manager_module, agent_module)
+    original_datetimes = {module: module.datetime for module in patched_modules}
+
+    time.time = lambda: instant
+    for module in patched_modules:
+        module.datetime = _FrozenDatetime
+    try:
+        yield instant
+    finally:
+        time.time = real_time
+        for module, original in original_datetimes.items():
+            module.datetime = original
+
+
 def _normalise(obj):
     """Strip volatile fields recursively so two turns compare equal."""
     if isinstance(obj, dict):
@@ -147,8 +199,11 @@ class TestStreamingFlagInert:
 
     @pytest.mark.parametrize("scenario_key", ["tool", "text"])
     def test_turn_output_is_identical_with_flag_off_and_on(self, scenario_key):
-        off_events, off_puppet = _run_scenario(streaming=False, scenario_key=scenario_key)
-        on_events, on_puppet = _run_scenario(streaming=True, scenario_key=scenario_key)
+        # Both runs share one frozen instant, so any OFF/ON token difference can
+        # only come from the flag -- not from the wall clock inside the payload.
+        with _frozen_clock():
+            off_events, off_puppet = _run_scenario(streaming=False, scenario_key=scenario_key)
+            on_events, on_puppet = _run_scenario(streaming=True, scenario_key=scenario_key)
 
         # The puppet really drove both turns (this is not an empty comparison).
         assert off_puppet.call_count == 1, "the puppet must have answered"
