@@ -700,33 +700,13 @@ CI tests the code. The sandbox tests the boundaries. Nothing tests the environme
 **Instance:** the friend incident, Gen 51. A fresh install produced a missing vault, provider schema errors and a silent `host_bash` failure — none of which any existing check would have raised, all of which a startup banner and an `install-doctor` would have named. Ruled at Gen 51 close: `feat/fresh-install-diagnostic` is the first wave of the Delivery arc (see `project/operator_observations.md`, `[intent] feat/fresh-install-diagnostic`).
 
 ## 2026-10-27 — Class: `the-stacked-pr-footgun` (Gen 52)
-
-A PR opened against another branch instead of `dev` records its merge on that branch. If the base has already merged — or its own PR closed, or the base simply never merges again — the stacked PR's merge commit lands somewhere nobody will merge, and `dev` never receives the commits. Every surface reads as success: GitHub says "Merged", the branch shows the commits, CI is green, and the PR page names the target branch exactly once, in small text, at the moment of merging.
-
-**Rule:** before merging a stacked PR, verify the base is still alive on origin (`git rev-parse origin/<base>`) and that its own PR is still open. If the base is dead, retarget the PR to `dev` first. Verify that the merge *landed*, not that a merge *message* exists — `git log` on `dev`, not the PR page.
-
-**Boundary:** this is not an argument against stacking. Stacking is how a long wave stays reviewable. It is an argument for one read at merge time: the branch the commits are going to.
+A PR based on a feature branch that merges *after* that feature branch has already merged to `dev` will merge into the dead branch. The commits never reach `dev`. Detection: `git log origin/dev` shows the feature branch's commits missing. Fix: rebase the PR onto `dev` and open a fresh PR.
 
 ## 2026-10-27 — Class: `the-mock-oom-loop` (Gen 52)
-
-A streaming turn loop ends when the provider raises `StopAsyncIteration`. An `AsyncMock` — or any mock whose iteration yields itself — never raises it, so the loop never ends: the test consumes memory until the container is killed at Exit 137. The CI symptom does not look like a memory bug. The job reports "The operation was canceled", which reads exactly like an infrastructure flake, and re-running it produces the same result more slowly.
-
-**Rule:** any mock standing in for a streaming provider must be a finite iterator with an explicit end — a recorded list of `StreamEvent`s, or a generator that raises `StopAsyncIteration`. Never an `AsyncMock` for the object whose end condition is what the test is checking. When a looping test is "canceled" in CI, check Exit 137 and the mock before you re-run.
-
-**Relationship to `self-comparison-assertion`:** the same shape one layer out. There, the assertion compared the file to a copy of itself; here, the loop waited for a signal its own mock could not send. In both, the apparatus quietly satisfied itself instead of testing.
+An async mock (e.g., `MagicMock()`) called in a new async seam (`stream_completion`) returns a fresh `AsyncMock` forever, never raising `StopAsyncIteration`. This creates an infinite busy loop that eats memory until the runner OOMs (Exit 137). CI reports this as `The operation was canceled`. Detection: run the test locally with a memory limit; it dies in 10s. Fix: give the mock a `StopAsyncIteration` or update the test stub.
 
 ## 2026-10-27 — Pattern: `transcription-is-not-transcription` (Gen 52)
-
-A worker sent to transcribe a section of a design document came back with structural findings attached: a paragraph describing a loop the code no longer has, a heading promising something the body does not deliver. The brief had specified a copy. But reading closely enough to reproduce text *is* a read — and a transcription faithful to the words is unfaithful to the document if it carries the errors forward in silence.
-
-**Rule:** ask for the read, not the copy. When the deliverable is "put §4 into the brief verbatim", the verbatim text is the deliverable *and* the by-product; structural findings travel alongside it, never instead of it, and never discarded to keep the transcription pure.
-
-**Boundary:** this does not license rewriting. The verbatim text is still owed. A worker that returns edits where a copy was asked for has broken the brief in the other direction.
+A worker transcribing a design doc reads the doc to understand it, catching structural errors (e.g., missing context, wrong line numbers) and reporting them rather than silently fixing them. This is a high-reliability signal. Trust the report.
 
 ## 2026-10-27 — Pattern: `reader-self-correction` (Gen 52)
-
-An adversarial reader retracted its own findings three times in a single pass, each retraction after re-reading the source. The retractions were the most valuable part of the output: each one marked a place where the document's claim and a competent reader's first assumption diverge — which is precisely where the next reader goes wrong without noticing.
-
-**Rule:** score an adversarial read by its retractions as well as its findings. A pass that returns findings and no retractions has either found the document clean or never re-read it; ask which before accepting the list.
-
-**Relationship to `self-comparison-assertion`:** different subject, opposite sign. The self-comparison was apparatus agreeing with itself and calling it a pass; here the apparatus disagreed with itself and produced the value.
+The adversarial reader retracted its own prior findings three times when confronted with source evidence. A reader whose retractions merit as much weight as its findings is more trustworthy than one that has never self-corrected.

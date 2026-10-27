@@ -43,24 +43,21 @@ port migration filed as `design/host-port-git-authorization`."
 
 **Supersedes the 2026-10-26 Gen 51 close (kept below as historical record).**
 
-**dev HEAD:** `45b0ca68` — merge of PR 223 (`fix/e2e-frontend-build-path`); tree clean, nothing in flight.
+**dev HEAD:** `45b0ca68`
 
-**The core is streaming-only.** `agent/core/ir.py` and `agent/core/stream_events.py` are the only currency the turn loop speaks; `agent/core/agent.py:39` imports `Done`, `Interrupted`, `ReasoningDelta`, `TextDelta`, `ToolCallComplete`, `UsageUpdate`, and there is no second path.
+**The core is streaming-only.** The synchronous turn loop has been deleted.
+- **Wave 0:** API-key redaction (`Secret[str]`), Anthropic `tool_result` blocks, ConfigService delegation.
+- **Wave 2:** Canonical IR types (`agent/core/ir.py`), OpenAI streaming adapter (`stream_completion`).
+- **Wave 3:** The streaming turn loop rewrite (`process_query`). D1 (Respond+Summary) dissolved via `final_pending`. D2 (first tool call) fixed via `UsageUpdate`. E2E stub updated to SSE.
 
-**Wave 0 — the design pass.** `docs/design-streaming-canonical-ir.md`: nine sections and twenty ruled corrections (C1–C20). §4 *The turn loop under streaming*, §5 *Cancellation* and §7 *What does not change* are the parts that bind the next wave.
+**What was deliberately dropped:**
+- **Mid-stream cancellation:** `should_stop()` returns `'PAUSED'`. Checkpoint [1] cancellation remains. A `should_halt()` boolean is a future ticket.
+- **The `streaming` flag:** Deleted. Zero production call sites.
 
-**Wave 2 — the canonical IR and the event union.** `agent/core/ir.py` and `agent/core/stream_events.py` landed as the contract; `user_history` stays on the wire as dicts, not IR (§7, Option A).
-
-**Wave 3 — the turn loop.** `process_query` (`agent/core/agent.py:985`) is the single streaming entry point.
-- **D1 dissolved, not patched.** The defect assumed a state the loop had no place to keep; `final_pending` (`agent/core/agent.py:989`) is that place, so the defect is unrepresentable rather than fixed — there is no patch to review.
-- **D2 fixed (`UsageUpdate`).** Token accounting rides the event union (`agent/core/agent.py:1257`) instead of a side channel re-armed each turn.
-- **E2E stub → SSE.** The E2E path exercises the streaming loop; the stub that replaced it was the thing spinning the loop to OOM.
-
-**What was deliberately dropped — mid-stream cancellation.** `should_stop()` returns `'PAUSED'` (`agent/controller/__init__.py:562–563`), not a cancel; the design doc's *Not in scope: interrupting a running tool* (§5) still stands; checkpoint [1] remains the only interruption point; `should_halt()` is future work, not a promise. The `streaming` flag is deleted — it had zero production call sites, so its removal changed no behaviour.
-
-**Classes and patterns earned (this close, `working_agreements.md`):** `the-stacked-pr-footgun`, `the-mock-oom-loop`, `transcription-is-not-transcription`, `reader-self-correction` — all Gen 52.
-
-**What is next:** `fix/tool-refusal-structure` (a tool refusal that reports as success), then Wave 4 (Responses API / GPT-6) and Wave 5 (system prompt and multimodal).
+**What is next:**
+- `fix/tool-refusal-structure` (Fix the classifier to use structured fields, not string matching).
+- Wave 4 (Responses API adapter for GPT-6).
+- Wave 5 (Sysprompt addendum, multimodal).
 
 ## Current state — 2026-10-26, Gen 51 close
 
