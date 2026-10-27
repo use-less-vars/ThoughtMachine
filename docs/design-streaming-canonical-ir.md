@@ -40,7 +40,7 @@ The IR replaces this with a typed representation. The IR is the shape *between* 
 
 1. `arguments` is always a `dict`. It is never a string, never None.
 2. `content` is always a list of blocks, even when there is exactly one text block. Single-string content is a wire-format special case, not an IR state.
-3. A `ReasoningBlock` with a `signature` must be replayed verbatim on the next request for the same message. A `ReasoningBlock` without a signature is an annotation, not state, and may be dropped.
+3. A `ReasoningBlock` with a `signature` must be replayed verbatim on the next request for the same message. A `ReasoningBlock` without a signature is an annotation, not state, and may be dropped. Because `session.user_history` holds wire dicts rather than IR (§7, "Where `user_history` lives"), the obligation lands on the adapter: **the adapter preserves `reasoning_signature` on the wire message.**
 4. A `ToolResultBlock` carries the `tool_use_id` of the `ToolUseBlock` it answers. The turn loop never re-serialises a tool result; it appends a `ToolResultBlock` to a `CanonicalMessage` with `role: "user"`.
 5. The IR is provider-neutral. A `CanonicalMessage` written by the turn loop is valid input to any adapter. An adapter that cannot express a block (e.g. a text-only provider meeting an `ImageBlock`) raises a typed `UnsupportedContentError` rather than silently dropping it.
 6. `arguments` is always a dict on `ToolCallComplete`. A streamed tool call whose accumulated arguments never parse to a JSON object produces a `ToolCallComplete` with `parse_error: str` set and `arguments: {}` (empty dict, not None). The turn loop turns a `parse_error` into a tool-result error event (refusal-shape, spec §8.6), not an `Interrupted` terminal. `Interrupted` is reserved for cancellation and provider failure; a malformed tool call is an ordinary failure the model can react to.
@@ -72,9 +72,30 @@ The turn loop is a generator. Under streaming it becomes a generator over typed 
 
 The turn loop's job — apply pending config, assemble request, call model, classify response, dispatch tools, commit, prune, emit — survives unchanged. What changes is the "call model, classify response" step and the timing of the commit.
 
-**Commits fire on `Done` or `Interrupted`, not on a returned response.** `TurnTransaction.commit()` (agent/core/turn_transaction.py:102) runs when the stream closes for any reason. On `Done`, the accumulated assistant message is complete. On `Interrupted`, the accumulated *partial* assistant message is committed — because a cancelled turn that produced text the user saw should survive in history, and a cancelled turn that produced nothing should not corrupt the transaction. The partial-vs-empty case is `TurnTransaction.has_assistant_message()`, which already exists.
+**Commit is two-phase, and streaming preserves both phases.** Today the turn loop commits twice per turn, and the ordering is the protection:
 
-**Tool dispatch fires on `ToolCallComplete`, not on `Done`.** A tool can begin executing while the model is still producing subsequent tool calls. This is what makes the "interrupt a long tool" capability usable: the user sees tool 1 running while the model is still calling tool 2, and can cancel between them. The dispatch table is the tool executor's existing `execute_tool_calls` — unchanged; the difference is *when* it is called.
+1. *Assistant, before dispatch.* `turn_transaction.commit_assistant_only()` (`agent/core/agent.py:1295`) fires once the assistant message has been added and **before any event is yielded** — see the comment at `agent.py:1291-1293` and the `token_update` yield two lines later. It sets `_assistant_committed` (`agent/core/turn_transaction.py:36`, set at `:98`) without closing the transaction, which leaves room for the tool results to be committed into the same `TurnTransaction`.
+2. *Tool results, after dispatch.* `turn_transaction.commit()` (`agent/core/agent.py:1337`) fires **after** tool execution and **before** the `tool_call` / `tool_result` yields (comment at `agent.py:1334-1335`). Because `_assistant_committed` is set, `commit()` takes the tool-buffer-only branch (`agent/core/turn_transaction.py:116-118`) and does not re-append the assistant message; it raises `RuntimeError('Transaction already committed')` only on a genuine second close (`:114-115`, `:142`).
+
+The streaming path keeps both phases, at both places. On `Done`: the assistant message accumulates from `TextDelta` / `ReasoningDelta` → `commit_assistant_only()` → `token_update` and `turn` are yielded → each `ToolCallComplete` is dispatched synchronously → `commit()` → `tool_call` / `tool_result` are yielded. On `Interrupted`: phase 1 fires with whatever partial assistant message exists, and phase 2 fires for any tool call whose `ToolCallComplete` had already dispatched.
+
+**The uncommitted window stays one statement wide, not one stream wide.** The invariant is unchanged — no event is yielded for data that is not yet in `user_history` — and streaming exercises it *more often* (every delta group is now a yield point) rather than differently. Collapsing the two phases into a single commit at stream close would widen the window to the whole stream and is out of scope for this pass.
+
+**The partial-vs-empty discriminator does not exist yet.** The earlier revision of this document claimed the case was covered by `TurnTransaction.has_assistant_message()`, "which already exists". It is not: that method is `return self._assistant_message is not None` (`agent/core/turn_transaction.py:171-173`) — it tests *presence*, not content. A cancelled turn that emitted only `ReasoningDelta`s, or that added an assistant message with `content: ''`, passes that test and commits an empty message into `user_history`, which is the corruption the paragraph above forbids. Three ways to close it, in order of preference:
+
+- **(i) Recommended — extend `has_assistant_message()`** so it also requires non-empty content (or a non-empty `tool_calls` list), not merely non-`None`. One predicate, one place, and both existing call sites (`agent.py:1294`, and the branch at `turn_transaction.py:116-122`) want the stricter reading.
+- **(ii) Introduce a separate `has_content()`** and leave `has_assistant_message()` as a presence test. Cleaner naming, but two predicates that can disagree, and the streaming path has to remember which one it is asking.
+- **(iii) Reuse the pause-path pattern.** The existing pause path at `agent.py:1257-1266` already refuses to route its grace turn through the accumulated message: it hand-builds a fresh `assistant_msg`, drops `tool_calls` with the comment "Don't include tool_calls — they weren't executed", and commits that through a throwaway `TurnTransaction`. It works, but it is a workaround for the gap rather than a fix, and copying it into the cancellation path gives two hand-built-message sites that must be kept in sync.
+
+Take (i). The pause path may then simplify to a plain `commit_assistant_only()`; this pass does not require that cleanup.
+
+**Tool dispatch fires on `ToolCallComplete`, not on `Done`.** A tool can begin executing while the model is still producing subsequent tool calls: the loop is consuming events, and each `ToolCallComplete` goes straight to the tool executor. The dispatch table is the tool executor's existing `execute_tool_calls` — unchanged; the difference is *when* it is called.
+
+### Not in scope: interrupting a running tool
+
+An earlier revision of this document claimed dispatch-per-`ToolCallComplete` made "interrupt a long tool" usable. It does not, and that claim is withdrawn. Dispatch is synchronous inside the same loop that consumes the stream: while `execute_tool_calls` is running, the loop is not reading events, so there is no event boundary at which a `break` could be observed and no checkpoint at which a stop flag could be read. The cancellation described in §5 is mid-*stream* — between events, which means between pieces of model output, not during a tool's execution.
+
+Interrupting a running tool needs a different architecture, not a different event ordering: the tool runs on a sub-agent or a separate thread, the stream reader keeps consuming while it runs, and results are joined back into the turn. That is a Wave 5-or-later capability and it is explicitly out of scope here. A long-running tool blocks cancellation in the streaming path exactly as it blocks it in the sync path; this pass does not improve that, and the document no longer claims to.
 
 **D1 dissolves explicitly.** The bug (`Respond` + `SummarizeTool` in one batch drops the summary) exists because the sync loop does `if final_detected: return` and the summary branch is unreachable. Under streaming, `Respond` arrives as a `ToolCallComplete` and `SummarizeTool` arrives as a *separate* `ToolCallComplete`. Two candidate mechanisms:
 
@@ -87,11 +108,19 @@ The turn loop's job — apply pending config, assemble request, call model, clas
 
 ## 5. Cancellation
 
-`break` out of the `for event in stream:` loop, then `stream.close()`. The adapter closes the HTTP connection. The provider stops generating. The turn loop's `finally` block (agent/core/agent.py:1465) gains a body:
+`break` out of the `for event in stream:` loop, then `stream.close()`. The adapter closes the HTTP connection. The provider stops generating.
 
-1. Emit `Interrupted { reason: "user" }` as the terminal `StreamEvent` the turn loop sees.
-2. Call `TurnTransaction.commit()` if the transaction has a partial assistant message.
-3. Emit an `agent_responded`-shaped event with `response_type: "interrupted"` — the frontend can render this differently from a normal answer, but the shape is uniform.
+**Two cancellation paths, not one — and the `finally` already in the code is neither of them.** The `finally` at `agent/core/agent.py:1465` is *query*-level: it sits at the same indentation as the `for turn in range(self.config.max_turns)` loop (that loop opens at `agent.py:982`) and its entire body is `self.state.execution_state = ExecutionState.READY` plus a log line. It runs once per `process_query` call, after the turn loop has exited, and it cannot observe a mid-stream cancel because the stream lives inside a turn. Naming it as the cancellation point would be wrong twice over: it fires too late to close the stream, and it cannot tell a cancelled turn from a completed one.
+
+What cancellation actually needs is these two, kept separate:
+
+1. **Between turns — the existing checkpoint, unchanged.** `if self.stop_check and self.stop_check():` at `agent.py:991`, at the top of each turn, transitions to `ExecutionState.PAUSING`. This is the only cancellation that exists today. Streaming does not change it.
+2. **Mid-stream — a new turn-level `finally`.** A `try/finally` *inside* the `for turn in range(self.config.max_turns):` body (`agent.py:982`), wrapping the event-consuming loop, so a `break` out of `for event in stream:` always reaches the close. Its body:
+   - Emit `Interrupted { reason: "user" }` as the terminal `StreamEvent` the turn loop sees.
+   - Call `commit_assistant_only()` if the transaction holds a partial assistant message *with content* (§4's discriminator), and `commit()` for tool results already dispatched.
+   - Emit an `agent_responded`-shaped event with `response_type: "interrupted"` — the frontend can render this differently from a normal answer, but the shape is uniform.
+
+The query-level `finally` at `agent.py:1465` keeps its current body and stays where it is. The two do not merge, and Wave 3 must not move the cancellation body into it.
 
 **What commits on cancel:** the partial assistant message and any tool call/result pairs already committed by `ToolCallComplete` dispatch.
 
@@ -105,20 +134,41 @@ The turn loop's job — apply pending config, assemble request, call model, clas
 
 **Why untouched.** The 80k token window is a cost boundary, not a capability boundary. Every turn re-sends the history, and re-sent tokens — while cheaper than new tokens — are paid for repeatedly. The append-only summary-with-kept-turns form is the shape that survived because every alternative ("prune older than N turns", "prune by token count only") destroyed information irreversibly. The mechanism is not naive; it is the result of a fight. Do not re-open that fight.
 
-**What streaming must not change about pruning.** The call site (`agent.py:1384`, in the compaction exit of Stage 10) is unchanged. The function's inputs (a summary string, a keep-recent count) and outputs (token-recovery events, mutated history) are unchanged. The reading of `session.user_history` and the writing of the summary message are unchanged. **If streaming requires a change here, the design pass stops and asks the operator for a scope ruling.** Do not change pruning in the dark.
+**What streaming must not change about pruning's algorithm.** The function's inputs (a summary string, a keep-recent count) and outputs (token-recovery events, mutated history) are unchanged. The reading of `session.user_history` and the writing of the summary message are unchanged. **If streaming requires a change to the algorithm here, the design pass stops and asks the operator for a scope ruling.** Do not change pruning in the dark.
 
-**One test that pins it.** `tests/test_pruning_orthogonal_to_streaming.py`: run the same summary scenario with the old sync path and with the streaming path; assert `session.user_history` is byte-identical after both. If they differ, streaming changed pruning; that is a stop-the-line signal, not a fix.
+**But the call site moves — one position, and that is the entire change.** `_apply_summary_pruning` is invoked today at `agent.py:1384`, inside the turn body, on the summary branch, immediately after the assistant message joins the transaction. It reads `session.user_history` to compute the append-only insertion index. Under streaming, with yields taking real time, that read can land *mid-stream* — the current turn's assistant message is not yet in `user_history` (commit-before-emit, §4, puts it there only when the stream closes), so the summary would be computed against a history missing the very turn that triggered it. The keep-recent window would be counted one turn short, and the insertion index would be computed against a stale list.
+
+The fix is positional and nothing else: **move the invocation to after the terminal event** — after `Done` (and after `commit()` for the tool results), or after `Interrupted` (and after the partial commit). Same function, same arguments, same algorithm; only the call site moves. Nothing about the summary text, the keep-recent count, or the append-only insertion changes.
+
+**One test that pins it.** `tests/test_pruning_orthogonal_to_streaming.py`: run the same summary scenario with the old sync path and with the streaming path; assert `session.user_history` is byte-identical after both. **And assert explicitly that the summary observes a `user_history` that includes the current turn's assistant message** — that is the property the positional move exists to guarantee, and byte-identical histories alone would still pass if the pruning fired early and happened to derive the same result from a shorter list. If the two paths differ, streaming changed pruning; that is a stop-the-line signal, not a fix.
 
 ## 7. What does not change
 
-Each item below is a *protected shape* — correct as it is, and the pass's job is to name it so it survives the migration.
+Each item below is a *protected shape* — correct as it is, and the pass's job is to name it so it survives the migration. Each entry names the mechanism it actually stands on, not the one the earlier revision of this section asserted.
 
-- **`_apply_summary_pruning`** — cost boundary, append-only summary form. §6 above.
-- **Mailbox pattern** — config-change-per-query. The turn loop applies a pending config at the start of each turn (`agent.py:905`), before any model call. Under streaming this is unchanged: the mailbox is read once, config is applied once, and the streaming turn runs against the resulting config.
-- **`TurnTransaction.commit-before-emit`** — the assistant message goes into `user_history` before any `agent_responded` event, so a consumer that dies mid-turn does not lose a message the model already produced (agent.py:1291-1297). Under streaming this survives: `commit()` fires on `Done`/`Interrupted`, then the terminal event is yielded.
-- **Refusal-as-result** — a permission refusal reaches the model as a text result, not an exception (spec §8.6, `agent/core/tool_executor.py:408/428/526/540`). Under streaming this survives unchanged; the tool executor is not in scope.
-- **`host_bash` grain gate** — reads only `effective_permissions`, never the session mirror (tools/host_bash_tool.py:267-300). The pass does not touch `host_bash_tool.py`.
-- **`_exec_container_raw` substrate split** — container git runs on its own path, not through the host port (host-port.md §7). The pass does not touch this boundary.
+- **`_apply_summary_pruning`** — **materially at risk, from position, not from algorithm.** The append-only summary-with-kept-turns form is correct and untouched; the call site at `agent.py:1384` is not. §6 moves it to after the terminal event. This is one of the two items that can actually break.
+- **Mailbox pattern** — **safe, with a narrowed claim.** `_apply_pending_config()` is called once per *query* (`agent.py:905`), before the turn loop opens; the loop reads `self.config.max_turns` fresh at entry (`agent.py:982`) and does not re-read config between turns. So the mailbox is checked at query boundaries — not turn boundaries, and certainly not mid-stream. Streaming does not weaken the mechanism: a config change still takes effect at the next query. But it multiplies yield points, and every yield is a preemption window in which a caller can enqueue a config update; none of those are observed until the next query. That is correct, and it should be stated so nobody "improves" it by polling the mailbox inside the event loop, where a mid-stream swap would change config under a request already in flight.
+- **Commit-before-emit** — **materially at risk, from ordering, not from mechanism.** It is *two* calls, not one: `commit_assistant_only()` (`agent.py:1295`, before any yield — comment at `agent.py:1291-1293`) and `commit()` (`agent.py:1337`, after dispatch, before the `tool_call` / `tool_result` yields). The earlier revision of this section named neither and never said the words `commit_assistant_only` at all: the scorecard asserted a protection it had not located. Streaming multiplies the yield points this ordering defends, which makes it the place a careless rewrite does the most damage. §4.
+- **Refusal-as-result** — **safe, with a caveat.** A permission refusal reaches the model as a text result, not an exception (spec §8.6, `agent/core/tool_executor.py:408/428/526/540`). The caveat: the loop classifies a result as a refusal by *string* — `result.startswith('❌')`, `'TOOL CALL REJECTED' in result`, `'Error executing tool' in result` (`agent.py:1330-1332`) — against markers the executor itself writes. Prose-based classification is fragile against any change to the refusal wording. Streaming does not touch it and does not make it worse. Safe for this pass; not a mechanism to build on.
+- **`host_bash` grain gate** — safe. Reads only `effective_permissions`, never the session mirror (tools/host_bash_tool.py:267-300). The pass does not touch `host_bash_tool.py`.
+- **`_exec_container_raw` substrate split** — safe. Container git runs on its own path, not through the host port (host-port.md §7). The pass does not touch this boundary.
+
+**Of the six, exactly two are materially at risk:** commit-before-emit (ordering — §4) and the pruning call site (position — §6). The other four are safe, two of them only after the claim about them is narrowed as above.
+
+### Where `user_history` lives: wire dicts, not IR (Option A)
+
+The pass left one question implicit: now that the IR exists, does `session.user_history` hold `CanonicalMessage`s or the wire dicts it holds today? Implicit is not good enough — the two readings give different obligations, so the choice is made here.
+
+**Option A — `user_history` keeps holding wire dicts. This is the decision.** The IR is the request/response boundary only: the turn loop builds `CanonicalMessage`s for the adapter, the adapter converts IR → wire on the way out and wire → IR on the way in, and what lands in `session.user_history` is the same `{'role': ..., 'content': ..., 'tool_calls': [...]}` dicts as today. Consequences, stated so they are not rediscovered in Wave 3:
+
+- **Persistence is unchanged.** `user_history` is read by the bridge, by session serialisation, and by pruning's insertion logic. None of those learn about `ContentBlock`, and no migration of stored sessions is required.
+- **Invariant 3 of §2 narrows.** It is not "the IR carries the signature through persistence"; it is **"the adapter preserves `reasoning_signature` on the wire message"** — the signature lives on the wire dict (today's `reasoning_content` / signature field), and the adapter's job is to round-trip it without dropping it on the tool-call turn. §2's invariant is to be read that way.
+- **No per-turn history conversion.** One conversion at the boundary per request, not an IR ⇄ wire conversion of the whole history on every turn.
+- **What this costs.** The typed guarantees hold only inside the adapter/loop boundary. Anything reading `user_history` directly — pruning, the bridge, tests — still sees wire shape and is not protected by the IR's invariants. Accepted: those readers are not where the vendor quirks live.
+
+**Option B — persist IR — is deferred, not rejected.** It would give the typed guarantees to every reader of history, at the cost of a session-format migration and a conversion on every history read. Wave 3 may revisit it as a separate decision with its own migration plan; this pass does not take it and is not blocked on it.
+
+This is written down because leaving it implicit is what made the earlier §7 readable two ways.
 
 ## 8. Migration order
 
@@ -128,7 +178,7 @@ Each wave is a separate PR, each with its own verification. No wave begins befor
 
 **Wave 2 — IR and OpenAI adapter, flag-gated.** Implement `CanonicalMessage`, `ContentBlock`, `CanonicalToolCall`, `CanonicalToolDefinition` in `agent/core/ir.py`. Implement `OpenAIAdapter.stream_completion(messages, tools, **kwargs) -> AsyncIterator[StreamEvent]` in `llm_providers/openai_compatible.py`. The turn loop still runs the old sync path. A new `Agent(streaming=True)` parameter selects the streaming path for testing; `streaming=False` (default) runs the old path. The new path runs in tests, not in production. **This is the only wave where two paths coexist.**
 
-**Wave 3 — turn loop rewrite against the streaming contract.** `process_query` becomes a `for event in stream:` loop. The `streaming` flag is deleted; one path forward. D1 dissolves via mechanism (a). D2 fixes via `UsageUpdate`. Cancellation lands in the `finally` at `agent.py:1465`. The pruning-pin test lands. **Old sync path deleted in the same wave — no drift window.**
+**Wave 3 — turn loop rewrite against the streaming contract.** `process_query` becomes a `for event in stream:` loop. The `streaming` flag is deleted; one path forward. D1 dissolves via mechanism (a). D2 fixes via `UsageUpdate`. Cancellation lands in the new turn-level `finally` inside the turn loop (§5); the query-level `finally` at `agent.py:1465` is unchanged and keeps only its `execution_state` reset. The `has_assistant_message()` content check (§4) lands here. The pruning call site moves after the terminal event (§6). The pruning-pin test lands. **Old sync path deleted in the same wave — no drift window.**
 
 **Wave 4 — Responses API adapter, capability-gated.** `ResponsesAdapter` in `llm_providers/responses_provider.py`. Capability detection by model name. The turn loop does not change — that is the point of the IR.
 
@@ -150,3 +200,32 @@ If the design pass survives the gate, Wave 2 begins. If it does not, the pass re
 ## Corrections
 
 *This section will be appended to as the pass is read, adversarially or otherwise. Each correction names the carrier — this document, the puppet report, the operator ruling — so that no correction is silent.*
+
+### C1 — Commit ordering was asserted, not located (§4)
+
+Carrier: adversarial review (`.thoughtmachine/working_docs/design-pass-adversarial-read-2026-10-27.md`, Attack 1 and the §7 audit). The v1.1 text named one call (`TurnTransaction.commit()`, `turn_transaction.py:102`) and said it "runs when the stream closes". The mechanism is **two** calls: `commit_assistant_only()` (`agent.py:1295`) before any yield, `commit()` (`agent.py:1337`) after dispatch and before the tool yields. §4 rewritten as two-phase; the uncommitted window is restated as one statement wide, not one stream wide.
+
+### C2 — "Interrupt a long tool" withdrawn (§4)
+
+Carrier: adversarial review, Attack 3. Dispatch is synchronous inside the consuming loop — no break point exists while a tool runs. The claim is removed, a "Not in scope" subsection added naming sub-agent/thread architecture as the prerequisite (Wave 5-or-later), and §5 restated as mid-*stream* cancel, not mid-*tool*.
+
+### C3 — `has_assistant_message()` tests presence, not content (§4)
+
+Carrier: adversarial review, Attack 2. `turn_transaction.py:171-173` is `return self._assistant_message is not None`. The pause path at `agent.py:1257-1266` already hand-builds a separate message because of the gap. v1.2 recommends extending the predicate (option i), with `has_content()` (ii) and the pause-path pattern (iii) named as alternatives.
+
+### C4 — The `finally` at `agent.py:1465` is query-level (§5)
+
+Carrier: adversarial review, Attack 4. The turn loop opens at `agent.py:982`; the `finally` sits outside it and only resets `execution_state`. §5 now names both paths and does not conflate them: the existing `stop_check` (`agent.py:991`) for between-turn cancel, plus a **new** turn-level `finally` inside the loop for mid-stream cancel. §8's Wave 3 line corrected to match.
+
+### C5 — Pruning's call site must move, not merely survive (§6)
+
+Carrier: adversarial review, the §7 audit. `agent.py:1384`. The algorithm is untouched; the **invocation** moves to after the terminal event (`Done` / `Interrupted`). The pruning-pin test gains an assertion that the summary observes a `user_history` including the current turn's assistant message.
+
+### C6 — §7 rewritten against mechanisms; `user_history` storage decided (§2, §7)
+
+Carrier: adversarial review, the §7 audit and its Gaps section. All six entries re-worded against the code, with the two materially at risk named explicitly (commit-before-emit; pruning position) and the other four scoped down (mailbox: query boundaries only, with preemption windows; refusal-as-result: safe but string-classified; `host_bash` gate and `_exec_container_raw` split: safe). §7 gains "Where `user_history` lives": **Option A — `user_history` holds wire dicts; the IR is the request/response boundary only.** Invariant 3 narrows to "the adapter preserves `reasoning_signature` on the wire message." Option B (IR in persistence) deferred to Wave 3 as a separate decision.
+
+### Line numbers verified against source for this pass
+
+`agent/core/agent.py`: 905 (`_apply_pending_config`), 982 (`for turn in range(max_turns)`), 991 (`stop_check`), 1257-1266 (pause grace path), 1294-1295 (`commit_assistant_only`), 1334-1337 (`commit`), 1384 (`_apply_summary_pruning` call), 1465 (query-level `finally`), 1468 (`_apply_summary_pruning` def). `agent/core/turn_transaction.py`: 72 (`commit_assistant_only`), 102-142 (`commit`), 171-173 (`has_assistant_message`).
+
