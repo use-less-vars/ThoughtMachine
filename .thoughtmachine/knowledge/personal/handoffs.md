@@ -741,3 +741,24 @@ You inherit `dev = 392e6b7a` with the tree clean: the auth arc is complete, D1 t
 3. Four Gen 51 entries went into the KB mid-session and five more at close. If you find the close entries missing, the close was interrupted, not skipped.
 
 **The one thing to carry:** verify the claim, not the conclusion. Every PASS this session that turned out wrong was honest. The gates held; what failed was the construction of the check.
+
+## 2026-10-27 — GEN 52 → GEN 53 HANDOFF
+
+You inherit `dev = 45b0ca68` with the tree clean: the core is streaming-only, the canonical IR and the event union are the contract, and the turn loop speaks nothing else. Nothing is in flight.
+
+**Read first:** `MANDATORY_STOP.md`, then `working_agreements.md` (the four Gen 52 entries at the end), then `docs/design-streaming-canonical-ir.md` — §4 *The turn loop under streaming*, §5 *Cancellation*, §7 *What does not change*, and the ruled corrections C1–C20. Then `agent/core/ir.py` and `agent/core/stream_events.py` (the contract), and `process_query` (`agent/core/agent.py:985`), which is the only entry point that matters.
+
+**What closed:** Wave 0, the design pass (`docs/design-streaming-canonical-ir.md`); Wave 2, the canonical IR (`agent/core/ir.py`) and the event union (`agent/core/stream_events.py`); Wave 3, the turn loop on `process_query`, with D1 dissolved by `final_pending` and D2 fixed by putting token accounting on `UsageUpdate`, and the E2E suite moved off its stub onto the real streaming path.
+
+**What was deliberately dropped:** mid-stream cancellation. `should_stop()` returns `'PAUSED'`, not a cancel (`agent/controller/__init__.py:562–563`); the design doc keeps *Not in scope: interrupting a running tool*; checkpoint [1] is still the only interruption point; `should_halt()` is future work. The `streaming` flag is deleted — zero production call sites, so nothing changed behaviour.
+
+**What's queued:** `fix/tool-refusal-structure` first — a tool refusal that reports as success is worse than a crash, because the model acts on it. Then Wave 4 (Responses API / GPT-6) and Wave 5 (system prompt and multimodal).
+
+**Tickets waiting, unfixed:** `ticket-bug-tool-refusal-reported-as-success.md` in `.thoughtmachine/working_docs/`. It is the next branch's input, not a nice-to-have — the branch does not exist yet, so the ticket is the whole spec.
+
+**What I got wrong — the corrections you inherit:**
+1. A stacked PR merged into a base that had already gone, so its commits landed on a branch nobody will merge again while every surface said "Merged". `the-stacked-pr-footgun` is in `working_agreements.md`.
+2. An `AsyncMock` provider that could never end, so the streaming loop ran until the container died at Exit 137 — and CI called it "The operation was canceled", which I read as a flake. `the-mock-oom-loop` is in `working_agreements.md`.
+3. I asked a worker to transcribe a design section and treated the structural errors it found on the way as noise. It was reading; I had asked for copying. `transcription-is-not-transcription` is in `working_agreements.md`. The adversarial reader then retracted three of its own findings in one pass, and the retractions were the useful output — `reader-self-correction`.
+
+**The one thing to carry:** the loop has one contract now. Anything that reaches around `ir.py` and `stream_events.py` is a defect, not a shortcut — and the way you will be told it is fine is a green test whose mock could not have failed.

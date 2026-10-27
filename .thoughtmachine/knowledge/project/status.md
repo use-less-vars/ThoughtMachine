@@ -1,6 +1,6 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-26, Gen 51 close.
+Updated: 2026-10-27, Gen 52 close.
 
 **Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
@@ -38,6 +38,29 @@ after W4 merges." Status line for this wave, verbatim: "Credential
 injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+## Current state — 2026-10-27, Gen 52 close
+
+**Supersedes the 2026-10-26 Gen 51 close (kept below as historical record).**
+
+**dev HEAD:** `45b0ca68` — merge of PR 223 (`fix/e2e-frontend-build-path`); tree clean, nothing in flight.
+
+**The core is streaming-only.** `agent/core/ir.py` and `agent/core/stream_events.py` are the only currency the turn loop speaks; `agent/core/agent.py:39` imports `Done`, `Interrupted`, `ReasoningDelta`, `TextDelta`, `ToolCallComplete`, `UsageUpdate`, and there is no second path.
+
+**Wave 0 — the design pass.** `docs/design-streaming-canonical-ir.md`: nine sections and twenty ruled corrections (C1–C20). §4 *The turn loop under streaming*, §5 *Cancellation* and §7 *What does not change* are the parts that bind the next wave.
+
+**Wave 2 — the canonical IR and the event union.** `agent/core/ir.py` and `agent/core/stream_events.py` landed as the contract; `user_history` stays on the wire as dicts, not IR (§7, Option A).
+
+**Wave 3 — the turn loop.** `process_query` (`agent/core/agent.py:985`) is the single streaming entry point.
+- **D1 dissolved, not patched.** The defect assumed a state the loop had no place to keep; `final_pending` (`agent/core/agent.py:989`) is that place, so the defect is unrepresentable rather than fixed — there is no patch to review.
+- **D2 fixed (`UsageUpdate`).** Token accounting rides the event union (`agent/core/agent.py:1257`) instead of a side channel re-armed each turn.
+- **E2E stub → SSE.** The E2E path exercises the streaming loop; the stub that replaced it was the thing spinning the loop to OOM.
+
+**What was deliberately dropped — mid-stream cancellation.** `should_stop()` returns `'PAUSED'` (`agent/controller/__init__.py:562–563`), not a cancel; the design doc's *Not in scope: interrupting a running tool* (§5) still stands; checkpoint [1] remains the only interruption point; `should_halt()` is future work, not a promise. The `streaming` flag is deleted — it had zero production call sites, so its removal changed no behaviour.
+
+**Classes and patterns earned (this close, `working_agreements.md`):** `the-stacked-pr-footgun`, `the-mock-oom-loop`, `transcription-is-not-transcription`, `reader-self-correction` — all Gen 52.
+
+**What is next:** `fix/tool-refusal-structure` (a tool refusal that reports as success), then Wave 4 (Responses API / GPT-6) and Wave 5 (system prompt and multimodal).
 
 ## Current state — 2026-10-26, Gen 51 close
 
