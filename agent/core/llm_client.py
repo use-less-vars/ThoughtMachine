@@ -3,12 +3,15 @@ LLM client for handling LLM provider interactions.
 
 Extracted from agent.py to separate LLM communication concerns.
 """
+import json
 import os
 import time
 from typing import Optional, List, Dict, Any
 from agent.logging import log
 from llm_providers.factory import ProviderFactory
 from llm_providers.exceptions import ProviderError, RateLimitExceeded, AuthenticationError, ModelNotFoundError, TokenLimitExceededError, ProviderTimeoutError, InvalidConfigError, ProviderNotFoundError, ToolFormatError
+from .ir import CanonicalToolCall
+from .stream_events import Done, ReasoningDelta, TextDelta, ToolCallComplete, UsageUpdate
 
 
 def _coerce_positive_int(value, default):
@@ -30,6 +33,54 @@ def _resolve_timeout_setting(provider_config, key, env_name, default):
     return _coerce_positive_int(provider_config.get(key), default)
 
 
+def _to_canonical_tool_call(tool_call):
+    """Wrap one wire-format tool call (OpenAI shape) in a ``CanonicalToolCall``.
+
+    The wire shape is ``{'id', 'type', 'function': {'name', 'arguments'}}`` with
+    ``arguments`` a JSON string. A string that does not parse as a JSON object
+    yields ``arguments={}`` plus ``parse_error`` (IR invariant 6) rather than a
+    half-parsed dict; the original bytes are kept in ``raw_arguments`` so the
+    tool executor can still attempt a repair.
+    """
+    if isinstance(tool_call, dict):
+        tc_id = tool_call.get('id')
+        function = tool_call.get('function')
+        if isinstance(function, dict):
+            name = function.get('name')
+            raw = function.get('arguments')
+        else:
+            name = tool_call.get('name')
+            raw = tool_call.get('arguments')
+    else:
+        function = getattr(tool_call, 'function', None)
+        tc_id = getattr(tool_call, 'id', None)
+        if function is not None:
+            name = getattr(function, 'name', None)
+            raw = getattr(function, 'arguments', None)
+        else:
+            name = getattr(tool_call, 'name', None)
+            raw = getattr(tool_call, 'arguments', None)
+    arguments = {}
+    raw_arguments = None
+    parse_error = None
+    if isinstance(raw, dict):
+        arguments = raw
+        raw_arguments = json.dumps(raw)
+    elif isinstance(raw, str):
+        raw_arguments = raw
+        if raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                parse_error = f'Invalid JSON in tool call arguments: {exc}'
+            else:
+                if isinstance(parsed, dict):
+                    arguments = parsed
+                else:
+                    parse_error = 'Tool call arguments are not a JSON object'
+    return CanonicalToolCall(id=tc_id or '', name=name or '', arguments=arguments, raw_arguments=raw_arguments, parse_error=parse_error)
+
+
 class LLMError(ProviderError):
     """Generic LLM error for provider-independent error handling."""
 
@@ -42,7 +93,7 @@ class LLMError(ProviderError):
 class LLMClient:
     """Handles LLM provider communication, context building, and system prompts."""
 
-    def __init__(self, config, session=None, logger=None, streaming: bool = False):
+    def __init__(self, config, session=None, logger=None):
         """
         Initialize LLM client.
 
@@ -50,13 +101,10 @@ class LLMClient:
             config: AgentConfig instance.
             session: Optional Session object.
             logger: Optional logger instance.
-            streaming: Whether the caller intends to use the streaming path.
-                Stored only - the sync path is unchanged and still does the work.
         """
         self.config = config
         self.session = session
         self.logger = logger
-        self.streaming = streaming
         pc = dict(getattr(config, 'provider_config', None) or {})
         timeout = _resolve_timeout_setting(pc, 'timeout', 'LLM_TIMEOUT', 120)
         max_retries = _resolve_timeout_setting(pc, 'max_retries', 'LLM_MAX_RETRIES', 3)
@@ -166,21 +214,39 @@ class LLMClient:
         """
         Stream a completion from the provider as provider-neutral events.
 
-        A thin delegate: the events come straight from the provider adapter,
-        which is duck-typed here (anything exposing ``stream_completion``
-        qualifies). Errors are not mapped - a failing stream ends with an
-        ``Interrupted`` event rather than an exception.
+        When the provider exposes ``stream_completion`` its events are delegated
+        straight through (duck-typed; errors are not mapped - a failing stream
+        ends with an ``Interrupted`` event rather than an exception).
 
-        Raises:
-            NotImplementedError: If the provider has no streaming support.
-                Because this is an async generator, that surfaces on first
-                iteration, not at call time.
+        When it does not (e.g. the Anthropic adapter), the same event sequence is
+        SYNTHESISED from one blocking ``chat_completion()`` call so callers have a
+        single code path: ``UsageUpdate`` (only when usage was reported), the
+        ``TextDelta``, then ``ReasoningDelta`` (only when non-empty), then one
+        ``ToolCallComplete`` per tool call, then ``Done``. Streaming support is a
+        provider capability, not a caller-side flag.
         """
         provider = getattr(self, 'provider', None)
-        if provider is None or not hasattr(provider, 'stream_completion'):
-            raise NotImplementedError(f'Provider {type(provider).__name__} does not support stream_completion')
-        async for event in provider.stream_completion(messages=messages, tools=tools, **kwargs):
-            yield event
+        if provider is not None and hasattr(provider, 'stream_completion'):
+            async for event in provider.stream_completion(messages=messages, tools=tools, **kwargs):
+                yield event
+            return
+        # No native streaming: one blocking call, replayed as events. Errors are
+        # mapped by chat_completion() itself (ProviderError -> LLMError), which is
+        # what a native stream's caller has to handle anyway.
+        response = self.chat_completion(messages=messages, tools=tools, **kwargs)
+        usage = getattr(response, 'usage', None)
+        if usage:
+            yield UsageUpdate(input_tokens=usage.get('prompt_tokens', 0) or 0, output_tokens=usage.get('completion_tokens', 0) or 0)
+        content = getattr(response, 'content', None)
+        if content:
+            yield TextDelta(text=content)
+        reasoning = getattr(response, 'reasoning', None)
+        if reasoning:
+            yield ReasoningDelta(text=reasoning)
+        for tool_call in getattr(response, 'tool_calls', None) or []:
+            canonical = _to_canonical_tool_call(tool_call)
+            yield ToolCallComplete(tool_call=canonical, parse_error=canonical.parse_error)
+        yield Done()
 
     def _provider_meta(self, response) -> Dict[str, Any]:
         """Best-effort extraction of provider-specific metadata from a response.

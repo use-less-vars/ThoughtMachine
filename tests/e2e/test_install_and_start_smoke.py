@@ -263,8 +263,24 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
     every later completion returns a plain final message, so a session that
     starts against this stub performs exactly one non-container tool call and
     then terminates the turn deterministically.
+
+    Completions are delivered as **SSE** (``text/event-stream``): the provider
+    adapter always requests ``stream=True`` (llm_providers/openai_compatible.py),
+    so a single ``application/json`` body is not a decodable response and would
+    surface as an interrupted stream instead of a tool call.
+
+    The event stream is framed with ``Transfer-Encoding: chunked`` over
+    ``HTTP/1.1`` (``protocol_version`` below).  That combination is what makes
+    the response well-delimited: an SSE body has no ``Content-Length``, so the
+    reader only knows the stream ended when the chunked body is terminated by
+    the zero-length chunk (``0\r\n\r\n``).  Emitting the events and then simply
+    returning without it leaves the end of the stream implicit in the server
+    closing the socket, and advertising ``Connection: keep-alive`` on such a
+    (``HTTP/1.0``, close-delimited) response would promise the opposite of what
+    the framing provides.
     """
 
+    protocol_version = "HTTP/1.1"
     server_version = "StubLLM/1.0"
 
     def log_message(self, *args):  # noqa: D401 - silence stderr access logs
@@ -277,6 +293,26 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_sse_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def _write_sse(self, payload: dict) -> None:
+        self._write_chunk(b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n")
+
+    def _write_chunk(self, data: bytes) -> None:
+        """Write one HTTP/1.1 chunk and flush it eagerly (SSE wants no buffering)."""
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+        self.wfile.flush()
+
+    def _write_sse_end(self) -> None:
+        """Terminate the chunked body so the client sees a clean end of stream."""
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def do_GET(self):  # noqa: N802 - http.server API
         if self.path.rstrip("/").endswith("/models"):
@@ -302,13 +338,20 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "induced failure for non-vacuity proof"}, status=500)
             return
 
+        chunk_base = {
+            "id": f"chatcmpl-stub-{call_index + 1}",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "stub-model",
+        }
         if call_index == 0:
             arguments = json.dumps({"operation": "current_datetime"})
-            message = {
+            first_delta = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
                     {
+                        "index": 0,
                         "id": "call_stub_1",
                         "type": "function",
                         "function": {"name": _TOOL_NAME, "arguments": arguments},
@@ -317,22 +360,30 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             }
             finish_reason = "tool_calls"
         else:
-            message = {
+            first_delta = {
                 "role": "assistant",
                 "content": "The current date and time has been retrieved.",
             }
             finish_reason = "stop"
 
-        self._send_json(
+        self._send_sse_headers()
+        self._write_sse(
+            {**chunk_base, "choices": [{"index": 0, "delta": first_delta, "finish_reason": None}]}
+        )
+        self._write_sse(
+            {**chunk_base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
+        )
+        # The adapter sends stream_options={'include_usage': True}; answer with a
+        # final empty-choices usage chunk so no provider-shape warning fires.
+        self._write_sse(
             {
-                "id": f"chatcmpl-stub-{call_index + 1}",
-                "object": "chat.completion",
-                "created": 0,
-                "model": "stub-model",
-                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                **chunk_base,
+                "choices": [],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             }
         )
+        self._write_chunk(b"data: [DONE]\n\n")
+        self._write_sse_end()
 
 
 class _StubLLM:

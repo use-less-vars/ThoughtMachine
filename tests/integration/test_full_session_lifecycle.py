@@ -137,7 +137,7 @@ class TestFullSessionLifecycle:
             config=AgentConfig(mode="custom", api_key="test-key", enable_logging=False),
             session_id=session_id,
         )
-        agent.llm_client.chat_completion = puppet.chat_completion
+        agent.llm_client.stream_completion = puppet.stream_completion
 
         events = list(agent.process_query("Read test.txt"))
         assert len(events) > 0
@@ -169,7 +169,7 @@ class TestFullSessionLifecycle:
             config=AgentConfig(mode="custom", api_key="test-key", enable_logging=False),
             session_id=session_id,
         )
-        agent2.llm_client.chat_completion = puppet2.chat_completion
+        agent2.llm_client.stream_completion = puppet2.stream_completion
 
         events2 = list(agent2.process_query("Confirm reconfiguration"))
         assert len(events2) > 0

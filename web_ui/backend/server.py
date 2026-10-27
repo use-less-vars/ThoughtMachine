@@ -1178,7 +1178,12 @@ else:
     # Normal Python: project root (parent of web_ui/)
     _BUNDLE_DIR = Path(__file__).resolve().parent.parent.parent
 
-_FRONTEND_DIST_DEV = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+# NOTE: deliberately ``absolute()`` and not ``resolve()``.  ``absolute()`` does
+# not follow symlinks, so when this module is imported through a symlinked
+# directory (e.g. the e2e installer smoke test's scratch mirror, which symlinks
+# web_ui/backend back into the real repo) the frontend tree is located next to
+# the *invoked* file rather than next to the symlink target.
+_FRONTEND_DIST_DEV = Path(__file__).absolute().parent.parent / "frontend" / "dist"
 _FRONTEND_DIST_BUNDLE = _BUNDLE_DIR / "frontend_dist"
 
 # Pick the first one that exists
@@ -6058,7 +6063,7 @@ def _session_has_conversation(session) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_frontend() -> bool:
-    """Run `npm run build` in the frontend directory.
+    """Run the frontend build (local vite binary when present, else npm).
 
     Returns True if the build succeeded, False otherwise.
     """
@@ -6068,14 +6073,29 @@ def _build_frontend() -> bool:
         return False
 
     log('INFO', 'server', f'Building frontend in {frontend_dir}...')
-    npm_cmd = os.environ.get('TM_NPM_CMD') or 'npm'
+    node_bin_dir = frontend_dir / "node_modules" / ".bin"
+    vite_bin = node_bin_dir / "vite"
+    # Prepend node_modules/.bin so that npm scripts (``sh -c vite``) and any
+    # transitively spawned binaries resolve the project-local executables.
+    build_env = os.environ.copy()
+    build_env["PATH"] = str(node_bin_dir) + os.pathsep + build_env.get("PATH", "")
+    if vite_bin.exists() and os.access(str(vite_bin), os.X_OK):
+        # Invoke the project-local vite binary by absolute path, mirroring
+        # start_thoughtmachine.sh: neither npm nor a PATH lookup is needed.
+        cmd = [str(vite_bin), "build"]
+        log('INFO', 'server', f'Using local vite binary at {vite_bin}')
+    else:
+        npm_cmd = os.environ.get('TM_NPM_CMD') or 'npm'
+        cmd = [npm_cmd, "run", "build"]
+        log('INFO', 'server', f'Using npm build ({npm_cmd} run build)')
     try:
         result = subprocess.run(
-            [npm_cmd, "run", "build"],
+            cmd,
             cwd=str(frontend_dir),
             capture_output=True,
             text=True,
             timeout=120,
+            env=build_env,
         )
         if result.returncode != 0:
             log('ERROR', 'server', f'Frontend build failed:\n{result.stderr}')
@@ -6105,7 +6125,22 @@ def _setup_frontend_serving() -> bool:
     # Always rebuild to prevent stale dist/ from serving old code
     # Vite/Rollup use incremental caching, so subsequent builds are fast.
     dist = _FRONTEND_DIST
-    if not _build_frontend():
+    frontend_dir = dist.parent
+    node_bin_dir = frontend_dir / "node_modules" / ".bin"
+    has_deps = (node_bin_dir / "vite").exists() or node_bin_dir.is_dir()
+    has_dist = (dist / "index.html").exists()
+
+    if os.environ.get("TM_SKIP_FRONTEND_BUILD") == "1":
+        # Explicit kill-switch: never rebuild, serve whatever dist is present.
+        log('INFO', 'server',
+            f'TM_SKIP_FRONTEND_BUILD=1 — skipping frontend rebuild (dist={dist})')
+    elif not has_deps and has_dist:
+        # Dependencies were never installed, but a valid dist already exists:
+        # serve it instead of degrading to the build-error page.
+        log('WARNING', 'server',
+            f'Frontend dependencies not installed in {frontend_dir} — skipping '
+            f'rebuild and serving existing dist at {dist}')
+    elif not _build_frontend():
         log('WARNING', 'server',
             'Frontend build failed — will show build-error page on /')
         return False

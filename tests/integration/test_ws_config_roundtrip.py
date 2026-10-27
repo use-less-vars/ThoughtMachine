@@ -254,7 +254,7 @@ class TestConfigRoundTrip:
             config=AgentConfig(mode="custom", api_key="test-key", enable_logging=False),
             session_id="test-session",
         )
-        agent.llm_client.chat_completion = puppet.chat_completion
+        agent.llm_client.stream_completion = puppet.stream_completion
 
         events = list(agent.process_query("Hello"))
 
