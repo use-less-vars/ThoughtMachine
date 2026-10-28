@@ -114,8 +114,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   // a delta-only message must never be persisted to the store. It is built from
   // coalesced `assistant_delta` events and reconciled (replaced) by the terminal
   // `conversation_changed` for the same turn.
-  const [inFlight, setInFlight] = useState(null) // null | { content }
-  const streamBufferRef = useRef('')  // text received since the last flush
+  const [inFlight, setInFlight] = useState(null) // null | { content, reasoning_content }
+  // Chunks received since the last flush, keyed by the field they land in, so
+  // thinking and answer text coalesce independently and never interleave.
+  const streamBufferRef = useRef({ content: '', reasoning_content: '' })
   const streamFrameRef = useRef(null)  // pending rAF/timeout handle
   // Cancel a pending coalescing frame on unmount (no setState after unmount).
   useEffect(() => () => {
@@ -149,8 +151,20 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   // assistant bubble. Kept out of `history` because the store may not hold a
   // delta-only message and because `history.length` is the pagination offset.
   const viewMessages = useMemo(() => {
-    if (!inFlight || !inFlight.content) return history
-    return [...history, { role: 'assistant', content: inFlight.content }]
+    if (!inFlight) return history
+    const content = inFlight.content || ''
+    const reasoningContent = inFlight.reasoning_content || ''
+    // Reasoning-only: a model can think for many frames before the first token
+    // of answer text, and that phase must be visible too.
+    if (!content && !reasoningContent) return history
+    return [...history, {
+      role: 'assistant',
+      content,
+      reasoning_content: reasoningContent,
+      // Drives the cheap plain-text render path in MessageBubble (no Markdown
+      // re-parse per frame). The reconciled/persisted message has no such flag.
+      is_streaming: true,
+    }]
   }, [history, inFlight])
   const status = sessionState?.state ?? 'IDLE'
   const isRunning = sessionState?.isRunning ?? false
@@ -515,21 +529,26 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       else clearTimeout(streamFrameRef.current)
       streamFrameRef.current = null
     }
-    streamBufferRef.current = ''
+    streamBufferRef.current = { content: '', reasoning_content: '' }
     setInFlight(null)
   }
 
   const flushDeltas = () => {
     streamFrameRef.current = null
     const pending = streamBufferRef.current
-    streamBufferRef.current = ''
-    if (!pending) return
-    setInFlight((prev) => ({ content: ((prev && prev.content) || '') + pending }))
+    streamBufferRef.current = { content: '', reasoning_content: '' }
+    if (!pending.content && !pending.reasoning_content) return
+    setInFlight((prev) => ({
+      content: ((prev && prev.content) || '') + pending.content,
+      reasoning_content: ((prev && prev.reasoning_content) || '') + pending.reasoning_content,
+    }))
   }
 
-  const pushDelta = (text) => {
+  // `target` names the in-flight field to append to: 'content' for assistant
+  // text, 'reasoning_content' for the thinking phase.
+  const pushDelta = (target, text) => {
     if (!text) return
-    streamBufferRef.current += text
+    streamBufferRef.current[target] = (streamBufferRef.current[target] || '') + text
     if (streamFrameRef.current != null) return
     if (typeof requestAnimationFrame === 'function') streamFrameRef.current = requestAnimationFrame(flushDeltas)
     else streamFrameRef.current = setTimeout(flushDeltas, 16)
@@ -597,7 +616,19 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         }
         // Append to the in-flight bubble (coalesced per frame). Never a store
         // write, and never a list replace.
-        pushDelta(msg.text || '')
+        pushDelta('content', msg.text || '')
+        break
+      }
+
+      case 'reasoning_delta': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] reasoning_delta for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Thinking phase: same per-frame coalescing as assistant text, but into
+        // the reasoning buffer so it renders in the bubble's Thinking block and
+        // never mixes with the answer.
+        pushDelta('reasoning_content', msg.text || '')
         break
       }
 

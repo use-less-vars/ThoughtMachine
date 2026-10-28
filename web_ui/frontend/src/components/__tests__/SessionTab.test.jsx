@@ -974,3 +974,118 @@ describe('SessionTab — assistant_delta streaming', () => {
   });
 });
 
+// ────────────────────────────────────────────────────────────────────────────
+// feat/reasoning-streaming — `reasoning_delta` → in-flight THINKING block.
+//
+// Before this, the thinking phase only reached the UI at turn end (inside the
+// terminal `conversation_changed`), so the bubble looked frozen while the model
+// reasoned. The tab now appends `reasoning_delta` chunks to the SAME per-frame
+// coalesced in-flight buffer as `assistant_delta`, but under a separate key, so
+// thinking never leaks into the answer body. It also had to stop bailing out of
+// the in-flight bubble when only reasoning had arrived (see the second test).
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — reasoning_delta streaming', () => {
+  it('renders reasoning_delta into the thinking block, never into the answer body', async () => {
+    renderTab({ sessionId: 'sess-reason' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason',
+        messages: [{ role: 'user', content: 'think-prompt' }],
+      })
+    );
+    expect(await screen.findByText('think-prompt')).toBeInTheDocument();
+
+    // Two chunks of the SAME turn coalesce into one in-flight reasoning buffer.
+    act(() => ws.receive({ type: 'reasoning_delta', session_id: 'sess-reason', text: 'ponder', turn: 1 }));
+    act(() => ws.receive({ type: 'reasoning_delta', session_id: 'sess-reason', text: 'ing', turn: 1 }));
+
+    // Coalescing is per animation frame (with a 16ms setTimeout fallback), so poll.
+    expect(await screen.findByText('pondering')).toBeInTheDocument();
+
+    // It lands in the Thinking block...
+    const block = document.querySelector('.reasoning-block');
+    expect(block).not.toBeNull();
+    expect(block.textContent).toContain('Thinking');
+    expect(block.textContent).toContain('pondering');
+
+    // ...and NOT in the assistant answer body.
+    const answer = document.querySelector('.assistant-markdown');
+    expect(answer).not.toBeNull();
+    expect(answer.textContent).toBe('');
+  });
+
+  it('shows an in-flight bubble for a reasoning-only stream (before any text arrives)', async () => {
+    // Regression guard: the old viewMessages guard was
+    //   if (!inFlight || !inFlight.content) return history
+    // so a reasoning-only stream (content === '') was structurally invisible —
+    // the bubble never appeared until the first assistant_delta chunk.
+    renderTab({ sessionId: 'sess-reason-only' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason-only',
+        messages: [{ role: 'user', content: 'reason-only-prompt' }],
+      })
+    );
+    expect(await screen.findByText('reason-only-prompt')).toBeInTheDocument();
+
+    // ONLY reasoning frames — no assistant_delta has been sent at this point.
+    act(() =>
+      ws.receive({
+        type: 'reasoning_delta',
+        session_id: 'sess-reason-only',
+        text: 'reasoning-only-marker',
+        turn: 1,
+      })
+    );
+
+    expect(await screen.findByText('reasoning-only-marker')).toBeInTheDocument();
+    // The bubble itself exists (not just the text inside some hidden node).
+    expect(document.querySelector('.reasoning-block')).not.toBeNull();
+  });
+
+  it('reconciles streamed reasoning with the terminal turn (each text rendered exactly once)', async () => {
+    renderTab({ sessionId: 'sess-reason-final' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason-final',
+        messages: [{ role: 'user', content: 'reconcile-prompt' }],
+      })
+    );
+    expect(await screen.findByText('reconcile-prompt')).toBeInTheDocument();
+
+    act(() => ws.receive({ type: 'reasoning_delta', session_id: 'sess-reason-final', text: 'ponder', turn: 1 }));
+    expect(await screen.findByText('ponder')).toBeInTheDocument();
+
+    // The terminal turn arrives as a conversation_changed replace whose
+    // persisted message carries BOTH the answer and the reasoning.
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason-final',
+        messages: [
+          { role: 'user', content: 'reconcile-prompt' },
+          { role: 'assistant', content: 'Done', reasoning_content: 'ponder' },
+        ],
+      })
+    );
+    expect(await screen.findByText('Done')).toBeInTheDocument();
+
+    // Exactly one copy of each — the in-flight bubble was folded away, not joined.
+    const bodyText = document.body.textContent || '';
+    expect((bodyText.match(/ponder/g) || [])).toHaveLength(1);
+    expect((bodyText.match(/Done/g) || [])).toHaveLength(1);
+    expect(bodyText).not.toContain('ponderponder');
+
+    // The reconciled message is no longer streaming, so the markdown path is
+    // back in charge (no plain pre-wrapped text node left behind).
+    expect(document.querySelector('.assistant-markdown [style*="pre-wrap"]')).toBeNull();
+    expect(document.querySelector('.reasoning-content [style*="pre-wrap"]')).toBeNull();
+  });
+});
+

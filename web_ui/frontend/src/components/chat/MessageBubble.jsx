@@ -120,8 +120,17 @@ function ToolCallContent({ content }) {
   )
 }
 
-/* ── Assistant message with optional reasoning block ── */
+/* ── Assistant message with optional reasoning block ──
+ *
+ * Streaming fast path: while a message is still being received (msg.is_streaming)
+ * its text changes on every animation frame, and ReactMarkdown re-parses +
+ * re-renders the whole document each time — that is the dominant cost of a live
+ * turn. So during streaming we render plain pre-wrapped text and only switch to
+ * ReactMarkdown once the message is final (markdown formatting of a half-written
+ * document is wrong anyway: an unterminated ** or ``` flickers between states).
+ */
 function AssistantContent({ msg }) {
+  const isStreaming = msg.is_streaming === true
   return (
     <>
       {msg.reasoning_content && (
@@ -131,16 +140,24 @@ function AssistantContent({ msg }) {
             <CopyButton text={msg.reasoning_content} label="📋" />
           </summary>
           <div className="reasoning-content">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {msg.reasoning_content}
-            </ReactMarkdown>
+            {isStreaming ? (
+              <div style={{ whiteSpace: 'pre-wrap' }}>{msg.reasoning_content}</div>
+            ) : (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {msg.reasoning_content}
+              </ReactMarkdown>
+            )}
           </div>
         </details>
       )}
       <div className="assistant-markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-          {msg.content}
-        </ReactMarkdown>
+        {isStreaming ? (
+          <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
+        ) : (
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {msg.content}
+          </ReactMarkdown>
+        )}
       </div>
     </>
   )
@@ -214,7 +231,8 @@ const MessageBubble = React.memo(
     prev.msg.is_system_notification === next.msg.is_system_notification &&
     prev.msg.is_final === next.msg.is_final &&
     prev.msg.is_summary === next.msg.is_summary &&
-    prev.msg.response_type === next.msg.response_type
+    prev.msg.response_type === next.msg.response_type &&
+    prev.msg.is_streaming === next.msg.is_streaming
 )
 
 export { MessageBubble, MessageContent, CopyButton }
