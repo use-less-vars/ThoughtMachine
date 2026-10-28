@@ -1505,8 +1505,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         await ws.send_json({"type": "status_message", "text": "▶ Resumed."})
 
                 elif command == "stop_session":
+                    # Stop button: truncate the running turn only — the bridge
+                    # thread and the session survive (close_session is what
+                    # tears the bridge down).
                     if bridge is not None:
-                        bridge.stop()
+                        # request_stop()'s return value is deliberately NOT used
+                        # for the ack: acknowledging an IDLE stop with 'Stopped.'
+                        # is a pinned contract (test_state_transitions.py::
+                        # test_ws_stop_session_status_only).
+                        bridge.request_stop()
                         await ws.send_json({"type": "status_message", "text": "⏹ Stopped."})
 
                 elif command == "get_config":

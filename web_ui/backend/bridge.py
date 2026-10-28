@@ -1784,8 +1784,50 @@ class WebAgentBridge:
                             else:
                                 log('INFO', 'server.bridge', f'Worker resumed: {wname}')
 
+    def request_stop(self) -> bool:
+        """Truncate the CURRENT TURN and keep the bridge thread and session alive.
+
+        This is the Stop-button path. It is deliberately narrow: it asks the
+        controller for a turn-level halt (the agent breaks out of the stream,
+        commits the partial assistant text it had already produced and emits its
+        'interrupted' terminal), and touches nothing else — no teardown, no
+        '[STOP]', no thread join, no unregistration, no queued-config drop.
+
+        Contrast with :meth:`stop`, which is TEARDOWN: it shuts the controller
+        down (and, on the legacy no-controller path, ends the bridge loop). Use
+        ``close_session``/``stop()`` to end the session; use this to end a turn.
+
+        Returns True when a turn was in flight (``controller.is_busy`` as sampled
+        BEFORE the halt, since the halt itself clears that flag), so a caller can
+        distinguish "a turn was halted" from "nothing was running".
+        """
+        if self._controller is not None:
+            busy = bool(getattr(self._controller, 'is_busy', False))
+            log('INFO', 'server.bridge',
+                f'request_stop(): turn-level halt requested (busy={busy}, '
+                'session retained)')
+            request_halt = getattr(self._controller, 'request_halt', None)
+            if not callable(request_halt):
+                log('WARNING', 'server.bridge',
+                    'request_stop(): controller has no request_halt(); '
+                    'turn-level stop is unavailable on this build — nothing halted')
+                return False
+            request_halt()
+            return busy
+        # Legacy no-controller path: the loop drives self._agent directly and no
+        # halt_check is wired into it, so there is no turn-level lever to pull.
+        # The only way to stop the running turn here is to end the loop, hence
+        # the fallback to the old teardown signal.
+        log('WARNING', 'server.bridge',
+            'request_stop(): no controller on this bridge path; turn-level stop '
+            'is unavailable — falling back to full teardown (_stop_event set, '
+            'bridge loop exits)')
+        self._stop_event.set()
+        self._pause_event.set()  # unblock if paused
+        return True
+
     def stop(self) -> None:
-        """Request the agent to stop (finishes current operation then exits)."""
+        """Tear the bridge down: stop the controller and end the bridge loop."""
         # Drop any queued config — the bridge is being torn down and the
         # caller (close_session / server close path) owns the lifecycle now.
         self._pending_config = None
@@ -3035,6 +3077,22 @@ class WebAgentBridge:
                 "turn": raw_event.get("turn"),
             })
 
+        elif event_type == "interrupted":
+            # A hard stop truncated the stream. The agent already committed the
+            # partial assistant text to the session (so the version sync above
+            # has shipped it in a conversation_changed), and this event tells
+            # the frontend to FOLD the in-flight bubble into the transcript
+            # rather than wait for a turn event that will never arrive.
+            # Same broadcast helper and payload shape as assistant_delta so
+            # routing cannot drift; this is not a second stop terminal - the
+            # controller still emits session_stop from the threaded stop_reason.
+            self._forwarder.broadcast(self._session_id, "interrupted", {
+                "session_id": self._session_id,
+                "text": raw_event.get("content", "") or "",
+                "stop_reason": raw_event.get("stop_reason", "interrupted"),
+                "turn": raw_event.get("turn"),
+            })
+
         elif event_type in ("user_query", "turn", "tool_result"):
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:
@@ -3140,6 +3198,11 @@ class WebAgentBridge:
 
                 # Process the query
                 self._processing = True
+                # A halt terminates the turn with stop_reason 'interrupted'; the
+                # synthetic bridge terminal below must not mislabel that as a
+                # clean completion, so the turn's own reason is carried out of
+                # the loop and preferred over the 'completed' default.
+                turn_stop_reason = None
                 try:
                     for raw_event in self._agent.process_query(query):
                         if self._stop_event.is_set():
@@ -3162,6 +3225,7 @@ class WebAgentBridge:
 
                         # If the agent yielded a stop_reason, break
                         if raw_event.get("stop_reason"):
+                            turn_stop_reason = raw_event.get("stop_reason")
                             break
                 except Exception as exc:
                     traceback.print_exc()
@@ -3174,7 +3238,7 @@ class WebAgentBridge:
                     self._processing = False
                     self._map_and_emit({
                         "type": "session_stop",
-                        "stop_reason": "completed",
+                        "stop_reason": turn_stop_reason or "completed",
                     })
         except Exception as exc:
             traceback.print_exc()

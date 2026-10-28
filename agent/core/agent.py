@@ -289,6 +289,10 @@ class Agent:
         if self.context_builder:
             self.conversation_manager.context_builder = self.context_builder
         self.stop_check = config.stop_check
+        # Hard stop (halt) is deliberately SEPARATE from stop_check: stop_check
+        # returns 'PAUSED' at a checkpoint and lets the turn finish cleanly,
+        # whereas a halt is terminal and must truncate the running stream.
+        self.halt_check = getattr(config, 'halt_check', None)
         self._next_query_queue = queue.Queue()
         self._paused = False
         self._should_reset = False
@@ -306,6 +310,25 @@ class Agent:
         # Mailbox pattern: pending config update to be applied at next process_query()
         self._pending_config: Optional[AgentConfig] = None
         self._last_config_error: Optional[str] = None
+
+    def should_halt(self) -> bool:
+        """
+        Return True when a HARD stop has been requested.
+
+        Distinct from stop_check, which is a cooperative checkpoint that
+        returns 'PAUSED' and lets the current turn complete. A halt is
+        terminal: the stream is truncated and the partial answer is kept.
+
+        Returns:
+            bool: True if the configured halt_check callable is set and truthy.
+        """
+        if not callable(self.halt_check):
+            return False
+        try:
+            return bool(self.halt_check())
+        except Exception as e:
+            log('WARNING', 'core.agent', f'halt_check raised, treating as no halt: {e}')
+            return False
 
     def request_config_update(self, new_config: AgentConfig):
         """
@@ -1239,14 +1262,28 @@ class Agent:
                     input_tokens = 0
                     output_tokens = 0
                     final_pending = False
+                    halted = False
                     stream_agen = self.llm_client.stream_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
                     for stream_event in _iter_stream_events(stream_agen):
-                        # NO in-stream stop interception. A hard stop is handled by
-                        # PAUSE CHECKPOINT [1] (turn_start) exactly as it was before
-                        # streaming: the turn finishes and the next checkpoint emits
-                        # the 'stopped' lifecycle event. Breaking out mid-stream here
-                        # would skip that producer, invent a second stop terminal, and
-                        # could act on a partially received tool call.
+                        # In-stream HARD STOP interception. A cooperative pause is
+                        # still handled only by PAUSE CHECKPOINT [1] (turn_start),
+                        # which returns 'PAUSED' and lets the turn finish; a hard
+                        # stop is different and must truncate the answer, so it is
+                        # tested here at the top of every iteration.
+                        #
+                        # This reuses the SAME stop_reason terminal shape as the
+                        # checkpoint path (the controller already converts
+                        # stop_reason into session_stop), so the 'interrupted'
+                        # event below is a report of partial content, not a second
+                        # stop producer.
+                        #
+                        # A partially received tool call is safe to discard: tool
+                        # execution happens AFTER this loop, so breaking here can
+                        # never act on a half-parsed call.
+                        if self.should_halt():
+                            log('DEBUG', 'core.pause', f'[HALT] hard stop requested mid-stream (turn={turn})')
+                            halted = True
+                            break
                         if isinstance(stream_event, TextDelta):
                             content += stream_event.text or ''
                             yield {'type': 'text_delta', 'text': stream_event.text, 'turn': self._display_turn}
@@ -1298,6 +1335,37 @@ class Agent:
                             raise _exception_for_interrupted(stream_event.reason or '')
                         # ToolCallStart / ToolCallArgumentsDelta are progress signals
                         # only (no UI event).
+                    if halted:
+                        # Persist the partial answer so the truncated text is not
+                        # lost with the discarded stream. Mirror the normal commit
+                        # path exactly, but gate on has_assistant_message() so an
+                        # empty halt (stopped before any delta) leaves history
+                        # untouched instead of pushing a blank assistant message.
+                        halt_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+                        halt_msg = {'role': 'assistant', 'content': content}
+                        if reasoning is not None:
+                            halt_msg['reasoning_content'] = reasoning
+                        halt_tx.add_assistant_message(halt_msg)
+                        if halt_tx.has_assistant_message():
+                            halt_tx.commit_assistant_only()
+                        else:
+                            halt_tx.rollback()
+                        self.total_input_tokens += input_tokens
+                        self.total_output_tokens += output_tokens
+                        interrupted_event = {
+                            'type': 'interrupted',
+                            'stop_reason': 'interrupted',
+                            'content': content,
+                            'turn': self._display_turn,
+                            'context_length': self.state.current_conversation_tokens,
+                            'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens},
+                        }
+                        if reasoning is not None:
+                            interrupted_event['reasoning'] = reasoning
+                        self._add_conversation_data_to_event(interrupted_event)
+                        log('DEBUG', 'core.pause', f'[HALT] committed partial assistant message (chars={len(content)})')
+                        yield interrupted_event
+                        return
                     llm_duration_ms = (time.time() - llm_start_time) * 1000
                     log('DEBUG', 'core.pause', f'LLM CALL END (duration_ms={llm_duration_ms:.0f})')
                     if self.logger:

@@ -33,6 +33,9 @@ class AgentController:
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self.pause_event.set()
+        # Hard stop: unlike stop()/shutdown(), this only truncates the running
+        # turn. It is checked by the agent mid-stream via halt_check.
+        self.halt_event = threading.Event()
         self.thread = None
         self._running = False
         self._agent_override = None
@@ -83,6 +86,7 @@ class AgentController:
             except queue.Empty:
                 break
         self.stop_event.clear()
+        self.halt_event.clear()
         self.pause_event.set()
         self.thread = None
         self._running = False
@@ -189,6 +193,7 @@ class AgentController:
         if self.agent is None:
             # ── Scenario 1: No agent — start fresh thread ──
             self.stop_event.clear()
+            self.halt_event.clear()
             self.pause_event.set()
             self._keep_alive = True
             self._pause_requested = False
@@ -228,6 +233,7 @@ class AgentController:
             self.thread = None
             self.agent = None
             self.stop_event.clear()
+            self.halt_event.clear()
             self.pause_event.set()
             self._keep_alive = True
             self._pause_requested = False
@@ -267,6 +273,7 @@ class AgentController:
                 return
             raise RuntimeError('Agent is already running. Stop it first.')
         self.stop_event.clear()
+        self.halt_event.clear()
         self.pause_event.set()
         self._keep_alive = True
         self._pause_requested = False
@@ -325,6 +332,18 @@ class AgentController:
         """Request the agent to stop completely (shuts down the thread)."""
         log('DEBUG', 'core.controller', 'stop() called - delegating to shutdown()')
         self.shutdown()
+
+    def request_halt(self):
+        """
+        Request a HARD stop of the currently running turn only.
+
+        Unlike stop(), this does not shut the controller down: it sets the
+        halt flag the agent polls mid-stream, so the running turn is
+        truncated and its partial content is committed. The thread, session
+        and conversation survive for the next query.
+        """
+        log('DEBUG', 'core.controller', 'request_halt() called - truncating current turn only')
+        self.halt_event.set()
 
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
@@ -553,6 +572,11 @@ class AgentController:
         if hasattr(self, 'agent') and self.agent is not None:
             log('DEBUG', 'core.controller', f"[CONTROLLER _run] entering with self.agent={id(self.agent)}, agent.conversation len={len(self.agent.conversation)}, first roles={[m.get('role') for m in self.agent.conversation[:3]]}")
 
+        def should_halt():
+            # Hard stop: terminal for the current turn, but the controller
+            # thread keeps running.
+            return self.halt_event.is_set()
+
         def should_stop():
             log('DEBUG', 'core.pause', f'stop_check called, pause_event.is_set()={self.pause_event.is_set()}')
             if self.stop_event.is_set():
@@ -570,6 +594,7 @@ class AgentController:
             if hasattr(self, '_agent_override') and self._agent_override is not None:
                 agent = self._agent_override
                 agent.config.stop_check = should_stop
+                agent.halt_check = should_halt
                 if hasattr(self, '_session') and self._session is not None:
                     agent.session = self._session
                     agent.conversation = self._session.user_history
@@ -592,6 +617,7 @@ class AgentController:
                         run_config.api_key = api_key_val
                         log('INFO', 'core.controller', f"[CONTROLLER] Filled missing api_key from env var")
                 agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
+                agent.halt_check = should_halt
                 self.agent = agent
             # Propagate agent's session_id so events carry it (needed for Web UI bridge)
             if self.agent and not self.current_session_id:
@@ -635,6 +661,7 @@ class AgentController:
                                 run_config = self._pending_config
                                 run_config.stop_check = should_stop
                                 new_agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
+                                new_agent.halt_check = should_halt
                                 self.agent = new_agent
                                 self._running = True
                                 self._agent_creation_failed = False
@@ -720,6 +747,9 @@ class AgentController:
                     traceback.print_exc()
                     stop_reason = 'error'
                 finally:
+                    # A halt is scoped to the turn that was running; clear it so
+                    # the next query is not truncated immediately.
+                    self.halt_event.clear()
                     self._processing_query = False
                     # Reset agent's internal execution state to READY so the next query
                     # triggers a proper ready→running transition.
