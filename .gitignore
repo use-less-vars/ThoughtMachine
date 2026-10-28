@@ -268,3 +268,11 @@ web_ui/frontend/.npmrc
 # so `git clean -xdf` would have destroyed them.
 !docs/agent-core-spec.md
 !docs/provider-compat-findings-2026-10-26.md
+
+# Gen 52 design pass (2026-10-28): the concurrency/affinity design doc and the
+# two task briefs written from the running machine. Public tier — the operator
+# asked for them saved under docs/. `docs/*` is a catch-all, so each needs its
+# own negation line; the directory negation lets git descend into docs/briefs/.
+!docs/design-concurrency-and-affinity.md
+!docs/briefs/
+!docs/briefs/**
