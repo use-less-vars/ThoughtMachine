@@ -445,9 +445,9 @@ class OpenAICompatibleProvider(LLMProvider):
         """Return the async SDK client, creating it on first use.
 
         ``__init__`` is deliberately left untouched: a provider that never
-        streams should not pay for a second HTTP client. NOTE: nothing closes
-        this client yet - it lives as long as the provider object and is
-        reclaimed with it.
+        streams should not pay for a second HTTP client. This client is closed
+        by :meth:`aclose` - which must be driven by the loop that owns it, see
+        ``agent.core.agent._close_stream_resources``.
         """
         if getattr(self, '_async_client', None) is None:
             client_kwargs = {'api_key': reveal_secret(self.config.api_key), 'timeout': self.config.timeout, 'max_retries': self.config.max_retries}
@@ -458,6 +458,46 @@ class OpenAICompatibleProvider(LLMProvider):
             self._async_client = AsyncOpenAI(**client_kwargs)
             log('DEBUG', 'llm.openai', f"async client created with base_url={(self._async_client.base_url if hasattr(self._async_client, 'base_url') else 'default')}")
         return self._async_client
+
+    async def aclose(self) -> None:
+        """Close the async SDK client on the loop that owns it.
+
+        ``AsyncOpenAI`` holds an ``httpx.AsyncClient`` whose connection pool is
+        bound to the loop it was first used on, so it can only be closed *by*
+        that loop: awaiting this from another loop - or from a thread with no
+        loop - does not release the transport and can raise. The caller that
+        owns the loop drives this coroutine with ``run_until_complete()`` and
+        only then closes the loop; see ``agent.core.agent._close_stream_resources``.
+
+        The reference is dropped before awaiting, so a later turn rebuilds a
+        client bound to whatever loop it runs on instead of reusing one whose
+        pool is attached to a loop that no longer exists. Never raises.
+        """
+        client = getattr(self, '_async_client', None)
+        self._async_client = None
+        if client is None:
+            return
+        try:
+            await client.close()
+        except Exception as exc:
+            log('WARNING', 'llm.openai', f'Closing async client failed: {exc}')
+
+    def close(self) -> None:
+        """Release the synchronous SDK client; the async one needs ``aclose``.
+
+        Safe from any thread: ``self.client`` is an ``httpx.Client``, whose pool
+        is thread-safe, so closing it here is enough. The async client is
+        deliberately left alone - :meth:`aclose` explains why it can only be
+        closed by its own loop, and this method is called from threads that do
+        not own that loop (``LLMClient.close()`` on a config restart).
+        """
+        client = getattr(self, 'client', None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as exc:
+            log('WARNING', 'llm.openai', f'Closing client failed: {exc}')
 
     async def stream_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> AsyncIterator[StreamEvent]:
         """Stream a chat completion as provider-neutral events.

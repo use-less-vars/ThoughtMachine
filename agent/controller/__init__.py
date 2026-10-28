@@ -772,5 +772,19 @@ class AgentController:
             self._emit_event({'type': 'error', 'error_type': 'CONTROLLER_ERROR', 'message': str(e), 'traceback': traceback.format_exc()})
         finally:
             log('DEBUG', 'core.controller', f'Finally block: thread finishing')
+            # Release the thread-local stream loop and the async HTTP client
+            # bound to it. This runs on the thread that owns both, which is the
+            # only thread allowed to close them. Best-effort in every direction:
+            # cleanup must never raise out of this ``finally`` (it would replace
+            # the exception that ended _run) and must never prevent the
+            # ``thread_finished`` event from being emitted. The controller module
+            # itself has no asyncio dependency; the teardown lives next to the
+            # loop it owns.
+            try:
+                from agent.core.agent import _close_stream_resources
+                llm_client = getattr(getattr(self, 'agent', None), 'llm_client', None)
+                _close_stream_resources(getattr(llm_client, 'provider', None))
+            except Exception as cleanup_error:
+                log('WARNING', 'core.controller', f'Resource cleanup failed (ignored): {cleanup_error}')
             self._emit_event({'type': 'thread_finished'})
             self._running = False

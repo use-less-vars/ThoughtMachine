@@ -98,9 +98,11 @@ def _audit_config_change(old_config, new_config, restart_required: bool) -> None
 
 #: Per-thread private event loop, used to drive streaming LLM adapters from
 #: synchronous code. Created lazily by :func:`_iter_stream_events` and kept for
-#: the lifetime of the thread, never closed: a loop object must be owned by
-#: exactly one driving thread, and each provider's async HTTP client is bound to
-#: the loop it was first used on, so the loop must be stable across calls.
+#: the lifetime of the thread: a loop object must be owned by exactly one
+#: driving thread, and each provider's async HTTP client is bound to the loop it
+#: was first used on, so the loop must be stable across calls. It is closed once
+#: the thread is done with it, by :func:`_close_stream_resources`, which closes
+#: the client first and then forgets this thread-local.
 _STREAM_LOCAL = threading.local()
 
 
@@ -167,6 +169,88 @@ def _iter_stream_events(agen):
                 pass
             except RuntimeError as close_error:
                 log('WARNING', 'core.agent', f'_iter_stream_events: could not close stream: {close_error}')
+
+
+def _close_stream_resources(provider=None) -> bool:
+    """Close this thread's private stream loop and everything bound to it.
+
+    Must be called on the thread that owns the loop - in practice the
+    controller worker thread, at the end of ``AgentController._run``:
+    ``_STREAM_LOCAL`` is a thread-local and a loop object may only be driven by
+    the thread that created it.
+
+    Order matters. The provider's async HTTP client is bound to the loop it was
+    first used on, so it has to be closed *by* that loop through
+    ``run_until_complete()`` before the loop itself is closed. The thread-local
+    is dropped afterwards, so the next turn on this thread builds a fresh loop
+    instead of finding a closed corpse (a closed loop cannot drive anything,
+    and the old client went with it).
+
+    Best-effort by construction: every step is guarded and nothing is raised,
+    because this runs from a ``finally`` where an exception would replace the
+    one that ended the thread. Idempotent: a second call after the loop is gone
+    is a no-op.
+
+    Returns:
+        True when a live loop was found and closed, False when there was
+        nothing to do.
+    """
+    local = _STREAM_LOCAL
+    loop = getattr(local, 'loop', None)
+    if loop is None:
+        return False
+    if loop.is_closed():
+        # Already cleaned up (or closed behind our back): just forget it, so a
+        # later turn cannot be handed a corpse.
+        try:
+            del local.loop
+        except AttributeError:
+            pass
+        return False
+    if loop.is_running():
+        # A running loop cannot be driven with run_until_complete(), and closing
+        # it would abandon whatever is in flight. Leave it alone.
+        log('WARNING', 'core.agent', '_close_stream_resources: stream loop is running, skipping cleanup')
+        return False
+    try:
+        aclose = getattr(provider, 'aclose', None)
+        if callable(aclose):
+            try:
+                loop.run_until_complete(aclose())
+            except Exception as close_error:
+                log('WARNING', 'core.agent', f'_close_stream_resources: closing provider failed: {close_error}')
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception as asyncgen_error:
+            log('WARNING', 'core.agent', f'_close_stream_resources: closing async generators failed: {asyncgen_error}')
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        if pending:
+            # Never abandon work silently: cancel it, record how much there was,
+            # then let the cancellations settle before the loop is closed.
+            log('WARNING', 'core.agent', f'_close_stream_resources: cancelling {len(pending)} pending task(s)')
+            for task in pending:
+                task.cancel()
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception as gather_error:
+                log('WARNING', 'core.agent', f'_close_stream_resources: awaiting cancelled tasks failed: {gather_error}')
+        # Only touch the executor when one was actually created: the shutdown
+        # call waits for its threads, which must not happen speculatively.
+        if getattr(loop, '_default_executor', None) is not None:
+            try:
+                loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception as executor_error:
+                log('WARNING', 'core.agent', f'_close_stream_resources: shutting down executor failed: {executor_error}')
+    finally:
+        try:
+            loop.close()
+        except Exception as loop_error:
+            log('WARNING', 'core.agent', f'_close_stream_resources: closing loop failed: {loop_error}')
+        try:
+            del local.loop
+        except AttributeError:
+            pass
+    return True
 
 
 #: Provider exception class names an adapter may report through
