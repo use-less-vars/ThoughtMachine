@@ -276,3 +276,13 @@ web_ui/frontend/.npmrc
 !docs/design-concurrency-and-affinity.md
 !docs/briefs/
 !docs/briefs/**
+
+# Gen 53 docs/KB catch-up (2026-10-28): the catch-up brief, the post-core-sprint
+# integration backlog, and the interruptible-tool-calls design doc. Public tier —
+# the operator ruled all three publishable. Two sit in ignored space
+# (`.thoughtmachine/working_docs/*` is re-ignored above) and one under the `docs/*`
+# catch-all, so each needs its own negation line or `git clean -xdf` would destroy
+# them.
+!docs/design-interruptible-tool-calls.md
+!.thoughtmachine/working_docs/brief-docs-kb-catchup.md
+!.thoughtmachine/working_docs/backlog-core-integration.md

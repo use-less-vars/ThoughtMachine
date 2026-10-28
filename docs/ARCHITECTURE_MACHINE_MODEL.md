@@ -205,7 +205,28 @@ boundary you might think.
   the tool's business. It is precisely why `host_bash` is its own tier rather than a flag on some
   other tool.
 
-## §7 — For the incoming engineer
+## §7 — Agent Runtime vs. Bootstrapping
+
+The machine has one home and one front door, and confusing them is the most common way a session
+goes wrong.
+
+1. **The Workspace Image is the runtime.** `agent-executor:latest` is where work happens — every
+   tool call that executes code lands inside a container built from it. Treat it as your home:
+   interpreters, linters, CLI tools and the test suite live there. If a command works in the image
+   and nowhere else, that is correct, not a limitation to route around.
+2. **The Vault Dockerfile is the blueprint.** The image is not configured by hand. It is declared in
+   the vault-managed Dockerfile and built from it, and when the runtime lacks a tool the fix is to
+   edit that Dockerfile and rebuild — not to install the tool on the host. A host install changes a
+   machine nobody can reproduce; a Dockerfile edit changes the image everyone gets.
+3. **Host Bash is bootstrapping, and only bootstrapping.** The `host_bash` tier (§5) exists for the
+   one job that cannot happen inside the container: building the container. Use it to run
+   `docker build`, then turn it off and go back inside. It is not a second runtime, not a
+   convenience shell, and never the place to "just quickly" install something.
+
+The test is simple: **if the work can happen in the image, it belongs in the image.** Host Bash is
+how you make the image better; it is not where you live.
+
+## §8 — For the incoming engineer
 
 **Code wins over this doc.** This describes intent, and intent has been wrong before — the doc is
 not the specification, the code is. When they disagree: read the code, then fix this doc so the next
