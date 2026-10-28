@@ -769,3 +769,61 @@ You inherit `dev = 45b0ca68` with the tree clean. The core is fundamentally diff
 - **The Worker Self-Correction:** The workers in this session routinely caught their own errors (and ours). Trust their retractions.
 - **The Stacked PR Footgun:** If you base a PR on a feature branch, and that feature branch merges first, your PR might merge into a branch that is already dead. Verify with `git log origin/dev` after merging.
 - **The Mock OOM:** Async mocks that lack a `StopAsyncIteration` will spin forever, OOM, and be reported by CI as `The operation was canceled`. Check the mocks before blaming the infrastructure.
+
+## 2026-10-28 — ## 2026-10-28 — docs/kb-catchup wave: BLOCKED on three rulin...
+
+## 2026-10-28 — docs/kb-catchup wave: BLOCKED on three rulings (state captured)
+
+Repo state at capture: HEAD (before branching) = `ca413e7f` "Merge pull request #233 from use-less-vars/fix/resource-leaks"; recent merges `85eb43ed` (release per-thread stream loop + async HTTP client), `66d9156b` (#232 feat/frontend-ci-gate), `7a961a43` (#231 **feat/reasoning-streaming-and-render**). **PR #234 ("the Concurrency Wall") is NOT in local history** — latest merge is #233.
+
+Written to disk (untracked/ignored, 3 of 4 docs):
+- `.thoughtmachine/working_docs/brief-docs-kb-catchup.md` (73 L)
+- `.thoughtmachine/working_docs/backlog-core-integration.md` (20 L)
+- `docs/design-interruptible-tool-calls.md` (14 L)
+Branch `docs/kb-catchup` created at `ca413e7f` and checked out; nothing committed.
+
+BLOCKER 1 — publication tier / .gitignore. The repo publishes by explicit negation, not by path. `.gitignore:136` is `docs/*` catch-all and `:118-124` ignores `.thoughtmachine/working_docs/*` except `ticket-*.md` / `protocol-*.md` / a few named files. Staging failed: "The following paths are ignored". So: `ticket-bug-macos-path-normalization.md` would commit as-is (`!ticket-*.md` covers it), but the **brief, the backlog and both new `docs/` files need their own `!` negation lines** (the tail comments show each is an operator tier decision, Gen 51/52 precedent). Do not `-f` add; add negations on ruling.
+
+BLOCKER 2 — PR #234 cannot be merged from here. No `gh` and no `git` binary in the exec container, `host_bash` + `ci` permissions banned, and `GitWriteTool` has no `fetch`/`pull` op. So `gh pr merge 234 ...` + `git switch dev && git pull` must run on the host. Base "dev at the merge commit of #234" is therefore unreachable; the wave is based on `ca413e7f` instead.
+
+BLOCKER 3 — two of the four docs duplicate existing material (see duplication sweep below).
+
+DUPLICATION SWEEP (result):
+1. `bug/macos-path-normalization` (Task 4) is a **strict duplicate + weaker**. `.thoughtmachine/working_docs/ticket-bug-macos-tmp-path-tests-assume-symlink-free.md` (Gen 47) already carries the same defect and a better fix shape: root cause PR 2 `0d9a7764` added realpath ingress via `_confine_workspace_path`, five assertions in `tests/integration/test_apply_config_coverage.py`, fix = `Path(x).resolve() == Path(y).resolve()` on **both sides**, provenance CI run 39640002594, severity MEDIUM not LOW, and the display question already routed to `design_config_workspace_path_display.md`. The new ticket's "`os.path.realpath` **or** `Path.resolve()`" phrasing is contradicted by `personal/lessons_learned.md` 2026-10-22: "`Path.resolve()` and `os.path.realpath()` are the same POSIX machinery ... 'Switch from resolve to realpath' is not a fix" and "`normpath` is not `realpath`". Recommendation: do not create; cross-reference the existing ticket. Also `40aa9084` (#163) already landed the macOS path-test ticket wave.
+2. Task 2 (`docs/global-kb-workspace-runtime-guidance.md`) duplicates and **contradicts** tracked `docs/ARCHITECTURE_MACHINE_MODEL.md` §1: that doc's execution-region table says the Agent and file tools are *host* processes and `host_bash` is "the one true host-execution grain" gated per-workspace by `allow_host_resources`; the proposed text says "you live in the container, not on the host" and that host_bash is "strictly for bootstrapping". The *policy* is new and worth keeping; the architecture claim conflicts with the tracked doc. Also note the filename says "global-kb" but the global KB (`~/.thoughtmachine/global/`) is read-only for agents (F24 gate), so it cannot be installed there by an agent.
+3. Task 1 item 1 (`bug/reasoning-block-pop-in`) is a **premise risk, not a duplicate**: my audit at `6ae43361` found `agent/core/agent.py:1266-1289` yields one `text_delta` per chunk but accumulates `ReasoningDelta` and yields NOTHING. However `7a961a43` (#231 feat/reasoning-streaming-and-render) merged since, so the backend half may now exist — **re-verify before dispatching the Integration Bugs worker**; the UI half is still real (`SessionTab.jsx:151-154` in-flight bubble carries only `{role, content}`).
+4. Task 1 item 2 (worker stop propagation) and item 3 (interruptible tool calls) are **net-new**; no duplicate. Topic appears only as roadmap step 7 in `personal/handoffs.md` §12 and `project/open_items_register.md` §16, plus `project/operator_notes.md` 2026-10-12 "Interruptible sleep/join".
+
+CITATION CORRECTION: both the brief, the backlog and the design doc cite `docs/design-streaming-canonical-ir.md` **§4** for "Cancellation". In that file §4 is "The turn loop under streaming"; **§5 is Cancellation** (headings: 1 claim, 2 canonical IR, 3 streaming contract, 4 turn loop under streaming, 5 Cancellation, 6 pruning, 7 what does not change, 8 migration order, 9 adversarial gate).
+
+RESOLUTION (same day, operator ruled all five):
+1. Merge SHA — correction to BLOCKER 2: `2ac3148c` **is** present in the local object
+   store (`git_read rev_parse 2ac3148c` → full SHA, and `ca413e7f` is its ancestor).
+   What is missing is only a way to *move the branch pointer*: `GitWriteTool` has no
+   `rebase`, `reset`, `merge` or `fetch`, `checkout` silently ignores its `base` arg,
+   and `branch_create` refuses the existing name. So the rebase is one host-side
+   command (`git rebase dev docs/kb-catchup`) and is conflict-free by construction:
+   `git diff ca413e7f..2ac3148c` over all six touched paths is empty.
+2. macOS ticket — DROPPED, no duplicate filed. Backlog item 4 now carries a
+   `**Tracked by:**` line pointing at `ticket-bug-macos-tmp-path-tests-assume-symlink-free.md`
+   plus the must-resolve-both-sides caveat.
+3. Runtime guidance — NOT a separate doc. Appended to
+   `docs/ARCHITECTURE_MACHINE_MODEL.md` as new **§7 "Agent Runtime vs. Bootstrapping"**
+   (three points: Workspace Image is the runtime; Vault Dockerfile is the blueprint,
+   edit it rather than install on the host; Host Bash is bootstrapping only — build the
+   image, turn it off, go back inside). The old §7 "For the incoming engineer" was
+   renumbered to §8; no other file cross-references it, so nothing else needed updating.
+   Note this sits deliberately next to §5 (`host_bash`: the exception) and reconciles the
+   contradiction flagged in the sweep: the doc's §1 table describes *process* placement,
+   §7 now states *policy* — you work in the image, you bootstrap from the host.
+4. Publication tier — AUTHORIZED. `.gitignore` gained a Gen 53 block with one comment and
+   three negations (`!docs/design-interruptible-tool-calls.md`,
+   `!.thoughtmachine/working_docs/brief-docs-kb-catchup.md`,
+   `!.thoughtmachine/working_docs/backlog-core-integration.md`). Verified by
+   `git_read status` listing all three as untracked rather than ignored.
+5. Reasoning premise — SETTLED. #231 is merged; the backend does stream `reasoning_delta`.
+   The frontend fix is still required and is pure React state (`SessionTab.jsx` swallows the
+   live deltas and only replaces them on commit). Recorded as a "Verified (dev @ 2ac3148c)"
+   line under backlog item 1 so the next worker does not re-derive the stale premise.
+
+Landed as commit `5032a0b4` on `docs/kb-catchup`, five files, +146/−1.
