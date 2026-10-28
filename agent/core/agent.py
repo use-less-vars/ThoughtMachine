@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import time
+import threading
 import traceback
 import uuid
 from datetime import datetime
@@ -95,19 +96,27 @@ def _audit_config_change(old_config, new_config, restart_required: bool) -> None
         pass
 
 
-#: One cached private event loop, used to drive streaming LLM adapters from
-#: synchronous code. Created lazily by :func:`_iter_stream_events`; never closed
-#: (the agent is a long-lived singleton per worker thread).
-_STREAM_LOOP = None
+#: Per-thread private event loop, used to drive streaming LLM adapters from
+#: synchronous code. Created lazily by :func:`_iter_stream_events` and kept for
+#: the lifetime of the thread, never closed: a loop object must be owned by
+#: exactly one driving thread, and each provider's async HTTP client is bound to
+#: the loop it was first used on, so the loop must be stable across calls.
+_STREAM_LOCAL = threading.local()
 
 
 def _iter_stream_events(agen):
     """Drive an async-generator stream from synchronous code, one event at a time.
 
     ``agen`` is an ``AsyncIterator`` (today: ``LLMClient.stream_completion``).
-    Each ``__anext__()`` is run to completion on a single cached private event
+    Each ``__anext__()`` is run to completion on this thread's private event
     loop, so the caller can stay a plain sync generator (``process_query``) and
     keep yielding dict events to its own consumers.
+
+    Thread safety: each thread gets its own private event loop, so concurrent
+    callers on different threads cannot contend for a shared loop object. Within
+    a thread the loop is reused rather than recreated, because each provider's
+    async HTTP client is bound to the loop it was first used on - a fresh loop
+    per call would break that client on the next turn.
 
     Termination: ``StopAsyncIteration`` is the normal end of the stream, not an
     error. An exception raised by ``agen`` propagates to the caller.
@@ -128,16 +137,17 @@ def _iter_stream_events(agen):
     *while* closing are logged rather than propagated, so they can never mask
     the caller's own exception or a ``GeneratorExit``.
     """
-    global _STREAM_LOOP
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         pass
     else:
         raise RuntimeError('_iter_stream_events() must be called from synchronous code: this thread already has a running event loop, so the stream cannot be driven with run_until_complete().')
-    if _STREAM_LOOP is None:
-        _STREAM_LOOP = asyncio.new_event_loop()
-    loop = _STREAM_LOOP
+    local = _STREAM_LOCAL
+    loop = getattr(local, 'loop', None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        local.loop = loop
     exhausted = False
     try:
         while True:
