@@ -103,6 +103,7 @@ describe('SESSION_RESOURCE_VOCAB (frontend mirror of backend)', () => {
       network: ['banned', 'ask', 'write', 'outbound'],
       mcp: ['banned', 'connect', 'full'],
       host_bash: ['banned', 'ask', 'allow'],
+      credential: ['banned', 'read', 'use'],
     });
   });
 
@@ -123,6 +124,7 @@ describe('PERMISSION_RANK_ORDER (frontend mirror of backend)', () => {
       outbound: 3.5,
       write: 3,
       write_on_feature_branch: 3,
+      use: 3,
       full: 4,
     });
   });
