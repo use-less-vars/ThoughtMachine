@@ -1289,6 +1289,7 @@ class Agent:
                             yield {'type': 'text_delta', 'text': stream_event.text, 'turn': self._display_turn}
                         elif isinstance(stream_event, ReasoningDelta):
                             reasoning = (reasoning or '') + (stream_event.text or '')
+                            yield {'type': 'reasoning_delta', 'text': stream_event.text, 'turn': self._display_turn}
                         elif isinstance(stream_event, ToolCallComplete):
                             canonical = stream_event.tool_call
                             raw_arguments = canonical.raw_arguments

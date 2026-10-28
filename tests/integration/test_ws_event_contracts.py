@@ -46,6 +46,12 @@ DELTAS vs the session-loaded template (all verified against current code):
     ``merged_config`` — the frontend config dict itself uses
     ``session_permissions``.
 
+  * ``reasoning_delta`` (bridge.py ``_map_and_emit``) — the agent's streamed
+    thinking (agent/core/agent.py ``reasoning_delta``) is forwarded to the
+    frontend under the SAME name, with ``session_id`` INSIDE the payload plus
+    ``text`` and ``turn``.  Also a direct ``_map_and_emit`` test (no
+    WebSocket): the arm is a pure mapping and needs no live session.
+
 Run (from repo root):
     python -m pytest tests/integration/test_ws_event_contracts.py -v
 
@@ -643,4 +649,49 @@ def test_session_deleted_payload_contract(contract_server):
     assert evt.get("type") == "session_deleted"
     assert evt.get("session_id") == session_id, (
         f"session_deleted.session_id {evt.get('session_id')!r} != {session_id!r}"
+    )
+
+
+def test_reasoning_delta_broadcast_contract(contract_server):
+    """reasoning_delta: streamed thinking is a first-class WS event.
+
+    The agent loop yields ``reasoning_delta`` chunks WHILE the model is still
+    thinking (agent/core/agent.py).  The bridge must forward each one to the
+    frontend under the SAME event name so the in-flight bubble can paint the
+    "Thinking" block live, instead of the UI only seeing reasoning at turn end
+    via the terminal ``turn``/``conversation_changed`` payloads.
+
+    Direct ``_map_and_emit`` call (no WebSocket): the arm is a pure mapping and
+    needs no live session.  ``session_id`` rides INSIDE the payload because
+    ``EventForwarder.broadcast`` (event_forwarder.py:84-96) ignores its first
+    argument.
+    """
+    from web_ui.backend.bridge import WebAgentBridge
+    from session.store import FileSystemSessionStore
+
+    bridge = WebAgentBridge(session_store=FileSystemSessionStore())
+    bridge._session_id = "sess-reasoning"
+    events = []
+    bridge.set_event_callback(events.append)
+
+    bridge._map_and_emit({"type": "reasoning_delta", "text": "hmm", "turn": 3})
+
+    reasoning_events = [e for e in events if e.get("type") == "reasoning_delta"]
+    assert reasoning_events, (
+        f"reasoning_delta must be forwarded to the frontend (got {events!r})"
+    )
+    first = reasoning_events[0]
+    assert first.get("session_id") == "sess-reasoning", (
+        f"reasoning_delta.session_id must be the routing session inside the payload "
+        f"(got {first.get('session_id')!r})"
+    )
+    assert first.get("text") == "hmm", (
+        f"reasoning_delta.text must carry the chunk text (got {first.get('text')!r})"
+    )
+    assert first.get("turn") == 3, (
+        f"reasoning_delta.turn must carry the originating turn (got {first.get('turn')!r})"
+    )
+    # Thinking must never masquerade as assistant text.
+    assert not [e for e in events if e.get("type") == "assistant_delta"], (
+        f"reasoning_delta must not map to assistant_delta (got {events!r})"
     )

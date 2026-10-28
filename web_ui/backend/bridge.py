@@ -3077,6 +3077,20 @@ class WebAgentBridge:
                 "turn": raw_event.get("turn"),
             })
 
+        elif event_type == "reasoning_delta":
+            # Token-level model REASONING (the "thinking" phase). Forwarded
+            # under the same event name so the frontend can paint it into the
+            # in-flight bubble while the model is still thinking; without this
+            # arm the reasoning is only visible at turn end (terminal `turn`
+            # event / conversation_changed), so the bubble looks frozen.
+            # session_id rides INSIDE the payload for the same reason as the
+            # text_delta arm above: broadcast() ignores its session_id argument.
+            self._forwarder.broadcast(self._session_id, "reasoning_delta", {
+                "session_id": self._session_id,
+                "text": raw_event.get("text", ""),
+                "turn": raw_event.get("turn", 0),
+            })
+
         elif event_type == "interrupted":
             # A hard stop truncated the stream. The agent already committed the
             # partial assistant text to the session (so the version sync above
