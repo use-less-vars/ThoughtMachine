@@ -16,7 +16,7 @@ on `pull_request` (all PRs, any base branch) and on `push` limited to `dev` and
 | Workflow | Jobs | Notes |
 | --- | --- | --- |
 | `cross-platform-smoke.yml` | `linux-install`, `windows-smoke`, `macos-launcher` | all gating |
-| `platform-matrix.yml` | `ubuntu-suite`, `linux-install-smoke`, `windows-import-smoke`, `windows-thin-pytest`, `macos-suite`, `macos-install-smoke`, `macos-docker-probe`, `web-ui-backend-suite` | 4 gating, 4 advisory |
+| `platform-matrix.yml` | `ubuntu-suite`, `linux-install-smoke`, `windows-import-smoke`, `windows-thin-pytest`, `macos-suite`, `macos-install-smoke`, `macos-docker-probe`, `web-ui-backend-suite`, `web-ui-frontend-suite` | 4 gating, 5 advisory |
 | `python-version-matrix.yml` | `unit-tests` (Python 3.11–3.14), `installer-contract`, `windows-python-314` | all gating |
 | `first_start_ci.yml` | `first-start` | gating |
 
@@ -54,6 +54,8 @@ Advisory (`continue-on-error: true`, never fails its workflow):
 - `platform-matrix.yml` — `web-ui-backend-suite` is likewise advisory, for an
   unrelated reason: `web_ui/backend/tests/` is outside the main `testpaths`, so it
   is collected and run as a separate advisory suite.
+- `platform-matrix.yml` — `web-ui-frontend-suite` is likewise advisory, for the
+  same reason as the backend job above: it is not a required status check.
 
 ## What each job proves, and what it does not
 
@@ -119,8 +121,10 @@ collection count drops (an empty selection cannot pass silently). The
 - macOS is gated by one job, and that job cannot see whether the app starts. A macOS
   start-up regression has no RED to land on.
 - Windows has no test-suite coverage — an import check and four test files.
-- No workflow step builds or tests the frontend directly: Vite/npm appear nowhere in
-  the four workflow files, so whatever `install.sh` does with Node is unasserted
-  beyond "the installer exited 0".
+- The frontend suite runs, but only advisory: `web-ui-frontend-suite`
+  (`platform-matrix.yml`) runs `npm ci` and the Vitest suite and asserts a
+  collected-test floor, yet `continue-on-error: true` means a red frontend run fails
+  nothing. Whatever `install.sh` does with Node is still unasserted beyond "the
+  installer exited 0".
 - Docker-marked and `e2e`-marked tests are excluded from every suite job except
   `linux-install-smoke`, which runs one of them on Linux only.
