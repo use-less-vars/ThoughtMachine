@@ -98,6 +98,15 @@ class EventType(enum.Enum):
     CREDENTIAL_USE = 'credential_use'
     CREDENTIAL_ROTATED = 'credential_rotated'
     CREDENTIAL_DELETED = 'credential_deleted'
+    # Token-level streaming deltas.  One of these is emitted per LLM chunk, so
+    # they share the event pipe with every lifecycle event.  They MUST be
+    # declared here: convert_from_legacy_format() -> BaseEvent.from_dict() falls
+    # back to EventType(<str>) for unknown types, and a ValueError there is
+    # caught by the caller as a WARNING (agent/controller:545 for the main
+    # agent, tools/workspace/worker_thread:1951 for workers) -- i.e. one bogus
+    # warning per streamed token.
+    TEXT_DELTA = 'text_delta'
+    REASONING_DELTA = 'reasoning_delta'
 
 
 class EventMetadata(BaseModel):
@@ -429,7 +438,9 @@ def create_event(event_type: Union[EventType, str], data: Dict[str, Any], source
     EventType.WORKER_RUNNING: WorkerRunningEvent, EventType.WORKER_STOPPING: WorkerStoppingEvent, EventType.WORKER_HEARTBEAT: WorkerHeartbeatEvent, EventType.WORKER_PARTIAL_RESULT: WorkerPartialResultEvent, EventType.WORKER_TIMEOUT: WorkerTimeoutEvent,
     EventType.WEBSOCKET_CONNECT: BaseEvent,
     EventType.WEBSOCKET_DISCONNECT: BaseEvent,
-    EventType.CONFIG_LOADED: BaseEvent,}
+    EventType.CONFIG_LOADED: BaseEvent,
+    EventType.TEXT_DELTA: BaseEvent,
+    EventType.REASONING_DELTA: BaseEvent,}
     event_class = event_class_map.get(event_type, BaseEvent)
     return event_class(type=event_type, metadata=metadata, data=data)
 
@@ -524,7 +535,12 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     'status_message': EventType.STATUS_MESSAGE,
     'error_occurred': EventType.ERROR_OCCURRED,
     'config_changed': EventType.CONFIG_CHANGED,
-    'conversation_changed': EventType.CONVERSATION_CHANGED,}
+    'conversation_changed': EventType.CONVERSATION_CHANGED,
+    # Streaming deltas: mapped explicitly (rather than relying on the
+    # EventType(str) fallback below) so the hot per-token path does not log
+    # "No mapping for ..." at DEBUG on every chunk.
+    'text_delta': EventType.TEXT_DELTA,
+    'reasoning_delta': EventType.REASONING_DELTA,}
     result = mapping.get(event_type_str)
     if result is None:
         log('DEBUG', 'core.events', f"No mapping for '{event_type_str}', attempting direct EventType creation")
