@@ -1249,6 +1249,7 @@ class Agent:
                         # could act on a partially received tool call.
                         if isinstance(stream_event, TextDelta):
                             content += stream_event.text or ''
+                            yield {'type': 'text_delta', 'text': stream_event.text, 'turn': self._display_turn}
                         elif isinstance(stream_event, ReasoningDelta):
                             reasoning = (reasoning or '') + (stream_event.text or '')
                         elif isinstance(stream_event, ToolCallComplete):

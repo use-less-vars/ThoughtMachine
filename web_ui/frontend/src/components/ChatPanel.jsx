@@ -37,6 +37,9 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
   // Fix 3a: last known scrollTop — used to preserve the user's reading
   // position when the messages list is replaced while scrolled up.
   const prevScrollTopRef = useRef(0)
+  // Streaming deltas grow the LAST message in place (count unchanged), so the
+  // last rendered content is tracked to detect "appended below the fold".
+  const prevLastContentRef = useRef(null)
 
   // ── Scroll handler — suppress updates during programmatic scroll ──
   const handleScroll = useCallback(() => {
@@ -80,6 +83,13 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
     const currentCount = messages ? messages.length : 0
     const prevCount = prevCountRef.current
     prevCountRef.current = currentCount
+    // A streaming delta keeps the count constant and only grows the last
+    // message's text; treat that as an append so the view follows the stream.
+    const currentLastContent = currentCount > 0 ? messages[currentCount - 1]?.content : ''
+    const prevLastContent = prevLastContentRef.current
+    prevLastContentRef.current = currentLastContent
+    const grewInPlace = currentCount === prevCount && currentCount > 0 &&
+      currentLastContent !== prevLastContent
 
     // No container — nothing to do.
     if (!chatRef.current || currentCount === 0) return
@@ -90,7 +100,7 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
     // defensively restore the last known scrollTop from prevScrollTopRef.
     // This replaces the previous hard early-return and prevents scroll fights
     // between this effect and the ResizeObserver.
-    if (!isAtBottomRef.current || currentCount <= prevCount) {
+    if (!isAtBottomRef.current || (currentCount <= prevCount && !grewInPlace)) {
       chatRef.current.scrollTop = prevScrollTopRef.current
       return
     }
