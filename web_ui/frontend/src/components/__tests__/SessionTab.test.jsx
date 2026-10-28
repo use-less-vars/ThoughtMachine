@@ -888,6 +888,57 @@ describe('SessionTab — assistant_delta streaming', () => {
     expect(bodyText).not.toContain('HelloHello');
   });
 
+  it('retains the streamed partial as a final message when the run is interrupted', async () => {
+    renderTab({ sessionId: 'sess-halt' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-halt',
+        messages: [{ role: 'user', content: 'stop-midstream-prompt' }],
+      })
+    );
+    expect(await screen.findByText('stop-midstream-prompt')).toBeInTheDocument();
+
+    // Two deltas for the SAME turn coalesce into one local in-flight bubble.
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-halt', text: 'Par', turn: 1 }));
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-halt', text: 'tial', turn: 1 }));
+    expect(await screen.findByText('Partial')).toBeInTheDocument();
+
+    // Hard stop: the backend truncated the stream and committed the text it had
+    // already produced, announcing it with `interrupted` instead of a terminal
+    // `conversation_changed` for that turn.
+    act(() =>
+      ws.receive({
+        type: 'interrupted',
+        session_id: 'sess-halt',
+        text: 'Partial',
+        stop_reason: 'interrupted',
+      })
+    );
+
+    // The text the user watched stream in survives as a FINAL message: it is
+    // present exactly once (the in-flight bubble was folded away, not joined),
+    // and no empty assistant bubble was added in its place.
+    const partialEls = screen.getAllByText('Partial');
+    expect(partialEls).toHaveLength(1);
+    const bodyText = document.body.textContent || '';
+    expect(bodyText.match(/Partial/g) || []).toHaveLength(1);
+    expect(bodyText).not.toContain('ParPartial');
+    expect(bodyText).not.toContain('PartialPartial');
+
+    // Store truth: user prompt + the retained partial, nothing else. An empty
+    // assistant message here would render as a blank bubble.
+    const stored = useStore.getState().sessionMessages['sess-halt'];
+    expect(stored).toHaveLength(2);
+    expect(stored[1]).toEqual({ role: 'assistant', content: 'Partial' });
+
+    // In-flight state is cleared, so a later render pass cannot resurrect it.
+    await waitFor(() =>
+      expect((document.body.textContent || '').match(/Partial/g) || []).toHaveLength(1)
+    );
+  });
+
   it('discards the in-flight bubble when the run ends without a terminal turn', async () => {
     renderTab({ sessionId: 'sess-crash' });
     const ws = await connectWs();

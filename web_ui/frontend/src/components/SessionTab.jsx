@@ -1045,6 +1045,38 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         useStore.getState().setSessionError(msg.session_id || currentSessionIdRef.current, msg.error || msg.message || 'Unknown error')
         break
 
+      case 'interrupted': {
+        // Hard stop: the backend truncated the stream mid-answer and committed
+        // whatever text had already been produced. Fold that partial text into
+        // the transcript as a FINAL assistant message and drop the in-flight
+        // bubble, so the text the user watched stream in does not vanish and
+        // no spinner is left running. The server may already have shipped the
+        // same partial in a conversation_changed, so de-duplicate against the
+        // tail of the history instead of trusting arrival order.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] interrupted for different session, ignoring:', msg.session_id)
+          break
+        }
+        const interruptedKey = msg.session_id || currentSessionIdRef.current
+        const partial = typeof msg.text === 'string' ? msg.text : ''
+        if (partial && interruptedKey) {
+          const existing = useStore.getState().sessionMessages[interruptedKey] || []
+          const tail = existing[existing.length - 1]
+          const alreadyRetained = !!(tail && tail.role === 'assistant' && tail.content === partial)
+          if (!alreadyRetained) {
+            useStore.getState().receiveConversationChanged(
+              interruptedKey,
+              [{ role: 'assistant', content: partial }],
+              { mode: 'append' }
+            )
+          }
+        }
+        // Always clear, even when the halt produced no text: no stuck spinner,
+        // and no blank bubble because nothing is appended above.
+        clearInFlight()
+        break
+      }
+
       case 'session_stop':
         // Defensive: the bridge normally folds session_stop into state_changed
         // + conversation_changed and never forwards the raw type, but handle it
