@@ -1647,12 +1647,21 @@ class Agent:
                     processed_tools = []
                     for tool_info in executed_tools:
                         result = tool_info.get('result', '')
-                        success = True
                         error = None
-                        if isinstance(result, str):
-                            if result.startswith('❌') or 'TOOL CALL REJECTED' in result or 'Error executing tool' in result:
-                                success = False
-                                error = result
+                        # Structural verdict first: the executor marks every
+                        # refusal / failure path with an explicit success=False.
+                        # Prose sniffing only runs when the executor supplied no
+                        # verdict (None), i.e. for results produced outside the
+                        # executor path; a denial's prose carries no marker, which
+                        # is why sniffing alone reported refusals as successes.
+                        success = tool_info.get('success', None)
+                        if success is None:
+                            success = True
+                            if isinstance(result, str):
+                                if result.startswith('❌') or 'TOOL CALL REJECTED' in result or 'Error executing tool' in result:
+                                    success = False
+                        if not success:
+                            error = result
                         processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn})
                     # Commit ALL tool results to user_history BEFORE yielding any events
                     # (tool_call, tool_result) so a pause between yields doesn't lose data.

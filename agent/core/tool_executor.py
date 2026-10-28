@@ -273,7 +273,9 @@ class ToolExecutor:
                 add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
                 tool_tokens = self.agent.token_counter.estimate_tokens(tool_result) if self.agent is not None else self._estimate_tokens_fallback(tool_result)
                 update_token_func(tool_tokens)
-                executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result})
+                # A state-level rejection is a refusal: record it structurally so the
+                # caller does not have to sniff the prose (which carries no marker).
+                executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result, 'success': False})
                 continue
             arguments_str = tool_call['function']['arguments']
             json_repair_needed = False
@@ -290,7 +292,7 @@ class ToolExecutor:
                     if self.logger:
                         self.logger.log_error('JSON_DECODE_ERROR', f'Failed to parse JSON for {tool_name}: {e}')
                     add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
-                    executed_tools.append({'name': tool_name, 'arguments': {'error': 'Invalid JSON', 'raw': arguments_str}, 'result': tool_result})
+                    executed_tools.append({'name': tool_name, 'arguments': {'error': 'Invalid JSON', 'raw': arguments_str}, 'result': tool_result, 'success': False})
                     log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=True, session_id=session_id)
                     continue
             log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=json_repair_needed, session_id=session_id)
@@ -309,7 +311,7 @@ class ToolExecutor:
             if not tool_class:
                 error_msg = f'Unknown tool: {tool_name}'
                 tool_result = error_msg
-                tool_execution_result = {'result': tool_result, 'tool_type': 'normal'}
+                tool_execution_result = {'result': tool_result, 'tool_type': 'normal', 'success': False}
                 tool_type = 'normal'
             else:
                 tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns, session_id=session_id, workspace_id=workspace_id)
@@ -339,7 +341,14 @@ class ToolExecutor:
             update_token_func(tool_tokens)
             if self.logger:
                 pass
-            executed_tools.append({'name': tool_name, 'arguments': arguments, 'result': tool_result})
+            tool_entry = {'name': tool_name, 'arguments': arguments, 'result': tool_result}
+            # Forward the executor's structural verdict when it has one, so a
+            # refusal stays distinguishable from a success without prose
+            # sniffing upstream.  Success paths stay key-less (no invented
+            # 'success': True), so an absent key keeps meaning "no verdict".
+            if 'success' in tool_execution_result:
+                tool_entry['success'] = tool_execution_result['success']
+            executed_tools.append(tool_entry)
         return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
     def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "", workspace_id: str = "") -> Dict[str, Any]:
@@ -357,6 +366,8 @@ class ToolExecutor:
             - meta: if tool_type == 'respond'
             - summary_text: if tool_type == 'summary'
             - summary_keep_recent_turns: if tool_type == 'summary'
+            - success: False on every refusal / failure path.  Absent when the
+              tool actually executed, so an absent key means "no verdict".
         """
         try:
             tool_args = arguments.copy()
@@ -383,9 +394,9 @@ class ToolExecutor:
                     infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id", "is_worker_context"}
                     valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
-                    return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal'}
+                    return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal', 'success': False}
                 except Exception:
-                    return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
+                    return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal', 'success': False}
             # Now inject infrastructure fields (safe because validation passed)
             # workspace_path is ALWAYS taken from the executor config: it is an
             # infrastructure field, so a caller-supplied value must never win.
@@ -405,7 +416,7 @@ class ToolExecutor:
             # (fail closed) rather than silently executing the tool ungated.
             if session_perms_obj is not None and not GATE_AVAILABLE:
                 if not _ensure_gate_imported():
-                    return {'result': 'Permission denied: security gate unavailable; tool execution denied (fail-closed).', 'tool_type': 'normal'}
+                    return {'result': 'Permission denied: security gate unavailable; tool execution denied (fail-closed).', 'tool_type': 'normal', 'success': False}
 
             # Assigned by the gate branch below; pre-declared so the
             # worker-context injection further down can tell whether a live
@@ -425,7 +436,7 @@ class ToolExecutor:
                 # categories have nothing to be permissive about and keep
                 # executing (e.g. introspection probes in tests).
                 if workspace_path and not ws_id and required_categories:
-                    return {'result': f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; tool execution denied (fail-closed).", 'tool_type': 'normal'}
+                    return {'result': f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; tool execution denied (fail-closed).", 'tool_type': 'normal', 'success': False}
                 # Fallback workspace-id resolution when no workspace_path is
                 # configured: prefer the explicitly passed workspace_id (agent
                 # session context), then a cached best-effort lookup of the
@@ -523,7 +534,7 @@ class ToolExecutor:
                     self._record_permission_widening(effective, session_id)
 
                 if not ok:
-                    return {'result': error_msg, 'tool_type': 'normal'}
+                    return {'result': error_msg, 'tool_type': 'normal', 'success': False}
 
                 # Resource binding check: tools bound to a hidden resource
                 # (requires_resource, e.g. git) may only run when the session
@@ -537,7 +548,7 @@ class ToolExecutor:
                         description=getattr(tool_class, 'describe_action', lambda a: '')(arguments),
                     )
                     if not ok2:
-                        return {'result': err2, 'tool_type': 'normal'}
+                        return {'result': err2, 'tool_type': 'normal', 'success': False}
             # Inject session permissions dict so the tool can apply
             # fine-grained security (e.g., DockerCodeRunner uses it
             # to decide container network/filesystem modes).
@@ -628,7 +639,7 @@ class ToolExecutor:
                         tool_args = injector.inject(tool_args)
                 except Exception as exc:
                     log('ERROR', 'core.credentials', "Credential injection failed for tool '%s': %s", tool_name, exc)
-                    return {'result': f"Credential injection failed: {exc}", 'tool_type': 'normal'}
+                    return {'result': f"Credential injection failed: {exc}", 'tool_type': 'normal', 'success': False}
 
                 # Audit trail: one CREDENTIAL_USE event per injected credential
                 # name.  Names only -- values are never placed on the bus.
@@ -694,9 +705,9 @@ class ToolExecutor:
             else:
                 return {'result': tool_result, 'tool_type': 'normal'}
         except ValidationError as e:
-            return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
+            return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal', 'success': False}
         except Exception as e:
-            return {'result': f'Error executing tool: {e}', 'tool_type': 'normal'}
+            return {'result': f'Error executing tool: {e}', 'tool_type': 'normal', 'success': False}
 
     def _record_permission_widening(self, effective: Any, session_id: str) -> None:
         """Audit per-category permission WIDENING between tool calls (worker).
