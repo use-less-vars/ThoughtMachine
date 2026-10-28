@@ -840,3 +840,86 @@ describe('SessionTab — cold-start status notice vs conversation_changed', () =
   });
 });
 
+// ────────────────────────────────────────────────────────────────────────────
+// feat/token-streaming — assistant_delta → in-flight bubble reconciliation.
+//
+// The backend streams `assistant_delta` ({session_id, text, turn}) per token and
+// still sends the terminal `turn` as a `conversation_changed` replace. The tab
+// appends deltas to a LOCAL in-flight bubble (never a store write) and must
+// reconcile it against that replace: if both survive, the streamed text renders
+// twice. Coalescing is per animation frame, so the assertions wait for the flush.
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — assistant_delta streaming', () => {
+  it('reconciles streamed deltas with the terminal turn (text rendered exactly once)', async () => {
+    renderTab({ sessionId: 'sess-stream' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({ type: 'conversation_changed', session_id: 'sess-stream', messages: [] })
+    );
+
+    // Two deltas for the SAME turn coalesce into one in-flight assistant bubble.
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-stream', text: 'Hel', turn: 1 }));
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-stream', text: 'lo', turn: 1 }));
+    expect(await screen.findByText('Hello')).toBeInTheDocument();
+
+    // The terminal `turn` arrives as a conversation_changed replace carrying the
+    // persisted message: it must REPLACE the in-flight bubble, not join it.
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-stream',
+        messages: [
+          { role: 'user', content: 'prompt-marker' },
+          { role: 'assistant', content: 'Hello' },
+        ],
+      })
+    );
+    expect(await screen.findByText('prompt-marker')).toBeInTheDocument();
+
+    // Visible-text proof (not element-count only): the streamed text must be
+    // really present, exactly once, and never as the in-flight buffer glued to
+    // the persisted copy.
+    const helloEls = screen.getAllByText('Hello');
+    expect(helloEls).toHaveLength(1);
+    expect(helloEls[0].textContent).toBe('Hello');
+    const bodyText = document.body.textContent || '';
+    expect(bodyText.match(/Hello/g) || []).toHaveLength(1);
+    expect(bodyText).not.toContain('HelHelo');
+    expect(bodyText).not.toContain('HelloHello');
+  });
+
+  it('discards the in-flight bubble when the run ends without a terminal turn', async () => {
+    renderTab({ sessionId: 'sess-crash' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-crash',
+        messages: [{ role: 'user', content: 'prompt-marker' }],
+      })
+    );
+    expect(await screen.findByText('prompt-marker')).toBeInTheDocument();
+
+    act(() =>
+      ws.receive({ type: 'assistant_delta', session_id: 'sess-crash', text: 'partial-text-marker', turn: 1 })
+    );
+    expect(await screen.findByText('partial-text-marker')).toBeInTheDocument();
+    // The in-flight bubble is local state only — the store never sees a
+    // delta-only message (pagination offsets and reloads stay server-truthful).
+    expect(useStore.getState().sessionMessages['sess-crash']).toHaveLength(1);
+
+    // Crash / hard stop: the run ends with state_changed is_running:false and no
+    // conversation_changed for the streamed turn — the phantom text must go.
+    act(() =>
+      ws.receive({
+        type: 'state_changed',
+        session_id: 'sess-crash',
+        state: 'IDLE',
+        is_running: false,
+      })
+    );
+    await waitFor(() => expect(screen.queryByText('partial-text-marker')).toBeNull());
+    expect(screen.getByText('prompt-marker')).toBeInTheDocument();
+  });
+});
+

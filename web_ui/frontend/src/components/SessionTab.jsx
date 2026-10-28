@@ -19,7 +19,7 @@
  * selectors; prop-drilling removal is sub-step 2.4.
  */
 
-import React, { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import useStore from '../store/useStore'
 import ChatPanel from './ChatPanel'
 import QueryBar from './QueryBar'
@@ -109,6 +109,22 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [scrollToBottomKey, setScrollToBottomKey] = useState(0) // incremented to force scroll to bottom (R3)
   const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
   const dataReceivedRef = useRef(false) // true once we've received a response to our load
+  // ── Streaming assistant text (feat/token-streaming) ──────────────────────
+  // The in-flight assistant bubble lives ONLY in this component's local state:
+  // a delta-only message must never be persisted to the store. It is built from
+  // coalesced `assistant_delta` events and reconciled (replaced) by the terminal
+  // `conversation_changed` for the same turn.
+  const [inFlight, setInFlight] = useState(null) // null | { content }
+  const streamBufferRef = useRef('')  // text received since the last flush
+  const streamFrameRef = useRef(null)  // pending rAF/timeout handle
+  // Cancel a pending coalescing frame on unmount (no setState after unmount).
+  useEffect(() => () => {
+    if (streamFrameRef.current != null) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(streamFrameRef.current)
+      else clearTimeout(streamFrameRef.current)
+      streamFrameRef.current = null
+    }
+  }, [])
   // Read mode from the store (sessionModes is keyed by sessionId; the prop
   // was removed — SessionTab reads it directly like other consumers).
   const mode = useStore((s) => (sessionId ? (s.sessionModes[sessionId] || null) : null))
@@ -129,6 +145,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const providers = sessionConfig?.providers ?? []
   const availableTools = sessionConfig?.tools ?? []
   const history = sessionMessages ?? EMPTY_MESSAGES
+  // Streaming view: history plus (only while a turn is streaming) the in-flight
+  // assistant bubble. Kept out of `history` because the store may not hold a
+  // delta-only message and because `history.length` is the pagination offset.
+  const viewMessages = useMemo(() => {
+    if (!inFlight || !inFlight.content) return history
+    return [...history, { role: 'assistant', content: inFlight.content }]
+  }, [history, inFlight])
   const status = sessionState?.state ?? 'IDLE'
   const isRunning = sessionState?.isRunning ?? false
   const contextLength = sessionState?.contextLength ?? 0
@@ -478,6 +501,40 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     connectSessionWsRef.current()
   }, [hubReady, isActive])
 
+  // ── Streaming deltas: rAF coalescing + in-flight bubble ──────────────────
+  // Deltas arrive once per token; flushing each one straight into React state
+  // would re-render the chat per token, so text received since the last frame
+  // is buffered and flushed once per animation frame (≈60 Hz — the display
+  // rate, nothing faster is observable). Coalescing lives here rather than in
+  // the bridge: a bridge-side timer would have to be flushed before the
+  // terminal `turn` conversation_changed, or a late delta could land AFTER the
+  // replace and resurrect the bubble.
+  const clearInFlight = () => {
+    if (streamFrameRef.current != null) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(streamFrameRef.current)
+      else clearTimeout(streamFrameRef.current)
+      streamFrameRef.current = null
+    }
+    streamBufferRef.current = ''
+    setInFlight(null)
+  }
+
+  const flushDeltas = () => {
+    streamFrameRef.current = null
+    const pending = streamBufferRef.current
+    streamBufferRef.current = ''
+    if (!pending) return
+    setInFlight((prev) => ({ content: ((prev && prev.content) || '') + pending }))
+  }
+
+  const pushDelta = (text) => {
+    if (!text) return
+    streamBufferRef.current += text
+    if (streamFrameRef.current != null) return
+    if (typeof requestAnimationFrame === 'function') streamFrameRef.current = requestAnimationFrame(flushDeltas)
+    else streamFrameRef.current = setTimeout(flushDeltas, 16)
+  }
+
   // ── Event router ─────────────────────────────────────────────────────────
   function handleEvent(msg) {
     // ── Debug: log conversation data ─────────────────────────────────
@@ -495,6 +552,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           break
         }
         useStore.getState().receiveStateChanged(msg.session_id || currentSessionIdRef.current, msg.state)
+        // Crash tolerance: the run is over without a terminal conversation_changed
+        // for the streamed turn, so drop the half-streamed bubble rather than
+        // leaving phantom text on screen.
+        if (msg.is_running === false) clearInFlight()
         break
 
       case 'tokens_updated':
@@ -528,6 +589,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           onWorkerEventRef.current?.(effectiveSessionId, msg)
         }
         break
+
+      case 'assistant_delta': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] assistant_delta for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Append to the in-flight bubble (coalesced per frame). Never a store
+        // write, and never a list replace.
+        pushDelta(msg.text || '')
+        break
+      }
 
       case 'conversation_changed':
         if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
@@ -584,6 +656,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           setTotalMessages(msg.total_count)
         }
         setHasMore(msg.has_more === true)
+        // The terminal turn event for the streamed text has arrived: the server
+        // history now owns those characters, so drop the in-flight bubble in the
+        // same handler (no duplicate render, no resurrect-on-late-delta).
+        clearInFlight()
         break
 
       case 'more_messages':
@@ -1238,7 +1314,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               onDismiss={() => setSecurityPrompt(null)}
             />
           )}
-          <ChatPanel messages={history} loadMore={loadMore} hasMore={hasMore} scrollToBottomKey={scrollToBottomKey} />
+          <ChatPanel messages={viewMessages} loadMore={loadMore} hasMore={hasMore} scrollToBottomKey={scrollToBottomKey} />
           <QueryBar
             sendCommand={sendCommand}
             status={status}

@@ -3024,6 +3024,17 @@ class WebAgentBridge:
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
+        elif event_type == "text_delta":
+            # Token-level assistant text. Rendered into an in-flight bubble by
+            # the frontend and reconciled against the terminal `turn`
+            # conversation_changed. session_id rides INSIDE the payload because
+            # the forwarder's broadcast() ignores its session_id argument.
+            self._forwarder.broadcast(self._session_id, "assistant_delta", {
+                "session_id": self._session_id,
+                "text": raw_event.get("text", ""),
+                "turn": raw_event.get("turn"),
+            })
+
         elif event_type in ("user_query", "turn", "tool_result"):
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:
