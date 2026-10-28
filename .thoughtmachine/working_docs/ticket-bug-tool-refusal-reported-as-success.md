@@ -3,7 +3,7 @@
 **Filed:** 2026-10-27, from a scripted single-turn reproduction
 **Category:** bug
 **Severity:** MEDIUM — the event stream lies about the outcome of a refused call
-**Status:** open; reproduced; pinned by a non-strict xfail
+**Status:** fix built and pushed, NOT merged — `c37943a1` on `fix/tool-refusal-structure` (base `12bd6408`); full gate 5592 passed, 66 skipped, 5 xfailed, exit 0. The prose marker this ticket describes ("TOOL CALL REJECTED") still has no producer anywhere in the tree: the fix carries the verdict structurally as `'success': False`, and `agent.py` reads that before falling back to the sniff.
 
 ## Summary
 
@@ -53,6 +53,8 @@ fallback is a decision; if it does, each remaining producer needs naming.
 deliberately non-strict so the fix surfaces as an XPASS rather than a silent no-op.
 **When this ticket is fixed the mark must be tightened** (removed, or `strict=True`),
 not left behind as a passing xfail.
+
+As of `c37943a1` the xfail count is unchanged (5 xfailed, 0 xpassed), so this pin was not tightened by the fix; tightening it is still owed.
 
 ## Filed
 
