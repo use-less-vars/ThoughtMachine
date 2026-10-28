@@ -1784,14 +1784,88 @@ class WebAgentBridge:
                             else:
                                 log('INFO', 'server.bridge', f'Worker resumed: {wname}')
 
+    def _stop_session_workers(self) -> int:
+        """Cooperatively stop every worker thread of THIS session.
+
+        Worker sub-agents are children of the session, not of the parent's
+        current turn: unless something stops them here they outlive the Stop
+        button and keep consuming tokens and containers in the background.
+
+        Fail-closed on a missing session id: without an id there is no way to
+        tell our workers from another session's, and stopping nothing is the
+        only safe answer (the same rule ``WorkerRegistry.shutdown_workers``
+        enforces).
+
+        The registry is snapshotted under ``_registry_lock`` and the lock is
+        RELEASED before any ``thread.stop()`` is called: a worker's own stop
+        path writes status/command files and touches the registry, so calling
+        into the worker while holding that lock would deadlock against it.
+
+        Returns the number of workers asked to stop.
+        """
+        if not (WORKER_BUS_AVAILABLE and _worker_registry is not None
+                and _registry_lock is not None):
+            return 0
+        session_id = self._session_id
+        if not session_id:
+            log('WARNING', 'server.bridge',
+                'request_stop(): no session id on this bridge — worker stop '
+                'cascade skipped (stopping nothing rather than every session)')
+            return 0
+
+        targets: List[Tuple[str, Any]] = []
+        with _registry_lock:
+            for key, thread in list(_worker_registry.items()):
+                if len(key) >= 3:
+                    sid, wname, _iid = key
+                else:
+                    sid, wname = key
+                if sid == session_id:
+                    targets.append((wname, thread))
+
+        stopped = 0
+        for wname, thread in targets:
+            if thread is None:
+                continue
+            is_alive = getattr(thread, 'is_alive', None)
+            if callable(is_alive):
+                try:
+                    if not is_alive():
+                        continue
+                except Exception:
+                    pass
+            # Already terminal or already stopping: stop() is cooperative and
+            # not idempotent (it re-publishes WORKER_STOPPING), so a second
+            # Stop press must not re-stop a worker that is on its way out.
+            if getattr(thread, 'status', None) in ('stopping', 'stopped'):
+                continue
+            stop_worker = getattr(thread, 'stop', None)
+            if not callable(stop_worker):
+                continue
+            try:
+                # Cooperative: never Thread.kill. The worker truncates at its
+                # next checkpoint and exits its run loop on its own.
+                stop_worker()
+                stopped += 1
+                log('INFO', 'server.bridge', f'Worker stopped by request_stop(): {wname}')
+            except Exception as exc:
+                log('WARNING', 'server.bridge', f'Failed to stop worker {wname}: {exc}')
+        if stopped:
+            log('INFO', 'server.bridge',
+                f'request_stop(): {stopped} worker(s) stopping for session {session_id}')
+        return stopped
+
     def request_stop(self) -> bool:
         """Truncate the CURRENT TURN and keep the bridge thread and session alive.
 
-        This is the Stop-button path. It is deliberately narrow: it asks the
-        controller for a turn-level halt (the agent breaks out of the stream,
-        commits the partial assistant text it had already produced and emits its
-        'interrupted' terminal), and touches nothing else — no teardown, no
-        '[STOP]', no thread join, no unregistration, no queued-config drop.
+        This is the Stop-button path. For the PARENT it is deliberately narrow:
+        it asks the controller for a turn-level halt (the agent breaks out of the
+        stream, commits the partial assistant text it had already produced and
+        emits its 'interrupted' terminal), and touches nothing else — no
+        teardown, no '[STOP]', no thread join, no unregistration, no queued-config
+        drop. The session's worker sub-agents, however, ARE stopped: they are
+        children of the session, so leaving them running would mean the user's
+        Stop only stopped half the work.
 
         Contrast with :meth:`stop`, which is TEARDOWN: it shuts the controller
         down (and, on the legacy no-controller path, ends the bridge loop). Use
@@ -1801,11 +1875,16 @@ class WebAgentBridge:
         BEFORE the halt, since the halt itself clears that flag), so a caller can
         distinguish "a turn was halted" from "nothing was running".
         """
+        # Cascade first: the workers must stop whatever the parent path does,
+        # including the legacy no-controller path and the build whose controller
+        # predates request_halt().
+        workers_stopped = self._stop_session_workers()
+
         if self._controller is not None:
             busy = bool(getattr(self._controller, 'is_busy', False))
             log('INFO', 'server.bridge',
                 f'request_stop(): turn-level halt requested (busy={busy}, '
-                'session retained)')
+                f'workers_stopped={workers_stopped}, session retained)')
             request_halt = getattr(self._controller, 'request_halt', None)
             if not callable(request_halt):
                 log('WARNING', 'server.bridge',
