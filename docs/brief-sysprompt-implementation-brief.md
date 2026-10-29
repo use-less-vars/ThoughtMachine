@@ -1,19 +1,19 @@
 # Brief — System-Prompt Addendum: Implementation
 
-**Status:** implementation brief. Awaiting three rulings (§4). No production code until those are answered.
-**Design:** `docs/design-sysprompt-addendum-and-injection.md`, 590 lines, on branch `docs/sysprompt-addendum-design` at `8a2e9e38`. **That file is not on `dev`** — see §0.1.
-**Audience:** the incoming Main engineer, who owns the three rulings in §4.
-**Authored by:** Gen 54 worker-side, from a verified read of `dev` at `9831e08b`.
+**Status:** implementation brief. All three rulings are in (§4.0) — implementation may start. Slice order and gating in §6.
+**Design:** `docs/design-sysprompt-addendum-and-injection.md`, 590 lines, on `dev` at `8a2e9e38` (merged in `9d964208`, PR #254) — see §0.1.
+**Audience:** the incoming Main engineer, who implements slices 1-5.
+**Authored by:** Gen 54 worker-side, from a verified read of `dev` at `9831e08b`; rulings recorded against `dev` at `9d964208`.
 
 ---
 
 ## 0. Provenance, and two housekeeping notes
 
-### 0.1 The design doc this brief implements is not on `dev`
+### 0.1 The design doc is on `dev` (it was not, at authoring time)
 
-`dev` = `origin/dev` = `9831e08b`. Asking git for `docs/design-sysprompt-addendum-and-injection.md` at that ref returns `fatal: path ... does not exist in 'dev'`. The design pass lives on `docs/sysprompt-addendum-design` at `8a2e9e38`, three commits: `d8696a4c` (gitignore ticket), `bc02333e` (the design pass), `8a2e9e38` (§13 rulings).
+When this brief was authored, `dev` = `origin/dev` = `9831e08b`, and asking git for `docs/design-sysprompt-addendum-and-injection.md` at that ref returned `fatal: path ... does not exist in 'dev'`. That gap is now closed: PR #254 merged as `9d964208`, so current `dev` carries the design doc. The design pass itself is three commits on `docs/sysprompt-addendum-design`, all now in `dev`'s history: `d8696a4c` (gitignore ticket), `bc02333e` (the design pass), `8a2e9e38` (§13 rulings).
 
-So read this brief **alongside that branch**, not alongside `dev`. Every `§n` reference below resolves in the *design doc*; every `file:line` reference resolves in **`dev@9831e08b`**. Those are two different trees today. If the design PR merges before this one, delete this subsection rather than correcting it.
+#254 was briefly blocked by newly-enabled required status checks and had to be re-verified against a `dev` that had moved; it merged immediately before this brief. On current `dev`, every `§n` reference below resolves in the design doc and every `file:line` reference resolves in the same tree. **If you are on `dev` and the design doc is absent, that is a real defect — stop and report it** rather than working around it.
 
 ### 0.2 Push was not possible from the authoring machine
 
@@ -31,7 +31,7 @@ The design pass established one thing cheaply: **the sync loop already contains 
 
 The sink is a **system-prompt addendum**: a small, mutable, session-scoped block of text appended to the composed system prompt. Updatable at the next token boundary, survives context compaction, persists with the session.
 
-**The gate.** Three schema questions are unresolved, and each changes the shape of the code, the shape of the tests, and the cost of being wrong. They are §4.1 (D-1), §4.2 (D-3), §4.3 (D-7). **Do not write production code before they are ruled on.** The cost of waiting is one round trip; the cost of guessing is at least one rewrite — D-1 decides the session schema, D-7 decides whether the addendum can silently lose an entry, D-3 decides whether a 14-site notification migration can even be in the same PR.
+**The gate.** Three schema questions were open, and each changed the shape of the code, the shape of the tests, and the cost of being wrong. They are §4.1 (D-1), §4.2 (D-3), §4.3 (D-7). **All three are now ruled (§4.0) — production code may start.** The cost of waiting is one round trip; the cost of guessing is at least one rewrite — D-1 decides the session schema, D-7 decides whether the addendum can silently lose an entry, D-3 decides whether a 14-site notification migration can even be in the same PR.
 
 Everything *else* is settled. §2 lists the rulings that are already binding. Anything in this brief that contradicts them is a bug in the brief.
 
@@ -57,12 +57,12 @@ From the design pass's §13.1. Non-negotiable for this implementation. If one tu
 
 ### In scope
 
-1. Session schema and persistence for the addendum — **gated on §4.1 (D-1)**.
+1. Session schema and persistence for the addendum — **unblocked (D-1: dedicated field)**.
 2. Composition of the addendum into the system string, in the right place, over the right base text.
 3. A survival test across real compaction.
 4. The Tier 1 drain, the `addendum_updated` runtime event, the bridge arm, the frontend arm.
-5. Budget enforcement — **gated on §4.3 (D-7)**.
-6. Narrowing `[SYSTEM NOTIFICATION]` sites — **gated on §4.2 (D-3)**; may be descoped entirely.
+5. Budget enforcement — **unblocked (D-7: refuse)**, and it must surface the refusal in the UI (§4.0).
+6. Narrowing `[SYSTEM NOTIFICATION]` sites — **ruled out of this implementation** (D-3: defer, §4.2). Tracked as a named backlog ticket, not silently dropped.
 
 ### Out of scope — split-off tickets
 
@@ -79,13 +79,26 @@ Also out of scope, from design §10: prompt caching (there is none in the repo �
 
 ---
 
-## 4. The three `[PENDING MAIN RULING]` items
+## 4. The three rulings
 
-Each of these changes the code shape, the test shape, and the cost of being wrong. For each: the question, the two paths, what each path forces you to touch, **what the test looks like under each path** (asked for explicitly, so that the ruling can be made by reading the test rather than by reasoning about the code), my recommendation, and the cost of my being wrong.
+Each of these changes the code shape, the test shape, and the cost of being wrong. For each: the question, the two paths, what each path forces you to touch, **what the test looks like under each path** (asked for explicitly, so that the ruling can be made by reading the test rather than by reasoning about the code), the recommendation that was made, and what the cost would have been had the ruling gone the other way. The three rulings are recorded in §4.0; the path analysis below is kept as the record, not as homework.
 
 A note on how to read the tests below: none of them are integration tests. Every one is a unit test over a pure function or an in-memory session object. If a proposed test needs a live model, the test is wrong.
 
-### 4.1 `[PENDING MAIN RULING]` — D-1: where does the addendum live on the session object?
+### 4.0 Rulings — all three settled
+
+| # | Ruling | What it forces |
+|---|---|---|
+| **D-1** | **Dedicated session field** (Path A) | Slice 1 touches the `session/models.py` and `session/store.py` serialisers. `metadata` is explicitly rejected: an untyped blob that is echoed to the client and reinterpreted at every read site is a trap. |
+| **D-3** | **Defer** (Path B) | Slice 6 does not ship. The 14 sites become a named backlog ticket, and the §4.2 Path B obligations — coexistence and attribution — are locked in with it. |
+| **D-7** | **Refuse** (Path A), **and fail visibly** | The refusal surfaces in the UI, not only to the caller. See below. |
+
+Two notes on D-3 and D-7.
+
+- **D-3's deferral is conditional on the obligations being *recorded*, not on good intentions.** The coexistence and attribution tests in §4.2 are what stop "defer" becoming "never". The backlog ticket must carry them and must name all 14 sites.
+- **D-7's ruling is stronger than the recommendation it accepted.** Refusing is only half of it: the refusal has to be *visible in the UI*, not merely returned to the caller. The carrier is the design's Tier 2, UI-only runtime kind — `runtime_notice` (design §7) — which must **not** enter `StreamEvent`. That is why **slice 5 cannot land before slice 4 has built the client channel** that carries it.
+
+### 4.1 `[RULED — dedicated session field]` — D-1: where does the addendum live on the session object?
 
 **The question.** The addendum needs a storage shape. Two candidates: a first-class session field, or a list of entries tucked into the existing `metadata` dict.
 
@@ -125,11 +138,11 @@ Forces changes in **no** serialiser: `metadata` is already persisted, so `sessio
 
 **Risks specific to Path B.** `metadata` is a free-form dict. Nothing in the schema says what is in it, which means: (i) anything that echoes `metadata` to the client echoes the model's memory text too; (ii) anything that summarises or truncates display state can touch it; (iii) an entry list in an untyped dict has no place to express the `pinned` and `budget_tokens` semantics that D-7 depends on, so Path B makes D-7 harder, not easier. There is a real, if small, chance that Path B leaks internal memory text to the UI.
 
-**My recommendation: Path A.** Two reasons. First, design §6.6 (C5) already treats the addendum as *a mutable session field* — that phrasing is a constraint on mutability, not on storage, but a first-class field is the shape the rest of the design assumes. Second, Path B defers a schema decision while making every read site responsible for interpreting an untyped blob; the saving is two call sites and the cost is paid at every future read.
+**Ruling: Path A — dedicated session field.** (Recommended, and accepted.) Two reasons. First, design §6.6 (C5) already treats the addendum as *a mutable session field* — that phrasing is a constraint on mutability, not on storage, but a first-class field is the shape the rest of the design assumes. Second, Path B defers a schema decision while making every read site responsible for interpreting an untyped blob; the saving is two call sites and the cost is paid at every future read.
 
-**Cost if I am wrong.** If Main rules B, the wasted work is small: two serialiser call sites and a shape — a localised revert, no data migration, because nothing has shipped. If Main rules A and we had built B, the follow-up is a real migration with real persisted sessions in the wild. **The asymmetry favours A**, which is why A is the recommendation even though it is the more committed option.
+**Cost had the ruling gone the other way.** If Main rules B, the wasted work is small: two serialiser call sites and a shape — a localised revert, no data migration, because nothing has shipped. If Main rules A and we had built B, the follow-up is a real migration with real persisted sessions in the wild. **The asymmetry favours A**, which is why A is the recommendation even though it is the more committed option.
 
-### 4.2 `[PENDING MAIN RULING]` — D-3: how fast do we narrow `[SYSTEM NOTIFICATION]`?
+### 4.2 `[RULED — defer]` — D-3: how fast do we narrow `[SYSTEM NOTIFICATION]`?
 
 **The question.** There are 14 sites that emit a `[SYSTEM NOTIFICATION]` message with `role='user'`, marker defined at `agent/.../message.py:16`. Design §8 gives the rule for what belongs where: **something that *happened* is a notification; something that is *true now* is an addendum.** Applying that rule across 14 sites is a migration with a blast radius much larger than the addendum itself. Does it belong in this implementation?
 
@@ -154,10 +167,10 @@ Forces **no** changes to the 14 sites. All existing notification tests stay gree
 2. *Attribution:* a table-driven test that asserts, for a named set of facts, which channel each one is in. This is the test that keeps Path B honest: without it, the two channels drift and the same fact lands in both.
 3. *No change* to the 14 existing tests. Under Path B that is a feature, and it is the whole argument: zero churn on the most-touched assertions in the codebase.
 
-**My recommendation: Path B, with a hard commitment.** The reasoning is not that narrowing is unnecessary — it is that Path B keeps the addendum PR reviewable. A PR that adds a feature *and* rewrites 14 prompt-composition sites is a PR nobody can actually review, and the failure mode under Path A is subtle: a botched conversion can fabricate a role (violating P1) or silently drop a fact, and 14 conversions in one diff is 14 chances to do that invisibly. Path B's risk is the opposite kind — two channels for "current state" indefinitely — which is visible, boring, and fixable per site. **The commitment:** the follow-up must be filed as a ticket that names all 14 sites, so Path B does not become "never".
+**Ruling: Path B — defer, with a hard commitment.** (Recommended, and accepted.) The reasoning is not that narrowing is unnecessary — it is that Path B keeps the addendum PR reviewable. A PR that adds a feature *and* rewrites 14 prompt-composition sites is a PR nobody can actually review, and the failure mode under Path A is subtle: a botched conversion can fabricate a role (violating P1) or silently drop a fact, and 14 conversions in one diff is 14 chances to do that invisibly. Path B's risk is the opposite kind — two channels for "current state" indefinitely — which is visible, boring, and fixable per site. **The commitment:** the follow-up must be filed as a ticket that names all 14 sites, so Path B does not become "never".
 
-**Cost if I am wrong.** If Main rules A and we built B, the remaining work is identical to what A would have been — same sites, same conversions — just scheduled later. Nothing is thrown away. If Main rules B and we built A, we would have shipped an unreviewable PR. Again the asymmetry favours the smaller commitment.
-### 4.3 `[PENDING MAIN RULING]` — D-7: what does the budget do when it is full?
+**Cost had the ruling gone the other way.** If Main rules A and we built B, the remaining work is identical to what A would have been — same sites, same conversions — just scheduled later. Nothing is thrown away. If Main rules B and we built A, we would have shipped an unreviewable PR. Again the asymmetry favours the smaller commitment.
+### 4.3 `[RULED — refuse]` — D-7: what does the budget do when it is full?
 
 **The question.** The addendum has a `budget_tokens` ceiling. Writes can arrive from the operator or the mailbox, in any order, while a turn is running. What happens on the write that would exceed the ceiling?
 
@@ -183,13 +196,13 @@ Two candidate semantics, and they differ in one respect only — but it is the r
 3. *Oversized single entry.* One entry larger than the entire budget: refuse, under both paths, because even evicting everything cannot fit it. Testing this prevents an infinite eviction loop, which is a real way to hang a turn.
 4. *Report survives the wire.* The evicted `entry_id` reaches the client in the `addendum_updated` event, so a UI can show that memory shrank. Under Path B this is not optional reporting hygiene — it is the only mechanism by which silent loss becomes non-silent.
 
-**My recommendation: Path A, refuse.**
+**Ruling: Path A — refuse, and surface it visibly.** (Recommended, and accepted — plus one requirement beyond the recommendation: the refusal must reach the UI, not only the caller. See §4.0.)
 
 A memory feature that can silently lose an entry is a memory feature nobody can trust, and the failure is invisible: the model simply stops knowing something, and no one can tell whether that is a bug or the budget working as designed. Refusal is a visible, recoverable, operator-facing failure — the operator writes again, smaller, and knows the state of the world. Path B's advantage is that the write never bounces, which matters if writes were frequent and automated; they are not, because per C2 they come from the operator and the mailbox, which is human-paced.
 
 There is a second reason, and it is the one that decided it: **under Path A the `pinned` flag is nearly redundant, and that is fine.** Under Path A the semantics are complete without eviction — pinning exists so that a future Path B (or a future T-2, where the model writes) has a safety apparatus already in the schema. Under Path B, `pinned` is load-bearing from day one, which means a `pinned` bug and a budget bug interact, and the tests multiply.
 
-**Cost if I am wrong.** If Main rules B, the additional work is one eviction function and its four tests — small, additive, and it does not invalidate any of the Path A tests except the refusal assertion. If Main rules A and we had built B, we ship a memory feature whose losses are only detectable by grepping logs. The asymmetry favours A.
+**Cost had the ruling gone the other way.** If Main rules B, the additional work is one eviction function and its four tests — small, additive, and it does not invalidate any of the Path A tests except the refusal assertion. If Main rules A and we had built B, we ship a memory feature whose losses are only detectable by grepping logs. The asymmetry favours A.
 
 **One thing the ruling does not settle, flagged early:** the unit of `budget_tokens`. Nothing in this design establishes a token estimator available at the write boundary, and a character-count proxy is wrong by a variable factor across providers. §9 lists this as an open question rather than pretending it is decided; if Main wants the budget enforced correctly it needs to name the estimator. Path A makes this cheap to defer: refuse on a conservative estimate, and the cost of the estimate being slightly wrong is a needless refusal rather than a silent eviction.
 
@@ -237,9 +250,9 @@ One consequence for the slice plan (§6, slice 4): the frontend arm and its test
 
 ## 6. Slice plan
 
-Six slices. Each is independently reviewable and independently revertable, and each is ordered so that the tests it needs can be written against code that already exists. Slices 1, 5 and 6 are gated on the rulings in §4 — if a ruling is outstanding, start at slice 2's *test* and leave the production code.
+Six slices. Each is independently reviewable and independently revertable, and each is ordered so that the tests it needs can be written against code that already exists. With the rulings in §4.0: slices 1-4 are unblocked now, slice 5 is unblocked but depends on slice 4 having built the client channel that carries the visible refusal, and slice 6 does not ship in this implementation.
 
-### Slice 1 — schema and persistence · **gated on §4.1 (D-1)**
+### Slice 1 — schema and persistence · **unblocked (D-1: dedicated field)**
 
 Add the addendum's storage shape and both serialiser directions. Defaults for a session that predates the field. **No behaviour change:** nothing reads the field yet, so the only way this slice can break anything is by being wrong about defaults, which is what its tests are for.
 
@@ -269,13 +282,13 @@ The bridge arm renames per arm as `bridge.py:3144-3153` already does for existin
 
 Done when: a duplicate `addendum_updated` carrying the same entry set is idempotent; an out-of-order pair converges on the same entry set (C4 — order-insensitive, no reliance on `seq`); a genuinely unknown kind hits the frontend `default:` without throwing; and the new kind's frontend arm is asserted by a *state change*, not by absence of exception.
 
-### Slice 5 — budget enforcement · **gated on §4.3 (D-7)**
+### Slice 5 — budget enforcement · **unblocked (D-7: refuse) — must surface the refusal in the UI**
 
 Enforced at the write boundary, not at composition (§4.3). Lands after slice 4 because the reporting half of Path B rides on `addendum_updated`, and a budget that cannot report an eviction is Path B with its only safety property removed.
 
-### Slice 6 — narrowing `[SYSTEM NOTIFICATION]` · **gated on §4.2 (D-3), skippable**
+### Slice 6 — narrowing `[SYSTEM NOTIFICATION]` · **deferred out of this implementation (D-3)**
 
-If D-3 rules Path B, this slice does not exist in this implementation and the 14 sites stay a named backlog ticket. If it rules Path A, it is the largest slice by test churn and should still land **last**, after everything above is merged and green, so that a bisect over prompt-shape changes has a clean starting point.
+D-3 ruled defer, so this slice does not ship in this implementation; the 14 sites stay a named backlog ticket. If that decision is ever reversed to Path A, this is the largest slice by test churn and should still land **last**, after everything above is merged and green, so that a bisect over prompt-shape changes has a clean starting point.
 
 ---
 
@@ -285,7 +298,7 @@ From design §9. Restated here with the slice that satisfies each, because the m
 
 | # | Obligation | Slice | Note on how it fails if done carelessly |
 |---|---|---|---|
-| 1 | **P1 — no fabricated roles.** The role multiset of the built request is exactly what it was before the addendum, plus/minus the notification sites converted in slice 6. | 2 | Converting a notification into a fabricated `assistant` or `system` role to "make it stick" passes a naive presence assertion. Assert the multiset, not the presence. |
+| 1 | **P1 — no fabricated roles.** The role multiset of the built request is exactly what it was before the addendum, unchanged — slice 6 does not ship (D-3). | 2 | Converting a notification into a fabricated `assistant` or `system` role to "make it stick" passes a naive presence assertion. Assert the multiset, not the presence. |
 | 2 | **P2 — exactly one `role='system'`, asserted per adapter.** | 2 | Asserting on the shared array only. Anthropic is last-wins (`anthropic_provider.py:88-91`, `:122`), so a second system message vanishes silently there while the generic assertion stays green. |
 | 3 | **P3 — an in-flight completion is unaffected.** The request for a turn that is already streaming is byte-identical whether or not a write lands mid-turn. | 4 | Testing only that "the next request differs". The obligation is about the request that must *not* change. |
 | 4 | **P4 — base prefix byte-stable, append-only, oldest-first.** | 2 | Re-sorting entries by `ts` or injecting at the front. Both produce a correct-looking prompt that is not append-only, and both are invisible without a byte comparison against the previous request. There is zero prompt caching in the repo, so this is cheap to satisfy and cheap to break undetected. |
@@ -321,7 +334,7 @@ Seven ways this goes wrong quietly. Each is a real failure mode found during the
 
 Not rulings — these are smaller than the three in §4, but each will otherwise be decided by whoever writes the code first, which is a worse process.
 
-1. **What is the unit of `budget_tokens`, and which estimator?** No token estimator was established as available at the write boundary, and a character-count proxy is wrong by a variable factor across providers. Path A tolerates a conservative estimate (cost of being wrong: a needless refusal); Path B does not (cost: wrongful eviction). If the answer is "a character budget, renamed", say so, and D-7 gets much simpler.
+1. **What is the unit of `budget_tokens`, and which estimator?** No token estimator was established as available at the write boundary, and a character-count proxy is wrong by a variable factor across providers. Path A tolerates a conservative estimate (cost of being wrong: a needless refusal); Path B does not (cost: wrongful eviction). If the answer is "a character budget, renamed", say so, and D-7 gets much simpler. D-7 ruled **refuse**, which makes a conservative estimate the safe default: if the estimate is wrong the operator gets a visible refusal, not a wrongful eviction. **Slice 5 still cannot land without an answer to this question** — "refuse" needs a number to refuse against.
 2. **Is there an entry-count cap distinct from the token budget?** A hundred tiny entries and three large ones behave very differently in a prompt, and only one of the two is bounded by a token ceiling.
 3. **What are the legal values of `source`?** The proposed shape carries a `source` string per entry. If it is free-form, nobody will ever filter by it; if it is an enum, it needs listing now.
 4. **Can the operator write while a turn is in flight, and does it queue or apply immediately?** Under C3 an in-flight write applies at the next token boundary — but the *operator* path does not go through the mailbox, so its synchronisation is a separate question and the answer determines whether slice 4 needs a lock.
@@ -332,9 +345,9 @@ Not rulings — these are smaller than the three in §4, but each will otherwise
 
 ## 10. Where to start
 
-1. Read `docs/design-sysprompt-addendum-and-injection.md` on branch `docs/sysprompt-addendum-design` at `8a2e9e38`. It is not on `dev` (§0.1). §3 (the pivot) and §13 (the rulings) are the parts that change how the rest reads.
-2. Rule on §4.1, §4.2, §4.3. Each is a two-way choice with the tests spelled out above, precisely so the ruling can be made by reading the tests rather than by re-deriving the design.
-3. Start slice 1 or slice 2 — whichever the rulings unblock first. Slice 2's tests can be written before its code and are worth writing first regardless, because they are the two obligations (2 and 4) whose failures are invisible.
+1. Read `docs/design-sysprompt-addendum-and-injection.md` on `dev` at `8a2e9e38` (§0.1). §3 (the pivot) and §13 (the rulings) are the parts that change how the rest reads.
+2. ~~Rule on §4.1, §4.2 and §4.3.~~ **Done — see §4.0.**
+3. Start slices 1 and 2 together — both are unblocked.
 
 What **not** to do: do not add a `default:` arm to `SessionTab.jsx` (§5.3 — it exists), do not restore `seq` on the wire (T-1), do not add a ninth `ENGINEER_TOOLS` entry (C2/T-2), and do not route writes through `_pending_config` (H7).
 
@@ -349,7 +362,8 @@ What **not** to do: do not add a `default:` arm to `SessionTab.jsx` (§5.3 — i
 | CI | **Not run.** Nothing in this brief is CI-verified. |
 | Contents verified by | `wc -lc` and `sha256sum` at write time; the authoritative numbers and hash are recorded in the commit message, since a file cannot contain its own hash. |
 | Design source | `docs/design-sysprompt-addendum-and-injection.md`, 590 lines, `8a2e9e38` |
-| Tree read for every `file:line` | `dev` at `9831e08b` |
+| Tree read for every `file:line` | `dev` at `9831e08b`; rulings recorded against `dev` at `9d964208` |
+| Rulings | D-1 dedicated session field · D-3 defer · D-7 refuse (visibly) — recorded in §4.0 |
 | Supersedes | Nothing. This is the first implementation brief for the addendum. |
 
 Two claims in this document are explicitly **not** independently verified, and are marked where they appear: CI behaviour on any branch in this arc (§0.3), and which of the two event schemas is live at runtime (§3). One claim is flagged for re-verification at implementation time rather than asserted: **H5** (§8).

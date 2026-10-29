@@ -299,3 +299,4 @@ web_ui/frontend/.npmrc
 !docs/infrastructure/
 !docs/infrastructure/**
 !docs/brief-sysprompt-implementation-brief.md
+!docs/design-sysprompt-addendum-and-injection.md
