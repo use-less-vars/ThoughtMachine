@@ -85,7 +85,16 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
     prevCountRef.current = currentCount
     // A streaming delta keeps the count constant and only grows the last
     // message's text; treat that as an append so the view follows the stream.
-    const currentLastContent = currentCount > 0 ? messages[currentCount - 1]?.content : ''
+    // The THINKING phase grows `reasoning_content` only (the answer body is
+    // still empty), so the signature must cover both fields -- keyed on
+    // `content` alone a reasoning-only delta looked like "no change" and the
+    // view fell into the restore-scrollTop branch below, freezing the panel
+    // while the model was thinking. The signature is private to this ref, so
+    // the two-field shape is not observable anywhere else.
+    const lastMsg = currentCount > 0 ? messages[currentCount - 1] : null
+    const currentLastContent = currentCount > 0
+      ? `${lastMsg?.content ?? ''}\u0000${lastMsg?.reasoning_content ?? ''}`
+      : ''
     const prevLastContent = prevLastContentRef.current
     prevLastContentRef.current = currentLastContent
     const grewInPlace = currentCount === prevCount && currentCount > 0 &&
