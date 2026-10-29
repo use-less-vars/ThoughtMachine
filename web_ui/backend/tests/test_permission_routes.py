@@ -547,6 +547,11 @@ class TestWorkspacePermissionsRoutes:
         assert json.loads(config_path.read_text(encoding="utf-8")) == {
             "permissions": perms,
             "allow_host_resources": True,
+            # The PUT merges into the config workspace bootstrapping seeded, and
+            # that seed always carries the blank ``git_identity`` pair the UI
+            # edits.  Blank means "not configured": the git writer pins nothing
+            # and git's own resolution decides the commit author.
+            "git_identity": {"name": "", "email": ""},
         }
 
         # GET returns exactly the saved map (no default merging).

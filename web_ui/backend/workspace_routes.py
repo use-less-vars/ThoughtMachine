@@ -1626,6 +1626,43 @@ def _save_workspace_config(ws_id: str, data: Dict[str, Any]) -> None:
     _atomic_write_json(data, _workspace_dir(ws_id) / "config.json")
 
 
+_GIT_IDENTITY_FORBIDDEN_CHARS = "\r\n\x00<>"
+
+
+def _validated_git_identity(raw: Any) -> Optional[Dict[str, str]]:
+    """Validate a caller-supplied ``git_identity`` for the workspace config.
+
+    Returns ``None`` when *raw* is ``None`` (no identity supplied), and a
+    ``{"name": str, "email": str}`` dict when it is valid; raises
+    ``ValueError`` with a human-readable message otherwise.
+
+    The key is ALWAYS persisted (the caller substitutes a blank pair for
+    ``None``) so the UI has something to edit.  A blank pair is a legal stored
+    value: the git writer reads a blank or incomplete identity exactly like an
+    absent key, so it means "not configured" -- git's own repo-local/global
+    resolution applies -- and never "commit with an empty ident".  What is
+    still refused is a value the writer cannot make sense of at all: a
+    non-string half, and the forbidden characters, which would be injected
+    verbatim into ``user.name`` / ``user.email``.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("git_identity must be an object with 'name' and 'email'")
+    identity: Dict[str, str] = {}
+    for label in ("name", "email"):
+        value = raw.get(label)
+        if not isinstance(value, str):
+            raise ValueError(f"git_identity.{label} must be a string")
+        if any(ch in value for ch in _GIT_IDENTITY_FORBIDDEN_CHARS):
+            raise ValueError(
+                f"git_identity.{label} contains a character that is not allowed "
+                "in a git identity (newline, NUL, '<' or '>')"
+            )
+        identity[label] = value
+    return identity
+
+
 def _resolve_workspace_permissions(cfg: Dict[str, Any], purpose: str) -> Dict[str, Any]:
     """Return the saved permission map, or ``{}`` when none is stored.
 
@@ -1738,10 +1775,14 @@ async def create_workspace(
 
     Validates the purpose (422), confines the path to $HOME minus the vault
     root (403), registers the workspace, creates the vault workspace dirs
-    and writes ``config.json`` with ``{purpose, permissions,
+    and writes ``config.json`` with ``{root, purpose, permissions,
     allow_host_resources}``.  ``settings.permissions`` (dict of
     resource→level overrides) and ``settings.allow_host_resources`` (bool)
-    are layered on top of the purpose preset.
+    are layered on top of the purpose preset.  ``settings.git_identity``
+    (``{"name", "email"}``) is validated (422 when malformed) and is ALWAYS
+    written: an unsupplied identity is stored as the blank pair
+    ``{"name": "", "email": ""}`` the UI edits, which the git writer reads
+    as "not configured" and leaves git's own resolution standing.
     """
     if not _origin_check_request(request, route_name="create_workspace"):
         raise HTTPException(status_code=403, detail="origin not permitted")
@@ -1772,6 +1813,16 @@ async def create_workspace(
             detail=f"Path '{body.path}' does not exist or is not a directory",
         )
 
+    # Validate the optional git identity *before* registering, so a rejected
+    # identity never leaves a half-created workspace behind.
+    try:
+        git_identity = _validated_git_identity((body.settings or {}).get("git_identity"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"errors": [str(exc)]},
+        )
+
     registry = WorkspaceRegistry.get_default()
     entry = registry.register_by_root(confined)
     ensure_workspace_dirs(entry.id)
@@ -1784,9 +1835,21 @@ async def create_workspace(
     allow_host_resources = bool(settings.get("allow_host_resources", False))
 
     cfg = _load_workspace_config(entry.id)
+    # ``root`` is the host directory this workspace owns: host execution
+    # (host_bash cwd anchoring) reads it live from config.json and refuses
+    # without it.  The registry owns the value, so persist a copy here.
+    cfg["root"] = entry.root_path
     cfg["purpose"] = body.purpose
     cfg["permissions"] = permissions
     cfg["allow_host_resources"] = allow_host_resources
+    # The key is ALWAYS present so the UI has something to edit.  A blank pair
+    # means "not configured" -- git's own resolution applies, never an empty
+    # ident (``git_write_tool._workspace_git_identity`` reads it as absent).
+    cfg["git_identity"] = (
+        git_identity
+        if git_identity is not None
+        else {"name": "", "email": ""}
+    )
     _save_workspace_config(entry.id, cfg)
 
     risk = compute_workspace_risk(

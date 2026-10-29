@@ -81,7 +81,13 @@ class GitWriteTool(GitReadTool):
         clone_url / clone_target: remote URL and target directory for clone.
     Commit author identity: the OPTIONAL workspace config key
         ``git_identity: {"name": ..., "email": ...}`` is pinned on every
-        commit as ``-c user.name=... -c user.email=...``. It is read from the
+        commit as ``-c user.name=... -c user.email=...``. Per label: an ABSENT
+        key or a PRESENT-but-blank STRING counts as absent (new workspaces are
+        seeded with ``{"name": "", "email": ""}`` so the UI has a key to
+        edit, and that seed must never block a commit) -- nothing is pinned in
+        that case and git's own resolution decides; a PRESENT value of the
+        wrong TYPE is malformed and REFUSES the commit (it must never fall
+        through to an identity the config did not name). It is read from the
         workspace config only (never from agent input), applied to that one
         invocation only (nothing is written to ``.git/config``), and never
         defaulted: when git itself rejects the commit for want of an identity,
@@ -732,9 +738,22 @@ class GitWriteTool(GitReadTool):
         """Return ``(identity, error)`` from the workspace ``git_identity``.
 
         ``identity`` is ``{"name": str, "email": str}`` when the workspace
-        config supplies a usable identity, ``None`` when the key is absent (or
-        no workspace is bound), and ``error`` is a message when the key is
-        present but malformed.
+        config supplies a usable identity, ``None`` when the key is absent, when
+        no workspace is bound, or when the stored pair is blank/incomplete (that
+        means "not configured", never "commit with an empty ident"), and
+        ``error`` is a message when the key is present but malformed.
+
+        Per label the split is three-way, tested by MEMBERSHIP (``label in
+        raw``), never by truthiness -- ``raw.get(label)`` cannot tell "absent"
+        from "present and null":
+
+        1. ABSENT -- the key is not in the dict at all: the pair is incomplete,
+           which is "not configured" -> ``(None, None)``.
+        2. PRESENT but not a ``str`` (``None``, ``42``, a list, ...): MALFORMED.
+           The config named something that cannot become a git ident, so the
+           commit is REFUSED.
+        3. PRESENT and a ``str`` but blank or whitespace-only: explicitly
+           cleared (the UI's "unset" state) -> ``(None, None)``.
 
         A malformed value is NEVER silently ignored: falling through to the
         repo-local/global identity would commit under the wrong author while
@@ -756,13 +775,34 @@ class GitWriteTool(GitReadTool):
                 "(expected an object with `name` and `email`).",
             )
         for label in ("name", "email"):
-            value = raw.get(label)
-            if not isinstance(value, str) or not value.strip():
+            # Membership, not truthiness: ``raw.get(label)`` cannot distinguish
+            # "key absent" from "key present and null", and those two are NOT
+            # the same thing (absent = incomplete/not configured; present but
+            # wrong type = malformed/refused).
+            if label not in raw:
+                # 1. ABSENT: the pair is incomplete -- "no identity configured",
+                # NOT "commit with an empty ident".  Registration seeds every
+                # workspace with ``{"name": "", "email": ""}`` so the UI has a
+                # key to edit; that seed (and any partially filled pair) must
+                # never block a commit, so treat it exactly like an absent key
+                # and let git's own repo-local/global resolution stand
+                # untouched.
+                return (None, None)
+            value = raw[label]
+            if not isinstance(value, str):
+                # 2. PRESENT but the wrong TYPE.  The config said something and
+                # it cannot become a git ident: falling through to the
+                # repo-local/global identity would commit under an author the
+                # config did not name, so refuse.
                 return (
                     None,
-                    f"Cannot commit: workspace `git_identity.{label}` must be a "
-                    "non-empty string.",
+                    f"Cannot commit: workspace `git_identity.{label}` must be a string.",
                 )
+            if not value.strip():
+                # 3. PRESENT, a string, but blank or whitespace-only:
+                # explicitly cleared (the UI's "unset" state) -> not
+                # configured, exactly like an absent key.
+                return (None, None)
             # git rejects (or silently mangles) an ident containing angle
             # brackets or line breaks; refuse at the config boundary instead of
             # emitting a malformed author header.
