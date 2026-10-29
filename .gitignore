@@ -298,3 +298,4 @@ web_ui/frontend/.npmrc
 # `**` re-includes the contents.
 !docs/infrastructure/
 !docs/infrastructure/**
+!docs/brief-sysprompt-implementation-brief.md
