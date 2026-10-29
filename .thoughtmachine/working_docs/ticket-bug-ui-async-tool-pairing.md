@@ -1,6 +1,15 @@
 # Ticket — UI: async tool-call pairing (Frontend Event Bus State Machine)
 
-**Status:** IMPLEMENTED — pushed on `fix/ui-async-tool-pairing` (`bfdbbc6c`, `e4202f31`, `1d4377ce`), PR open
+**Status:** CLOSED — fixed and merged as **PR #246** (`fix/ui-async-tool-pairing`), confirmed on
+`dev` @ `adfb5ef6`. Original status line said "IMPLEMENTED — pushed on `fix/ui-async-tool-pairing`
+(`bfdbbc6c`, `e4202f31`, `1d4377ce`), PR open"; corrected 2026-10-29 after the merge.
+**What landed:** `toolCallEventId(evt)` (identity from `session_id`/`worker_*`/`instance_*` +
+`tc<tool_call_id>`, deliberately WITHOUT timestamp and WITHOUT the event name) and
+`mergeToolMessages(prev, incoming, seq)` (pure upsert: match on `tool_call_id`, replace in place,
+preserve the first entry's `_seq` so call order == bubble order, overlay only defined fields).
+`tool_result` adopts the call bubble's identity and `tool_call` role when paired; unpaired/
+legacy/id-less events keep the old `tool_result` standalone rendering. `eventId()` survives as the
+fallback for providers that omit ids. Tests: `components/__tests__/adaptWorkerEvent.test.js`.
 against `dev`
 **Branch to fix on:** `fix/ui-async-tool-pairing` (pushed, PR open against `dev`)
 **Severity:** medium — cosmetic ordering + duplicate bubbles, no data loss

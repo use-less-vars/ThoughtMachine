@@ -710,3 +710,72 @@ A worker transcribing a design doc reads the doc to understand it, catching stru
 
 ## 2026-10-27 — Pattern: `reader-self-correction` (Gen 52)
 The adversarial reader retracted its own prior findings three times when confronted with source evidence. A reader whose retractions merit as much weight as its findings is more trustworthy than one that has never self-corrected.
+
+## 2026-10-29 — Class: `handoff-claims-require-disk-read` (Gen 54)
+**A handoff is a map, not the territory.** Every claim of "fixed" in a handoff must be verified by a
+disk read (`grep`/`diff`/`read`) before the next generation builds on it, *even when the claim comes
+from the operator*.
+
+Gen 53's handoff claimed the refusal-as-success fix had landed; Gen 54 proved it was a ghost and
+actually landed it. Same sprint, same failure shape, second surface: the operator's brief for the
+UI event-bus work asserted (a) that reasoning streaming was broken in `SessionTab.jsx` and (b) that
+the tool-pairing bug lived there. Disk said otherwise — `reasoning_delta` had been wired by
+`ab94020de` (PR #231, already merged), and `SessionTab.jsx` contains **no** `tool_call*` cases at
+all; the real defect was `eventId()` in `components/chat/adaptWorkerEvent.js`. A generation that had
+implemented the brief as written would have re-done merged work and "fixed" a file that never had
+the bug.
+
+**Cheapest possible test:** one `grep` for the symbol the claim names. If the handoff says a
+function changed, read the function. If it says a bug is fixed, find the line that made it true.
+No exceptions for confidence, seniority, or plausibility — this class fires hardest on claims that
+*sound* right.
+
+## 2026-10-29 — Class: `async-event-bus-out-of-order-rendering` (Gen 54)
+In a streaming, concurrently-executing agent, **`tool_call_start`, `tool_call` and `tool_result` for
+different tool calls interleave arbitrarily**, and the completion order of parallel calls is not the
+call order. A UI that renders events "as they arrive" therefore shows a scrambled story: results
+attach to the wrong call, and one call's phases render as several bubbles.
+
+**Rule: bind lifecycle events by a stable domain id (`tool_call_id`), never by arrival order, and
+never fold the event *name* into the identity key.** A per-phase key (`..._tool_call_start` vs
+`..._tool_call`) makes dedup structurally incapable of merging one call's phases — the merge is
+impossible before any reducer logic runs.
+
+Corollary for the frontend: a row's **position must be fixed when the call starts** and mutated in
+place as it progresses (`pending → running → ok/error`). Appending on completion reorders history
+under parallelism, no matter how correct the pairing is.
+
+Live instance: `adaptWorkerEvent.eventId()` includes `evt.event` in the dedup key, and never reads
+`tool_call_id` (0 references) although the backend emits it (`agent/core/tool_executor.py:261,273,294`).
+See `.thoughtmachine/working_docs/ticket-bug-ui-async-tool-pairing.md`.
+
+## 2026-10-29 — Class: `verified-at-a-moving-head` (Gen 54)
+**Every "verified as X" claim has a shelf life measured in minutes on this project, not days.** The
+repo is worked by several agents and the operator simultaneously; branches are created, merged and
+deleted faster than a single session can read them.
+
+Observed in one sitting, all against the same checkout:
+- `dev` moved `#240 → #245 → #246 → #247 → #248 → #249` while a KB file was being written.
+- A "highest PR is #240, so #241/#243/#244 do not exist" conclusion was **true when measured and
+  false ten minutes later**. The operator's contrary ruling was right; the agent's confident absolute
+  was wrong, not its evidence.
+- A working-tree diff was observed (ChatPanel/MessageBubble reasoning fixes), then vanished from the
+  tree. It was **not lost** — the other agent had committed it to `fix/reasoning-ui-streaming`
+  (`7c5f1fae`) and switched back to `dev`. "Vanished" was one `git_read log --branch` away from being
+  a false report of lost work.
+- `platform-matrix.yml`'s frontend job read as **BLOCKING** in one call and **advisory**
+  (`continue-on-error: true`) in the next.
+
+**Discipline:** write claims as *"at `<sha>`, `<file>:<line>` does X"* — never *"X is true"*. Re-read
+HEAD before contradicting the operator. When something disappears from the working tree, check the
+other branches and the stash **before** reporting loss.
+
+## 2026-10-29 — Class: `advisory-gate-is-not-a-gate` (Gen 54)
+A CI job that runs but carries `continue-on-error: true` reports red and passes anyway. It reads as
+coverage in a workflow listing and as a gap in practice: `web-ui-frontend-suite` in
+`.github/workflows/platform-matrix.yml` executes 681 Vitest tests with a 650-test floor (so the suite
+cannot silently shrink) and a red run **does not fail the matrix**.
+
+**A gate's authority is its `continue-on-error` line, not its presence.** Do not report "covered in CI"
+until you have read whether a failure can actually block. Promotion to blocking is a separate change
+(branch `ci/promote-vitest-gating`), and the floor assertion is what makes promoting it safe.
