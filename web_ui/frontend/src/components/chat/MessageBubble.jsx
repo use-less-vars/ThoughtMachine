@@ -131,10 +131,27 @@ function ToolCallContent({ content }) {
  */
 function AssistantContent({ msg }) {
   const isStreaming = msg.is_streaming === true
+  /* The thinking block defaults to open. A user can collapse it, and that
+   * choice must survive the rest of the stream -- but NOT leak onto a
+   * different message: ChatPanel keys bubbles by array index
+   * (`messages.map((msg, i) => <MessageBubble key={i} .../>)`), so a load-more
+   * prepend or a whole-list `conversation_changed` replace re-uses the same
+   * component instance for a DIFFERENT message. Messages carry no id, so
+   * identity is derived from content: while streaming, the reasoning text is
+   * append-only, so a live continuation of the collapsed text is a prefix of
+   * the new text. Anything that is not a prefix-extension is a different
+   * message, and the block re-opens. */
+  const [collapsedText, setCollapsedText] = useState(null)
+  const reasoningText = msg.reasoning_content || ''
+  const reasoningOpen = collapsedText === null || !reasoningText.startsWith(collapsedText)
   return (
     <>
       {msg.reasoning_content && (
-        <details className="reasoning-block" open>
+        <details
+          className="reasoning-block"
+          open={reasoningOpen}
+          onToggle={(e) => setCollapsedText(e.currentTarget.open ? null : reasoningText)}
+        >
           <summary className="reasoning-summary">
             💭 Thinking
             <CopyButton text={msg.reasoning_content} label="📋" />

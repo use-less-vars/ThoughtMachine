@@ -17,7 +17,7 @@
 
 import React from 'react';
 import { describe, it, expect, afterEach } from 'vitest';
-import { render, cleanup } from '@testing-library/react';
+import { render, cleanup, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import { MessageBubble } from '../MessageBubble';
 
@@ -97,5 +97,102 @@ describe('MessageBubble — streaming render fast path', () => {
     expect(strong).not.toBeNull();
     expect(strong.textContent).toBe('ing');
     expect(block.textContent).not.toContain('**ing**');
+  });
+});
+
+/*
+ * D1 — the thinking block is collapsible.
+ *
+ * `open` used to be hardcoded on the <details>, so a user who collapsed the
+ * Thinking block had it snap back open on the very next delta (the message
+ * re-renders on every streamed frame). The block now owns its open state, but
+ * it must NOT leak that state onto a different message: ChatPanel keys bubbles
+ * by array index (`messages.map((msg, i) => <MessageBubble key={i} .../>)`), so
+ * a load-more prepend or a whole-list `conversation_changed` replace hands the
+ * same instance a different message, and messages carry no id.
+ */
+describe('MessageBubble — collapsible thinking block', () => {
+  const block = () => document.querySelector('details.reasoning-block');
+
+  // React 18 attaches `toggle` as a NON-delegated listener directly on the
+  // <details> node (jsdom dispatches no toggle event of its own), so the event
+  // is fired at the element itself rather than at a container.
+  function setOpen(details, open) {
+    details.open = open;
+    fireEvent(details, new Event('toggle'));
+  }
+
+  it('renders the thinking block open by default', () => {
+    render(
+      <MessageBubble msg={{ role: 'assistant', content: '', reasoning_content: 'step one' }} index={0} />
+    );
+
+    expect(block()).not.toBeNull();
+    expect(block().open).toBe(true);
+  });
+
+  it('keeps a user-collapsed thinking block collapsed while the reasoning streams on', () => {
+    const { rerender } = render(
+      <MessageBubble
+        msg={{ role: 'assistant', content: '', reasoning_content: 'step one', is_streaming: true }}
+        index={0}
+      />
+    );
+    expect(block().open).toBe(true);
+
+    setOpen(block(), false);
+    expect(block().open).toBe(false);
+
+    // Append-only growth of the SAME message — a live continuation.
+    rerender(
+      <MessageBubble
+        msg={{ role: 'assistant', content: '', reasoning_content: 'step one, step two', is_streaming: true }}
+        index={0}
+      />
+    );
+
+    expect(block().open).toBe(false);
+    expect(block().textContent).toContain('step one, step two');
+  });
+
+  it('stays open again after the user re-expands it', () => {
+    const { rerender } = render(
+      <MessageBubble
+        msg={{ role: 'assistant', content: '', reasoning_content: 'step one', is_streaming: true }}
+        index={0}
+      />
+    );
+
+    setOpen(block(), false);
+    expect(block().open).toBe(false);
+
+    setOpen(block(), true);
+    expect(block().open).toBe(true);
+
+    // ...and the re-opened state survives further streaming.
+    rerender(
+      <MessageBubble
+        msg={{ role: 'assistant', content: '', reasoning_content: 'step one, step two', is_streaming: true }}
+        index={0}
+      />
+    );
+    expect(block().open).toBe(true);
+  });
+
+  it('does not carry a collapsed state onto a different message in the same slot', () => {
+    const { rerender } = render(
+      <MessageBubble msg={{ role: 'assistant', content: '', reasoning_content: 'first reasoning' }} index={0} />
+    );
+
+    setOpen(block(), false);
+    expect(block().open).toBe(false);
+
+    // Index keying re-uses this very instance for a different message.
+    rerender(
+      <MessageBubble msg={{ role: 'assistant', content: '', reasoning_content: 'unrelated reasoning' }} index={0} />
+    );
+
+    expect(block().open).toBe(true);
+    expect(block().textContent).toContain('unrelated reasoning');
   });
 });
