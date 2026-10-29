@@ -295,3 +295,10 @@ web_ui/frontend/.npmrc
 # `**` re-includes the contents.
 !docs/infrastructure/
 !docs/infrastructure/**
+
+# Gen 54 delivery arc: workspace runtime guidance — the rule that the agent lives
+# in the Workspace Image and that host Bash is bootstrap-only (docker build), to be
+# turned off once the image is built. Public tier, ships with the repo. `docs/*`
+# above is a catch-all, so this file needs its own negation line or `git add`
+# refuses it and `git clean -xdf` would delete it.
+!docs/global-kb-workspace-runtime-guidance.md
