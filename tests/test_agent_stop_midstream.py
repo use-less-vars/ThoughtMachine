@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from agent.config.models import AgentConfig
 from agent.core.agent import Agent
-from agent.core.stream_events import Done, TextDelta
+from agent.core.stream_events import Done, Interrupted, TextDelta
 from agent.core.turn_transaction import TurnTransaction
 
 
@@ -180,3 +180,69 @@ def test_normal_turn_is_undisturbed_by_the_halt_path():
     assert len(assistants) == 1, assistants
     assert assistants[0]["content"] == "Hello"
     assert len(agent.conversation) == history_before + 2, agent.conversation
+
+
+
+def test_timeout_midstream_commits_partial_assistant_message():
+    """(e) Provider timeout AFTER deltas: partial text is committed, error emitted.
+
+    The stream loop raises out of the LLM call on the ``Interrupted`` event, so
+    the normal commit site is never reached. The terminal-error path must commit
+    what the user already watched stream in before yielding its ``error`` event.
+    """
+    agent = _make_agent(session_id="test-session-timeout")
+    llm = _ScriptedLLM([[
+        TextDelta(text="Par"),
+        TextDelta(text="tial"),
+        Interrupted(reason="provider_error: APITimeoutError"),
+    ]])
+    agent.llm_client.stream_completion = llm.stream_completion
+    history_before = len(agent.conversation)
+
+    events = list(agent.process_query("tell me a long story"))  # must terminate
+    types = [event["type"] for event in events]
+
+    deltas = [event for event in events if event["type"] == "text_delta"]
+    assert [event["text"] for event in deltas] == ["Par", "tial"], types
+
+    # One terminal error event, unchanged shape.
+    errors = [event for event in events if event["type"] == "error"]
+    assert len(errors) == 1, types
+    assert errors[0]["error_type"] == "TIMEOUT"
+    assert errors[0]["stop_reason"] == "error"
+
+    # No normal turn terminal - the error replaces it rather than doubling it.
+    assert "turn" not in types, types
+
+    # The partial assistant text survived the failure.
+    assistants = _assistant_messages(agent)
+    assert len(assistants) == 1, assistants
+    assert assistants[0]["content"] == "Partial"
+    assert len(agent.conversation) == history_before + 2, agent.conversation  # user + assistant
+
+    # The failed stream was closed by _iter_stream_events' finally.
+    assert llm.closed is True
+
+
+def test_timeout_with_no_streamed_text_commits_nothing():
+    """(f) Timeout before any delta: empty-turn guard, error still emitted."""
+    agent = _make_agent(session_id="test-session-timeout-empty")
+    llm = _ScriptedLLM([[Interrupted(reason="provider_error: APITimeoutError")]])
+    agent.llm_client.stream_completion = llm.stream_completion
+    history_before = len(agent.conversation)
+
+    events = list(agent.process_query("say something"))
+    types = [event["type"] for event in events]
+
+    assert [event for event in events if event["type"] == "text_delta"] == [], types
+
+    # The terminal error is still emitted so the UI can clear its in-flight state.
+    errors = [event for event in events if event["type"] == "error"]
+    assert len(errors) == 1, types
+    assert errors[0]["error_type"] == "TIMEOUT"
+    assert errors[0]["stop_reason"] == "error"
+
+    # Nothing streamed -> no blank assistant bubble in history.
+    assert _assistant_messages(agent) == [], agent.conversation
+    assert len(agent.conversation) == history_before + 1, agent.conversation
+

@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from openai import APITimeoutError
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import (
@@ -94,11 +95,18 @@ class FakeStream:
 
 
 class _FakeCompletions:
-    """``client.chat.completions`` stand-in: records every ``create`` call."""
+    """``client.chat.completions`` stand-in: records every ``create`` call.
 
-    def __init__(self, items=None, create_exc=None):
+    ``attempts`` is an optional list of item lists, one per ``create()`` call:
+    the n-th call drains ``attempts[n]``. It exists so a retry test can make
+    the first attempt fail and the second succeed. Once ``attempts`` is
+    exhausted (or when it is not given at all) every call replays ``items``.
+    """
+
+    def __init__(self, items=None, create_exc=None, attempts=None):
         self._items = list(items or [])
         self._create_exc = create_exc
+        self._attempts = [list(attempt) for attempt in attempts] if attempts is not None else None
         self.calls = []
         self.streams = []
 
@@ -106,24 +114,29 @@ class _FakeCompletions:
         self.calls.append(kwargs)
         if self._create_exc is not None:
             raise self._create_exc
-        stream = FakeStream(self._items)
+        if self._attempts:
+            items = self._attempts.pop(0)
+        else:
+            items = self._items
+        stream = FakeStream(items)
         self.streams.append(stream)
         return stream
 
 
 class FakeAsyncClient:
-    def __init__(self, items=None, create_exc=None):
-        self.chat = SimpleNamespace(completions=_FakeCompletions(items, create_exc))
+    def __init__(self, items=None, create_exc=None, attempts=None):
+        self.chat = SimpleNamespace(completions=_FakeCompletions(items, create_exc, attempts))
 
 
-def _provider(items=None, create_exc=None):
+def _provider(items=None, create_exc=None, attempts=None, max_retries=None):
     """Build a provider with the fake async client already installed."""
+    overrides = {} if max_retries is None else {'max_retries': max_retries}
     provider = OpenAICompatibleProvider(
-        ProviderConfig(api_key='sk-test', model=MODEL, timeout=5)
+        ProviderConfig(api_key='sk-test', model=MODEL, timeout=5, **overrides)
     )
     # ``_ensure_async_client()`` only builds a real ``AsyncOpenAI`` when the
     # attribute is missing/None, so pre-seeding it is the supported seam.
-    provider._async_client = FakeAsyncClient(items, create_exc)
+    provider._async_client = FakeAsyncClient(items, create_exc, attempts)
     return provider
 
 
@@ -425,3 +438,154 @@ def test_cancellation_propagates_without_interrupted_event():
     assert not any(isinstance(event, Interrupted) for event in seen)
     fake_stream = provider._async_client.chat.completions.streams[0]
     assert fake_stream.closed is True, 'the SDK stream must still be closed on cancellation'
+
+
+# ---------------------------------------------------------------------------
+# 8. Retry of a timeout that arrives before the first token
+# ---------------------------------------------------------------------------
+#
+# The backoff lives in the provider, not in the SDK: ``_ensure_async_client()``
+# pins the SDK at ``max_retries=0`` so a single attempt can never be retried
+# twice. These tests neutralise the waits (base and cap to 0) so nothing
+# actually sleeps.
+
+def _no_backoff(monkeypatch):
+    monkeypatch.setattr('llm_providers.openai_compatible._RETRY_BACKOFF_BASE_SECONDS', 0)
+    monkeypatch.setattr('llm_providers.openai_compatible._RETRY_BACKOFF_MAX_SECONDS', 0)
+
+
+def _timeout():
+    """``APITimeoutError`` exactly as the SDK raises it mid-iteration."""
+    return APITimeoutError(request=SimpleNamespace())
+
+
+def test_timeout_before_first_token_is_retried(monkeypatch):
+    _no_backoff(monkeypatch)
+    provider = _provider(attempts=[
+        [_timeout()],
+        [_text_chunk('recovered', finish_reason='stop')],
+    ])
+
+    events = _drain(provider)  # must not raise
+
+    assert _kinds(events) == ['TextDelta', 'Done']
+    assert events[0] == TextDelta(text='recovered')
+    assert not any(isinstance(event, Interrupted) for event in events)
+
+    completions = provider._async_client.chat.completions
+    assert len(completions.calls) == 2, 'a pre-first-token timeout must re-issue create()'
+    # The dead stream is closed before the retry and is never reused.
+    assert completions.streams[0].closed is True
+    assert completions.streams[1] is not completions.streams[0]
+
+
+def test_timeout_after_first_token_is_not_retried(monkeypatch):
+    _no_backoff(monkeypatch)
+    provider = _provider(attempts=[
+        [_text_chunk('one'), _timeout()],
+    ])
+
+    events = _drain(provider)
+
+    # The operator already saw 'one': exactly one error, no duplicated text.
+    assert _kinds(events) == ['TextDelta', 'Interrupted']
+    assert events[0] == TextDelta(text='one')
+    assert events[1].reason == 'provider_error: APITimeoutError'
+    assert len(provider._async_client.chat.completions.calls) == 1
+
+
+def test_retry_resets_pending_tool_call_accumulator(monkeypatch):
+    """A retry must not splice fragments from two different streams.
+
+    Attempt 1 leaves an orphaned argument fragment in the per-attempt
+    ``pending`` accumulator without emitting anything (the function name has
+    not arrived, so no ``ToolCallStart`` can be built yet), then times out.
+    Attempt 2 replays the same call in full. Without ``pending.clear()`` on
+    retry the completed call would carry
+    ``'{"file_path": "/tm{"file_path": "/tmp/x.txt"}'`` -- unparseable, i.e.
+    silently corrupted arguments.
+    """
+    _no_backoff(monkeypatch)
+    provider = _provider(attempts=[
+        [
+            _tool_chunk(index=0, call_id='call_1', arguments='{"file_path": "/tm'),
+            _timeout(),
+        ],
+        [
+            _tool_chunk(index=0, call_id='call_1', name='ReadFile', arguments='{"file_path": "/tmp/x.txt"}'),
+            _empty_chunk(finish_reason='tool_calls'),
+        ],
+    ])
+
+    events = _drain(provider, tools=TOOLS)
+
+    start = _only(events, ToolCallStart)
+    assert (start.id, start.name) == ('call_1', 'ReadFile')
+
+    complete = _only(events, ToolCallComplete)
+    assert complete.tool_call.arguments == {'file_path': '/tmp/x.txt'}
+    assert complete.tool_call.raw_arguments == '{"file_path": "/tmp/x.txt"}'
+    assert complete.parse_error is None
+    assert complete.tool_call.parse_error is None
+    assert events[-1] == Done()
+    assert len(provider._async_client.chat.completions.calls) == 2
+
+
+def test_max_retries_zero_disables_retry(monkeypatch):
+    _no_backoff(monkeypatch)
+    provider = _provider(attempts=[[_timeout()]], max_retries=0)
+
+    events = _drain(provider)
+
+    assert _kinds(events) == ['Interrupted']
+    assert events[0].reason == 'provider_error: APITimeoutError'
+    assert len(provider._async_client.chat.completions.calls) == 1, 'max_retries=0 means no retry'
+
+
+def test_retry_budget_exhausted_yields_single_interrupted(monkeypatch):
+    """Every attempt times out: retries stop at the budget, one error escapes.
+
+    ``items`` (not ``attempts``) is replayed by every ``create()`` call, so
+    attempt N+1 fails exactly like attempt N and the loop can only end through
+    the budget/max_attempts guard -- never through a successful attempt.
+    """
+    _no_backoff(monkeypatch)
+    provider = _provider(items=[_timeout()])
+
+    events = _drain(provider)  # must not raise
+
+    completions = provider._async_client.chat.completions
+    assert len(completions.calls) == 4, 'default max_retries=3 means 1 initial + 3 retries'
+
+    # Exactly one terminal error -- retries must not multiply the failure.
+    assert _kinds(events) == ['Interrupted']
+    assert events[0].reason == 'provider_error: APITimeoutError'
+    # Nothing was ever streamed, so no text and no clean completion.
+    assert not any(isinstance(event, TextDelta) for event in events)
+    assert not any(isinstance(event, Done) for event in events)
+
+
+def test_async_client_constructed_with_zero_sdk_retries(monkeypatch):
+    """The SDK's own retry must be 0 -- otherwise one attempt is retried twice."""
+    captured = {}
+
+    class _RecordingAsyncClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.chat = SimpleNamespace(
+                completions=_FakeCompletions([_text_chunk('hi', finish_reason='stop')])
+            )
+
+    monkeypatch.setattr('llm_providers.openai_compatible.AsyncOpenAI', _RecordingAsyncClient)
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(api_key='sk-test', model=MODEL, timeout=5, max_retries=5)
+    )
+    # No pre-seeded client: force ``_ensure_async_client()`` to construct one.
+    provider._async_client = None
+
+    _drain(provider)
+
+    assert captured['max_retries'] == 0, 'the provider owns streaming retries; the SDK must not add its own'
+    assert captured['timeout'] == 5
+
