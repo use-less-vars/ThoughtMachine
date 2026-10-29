@@ -22,6 +22,18 @@ from agent.core.ir import CanonicalToolCall
 from agent.core.stream_events import TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgumentsDelta, ToolCallComplete, UsageUpdate, Interrupted, Done, StreamEvent
 from agent.logging import log
 
+# Streaming retry policy. The provider owns streaming retries so that a
+# single budget covers them; the SDK clients are pinned at max_retries=0
+# for the same reason (otherwise one attempt can be retried twice, once by
+# each layer). Waits are 1s, 2s, 4s, ... capped at
+# _RETRY_BACKOFF_MAX_SECONDS, and the whole retry sequence is additionally
+# bounded by _RETRY_TOTAL_BUDGET_SECONDS so that a provider which hangs on
+# every attempt cannot pin the turn for minutes.
+_RETRY_BACKOFF_BASE_SECONDS = 1.0
+_RETRY_BACKOFF_MAX_SECONDS = 8.0
+_RETRY_TOTAL_BUDGET_SECONDS = 30.0
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """
     Provider for OpenAI-compatible APIs.
@@ -450,7 +462,9 @@ class OpenAICompatibleProvider(LLMProvider):
         ``agent.core.agent._close_stream_resources``.
         """
         if getattr(self, '_async_client', None) is None:
-            client_kwargs = {'api_key': reveal_secret(self.config.api_key), 'timeout': self.config.timeout, 'max_retries': self.config.max_retries}
+            # The provider owns streaming retries (see ``stream_completion``): the
+            # SDK's own retry must stay at 0 so one attempt is never retried twice.
+            client_kwargs = {'api_key': reveal_secret(self.config.api_key), 'timeout': self.config.timeout, 'max_retries': 0}
             if self.config.base_url:
                 client_kwargs['base_url'] = self.config.base_url
             if self.config.extra_headers:
@@ -588,64 +602,110 @@ class OpenAICompatibleProvider(LLMProvider):
                 parse_error=parse_error,
             )
 
+        # Retry budget: ``max_retries`` counts retries, not attempts.
+        max_attempts = 1 + max(0, int(self.config.max_retries or 0))
+        attempt = 0
+        total_wait = 0.0
         stream = None
+        # Set immediately before every payload delta reaches the caller. Once
+        # true the retry window is closed: a second stream would duplicate
+        # text the operator has already seen.
+        emitted = False
         try:
-            stream = await self._ensure_async_client().chat.completions.create(**completion_kwargs)
-            async for chunk in stream:
-                usage = getattr(chunk, 'usage', None)
-                if usage is not None:
-                    yield UsageUpdate(input_tokens=getattr(usage, 'prompt_tokens', 0) or 0, output_tokens=getattr(usage, 'completion_tokens', 0) or 0)
-                choices = getattr(chunk, 'choices', None) or []
-                if not choices:
-                    # usage-only chunk
-                    continue
-                choice = choices[0]
-                delta = getattr(choice, 'delta', None)
-                if delta is not None:
-                    reasoning = getattr(delta, 'reasoning_content', None)
-                    if reasoning:
-                        yield ReasoningDelta(text=reasoning)
-                    content = getattr(delta, 'content', None)
-                    if content:
-                        yield TextDelta(text=content)
-                    for fragment in getattr(delta, 'tool_calls', None) or []:
-                        state = _state(getattr(fragment, 'index', 0) or 0)
-                        fragment_id = getattr(fragment, 'id', None)
-                        if fragment_id:
-                            state['id'] = fragment_id
-                        function = getattr(fragment, 'function', None)
-                        if function is not None:
-                            name = getattr(function, 'name', None)
-                            if name:
-                                state['name'] = name
-                            arguments_delta = getattr(function, 'arguments', None)
-                            if arguments_delta:
-                                state['raw'] += arguments_delta
-                                if state['started']:
-                                    state['emitted'] = len(state['raw'])
-                                    yield ToolCallArgumentsDelta(id=state['id'], arguments_delta=arguments_delta)
-                        for event in _start_events(state):
-                            yield event
-                if getattr(choice, 'finish_reason', None) == 'tool_calls':
+            while True:
+                # Every per-attempt accumulator is reset here: a retry that
+                # reused ``pending`` would splice argument fragments from two
+                # different streams into one malformed tool call.
+                pending.clear()
+                try:
+                    stream = await self._ensure_async_client().chat.completions.create(**completion_kwargs)
+                    async for chunk in stream:
+                        usage = getattr(chunk, 'usage', None)
+                        if usage is not None:
+                            yield UsageUpdate(input_tokens=getattr(usage, 'prompt_tokens', 0) or 0, output_tokens=getattr(usage, 'completion_tokens', 0) or 0)
+                        choices = getattr(chunk, 'choices', None) or []
+                        if not choices:
+                            # usage-only chunk
+                            continue
+                        choice = choices[0]
+                        delta = getattr(choice, 'delta', None)
+                        if delta is not None:
+                            reasoning = getattr(delta, 'reasoning_content', None)
+                            if reasoning:
+                                emitted = True
+                                yield ReasoningDelta(text=reasoning)
+                            content = getattr(delta, 'content', None)
+                            if content:
+                                emitted = True
+                                yield TextDelta(text=content)
+                            for fragment in getattr(delta, 'tool_calls', None) or []:
+                                state = _state(getattr(fragment, 'index', 0) or 0)
+                                fragment_id = getattr(fragment, 'id', None)
+                                if fragment_id:
+                                    state['id'] = fragment_id
+                                function = getattr(fragment, 'function', None)
+                                if function is not None:
+                                    name = getattr(function, 'name', None)
+                                    if name:
+                                        state['name'] = name
+                                    arguments_delta = getattr(function, 'arguments', None)
+                                    if arguments_delta:
+                                        state['raw'] += arguments_delta
+                                        if state['started']:
+                                            state['emitted'] = len(state['raw'])
+                                            emitted = True
+                                            yield ToolCallArgumentsDelta(id=state['id'], arguments_delta=arguments_delta)
+                                for event in _start_events(state):
+                                    emitted = True
+                                    yield event
+                        if getattr(choice, 'finish_reason', None) == 'tool_calls':
+                            for index in sorted(pending):
+                                state = pending[index]
+                                for event in _start_events(state):
+                                    emitted = True
+                                    yield event
+                                emitted = True
+                                yield _complete_event(state)
+                            pending.clear()
+                    # The stream can end without finish_reason == 'tool_calls' (some
+                    # providers report 'stop' for tool calls), so finalise anything left.
                     for index in sorted(pending):
                         state = pending[index]
                         for event in _start_events(state):
+                            emitted = True
                             yield event
+                        emitted = True
                         yield _complete_event(state)
                     pending.clear()
-            # The stream can end without finish_reason == 'tool_calls' (some
-            # providers report 'stop' for tool calls), so finalise anything left.
-            for index in sorted(pending):
-                state = pending[index]
-                for event in _start_events(state):
-                    yield event
-                yield _complete_event(state)
-            pending.clear()
-            yield Done()
+                    yield Done()
+                    break
+                except (GeneratorExit, asyncio.CancelledError):
+                    # Cancellation is never retried; it must win over any
+                    # timeout handling below.
+                    raise
+                except APITimeoutError as exc:
+                    wait = min(_RETRY_BACKOFF_MAX_SECONDS, _RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+                    # Not retryable once anything reached the caller, once the
+                    # attempts are spent, or once the next wait would breach the
+                    # total budget; ``raise`` falls through to the Interrupted
+                    # path below, which is today's behaviour unchanged.
+                    if emitted or attempt + 1 >= max_attempts or total_wait + wait > _RETRY_TOTAL_BUDGET_SECONDS:
+                        raise
+                    if stream is not None:
+                        try:
+                            await stream.close()
+                        except Exception as close_exc:
+                            log('DEBUG', 'llm.openai', f'Closing stream failed: {close_exc}')
+                        # Never reuse a dead stream: the retry re-issues create().
+                        stream = None
+                    attempt += 1
+                    total_wait += wait
+                    log('WARNING', 'llm.openai', f'Stream timed out before the first token (attempt {attempt} of {max_attempts} used); retrying in {wait:.1f}s: {type(exc).__name__}: {exc}')
+                    await asyncio.sleep(wait)
         except (GeneratorExit, asyncio.CancelledError):
             # Both derive from BaseException, so the clause below cannot swallow
             # them; spelled out so a future widening of that clause cannot turn a
-            # cancellation into an Interrupted event.
+            # cancellation into an Interrupted event. Never retried.
             raise
         except Exception as exc:
             # Broad by design, mirroring chat_completion's own final except:
