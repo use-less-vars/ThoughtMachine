@@ -440,7 +440,7 @@ def test_site1_refused_bind_does_not_leak_path(bind_server, monkeypatch):
         f"the project switch to another workspace must be refused: {evt!r}"
     )
     assert bound_id == id_a, f"the bridge must stay bound to {id_a!r}: {bound_id!r}"
-    assert bound_path == root_a, (
+    assert Path(bound_path or "").resolve() == Path(root_a).resolve(), (
         "a refused bind must not leak the switched path into bridge._workspace_path: "
         f"expected {root_a!r}, got {bound_path!r}"
     )

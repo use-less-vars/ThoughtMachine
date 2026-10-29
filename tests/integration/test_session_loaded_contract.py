@@ -624,7 +624,7 @@ def test_apply_config_different_workspace_path_still_switches_session(contract_s
         f"workspace switch must create a NEW session id "
         f"(got {sw_evt.get('session_id')!r} == original {original_session_id!r})"
     )
-    assert sw_evt.get("workspace_path") == os.path.normpath(proj_b), (
+    assert Path(sw_evt.get("workspace_path") or "").resolve() == Path(proj_b).resolve(), (
         f"session_loaded.workspace_path {sw_evt.get('workspace_path')!r} != "
         f"{os.path.normpath(proj_b)!r}"
     )
