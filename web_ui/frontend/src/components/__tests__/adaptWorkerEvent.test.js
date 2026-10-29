@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import adaptWorkerEvent, { isWorkerEventRenderable } from '../chat/adaptWorkerEvent';
+import adaptWorkerEvent, { isWorkerEventRenderable, toolCallEventId, mergeToolMessages } from '../chat/adaptWorkerEvent';
 import { makeDedupKey, normaliseToolEvent } from '../WorkerOutputPanel';
 
 // ── Constants from the source (must match adaptWorkerEvent.js) ────────────
@@ -1056,6 +1056,213 @@ describe('tool_call_id plumbing', () => {
     expect(seen.has(b)).toBe(false);
     // Control: without ids the old behaviour (collapse) still holds.
     expect(makeDedupKey('tool_call', 'T')).toBe(makeDedupKey('tool_call', 'T'));
+  });
+});
+
+// ── Tool-call phase identity + merge (frontend step 2) ─────────────────────
+// One backend tool call arrives as three events (start / call / result) at
+// three different timestamps with three different event names.  They must
+// share ONE message identity so a later merge step can show a single bubble.
+// Without a backend id the historical behaviour (three distinct rows) is kept.
+
+// Build a phase event with the essentials; `tcId` omitted => no id at all.
+function toolPhase(event, tcId, opts = {}) {
+  const {
+    timestamp = '2026-08-01T10:00:00.000Z',
+    tool = 'read_file',
+    args = { path: '/a' },
+    result,
+    success,
+  } = opts;
+  const request = { tool, args };
+  if (tcId) request.tool_call_id = tcId;
+  if (success !== undefined) request.success = success;
+  const response = result !== undefined ? { result } : {};
+  return makeEvent({ session_id: 'sess1', worker_name: 'w1', event, timestamp, request, response });
+}
+
+describe('tool-call phase identity (step 2)', () => {
+  it('gives all three phases of one call the same _id', () => {
+    const start = adaptWorkerEvent(toolPhase('tool_call_start', 'call_1'));
+    const call = adaptWorkerEvent(toolPhase('tool_call', 'call_1'));
+    const result = adaptWorkerEvent(toolPhase('tool_result', 'call_1', { result: 'ok' }));
+    expect(call._id).toBe(start._id);
+    expect(result._id).toBe(start._id);
+    // Sanity: the shared id is built from the backend id, not the event name.
+    expect(start._id).toBe(toolCallEventId(toolPhase('tool_call_start', 'call_1')));
+    expect(start._id).toContain('tccall_1');
+    // A paired result routes into the call bubble.
+    expect(result.role).toBe('tool_call');
+    expect(result.result).toBe('ok');
+    expect(result.tool_call_id).toBe('call_1');
+  });
+
+  it('never collides two different calls in the same session', () => {
+    const a = adaptWorkerEvent(toolPhase('tool_call', 'call_1'))._id;
+    const b = adaptWorkerEvent(toolPhase('tool_call', 'call_2'))._id;
+    expect(a).not.toBe(b);
+    expect(new Set([a, b]).size).toBe(2);
+    // Each result lines up with ITS OWN call, not with the sibling.
+    expect(adaptWorkerEvent(toolPhase('tool_result', 'call_2', { result: 'second' }))._id).toBe(b);
+    expect(adaptWorkerEvent(toolPhase('tool_result', 'call_1', { result: 'first' }))._id).toBe(a);
+  });
+
+  it('falls back to three distinct ids and a standalone tool_result without an id', () => {
+    const start = adaptWorkerEvent(toolPhase('tool_call_start'));
+    const call = adaptWorkerEvent(toolPhase('tool_call'));
+    const result = adaptWorkerEvent(toolPhase('tool_result', undefined, { result: 'ok' }));
+    expect(new Set([start._id, call._id, result._id]).size).toBe(3);
+    expect(toolCallEventId(toolPhase('tool_call'))).toBeNull();
+    // Unpaired results keep today's role + content exactly.
+    expect(result.role).toBe('tool_result');
+    expect(result.content).toBe('ok');
+    expect(result.result).toBe('ok');
+    expect('tool_call_id' in result).toBe(false);
+    expect('tool_call_id' in call).toBe(false);
+  });
+
+  it('keeps eventId() output byte-identical to the pre-refactor literals', () => {
+    // Full identity: session_id + worker_name + i<id> + l<label> + ts + event.
+    expect(adaptWorkerEvent(makeEvent({
+      session_id: 'sess1',
+      worker_name: 'w1',
+      instance_id: 0,
+      instance_label: 'L',
+      timestamp: '2026-08-01T10:00:00.000Z',
+      event: 'tool_call',
+      request: { tool: 't', args: {} },
+    }))._id).toBe('sess1_w1_i0_lL_2026-08-01T10:00:00.000Z_tool_call');
+    // Sparse variants — the join('_') shape must not shift.
+    expect(adaptWorkerEvent({ event: 'tool_call' })._id).toBe('tool_call');
+    expect(adaptWorkerEvent({ event: 'tool_call', timestamp: 'T' })._id).toBe('T_tool_call');
+    expect(adaptWorkerEvent({ session_id: 's', event: 'tool_call', timestamp: 'T' })._id).toBe('s_T_tool_call');
+    expect(adaptWorkerEvent({ event: 'tool_call', instance_id: 0 })._id).toBe('i0_tool_call');
+    expect(adaptWorkerEvent({ event: 'tool_call', instance_label: 'L2' })._id).toBe('lL2_tool_call');
+  });
+});
+
+describe('mergeToolMessages (step 2)', () => {
+  it('collapses start + call + result into ONE entry carrying the result', () => {
+    const start = adaptWorkerEvent(toolPhase('tool_call_start', 'call_1'));
+    const call = adaptWorkerEvent(toolPhase('tool_call', 'call_1'));
+    const done = adaptWorkerEvent(toolPhase('tool_result', 'call_1', { result: 'file contents' }));
+    let list = mergeToolMessages([], start, 1);
+    list = mergeToolMessages(list, call, 2);
+    list = mergeToolMessages(list, done, 3);
+    expect(list).toHaveLength(1);
+    expect(list[0]._seq).toBe(1);          // first-insert sequence kept
+    expect(list[0]._id).toBe(start._id);   // first-insert identity kept
+    expect(list[0].role).toBe('tool_call');
+    expect(list[0].result).toBe('file contents');
+    expect(list[0].tool_name).toBe('read_file');
+    expect(list[0].arguments).toEqual({ path: '/a' });
+    // Round-B rule: content is FIRST-INSERT authoritative — the result phase
+    // must NOT overwrite the name/args JSON with the result text.
+    expect(list[0].content).toBe(start.content);
+    expect(list[0].content).not.toBe('file contents');
+    expect(JSON.parse(list[0].content)).toEqual({ name: 'read_file', arguments: { path: '/a' } });
+  });
+
+  it('orders two calls by first insert and attributes reversed results correctly', () => {
+    let list = mergeToolMessages([], adaptWorkerEvent(toolPhase('tool_call_start', 'call_1', { tool: 'read_file' })), 1);
+    list = mergeToolMessages(list, adaptWorkerEvent(toolPhase('tool_call_start', 'call_2', { tool: 'write_file' })), 2);
+    // Results arrive in REVERSE order: call_2 finishes first.
+    list = mergeToolMessages(list, adaptWorkerEvent(toolPhase('tool_result', 'call_2', { tool: 'write_file', result: 'wrote B' })), 3);
+    list = mergeToolMessages(list, adaptWorkerEvent(toolPhase('tool_result', 'call_1', { tool: 'read_file', result: 'read A' })), 4);
+    expect(list).toHaveLength(2);
+    expect(list.map(m => m.tool_call_id)).toEqual(['call_1', 'call_2']);
+    expect(list.map(m => m._seq)).toEqual([1, 2]);
+    // Attribution proven on the result text, not just on the count.
+    expect(list[0].result).toBe('read A');
+    expect(list[1].result).toBe('wrote B');
+    expect(list[0].tool_name).toBe('read_file');
+    expect(list[1].tool_name).toBe('write_file');
+  });
+
+  it('does not mutate prev (array or entry)', () => {
+    const first = mergeToolMessages([], adaptWorkerEvent(toolPhase('tool_call_start', 'call_1')), 7);
+    const snapshot = JSON.parse(JSON.stringify(first));
+    const next = mergeToolMessages(first, adaptWorkerEvent(toolPhase('tool_result', 'call_1', { result: 'done' })), 8);
+    expect(first).toHaveLength(1);
+    expect(JSON.parse(JSON.stringify(first))).toEqual(snapshot);
+    expect(first[0].result).toBeUndefined();
+    expect(next).not.toBe(first);
+    expect(next[0]).not.toBe(first[0]);
+    expect(next[0].result).toBe('done');
+  });
+
+  it('appends messages that carry no tool_call_id', () => {
+    const a = mergeToolMessages([], adaptWorkerEvent(toolPhase('tool_call')), 1);
+    const b = mergeToolMessages(a, adaptWorkerEvent(toolPhase('tool_call')), 2);
+    expect(a).toHaveLength(1);
+    expect(b).toHaveLength(2);
+    expect(b.map(m => m._seq)).toEqual([1, 2]);
+    // A third id-less phase still appends — the legacy three-row layout.
+    const c = mergeToolMessages(b, adaptWorkerEvent(toolPhase('tool_result', undefined, { result: 'r' })), 3);
+    expect(c).toHaveLength(3);
+  });
+
+  it('never erases an earlier field with undefined', () => {
+    const base = { _id: 'x', tool_call_id: 'call_9', error: 'boom', content: 'c', _seq: 1 };
+    const list = mergeToolMessages([base], { _id: 'x', tool_call_id: 'call_9', result: 'late', content: 'c2' }, 2);
+    expect(list[0].error).toBe('boom');
+    expect(list[0].result).toBe('late');
+    expect(list[0]._seq).toBe(1);
+    expect(list[0].content).toBe('c');   // content is never overlaid
+  });
+});
+
+// ── ACCEPTANCE: the whole real-world sequence ───────────────────────────────
+// Two tool calls emitted start→call each, then the two results arriving in
+// REVERSE order (call 2 first).  This is the panel's actual fold.
+describe('ACCEPTANCE — two interleaved tool calls, reversed results (step 2)', () => {
+  function foldFetch(messages) {
+    let msgs = [];
+    let seq = 0;
+    for (const msg of messages) {
+      seq += 1;
+      msgs = mergeToolMessages(msgs, msg, seq);
+    }
+    return msgs;
+  }
+
+  it('pairs each result to its own call and orders by call start', () => {
+    const messages = [
+      adaptWorkerEvent(toolPhase('tool_call_start', 'call_1', { tool: 'read_file' })),
+      adaptWorkerEvent(toolPhase('tool_call_start', 'call_2', { tool: 'write_file' })),
+      adaptWorkerEvent(toolPhase('tool_call', 'call_1', { tool: 'read_file' })),
+      adaptWorkerEvent(toolPhase('tool_call', 'call_2', { tool: 'write_file' })),
+      // Results in REVERSE order: call 2 finishes first.
+      adaptWorkerEvent(toolPhase('tool_result', 'call_2', { tool: 'write_file', result: 'wrote B' })),
+      adaptWorkerEvent(toolPhase('tool_result', 'call_1', { tool: 'read_file', result: 'read A' })),
+    ];
+    const msgs = foldFetch(messages);
+    expect(msgs).toHaveLength(2);
+    expect(new Set(msgs.map(m => m._id)).size).toBe(2);
+    // Ordered by call START, not by result arrival.
+    expect(msgs.map(m => m.tool_call_id)).toEqual(['call_1', 'call_2']);
+    expect(msgs.map(m => m._seq)).toEqual([1, 2]);
+    // Attribution proven on the result TEXT, not on the count.
+    expect(msgs[0].result).toBe('read A');
+    expect(msgs[1].result).toBe('wrote B');
+    // Round-B fix: content is still the name/args JSON the bubble parses.
+    expect(JSON.parse(msgs[0].content)).toEqual({ name: 'read_file', arguments: { path: '/a' } });
+    expect(JSON.parse(msgs[1].content)).toEqual({ name: 'write_file', arguments: { path: '/a' } });
+    expect(msgs[0].content).not.toBe('read A');
+    expect(msgs[1].content).not.toBe('wrote B');
+    expect(msgs.map(m => m.role)).toEqual(['tool_call', 'tool_call']);
+  });
+
+  it('keeps the old three-row layout for id-less (replayed) phases', () => {
+    const msgs = foldFetch([
+      adaptWorkerEvent(toolPhase('tool_call_start')),
+      adaptWorkerEvent(toolPhase('tool_call')),
+      adaptWorkerEvent(toolPhase('tool_result', undefined, { result: 'legacy ok' })),
+    ]);
+    expect(msgs).toHaveLength(3);
+    expect(msgs.map(m => m.role)).toEqual(['tool_call', 'tool_call', 'tool_result']);
+    expect(msgs[2].content).toBe('legacy ok');
+    expect(new Set(msgs.map(m => m._id)).size).toBe(3);
   });
 });
 

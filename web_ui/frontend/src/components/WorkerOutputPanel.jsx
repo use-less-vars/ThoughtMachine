@@ -1,6 +1,6 @@
 import React, { memo, useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import { MessageBubble } from './chat/MessageBubble';
-import adaptWorkerEvent, { isWorkerEventRenderable } from './chat/adaptWorkerEvent';
+import adaptWorkerEvent, { isWorkerEventRenderable, mergeToolMessages } from './chat/adaptWorkerEvent';
 
 const PANEL_MIN = 250;
 const PANEL_MAX = 600;
@@ -553,8 +553,22 @@ function WorkerOutputPanel({
     }
 
     // ═══ PURE state update — NO side effects ═══
+    // Left-fold the new messages through mergeToolMessages so the phases of one
+    // tool call (start → call → result) collapse into ONE bubble that keeps its
+    // call-start position instead of appending three rows.
+    // `seq` is derived from the array being built, never from a ref mutated in
+    // here: React StrictMode double-invokes state updaters, so a mutable
+    // counter would double-increment and corrupt the ordering.
     setEvents(prev => {
-      const updated = [...prev, ...newOnes]
+      let updated = Array.isArray(prev) ? prev : []
+      let seq = updated.reduce(
+        (max, m) => (typeof m?._seq === 'number' && m._seq > max ? m._seq : max),
+        0,
+      )
+      for (const msg of newOnes) {
+        seq += 1
+        updated = mergeToolMessages(updated, msg, seq)
+      }
       eventsRef.current = updated
       return updated
     })

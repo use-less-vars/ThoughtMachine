@@ -21,11 +21,13 @@ const WORKER_RESUMED_TEXT = '▶ Worker resumed'
 const UNKNOWN_EVENT_TEXT = 'Unknown event: '
 
 /**
- * Build a unique ID for deduplication.
- * Includes session_id and worker_name when available so events from
- * different spawns / workers don't collide.
+ * Ordered identity parts shared by eventId() and toolCallEventId().
+ *
+ * Kept as a separate builder so both ids are built from the SAME conditions
+ * and labels — the eventId() output must stay byte-identical to what it was
+ * when these checks lived inline.
  */
-function eventId(evt) {
+function identityParts(evt) {
   const parts = []
   if (evt.session_id) parts.push(evt.session_id)
   if (evt.worker_name) parts.push(evt.worker_name)
@@ -33,9 +35,82 @@ function eventId(evt) {
   // (multi-instance spawns) don't collide in dedup keys
   if (evt.instance_id != null) parts.push(`i${evt.instance_id}`)
   if (evt.instance_label) parts.push(`l${evt.instance_label}`)
+  return parts
+}
+
+/**
+ * Build a unique ID for deduplication.
+ * Includes session_id and worker_name when available so events from
+ * different spawns / workers don't collide.
+ */
+function eventId(evt) {
+  const parts = identityParts(evt)
   if (evt.timestamp) parts.push(evt.timestamp)
   parts.push(evt.event || '')
   return parts.join('_')
+}
+
+/**
+ * Build the identity shared by all three phases (start / call / result) of a
+ * single backend tool call.
+ *
+ * Same identity parts as eventId() but WITHOUT the timestamp and WITHOUT the
+ * event name — those are exactly the two components that differ between the
+ * phases — plus the backend `tool_call_id`.  Returns null when the event
+ * carries no usable id, which keeps the old "three separate rows" behaviour
+ * for replayed/legacy events and providers that omit ids.
+ */
+export function toolCallEventId(evt) {
+  const req = (evt && evt.request) || {}
+  const tcId = req.tool_call_id
+  if (typeof tcId !== 'string' || !tcId) return null
+  const parts = identityParts(evt)
+  parts.push(`tc${tcId}`)
+  return parts.join('_')
+}
+
+/**
+ * PURE upsert for tool messages (call-start / call / result phases).
+ *
+ * `seq` is a monotonically increasing number supplied by the caller; it is
+ * stamped onto appended entries only, so a merged entry keeps the sequence
+ * number of the FIRST time it appeared (call order == bubble order).
+ *
+ * - no usable `tool_call_id` -> append (nothing to pair with).
+ * - id present, no match     -> append.
+ * - id present, match found  -> replace IN PLACE (position preserved), keep
+ *   the first entry's `_seq` and `_id`, and overlay only the fields the
+ *   incoming message actually defines, so a later, thinner phase never erases
+ *   a richer earlier field with `undefined`.
+ *
+ * Never mutates `prev` (or any of its entries); always returns a new array.
+ */
+export function mergeToolMessages(prev, incoming, seq) {
+  const list = Array.isArray(prev) ? prev : []
+  const msg = incoming || {}
+  const tcId = msg.tool_call_id
+  const hasId = typeof tcId === 'string' && tcId.length > 0
+  if (hasId) {
+    const idx = list.findIndex(m => m && m.tool_call_id === tcId)
+    if (idx !== -1) {
+      const base = list[idx]
+      const merged = { ...base }
+      for (const key of Object.keys(msg)) {
+        if (msg[key] !== undefined) merged[key] = msg[key]
+      }
+      // Position, first-insert identity AND content are authoritative.
+      // `content` must never be overwritten: for tool calls it is the
+      // name/args JSON that MessageBubble parses, while the outcome travels in
+      // `result`.  A later phase overwriting content would break the bubble.
+      merged._seq = base._seq
+      merged._id = base._id
+      merged.content = base.content
+      const next = list.slice()
+      next[idx] = merged
+      return next
+    }
+  }
+  return [...list, { ...msg, _seq: seq }]
 }
 
 /**
@@ -163,11 +238,21 @@ export default function adaptWorkerEvent(evt) {
         name: req.tool || 'unknown',
         arguments: req.args || {},
       })
-      return {
-        _id: eventId(evt),
+      // One identity for every phase of a call when the backend supplied an id;
+      // otherwise the historical per-event id (three separate rows).
+      const msg = {
+        _id: toolCallEventId(evt) || eventId(evt),
         role: 'tool_call',
         content: jsonContent,
+        tool_name: req.tool || 'unknown',
+        arguments: req.args || {},
       }
+      if (typeof req.tool_call_id === 'string' && req.tool_call_id) {
+        msg.tool_call_id = req.tool_call_id
+      }
+      if (req.success !== undefined) msg.success = req.success
+      if (req.error !== undefined) msg.error = req.error
+      return msg
     }
 
     // ── Tool call (pending / started) ───────────────────────
@@ -177,11 +262,17 @@ export default function adaptWorkerEvent(evt) {
         name: req.tool || 'unknown',
         arguments: req.args || {},
       })
-      return {
-        _id: eventId(evt),
+      const msg = {
+        _id: toolCallEventId(evt) || eventId(evt),
         role: 'tool_call',
         content: jsonContent,
+        tool_name: req.tool || 'unknown',
+        arguments: req.args || {},
       }
+      if (typeof req.tool_call_id === 'string' && req.tool_call_id) {
+        msg.tool_call_id = req.tool_call_id
+      }
+      return msg
     }
 
     // ── Tool result ───────────────────────────────────────────────
@@ -193,12 +284,29 @@ export default function adaptWorkerEvent(evt) {
         ? (resp.result || '(empty)')
         : (req.error || resp.result || 'Unknown error')
       const isSummary = (req.tool === 'SummarizeTool')
-      return {
-        _id: eventId(evt),
-        role: 'tool_result',
+      // Paired result (backend supplied tool_call_id): adopt the call bubble's
+      // identity AND its 'tool_call' role so mergeToolMessages folds the result
+      // into the row the call already created.
+      //
+      // UNPAIRED results deliberately stay standalone (role 'tool_result',
+      // unchanged content): there is nothing to pair them with, which is the
+      // case for replayed/legacy events and for providers that omit ids.  They
+      // must keep rendering exactly as they do today.
+      const pairedId = toolCallEventId(evt)
+      const msg = {
+        _id: pairedId || eventId(evt),
+        role: pairedId ? 'tool_call' : 'tool_result',
         content: String(content),
         is_summary: isSummary,
+        tool_name: req.tool || 'unknown',
+        arguments: req.args || {},
+        success,
+        result: String(content),
       }
+      if (typeof req.tool_call_id === 'string' && req.tool_call_id) {
+        msg.tool_call_id = req.tool_call_id
+      }
+      return msg
     }
 
     // ── System notifications (warnings) ──────────────────────────

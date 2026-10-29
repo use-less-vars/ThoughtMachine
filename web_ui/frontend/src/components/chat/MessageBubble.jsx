@@ -184,7 +184,17 @@ function MessageContent({ msg }) {
     case 'assistant':
       return <AssistantContent msg={msg} />
     case 'tool_call':
-      return <ToolCallContent content={msg.content} />
+      return (
+        <>
+          <ToolCallContent content={msg.content} />
+          {/* Paired result: the call and its outcome share ONE bubble now, so
+              the outcome is rendered below the args.  Unpaired results never
+              reach this path — they keep role 'tool_result'. */}
+          {msg.result !== undefined && msg.result !== null && String(msg.result) !== ''
+            ? <TruncatableContent text={String(msg.result)} />
+            : null}
+        </>
+      )
     case 'tool_result':
       return <TruncatableContent text={msg.content} />
     case 'system':
@@ -232,7 +242,15 @@ const MessageBubble = React.memo(
     prev.msg.is_final === next.msg.is_final &&
     prev.msg.is_summary === next.msg.is_summary &&
     prev.msg.response_type === next.msg.response_type &&
-    prev.msg.is_streaming === next.msg.is_streaming
+    prev.msg.is_streaming === next.msg.is_streaming &&
+    // Merged tool bubbles: content is intentionally UNCHANGED when a result
+    // lands on an existing call bubble (content is first-insert authoritative),
+    // so the fields that DO change on merge must be compared here or the
+    // bubble would never re-render and the result would stay invisible.
+    prev.msg.result === next.msg.result &&
+    prev.msg.success === next.msg.success &&
+    prev.msg.error === next.msg.error &&
+    prev.msg.status === next.msg.status
 )
 
 export { MessageBubble, MessageContent, CopyButton }
