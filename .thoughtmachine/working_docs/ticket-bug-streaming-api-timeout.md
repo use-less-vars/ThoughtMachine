@@ -1,9 +1,11 @@
 # Ticket — Streaming provider timeout kills the turn and discards the streamed text
 
-**Status:** Open
+**Status:** Fixed — PR open against `dev`. Branch `fix/streaming-timeout-retry`: `57edcd9c` (provider retry
+with backoff in `llm_providers/openai_compatible.py`) and `b8c7fe26` (persist partial assistant text in
+`agent/core/agent.py`).
 **Severity:** High
 **Filed:** 2026-10-29
-**Branch to fix on:** `fix/streaming-api-timeout-retry` (not yet created)
+**Branch to fix on:** `fix/streaming-timeout-retry` (exists, pushed)
 
 ---
 
@@ -161,16 +163,33 @@ and add a timeout-path partial-retention case to `tests/test_agent_stop_midstrea
   a caller-side flag) and this ticket does not add one.
 - Splitting the scalar timeout into connect vs read timeouts (`httpx.Timeout` / `http_client=`). Orthogonal and smaller; separate ticket.
 
-## OPERATOR TO CONFIRM
+## OPERATOR DECISIONS
 
-- Which provider and base URL produced the failures — a self-hosted or gateway endpoint may time out differently, and the budget should be sized for
-  the one actually used.
-- Intermittent or deterministic: does the same long prompt fail repeatedly? This decides whether retrying is a real fix or just shifts the failure
-  rate.
-- Retry scope: only the window before the first token (recommended — preserves what the operator has seen), or restart the whole turn (recovers more
-  cases, duplicates visible text).
-- Desired retry budget and maximum total wait — how long may the turn stall before the operator should just see the error.
-- Whether the discarded-partial-text defect ships inside this fix or splits out. Same file and code path, but independently testable; splitting is
-  defensible.
-- `max_retries` semantics once explicit backoff exists: leave the SDK at 3 and layer the new budget on top (two budgets, harder to reason about), or
-  set the SDK to 0 and own all retries in `stream_completion` (one budget, one place).
+Resolved. Every question raised at filing time is resolved below — four by operator decision (1–4), two settled in implementation (5–6) — and this
+section reads as closed.
+
+1. **Provider.** DeepSeek at `https://api.deepseek.com/v1/`. The budget is sized for that endpoint, not for a self-hosted or gateway endpoint.
+2. **Failure mode.** Intermittent and mid-stream, not deterministic. Retrying is a real fix, not a displacement of the failure rate.
+3. **Retry scope.** Retry only before the first token is emitted. Once content or reasoning content has been emitted, do not retry: commit whatever
+   partial text exists and emit a clean `TIMEOUT`. In `agent/core/agent.py` the accumulated `content` / `reasoning` is written through before the
+   terminal error event is yielded, matching the hard-stop branch's partial-persist pattern.
+4. **`max_retries` semantics.** Set the SDK's own `max_retries=0` and own all retry logic inside `stream_completion`
+   (`llm_providers/openai_compatible.py`), rather than relying on SDK-level retries. One budget, one place.
+5. **Retry budget.** Not an operator directive — the values were chosen in implementation, and the operator reviewed the behaviour and signed off on it.
+   Backoff doubles from 1.0s per attempt (1s, 2s, 4s), each individual wait is capped at 8.0s, and total wall-clock wait across all attempts is capped at
+   30.0s. Attempts are `1 + max_retries`, so the wait budget and the attempt count are two independent limits and either can end the retry loop. All four
+   values are module constants in `llm_providers/openai_compatible.py`, so the budget is tunable without touching control flow.
+6. **Partial-text defect ships inside this fix.** Both defects are fixed on the same branch. The discarded-partial-text path and the retry sit in the same
+   turn-termination flow in `agent/core/agent.py`, and splitting them into a second PR would have left the partial-text loss in place in the meantime.
+
+### Deviations reviewed and signed off
+
+Three implementation deviations were reviewed and signed off by the operator, each recorded as the decision and its consequence.
+
+- **Retry window closed on tool-call events.** The retry window is closed on tool-call start and on tool-call argument deltas as well as on emitted
+  text — a superset of decision 3, adopted so that a retry cannot duplicate tool events in the UI. Accepted consequence: a timeout during tool-call
+  argument streaming is not retried.
+- **Predicate is `APITimeoutError` only.** As specified. `APIConnectionError` is the same user-visible failure mode and is deferred to a later
+  hygiene wave.
+- **`max_retries` means different things by path.** It now denotes SDK retries for the synchronous client but the application's own retry count for
+  streaming. This is documented in comments at the point of use in `llm_providers/openai_compatible.py`.
