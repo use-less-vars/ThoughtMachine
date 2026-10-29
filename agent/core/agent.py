@@ -1506,6 +1506,31 @@ class Agent:
                         self.logger.log_system_resources()
                         self.logger.log_agent_end('provider_error', f'Provider error: {e}')
                         self.logger.close()
+                    # Persist the partial answer so the truncated text is not lost.
+                    # The stream loop raised out of the LLM call before reaching the
+                    # normal commit site further down, so whatever the model already
+                    # streamed would vanish from history while the UI kept it. This
+                    # mirrors the hard-stop commit above: same TurnTransaction usage,
+                    # same message shape. It is gated on a non-empty accumulator so an
+                    # immediate failure that streamed nothing leaves history untouched
+                    # instead of pushing a blank assistant message.
+                    # Unexecuted tool_calls are deliberately not persisted (see the if halted: block above).
+                    if content or reasoning:
+                        try:
+                            error_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+                            error_msg = {'role': 'assistant', 'content': content}
+                            if reasoning is not None:
+                                error_msg['reasoning_content'] = reasoning
+                            error_tx.add_assistant_message(error_msg)
+                            if error_tx.has_assistant_message():
+                                error_tx.commit_assistant_only()
+                            else:
+                                error_tx.rollback()
+                            log('DEBUG', 'core.agent', f'[PROVIDER ERROR] committed partial assistant message (chars={len(content)})')
+                        except Exception as commit_error:
+                            # Persistence must never suppress the error event or
+                            # change the turn's stop reason.
+                            log('WARNING', 'core.agent', f'[PROVIDER ERROR] could not persist partial assistant message: {commit_error}')
                     if self.session is not None:
                         self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}', is_system_notification=True))
                     event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
