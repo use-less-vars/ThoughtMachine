@@ -1662,17 +1662,17 @@ class Agent:
                                     success = False
                         if not success:
                             error = result
-                        processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn})
+                        processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn, 'tool_call_id': tool_info.get('tool_call_id', '')})
                     # Commit ALL tool results to user_history BEFORE yielding any events
                     # (tool_call, tool_result) so a pause between yields doesn't lose data.
                     if turn_transaction:
                         turn_transaction.commit()
                     for tool in processed_tools:
-                        event_dict = {'type': 'tool_call', 'tool_name': tool['name'], 'arguments': tool['arguments'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
+                        event_dict = {'type': 'tool_call', 'tool_name': tool['name'], 'arguments': tool['arguments'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn'], 'tool_call_id': tool['tool_call_id']}
                         self._add_conversation_data_to_event(event_dict)
                         yield event_dict
                     for tool in processed_tools:
-                        event_dict = {'type': 'tool_result', 'tool_name': tool['name'], 'result': tool['result'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
+                        event_dict = {'type': 'tool_result', 'tool_name': tool['name'], 'result': tool['result'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn'], 'tool_call_id': tool['tool_call_id']}
                         self._add_conversation_data_to_event(event_dict)
                         yield event_dict
                     # Flush any buffered token warnings after the turn is committed

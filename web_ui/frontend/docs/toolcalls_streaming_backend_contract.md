@@ -43,14 +43,16 @@ execution begins. Worker panels render a pending `tool_call_start` row before th
                                                       # user_history BEFORE next yield
                                                       # ("so a pause between yields
                                                       #  doesn't lose data")
-1321-1324  yield {'type': 'tool_call', 'tool_name', 'arguments', 'success', 'error', 'turn'}
+1321-1324  yield {'type': 'tool_call', 'tool_name', 'arguments', 'success', 'error', 'turn', 'tool_call_id'}
 1325-1328  yield {'type': 'tool_result', ...}          # both strictly POST-completion
 ```
 
 Every `tool_call`/`tool_result` pair is derived from the `executed_tools`
 return value of the synchronous call — i.e. both are emitted **after** the tool
-finished. Note the emitted `tool_call` event does **not** carry `tool_call_id`
-(only `tool_name`/`arguments`/`success`/`error`/`turn`).
+finished. Both post-completion events (`tool_call` and `tool_result`) now carry
+`tool_call_id` in addition to `tool_name`/`arguments`/`success`/`error`/`turn`
+(`tool_result` carries `tool_name`/`result`/`success`/`error`/`turn`/
+`tool_call_id`); the id is taken from `executed_tools` and defaults to `""`.
 
 ### 1.2 Tool executor — `agent/core/tool_executor.py`
 
@@ -63,7 +65,7 @@ finished. Note the emitted `tool_call` event does **not** carry `tool_call_id`
 238-245  tool class resolution
 252     tool_execution_result = self._execute_single_tool(...)   # SYNCHRONOUS run()
 271-274  tool result msg buffered via turn_transaction.add_tool_result(...)
-279     executed_tools.append({'name', 'arguments', 'result'})
+279     executed_tools.append({'name', 'arguments', 'result', 'tool_call_id'})
 ```
 
 - No event is published **by the executor before/during** execution; the
@@ -93,13 +95,16 @@ receives):
 
 ```
 429-436  event_type == 'tool_call'    -> _publish("tool_call",
-                                     {"tool_name": ..., "arguments": ...})
-                                     # NOTE: tool_call_id NOT forwarded
+                                     {"tool_name": ..., "arguments": ...,
+                                      "tool_call_id": ...})
 438-449  event_type == 'tool_result'  -> _publish("tool_result",
                                      {"tool_name", "success", "error",
-                                      "result": str(result)[:1000]})
-                                     # NOTE: tool_call_id NOT forwarded
+                                      "result": str(result)[:1000],
+                                      "tool_call_id": ...})
 ```
+
+All three phases (`tool_call_start`, `tool_call`, `tool_result`) now forward
+`tool_call_id` (default `""` when the provider supplied no id).
 
 (Truncation: result capped at 1000 chars, :448.)
 
@@ -120,8 +125,9 @@ fall through the **generic** else branch (:790-802):
 }
 ```
 
-i.e. `worker:tool_call` data = `{tool_name, arguments}` and
-`worker:tool_result` data = `{tool_name, success, error, result}`.
+i.e. `worker:tool_call` data = `{tool_name, arguments, tool_call_id}` and
+`worker:tool_result` data = `{tool_name, success, error, result, tool_call_id}`
+(`tool_call_start` data = `{tool_name, arguments, tool_call_id}`).
 (Special-cased siblings: `tokens_updated` flattened :733-742,
 `context_updated` :743-775, `context_summarized` :776-789.)
 
@@ -176,8 +182,8 @@ one event per call:
 {'type': 'tool_call_start',
  'tool_name': tc['function']['name'],
  'arguments': tc['function']['arguments'],   # raw JSON string (as sent by the model)
- 'tool_call_id': tc['id'],                   # AVAILABLE here; absent from the
-                                             # post-completion tool_call yield
+ 'tool_call_id': tc['id'],                   # AVAILABLE here; also carried by the
+                                             # post-completion tool_call/tool_result yields
  'turn': ...}
 ```
 
@@ -197,7 +203,7 @@ elif event_type == "tool_call_start":
     self._publish("tool_call_start", {
         "tool_name": event.get("tool_name", ""),
         "arguments": event.get("arguments", ""),
-        "tool_call_id": event.get("tool_call_id", ""),   # recommend adding!
+        "tool_call_id": event.get("tool_call_id", ""),
     })
 ```
 
@@ -216,9 +222,15 @@ elif event_type == "tool_call_start":
 
 ```
 event                data (WS, under .data)                          timing
-worker:tool_call     {tool_name, arguments}                          post-completion (today)
-worker:tool_call_start  {tool_name, arguments, tool_call_id?}        pre-execution (implemented, PR #TBD)
-worker:tool_result   {tool_name, success, error, result[:1000]}      post-completion (today)
+worker:tool_call     {tool_name, arguments, tool_call_id}            post-completion (implemented, PR #TBD)
+worker:tool_call_start  {tool_name, arguments, tool_call_id}         pre-execution (implemented, PR #TBD)
+worker:tool_result   {tool_name, success, error, result[:1000],       post-completion (implemented, PR #TBD)
+                     tool_call_id}
+
+tool_call_id is the provider's id for the call and is `""` when the provider
+supplied none. Because the id is present in all three phases, a consumer can
+pair a `tool_result` with its originating `tool_call_start`/`tool_call` even
+when several calls in one turn complete out of order.
 ```
 
 Main-agent chat would additionally need the assistant-message-with-tool_calls
@@ -236,10 +248,9 @@ here.
    `tool_call` (:159-171) or add an `is_running` flag to the returned msg.
 3. Dedup: current key is `type|timestamp` (WorkerOutputPanel.jsx:328) so a
    distinct `tool_call_start` type renders independently — but for reliable
-   start→result **pairing** in multi-call turns, prefer keying on
-   `tool_call_id` once it is present in the payload (see 4.1/4.2 — it is
-   currently dropped at worker_thread.py:433-436 and not emitted at
-   agent.py:1321).
+   start→result **pairing** in multi-call turns, key on
+   `tool_call_id`, which is now present in all three phases (see 4.1/4.2 — it
+   is forwarded at worker_thread.py:429-449 and emitted at agent.py:1321-1328).
 4. Tests: extend `chat/adaptWorkerEvent.test.js` with `tool_call_start`
    fixtures (mirror :303-342); run with
    `cd /workspace/web_ui/frontend && /workspace/node-bin/bin/node node_modules/vitest/vitest.mjs run --maxWorkers=1 --testTimeout=15000`.

@@ -460,6 +460,7 @@ class WorkerBusAdapter:
             self._publish("tool_call", {
                 "tool_name": event.get("tool_name", ""),
                 "arguments": event.get("arguments", {}),
+                "tool_call_id": event.get("tool_call_id", ""),
             })
 
         elif event_type == "tool_result":
@@ -473,6 +474,7 @@ class WorkerBusAdapter:
                 "success": event.get("success", True),
                 "error": event.get("error", "") or "",
                 "result": str(result)[:1000] if result else "",
+                "tool_call_id": event.get("tool_call_id", ""),
             })
 
         elif event_type == "token_warning":

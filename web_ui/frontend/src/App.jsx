@@ -797,7 +797,12 @@ export default function App() {
         const instancePart =
           (e.instance_id != null ? `|i${e.instance_id}` : '') +
           (e.instance_label ? `|l${e.instance_label}` : '')
-        return eCanonicalType + '|' + (e.timestamp || '') + instancePart
+        // Backend tool_call_id (when present) distinguishes sibling tool events
+        // that share a type AND a timestamp; absent → key is unchanged.
+        const eToolCallId = e.data?.tool_call_id
+        const toolCallPart =
+          (typeof eToolCallId === 'string' && eToolCallId) ? '|tc' + eToolCallId : ''
+        return eCanonicalType + '|' + (e.timestamp || '') + instancePart + toolCallPart
       }
       const key = evtKey(event)
       const incomingVisible = isWorkerEventRenderable(event)
