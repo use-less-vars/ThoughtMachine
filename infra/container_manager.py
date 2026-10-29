@@ -2179,7 +2179,7 @@ class ContainerManager:
             f"Image {image!r} is not present locally, and NO pull was "
             "attempted: container start is local-first, so an absent image is "
             "refused instead of being fetched implicitly by docker-py's "
-            "containers.run. Build it from the vault Dockerfile at "
+            "containers.run. Build it from the Dockerfile at "
             f"{vault_dockerfile} and tag it explicitly with "
             f"ContainerBuildTool(tag={image!r}). Warning: "
             "ContainerBuildTool() with no tag builds "
