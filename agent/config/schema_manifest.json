@@ -689,6 +689,16 @@
           "type": "dict",
           "required": false,
           "description": "Workspace resource permission map (resource name -> banned/ask/read/write), validated against agent/config/resource_catalog.json."
+        },
+        "git_identity": {
+          "type": "dict",
+          "required": false,
+          "description": "Commit author pins (a dict of name and email) read by tools/git_write_tool.py and applied per invocation as -c user.name/user.email for that one git call; never written to .git/config and never defaulted. Engine-read key: thoughtmachine/vault_repair.py never machine-removes it."
+        },
+        "root": {
+          "type": "string",
+          "required": false,
+          "description": "Absolute host path of the workspace root, read by thoughtmachine/host_port.py (_workspace_root) as the host_bash cwd-containment anchor, by workspace_capabilities.resolve_workspace_id, and by setup_workspace. Plain non-empty string, realpath-normalised. Engine-read key: thoughtmachine/vault_repair.py never machine-removes it."
         }
       }
     },

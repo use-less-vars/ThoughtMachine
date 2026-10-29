@@ -82,6 +82,20 @@ _PERM_INTEREST = LEGACY_SET | SESSION_VOCAB_SET | {"system", "docker"}
 # silently reduce grants); reported as manual_review everywhere it is seen.
 _GAW_KEY = "git_allow_worktree_commits"
 
+# Engine-read keys: values the engine itself consumes (not tool-facing grants),
+# so a machine removal silently disables working behaviour instead of merely
+# tidying a config file.  ``root`` is the host_bash cwd-containment anchor
+# (thoughtmachine/host_port.py _workspace_root), ``git_identity`` is the commit
+# author pin (tools/git_write_tool.py _workspace_git_identity), and ``_GAW_KEY``
+# folds to git 'write' at load.  The schema manifest also declares ``root`` and
+# ``git_identity`` (agent/config/schema_manifest.json, entry
+# 'workspaces/*/config.json'); this set is the independent safety net that keeps
+# ``--apply`` from ever quarantining them, declared or not.
+#
+# Only the "may this be machine-removed?" decisions route through this set;
+# the legacy-fold-to-git-'write' checks stay keyed on ``_GAW_KEY`` itself.
+_ENGINE_READ_KEYS = frozenset({_GAW_KEY, "root", "git_identity"})
+
 # Git grain ranks reuse the canonical ``GRANT_LEVEL_RANKS``
 # (security/resource_catalog.py) so the git-fold order
 # ``banned < read < ask < write == write_on_feature_branch`` cannot drift
@@ -487,6 +501,23 @@ def _collect_drift_issues(drift_report: dict, manifest: dict, sink: _IssueSink,
                         % (_GAW_KEY, rel)
                     ),
                     fix="review (engine-read legacy flag)",
+                )
+                continue
+            if issue == "undeclared field" and field in _ENGINE_READ_KEYS:
+                # Other engine-read keys (``root`` -> host_bash containment,
+                # ``git_identity`` -> commit pins): declaring them in the schema
+                # manifest is the real fix; until then they are reported for
+                # human review, never offered for machine removal.
+                sink.add(
+                    file=rel, path_in_file=field, category="unknown_top_key",
+                    classification="manual_review", severity="warning",
+                    message=(
+                        'Engine-read field "%s" in %s is not declared in the '
+                        'schema manifest; removing it would silently disable '
+                        'the engine feature that reads it -- left for human '
+                        'review' % (field, rel)
+                    ),
+                    fix="declare it in the schema manifest (engine-read key)",
                 )
                 continue
             mapped = _drift_issue_map(issue, field, message, action, file_spec)
@@ -1120,6 +1151,14 @@ def _fix_issue(root: Path, quarantine_dir: Path, issue: dict,
         return {"status": "applied", "action": "backfilled %s from schema default" % last}
 
     if category in ("unknown_top_key", "unknown_nested_key"):
+        # Engine-read keys are never machine-removed, whatever the manifest
+        # says: removing ``root`` would break host_bash cwd containment and
+        # removing ``git_identity`` would break commits.  Guard BEFORE touching
+        # the document, and derive the key name from the raw path too -- a key
+        # literally named "root" canonicalises to '' (the locate root label).
+        key_name = (canon or path_in_file or "").rsplit(".", 1)[-1]
+        if key_name in _ENGINE_READ_KEYS:
+            raise ValueError(_engine_read_refusal_message(key_name))
         removed = _get_node(doc, canon)
         hint_key = _parent_path_of(canon)[1] or canon or "value"
         _quarantine_artifact_path(quarantine_dir, rel, canon, category,
@@ -1136,8 +1175,8 @@ def _fix_issue(root: Path, quarantine_dir: Path, issue: dict,
 
     if category == "legacy_permission_key":
         parent, last = _resolve_parent(doc, canon)
-        if last == _GAW_KEY:
-            raise ValueError("manual review only (engine-read flag; never auto-removed)")
+        if last in _ENGINE_READ_KEYS:
+            raise ValueError(_engine_read_refusal_message(last))
         if last == "docker":
             if "container" in parent:
                 raise ValueError("'container' already present; refusing to overwrite")
@@ -1359,10 +1398,23 @@ def _resolve_selection(report: dict, parsed: dict) -> dict:
     }
 
 
-def _is_gaw_target(path_in_file: str) -> bool:
-    """True when the issue addresses the engine-read GAW legacy flag."""
+def _engine_read_refusal_message(path_in_file: str) -> str:
+    """Exact refusal text for an engine-read target.
+
+    ``git_allow_worktree_commits`` has always been refused as "engine-read
+    *flag*" and that string is pinned byte-for-byte (downstream logs and tests
+    may assert on it); the newer engine-read keys (``root``, ``git_identity``)
+    are described as "engine-read *key*".
+    """
+    last = (path_in_file or "").rsplit(".", 1)[-1]
+    kind = "flag" if last == _GAW_KEY else "key"
+    return "manual review only (engine-read %s; never auto-removed)" % kind
+
+
+def _is_engine_read_target(path_in_file: str) -> bool:
+    """True when the issue addresses an engine-read key (never auto-removed)."""
     p = path_in_file or ""
-    return p == _GAW_KEY or p.endswith("." + _GAW_KEY)
+    return p.rsplit(".", 1)[-1] in _ENGINE_READ_KEYS
 
 
 def _quarantine_root_file(root: Path, quarantine_dir: Path, name: str) -> Path:
@@ -1481,9 +1533,9 @@ def _apply_selected_fixes(root: Path, quarantine_dir: Path, report: dict,
                                       issue.get("file") or "")
                 entry["status"] = "applied"
                 entry["action"] = "quarantined unknown root file"
-            elif _is_gaw_target(entry["path_in_file"]):
+            elif _is_engine_read_target(entry["path_in_file"]):
                 raise ValueError(
-                    "manual review only (engine-read flag; never auto-removed)")
+                    _engine_read_refusal_message(entry["path_in_file"]))
             elif category in _FIXABLE_SELECTABLE:
                 res = _fix_issue(root, quarantine_dir, issue, made)
                 entry["status"] = "applied"
