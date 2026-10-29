@@ -1,12 +1,25 @@
 # Core Integration Backlog (Post-Core-Sprint)
 
-## 1. `bug/reasoning-block-pop-in` (Fix in flight)
-**Symptom:** Reasoning streams on backend (`reasoning_delta`), but UI shows a blank screen, then streams text, then pops the reasoning block in *after* the text finishes.
-**Cause:** The terminal `turn` event replaces the in-flight bubble, bringing the committed reasoning with it. The frontend state doesn't paint `reasoning_delta` live.
-**Fix:** Update `SessionTab.jsx` to append `reasoning_delta` to the `inFlight` state's `reasoning_content` field, and ensure `MessageBubble.jsx` renders it inside the `<Thinking>` block when `isStreaming={true}`.
-**Verified (dev @ `2ac3148c`):** #231 is merged, so the backend side is done — `reasoning_delta`
-does stream. The remaining gap is purely React state: `SessionTab.jsx` swallows the live deltas
-and only replaces them on commit. Do not re-derive a "backend does not stream" premise.
+## 1. `bug/reasoning-block-pop-in` (FIXED — branch unmerged, needs push + PR)
+**Symptom:** Reasoning streams on the backend, but the UI showed a blank screen, then streamed text,
+then popped the reasoning block in *after* the text finished; the panel also stopped auto-scrolling
+while the model was thinking.
+**Corrected cause (2026-10-29 — the previous diagnosis in this file was WRONG):** the claim that
+"`SessionTab.jsx` swallows the live deltas and only replaces them on commit" is **false at `dev`
+@ `adfb5ef6`**: `SessionTab.jsx:623` handles `case 'reasoning_delta'` and appends to the in-flight
+bubble's `reasoning_content` with per-frame coalescing (landed in **#231**, `ab94020de`). The two real
+defects were:
+1. `ChatPanel.jsx` keyed its scroll-follow signature on `messages[last].content` alone. A thinking-phase
+   delta grows only `reasoning_content`, so the signature looked unchanged, the panel took the
+   restore-`scrollTop` branch, and the view froze mid-thinking.
+2. `MessageBubble.jsx` hard-coded `<details className="reasoning-block" open>` while `ChatPanel` keys
+   bubbles by **array index**, so a load-more prepend or a `conversation_changed` replace re-used the
+   instance for a *different* message and the block re-opened (the "pop-in").
+**Fix:** **already committed** on `fix/reasoning-ui-streaming` @ `7c5f1fae` ("Fix reasoning-block pop-in
+and autoscroll stall during the thinking phase") — two-field scroll signature, and per-content
+collapse state that survives append-only streaming but re-opens for a different message.
+**OPEN ACTION:** that branch is **local only — it has no `remotes/origin/` counterpart**. The fix is
+stranded until it is pushed and a PR opened. Do not re-implement it; fetch the branch.
 
 ## 2. `bug/worker-stop-propagation` (Fix in flight)
 **Symptom:** Hitting "Stop" on an agent that has spawned workers stops the main agent but leaves workers running.
