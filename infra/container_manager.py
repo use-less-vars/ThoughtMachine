@@ -2156,7 +2156,8 @@ class ContainerManager:
         """One precise paragraph explaining a local-first image refusal.
 
         Names the resolved image ref, states that NO pull was attempted,
-        points at the vault Dockerfile the image must be built from, and gives
+        points at the Dockerfile the image must be built from (rendered
+        relative, never as an absolute host path), and gives
         the exact remedy -- including the trap that a TAG-omitted build
         produces the workspace-hashed ``agent-executor-<hash>`` tag, which is
         NOT the default start image ``agent-executor``.
@@ -2167,10 +2168,14 @@ class ContainerManager:
         vault_dockerfile = (
             Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "Dockerfile"
         )
+        # The path is RENDERED RELATIVE to the anchor it was resolved against,
+        # so the message never echoes an absolute host path.
+        display_dockerfile = f"workspaces/{self.workspace_id}/Dockerfile"
         if not vault_dockerfile.exists():
             legacy = Path(self.workspace_path) / "Dockerfile"
             if legacy.exists():
                 vault_dockerfile = legacy
+                display_dockerfile = f"{Path(self.workspace_path).name}/Dockerfile"
         # The tag a TAG-omitted ContainerBuildTool() actually produces, from
         # the single tag convention (docker_executor._compute_image_tag).
         hashed_tag = "agent-executor-" + hashlib.sha256(
@@ -2180,7 +2185,7 @@ class ContainerManager:
             "attempted: container start is local-first, so an absent image is "
             "refused instead of being fetched implicitly by docker-py's "
             "containers.run. Build it from the Dockerfile at "
-            f"{vault_dockerfile} and tag it explicitly with "
+            f"{display_dockerfile} and tag it explicitly with "
             f"ContainerBuildTool(tag={image!r}). Warning: "
             "ContainerBuildTool() with no tag builds "
             f"{hashed_tag!r} instead (the "
