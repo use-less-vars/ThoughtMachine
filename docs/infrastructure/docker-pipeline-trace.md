@@ -4,41 +4,18 @@
 
 ## 1. Dockerfile Inventory
 
-**Only one Dockerfile exists** in the project:
+**The `docker/` directory no longer exists** — there is no `docker/executor.Dockerfile` and no
+`docker/requirements-docker.txt`. The inventory below is what is actually on disk; the
+`docker/requirements-docker.txt` analysis in §§2–3 and the git-log appendix are kept only as
+**historical record**.
 
-| File | Path | Size |
+| File | Path | Role |
 |------|------|------|
-| Executor container | `docker/executor.Dockerfile` | 550 bytes |
-
-### `docker/executor.Dockerfile`
-
-```dockerfile
-FROM python:3.11-slim
-
-# Install only essential system packages (no git)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
-
-# Python packages for the sandbox runtime
-COPY docker/requirements-docker.txt /app/requirements-docker.txt
-RUN pip install --no-cache-dir -r /app/requirements-docker.txt
-
-# User site-packages enabled for pip install --user support
-RUN useradd -m -u 1000 agent && mkdir /workspace && chown agent:agent /workspace
-WORKDIR /workspace
-USER agent
-
-CMD ["tail", "-f", "/dev/null"]
-```
-
-**Characteristics:**
-- Base image: `python:3.11-slim`
-- Non-root user: `agent` (UID 1000)
-- Working dir: `/workspace`
-- No `git` installed
-- Installs from `docker/requirements-docker.txt`
-- Default CMD is a no-op tail (container stays alive for `docker exec` usage)
-- No `.dockerignore` — entire project sent as build context
+| Per-workspace Dockerfile — **the build input** | `<vault_root>/workspaces/<workspace_id>/Dockerfile` | Authoritative executor image definition |
+| Per-workspace requirements | `<vault_root>/workspaces/<workspace_id>/requirements.txt` | Staged into the build context beside the Dockerfile; required |
+| Repo default Dockerfile | `resources/default_dockerfile.txt` (964 B) | Runtime image hash source; `python:3.12-slim`, `COPY requirements.txt`, agent uid 1000, nodejs/npm |
+| Resource overlay | `resources/git_resource_overlay_dockerfile.txt` | Layers git tooling on the default image |
+| Frontend editor | `web_ui/frontend/src/components/DockerfileEditor.jsx` | Edits the vault Dockerfile |
 
 ### No other Dockerfiles
 - No `Dockerfile` at project root
@@ -46,25 +23,91 @@ CMD ["tail", "-f", "/dev/null"]
 - No multi-stage builds
 - No docker-compose anywhere
 
+### Real build path
+
+```
+<vault_root>/workspaces/<workspace_id>/Dockerfile + requirements.txt
+  → ContainerManager.build_image(tag=None, nocache=False)        infra/container_manager.py:4167
+      · stages ONLY {Dockerfile, requirements.txt} into a tempdir          (:4268-4304)
+      · session container-grant gate, fail-closed                         (:4278-4298)
+      → executor._run_image_build(client, tmpdir, "Dockerfile", tag, …)   (:4310 → executor.py:159)
+          · client.api.build(...) → image tagged agent-executor-<hash>
+```
+
+- Vault-gated resolution: `<vault_root>/workspaces/<workspace_id>/Dockerfile`, falling back to
+  `<workspace_path>/Dockerfile`. There is no `dockerfile_path` override.
+- Returns **exactly** `{"image_tag": str, "build_log": str}` (log truncated to 100 KB).
+- Raises `RuntimeError` when the Docker SDK is unavailable, no vault/legacy Dockerfile exists, the
+  vault `requirements.txt` is missing ("Run the vault bootstrap to seed per-workspace
+  requirements"), the session has no container grant, or the build itself fails.
+- Only those two files are staged, so the workspace tree is never part of the build context:
+  `COPY .` cannot read workspace files — `.git` exfiltration is impossible by construction.
+
+### Image tags: per-workspace, never `agent-executor:latest`
+
+`_compute_image_tag()` (`infra/containers/executor.py:145-156`):
+
+```python
+path_hash = hashlib.sha256(workspace_path.encode()).hexdigest()[:16]
+return f"agent-executor-{path_hash}"
+```
+
+Different workspaces (worktrees included) get different tags, so they never share or conflict on one
+tag like `agent-executor:latest`. `DEFAULT_IMAGE = "agent-executor"`
+(`agent/config/defaults.py:135`) is a default image *name*, not the tag builds are published under.
+
+### Build-hash reuse gate
+
+Every built image is labelled `thoughtmachine.build_hash` (`EXECUTOR_BUILD_HASH_LABEL`,
+`executor.py:84`). `build_image` computes
+
+```python
+build_hash = compute_executor_build_hash(
+    extra_paths=[str(vault_dockerfile), str(req_vault)]
+)
+```
+
+— the executor build sources (repo `requirements.txt` + `resources/default_dockerfile.txt`) folded
+with the vault Dockerfile and vault requirements bytes, so editing the workspace Dockerfile always
+changes the hash and can never leave a stale image looking current.
+
+| Condition | Behaviour |
+|-----------|-----------|
+| image exists, label == `build_hash`, `nocache=False` | skip the build; return `{"image_tag": tag, "build_log": ""}` (log: "Image … already matches build sources — skipping build") |
+| image exists, label != `build_hash` | rebuild (log: "build sources drifted (label mismatch) — rebuilding") |
+| `nocache=True` | force a real rebuild — the reuse gate is bypassed, so an unchanged hash cannot short-circuit an explicit rebuild |
+
+Tests: `tests/test_build_image_vault_dockerfile_hash.py` (the hash/label covers the vault Dockerfile),
+`tests/test_build_image_session_grant_gate.py`, `tests/test_build_networkmode_contract.py`,
+`tests/tools/test_container_build_nocache.py`.
+
 ### Template for User-Customizable Dockerfile
 
-**`resources/default_dockerfile.txt`** (978 bytes) — fallback template for the unified runtime image (`infra/resource_container_manager.py`):
+**`resources/default_dockerfile.txt`** (964 bytes) — the repo-side runtime Dockerfile (a dependency-only base that `resources/git_resource_overlay_dockerfile.txt` layers git tooling onto). Its bytes are one of the executor build-hash sources (`EXECUTOR_RUNTIME_DOCKERFILE`, `infra/containers/executor.py:87`):
 
 ```dockerfile
-FROM python:3.11-slim
-RUN useradd -m -s /bin/bash agent
+FROM python:3.12-slim
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update ... && apt-get install -y --no-install-recommends nodejs npm ...
+RUN groupadd -g 1000 agent ... && useradd -m -u 1000 -g 1000 -s /bin/bash agent ...
+ENV HOME=/home/agent
 USER agent
 WORKDIR /workspace
-COPY . .
-RUN pip install --no-cache-dir -r requirements.txt || true
 CMD ["python", "main.py"]
 ```
 
-**Note**: This template uses `requirements.txt` (host file with web server packages), NOT `docker/requirements-docker.txt`. This means user-custom containers get FastAPI/uvicorn/etc., while the executor container gets ML packages.
+(abridged — the file also runs an import-metadata assertion that every requirement is installed.)
+
+**Note**: it copies `requirements.txt`, not any `docker/…` file, and there is no `COPY . .` in it — the executor build context holds only `Dockerfile` + `requirements.txt`, so `COPY .` could not read the workspace anyway.
 
 ---
 
 ## 2. Requirements Files Inventory
+
+> **Historical (pre-removal audit).** `docker/requirements-docker.txt` no longer exists. The image
+> now installs `<vault_root>/workspaces/<workspace_id>/requirements.txt`, staged next to the
+> Dockerfile. Keep the split analysis in §§2–3 and §9 as the record of why it was abandoned.
 
 | File | Path | Packages | Version Pins | Purpose |
 |------|------|----------|--------------|---------|
@@ -153,8 +196,8 @@ tree-sitter
 
 ### Web UI Rebuild Mechanism
 
-**`web_ui/backend/server.py`** line 1875:
-- WebSocket command `"rebuild_container"` is handled by calling `docker_executor.rebuild_container()`
+**`web_ui/backend/server.py`** (handler at `:3725`; the `:1875` line in the original audit has moved):
+- WebSocket command `"rebuild_container"` is handled by importing `rebuild_container` from `infra.containers.executor` (`server.py:3730`) and running it for that workspace
 - This triggers a background rebuild of the executor Docker image
 
 ### GUI Flow
@@ -163,12 +206,12 @@ tree-sitter
 User clicks "Rebuild Container" in Workspace Panel
     → WebSocket "rebuild_container" event
     → server.py handler
-    → docker_executor.rebuild_container(workspace_path)
+    → infra.containers.executor.rebuild_container(workspace_path)
     → Background thread:
         1. Stop & remove existing container
         2. _build_image(nocache=True)
-           → Builds from docker/executor.Dockerfile
-           → Installs docker/requirements-docker.txt
+           → Builds from the vault <workspace_id>/Dockerfile
+           → Installs the vault <workspace_id>/requirements.txt
         3. _ensure_container()
            → Creates fresh container from new image
     → Status reported back via WebSocket
@@ -178,15 +221,15 @@ User clicks "Rebuild Container" in Workspace Panel
 
 ## 5. Container Panel Rebuild Mechanism
 
-### Core Engine: `docker_executor.py` (1050 lines)
+### Core Engine: `infra/containers/executor.py`
 
-Located at project **root** (not inside `agent/` or `tools/`).
+The engine is no longer a root-level `docker_executor.py`: it lives at `infra/containers/executor.py` and is imported as `infra.containers.executor` (older docs and code comments still call the module `docker_executor`). The line numbers below come from the original audit pass and have drifted; treat them as approximate.
 
 | Component | Lines | Function |
 |-----------|-------|----------|
 | `DockerExecutor` class | ~300-800 | Full container lifecycle management |
 | `_ensure_image()` | 636+ | Lazily builds image if missing |
-| `_build_image()` | 657+ | Builds from `docker/executor.Dockerfile` |
+| `_build_image()` | 657+ | Builds from the vault `<workspace_id>/Dockerfile` (via `ContainerManager.build_image`) |
 | `_ensure_container()` | 347+ | Creates or recycles container |
 | `rebuild_container()` | 792+ | Background rebuild triggered from Web UI |
 | `get_container_status()` | — | Returns build results from background thread |
@@ -204,11 +247,11 @@ Located at project **root** (not inside `agent/` or `tools/`).
 ```
                     ┌──────────────────────┐
                     │  Web UI (rebuild)     │
-                    │  server.py:1875       │
+                    │  server.py:3725       │
                     └──────────┬───────────┘
                                │ WebSocket
                     ┌──────────▼───────────┐
-                    │  docker_executor.py   │  ← 1050 lines, main engine
+                    │ executor.py (infra/)  │  ← main engine
                     │  DockerExecutor       │
                     │  rebuild_container()  │
                     │  verify_integrity()   │
@@ -220,8 +263,8 @@ Located at project **root** (not inside `agent/` or `tools/`).
                     └──────────┬───────────┘
                                │ builds from
                     ┌──────────▼───────────┐
-                    │ executor.Dockerfile   │
-                    │ + requirements-docker │
+                    │ vault Dockerfile      │
+                    │ + requirements.txt    │
                     └──────────────────────┘
 
      Agent Tool Layer:
@@ -269,7 +312,7 @@ The vault lives at `~/.thoughtmachine/` and is the user's local config/session/k
 | Container lifecycle | Long-running (`tail -f /dev/null` CMD) |
 | Execution model | `docker exec` into running container |
 | Rebuild trigger | Web UI "rebuild container" button, or agent tool `build=True` |
-| Image tag | Derived from workspace path hash |
+| Image tag | Derived from workspace path hash — `agent-executor-<sha256(workspace_path)[:16]>` (per workspace; never `agent-executor:latest` — see §1) |
 | Container per workspace | Single container, reused |
 | Stale detection | Yes — `verify_container_integrity()` checks config matches |
 | Ephemeral per-command | No — container persists between commands |
@@ -434,26 +477,29 @@ python -m pytest tests/docker_integration/ -v --collect-only
 
 ```bash
 # Check container status
-python -c "from docker_executor import verify_container_integrity; print(verify_container_integrity())"
+python -c "from infra.containers.executor import verify_container_integrity; print(verify_container_integrity())"
 
 # Rebuild container
-python -c "from docker_executor import rebuild_container; print(rebuild_container('/workspace'))"
+python -c "from infra.containers.executor import rebuild_container; print(rebuild_container('/workspace'))"
 
 # Check image size
-docker images agent-executor --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+docker images 'agent-executor-*' --format '{{.Repository}}:{{.Tag}} {{.Size}}'
 ```
 
 ---
 
 ## Appendix: Git History
 
-### `docker/requirements-docker.txt` (2 commits)
+> **Historical paths.** `docker/requirements-docker.txt` and `docker/executor.Dockerfile` were both
+> deleted with the `docker/` directory. The commit lists below are kept as provenance only.
+
+### `docker/requirements-docker.txt` (2 commits — file deleted)
 ```
 92d127c fix(deps): bump fast-json-repair & libcst to installable versions
 e823d2a Added missing files of the provider management...
 ```
 
-### `docker/executor.Dockerfile` (11 commits)
+### `docker/executor.Dockerfile` (11 commits — file deleted)
 ```
 5f3ccf6 Slim down default container image to minimal sandbox
 ca688f0 Changed docker exec environment...

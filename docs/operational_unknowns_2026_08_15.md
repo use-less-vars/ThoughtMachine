@@ -12,7 +12,7 @@
 2. **`_timeout_triggered` is sticky for the life of the worker thread** in the legacy path: it is set once (`tools/workspace/worker.py:1229`) and never reset. It is not part of the per-query reset block (`worker.py:1437-1451`).
 3. **Legacy `send_query` has no query-id correlation and nothing drains the output queue** (`worker.py:709-742`) — a stale envelope from a timed-out query is returned to the *next* caller. The stale comment at `worker.py:715` ("query clears the queue") is false.
 4. **No tool class appends tool output to the live conversation history.** The only context mutations are agent-core summarization (`agent.py:1317`) and worker context assembly (`worker.py:1293-1300`, `1348-1352`).
-5. **EditDockerfile is vestigial**: it is referenced by exactly 4 files (class, registration, worker blocklist, tests); no runtime dispatch path enumerates it. Removal is safe.
+5. **EditDockerfile is vestigial — RESOLVED (removed).** It was referenced by exactly 4 files (class, registration, worker blocklist, tests) and no runtime dispatch path ever enumerated it. The tool has since been deleted; see Section D.
 6. **Vault git hooks are latent/dead code**: the only consumer is `git_info_tool.py:675-725` (`_run_vault_hooks`), and nothing in the codebase ever creates `~/.thoughtmachine/hooks/`. The directory must be hand-created by an operator or hooks silently never run.
 
 ## Section A — Why can a worker stop mid-journey and never emit a final Respond?
@@ -109,7 +109,18 @@ Worker query-level chain: `worker.py:594` default 600 → `worker_cfg["timeout_s
 - Session load only **removes** orphaned tool messages (`session_lifecycle.py:300-304`).
 - **Conclusion: no tool class appends tool output to the live conversation. Verdict: PASS.**
 
-## Section D — EditDockerfile removal
+## Section D — EditDockerfile removal — **RESOLVED (tool deleted)**
+
+> **Status: done.** `tools/workspace/edit_dockerfile.py` no longer exists, its registration and the
+> worker blocklist entry are gone, and the removal is pinned by
+> `tests/tools/test_workspace_tools.py::TestEditDockerfileRemoved` (`:1303-1321`), whose three guards
+> assert the name is absent from `tools.TOOL_CLASSES`, that
+> `importlib.util.find_spec("tools.workspace.edit_dockerfile") is None`, and that it is absent from
+> `_WORKER_BLOCKLIST`. Editing the image is now done by editing the **vault Dockerfile**
+> (`<vault_root>/workspaces/<workspace_id>/Dockerfile`, UI: `web_ui/frontend/src/components/DockerfileEditor.jsx`)
+> and building it with **`ContainerBuildTool`** (`tools/container_control.py:802`) →
+> `ContainerManager.build_image()` (`infra/container_manager.py:4167`). Everything below is the
+> historical pre-removal record.
 
 - Class: `tools/workspace/edit_dockerfile.py:48`; `tool="EditDockerfile"` (51); `required_categories=["container:write"]` (52); `skip_output_truncation=True`; appends `# Added by agent via edit_dockerfile on <iso>\n{instructions}\n`; creates from template `resources/default_dockerfile.txt` with fallback `FROM python:3.11-slim\n` (91-95).
 - References (full-repo grep = 18 hits in exactly 4 files):
@@ -119,7 +130,7 @@ Worker query-level chain: `worker.py:594` default 600 → `worker_cfg["timeout_s
   4. `tests/tools/test_workspace_tools.py:1155-1274` (TestEditDockerfile incl. `container:write` assert at 1272-1274)
 - **Not referenced by** any agent tool list, `_ALL_TOOLS`, server.py, tool_map, or web UI.
 - `security_gate`: no `container:write` in the level map (`banned0/ask1/read2/connect3/write3/full4`, `security_gate.py:169-227`) → a boolean True satisfies via `_value_satisfies`.
-- **Removal verdict: SAFE** for runtime (no callers beyond registry-based dispatch). Needed changes: delete `edit_dockerfile.py`; remove registration `tools/__init__.py:237-240`; remove blocklist entry `worker.py:398`; update/remove `tests/tools/test_workspace_tools.py:1155-1274`.
+- **Removal verdict: SAFE** for runtime (no callers beyond registry-based dispatch). ~~Needed changes: delete `edit_dockerfile.py`; remove registration `tools/__init__.py:237-240`; remove blocklist entry `worker.py:398`; update/remove `tests/tools/test_workspace_tools.py:1155-1274`.~~ **DONE** — all four changes are in the tree; the old `TestEditDockerfile` (1155-1274) is replaced by `TestEditDockerfileRemoved` (`tests/tools/test_workspace_tools.py:1303-1321`), which asserts the removal.
 
 ## Section E — Vault git hooks
 

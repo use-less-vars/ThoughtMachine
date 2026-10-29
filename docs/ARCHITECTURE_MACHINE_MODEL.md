@@ -210,8 +210,10 @@ boundary you might think.
 The machine has one home and one front door, and confusing them is the most common way a session
 goes wrong.
 
-1. **The Workspace Image is the runtime.** `agent-executor:latest` is where work happens — every
-   tool call that executes code lands inside a container built from it. Treat it as your home:
+1. **The Workspace Image is the runtime.** The image built for this workspace — tagged
+   `agent-executor-<sha256(workspace_path)[:16]>`, so two workspaces never share one tag like
+   `agent-executor:latest` — is where work happens: every tool call that executes code lands inside a
+   container built from it. Treat it as your home:
    interpreters, linters, CLI tools and the test suite live there. If a command works in the image
    and nowhere else, that is correct, not a limitation to route around.
 2. **The Vault Dockerfile is the blueprint.** The image is not configured by hand. It is declared in
@@ -221,7 +223,10 @@ goes wrong.
 3. **Host Bash is bootstrapping, and only bootstrapping.** The `host_bash` tier (§5) exists for the
    one job that cannot happen inside the container: building the container. Use it to run
    `docker build`, then turn it off and go back inside. It is not a second runtime, not a
-   convenience shell, and never the place to "just quickly" install something.
+   convenience shell, and never the place to "just quickly" install something. Correction: you do not
+   need `host_bash` even for this — `ContainerBuildTool` builds the workspace image from the vault
+   Dockerfile via `ContainerManager.build_image()` under the container grant; `host_bash` is only
+   the escape hatch for what that tool cannot express.
 
 The test is simple: **if the work can happen in the image, it belongs in the image.** Host Bash is
 how you make the image better; it is not where you live.
