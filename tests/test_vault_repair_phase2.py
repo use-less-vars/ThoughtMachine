@@ -454,6 +454,25 @@ def test_git_allow_worktree_commits_never_auto_removed(tmp_path):
     assert _vault_json(tmp_path, "workspaces/ws1/sessions/s1/permissions.json") == {
         "git_allow_worktree_commits": True}
     assert any(i["category"] == "legacy_permission_key" for i in report["issues"])
+    # The refusal text for this flag is pinned byte-for-byte (downstream logs
+    # and operators match on it), so the engine-read guard must reproduce it
+    # exactly -- including the word "flag" rather than the generic "key".
+    with pytest.raises(ValueError) as excinfo:
+        vr._fix_issue(
+            tmp_path,
+            tmp_path / "logs/quarantine",
+            {
+                "file": "workspaces/ws1/sessions/s1/permissions.json",
+                "path_in_file": "git_allow_worktree_commits",
+                "category": "legacy_permission_key",
+            },
+            {},
+        )
+    assert str(excinfo.value) == (
+        "manual review only (engine-read flag; never auto-removed)")
+    # Other engine-read keys keep the generic wording.
+    assert vr._engine_read_refusal_message("git_identity") == (
+        "manual review only (engine-read key; never auto-removed)")
 
 
 def test_quarantine_artifacts_redact_secrets(tmp_path):
