@@ -265,6 +265,7 @@ class ToolExecutor:
                         "name": tc["function"]["name"],
                         "arguments": {},
                         "result": stopped_content,
+                        "tool_call_id": tc.get("id", ""),
                     })
                 return (executed_tools, False, None, None, None)
             tool_name = tool_call['function']['name']
@@ -275,7 +276,7 @@ class ToolExecutor:
                 update_token_func(tool_tokens)
                 # A state-level rejection is a refusal: record it structurally so the
                 # caller does not have to sniff the prose (which carries no marker).
-                executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result, 'success': False})
+                executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result, 'success': False, 'tool_call_id': tool_call.get('id', '')})
                 continue
             arguments_str = tool_call['function']['arguments']
             json_repair_needed = False
@@ -292,7 +293,7 @@ class ToolExecutor:
                     if self.logger:
                         self.logger.log_error('JSON_DECODE_ERROR', f'Failed to parse JSON for {tool_name}: {e}')
                     add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
-                    executed_tools.append({'name': tool_name, 'arguments': {'error': 'Invalid JSON', 'raw': arguments_str}, 'result': tool_result, 'success': False})
+                    executed_tools.append({'name': tool_name, 'arguments': {'error': 'Invalid JSON', 'raw': arguments_str}, 'result': tool_result, 'success': False, 'tool_call_id': tool_call.get('id', '')})
                     log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=True, session_id=session_id)
                     continue
             log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=json_repair_needed, session_id=session_id)
@@ -341,7 +342,7 @@ class ToolExecutor:
             update_token_func(tool_tokens)
             if self.logger:
                 pass
-            tool_entry = {'name': tool_name, 'arguments': arguments, 'result': tool_result}
+            tool_entry = {'name': tool_name, 'arguments': arguments, 'result': tool_result, 'tool_call_id': tool_call.get('id', '')}
             # Forward the executor's structural verdict when it has one, so a
             # refusal stays distinguishable from a success without prose
             # sniffing upstream.  Success paths stay key-less (no invented
