@@ -531,3 +531,60 @@ Each with my recommendation, so that silence is not an option but disagreement i
 - **D-5 — Tier 1 drain at the per-token poll: adopt?** Recommend yes. It is the moment §3 found, it costs one branch beside an existing one, and it touches neither the IR nor any adapter.
 - **D-6 — Ordering: make injection order-insensitive (a), or restore `seq` to the wire (b)?** Recommend (a) now, (b) as a separate ticket, because (b) changes a stable contract for reasons that predate this work.
 - **D-7 — Budget enforcement: refuse the write, or truncate oldest-first and report?** Recommend refuse-and-report for the operator path, evict-and-report for the mailbox path. Silent truncation of a remembered instruction is the worst of the three outcomes.
+
+---
+
+## 13. Rulings — Gen 54, Delivery Arc
+
+Operator rulings, recorded verbatim where quoted, with the consequences each one forces inside the sections above. Where a ruling and a recommendation in §12 differ, the ruling governs; the recommendation is left in place as history rather than quietly rewritten.
+
+### 13.1 Decisions closed
+
+| # | Question (§12) | Ruling |
+|---|---|---|
+| D-2 | Composed into the single system string, or a second system message? | **Composed into the single system string.** |
+| D-4 | Who may write the addendum: mailbox, tool, operator? | **Mailbox + operator first.** No ninth tool in `ENGINEER_TOOLS` yet — separate decision. |
+| D-5 | Tier 1 drain at the per-token poll? | **Adopted.** |
+| D-6 | Ordering: order-insensitive now, or restore `seq` to the wire? | **Order-insensitive now.** `seq` restoration is its own ticket. |
+| §6.6 | Mode, or addendum? | **Addendum. The two must never share a field.** Mode is immutable; the addendum is a mutable session field. |
+
+### 13.2 What each ruling changes in the text above
+
+**D-2 closes §6.2 and §6.4, and makes P2 structural rather than advisory.** The addendum is composed into `system_prompt` before the `insert(0, …)` at `llm_client.py:177`. This is a commitment, not a preference: an implementation that adds a second system message is now a defect against this document. It also retires the §6.4 trap by construction, because there is no sibling message for `_find_main_prompt_and_summary` to misread.
+
+**D-5 accepts §7.2 unchanged.** Tier 1 drains beside the existing halt check at `agent/core/agent.py:1367-1370`. No new thread, no new channel, no contention with the blocking `__anext__` — the drain runs *between* `__anext__` calls, which is the only window that exists and the window §3 established. Tier 0 (§7.1) remains the existing `_pending_config` mailbox, untouched; this ruling does not widen it.
+
+**D-4 narrows §6.6's writer list to two.** In the first cut: the config mailbox, for system-originated facts; and the operator, via the config panel. An agent-side tool is explicitly deferred, so `ENGINEER_TOOLS` stays at eight. The consequence is worth stating plainly: **for the first cut the model cannot write its own memory.** An addendum entry exists only because the config layer or the operator put it there. That is the safer direction of error, and it keeps the §9 test obligations reachable without touching the tool registry.
+
+**D-6 adopts §7.4 option (a) and puts an obligation on the payload.** Order-insensitivity is only true if the notification is self-describing and idempotent, so `addendum_updated` must carry `entry_id`, `ts` and the resulting entry set (or a convergent diff) rather than a delta whose meaning depends on arrival order; and every client arm must tolerate duplicate and out-of-order arrival by converging on the same display. Without that, "order-insensitive" is a claim about intent rather than a property of the wire. Option (b) becomes ticket T-1 below.
+
+**§6.6 rules the mode question.** The addendum is a mutable session field, sibling to `summary`, and never shares a field with `mode`. The immutability at `config_manager.py:1180-1181` therefore cannot leak into the addendum — which is precisely what requirement 1 needs.
+
+### 13.3 Still open
+
+The rulings did not address these, and I have not inferred them. The recommendations in §12 stand as provisional, not settled:
+
+- **D-1** — the addendum as its own session field rather than an entry list inside `metadata`. The §6.6 ruling uses the words "mutable session field", which is consistent with D-1 but is not the same statement. Confirm before the schema is written, because it fixes `to_persistable_dict` and `from_persistable_dict` (`session/models.py:326`, `:341`).
+- **D-3** — how fast `[SYSTEM NOTIFICATION]` narrows (§8). The recommendation is site by site with no flag day; unruled.
+- **D-7** — budget enforcement: refuse the write, or evict oldest-first and report (§6.5). Unruled, and it decides whether the addendum can silently lose an entry.
+- **§5.5** — whether an unknown `type` on the main frontend switch is a no-op or a crash is still unverified. One `grep` settles it. This closes before implementation begins, not during, because the answer decides whether a P5 test is a regression guard or a bug fix.
+- **§11.1–11.6** — six pre-existing defects, each wanting its own ruling.
+
+### 13.4 Work items split off by these rulings
+
+Filed separately, not part of the addendum implementation:
+
+- **T-1** — restore `seq` to the wire: `event_forwarder.broadcast` (`web_ui/backend/event_forwarder.py:84-96`) and every hand-built bridge payload arm (`web_ui/backend/bridge.py:3144-3183`). Also the natural place to use the `session_id` argument the forwarder currently ignores.
+- **T-2** — a ninth tool, so the model can write its own addendum. An `ENGINEER_TOOLS` contract change, deferred by D-4.
+- **T-3** — correct the false premise at `docs/design-streaming-canonical-ir.md:18` (§3, §11.6). As written it will cause the next reader to re-reject the addendum for a reason the code refutes.
+- **T-4** — mark `docs/design-interruptible-tool-calls.md` superseded by the IR document's `:98` (§11.2).
+- **T-5** — `docs/agent-core-spec.md` stale line references (§11.1).
+- **T-6** — the unverified frontend default arm (§5.5): one `grep`, then either a test or a fix.
+
+### 13.5 What the rulings did not change
+
+The invariants (§5) are untouched: P1 through P5 stand as written, and D-2 hardens P2 rather than relaxing it. The three-channel rule (§4.4) is unchanged — injection remains illegal on the provider channel, which is why the new kinds are runtime-channel kinds (§7.3). The non-scope list (§10) stands in full: no prompt caching, no interruptible tools, no backpressure or resume, no event-schema unification.
+
+### 13.6 Next
+
+An implementation brief for Design A (the addendum sink) and Design B (Tier 1 drain) follows this document's merge to `dev`. It should not be written against an unmerged design, because §13.3 leaves three schema-affecting questions — D-1, D-3 and D-7 — that a brief would otherwise have to guess at.
