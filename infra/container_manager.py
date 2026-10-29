@@ -775,6 +775,31 @@ def _reobserve_effective_intent(workspace_id, record_id, container):
         return None
 
 
+def _local_image_present(client, image):
+    """Probe whether ``image`` exists LOCALLY -- never pulling it.
+
+    ``docker-py``'s ``containers.run`` implicitly PULLS the image when the
+    daemon reports ``ImageNotFound``, so without this probe a create is
+    silently remote-first: an absent image is fetched from a registry instead
+    of failing.  ``images.get`` never pulls, so probing here is what makes
+    container start LOCAL-FIRST: an absent image is refused (with a precise
+    message) before any create is attempted.
+
+    Returns ``True`` when the image is present locally, ``False`` when the
+    daemon reports it absent (``ImageNotFound``), and ``None`` when the probe
+    itself is unavailable (a client without ``images``, a daemon hiccup, ...).
+    ``None`` is NOT a refusal: an unprobeable client keeps the historical
+    behaviour rather than blocking a start that used to work.
+    """
+    try:
+        client.images.get(image)
+        return True
+    except ImageNotFound:
+        return False
+    except Exception:
+        return None
+
+
 class ContainerManager:
     """Owns the Docker containers for one session (start -> exec -> stop)."""
 
@@ -2127,6 +2152,42 @@ class ContainerManager:
         self._containers[name] = container.id
         return container
 
+    def _image_absent_message(self, image):
+        """One precise paragraph explaining a local-first image refusal.
+
+        Names the resolved image ref, states that NO pull was attempted,
+        points at the vault Dockerfile the image must be built from, and gives
+        the exact remedy -- including the trap that a TAG-omitted build
+        produces the workspace-hashed ``agent-executor-<hash>`` tag, which is
+        NOT the default start image ``agent-executor``.
+        """
+        # Same resolution as ``build_image`` (vault-managed Dockerfile first,
+        # legacy workspace-path Dockerfile second) -- mirrored, not shared, so
+        # ``build_image``'s behaviour is untouched.
+        vault_dockerfile = (
+            Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "Dockerfile"
+        )
+        if not vault_dockerfile.exists():
+            legacy = Path(self.workspace_path) / "Dockerfile"
+            if legacy.exists():
+                vault_dockerfile = legacy
+        # The tag a TAG-omitted ContainerBuildTool() actually produces, from
+        # the single tag convention (docker_executor._compute_image_tag).
+        hashed_tag = "agent-executor-" + hashlib.sha256(
+            self.workspace_path.encode()).hexdigest()[:16]
+        return (
+            f"Image {image!r} is not present locally, and NO pull was "
+            "attempted: container start is local-first, so an absent image is "
+            "refused instead of being fetched implicitly by docker-py's "
+            "containers.run. Build it from the Dockerfile at "
+            f"{vault_dockerfile} and tag it explicitly with "
+            f"ContainerBuildTool(tag={image!r}). Warning: "
+            "ContainerBuildTool() with no tag builds "
+            f"{hashed_tag!r} instead (the "
+            "agent-executor-<sha256(workspace_path)[:16]> convention), which "
+            "is NOT the start image -- always pass the tag explicitly."
+        )
+
     def _fresh_start(self, *, image, name, note, worker_name, lifecycle_class,
                      network_mode, workspace_mode, reuse_record_id=None,
                      permissions=None, mem_limit=None, cpu_quota=None,
@@ -2286,6 +2347,11 @@ class ContainerManager:
             # Operator-only recreate: bind the fresh container to the EXISTING
             # record (no new record, no delete; the name index is untouched).
             labels.update(record_label(reuse_record_id))
+            # Local-first image guard: place the refusal BEFORE the create site
+            # so a recreate never reaches ``containers.run`` (which would pull).
+            if _local_image_present(self.client, image) is False:
+                return {"error": self._image_absent_message(image),
+                        "code": "image_not_present_locally"}
             container = self._run_container(
                 image=image, name=name, labels=labels, mounts=mounts,
                 tmpfs=tmpfs, network_mode=network_mode,
@@ -2376,6 +2442,11 @@ class ContainerManager:
             return {"id": container.id, "name": name, "status": "created",
                     "note": note or ""}
 
+        # Local-first image guard: probed BEFORE the record is minted, so an
+        # absent image refuses the create without leaving an orphan record.
+        if _local_image_present(self.client, image) is False:
+            return {"error": self._image_absent_message(image),
+                    "code": "image_not_present_locally"}
         with record_creation(
             workspace_id=self.workspace_id,
             lifecycle_class=lifecycle_class,
