@@ -137,7 +137,7 @@ from agent.config.session_config import SessionConfig
 from agent.config.audit import log_config_audit, restart_required_for
 
 from web_ui.backend.event_forwarder import EventForwarder, _active_tab_bridges
-from web_ui.backend.config_manager import ConfigManager
+from web_ui.backend.config_manager import ConfigManager, resolve_provider_fields
 from web_ui.backend.session_manager import (
     SessionManager,
 )
@@ -1559,25 +1559,17 @@ class WebAgentBridge:
         self._session_config = session_config
 
         # Resolve API key from the full config chain if not already set
+        # (same helper as ConfigManager.apply_config — single owner)
         if not session_config.api_key:
             try:
-                resolved = self._config_manager.resolve_full_config(
+                resolve_provider_fields(
+                    session_config,
                     workspace_id=session_config.workspace_id or self._workspace_id,
                     session_id=self._session_id or (
                         self._loaded_session.session_id if self._loaded_session else None
                     ),
                     provider_id=session_config.provider_id,
                 )
-                if resolved.get("api_key"):
-                    session_config.api_key = resolved["api_key"]
-                if not session_config.base_url and resolved.get("base_url"):
-                    session_config.base_url = resolved["base_url"]
-                # Merge provider-specific config (timeout/max_retries) into session
-                resolved_pc = resolved.get("provider_config") or {}
-                if resolved_pc:
-                    merged = dict(getattr(session_config, "provider_config", None) or {})
-                    merged.update(resolved_pc)
-                    session_config.provider_config = merged
             except Exception:
                 pass
 
@@ -2029,6 +2021,10 @@ class WebAgentBridge:
             is_running=self.is_running,
             has_session=self._session is not None,
             workspace_path=self._workspace_path,
+            workspace_id=self._workspace_id,
+            session_id=self._session_id or (
+                self._loaded_session.session_id if self._loaded_session else None
+            ),
         )
 
         # Step 2: Update session config if ConfigManager returned a new one
