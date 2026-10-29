@@ -2,7 +2,7 @@
 
 **Status:** implementation brief. All three rulings are in (§4.0) — implementation may start. Slice order and gating in §6.
 **Design:** `docs/design-sysprompt-addendum-and-injection.md`, 590 lines, on `dev` at `8a2e9e38` (merged in `9d964208`, PR #254) — see §0.1.
-**Audience:** the incoming Main engineer, who implements slices 1-5.
+**Audience:** the implementing agent. Main rules; the agent implements slices 1-5.
 **Authored by:** Gen 54 worker-side, from a verified read of `dev` at `9831e08b`; rulings recorded against `dev` at `9d964208`.
 
 ---
@@ -74,6 +74,8 @@ Listed so that nobody rediscovers them mid-implementation and calls them in-scop
 - **T-4** mark `design-interruptible-tool-calls.md` superseded — 14 lines, contradicting IR `:98`.
 - **T-5** stale `agent-core-spec.md` line references.
 - **T-6** ~~frontend `default:` arm~~ — **closed, see §5.** No ticket needed; the arm already exists and works. The obligation there is a regression guard, not a fix.
+- **T-9** a UI surface for the addendum — a panel where the operator can read and edit memory. Not this wave (Q6); slice 4's frontend obligation is event handling only.
+- **T-10** a real tokenizer at the write boundary, replacing `len(text)`. Required before `budget_chars` can honestly become `budget_tokens` again (Q1).
 
 Also out of scope, from design §10: prompt caching (there is none in the repo — which is precisely why P4 is cheap to satisfy), interruptible tool calls, backpressure/resume, and any unification of the two event schemas. On that last point: whether `agent/events.py:114-118` / `:131` / `EventType:23` or the turn-loop dicts are live at runtime was **not established**. The design does not depend on the answer. Do not go looking — it is a rabbit hole with no bearing on the deliverable.
 
@@ -113,9 +115,9 @@ Proposed shape, from design §6.5:
 ```python
 {
   "entries": [
-    {"id": str, "ts": str, "source": str, "text": str, "pinned": bool}
+    {"id": str, "ts": str, "source": "operator|mailbox|tool", "text": str, "pinned": bool}
   ],
-  "budget_tokens": int,
+  "budget_chars": int,
 }
 ```
 
@@ -136,7 +138,9 @@ Forces changes in **no** serialiser: `metadata` is already persisted, so `sessio
 3. *Forward tolerance.* Same as A.
 4. *Plumbing.* A test proving that `metadata` actually reaches the composition point in `agent/core/llm_client.py:144-179`. Under Path A the field is on the session object that composition already receives; under Path B you must verify the dict survives whatever strips session objects down for the LLM call, and that nothing between the store and the composer recreates `metadata` from a whitelist. **This test exists only to prove Path B works at all**, which is a signal about Path B.
 
-**Risks specific to Path B.** `metadata` is a free-form dict. Nothing in the schema says what is in it, which means: (i) anything that echoes `metadata` to the client echoes the model's memory text too; (ii) anything that summarises or truncates display state can touch it; (iii) an entry list in an untyped dict has no place to express the `pinned` and `budget_tokens` semantics that D-7 depends on, so Path B makes D-7 harder, not easier. There is a real, if small, chance that Path B leaks internal memory text to the UI.
+**The estimator and the two caps (Q1, Q2).** `budget_chars` is measured with `len(text)` on each entry's text, summed over the set. There is no tokenizer at the write boundary, so a character count is the only provider-neutral measure available — and it errs conservatively, which under D-7's refuse semantics costs a needless refusal, never a silent loss. The entry count is capped separately at **32** (Q2): a hundred tiny entries and three large ones behave very differently in a prompt, and the character budget bounds only the second case. A real tokenizer is **T-10** (§3).
+
+**Risks specific to Path B.** `metadata` is a free-form dict. Nothing in the schema says what is in it, which means: (i) anything that echoes `metadata` to the client echoes the model's memory text too; (ii) anything that summarises or truncates display state can touch it; (iii) an entry list in an untyped dict has no place to express the `pinned` and `budget_chars` semantics that D-7 depends on, so Path B makes D-7 harder, not easier. There is a real, if small, chance that Path B leaks internal memory text to the UI.
 
 **Ruling: Path A — dedicated session field.** (Recommended, and accepted.) Two reasons. First, design §6.6 (C5) already treats the addendum as *a mutable session field* — that phrasing is a constraint on mutability, not on storage, but a first-class field is the shape the rest of the design assumes. Second, Path B defers a schema decision while making every read site responsible for interpreting an untyped blob; the saving is two call sites and the cost is paid at every future read.
 
@@ -172,7 +176,7 @@ Forces **no** changes to the 14 sites. All existing notification tests stay gree
 **Cost had the ruling gone the other way.** If Main rules A and we built B, the remaining work is identical to what A would have been — same sites, same conversions — just scheduled later. Nothing is thrown away. If Main rules B and we built A, we would have shipped an unreviewable PR. Again the asymmetry favours the smaller commitment.
 ### 4.3 `[RULED — refuse]` — D-7: what does the budget do when it is full?
 
-**The question.** The addendum has a `budget_tokens` ceiling. Writes can arrive from the operator or the mailbox, in any order, while a turn is running. What happens on the write that would exceed the ceiling?
+**The question.** The addendum has a `budget_chars` ceiling. Writes can arrive from the operator or the mailbox, in any order, while a turn is running. What happens on the write that would exceed the ceiling?
 
 Two candidate semantics, and they differ in one respect only — but it is the respect that matters for a memory feature:
 
@@ -196,7 +200,7 @@ Two candidate semantics, and they differ in one respect only — but it is the r
 3. *Oversized single entry.* One entry larger than the entire budget: refuse, under both paths, because even evicting everything cannot fit it. Testing this prevents an infinite eviction loop, which is a real way to hang a turn.
 4. *Report survives the wire.* The evicted `entry_id` reaches the client in the `addendum_updated` event, so a UI can show that memory shrank. Under Path B this is not optional reporting hygiene — it is the only mechanism by which silent loss becomes non-silent.
 
-**Ruling: Path A — refuse, and surface it visibly.** (Recommended, and accepted — plus one requirement beyond the recommendation: the refusal must reach the UI, not only the caller. See §4.0.)
+**Ruling: Path A — refuse, and report it visibly.** (Recommended, and accepted — plus one requirement beyond the recommendation: the refusal must reach the UI, not only the caller, carried by the `runtime_notice` kind that slice 4 builds. See §4.0.)
 
 A memory feature that can silently lose an entry is a memory feature nobody can trust, and the failure is invisible: the model simply stops knowing something, and no one can tell whether that is a bug or the budget working as designed. Refusal is a visible, recoverable, operator-facing failure — the operator writes again, smaller, and knows the state of the world. Path B's advantage is that the write never bounces, which matters if writes were frequent and automated; they are not, because per C2 they come from the operator and the mailbox, which is human-paced.
 
@@ -204,7 +208,7 @@ There is a second reason, and it is the one that decided it: **under Path A the 
 
 **Cost had the ruling gone the other way.** If Main rules B, the additional work is one eviction function and its four tests — small, additive, and it does not invalidate any of the Path A tests except the refusal assertion. If Main rules A and we had built B, we ship a memory feature whose losses are only detectable by grepping logs. The asymmetry favours A.
 
-**One thing the ruling does not settle, flagged early:** the unit of `budget_tokens`. Nothing in this design establishes a token estimator available at the write boundary, and a character-count proxy is wrong by a variable factor across providers. §9 lists this as an open question rather than pretending it is decided; if Main wants the budget enforced correctly it needs to name the estimator. Path A makes this cheap to defer: refuse on a conservative estimate, and the cost of the estimate being slightly wrong is a needless refusal rather than a silent eviction.
+**The one thing the ruling left open is now settled (Q1).** The unit is `budget_chars`, measured with `len(text)` summed over the entry set. There is no tokenizer at the write boundary, and a character count is provider-neutral, so it cannot be wrong in a provider-dependent way — it can only be a *conservative* approximation of tokens, which under Path A costs a needless refusal rather than a silent eviction. A real tokenizer is **T-10** (§3).
 
 ---
 
@@ -250,7 +254,7 @@ One consequence for the slice plan (§6, slice 4): the frontend arm and its test
 
 ## 6. Slice plan
 
-Six slices. Each is independently reviewable and independently revertable, and each is ordered so that the tests it needs can be written against code that already exists. With the rulings in §4.0: slices 1-4 are unblocked now, slice 5 is unblocked but depends on slice 4 having built the client channel that carries the visible refusal, and slice 6 does not ship in this implementation.
+Six slices. Each is independently reviewable and independently revertable, and each is ordered so that the tests it needs can be written against code that already exists. With the rulings in §4.0: slices 1-4 are unblocked now, slice 5 is unblocked but depends on slice 4 having built the client channel that carries the visible refusal, and slice 6 does not ship in this implementation. Estimated blast radius per slice — the persisted-dict keys and the runtime event kinds each one adds — is §13.
 
 ### Slice 1 — schema and persistence · **unblocked (D-1: dedicated field)**
 
@@ -274,17 +278,17 @@ A test, not a feature. Run a **real** `SummarizeTool` compaction and assert the 
 
 The structural argument that survival is free (pruner 1 replays the main prompt at `session/context_builder.py:284-291` / `:357` with `keep_turns=5` at `:212`; pruner 2 cannot reach a non-message at `history_pruner.py:164-165` with `keep_system_notifications=False` at `:68`) is exactly that — an argument. This slice converts it into an assertion. Do not skip it on the grounds that the argument is sound; the argument is sound *given* slices 1 and 2 are correct, and something has to check that.
 
-### Slice 4 — Tier 1 drain, runtime event, bridge arm, frontend arm · **carries C3 and C4**
+### Slice 4 — Tier 1 drain, both runtime events, bridge arm, frontend arm · **carries C3 and C4**
 
-The drain sits beside the halt poll at `agent/core/agent.py:1367-1370` — per stream event, which is roughly per token. The new runtime kind `addendum_updated` follows the precedent of `tool_call_start` at `agent.py:1654-1659`: a turn-loop dict, **not** a `StreamEvent`. That distinction is a hard rule from design §4 — the provider channel (`agent/core/stream_events.py:108-119`) is a closed, content-only union, and injection is legal on the runtime and client channels only.
+The drain sits beside the halt poll at `agent/core/agent.py:1367-1370` — per stream event, which is roughly per token. **This slice builds two runtime kinds, not one** — Main caught the one-event version in review, and the correction is load-bearing rather than cosmetic. `addendum_updated` is the feature channel. `runtime_notice` is the Tier 2, UI-only carrier that must exist *before* slice 5 can refuse visibly (D-7, §4.0): building only `addendum_updated` leaves the budget with no way to reach the user's eyes, which is exactly the failure D-7's ruling exists to prevent. Both follow the precedent of `tool_call_start` at `agent.py:1654-1659` — turn-loop dicts, **not** `StreamEvent`s. That distinction is a hard rule from design §4 — the provider channel (`agent/core/stream_events.py:108-119`) is a closed, content-only union, and injection is legal on the runtime and client channels only.
 
 The bridge arm renames per arm as `bridge.py:3144-3153` already does for existing kinds. The frontend arm and its guard land **in this slice** (§5.3) — a guard written before the event exists on the wire is a test of a test.
 
-Done when: a duplicate `addendum_updated` carrying the same entry set is idempotent; an out-of-order pair converges on the same entry set (C4 — order-insensitive, no reliance on `seq`); a genuinely unknown kind hits the frontend `default:` without throwing; and the new kind's frontend arm is asserted by a *state change*, not by absence of exception.
+Done when: `runtime_notice` reaches the session UI as a rendered notice, asserted by a state change and not by absence of exception; a duplicate `addendum_updated` carrying the same entry set is idempotent; an out-of-order pair converges on the same entry set (C4 — order-insensitive, no reliance on `seq`); a genuinely unknown kind hits the frontend `default:` without throwing; and the new kind's frontend arm is asserted by a *state change*, not by absence of exception.
 
 ### Slice 5 — budget enforcement · **unblocked (D-7: refuse) — must surface the refusal in the UI**
 
-Enforced at the write boundary, not at composition (§4.3). Lands after slice 4 because the reporting half of Path B rides on `addendum_updated`, and a budget that cannot report an eviction is Path B with its only safety property removed.
+Enforced at the write boundary, not at composition (§4.3). D-7 ruled **refuse, and report it visibly** (Path A): an over-budget write is rejected, the entry set is unchanged, and the refusal is surfaced through the `runtime_notice` channel slice 4 built — to the UI, not only to the caller. Lands after slice 4 for exactly that reason: without a notice channel, "refuse" degrades into a silent no-op, the worst of the three outcomes.
 
 ### Slice 6 — narrowing `[SYSTEM NOTIFICATION]` · **deferred out of this implementation (D-3)**
 
@@ -330,16 +334,16 @@ Seven ways this goes wrong quietly. Each is a real failure mode found during the
 
 ---
 
-## 9. Open questions for Main
+## 9. The six questions — answered
 
-Not rulings — these are smaller than the three in §4, but each will otherwise be decided by whoever writes the code first, which is a worse process.
+Raised as smaller-than-§4 questions, on the grounds that each would otherwise be decided by whoever wrote the code first. All six are now answered by Main, the answers are binding, and each answer is folded into the section it touches rather than left here as prose.
 
-1. **What is the unit of `budget_tokens`, and which estimator?** No token estimator was established as available at the write boundary, and a character-count proxy is wrong by a variable factor across providers. Path A tolerates a conservative estimate (cost of being wrong: a needless refusal); Path B does not (cost: wrongful eviction). If the answer is "a character budget, renamed", say so, and D-7 gets much simpler. D-7 ruled **refuse**, which makes a conservative estimate the safe default: if the estimate is wrong the operator gets a visible refusal, not a wrongful eviction. **Slice 5 still cannot land without an answer to this question** — "refuse" needs a number to refuse against.
-2. **Is there an entry-count cap distinct from the token budget?** A hundred tiny entries and three large ones behave very differently in a prompt, and only one of the two is bounded by a token ceiling.
-3. **What are the legal values of `source`?** The proposed shape carries a `source` string per entry. If it is free-form, nobody will ever filter by it; if it is an enum, it needs listing now.
-4. **Can the operator write while a turn is in flight, and does it queue or apply immediately?** Under C3 an in-flight write applies at the next token boundary — but the *operator* path does not go through the mailbox, so its synchronisation is a separate question and the answer determines whether slice 4 needs a lock.
-5. **Does `addendum_updated` carry the full entry set every time, or a delta?** C4 says the resulting entry set, for idempotence. That is the right call for correctness and it means message size grows with memory size. Confirm, or name a cap.
-6. **Is there a UI surface for the addendum in scope?** The design treats the frontend arm as an event-handling obligation only. If the operator is meant to *see* memory, that is additional work in slice 4 and should be named before the slice is estimated.
+1. **What is the unit of the budget, and which estimator?** No token estimator was established as available at the write boundary, and a character-count proxy is wrong by a variable factor across providers. Path A tolerates a conservative estimate (cost of being wrong: a needless refusal); Path B does not (cost: wrongful eviction). If the answer is "a character budget, renamed", say so, and D-7 gets much simpler. **Answered (Q1):** the field is `budget_chars`, measured with `len(text)` summed over the entry set — provider-neutral, conservative by construction, and honest about what it counts. A real tokenizer is **T-10** (§3), out of scope this wave.
+2. **Is there an entry-count cap distinct from the character budget?** A hundred tiny entries and three large ones behave very differently in a prompt, and only one of the two is bounded by a character ceiling. **Answered (Q2):** yes — **32 entries**, enforced at the same write boundary as the character budget and independently of it.
+3. **What are the legal values of `source`?** The proposed shape carries a `source` string per entry. If it is free-form, nobody will ever filter by it; if it is an enum, it needs listing now. **Answered (Q3):** an enum — `operator | mailbox | tool`. Nothing else is legal; the loader validates on read rather than trusting the persisted file.
+4. **Can the operator write while a turn is in flight, and does it queue or apply immediately?** Under C3 an in-flight write applies at the next token boundary — but the *operator* path does not go through the mailbox, so its synchronisation is a separate question and the answer determines whether slice 4 needs a lock. **Answered (Q4):** the operator path calls the **same write-boundary function and the same queue** as the mailbox, so there is no separate lock and no second entry point where the budget check could be forgotten. An in-flight write still applies at the next token boundary (C3).
+5. **Does `addendum_updated` carry the full entry set every time, or a delta?** C4 says the resulting entry set, for idempotence. That is the right call for correctness and it means message size grows with memory size. Confirm, or name a cap. **Answered (Q5):** the full entry set every time. Message size grows with memory, but memory is now bounded by 32 entries and `budget_chars`, so that is bounded growth.
+6. **Is there a UI surface for the addendum in scope?** The design treats the frontend arm as an event-handling obligation only. If the operator is meant to *see* memory, that is additional work in slice 4 and should be named before the slice is estimated. **Answered (Q6):** not in this wave. The frontend obligation stays event handling; a visible memory panel is **T-9** (§3), out of scope, and slice 4 is estimated without it.
 
 ---
 
@@ -364,6 +368,37 @@ What **not** to do: do not add a `default:` arm to `SessionTab.jsx` (§5.3 — i
 | Design source | `docs/design-sysprompt-addendum-and-injection.md`, 590 lines, `8a2e9e38` |
 | Tree read for every `file:line` | `dev` at `9831e08b`; rulings recorded against `dev` at `9d964208` |
 | Rulings | D-1 dedicated session field · D-3 defer · D-7 refuse (visibly) — recorded in §4.0 |
+| Inversions / Ripple | §12 / §13 — the assumptions this design overturns, and the per-slice blast radius |
 | Supersedes | Nothing. This is the first implementation brief for the addendum. |
 
 Two claims in this document are explicitly **not** independently verified, and are marked where they appear: CI behaviour on any branch in this arc (§0.3), and which of the two event schemas is live at runtime (§3). One claim is flagged for re-verification at implementation time rather than asserted: **H5** (§8).
+
+---
+
+## 12. Inversions
+
+Four assumptions this design overturns. They are listed because an implementer who imports the default will build the wrong thing, and in three of the four cases the wrong thing passes its own tests.
+
+1. **"There is no moment in the sync loop" → there is one, and it is per token.** `design-streaming-canonical-ir.md:18` states the sync loop offers no per-token moment. It does: the halt poll at `agent/core/agent.py:1367-1370` runs once per stream event. The *sink* was missing, not the moment. (T-3 corrects the source document.)
+2. **"Mid-stream state needs a `StreamEvent`" → it needs a runtime/client kind.** The provider channel (`agent/core/stream_events.py:108-119`) is closed and content-only; injection is legal on the runtime and client channels only. `addendum_updated` and `runtime_notice` are therefore turn-loop dicts, never `StreamEvent`s. An implementer who reaches for a `StreamEvent` variant will find the type system fighting them, and should read that as the design working.
+3. **"Current state is a notification" → current state is the addendum.** The house rule inverts the default: something that *happened* is a notification (prunable by design — `history_pruner.py:68`, `:164-165`); something that is *true now* is an addendum, which survives compaction. Expressing a standing fact as a notification is the H6 failure mode, and it fails silently by being pruned.
+4. **"The addendum is display state, so it goes in `metadata`" → it is a first-class session field.** Ruled D-1. `metadata` is untyped, echoed to the client, reinterpreted at every read site, and has nowhere to express `pinned`, `budget_chars` or the 32-entry cap.
+
+The direction is consistent: each inversion moves work *earlier* — into the schema, the write boundary, or composition — and out of paths that fail silently.
+
+## 13. Ripple (est.)
+
+Estimated blast radius by slice. "Keys" and "kinds" are the two axes that matter, because both are interface changes that a reviewer would not expect in a feature PR this size.
+
+| Slice | Persisted-dict keys | Runtime event kinds | Files (est.) | Test churn |
+|---|---|---|---|---|
+| 1 | **+1** (`addendum`: `entries`, `budget_chars`) | none | 2 (`session/models.py`, `session/store.py`) | low — 3 new tests, existing suite untouched |
+| 2 | none | none | 1 (`agent/core/llm_client.py`) | medium — per-adapter assertions |
+| 3 | none | none | 0 (test only) | 1 new test, run twice |
+| 4 | none | **+2** (`addendum_updated`, `runtime_notice`) | 4-5 (`agent/core/agent.py`, `bridge.py`, `SessionTab.jsx`, a reducer) | medium-high — idempotence, ordering, unknown-kind guard |
+| 5 | none | none (reuses `runtime_notice`) | 1-2 (write boundary + its UI surfacing) | medium — refusal, boundary, oversized, pinned |
+| 6 | none | none | 14 sites | deferred (D-3) |
+
+Two notes. **Slice 1 carries the only persisted-shape change in the implementation** — additive and defaulted, so a session that predates the field loads as empty and there is no migration. **Slice 4 adds two runtime kinds, not one**; that is the A3 correction, and it is what makes slice 5 possible at all.
+
+Confidence: file counts are derived from citations already in this brief, not from a fresh enumeration of call sites. Treat them as floors, not ceilings.
