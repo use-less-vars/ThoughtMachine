@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import adaptWorkerEvent, { isWorkerEventRenderable } from '../chat/adaptWorkerEvent';
+import { makeDedupKey, normaliseToolEvent } from '../WorkerOutputPanel';
 
 // ── Constants from the source (must match adaptWorkerEvent.js) ────────────
 const WORKER_STARTED_TEXT = '⬤ Worker started';
@@ -1002,6 +1003,59 @@ describe('isWorkerEventRenderable', () => {
 
   it('is true for raw WS user_message with a query', () => {
     expect(isWorkerEventRenderable({ type: 'worker:user_message', data: { query: 'Do it' }, timestamp: 't' })).toBe(true);
+  });
+});
+
+// ── tool_call_id plumbing (frontend step 1) ────────────────────────────────
+// The backend now sends tool_call_id on tool_call_start / tool_call /
+// tool_result.  Step 1 only plumbs it through the WS normalisation and both
+// dedup keys; eventId() and bubble pairing are deliberately untouched.
+describe('tool_call_id plumbing', () => {
+  const TCID = 'call_abc123';
+
+  it('carries tool_call_id into request for all three tool events', () => {
+    const trio = [
+      ['tool_call_start', { tool_name: 'read_file', arguments: '{"path":"/a"}', tool_call_id: TCID }],
+      ['tool_call', { tool_name: 'read_file', arguments: '{"path":"/a"}', tool_call_id: TCID }],
+      ['tool_result', { tool_name: 'read_file', success: true, result: 'ok', tool_call_id: TCID }],
+    ];
+    for (const [eventType, data] of trio) {
+      const { request } = normaliseToolEvent(eventType, data);
+      expect(request.tool_call_id).toBe(TCID);
+      // Existing keys are unchanged.
+      expect(request.tool).toBe('read_file');
+    }
+    // status/success keys still behave as before.
+    expect(normaliseToolEvent('tool_call_start', trio[0][1]).request.status).toBe('running');
+    expect(normaliseToolEvent('tool_call', trio[1][1]).request.args).toEqual({ path: '/a' });
+    expect(normaliseToolEvent('tool_result', trio[2][1]).request.success).toBe(true);
+    expect(normaliseToolEvent('tool_result', trio[2][1]).response).toEqual({ result: 'ok' });
+  });
+
+  it('adds no tool_call_id key when the backend sent none (backward compat)', () => {
+    for (const eventType of ['tool_call_start', 'tool_call', 'tool_result']) {
+      const { request } = normaliseToolEvent(eventType, { tool_name: 'x', arguments: {}, success: true, result: 'r' });
+      expect('tool_call_id' in request).toBe(false);
+    }
+    // Absent / empty / non-string ids must not change the key at all.
+    expect(makeDedupKey('tool_call', 'T')).toBe('tool_call|T');
+    expect(makeDedupKey('worker_message', 'T')).toBe('final_response|T');
+    expect(makeDedupKey('tool_call', 'T', '')).toBe('tool_call|T');
+    expect(makeDedupKey('tool_call', 'T', undefined)).toBe('tool_call|T');
+  });
+
+  it('keeps sibling tool events distinct in the dedup key', () => {
+    const a = makeDedupKey('tool_call', 'T', 'call_1');
+    const b = makeDedupKey('tool_call', 'T', 'call_2');
+    expect(a).toBe('tool_call|T|tccall_1');
+    expect(b).toBe('tool_call|T|tccall_2');
+    expect(a).not.toBe(b);
+    // Reproduce the panel's dedup filter (key + Set) to prove the second
+    // same-type/same-timestamp event is no longer swallowed.
+    const seen = new Set([a]);
+    expect(seen.has(b)).toBe(false);
+    // Control: without ids the old behaviour (collapse) still holds.
+    expect(makeDedupKey('tool_call', 'T')).toBe(makeDedupKey('tool_call', 'T'));
   });
 });
 

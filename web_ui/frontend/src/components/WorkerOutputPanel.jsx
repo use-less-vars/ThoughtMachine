@@ -26,6 +26,85 @@ const STATUS_DOT = {
 
 const STATUS_DOT_FALLBACK = { color: '#585b70', busy: false, label: 'Idle', title: 'Worker is idle' };
 
+// Suffix component for the backend tool_call_id.  Only a non-empty string
+// participates; anything else yields '' so keys stay byte-identical to before.
+function toolCallIdKeyPart(toolCallId) {
+  return (typeof toolCallId === 'string' && toolCallId) ? '|tc' + toolCallId : ''
+}
+
+// Helper: compute a dedup key for any event (either stored internal format
+// or raw incoming WS event).  Returns a string that is the same for any
+// event name variant of the same logical event at the same timestamp.
+// A backend tool_call_id (when present) makes two same-type/same-timestamp
+// tool events distinct — the backend reuses millisecond timestamps for
+// sibling calls, so timestamp-only keys collapsed them.
+export function makeDedupKey(eventName, timestamp, toolCallId) {
+  // Assistant-message-like events all map to the same canonical key
+  let canonical
+  if (
+    eventName === 'worker_message' ||
+    eventName === 'final_response' ||
+    eventName === 'assistant_message' ||
+    eventName === 'worker:worker_message' ||
+    eventName === 'worker:assistant_message'
+  ) {
+    canonical = 'final_response'
+  } else if (
+    // Token warnings arrive via two backend paths:
+    //   Path A (per-worker bus): worker:token_warning  → rawType='token_warning'
+    //   Path B (global bus):     worker:system_notification → rawType='system_notification'
+    // Both represent the same logical warning; canonicalize to the same key
+    // so the second arrival is deduplicated away.
+    eventName === 'token_warning' ||
+    eventName === 'system_notification'
+  ) {
+    canonical = 'system_notification'
+  } else {
+    canonical = eventName
+  }
+  return canonical + '|' + (timestamp || '') + toolCallIdKeyPart(toolCallId)
+}
+
+// Pure normalisation of the three tool-* WS events into the
+// { event, timestamp, request, response } shape adaptWorkerEvent consumes.
+// Exported for unit tests.  `fallbackResponse` mirrors the caller's
+// `e.response || {}` default for the two call-shaped events.
+export function normaliseToolEvent(eventType, data, fallbackResponse) {
+  const d = data || {}
+  let args = {}
+  try {
+    if (d.arguments) {
+      args = typeof d.arguments === 'string' ? JSON.parse(d.arguments) : d.arguments
+    }
+  } catch (_) { /* ignore parse errors */ }
+  // Only propagate a real id — an absent one must not add the key at all,
+  // keeping the request shape identical to before for old backends.
+  const tc = (typeof d.tool_call_id === 'string' && d.tool_call_id)
+    ? { tool_call_id: d.tool_call_id }
+    : {}
+  if (eventType === 'tool_call_start') {
+    // Pending tool call — render an in-progress row before the tool
+    // finishes.  Mirrors 'tool_call' but tags status:'running'.
+    return {
+      request: { tool: d.tool_name || 'unknown', args, status: 'running', ...tc },
+      response: fallbackResponse || {},
+    }
+  }
+  if (eventType === 'tool_call') {
+    return {
+      request: { tool: d.tool_name || 'unknown', args, ...tc },
+      response: fallbackResponse || {},
+    }
+  }
+  if (eventType === 'tool_result') {
+    return {
+      request: { tool: d.tool_name || 'unknown', success: d.success !== false, ...tc },
+      response: { result: d.result || '' },
+    }
+  }
+  return null
+}
+
 
 
 function relativeTime(isoString) {
@@ -178,35 +257,8 @@ function WorkerOutputPanel({
   // are correctly deduplicated against each other.
   const seenEventKeysRef = useRef(new Set());
 
-  // Helper: compute a dedup key for any event (either stored internal format
-  // or raw incoming WS event).  Returns a string that is the same for any
-  // event name variant of the same logical event at the same timestamp.
-  const makeDedupKey = (eventName, timestamp) => {
-    // Assistant-message-like events all map to the same canonical key
-    let canonical
-    if (
-      eventName === 'worker_message' ||
-      eventName === 'final_response' ||
-      eventName === 'assistant_message' ||
-      eventName === 'worker:worker_message' ||
-      eventName === 'worker:assistant_message'
-    ) {
-      canonical = 'final_response'
-    } else if (
-      // Token warnings arrive via two backend paths:
-      //   Path A (per-worker bus): worker:token_warning  → rawType='token_warning'
-      //   Path B (global bus):     worker:system_notification → rawType='system_notification'
-      // Both represent the same logical warning; canonicalize to the same key
-      // so the second arrival is deduplicated away.
-      eventName === 'token_warning' ||
-      eventName === 'system_notification'
-    ) {
-      canonical = 'system_notification'
-    } else {
-      canonical = eventName
-    }
-    return canonical + '|' + (timestamp || '')
-  }
+  // Dedup key helper lives at module scope (exported as makeDedupKey) so the
+  // key shape — including the tool_call_id component — is unit-testable.
 
   // ── Merge incoming WS events (from bridge via SessionTab) ────────────
   // Filter by worker name so cross-session WS events are correctly routed
@@ -325,7 +377,7 @@ function WorkerOutputPanel({
     const firstTimers = relevantEvents.filter(e => {
       const rawType = e.type?.replace('worker:', '') || ''
 
-      const key = makeDedupKey(rawType, e.timestamp)
+      const key = makeDedupKey(rawType, e.timestamp, e.data?.tool_call_id)
       console.warn('[DEDUP CHECK] rawType:', rawType, 'timestamp:', e.timestamp, 'key:', key, 'alreadySeen:', seenEventKeysRef.current.has(key));
       return !seenEventKeysRef.current.has(key)
     })
@@ -337,34 +389,15 @@ function WorkerOutputPanel({
         let response = e.response || {}
 
         switch (eventType) {
-          case 'tool_call_start': {
-            // Pending tool call — render an in-progress row before the tool
-            // finishes. Mirrors 'tool_call' but tags status:'running'.
-            const data = e.data || {}
-            let args = {}
-            try {
-              if (data.arguments) {
-                args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
-              }
-            } catch (_) { /* ignore parse errors */ }
-            request = { tool: data.tool_name || 'unknown', args, status: 'running' }
-            break
-          }
-          case 'tool_call': {
-            const data = e.data || {}
-            let args = {}
-            try {
-              if (data.arguments) {
-                args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
-              }
-            } catch (_) { /* ignore parse errors */ }
-            request = { tool: data.tool_name || 'unknown', args }
-            break
-          }
+          case 'tool_call_start':
+          case 'tool_call':
           case 'tool_result': {
-            const data = e.data || {}
-            request = { tool: data.tool_name || 'unknown', success: data.success !== false }
-            response = { result: data.result || '' }
+            // Normalisation lives in normaliseToolEvent (module scope,
+            // unit-tested); it also carries the backend tool_call_id through
+            // into request so later steps can pair call↔result.
+            const normalised = normaliseToolEvent(eventType, e.data, e.response)
+            request = normalised.request
+            response = normalised.response
             break
           }
           case 'assistant_message': {
@@ -509,13 +542,13 @@ function WorkerOutputPanel({
     for (let i = 0; i < firstTimers.length; i++) {
       if (isWorkerEventRenderable(newOnes[i])) {
         const rawType = firstTimers[i].type?.replace('worker:', '') || ''
-        seenEventKeysRef.current.add(makeDedupKey(rawType, firstTimers[i].timestamp))
+        seenEventKeysRef.current.add(makeDedupKey(rawType, firstTimers[i].timestamp, firstTimers[i].data?.tool_call_id))
       }
     }
 
     // ═══ Bailout if nothing new ═══
     if (newOnes.length === 0) {
-      console.warn('[DEDUP BAILOUT] All incoming events were deduplicated. incomingEvents:', incomingEvents, 'computed dedup keys:', relevantEvents.map(e => makeDedupKey(e.type?.replace('worker:', '') || '', e.timestamp)));
+      console.warn('[DEDUP BAILOUT] All incoming events were deduplicated. incomingEvents:', incomingEvents, 'computed dedup keys:', relevantEvents.map(e => makeDedupKey(e.type?.replace('worker:', '') || '', e.timestamp, e.data?.tool_call_id)));
       return
     }
 
