@@ -16,6 +16,7 @@ Exported names (all public — no leading underscore):
     config_to_dict
     atomic_replace
     resolve_full_config
+    resolve_provider_fields
     session_config_from_merged
     agent_config_from_merged
     CONFIG_LAYER_ORDER
@@ -31,7 +32,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from agent.config.presets import get_tools_for_mode
 from agent.logging import log
@@ -805,6 +806,60 @@ def resolve_full_config(
     return merged
 
 
+def resolve_provider_fields(
+    session_config,
+    *,
+    workspace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    provider_id: Optional[str] = None,
+    overwrite: bool = False,
+    preserve: Iterable[str] = (),
+):
+    """Fill ``api_key`` / ``base_url`` / ``provider_config`` on *session_config*.
+
+    Single owner for the credential derivation used by BOTH entry points —
+    ``Bridge.start()`` (first turn) and ``ConfigManager.apply_config()``
+    (later turns) — so the two paths cannot drift apart again.  Resolution
+    goes through the FULL chain (workspace defaults + session metadata +
+    provider profile), and values already present are only overwritten when
+    *overwrite* is set.
+
+    Args:
+        session_config: ``SessionConfig`` to fill in place (also returned).
+        workspace_id / session_id / provider_id: Chain selectors forwarded to
+            ``resolve_full_config``.
+        overwrite: Replace already-set ``api_key`` / ``base_url`` (used when
+            the provider genuinely changed).
+        preserve: Field names that must NOT be touched — the payload carried
+            an explicit user override for them.
+
+    Returns:
+        The same *session_config* instance.
+    """
+    resolved = resolve_full_config(
+        workspace_id=workspace_id,
+        session_id=session_id,
+        provider_id=provider_id,
+    )
+
+    if resolved.get("api_key") and "api_key" not in preserve:
+        if overwrite or not session_config.api_key:
+            session_config.api_key = resolved["api_key"]
+
+    if resolved.get("base_url") and "base_url" not in preserve:
+        if overwrite or not session_config.base_url:
+            session_config.base_url = resolved["base_url"]
+
+    # Merge provider-specific config (timeout/max_retries) into session
+    resolved_pc = resolved.get("provider_config") or {}
+    if resolved_pc:
+        merged_pc = dict(getattr(session_config, "provider_config", None) or {})
+        merged_pc.update(resolved_pc)
+        session_config.provider_config = merged_pc
+
+    return session_config
+
+
 def _filter_model_fields(data: Dict[str, Any], model) -> Dict[str, Any]:
     """Filter *data* to fields declared by *model* (strict-schema safe)."""
     return {k: v for k, v in data.items() if k in model.model_fields and v is not None}
@@ -886,6 +941,26 @@ class ConfigManager:
             session_id=session_id,
             provider_id=provider_id,
             worker_overrides=worker_overrides,
+        )
+
+    @staticmethod
+    def resolve_provider_fields(
+        session_config,
+        *,
+        workspace_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        overwrite: bool = False,
+        preserve: Iterable[str] = (),
+    ):
+        """Fill provider credentials on a ``SessionConfig`` (module-level)."""
+        return resolve_provider_fields(
+            session_config,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            provider_id=provider_id,
+            overwrite=overwrite,
+            preserve=preserve,
         )
 
     @staticmethod
@@ -1066,6 +1141,8 @@ class ConfigManager:
         is_running: bool = False,
         has_session: bool = False,
         workspace_path: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> tuple[Dict[str, Any], Optional[Any]]:
         """
         Validate + translate frontend config dict, enforce mode rules.
@@ -1078,6 +1155,9 @@ class ConfigManager:
             current_config: The current ``SessionConfig`` instance.
             is_running: Whether the bridge is currently running.
             has_session: Whether a session has been started.
+            workspace_path: Workspace root path (echoed into the frontend dict).
+            workspace_id: Workspace whose config layers to resolve credentials from.
+            session_id: Session whose metadata layer to resolve credentials from.
 
         Returns:
             ``(frontend_format_dict, updated_SessionConfig_or_None)``
@@ -1152,20 +1232,38 @@ class ConfigManager:
                 "session_permissions",
             )
 
-        # If provider_id changed, resolve provider credentials
+        # Resolve provider credentials through the FULL config chain — the
+        # start path (Bridge.start) uses the same helper, so the derived
+        # api_key/base_url can no longer differ between turn 1 and turn N.
+        #
+        # Two guards keep a genuine user edit authoritative:
+        #   * ``overwrite`` — a real provider switch (payload provider_id !=
+        #     live provider_id) replaces stale credentials from the old
+        #     provider profile.
+        #   * ``preserve`` — a non-empty payload value that DIFFERS from the
+        #     live config is an explicit user override and must win.  A pure
+        #     echo of the snapshot (the frontend re-sends the resolved
+        #     config on every continue_session) equals the live value, so it
+        #     does not block re-resolution on a provider switch.
         if "provider_id" in config_dict and config_dict["provider_id"]:
             try:
-                merged = resolve_full_config(provider_id=config_dict["provider_id"])
-                if merged.get("api_key"):
-                    session_config.api_key = merged["api_key"]
-                if merged.get("base_url"):
-                    session_config.base_url = merged["base_url"]
-                # Merge provider-specific config (timeout/max_retries) into session
-                resolved_pc = merged.get("provider_config") or {}
-                if resolved_pc:
-                    merged_pc = dict(getattr(session_config, "provider_config", None) or {})
-                    merged_pc.update(resolved_pc)
-                    session_config.provider_config = merged_pc
+                provider_changed = (
+                    getattr(current_config, "provider_id", None)
+                    != config_dict["provider_id"]
+                )
+                preserve = {
+                    field for field in ("api_key", "base_url")
+                    if config_dict.get(field)
+                    and config_dict[field] != getattr(current_config, field, None)
+                }
+                resolve_provider_fields(
+                    session_config,
+                    workspace_id=workspace_id,
+                    session_id=session_id,
+                    provider_id=config_dict["provider_id"],
+                    overwrite=provider_changed,
+                    preserve=preserve,
+                )
             except Exception as e:
                 log("WARNING", "server.bridge",
                     f"Provider resolution failed during apply_config: {e}")
