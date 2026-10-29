@@ -1,6 +1,6 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-27, Gen 52 close.
+Updated: 2026-10-28, Gen 54 mid-session.
 
 **Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
@@ -38,6 +38,55 @@ after W4 merges." Status line for this wave, verbatim: "Credential
 injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+## Current state — 2026-10-28, Gen 54 mid-session
+
+**Supersedes the Gen 52 close (kept below as historical record).**
+**dev HEAD:** `12bd6408`
+
+Gen 53 (`fix/stream-loop-thread-safety`, `44d0dda`) and the `docs/kb-catchup` wave (#235, `d8fda869`) closed without a status.md block; they are recorded here so the chain has no gap.
+
+## The generation in one line
+
+Six waves landed; the last one — tool refusals reported to the UI as success — is built, gated and pushed but NOT yet merged, and a spec-level lie was found underneath it.
+
+## Waves merged this generation (#233 → #236)
+
+- #233 `ca413e7f` — `fix/resource-leaks`.
+- #234 `2ac3148c` — `test/core-concurrency-wall`: pins per-thread loop isolation, thread-death cleanup and event-bus concurrency; its controller case is mutation-verified (it goes red if the teardown call is deleted).
+- #235 `d8fda869` — `docs/kb-catchup`.
+- #236 `12bd6408` — `fix/integration-bugs` (`56479062`): Stop now cascades to the session's worker sub-agents. The turn-scoped path (`server.py:1507` → `bridge.request_stop()` → `controller.request_halt()`) was the only Stop path that did not reach workers.
+
+## In flight: `fix/tool-refusal-structure` @ `c37943a1`
+
+- A denied tool call was reported to the UI as `success: True`. The cause is structural, not cosmetic. (1) No producer in the tree emits the `TOOL CALL REJECTED` literal the classifier greps for — only `agent/core/agent.py:1653` reads it, while gate denials say `Permission denied: …` and `_create_tool_rejection_message` says `Tool not allowed. …` — so the sniffer could not fire for a real refusal. (2) The per-call verdict was dropped at the `execute_tool_calls` boundary, which built `executed_tools` entries as `{name, arguments, result}` only.
+- Fix: the nine `_execute_single_tool` refusal/failure returns gain `'success': False` with byte-identical prose; the three non-execution appends in `execute_tool_calls` (state rejection, invalid JSON, unknown tool) gain it too; the verdict is forwarded into `executed_tools`; and `agent.py` reads `tool_info.get('success')` first, keeping the prose sniff only as a fallback for producers outside the executor path.
+- Success paths stay key-less on purpose: `agent/presenter/event_processor.py:300-306` does `event.get('success', True)`, so flipping that default would turn every legacy producer into a failure. An absent key keeps meaning "no verdict".
+- Tests: `TestToolFailureSuccessFlag` (6) in `tests/test_tool_executor.py`; `tests/test_provider_token_truth_midturn.py` flips its documented KNOWN-BUG pin `success is True` → `is False`, which that test's own comment required once the bug was fixed.
+- Gate: `python -m pytest -q` → 5592 passed, 66 skipped, 5 xfailed, 12 subtests passed, exit 0.
+- Not on dev: `grep -c "'success': False" agent/core/tool_executor.py` is 0 at `12bd6408`. Any earlier statement that this had already landed on dev is wrong.
+- `docs/agent-core-spec.md` still documents the pre-fix behaviour — §8.6 at `:619-625` ("a refused call is emitted with `success: true`"), plus `:420`, `:477`, `:1106` — and its line citations have drifted (`:496` cites `agent/core/agent.py:1324-1333`; the classifier is at `:1650-1666`). Correction owed with the merge; not done in this wave.
+
+## Seam B — verdict
+
+- Seam B in `docs/design-concurrency-and-affinity.md` §3.B ("The Worker-Spawn Path") is CLOSED as an ownership seam. A worker is an in-process daemon thread (`tools/workspace/worker_thread.py:901`, `:939`) that lazily builds its own `Agent` on its first query (`:2522`, `:2534-2538`); `grep -c asyncio tools/workspace/worker_thread.py` is 0; its loop comes from the thread-local at `agent/core/agent.py:151` (defined `:106`). It never touches the controller's loop or its bound httpx pool.
+- It is OPEN as a teardown leak. `_close_stream_resources` is called only from `agent/controller/__init__.py:784-786`; `WorkerThread.run()`'s `finally` (`worker_thread.py:2925-2965`) closes no loop, provider or client, and `reset()` (`:1584`) drops `self._agent` without `LLMClient.close()` (`agent/core/llm_client.py:344`). Hygiene on thread death, not cross-thread corruption. Filed as `ticket-hygiene-worker-stream-loop-teardown-leak.md`.
+
+## Next
+
+- Merge `fix/tool-refusal-structure` (PR pending; `12bd6408` is its base, so it merges without a rebase).
+- Correct `docs/agent-core-spec.md` §8.6 in that PR or immediately after it.
+- `fix/vault-schema-root-and-git-identity` in flight on a disjoint front: declare `root` and `git_identity` in `agent/config/schema_manifest.json` under `workspaces/*/config.json`, and route the engine-read keys through one `_ENGINE_READ_KEYS` frozenset in `thoughtmachine/vault_repair.py` so `--apply` can never quarantine them.
+- Open operator rulings: idle-stop ack honesty (pinned by `tests/integration/test_state_transitions.py::test_ws_stop_session_status_only`), the CI advisory-vs-blocking flip, and keep-or-revert plain-text-while-streaming in `MessageBubble.jsx`.
+- macOS path-normalisation test failures are tracked separately and are not to be fixed.
+- Publication-tier contradiction, unresolved: `working_agreements.md:60` ("Never staged, never committed: everything under `.thoughtmachine/knowledge/`") contradicts `.gitignore:228-247`, which deliberately re-includes the seven-file onboarding contract set (this file among them) and `docs/KB_POLICY.md:127`. This commit follows the `.gitignore` intent; the agreement text needs an operator ruling.
+
+## Ruled this generation (do not re-litigate)
+
+- Failure is carried as data, not prose. Do not re-robustify the string sniffer and do not delete the marker fallback.
+- Do not flip `event_processor.py`'s `event.get('success', True)` default. An absent key means "no verdict".
+- Success paths stay key-less. Blanket `success: True` on every return is not wanted.
+- Workers own their loops. The remaining Seam B work is teardown only, not re-architecture.
 
 ## Current state — 2026-10-27, Gen 52 close
 

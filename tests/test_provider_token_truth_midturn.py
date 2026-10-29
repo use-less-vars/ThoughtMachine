@@ -88,13 +88,15 @@ class TestProviderTokenTruthMidTurn:
         results = [event for event in events if event["type"] == "tool_result"]
         assert len(results) == 2, types
         for result in results:
-            # KNOWN BUG (bug/tool-refusal-reported-as-success, queued separately):
+            # FIXED (bug/tool-refusal-reported-as-success):
             # the rejection in tool_executor._create_tool_rejection_message does
             # not match the result-classification prefixes in agent.py ("\u274c",
             # "TOOL CALL REJECTED", "Error executing tool"), so a refusal is
-            # reported with success=True. Pinned as CURRENT behaviour; this
-            # assertion is expected to flip to False when that bug is fixed.
-            assert result["success"] is True
+            # reported with success=True.  The assertion pinned here has now
+            # flipped, as promised: tool_executor records the refusal
+            # structurally ('success': False) and agent.py honours that verdict
+            # before falling back to the legacy prose sniff.
+            assert result["success"] is False
             assert "not allowed" in result["result"]
             assert "token" in result["result"]
         assert agent.state.restrictions_active is True

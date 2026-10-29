@@ -446,3 +446,122 @@ class TestToolCallRawDiagnosticStream:
         assert rec["json_repair_needed"] is False
         assert rec["session_id"] == "sess-1"
         assert "sk-<REDACTED>" in rec["arguments_preview"]
+
+
+# ---------------------------------------------------------------------------
+# Structural failure signal: refusal / never-executed paths carry success=False
+#
+# A refused tool call used to be reported upstream as success=True: agent.py
+# classified outcomes by sniffing the result PROSE, and the gate's denials say
+# "Permission denied: ..." (no '❌' prefix, no marker), so a denial looked
+# exactly like a success to the UI.  The executor now states the verdict
+# structurally; these tests pin it.
+# ---------------------------------------------------------------------------
+
+class _RequiredArgTool(ToolBase):
+    """Tool with a mandatory argument, to trip the ValidationError path."""
+
+    tool: str = "_RequiredArgTool"
+    required_categories: ClassVar[List[str]] = []
+    path: str
+
+    def execute(self) -> str:
+        return "unreachable"
+
+
+class _ExplodingTool(ToolBase):
+    """Tool whose execute() raises, to trip the generic exception path."""
+
+    tool: str = "_ExplodingTool"
+    required_categories: ClassVar[List[str]] = []
+
+    def execute(self) -> str:
+        raise RuntimeError("boom")
+
+
+class TestToolFailureSuccessFlag:
+    """A refused/never-executed tool call must be structurally reported as a
+    failure (``success is False``), not left to prose sniffing upstream."""
+
+    def _executor(self, tool_classes, permissions=None):
+        return ToolExecutor(
+            tool_classes=tool_classes,
+            config=FakeConfig(permissions),
+            state=FakeState(),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+
+    @staticmethod
+    def _single(executor, tool_cls, arguments=None):
+        return executor._execute_single_tool(
+            tool_cls, arguments or {}, tool_cls.__name__, 0,
+            lambda: False, lambda: None, lambda: 0,
+        )
+
+    def test_denied_call_is_flagged_as_failure(self):
+        executor = self._executor(
+            [ContainerTool], permissions=SessionPermissions(container=False)
+        )
+        result = self._single(executor, ContainerTool)
+        # The prose is untouched -- only the structural flag is new.
+        assert result["result"].startswith(
+            "Permission denied: Tool requires container:true"
+        ), result["result"]
+        assert result["tool_type"] == "normal"
+        assert result["success"] is False
+
+    def test_validation_error_is_flagged_as_failure(self):
+        executor = self._executor([_RequiredArgTool])
+        result = self._single(executor, _RequiredArgTool)
+        assert result["result"].startswith("Invalid arguments:"), result["result"]
+        assert result["success"] is False
+
+    def test_tool_exception_is_flagged_as_failure(self):
+        executor = self._executor([_ExplodingTool])
+        result = self._single(executor, _ExplodingTool)
+        assert result["result"] == "Error executing tool: boom", result["result"]
+        assert result["success"] is False
+
+    def test_executed_call_gets_no_success_key(self):
+        """Success paths keep their exact shape -- no key is invented."""
+        executor = self._executor([PermissiveTool])
+        result = self._single(executor, PermissiveTool)
+        assert result["result"] == "OK"
+        assert "success" not in result
+
+    def test_execute_tool_calls_propagates_failure_flag(self):
+        """The public entry point must forward the verdict, otherwise every
+        per-call ``success`` flag dies at the executed_tools boundary."""
+        executor = ToolExecutor(
+            tool_classes=[ContainerTool],
+            config=FakeConfig(SessionPermissions(container=False)),
+            state=_AllowAllState(),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+        executed, *_ = executor.execute_tool_calls(
+            [{"id": "tc-1", "function": {"name": "ContainerTool", "arguments": "{}"}}],
+            add_to_conversation_func=lambda _m: None,
+        )
+        assert executed[0]["result"].startswith("Permission denied:"), executed[0]
+        assert executed[0]["success"] is False
+
+    def test_execute_tool_calls_leaves_success_shape_unchanged(self):
+        executor = ToolExecutor(
+            tool_classes=[PermissiveTool],
+            config=FakeConfig(None),
+            state=_AllowAllState(),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+        executed, *_ = executor.execute_tool_calls(
+            [{"id": "tc-1", "function": {"name": "PermissiveTool", "arguments": "{}"}}],
+            add_to_conversation_func=lambda _m: None,
+        )
+        assert executed[0]["result"] == "OK"
+        assert "success" not in executed[0]
+
