@@ -18,7 +18,11 @@ from typing import Any, Dict, List, Optional
 
 from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
 from thoughtmachine.vault import _copy_resource, vault_root
-from thoughtmachine.workspace_registry import RESERVED_WORKSPACE_IDS, _normalize_path
+from thoughtmachine.workspace_registry import (
+    RESERVED_WORKSPACE_IDS,
+    WorkspaceRegistry,
+    _normalize_path,
+)
 from thoughtmachine.validation import validate_single_path_segment
 
 # Minimal validation for template workers (avoids circular import via agent.__init__)
@@ -298,6 +302,29 @@ def _resources_dir() -> Path:
     return Path(str(pkg_path)).resolve().parent / "resources"
 
 
+def _registry_root_path(workspace_id: str) -> Optional[str]:
+    """Return the workspace's host directory from the registry, or ``None``.
+
+    The registry (``state/workspace_registry.json`` → ``root_path``) is the
+    single owner of "where this workspace lives on the host", and the same
+    value the UI and the container mount use.  ``config.json`` ``root`` is
+    seeded from it so the two stores agree: ``host_port._workspace_root``
+    reads ``root`` live and refuses to run ``host_bash`` without it.
+
+    Best-effort by contract: bootstrapping must never fail because the
+    registry is missing, corrupt or unavailable, so every fault collapses to
+    ``None`` and the caller omits the key (readers fail closed on absence).
+    """
+    try:
+        entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+    except Exception:  # pragma: no cover - defensive (corrupt registry)
+        return None
+    root = getattr(entry, "root_path", None)
+    if not isinstance(root, str) or not root.strip():
+        return None
+    return root
+
+
 def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     """
     Bootstrap a workspace's default files.
@@ -316,7 +343,12 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
       ``permissions`` key (the ``FRESH_WORKSPACE_DEFAULT_PERMISSIONS`` map:
       filesystem/git ``read``, network/mcp/host_bash ``banned``, container
       ``False``).  A missing file OR a present file with no ``permissions`` key
-      both make the security gate fail closed to deny-all.
+      both make the security gate fail closed to deny-all.  When the workspace
+      is registered, the registry's ``root_path`` is seeded as the top-level
+      ``root`` key as well (the host directory ``host_bash`` anchors cwd in).
+      A blank ``git_identity: {"name": "", "email": ""}`` is always seeded so
+      the UI has a key to edit; blank/incomplete means "not configured" and
+      commits fall through to git's own identity resolution.
 
     No subdirectories (e.g. ``sessions/``, ``state/``, ``knowledge/``) are
     created inside the workspace config directory.
@@ -400,10 +432,23 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     # never overwrite an existing config.json.
     config_path = base / "config.json"
     if not config_path.exists():
-        _atomic_write_json(
-            config_path,
-            {"permissions": dict(FRESH_WORKSPACE_DEFAULT_PERMISSIONS)},
-        )
+        seed: Dict[str, Any] = {
+            "permissions": dict(FRESH_WORKSPACE_DEFAULT_PERMISSIONS),
+            # Present-but-blank: the UI needs a key to edit, and "blank" means
+            # "no identity configured" (git's own resolution applies) -- never
+            # "commit with an empty ident" (``git_write_tool`` treats a blank
+            # or incomplete pair exactly like an absent key).
+            "git_identity": {"name": "", "email": ""},
+        }
+        # ``root`` is a hard requirement for host execution: ``host_port``
+        # reads it live and refuses a workspace without one.  Seeding it here
+        # means every creation path that registers and then bootstraps
+        # (POST /api/workspace, server auto-register, session creation)
+        # persists it, not just the ones that remember to write config.json.
+        registry_root = _registry_root_path(workspace_id)
+        if registry_root is not None:
+            seed["root"] = registry_root
+        _atomic_write_json(config_path, seed)
         created.append(str(config_path))
 
     # ── Safeguard: warn about unexpected items ────────────────────────────

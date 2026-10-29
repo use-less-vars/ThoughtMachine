@@ -17,7 +17,17 @@ Policy under test (``GitWriteTool._git_commit``):
    every other failure -- and every success -- passes through unchanged;
 5. a malformed ``git_identity`` is refused, never silently ignored (falling
    through would attribute the commit to the wrong author while reporting
-   success).
+   success).  The split is three-way per label, by membership:
+
+   * ABSENT key -> the pair is incomplete -> "not configured" (no pins, git's
+     own resolution stands, never an empty ident);
+   * PRESENT but not a ``str`` (``None``, ``42``, ...) -> MALFORMED -> refused
+     (a wrong TYPE is not "blank": the config said something);
+   * PRESENT and a ``str`` but blank/whitespace-only -> explicitly cleared ->
+     "not configured".
+
+   New workspaces are seeded with ``{"name": "", "email": ""}`` so the UI
+   has a key to edit; that seed is a pair of blank STRINGS, never a refusal.
 
 The backends are covered too: the pins land in the FINAL argv of both
 execution modes, after all ``args[0]``-based hook/permission logic has run, and
@@ -348,18 +358,21 @@ def test_pending_identity_cleared_when_git_raises(tmp_path, monkeypatch):
     "raw,expected_fragment",
     [
         ("Agent A <agent-a@example.test>", "git_identity` is malformed"),
-        ({"name": "Agent A"}, "git_identity.email` must be a non-empty string"),
-        ({"name": "Agent A", "email": "   "}, "git_identity.email` must be a non-empty string"),
-        ({"name": None, "email": "a@example.test"}, "git_identity.name` must be a non-empty string"),
+        (["Agent A", "a@example.test"], "git_identity` is malformed"),
+        # A wrong TYPE is malformed, not blank: the config named something that
+        # cannot become a git ident, so the commit is refused rather than
+        # attributed to git's global author.
+        ({"name": None, "email": "a@example.test"}, "git_identity.name` must be a string"),
+        ({"name": "Agent A", "email": 42}, "git_identity.email` must be a string"),
         ({"name": "Agent <A>", "email": "a@example.test"}, "characters that are not allowed"),
         ({"name": "Agent\nA", "email": "a@example.test"}, "characters that are not allowed"),
         ({"name": "Agent A", "email": "a@example.test>"}, "characters that are not allowed"),
     ],
     ids=[
-        "not-an-object",
-        "email-absent",
-        "email-blank",
+        "not-an-object-string",
+        "not-an-object-list",
         "name-null",
+        "email-not-a-string",
         "name-angle-bracket",
         "name-newline",
         "email-angle-bracket",
@@ -382,6 +395,56 @@ def test_malformed_workspace_identity_refused(
     assert not recorder.committed
     assert not any(argv[:1] == ["add"] for argv in recorder.calls)
     assert not any(argv[:2] == ["config", "--get"] for argv in recorder.calls)
+
+
+# --- blank / incomplete identity means "not configured", never an empty ----
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"name": "", "email": ""},
+        {"name": "   ", "email": "\t"},
+        {"name": "Agent A"},
+        ({"name": "Agent A", "email": "   "}),
+        {},
+    ],
+    ids=[
+        "both-blank",
+        "both-whitespace",
+        "email-absent",
+        "email-blank",
+        "empty-object",
+    ],
+)
+def test_blank_workspace_identity_is_not_configured(tmp_path, monkeypatch, raw):
+    """A blank or incomplete pair is treated exactly like an absent key.
+
+    "Blank" here means a blank STRING (explicitly cleared) or an ABSENT key
+    (incomplete pair) -- a present value of the wrong type is malformed and is
+    covered by ``test_malformed_workspace_identity_refused``.  Registration
+    seeds ``{"name": "", "email": ""}`` so the UI has a key to edit; that
+    seed -- and any partially filled pair -- must never block a commit.
+    Nothing is pinned, no probe is issued and no ``git config`` write happens,
+    so git's own repo-local/global/env resolution decides the author.
+    """
+    (tmp_path / "a.txt").write_text("x\n")
+    _workspace_config(monkeypatch, {WS_A: {"git_identity": raw}})
+    tool = _tool()
+    recorder = _Recorder()
+    staged = _stage_spy(tool, recorder)
+
+    result = tool._git_commit(tmp_path)
+
+    assert "Cannot commit:" not in result
+    assert "COMMIT_OK" in result
+    assert staged[-1] is None
+    assert recorder.calls == [
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["add", "--", "a.txt"],
+        ["commit", "-m", "agent commit", "--", "a.txt"],
+    ]
+    assert recorder.config_writes == []
 
 
 # --- backend argv: pins precede the subcommand, hardening still wins -------
