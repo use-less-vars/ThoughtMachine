@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 from .debug_context import PAUSE_DEBUG, pause_debug
 from agent.config.defaults import DEFAULT_RESPONSE_TOKENS
 from agent.config.audit import log_config_audit
+from agent.config.models import normalize_base_url
 
 
 def _config_diff(old_config, new_config) -> List[str]:
@@ -520,6 +521,12 @@ class Agent:
             if isinstance(new_val, str) and new_val == '':
                 new_val = None
 
+            # base_url is a URL: a trailing slash or a differently-cased host
+            # is the same endpoint, not a config change.
+            if field_name == 'base_url':
+                old_val = normalize_base_url(old_val)
+                new_val = normalize_base_url(new_val)
+
             if old_val != new_val:
                 log('DEBUG', 'core.agent',
                     f'Config field "{field_name}" differs: '
@@ -551,7 +558,12 @@ class Agent:
 
             old_val = getattr(old_config, field_name)
             new_val = getattr(new_config, field_name)
-            changed = old_val != new_val
+            if field_name == 'base_url':
+                # Compare URLs in normalised form so a trailing slash or a
+                # differently-cased host does not report a phantom change.
+                changed = normalize_base_url(old_val) != normalize_base_url(new_val)
+            else:
+                changed = old_val != new_val
 
             field_log.append(f'{field_name}: changed={changed} old={_json2.dumps(old_val, default=str) if not callable(old_val) else "<callable>"} new={_json2.dumps(new_val, default=str) if not callable(new_val) else "<callable>"}')
 
@@ -588,7 +600,7 @@ class Agent:
             return False
         if new_config.api_key != self.config.api_key:
             return False
-        if new_config.base_url != self.config.base_url:
+        if normalize_base_url(new_config.base_url) != normalize_base_url(self.config.base_url):
             return False
         if new_config.system_prompt != self.config.system_prompt:
             return False

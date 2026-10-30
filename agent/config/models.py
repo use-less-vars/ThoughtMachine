@@ -3,6 +3,7 @@ Configuration models for the ThoughtMachine agent.
 """
 from typing import ClassVar, Optional, Callable, List, Any, Dict, Literal
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, Field, field_validator, model_validator, model_serializer, ConfigDict
 from agent.logging import log
 from agent.config.secret import Secret
@@ -10,6 +11,50 @@ from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
 from thoughtmachine.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
+
+
+def normalize_base_url(url: Optional[str]) -> Optional[str]:
+    """Canonicalise a ``base_url`` for *comparison* purposes only.
+
+    Two spellings of the same endpoint must not look like a config change, so
+    the scheme and host are lowercased and trailing ``/`` characters are
+    stripped from the path::
+
+        'https://API.DeepSeek.com/v1/'  ->  'https://api.deepseek.com/v1'
+        'https://api.deepseek.com'      ->  'https://api.deepseek.com'
+
+    The path is left otherwise untouched (it is case-sensitive on most
+    servers), ``None`` and blank strings both become ``None``, and the result
+    never ends with ``/``.  Unparseable input falls back to a stripped,
+    lowercased, trailing-``/``-free copy of the input.  This function never
+    raises.
+
+    WARNING - do NOT add, remove, strip or otherwise canonicalise a ``/v1``
+    (or any other) path suffix here.  ``https://api.openai.com/v1`` and
+    ``https://api.openai.com`` are *different* endpoints - the bare host
+    returns 404 - so they must stay unequal.  Collapsing the version segment
+    would silently rewrite the request routing of a live session.
+    """
+    if url is None:
+        return None
+    text = url.strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+    except Exception:
+        # Malformed URL (e.g. a broken IPv6 literal): never raise, just apply
+        # the crude normalisation the caller can still compare.
+        return text.lower().rstrip('/') or None
+    normalized = urlunsplit((
+        parts.scheme.lower(),
+        parts.netloc.lower(),
+        parts.path.rstrip('/'),
+        parts.query,
+        parts.fragment,
+    ))
+    return normalized.rstrip('/') or None
+
 
 # Category constants for AgentConfig fields
 RESTART_REQUIRED = "restart_required"

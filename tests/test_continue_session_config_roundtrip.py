@@ -20,7 +20,7 @@ Both entry points now share ``config_manager.resolve_provider_fields``.
 
 import pytest
 
-from agent.config.models import AgentConfig
+from agent.config.models import AgentConfig, normalize_base_url
 from agent.config.session_config import SessionConfig
 from agent.core.agent import Agent
 
@@ -245,3 +245,145 @@ class TestBlankPayloadValuesDoNotBlockResolution:
         _, sc_next = _apply_continue_payload(sc_start, payload)
 
         assert sc_next.base_url == f"{SESSION_BASE_URL}/p1"
+
+
+class TestBaseUrlSpellingIsNotAConfigChange:
+    """``base_url`` spelling (trailing slash, host casing) is not a change.
+
+    The frontend fallback config ships ``.../v1/`` while the session/profile
+    layers ship ``.../v1``.  Without normalisation that lone trailing slash
+    made ``Agent._configs_are_identical`` say "different", ``_can_hot_swap``
+    say "no" (``base_url`` is RESTART_REQUIRED) and every turn pay a full
+    restart plus a "Configuration updated" notification for a config the user
+    never touched.
+    """
+
+    def test_trailing_slash_is_not_a_config_change(self, monkeypatch):
+        _install_layered_resolver(monkeypatch)
+        sc_start = _resolve_as_start_does(_start_like_session_config())
+        agent_config_start = sc_start.to_agent_config()
+        assert agent_config_start.base_url == f"{SESSION_BASE_URL}/p1"
+
+        slashed = agent_config_start.model_copy(
+            update={"base_url": agent_config_start.base_url + "/"}
+        )
+        # The raw strings really do differ - only normalisation may hide it.
+        assert slashed.base_url != agent_config_start.base_url
+
+        agent = _agent_for(agent_config_start)
+        messages_before = len(agent.conversation)
+
+        assert agent._configs_are_identical(agent_config_start, slashed), (
+            "a trailing slash on base_url was treated as a semantic change"
+        )
+
+        agent.request_config_update(slashed)
+        assert agent._apply_pending_config() is True
+        assert agent._pending_config is None
+        assert len(agent.conversation) == messages_before, (
+            "a trailing-slash-only base_url change produced a notification"
+        )
+
+    def test_host_case_is_not_a_config_change(self, monkeypatch):
+        _install_layered_resolver(monkeypatch)
+        sc_start = _resolve_as_start_does(_start_like_session_config())
+        agent_config_start = sc_start.to_agent_config()
+
+        cased = agent_config_start.model_copy(
+            update={
+                "base_url": agent_config_start.base_url.replace(
+                    "session-layer.example", "SESSION-Layer.EXAMPLE"
+                )
+            }
+        )
+        assert cased.base_url != agent_config_start.base_url
+
+        agent = _agent_for(agent_config_start)
+        assert agent._configs_are_identical(agent_config_start, cased), (
+            "a host-case difference in base_url was treated as a change"
+        )
+
+    def test_version_path_is_still_significant(self, monkeypatch):
+        """Over-normalisation guard: bare host and ``/v1`` are NOT equal."""
+        _install_layered_resolver(monkeypatch)
+        sc_start = _resolve_as_start_does(_start_like_session_config())
+
+        with_v1 = sc_start.to_agent_config().model_copy(
+            update={"base_url": "https://api.openai.com/v1"}
+        )
+        bare = sc_start.to_agent_config().model_copy(
+            update={"base_url": "https://api.openai.com"}
+        )
+
+        agent = _agent_for(with_v1)
+        assert agent._configs_are_identical(with_v1, bare) is False
+        assert agent._can_hot_swap(bare) is False
+
+    def test_real_host_change_still_notifies(self, monkeypatch):
+        _install_layered_resolver(monkeypatch)
+        sc_start = _resolve_as_start_does(_start_like_session_config())
+
+        old_config = sc_start.to_agent_config().model_copy(
+            update={"base_url": "https://api.deepseek.com/v1"}
+        )
+        new_config = sc_start.to_agent_config().model_copy(
+            update={"base_url": "https://other-provider.example/v1"}
+        )
+
+        agent = _agent_for(old_config)
+        assert agent._configs_are_identical(old_config, new_config) is False
+
+        messages_before = len(agent.conversation)
+        agent._notify_config_change(old_config, new_config)
+
+        assert len(agent.conversation) == messages_before + 1
+        notification = agent.conversation[-1]
+        assert notification.get("is_system_notification") is True
+        assert "Configuration updated" in notification.get("content", "")
+        assert "https://other-provider.example/v1" in notification["content"]
+
+
+class TestNormalizeBaseUrl:
+    """Direct unit coverage for the comparison helper."""
+
+    @pytest.mark.parametrize("raw", [None, "", "   ", "\n\t "])
+    def test_blank_values_become_none(self, raw):
+        assert normalize_base_url(raw) is None
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("https://api.deepseek.com/v1/", "https://api.deepseek.com/v1"),
+            ("https://api.deepseek.com/v1", "https://api.deepseek.com/v1"),
+            ("https://api.deepseek.com/", "https://api.deepseek.com"),
+            ("https://api.deepseek.com", "https://api.deepseek.com"),
+            ("  https://api.deepseek.com/v1/  ", "https://api.deepseek.com/v1"),
+        ],
+    )
+    def test_trailing_slashes_are_removed(self, raw, expected):
+        result = normalize_base_url(raw)
+        assert result == expected
+        assert not result.endswith("/")
+
+    def test_scheme_and_host_are_lowercased(self):
+        assert (
+            normalize_base_url("HTTPS://API.DeepSeek.COM/v1")
+            == "https://api.deepseek.com/v1"
+        )
+
+    def test_path_case_is_preserved(self):
+        assert (
+            normalize_base_url("https://api.example.com/MyEndpoint/")
+            == "https://api.example.com/MyEndpoint"
+        )
+
+    def test_version_suffix_is_never_collapsed(self):
+        assert normalize_base_url("https://api.openai.com/v1") != normalize_base_url(
+            "https://api.openai.com"
+        )
+
+    @pytest.mark.parametrize(
+        "garbage", ["http://[::1", ":////", "not a url", "http://", "\x00"]
+    )
+    def test_garbage_never_raises(self, garbage):
+        normalize_base_url(garbage)
