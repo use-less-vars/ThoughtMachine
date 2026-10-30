@@ -1,7 +1,13 @@
 # Ticket (hygiene): panel polls status endpoints, never subscribes to the bus
 
+> **SUPERSEDED 2026-10-29** — merged into `ticket-bug-panels-poll-instead-of-subscribe.md`,
+> together with `ticket-bug-live-view-container-stale-no-push.md` (same defect, observed from
+> the operator side). The union of symptoms, evidence and acceptance criteria lives in the
+> merged ticket. The body below is kept unchanged as the historical record.
+
 **Frame / Tag:** hygiene
-**Status:** open (FILE ONLY — no fix in wave 9c)
+**Status:** SUPERSEDED by ticket-bug-panels-poll-instead-of-subscribe.md
+**Was:** open (FILE ONLY — no fix in wave 9c)
 **Scope:** web UI status panel
 
 ## Summary

@@ -244,6 +244,7 @@ web_ui/frontend/.npmrc
 !.thoughtmachine/knowledge/project/operator_observations.md
 # Gen 54 (2026-10-29) — operator-owned records that must survive a clone:
 !.thoughtmachine/knowledge/project/hall_of_fame.md
+!.thoughtmachine/knowledge/project/operator-dashboard.md
 !.thoughtmachine/working_docs/backlog-delivery-arc.md
 !.thoughtmachine/knowledge/personal/
 .thoughtmachine/knowledge/personal/*

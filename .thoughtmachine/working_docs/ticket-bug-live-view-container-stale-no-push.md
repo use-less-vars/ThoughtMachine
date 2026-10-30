@@ -1,9 +1,15 @@
 # Ticket: bug/live-view-container-stale-no-push
 
+> **SUPERSEDED 2026-10-29** — merged into `ticket-bug-panels-poll-instead-of-subscribe.md`,
+> together with `ticket-hygiene-panel-polls-no-subscribe.md` (same defect, poll-side mechanism).
+> The union of symptoms, evidence and acceptance criteria lives in the merged ticket. The body
+> below is kept unchanged as the historical record.
+
 **Filed:** Gen 43, 2026-10-14 at `d378c206`
 **Source:** operator observation during live use — not a dispatched read.
 **Severity:** Medium — visibility only, no data loss, no security impact.
-**Status:** filed, not dispatched. Candidate for the UI sprint.
+**Status:** SUPERSEDED by ticket-bug-panels-poll-instead-of-subscribe.md
+**Was:** filed, not dispatched. Candidate for the UI sprint.
 
 ## Defect
 

@@ -4,7 +4,8 @@
 **Source:** operator request, 2026-10-14; misfiled by Gen 43 (acknowledged
 miss; conversation ≠ KB)
 **Severity:** Medium — introspection gap, blocks self-diagnosis
-**Status:** filed, not dispatched. Gen 44 dispatches.
+**Status:** **CLOSED 2026-10-29** — runtime version reporting shipped. See `## Resolution`;
+the body below is kept as the original spec.
 
 ## Feature
 
@@ -140,4 +141,50 @@ capture point and its consumers. Before closing this ticket, confirm it is
 `git status --porcelain`-derived and not, say, a timestamp comparison. Also
 confirm the packaged-install path (D2) is exercised by a test rather than only
 by an `except Exception`.
+
+---
+
+## Resolution — closed 2026-10-29 (Gen 54)
+
+**Closed on the capability the ticket asked for:** the machine can now answer *"what version of
+TM was running when this fired?"* without being told. D1 (start-time capture at the process
+root, frozen in a module constant), D2 (git-less fallback that says `unknown` instead of
+fabricating a hash) and the core of D3 (a `CheckSystem` surface) are in the tree, at the
+locations recorded in the Gen 46 update above:
+
+- capture: `web_ui/backend/server.py:228-247` — `_get_server_revision()` runs `git rev-parse HEAD`
+  with `cwd=_project_root` at **import time**, frozen into `_SERVER_REVISION`; `_SERVER_BRANCH` /
+  `_SERVER_DIRTY` captured in the same snapshot (`:250+`).
+- read: `tools/workspace/check_system.py:195-215` — `_server_version()` imports those constants;
+  its docstring states there is no subprocess git invocation here.
+- fallback: `server.py:242-244` and `check_system.py:206-214` degrade to `unknown` / `False`.
+- surfaces that exist today: `CheckSystem query='version'` → `{revision, branch, dirty}`; startup
+  log lines at `server.py:669` (lifespan) and `server.py:5295` (uvicorn start); `GET /health` →
+  `{status, service, revision}` (`server.py:3229-3235`); and, unplanned but correct,
+  `ContainerStatusTool.runtime_commit` (`tools/container_control.py:55-60`).
+
+That is enough for the three incidents in §"Why it matters": the field report can name the
+runtime, and "did this merge fix it" no longer requires asking the operator for a SHA.
+
+**What this closure does NOT claim.** Closure is on the capability, not on a clean sweep:
+
+1. The two items under `### Verification still owed` above were **not** discharged. The dirty
+   computation was still not read line-by-line, and the packaged-install fallback is still not
+   confirmed to be covered by a test rather than only by an `except Exception`. Closing means
+   "the operator's question is answerable", not "every branch is verified".
+2. The four residual gaps in `### Not shipped` are unchanged and out of scope here: no
+   `GET /api/version`, no process-start timestamp, no container build hash in the version
+   payload, no `commits_behind_dev`. If wanted, they are a **new, smaller** ticket — do not
+   reopen this one for them.
+
+## Related
+
+- `ticket-bug-checksystem-version-reports-loaded-revision-not-head.md` — **a DIFFERENT
+  complaint, still open.** It is not about the machine failing to report a version (this ticket);
+  it is about *which* revision the reporting reads: the revision loaded at process start rather
+  than the current HEAD of the codebase. D1 chose start-time capture **deliberately** (see the
+  operator's constraint in §Feature), so that ticket is a disagreement about the semantics of the
+  value, not a defect this ticket left behind. Closing this ticket must not be read as closing
+  that one.
+- `ticket-feat-dispatch-report-duration.md` — the sibling "machine describes its own run" ask.
 
