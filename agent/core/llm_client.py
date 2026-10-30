@@ -81,6 +81,63 @@ def _to_canonical_tool_call(tool_call):
     return CanonicalToolCall(id=tc_id or '', name=name or '', arguments=arguments, raw_arguments=raw_arguments, parse_error=parse_error)
 
 
+#: Framing line that separates the session addendum from the rest of the system
+#: prompt. It is the only structural text added: entry metadata (id / ts /
+#: source / pinned) is never rendered, so the model sees prose only.
+ADDENDUM_HEADING = 'Additional session context:'
+
+
+def _session_addendum(session):
+    """Return ``session``'s addendum, or ``None`` when it has none.
+
+    The addendum is an optional first-class session field and the session may
+    be exposed as an object *or* as a plain dict, so both shapes are read here.
+    A session that never heard of the field (no attribute, no key) yields
+    ``None`` rather than raising.
+    """
+    if session is None:
+        return None
+    addendum = getattr(session, 'addendum', None)
+    if addendum is None and isinstance(session, dict):
+        addendum = session.get('addendum')
+    return addendum
+
+
+def _addendum_entry_texts(addendum) -> List[str]:
+    """Return the stored entry texts of *addendum* in stored order.
+
+    Stored order is preserved exactly as written: nothing is sorted, filtered,
+    reordered by ``pinned`` or re-budgeted here (the budget is enforced at the
+    write boundary, not at composition time). Entries whose text is not a
+    string carry nothing renderable and are skipped.
+    """
+    if isinstance(addendum, dict):
+        entries = addendum.get('entries')
+    else:
+        entries = getattr(addendum, 'entries', None)
+    if not isinstance(entries, (list, tuple)):
+        return []
+    texts = []
+    for entry in entries:
+        text = entry.get('text') if isinstance(entry, dict) else getattr(entry, 'text', None)
+        if isinstance(text, str):
+            texts.append(text)
+    return texts
+
+
+def render_addendum_block(session) -> str:
+    """Render *session*'s addendum entries as prompt text.
+
+    Returns ``''`` when the session has no addendum, a ``None`` addendum or an
+    addendum with no entries - the caller then leaves the system prompt
+    completely untouched (byte-identical to the un-composed prompt).
+    """
+    texts = _addendum_entry_texts(_session_addendum(session))
+    if not texts:
+        return ''
+    return ADDENDUM_HEADING + '\n' + '\n\n'.join(texts)
+
+
 class LLMError(ProviderError):
     """Generic LLM error for provider-independent error handling."""
 
@@ -161,6 +218,13 @@ class LLMClient:
             system_prompt = self.config.system_prompt
         else:
             system_prompt = self.load_system_prompt()
+
+        # Compose the session addendum (if any) onto the end of the system
+        # prompt. An absent / None / zero-entry addendum renders nothing, which
+        # leaves ``system_prompt`` byte-identical to the text resolved above.
+        addendum_block = render_addendum_block(getattr(self, 'session', None))
+        if addendum_block:
+            system_prompt = f'{system_prompt}\n\n{addendum_block}'
 
         # Remove old system prompts but preserve summary messages
         # (Summaries also use role='system' and are needed by SummaryBuilder.

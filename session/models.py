@@ -23,6 +23,17 @@ from agent.core.message import Message
 # (post-construction) wrap keeps the original WARNING.
 _SESSION_INITIALISED_FLAG = '_tm_session_initialised'
 
+# Addendum schema defaults (brief §4.1, Path A; rulings R2/R3). The addendum is
+# a first-class session field -- a sibling of `summary` -- with the shape
+# {"entries": [...], "budget_chars": int, "max_entries": int}.
+# `budget_chars` is an exact character count (R2: no estimator); `max_entries`
+# caps the entry count separately at 64 (R3).
+DEFAULT_ADDENDUM_BUDGET_CHARS = 8000
+DEFAULT_ADDENDUM_MAX_ENTRIES = 64
+# R4: `tool` is NOT a legal source -- C2 forbids the model writing its own
+# memory, so no entry in this wave could legitimately carry it.
+ADDENDUM_SOURCES = ('operator', 'mailbox')
+
 class ObservableList(list):
     """A list that notifies a callback when mutated."""
 
@@ -137,6 +148,94 @@ class ContainerMetadata:
         """Create from dictionary."""
         return cls(**data)
 
+
+def _default_addendum() -> Dict[str, Any]:
+    """A fresh, empty addendum in its canonical default state."""
+    return {
+        'entries': [],
+        'budget_chars': DEFAULT_ADDENDUM_BUDGET_CHARS,
+        'max_entries': DEFAULT_ADDENDUM_MAX_ENTRIES,
+    }
+
+
+def _normalize_addendum_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    """Normalise one addendum entry, or return None when it is not legal.
+
+    A legal entry carries `id` (non-empty str), `source` in ADDENDUM_SOURCES and
+    `text` (str); `ts` defaults to '' and `pinned` is coerced to bool. Unknown
+    keys are dropped, which is what makes a later version's extra field
+    harmless on read.
+    """
+    if not isinstance(entry, dict):
+        return None
+    entry_id = entry.get('id')
+    source = entry.get('source')
+    text = entry.get('text')
+    if not isinstance(entry_id, str) or not entry_id:
+        return None
+    if source not in ADDENDUM_SOURCES:
+        return None
+    if not isinstance(text, str):
+        return None
+    ts = entry.get('ts', '')
+    return {
+        'id': entry_id,
+        'ts': ts if isinstance(ts, str) else str(ts),
+        'source': source,
+        'text': text,
+        'pinned': bool(entry.get('pinned', False)),
+    }
+
+
+def normalize_addendum(raw: Any) -> Dict[str, Any]:
+    """Coerce a persisted (or partial) addendum into the canonical shape.
+
+    Missing keys are defaulted rather than rejected, so a session file written
+    before the field existed loads as an empty addendum. An entry that fails
+    validation is DROPPED with a WARNING and never raised: the store's
+    load_session treats any exception here as a failed load, and one malformed
+    entry must not cost the whole session.
+    """
+    addendum = _default_addendum()
+    if raw is None:
+        return addendum
+    if not isinstance(raw, dict):
+        log('WARNING', 'core.session',
+            f'[addendum] ignoring non-dict addendum of type {type(raw).__name__}')
+        return addendum
+
+    raw_entries = raw.get('entries', [])
+    if isinstance(raw_entries, list):
+        for raw_entry in raw_entries:
+            entry = _normalize_addendum_entry(raw_entry)
+            if entry is None:
+                log('WARNING', 'core.session',
+                    f'[addendum] dropping invalid entry on load: {raw_entry!r}')
+                continue
+            addendum['entries'].append(entry)
+    elif raw_entries is not None:
+        log('WARNING', 'core.session',
+            f"[addendum] ignoring non-list 'entries' of type {type(raw_entries).__name__}")
+
+    budget_chars = raw.get('budget_chars', DEFAULT_ADDENDUM_BUDGET_CHARS)
+    if isinstance(budget_chars, int) and not isinstance(budget_chars, bool):
+        addendum['budget_chars'] = budget_chars
+    else:
+        log('WARNING', 'core.session',
+            f'[addendum] budget_chars={budget_chars!r} is not an int; '
+            f'using {DEFAULT_ADDENDUM_BUDGET_CHARS}')
+
+    max_entries = raw.get('max_entries', DEFAULT_ADDENDUM_MAX_ENTRIES)
+    if isinstance(max_entries, int) and not isinstance(max_entries, bool):
+        addendum['max_entries'] = max_entries
+    else:
+        log('WARNING', 'core.session',
+            f'[addendum] max_entries={max_entries!r} is not an int; '
+            f'using {DEFAULT_ADDENDUM_MAX_ENTRIES}')
+
+    return addendum
+
+
 @dataclass
 class Session:
     """An atomic conversation unit with all its state."""
@@ -155,6 +254,7 @@ class Session:
     version: int = 1
     next_seq: int = 0
     summary: Optional[Dict[str, Any]] = field(default=None, compare=False, repr=False)
+    addendum: Dict[str, Any] = field(default_factory=_default_addendum)
     agent_instance: Optional[Any] = field(default=None, compare=False, repr=False)
     workspace_id: Optional[str] = field(default=None, compare=False)
     mode: str = "agent"  # "agent", "engineer", or "custom"
@@ -323,7 +423,7 @@ class Session:
         Convert session to a dictionary suitable for JSON serialization.
         Excludes non-persistable fields like agent_context (derived) and objects.
         """
-        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'workspace_id': self.workspace_id, 'mode': self.mode, 'last_active': self.last_active, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
+        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'workspace_id': self.workspace_id, 'mode': self.mode, 'last_active': self.last_active, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'addendum': self.addendum, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
         return data
 
     @classmethod
@@ -376,7 +476,7 @@ class Session:
         # Backward compat: mode and last_active (legacy sessions may lack these)
         mode = data.get('mode', 'agent')
         last_active = data.get('last_active', '')
-        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), mode=mode, last_active=last_active, metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
+        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), mode=mode, last_active=last_active, metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), addendum=normalize_addendum(data.get('addendum')), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
         return session
 
     def update_from_persistable_dict(self, data: Dict[str, Any]) -> None:
@@ -435,6 +535,7 @@ class Session:
         self.security_config = security_config
         self.version = version
         self.summary = data.get('summary')
+        self.addendum = normalize_addendum(data.get('addendum'))
         self.total_input_tokens = data.get('total_input_tokens', 0)
         self.total_output_tokens = data.get('total_output_tokens', 0)
         self.next_seq = next_seq_value
