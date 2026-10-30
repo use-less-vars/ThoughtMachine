@@ -289,6 +289,10 @@ web_ui/frontend/.npmrc
 !docs/design-interruptible-tool-calls.md
 !.thoughtmachine/working_docs/brief-docs-kb-catchup.md
 !.thoughtmachine/working_docs/backlog-core-integration.md
+# Standing backlog triage (oldest-open-tickets review). Same reason as the two
+# lines above: it lives in ignored space, so without this negation it is never
+# versioned and vanishes on the next clone.
+!.thoughtmachine/working_docs/backlog-triage.md
 
 # Docker pipeline trace: a tracked, public-tier doc left in ignored space by
 # the `docs/*` catch-all, so `git add` refused to stage edits to an
