@@ -1,12 +1,35 @@
 # Operator dashboard
 
-**Status:** 190 `ticket-*.md` files on disk — **12 closed** with evidence, **2 superseded** by one
-merged ticket, **176 open**. The open set is overwhelmingly *diagnosed*: the plan is known and the
-work is unstarted. **8 items genuinely lack a diagnosis** — they are the only ones under
-`Unknown / needs investigation`.
+**Status:** **194** `ticket-*.md` files on disk. The buckets below are an explicit partition —
+every file is counted exactly once, and the four file buckets sum to the total:
+
+| bucket | files |
+|---|---|
+| closed with evidence — the ticket's own `Status:` line opens CLOSED / SHIPPED / FIXED / RESOLVED | **10** |
+| superseded by merge, or retired — `Status:` opens SUPERSEDED / RETIRED | **3** |
+| open — diagnosed, plan known, work unstarted | **145** |
+| stale — **no `Status:` line in the file at all** | **36** |
+| **total** | **194** |
+
+Two tickets counted in `open` were **filed by this reconciliation pass** —
+`ticket-bug-state-bridge-engineer-mode-deletes-custom-prompt.md`, an operator report that had no
+file on disk, and `ticket-chore-ticket-front-matter-backfill.md`, the queue entry this page's own
+"Interim snapshot" note refers to. That is why the total is 194, not the 192 measured before the
+pass; neither is yet placed in a body section below.
+
+`non-ticket-rows`: **1** — the committed `.gitignore` merge conflict under `Unknown / needs
+investigation`. It is a page row, not a ticket file, so it sits outside the 194. The open set is
+overwhelmingly *diagnosed*: the plan is known and the work is unstarted. **8 rows lack a diagnosis**
+— they are the only ones under `Unknown / needs investigation`, and **7 of those 8 are tickets**.
 **Updated:** 2026-10-29 (Gen 54). Built from the `Status:` line of every ticket,
 `project/core.md` (C1-C9 + §0.1), and the newest section of `project/status.md`.
 **Nothing here was executed.** No fix was attempted while writing this page.
+**Interim snapshot — how the counts were obtained:** every number here is scraped from each
+file's `Status:` **prose** line. Nothing in a ticket is machine-read except that one line, and **36
+files do not have one**, so their disposition cannot be scraped at all — they are counted as `stale`
+rather than guessed at. A front-matter backfill (a parsed `status:` field per ticket, this page
+generated from it) is queued and has not started. Until it lands, re-derive the counts before
+quoting them: the numbers are accurate to the scrape, not to the second.
 
 ## State of play (read this first)
 
@@ -241,7 +264,10 @@ work is unstarted. **8 items genuinely lack a diagnosis** — they are the only 
 
 ## Unknown / needs investigation
 
-Only items with **no diagnosis**. Everything else is above.
+Only items with **no diagnosis**. Everything else is above. **8 rows**: **7 tickets** plus **1
+non-ticket row** (the `.gitignore` block at the end). **3 of the 7** ticket rows have **no `Status:`
+line** — they are file-stale by the partition at the top of this page, and they are listed here on
+the strength of their bodies, not their status.
 
 - **First install: creating the first workspace freezes the UI; a restart clears it** —
   `ticket-bug-first-install-workspace-freeze.md` (filed 2026-10-29). No reproduction, no log, no
@@ -272,7 +298,11 @@ Only items with **no diagnosis**. Everything else is above.
 
 ## Recently closed
 
-Kept out of the open lists above. Twelve closed with evidence, plus one merge.
+Kept out of the open lists above. **13 files** carry a closing `Status:` line — **10 closed with
+evidence** and **3 superseded or retired** (two of the three folded into a third ticket by one
+merge). One further row, `ticket-bug-container-control-base-registered-as-tool.md`, is listed here
+although its ticket file has **no `Status:` line at all**: the refutation exists only on this page,
+so by the partition above that file counts as `stale`, not closed.
 
 - `ticket-bug-capabilities-undeclared-fields-silently-inert.md` — shipped (PR #119).
 - `ticket-bug-checksystem-vault-status-cross-tenant-leak.md` — shipped (PR #119).

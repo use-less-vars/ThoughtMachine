@@ -779,3 +779,7 @@ cannot silently shrink) and a red run **does not fail the matrix**.
 **A gate's authority is its `continue-on-error` line, not its presence.** Do not report "covered in CI"
 until you have read whether a failure can actually block. Promotion to blocking is a separate change
 (branch `ci/promote-vitest-gating`), and the floor assertion is what makes promoting it safe.
+
+## 2026-10-29 — Class: `worktree-cleanup-is-destructive-by-default` (Gen 54)
+A worktree is not removable until its branch is pushed, or its HEAD SHA is recorded in the wave report. Cleanup is an operation on someone else's uncommitted work by default; treat it as a destructive action.
+
