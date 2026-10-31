@@ -179,8 +179,8 @@ def _collect_sessions_from_store() -> list[dict]:
 
 # -- Local-caller gate -------------------------------------------------------
 #
-# /api/system/health exposes vault-global state (the worker registry, the open
-# sessions, and the event log).  It is an operator endpoint and must never be
+# /api/system/health exposes vault-global operator state (the running-worker
+# registry and the open sessions).  It is an operator endpoint and must never be
 # reachable from another host.  This duplicates
 # web_ui/backend/server.py::_localhost_only -- duplicated rather than imported
 # because server.py imports this module, so importing back into it is circular.
