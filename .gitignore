@@ -308,3 +308,4 @@ web_ui/frontend/.npmrc
 =======
 >>>>>>> origin/dev
 !docs/design-sysprompt-addendum-and-injection.md
+.worktrees/
