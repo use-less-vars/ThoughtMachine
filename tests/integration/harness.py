@@ -285,6 +285,37 @@ def restart(tmp_home):
     return server_mod.app
 
 
+def enable_in_process_trust() -> None:
+    """Declare the in-process harness allowance for THIS interpreter.
+
+    ``auth_boundary`` refuses every request it cannot authenticate, and the
+    harness peer address (``testclient``) is not a credential: the boundary
+    only lets it through while ``auth_boundary.TRUST_TEST_HARNESS`` is on.
+    Under pytest the repository-root ``conftest.py`` turns that flag on for the
+    session AND re-applies it to the module every time it is re-imported (its
+    ``sys.meta_path`` hook), so a test loaded by pytest needs nothing here.
+
+    A child interpreter started by a test has neither: no pytest, therefore no
+    conftest, therefore no hook -- the freshly imported module keeps the shipped
+    default and the child's very first uncredentialed request is refused.  Such
+    a child must declare the allowance itself, which is the only reason this
+    helper exists; it is the other side of the same seam, not a substitute for
+    the hook.
+
+    Call it AFTER the backend has been (re)imported -- i.e. after
+    ``start_backend()`` or ``restart()``, at every such point, because each one
+    purges ``web_ui.backend`` from ``sys.modules`` and the next import builds a
+    cold module whose body assigns the shipped default.  The module is resolved
+    from ``sys.modules`` at call time (and imported first if it is not there
+    yet, so a caller cannot get the order wrong), and the flag is set on the
+    live object the app's middleware closes over.
+    """
+    boundary = sys.modules.get("web_ui.backend.auth_boundary")
+    if boundary is None:
+        boundary = importlib.import_module("web_ui.backend.auth_boundary")
+    boundary.enable_test_harness_trust(True)
+
+
 def make_client(app):
     return TestClient(app)
 

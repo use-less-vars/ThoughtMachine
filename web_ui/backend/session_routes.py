@@ -44,7 +44,6 @@ from thoughtmachine.workspace_capabilities import (
 )
 
 from web_ui.backend.config_manager import ConfigManager
-from web_ui.backend.origin_policy import _origin_check_request
 from web_ui.backend.session_manager import SessionManager
 
 # ── Router ──────────────────────────────────────────────────────────────────
@@ -111,8 +110,6 @@ async def create_session(request: Request, body: CreateSessionBody) -> Dict[str,
     Optionally accepts a ``name`` and ``workspace_id``.
     Returns the created session's metadata.
     """
-    if not _origin_check_request(request, route_name="create_session"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         store = _get_store()
         session_manager = SessionManager(store, ConfigManager())
@@ -307,8 +304,6 @@ async def delete_session(
     Optionally accepts ``workspace_id`` for scoped deletion.
     Returns ``{\"success\": true}`` if found and deleted.
     """
-    if not _origin_check_request(request, route_name="delete_session"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         store = _get_store()
         found = store.delete_session(session_id, workspace_id=workspace_id)
@@ -502,8 +497,6 @@ async def put_session_permissions(
     and return {"raw": normalized, "effective": ..., "resolved_at": ...}.
     An empty object {} clears explicit grants (all-defaults profile).
     """
-    if not _origin_check_request(request, route_name="put_session_permissions"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         _store, session = _load_permission_session(session_id)
         ws_id = session.workspace_id or ""

@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from web_ui.backend import health_routes
+from web_ui.backend.auth_boundary import AuthBoundaryMiddleware
 
 # -- Harness -----------------------------------------------------------------
 
@@ -91,6 +92,10 @@ def _write_worker_status(workers_dir: Path, workspace_path: str) -> None:
 def app():
     application = FastAPI()
     application.include_router(health_routes.router)
+    # The local-caller gate lives in the boundary middleware, not in the route:
+    # compose it as ``server.py`` does, so these tests keep pinning the refusal
+    # itself rather than a per-route copy of it that no longer exists.
+    application.add_middleware(AuthBoundaryMiddleware)
     return application
 
 
@@ -166,15 +171,19 @@ def test_remote_client_cannot_reach_workers_or_sessions(app, env):
             assert "coder" not in body
 
 
-def test_missing_peer_address_is_refused():
-    """Fail closed: no reportable peer address is treated as NOT local."""
-    for client in (None, types.SimpleNamespace(host=None)):
-        denied = health_routes._localhost_only(
-            types.SimpleNamespace(client=client)
-        )
-        assert denied is not None
-        assert denied.status_code == 403
-        assert json.loads(denied.body) == {"error": "localhost only"}
+def test_missing_peer_address_is_refused(app, env):
+    """Fail closed: no reportable peer address is treated as NOT local.
+
+    The gate is step 0 of ``AuthBoundaryMiddleware``
+    (``local_gate.localhost_only``), so this drives the composed app with a
+    transport that reports no peer address at all -- not a per-route copy of
+    the decision that no longer exists.
+    """
+    with TestClient(app, client=None) as client:
+        response = client.get("/api/system/health")
+    assert response.status_code == 403
+    assert response.json() == {"error": "localhost only"}
+    assert "running_workers" not in response.text
 
 
 def test_loopback_client_is_served(app, env):

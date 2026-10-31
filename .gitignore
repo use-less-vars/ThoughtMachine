@@ -303,9 +303,33 @@ web_ui/frontend/.npmrc
 # `**` re-includes the contents.
 !docs/infrastructure/
 !docs/infrastructure/**
-<<<<<<< HEAD
 !docs/brief-sysprompt-implementation-brief.md
-=======
->>>>>>> origin/dev
 !docs/design-sysprompt-addendum-and-injection.md
+
+# Tracked docs still hidden from the RAG index (Gen 56, 2026-10-31).
+# Every file below is versioned in git, yet the `docs/*` catch-all above still
+# matches it, and codebase_indexer.should_skip_file() matches .gitignore
+# patterns through pathspec without ever consulting git tracking
+# (agent/knowledge/codebase_indexer.py:200-211). A tracked, committed doc can
+# therefore be silently absent from the RAG index. One line per file; no
+# directory negation is needed, because git does not apply .gitignore to paths
+# it already tracks and pathspec's match_file() needs no descent line.
+!docs/LLM_quality insurance.md
+!docs/audit_logging_testing_introspection_2026_08_13.md
+!docs/docker_usage.md
+!docs/event_pipeline_audit.md
+!docs/logging_manual.md
+!docs/message_metadata.md
+!docs/pruning_system.md
+!docs/rag_for_code.md
+!docs/research/r3-bootstrap.md
+!docs/research/r4-checksystem.md
+!docs/research/r6-worker-config.md
+!docs/research/synthesis-and-recommendations.md
+!docs/security_layer.md
+!docs/system_notifications.md
+!docs/token_pipeline.md
+!docs/windows_installation_saga.md
+!docs/windows_stability_contract.md
+!docs/worker_smoke_checklist.md
 .worktrees/

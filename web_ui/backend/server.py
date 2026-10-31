@@ -212,7 +212,6 @@ def _get_session_store() -> FileSystemSessionStore:
 
 
 from web_ui.backend.origin_policy import (
-    _origin_check_request,
     allowed_origins as _cors_allowed_origins,
     websocket_origin_allowed,
 )
@@ -224,8 +223,8 @@ from web_ui.backend.health_routes import router as health_router
 from web_ui.backend.local_gate import (
     LOCAL_CLIENT_HOSTS as _LOCAL_CLIENT_HOSTS,
     TEST_HARNESS_CLIENT_HOSTS as _TEST_HARNESS_CLIENT_HOSTS,
-    localhost_only as _localhost_only,
 )
+from web_ui.backend.auth_boundary import AuthBoundaryMiddleware
 from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.addendum_routes import router as addendum_router
 from web_ui.backend.prompt_routes import router as prompt_router
@@ -1202,13 +1201,35 @@ else:
 # Whether --serve-frontend was requested (set in main())
 _SERVE_FRONTEND = False
 
+# ── Authentication boundary ────────────────────────────────────────────────
+# ONE ingress gate for every HTTP request and WebSocket handshake: Host
+# validation, the exemption set, the origin predicate and the credential live
+# in ``web_ui/backend/auth_boundary.py`` (the policy and the ordering are
+# documented there).  Nothing is added per route, so a new route is protected
+# by construction.
+#
+# ORDER MATTERS.  ``add_middleware`` PREPENDS, so the middleware added LAST is
+# the OUTERMOST one.  This registration is deliberately placed BEFORE the CORS
+# registration below: CORS must stay outermost so that a preflight (which
+# carries no credentials by specification) is answered by CORSMiddleware and
+# never reaches the gate.  Moving this call below the CORS block would make the
+# gate outermost and 401 every cross-origin preflight; the boundary still
+# passes unauthenticated ``OPTIONS`` through as a belt-and-braces measure, but
+# the ordering is the real guarantee.
+app.add_middleware(AuthBoundaryMiddleware)
+
+
 # ── CORS (loopback dev-server origins only, no credentials) ────────────────────────
 # The frontend is either served same-origin by this app or by the vite dev
 # server on TM_FRONTEND_PORT (default 5173).  Only those loopback spellings
 # are allowed: ``allow_origins=["*"]`` + ``allow_credentials=True`` (a) is
 # invalid per the CORS spec and (b) let ANY web page drive the local API.
-# This app authenticates with nothing (no cookie, no Authorization header),
-# so ``allow_credentials`` is off.
+# The app now authenticates with a token (see the authentication boundary
+# above), but only on the two mechanisms CORS does not police: the session
+# cookie is ``SameSite=Strict`` and the bearer token is never sent by a
+# browser, so a credentialed CORS grant buys an attacker nothing.  It stays
+# off: ``allow_origins=[...]`` + ``allow_credentials=True`` would let any page
+# on the dev-server origin read responses with the caller's cookie attached.
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
@@ -3898,8 +3919,6 @@ async def browse_directory(request: Request, path: str = ""):
     (~/.thoughtmachine); paths that resolve into the vault are rejected.
     Directories on other drives (e.g. ``D:\\`` on Windows) are allowed.
     """
-    if not _origin_check_request(request, route_name="browse_directory"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         base_path = _confine_to_home(path)
         if not os.path.isdir(base_path):
@@ -3982,8 +4001,6 @@ async def create_directory(request: Request, body: dict):
     navigate to another drive) is treated as the full target path and is
     validated like any other host path: absolute and outside the vault.
     """
-    if not _origin_check_request(request, route_name="create_directory"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         parent_path = body.get("parent_path", "")
         dir_name = body.get("name", "")
@@ -4020,25 +4037,25 @@ async def user_home():
     return {"home": str(Path.home())}
 
 
-# --- Loopback-only gate for the health routes -------------------------------
+# --- Loopback-only notion, shared with the ingress gate ----------------------
 # The server binds 127.0.0.1 by default (see the ``--host`` default in main()),
 # but the bind can be overridden (``--host``/``HOST``) and a reverse proxy in
-# front of the process would forward a remote caller as a local one.  The health
-# routes therefore check the peer address themselves.
+# front of the process would forward a remote caller as a local one.  The
+# peer-address check itself is no longer made per route: it is step 0 of
+# ``auth_boundary.AuthBoundaryMiddleware``, which every route sits behind.
 #
-# The gate lives in ``web_ui/backend/local_gate.py`` and is imported at the top
-# of this module; it used to be a second copy of the one in ``health_routes.py``.
-# ``_LOCAL_CLIENT_HOSTS`` / ``_TEST_HARNESS_CLIENT_HOSTS`` / ``_localhost_only``
-# are bound here as aliases of the shared definitions so the bind-host check
-# below and the existing call sites keep working unchanged.
+# What stays here is the shared *definition* of "local".  It lives in
+# ``web_ui/backend/local_gate.py`` and is imported at the top of this module, so
+# the bind-host check below cannot disagree with the gate about which literals
+# mean this machine.
 
 
 def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> Optional[str]:
     """Return the refusal message for a bind *host*, or ``None`` when it is safe.
 
     Accepted values are exactly the local-caller literals in
-    ``_LOCAL_CLIENT_HOSTS`` — one notion of "local", shared with the health gate
-    below — plus their bracketed IPv6 CLI spelling (``[::1]``), which is how a
+    ``_LOCAL_CLIENT_HOSTS`` — one notion of "local", shared with the ingress
+    gate — plus their bracketed IPv6 CLI spelling (``[::1]``), which is how a
     scoped IPv6 host is written on a command line.
 
     An empty or whitespace-only host is refused even when *allow_remote* is set:
@@ -4070,9 +4087,6 @@ def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> O
 
 @app.get("/health")
 async def health(request: Request):
-    denied = _localhost_only(request)
-    if denied is not None:
-        return denied
     return {
         "status": "ok",
         "service": "thoughtmachine-web-ui",
@@ -4945,8 +4959,6 @@ def workspace_container_start(request: Request, workspace_id: str,
                               workspace_path: str = "",
                               body: Optional[dict] = Body(default=None)):
     """Start (or reuse) the named container in the workspace."""
-    if not _origin_check_request(request, route_name="workspace_container_start"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
     except WorkspacePathForbiddenError as exc:
@@ -4978,8 +4990,6 @@ def workspace_container_stop(request: Request, workspace_id: str,
                              container_name: str,
                              workspace_path: str = ""):
     """Stop the named container in the workspace."""
-    if not _origin_check_request(request, route_name="workspace_container_stop"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
     except WorkspacePathForbiddenError as exc:
@@ -5023,8 +5033,6 @@ def workspace_container_delete(request: Request, workspace_id: str,
                                container_name: str,
                                workspace_path: str = ""):
     """Remove the named container in the workspace."""
-    if not _origin_check_request(request, route_name="workspace_container_delete"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
     except WorkspacePathForbiddenError as exc:
@@ -5368,8 +5376,6 @@ def container_record_kill(record_id: str, request: Request,
                           workspace_id: Optional[str] = None,
                           body: Optional[dict] = Body(default=None)):
     """Kill the record's container (stop; escalates to Docker kill)."""
-    if not _origin_check_request(request, route_name="container_record_kill"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     return _record_user_action(record_id, "kill", request, workspace_id, body)
 
 
@@ -5378,8 +5384,6 @@ def container_record_restart(record_id: str, request: Request,
                              workspace_id: Optional[str] = None,
                              body: Optional[dict] = Body(default=None)):
     """Restart the record's container (stop then start via the name index)."""
-    if not _origin_check_request(request, route_name="container_record_restart"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     return _record_user_action(record_id, "restart", request, workspace_id, body)
 
 
@@ -5388,8 +5392,6 @@ def container_record_recreate(record_id: str, request: Request,
                               workspace_id: Optional[str] = None,
                               body: Optional[dict] = Body(default=None)):
     """Recreate the record's container (remove then start via the name index)."""
-    if not _origin_check_request(request, route_name="container_record_recreate"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     return _record_user_action(record_id, "recreate", request, workspace_id, body)
 
 
@@ -5456,8 +5458,6 @@ def workspace_container_action(workspace_id: str, record_id: str,
     only be removed by the operator"). The ``actor`` value labels who to
     blame in the audit trail; it authorises nothing.
     """
-    if not _origin_check_request(request, route_name="workspace_container_action"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     actor, actor_error = _resolve_actor(request, body)
     if actor_error is not None:
         return actor_error
@@ -5638,8 +5638,6 @@ def workspace_container_resources(workspace_id: str, record_id: str,
     ``id`` stays stable across the recreate; the response is the same entry
     shape the container-view GET emits.
     """
-    if not _origin_check_request(request, route_name="workspace_container_resources"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     actor, actor_error = _resolve_actor(request, body)
     if actor_error is not None:
         return actor_error
@@ -5907,9 +5905,6 @@ def health_containers(request: Request):
     lib_missing | import_failed | docker_host_unreachable, or null when
     Docker is available.
     """
-    denied = _localhost_only(request)
-    if denied is not None:
-        return denied
     checked_at = datetime.now(timezone.utc).isoformat()
     client = None
     try:

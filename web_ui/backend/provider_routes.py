@@ -21,7 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
@@ -31,7 +31,6 @@ from agent.config.provider_profile import (
     ProviderProfile,
 )
 
-from web_ui.backend.origin_policy import _origin_check_request
 
 router = APIRouter(prefix="/api")
 
@@ -88,8 +87,6 @@ def upsert_provider(request: Request, payload: ProviderPayload):
     accidental overwrite when the frontend field is blank), and the profile
     is validated against ``ProviderProfile`` (unknown fields rejected).
     """
-    if not _origin_check_request(request, route_name="upsert_provider"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     provider_data = payload.provider if isinstance(payload.provider, dict) else {}
     if not provider_data.get("id"):
         return _json_error("Provider must have an id", status_code=400)
@@ -115,8 +112,6 @@ def upsert_provider(request: Request, payload: ProviderPayload):
 @router.delete("/providers/{provider_id}")
 def delete_provider(request: Request, provider_id: str):
     """Delete a provider profile; 404 when the id is unknown."""
-    if not _origin_check_request(request, route_name="delete_provider"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     provider_id = (provider_id or "").strip()
     if not provider_id:
         return _json_error("Provider id is required", status_code=400)

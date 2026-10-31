@@ -18,7 +18,6 @@ from pydantic import BaseModel
 from agent.presenter.state_bridge import StateBridge
 import thoughtmachine.vault as _vault
 
-from web_ui.backend.origin_policy import _origin_check_request
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
@@ -92,8 +91,6 @@ async def reset_config(request: Request, body: ResetConfigBody) -> Dict[str, Any
     Returns:
         The factory-default configuration dict (with ``api_key`` excluded).
     """
-    if not _origin_check_request(request, route_name="reset_config"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         import os
         config_path = os.path.expanduser(_CONFIG_PATH)
@@ -149,8 +146,6 @@ async def set_mode(request: Request, body: ModeSwitchBody) -> Dict[str, str]:
 
     Returns ``{"status": "ok", "mode": "..."}``.
     """
-    if not _origin_check_request(request, route_name="set_mode"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     mode = body.mode.strip().lower()
 
     # Map legacy "full" to "agent"

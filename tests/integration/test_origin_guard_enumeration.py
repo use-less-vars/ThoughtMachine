@@ -1,16 +1,30 @@
-"""Pin the origin-guard invariant for every non-GET route of the web UI backend.
+"""Pin the origin/peer gate to its SINGLE enforcement point.
 
-5a enumerates the FastAPI routes straight out of ``web_ui/backend/*.py`` with
-``ast`` (no imports, no regex) and asserts that every non-GET route refuses
-foreign origins: it either calls ``_origin_check_request`` inline, or it is one
-of the pinned ``STRICT_ORIGIN_NON_GET`` routes that use the stricter
-``_origin_allowed`` helper.  5b cross-checks that enumeration against
-``app.openapi()``, so a route cannot reach the running app without also being
-seen by the AST scan.  5c resolves the pinned tuple lists back to their source
-decorator paths, and 5d samples one route per mechanism shape behaviourally.
+The web UI backend enforces "is this request from a browser on this machine?"
+in exactly one place: ``AuthBoundaryMiddleware`` in
+``web_ui/backend/auth_boundary.py``.  Per-route copies of the origin guard (and
+per-route peer-address gates on the health probes) used to exist as well; a
+second copy of a security decision is a second thing that can drift, so they
+were deleted.  This file pins that the single copy is really single, and that
+it is composed into the app where it can actually refuse:
 
-The subject of the test is the invariant, not a fixed list of routes: adding a
-route must show up in the scan automatically. If this test can be made green by removing a route's guard, the test is wrong. If it can be made green by adding a route without the guard, the test is wrong.
+P1  no module under ``web_ui/backend/`` other than the three mechanism modules
+    calls ``_origin_check_request`` / ``_origin_allowed`` / ``_localhost_only``
+    at all -- neither in a route handler nor anywhere else.
+P2  the middleware takes both predicates from the mechanism modules (via
+    ``ast``), and its own body calls them: the gate is not a re-implementation.
+P3  the app's middleware stack puts ``CORSMiddleware`` OUTSIDE the boundary, so
+    a credential-less preflight is answered before the gate sees it.
+P4  behaviourally, a foreign ``Origin`` is refused with 403 on non-GET routes
+    drawn from four different modules, while a loopback ``Origin`` is served.
+P5  behaviourally, a non-loopback PEER is refused with 403 on the health
+    probes, while a loopback peer is served.
+5b  parity: the running app exposes exactly the non-GET routes the AST scan
+    sees, so no route can reach the app without being visible to P1.
+
+The subject of the test is the invariant, not a fixed list of routes. If this
+test can be made green by re-adding a per-route guard, the test is wrong: P1
+would have to be relaxed to allow it.
 """
 
 import ast
@@ -24,51 +38,58 @@ BACKEND_DIR = REPO_ROOT / "web_ui" / "backend"
 ROUTE_METHODS = frozenset({"get", "post", "put", "patch", "delete"})
 ROUTE_METHODS_UPPER = frozenset(method.upper() for method in ROUTE_METHODS)
 GET = "GET"
-ORIGIN_PREDICATES = frozenset({"_origin_check_request", "_origin_allowed"})
 
-# GET routes that touch the filesystem and therefore carry a guard as well.
-# (handler_function_name, full_openapi_path, predicate_name); the handler name is
-# spelled exactly as the function is defined in the source.
-FILESYSTEM_GET_MUST_GUARD = [
-    ("vault_repair_status", "/api/vault/repair/status", "_origin_allowed"),
-    ("browse_directory", "/api/browse", "_origin_check_request"),
+#: Predicates that decide "is this caller from this machine / this origin?", in
+#: every spelling they are known by: ``localhost_only`` (the definition in
+#: ``local_gate``) is imported under the ``_localhost_only`` alias elsewhere, so
+#: banning only one spelling would let the other back in.  Outside the three
+#: mechanism modules nobody may call any of them: the middleware is the only caller.
+GUARD_NAMES = frozenset({"_origin_check_request", "_origin_allowed", "localhost_only", "_localhost_only"})
+
+#: The mechanism modules themselves: the definition of each predicate
+#: (``origin_policy``, ``local_gate``) and the one place that uses them
+#: (``auth_boundary``).
+MECHANISM_MODULES = frozenset({"origin_policy.py", "local_gate.py", "auth_boundary.py"})
+
+ORIGIN_POLICY_MODULE = "web_ui.backend.origin_policy"
+LOCAL_GATE_MODULE = "web_ui.backend.local_gate"
+
+#: The two predicates the boundary itself must import and call (P2):
+#: (module the predicate is defined in, predicate name).
+BOUNDARY_PREDICATES = (
+    (ORIGIN_POLICY_MODULE, "_origin_check_request"),
+    (LOCAL_GATE_MODULE, "localhost_only"),
+)
+
+#: A browser origin that is not this machine, and one that is
+#: (``_ORIGIN_RE`` trusts ``http(s)://{localhost,127.0.0.1}[:port]``).
+FOREIGN_ORIGIN = "http://evil.example"
+TRUSTED_ORIGIN = "http://127.0.0.1:5173"
+
+#: Loopback peer, spelled as a socket address so the test harness trust flag
+#: (keyed on the peer NAME ``testclient``) cannot bypass the gate here.
+LOOPBACK_PEER = ("127.0.0.1", 51234)
+REMOTE_PEER = ("8.8.8.8", 5555)
+
+#: Behavioural sample for P4: (handler_function_name, module_file_name).  One
+#: route per module, never one route per method shape: what the single gate has
+#: to prove is that it is wired into every router, not that each shape of
+#: handler behaves.  Resolved through the same AST enumeration as 5b -- never by
+#: importing the handler -- so a renamed or moved handler fails here loudly.
+#: The bodies sent are empty objects: a 422/400 from body validation is the
+#: CONTROL's expected outcome, because the gate must run before the handler.
+FOREIGN_ORIGIN_SAMPLE = [
+    ("set_mode", "config_routes.py"),
+    ("upsert_provider", "provider_routes.py"),
+    ("save_prompt", "prompt_routes.py"),
+    ("create_directory", "server.py"),
 ]
 
-# Non-GET routes guarded by the stricter helper instead of _origin_check_request.
-# (handler_function_name, full_openapi_path, predicate_name)
-STRICT_ORIGIN_NON_GET = [
-    ("vault_repair_apply", "/api/vault/repair/apply", "_origin_allowed"),
-]
+#: P5 paths: one from ``server.py`` and one from ``health_routes.py``, both
+#: exempt from the credential but NOT from the peer gate.
+PEER_GATED_PATHS = ("/health", "/api/system/health")
 
-# Behavioural sample: one route per mechanism shape (POST-with-body, POST-no-body,
-# PUT, DELETE).  ``route_label`` is the handler function name, resolved to
-# (method, path) with the same AST prefix resolution as 5a/5c - never by
-# importing the handler - so a renamed or moved handler fails here loudly.
-# (route_label, mechanism_shape, body_builder_or_None)
-REPRESENTATIVE_FOREIGN_ORIGIN_SAMPLE = [
-    # POST-with-body: resolve_workspace_path takes no path or query parameter, so the only input that can pre-empt the handler is a body schema failure; {"path": ...} satisfies ResolvePathBody.
-    ("resolve_workspace_path", "POST-with-body", lambda: {"path": "/tmp"}),
-    # POST-no-body: complete_onboarding takes nothing but the request, so there is no body validation that could 422 before the guard runs.
-    ("complete_onboarding", "POST-no-body", None),
-    # PUT: put_dockerfile takes one path parameter and no body model, so it cannot 422 before the guard, and the guard fires before it would write anything.
-    ("put_dockerfile", "PUT", None),
-    # DELETE: delete_provider with an unknown provider_id is a no-op if it is ever reached, and the guard fires long before that.
-    ("delete_provider", "DELETE", None),
-]
-
-# The four pinned shape labels and the HTTP method each one must resolve to.
-EXPECTED_METHOD_BY_SHAPE = {
-    "POST-with-body": "POST",
-    "POST-no-body": "POST",
-    "PUT": "PUT",
-    "DELETE": "DELETE",
-}
-
-# ``predicates`` is every origin predicate the handler calls anywhere in its body
-# (presence).  ``first_statement_predicates`` holds only those called by the
-# handler's first non-docstring statement, so that the ordering (the guard gates
-# the work) can be asserted separately from presence.
-_Route = namedtuple("_Route", "method path handler module line predicates first_statement_predicates")
+_Route = namedtuple("_Route", "method path handler module line")
 
 
 def _callee_name(call):
@@ -120,37 +141,61 @@ def _route_decorators(function):
         yield method.upper(), literal.value, (owner.id if isinstance(owner, ast.Name) else None)
 
 
-def _guard_calls(function):
-    """Return the set of origin predicates called anywhere inside ``function``."""
+class _GuardCallVisitor(ast.NodeVisitor):
+    """Collect every call to a name in ``GUARD_NAMES``, tagged with its enclosing function."""
+
+    def __init__(self, module):
+        self.module = module
+        self.scope = []
+        self.offenders = []
+
+    def _visit_function(self, node):
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Call(self, node):
+        name = _callee_name(node)
+        if name in GUARD_NAMES:
+            enclosing = self.scope[-1] if self.scope else "<module>"
+            self.offenders.append(f"{self.module}:{node.lineno} {name} ({enclosing})")
+        self.generic_visit(node)
+
+
+def _guard_call_sites():
+    """Every guard call outside the mechanism modules, as ``module:line name (handler)``."""
+    offenders = []
+    for source in sorted(BACKEND_DIR.glob("*.py")):
+        if source.name in MECHANISM_MODULES:
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        visitor = _GuardCallVisitor(source.name)
+        visitor.visit(tree)
+        offenders.extend(visitor.offenders)
+    return offenders
+
+
+def _imported_names(tree):
+    """Map module name -> set of names imported from it, over all ``ImportFrom`` nodes."""
+    imported = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.setdefault(node.module, set()).update(alias.name for alias in node.names)
+    return imported
+
+
+def _called_guard_names(tree):
+    """The subset of ``GUARD_NAMES`` called anywhere in ``tree``."""
     found = set()
-    for node in ast.walk(function):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = _callee_name(node)
-            if name in ORIGIN_PREDICATES:
+            if name in GUARD_NAMES:
                 found.add(name)
     return found
-
-
-def _first_statement_predicates(function):
-    """Return the origin predicates called by the first non-docstring statement.
-
-    Presence (``_guard_calls``) walks the whole function, so it cannot tell a
-    guard that gates the work from one that follows it.  This returns the
-    predicates reachable from ``body[0]`` after any docstring, so ordering can
-    be asserted: the check must come before the side effects it protects.
-    """
-    statements = list(function.body)
-    if statements and ast.get_docstring(function, clean=False) is not None:
-        statements = statements[1:]
-    if not statements:
-        return frozenset()
-    found = set()
-    for node in ast.walk(statements[0]):
-        if isinstance(node, ast.Call):
-            name = _callee_name(node)
-            if name in ORIGIN_PREDICATES:
-                found.add(name)
-    return frozenset(found)
 
 
 def _enumerate_routes():
@@ -158,7 +203,7 @@ def _enumerate_routes():
 
     Returns ``(routes, un_addable_handlers)``; ``un_addable_handlers`` collects the
     non-GET routes whose decorator path could not be resolved to a full API path,
-    so that a route can never dodge the invariant by being invisible to the scan.
+    so that a route can never dodge 5b's parity check by being invisible to the scan.
     """
     routes = []
     un_addable_handlers = []
@@ -190,18 +235,16 @@ def _enumerate_routes():
                         handler=node.name,
                         module=source.name,
                         line=node.lineno,
-                        predicates=frozenset(_guard_calls(node)),
-                        first_statement_predicates=_first_statement_predicates(node),
                     )
                 )
     return routes, un_addable_handlers
 
 
-def _routes_by_path(routes):
-    """Group ``routes`` by full path."""
+def _routes_by_handler(routes):
+    """Group ``routes`` by handler function name."""
     grouped = {}
     for route in routes:
-        grouped.setdefault(route.path, []).append(route)
+        grouped.setdefault(route.handler, []).append(route)
     return grouped
 
 
@@ -223,131 +266,119 @@ def _concretise(path):
     return "/".join(segments)
 
 
-def test_5a_presence_every_non_get_route_calls_the_origin_guard():
-    """Presence: no non-GET route exists without an origin guard (AST only)."""
+def test_p1_no_route_level_guard_survives_outside_the_boundary():
+    """P1: the guard is called in exactly one module, and never by a route handler."""
+    offenders = _guard_call_sites()
+    scanned = sorted(
+        source.name for source in BACKEND_DIR.glob("*.py") if source.name not in MECHANISM_MODULES
+    )
+    print(f"p1 scanned_modules={len(scanned)} guard_call_sites={len(offenders)}")
+    assert scanned, f"no backend modules found under {BACKEND_DIR}"
+    assert offenders == [], (
+        "per-route origin/peer guards must not exist: the AuthBoundaryMiddleware is the single "
+        "enforcement point (delete the guard, do not add the module to MECHANISM_MODULES): "
+        + "; ".join(offenders)
+    )
+
+
+def test_p2_the_boundary_imports_and_calls_both_predicates():
+    """P2: the middleware is a caller of the mechanism, not a second copy of it."""
+    source = BACKEND_DIR / "auth_boundary.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    imported = _imported_names(tree)
+
+    expected = set()
+    for module, predicate in BOUNDARY_PREDICATES:
+        expected.add(predicate)
+        assert predicate in imported.get(module, set()), (
+            f"auth_boundary.py must import {predicate} from {module}; "
+            f"imported: {sorted(imported.get(module, set()))}"
+        )
+
+    missing = sorted(expected - _called_guard_names(tree))
+    assert missing == [], f"auth_boundary.py imports but never calls {missing}"
+
+
+def test_p3_cors_is_registered_outside_the_boundary():
+    """P3: CORS must be the outer layer, so preflights never reach the gate."""
+    _ensure_repo_root_on_sys_path()
+    from web_ui.backend import server
+
+    classes = [middleware.cls for middleware in server.app.user_middleware]
+    assert server.CORSMiddleware in classes, f"CORSMiddleware is not registered; stack is {classes}"
+    assert server.AuthBoundaryMiddleware in classes, f"AuthBoundaryMiddleware is not registered; stack is {classes}"
+
+    cors_index = classes.index(server.CORSMiddleware)
+    boundary_index = classes.index(server.AuthBoundaryMiddleware)
+    assert cors_index < boundary_index, (
+        "CORSMiddleware must be OUTSIDE (lower index than) AuthBoundaryMiddleware, else a preflight "
+        f"is refused by the credential gate: cors={cors_index} boundary={boundary_index}"
+    )
+
+
+def test_p4_foreign_origin_is_refused_and_loopback_origin_is_served():
+    """P4: the single gate refuses a foreign Origin on routes from four modules."""
+    _ensure_repo_root_on_sys_path()
+    from fastapi.testclient import TestClient
+    from web_ui.backend import auth_token, server
+
+    modules = [module for _, module in FOREIGN_ORIGIN_SAMPLE]
+    assert len(set(modules)) == len(modules), f"the sample must span distinct modules, got {modules}"
+
     routes, un_addable_handlers = _enumerate_routes()
-    non_get = [route for route in routes if route.method != GET]
-    grouped = _routes_by_path(routes)
-    print(
-        "5a discovered routes={total} non_get={non_get} guarded_by_origin_check_request={check} "
-        "guarded_by_origin_allowed={allowed}".format(
-            total=len(routes),
-            non_get=len(non_get),
-            check=sum(1 for route in non_get if "_origin_check_request" in route.predicates),
-            allowed=sum(1 for route in non_get if "_origin_allowed" in route.predicates),
+    assert un_addable_handlers == [], "unresolvable non-GET routes: " + "; ".join(un_addable_handlers)
+    grouped = _routes_by_handler(routes)
+
+    token = auth_token.ensure_token()
+    client = TestClient(server.app, client=LOOPBACK_PEER, raise_server_exceptions=False)
+    for handler, module in FOREIGN_ORIGIN_SAMPLE:
+        matches = [route for route in grouped.get(handler, []) if route.module == module]
+        assert len(matches) == 1, (
+            f"{handler}: expected exactly one route in {module}, found "
+            f"{[(route.method, route.path) for route in matches]}"
         )
-    )
-
-    # (5) Hard escape hatch: a non-GET route the scan cannot resolve would skip
-    # the invariant silently, so it fails loudly here, naming module and function.
-    assert len(un_addable_handlers) == 0, (
-        "non-GET routes that could not be resolved to a full API path (fix the resolver or the route, never skip): "
-        + "; ".join(un_addable_handlers)
-    )
-
-    # (1a) The invariant itself: every non-GET route calls the general helper, or
-    # is one of the pinned strict-helper routes. Never neither.
-    strict_paths = {entry[1] for entry in STRICT_ORIGIN_NON_GET}
-    unguarded = [
-        "{method} {path} -> {handler} ({module}:{line})".format(
-            method=route.method, path=route.path, handler=route.handler, module=route.module, line=route.line
-        )
-        for route in non_get
-        if "_origin_check_request" not in route.predicates and route.path not in strict_paths
-    ]
-    assert unguarded == [], (
-        "non-GET routes that neither call _origin_check_request nor appear in STRICT_ORIGIN_NON_GET: "
-        + "; ".join(unguarded)
-    )
-
-    # (1b) The strict list is exhaustive over the strict helper: a non-GET route may
-    # not adopt _origin_allowed without being pinned above, or the list would be a
-    # permission slip for one path instead of a census of the strict mechanism.
-    unpinned_strict = [
-        "{method} {path} -> {handler} ({module}:{line})".format(
-            method=route.method, path=route.path, handler=route.handler, module=route.module, line=route.line
-        )
-        for route in non_get
-        if "_origin_allowed" in route.predicates and route.path not in strict_paths
-    ]
-    assert unpinned_strict == [], (
-        "non-GET routes that call _origin_allowed but are missing from STRICT_ORIGIN_NON_GET: "
-        + "; ".join(unpinned_strict)
-    )
-
-    # (6) Ordering: the guard must gate the work, not follow it. Presence alone
-    # cannot see the difference - a handler that writes something and then checks
-    # the origin carries the guard without being protected by it. Scoped to
-    # _origin_check_request sites: the two _origin_allowed sites (vault-repair)
-    # deliberately run function-local lazy imports before their guard, so the
-    # ordering rule does not apply to them.
-    misordered = [
-        "{method} {path} -> {handler} ({module}:{line}) first statement calls {calls}".format(
-            method=route.method,
-            path=route.path,
-            handler=route.handler,
-            module=route.module,
-            line=route.line,
-            calls=sorted(route.first_statement_predicates) or "nothing",
-        )
-        for route in non_get
-        if "_origin_check_request" in route.predicates
-        and "_origin_check_request" not in route.first_statement_predicates
-    ]
-    assert misordered == [], (
-        "non-GET routes whose _origin_check_request call is not the first statement after the docstring "
-        "(the guard must gate the work, not follow it): " + "; ".join(misordered)
-    )
-
-    # FILESYSTEM_GET_MUST_GUARD is a "these GETs must be guarded" list, not an
-    # "only these GETs may be guarded" list, so it is deliberately not exhaustive
-    # over GET routes that carry a guard - do not add such an assertion.
-
-    # (2) Every STRICT_ORIGIN_NON_GET entry exists, is non-GET and calls _origin_allowed.
-    strict_problems = []
-    for handler, path, predicate in STRICT_ORIGIN_NON_GET:
-        matches = grouped.get(path, [])
-        if len(matches) != 1:
-            strict_problems.append(f"{path}: expected exactly one route, found {len(matches)}")
-            continue
         route = matches[0]
-        if route.method == GET:
-            strict_problems.append(f"{path}: listed as non-GET but the source decorator is GET")
-        if route.handler != handler:
-            strict_problems.append(f"{path}: handler is {route.handler}, list says {handler}")
-        if predicate not in route.predicates:
-            strict_problems.append(
-                f"{path}: {route.handler} does not call {predicate} (calls {sorted(route.predicates)})"
-            )
-    assert strict_problems == [], "STRICT_ORIGIN_NON_GET disagrees with the source: " + "; ".join(strict_problems)
+        assert route.method != GET, f"{handler} ({module}) is {route.method} {route.path}; the sample needs a non-GET route"
+        path = _concretise(route.path)
+        credential = {"Authorization": f"Bearer {token}"}
 
-    # (4) A strict-helper route must not also call the general helper, or the
-    # stricter refusal could be masked by the weaker check.
-    mixed = [
-        "{method} {path} -> {handler}".format(method=route.method, path=route.path, handler=route.handler)
-        for _, path, _ in STRICT_ORIGIN_NON_GET
-        for route in grouped.get(path, [])
-        if "_origin_check_request" in route.predicates
-    ]
-    assert mixed == [], "strict-helper routes that also call _origin_check_request: " + "; ".join(mixed)
+        refused = client.request(route.method, path, headers={"Origin": FOREIGN_ORIGIN, **credential}, json={})
+        assert refused.status_code == 403, (
+            f"{route.method} {route.path} ({module}:{route.line}) answered {refused.status_code} for a foreign "
+            f"Origin, expected 403 from the boundary; a 404/405 means the sampled path or method is wrong, "
+            f"not that the assertion should be relaxed. body={refused.text!r}"
+        )
+        assert "origin" in refused.text.lower(), (
+            f"{route.method} {route.path} refused with 403 but not for the origin: body={refused.text!r}"
+        )
 
-    # (3) Every FILESYSTEM_GET_MUST_GUARD entry exists, is GET and calls the named predicate.
-    filesystem_problems = []
-    for handler, path, predicate in FILESYSTEM_GET_MUST_GUARD:
-        matches = grouped.get(path, [])
-        if len(matches) != 1:
-            filesystem_problems.append(f"{path}: expected exactly one route, found {len(matches)}")
-            continue
-        route = matches[0]
-        if route.method != GET:
-            filesystem_problems.append(f"{path}: listed as GET but the source decorator is {route.method}")
-        if route.handler != handler:
-            filesystem_problems.append(f"{path}: handler is {route.handler}, list says {handler}")
-        if predicate not in route.predicates:
-            filesystem_problems.append(
-                f"{path}: {route.handler} does not call {predicate} (calls {sorted(route.predicates)})"
-            )
-    assert filesystem_problems == [], "FILESYSTEM_GET_MUST_GUARD disagrees with the source: " + "; ".join(filesystem_problems)
+        served = client.request(route.method, path, headers={"Origin": TRUSTED_ORIGIN, **credential}, json={})
+        assert served.status_code not in (403, 404, 405), (
+            f"{route.method} {route.path} ({module}:{route.line}) answered {served.status_code} for the loopback "
+            f"Origin {TRUSTED_ORIGIN}; 403 means the gate refuses a trusted origin, 404/405 means the sampled "
+            f"path or method is wrong. body={served.text!r}"
+        )
+
+
+def test_p5_non_loopback_peer_is_refused_on_the_health_probes():
+    """P5: a remote peer is refused on the probes that no longer carry their own gate."""
+    _ensure_repo_root_on_sys_path()
+    from fastapi.testclient import TestClient
+    from web_ui.backend import server
+
+    remote = TestClient(server.app, client=REMOTE_PEER, raise_server_exceptions=False)
+    local = TestClient(server.app, client=LOOPBACK_PEER, raise_server_exceptions=False)
+    for path in PEER_GATED_PATHS:
+        refused = remote.get(path)
+        assert refused.status_code == 403, (
+            f"GET {path} answered {refused.status_code} for non-loopback peer {REMOTE_PEER}, expected 403 "
+            f"from the boundary's peer gate; body={refused.text!r}"
+        )
+        served = local.get(path)
+        assert served.status_code == 200, (
+            f"GET {path} answered {served.status_code} for loopback peer {LOOPBACK_PEER}, expected 200 "
+            f"(the probe must stay served on this machine); body={served.text!r}"
+        )
 
 
 def test_5b_openapi_operations_match_the_ast_enumeration():
@@ -384,69 +415,3 @@ def test_5b_openapi_operations_match_the_ast_enumeration():
         "(method, path) sets differ: openapi={openapi} ast={ast}; only_in_openapi={only_openapi}; "
         "only_in_ast={only_ast}".format(openapi=len(openapi_non_get), ast=len(ast_pairs), only_openapi=only_openapi, only_ast=only_ast)
     )
-
-
-def test_5c_pinned_tuples_resolve_to_the_source_decorator_paths():
-    """The pinned handler names, methods and paths agree with the AST decorator paths."""
-    routes, _ = _enumerate_routes()
-    grouped = _routes_by_path(routes)
-
-    for expected_methods, entries in (
-        (frozenset({GET}), FILESYSTEM_GET_MUST_GUARD),
-        (ROUTE_METHODS_UPPER - {GET}, STRICT_ORIGIN_NON_GET),
-    ):
-        for handler, path, predicate in entries:
-            at_path = grouped.get(path, [])
-            matches = [route for route in at_path if route.handler == handler]
-            assert len(matches) == 1, "{path}: expected one route defined by {handler}, found handlers {found}".format(
-                path=path, handler=handler, found=[route.handler for route in at_path]
-            )
-            route = matches[0]
-            assert route.path == path, f"{handler}: resolved to {route.path}, list says {path}"
-            assert route.method in expected_methods, (
-                f"{handler}: resolved to {route.method} {route.path} in {route.module}:{route.line}, "
-                f"but the list is restricted to {sorted(expected_methods)}"
-            )
-            assert predicate in ORIGIN_PREDICATES, f"{handler}: unknown origin predicate {predicate}"
-
-
-def test_5d_foreign_origin_is_refused_once_per_mechanism_shape():
-    """Behavioural sample: a foreign Origin is refused with 403 on one route per mechanism shape.
-
-    Behavioural coverage is sampled, not exhaustive. Presence (AST + OpenAPI) proves every non-GET route calls the guard; 5d proves the guard refuses on one route per mechanism shape. 33 of 37 routes are proven by presence only. This is deliberate - exhaustive behavioural coverage would turn 5d into a payload-fixture maintenance burden.
-    5d sends valid bodies; a malformed body would return 422 before the handler runs, which does not test the guard.
-    """
-    _ensure_repo_root_on_sys_path()
-    from fastapi.testclient import TestClient
-    from web_ui.backend.server import app
-
-    routes, _ = _enumerate_routes()
-    by_handler = {}
-    for route in routes:
-        by_handler.setdefault(route.handler, []).append(route)
-
-    shapes = [mechanism_shape for _, mechanism_shape, _ in REPRESENTATIVE_FOREIGN_ORIGIN_SAMPLE]
-    assert len(shapes) == 4, f"expected exactly 4 sampled shapes, found {shapes}"
-    assert shapes == list(EXPECTED_METHOD_BY_SHAPE), (
-        f"the sample must cover each pinned shape exactly once ({list(EXPECTED_METHOD_BY_SHAPE)}), found {shapes}"
-    )
-    client = TestClient(app)
-    for route_label, mechanism_shape, body_builder in REPRESENTATIVE_FOREIGN_ORIGIN_SAMPLE:
-        assert mechanism_shape in EXPECTED_METHOD_BY_SHAPE, f"unknown mechanism shape {mechanism_shape!r}"
-        expected_method = EXPECTED_METHOD_BY_SHAPE[mechanism_shape]
-        matches = by_handler.get(route_label, [])
-        assert len(matches) == 1, f"{route_label}: expected one route, found {[(route.method, route.path) for route in matches]}"
-        route = matches[0]
-        assert route.method == expected_method, (
-            f"{route_label}: sample declares mechanism shape {mechanism_shape} (expected {expected_method}) "
-            f"but the route is {route.method} {route.path}"
-        )
-        assert route.method != GET, f"{route_label}: the sample must exercise a non-GET route, got {route.method} {route.path}"
-        request_kwargs = {"headers": {"Origin": "http://evil.example"}}
-        if body_builder is not None:
-            request_kwargs["json"] = body_builder()
-        response = getattr(client, route.method.lower())(_concretise(route.path), **request_kwargs)
-        assert response.status_code == 403, (
-            f"{mechanism_shape} {route.method} {route.path} ({route.handler}) answered {response.status_code}, expected 403; "
-            "a 404 or 405 means the sampled path or method is wrong, not that the assertion should be relaxed"
-        )

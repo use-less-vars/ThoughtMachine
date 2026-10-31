@@ -42,8 +42,6 @@ def vault_repair_status(request: Request) -> JSONResponse:
     from thoughtmachine import vault_repair
     from thoughtmachine.vault import vault_root
 
-    if not _origin_allowed(request):
-        return _json_error("origin not allowed", 403)
     try:
         root = Path(vault_root()).expanduser().resolve()
         if not root.is_dir():
@@ -84,8 +82,6 @@ def vault_repair_apply(request: Request, body: _RepairApplyBody) -> JSONResponse
     from thoughtmachine import vault_repair
     from thoughtmachine.vault import vault_root
 
-    if not _origin_allowed(request):
-        return _json_error("origin not allowed", 403)
     ids = [v for v in (body.repair_ids or []) if v and str(v).strip()]
     cats = [v for v in (body.categories or []) if v and str(v).strip()]
     if bool(ids) == bool(cats):

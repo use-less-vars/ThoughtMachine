@@ -7,27 +7,27 @@ used to exist as two independently maintained copies with their own
 identical only until somebody edits one of them.  The weaker of the two would be
 the one guarding the vault-global payload, and nothing would report it.
 
-This module pins the fix recorded as R2 in
-``ticket-residual-w3-isolation-findings-not-fixed.md``:
+The definition now lives in ``web_ui/backend/local_gate.py`` alone, and the peer
+address is checked once — step 0 of
+``web_ui/backend/auth_boundary.AuthBoundaryMiddleware``, which every route sits
+behind.  This module pins that end state:
 
-* ``server.py`` imports the shared definitions, it does not restate them
+* ``server.py`` imports the shared constants, it does not restate them
   (identity, not equality — a re-declared frozenset would be a *different*
   object and fails here);
-* the copy that is still inside ``health_routes.py`` agrees with the shared
-  definitions on both constant sets;
-* both gates behave identically when driven with the same injected client
-  address, including the fail-closed no-peer case.
-
-**Residual, recorded rather than hidden:** ``web_ui/backend/health_routes.py``
-still holds its own copy because that file is frozen for this wave.  The copy is
-no longer unobserved — a divergence in either constant set or in the decision
-fails the tests below — but it is still a copy.  Unfreezing that module and
-replacing its local definitions with imports of ``web_ui.backend.local_gate`` is
-the remaining half.
+* ``local_gate.localhost_only`` is the only peer-address gate in the product:
+  neither ``server.py`` nor ``health_routes.py`` declares a ``localhost_only``
+  of its own, and neither carries the loopback/test-harness literals any more;
+* the gate decides correctly on its own: loopback and harness peers allowed,
+  remote and loopback-looking names denied, "no peer address at all" fails
+  closed, and the refusal is one fixed body that never echoes the caller;
+* the real routes actually run it: ``/health`` answers a loopback and a harness
+  caller and refuses a remote one through the assembled app.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 from types import SimpleNamespace
 
@@ -58,6 +58,15 @@ PEER_HOSTS = [
     "",                     # empty host is not loopback
 ]
 
+#: The two literals the gate is allowed to own (in ``local_gate.py``).
+DUPLICATED_LITERALS = (
+    'frozenset({"127.0.0.1","::1","localhost"})',
+    'frozenset({"testclient"})',
+)
+
+#: Names a per-route copy of the gate used to be declared under.
+GATE_FUNCTION_NAMES = frozenset({"localhost_only", "_localhost_only"})
+
 
 def _outcome(gate, host) -> tuple:
     """Normalise one gate decision to ``("allow", None)`` or ``("deny", status)``."""
@@ -67,88 +76,87 @@ def _outcome(gate, host) -> tuple:
     return ("deny", response.status_code)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  One definition
-# ══════════════════════════════════════════════════════════════════════════
+def _source(module) -> str:
+    with open(module.__file__, encoding="utf-8") as handle:
+        return handle.read()
 
 
-class TestSingleDefinition:
+def _declared_functions(text: str):
+    """Names of every function ``def``-ed at module level of *text*."""
+    tree = ast.parse(text)
+    return {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  One definition, imported
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestServerImportsTheSharedDefinition:
     def test_server_binds_the_shared_objects(self):
         """server.py must alias the shared definitions, not restate them."""
         assert server._LOCAL_CLIENT_HOSTS is local_gate.LOCAL_CLIENT_HOSTS
         assert server._TEST_HARNESS_CLIENT_HOSTS is local_gate.TEST_HARNESS_CLIENT_HOSTS
-        assert server._localhost_only is local_gate.localhost_only
-
-    def test_server_source_carries_no_local_copy(self):
-        """The literal and the gate body must not come back into server.py."""
-        with open(server.__file__, encoding="utf-8") as handle:
-            text = handle.read()
-        assert 'frozenset({"127.0.0.1", "::1", "localhost"})' not in text
-        assert 'frozenset({"testclient"})' not in text
-        assert "def _localhost_only(" not in text
 
 
-class TestFrozenCopyAgrees:
-    """health_routes.py is frozen, so its copy is pinned instead of deleted."""
+# ════════════════════════════════════════════════════════════════════════════
+#  No second copy may come back
+# ════════════════════════════════════════════════════════════════════════════
 
-    def test_local_client_hosts_agree(self):
-        assert health_routes._LOCAL_CLIENT_HOSTS == local_gate.LOCAL_CLIENT_HOSTS
 
-    def test_test_harness_hosts_agree(self):
-        assert (
-            health_routes._TEST_HARNESS_CLIENT_HOSTS
-            == local_gate.TEST_HARNESS_CLIENT_HOSTS
+class TestTheGateIsDefinedOnce:
+    @pytest.mark.parametrize("module", [server, health_routes], ids=lambda m: m.__name__)
+    def test_module_declares_no_gate_of_its_own(self, module):
+        """A re-declared gate would be a second definition, drifting silently."""
+        declared = _declared_functions(_source(module))
+        assert declared & GATE_FUNCTION_NAMES == set()
+
+    @pytest.mark.parametrize("module", [server, health_routes], ids=lambda m: m.__name__)
+    def test_module_restates_no_host_literals(self, module):
+        """The literal sets belong to ``local_gate.py`` and nowhere else."""
+        compact = _source(module).replace(" ", "")
+        for literal in DUPLICATED_LITERALS:
+            assert literal not in compact
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The shared gate's own decisions
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestGateDecisions:
+    @pytest.mark.parametrize(
+        "host", sorted(local_gate.LOCAL_CLIENT_HOSTS | local_gate.TEST_HARNESS_CLIENT_HOSTS)
+    )
+    def test_loopback_and_harness_peers_are_allowed(self, host):
+        assert _outcome(local_gate.localhost_only, host) == ("allow", None)
+
+    @pytest.mark.parametrize("host", PEER_HOSTS)
+    def test_only_the_defined_peers_are_local(self, host):
+        expected = (
+            ("allow", None)
+            if host in local_gate.LOCAL_CLIENT_HOSTS
+            or host in local_gate.TEST_HARNESS_CLIENT_HOSTS
+            else ("deny", 403)
         )
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Identical behaviour under the same injected peer
-# ══════════════════════════════════════════════════════════════════════════
-
-
-class TestBehavioursAgree:
-    @pytest.mark.parametrize("host", PEER_HOSTS + [None])
-    def test_health_copy_matches_the_shared_gate(self, host):
-        assert _outcome(health_routes._localhost_only, host) == _outcome(
-            local_gate.localhost_only, host
-        )
-
-    @pytest.mark.parametrize("host", PEER_HOSTS + [None])
-    def test_server_gate_matches_the_shared_gate(self, host):
-        assert _outcome(server._localhost_only, host) == _outcome(
-            local_gate.localhost_only, host
-        )
+        assert _outcome(local_gate.localhost_only, host) == expected
 
     def test_no_peer_address_fails_closed(self):
-        """No gate may read "no peer" as local."""
-        for gate in (
-            local_gate.localhost_only,
-            health_routes._localhost_only,
-            server._localhost_only,
-        ):
-            assert _outcome(gate, None)[0] == "deny"
+        """No peer address must never be read as local."""
+        assert _outcome(local_gate.localhost_only, None) == ("deny", 403)
 
-    def test_refusal_body_is_identical_and_echoes_nothing(self):
-        """Both gates answer the same fixed body and never the caller address."""
+    def test_refusal_body_is_fixed_and_echoes_nothing(self):
+        """One fixed body, and never the caller's address."""
         peer = "203.0.113.9"
-        shared = local_gate.localhost_only(_request(peer))
-        frozen = health_routes._localhost_only(_request(peer))
-        assert shared.status_code == frozen.status_code == 403
-        assert shared.body == frozen.body
-        assert json.loads(shared.body) == {"error": "localhost only"}
-        assert peer not in shared.body.decode()
-
-    def test_loopback_and_harness_peers_are_allowed(self):
-        for host in sorted(
-            local_gate.LOCAL_CLIENT_HOSTS | local_gate.TEST_HARNESS_CLIENT_HOSTS
-        ):
-            assert _outcome(local_gate.localhost_only, host) == ("allow", None)
-            assert _outcome(health_routes._localhost_only, host) == ("allow", None)
+        refused = local_gate.localhost_only(_request(peer))
+        assert refused.status_code == 403
+        assert json.loads(refused.body) == {"error": "localhost only"}
+        assert peer not in refused.body.decode()
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 #  The routes actually run the gate
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 
 class TestRoutesUseTheGate:

@@ -20,7 +20,6 @@ from agent.logging.unified import (
     set_truncation_limits,
 )
 
-from web_ui.backend.origin_policy import _origin_check_request
 
 router = APIRouter(prefix="/api/logging")
 
@@ -65,8 +64,6 @@ async def update_logging_config(request: Request, body: LoggingConfigBody) -> Di
     Returns the previous and new config values, and broadcasts the update
     to all active WebSocket bridges.
     """
-    if not _origin_check_request(request, route_name="update_logging_config"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     result: Dict[str, Any] = {
         "status": "ok",
         "config": {},
