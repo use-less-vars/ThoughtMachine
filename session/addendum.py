@@ -16,8 +16,12 @@ reaches the model by being composed into the single system-prompt string
 
 Nothing here is typed as a ``StreamEvent``: the queue carries plain
 runtime-channel dicts (design doc §7.3), which the turn loop re-yields verbatim.
-No budget enforcement lives here either -- that is slice 5, so a write is never
-refused for size (ruling D-7 is unruled; §13.3).
+
+Budget enforcement (slice 5) lives here too, at this same boundary: a write that
+would push the RESULTING entry set past the session's ``budget_chars`` (measured
+as an exact character count) or ``max_entries`` is REFUSED -- never truncated,
+never compensated for by evicting an existing entry -- and reported as a
+``runtime_notice`` with code ``budget_exceeded`` / ``max_entries_exceeded``.
 """
 from __future__ import annotations
 
@@ -41,6 +45,11 @@ DROP_INVALID_SOURCE = 'invalid_source'
 DROP_INVALID_TEXT = 'invalid_text'
 DROP_EMPTY_TEXT = 'empty_text'
 DROP_REJECTED_BY_SCHEMA = 'rejected_by_schema'
+#: Slice 5: the resulting entry set would not fit the addendum's budget. The
+#: verdict is refusal only (never truncation, never eviction), which is what
+#: keeps the refusal atomic: nothing is persisted and nothing is enqueued.
+DROP_BUDGET_EXCEEDED = 'budget_exceeded'
+DROP_MAX_ENTRIES_EXCEEDED = 'max_entries_exceeded'
 
 
 def _now_iso() -> str:
@@ -141,6 +150,10 @@ def write_addendum_entry(session, text, source: str = 'operator') -> dict:
         set (empty on a drop). Never raises: a rejection is reported through the
         return value and a ``runtime_notice`` on the queue, because the slice-1
         contract is that one bad write must not cost the session.
+
+        A write that would not fit the addendum's budget is one of those drops:
+        ``reason`` is ``'budget_exceeded'`` or ``'max_entries_exceeded'``, and
+        the session's addendum is left exactly as it was.
     """
     try:
         if session is None:
@@ -171,6 +184,25 @@ def write_addendum_entry(session, text, source: str = 'operator') -> dict:
         if len(entries) != len(addendum['entries']) + 1:
             return _dropped(session, DROP_REJECTED_BY_SCHEMA,
                             f'entry rejected by the addendum schema: {entry!r}')
+
+        # --- Slice 5: budget enforcement -------------------------------------
+        # Measured on the RESULTING set (existing + candidate), as an exact
+        # character count; there is no estimator and no token proxy. The check
+        # runs before anything is persisted or enqueued, which is what makes the
+        # refusal atomic. There is no grandfathering either: a session that is
+        # already over budget can never accept another write, because its
+        # resulting set is over budget too. ``pinned`` exempts nothing.
+        total_chars = sum(len(item['text']) for item in entries)
+        if total_chars > normalized['budget_chars']:
+            return _dropped(
+                session, DROP_BUDGET_EXCEEDED,
+                f"addendum budget exceeded: {total_chars} > "
+                f"{normalized['budget_chars']} chars")
+        if len(entries) > normalized['max_entries']:
+            return _dropped(
+                session, DROP_MAX_ENTRIES_EXCEEDED,
+                f"addendum entry limit exceeded: {len(entries)} > "
+                f"{normalized['max_entries']} entries")
 
         # Persist on the session's addendum, keeping any key this module does not
         # know about so a later version's field is not silently erased.
