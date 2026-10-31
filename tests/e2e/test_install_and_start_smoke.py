@@ -90,6 +90,13 @@ from pathlib import Path
 
 import pytest
 
+# The credential store is imported rather than re-derived: the token path and its
+# parsing live in ``web_ui/backend/auth_token.py``, so this test follows the
+# server's own definition of "where the token is" and "what the token is".
+from web_ui.backend.auth_token import STATE_DIRNAME as _TOKEN_STATE_DIRNAME
+from web_ui.backend.auth_token import TOKEN_FILENAME as _TOKEN_FILENAME
+from web_ui.backend.auth_token import read_token as _read_token
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _BASH = shutil.which("bash")
@@ -115,6 +122,11 @@ _INSTALL_BANNERS = (
 _HEALTH_TIMEOUT_S = 60.0
 _HEALTH_POLL_S = 1.0
 _START_LOG_TIMEOUT_S = 20.0
+# Bounded wait for ``<vault>/state/web_ui_token``: the backend writes it during
+# startup, which can race this process.  Never a skip -- a token that never
+# appears is a failure of the server under test.
+_TOKEN_WAIT_TIMEOUT_S = 30.0
+_TOKEN_POLL_S = 0.25
 _TOOL_NAME = "DateTimeTool"
 _CONTAINER_MARKERS = ("container", "docker")
 
@@ -435,13 +447,63 @@ def _wait_health(url: str, timeout: float = _HEALTH_TIMEOUT_S) -> bool:
     return False
 
 
-def _http_post_json(url: str, payload: dict, timeout: float = 30.0):
+def _vault_token(vault: Path, timeout: float = _TOKEN_WAIT_TIMEOUT_S) -> str:
+    """Return the token the backend minted inside *vault*, retried until present.
+
+    The location is composed from the server's own constants
+    (``web_ui/backend/auth_token.py``: ``STATE_DIRNAME`` / ``TOKEN_FILENAME`` ->
+    ``<vault>/state/web_ui_token``) and the value is parsed by the server's own
+    ``read_token`` (which strips whitespace and fails closed on a broken store),
+    so this test cannot drift from the real credential store.
+
+    ``token_path()`` is deliberately not used: it resolves through
+    ``thoughtmachine.vault.vault_root()`` for *this* process, while the backend
+    under test was handed ``THOUGHTMACHINE_VAULT_ROOT=<scratch vault>`` and a
+    throwaway ``HOME``.  The vault the server was pointed at is the one to read.
+    """
+    token_file = Path(vault) / _TOKEN_STATE_DIRNAME / _TOKEN_FILENAME
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            token = _read_token(token_file)
+        except RuntimeError as exc:  # unusable store: fail closed, do not retry
+            raise AssertionError(f"web UI token store is unusable: {exc}") from exc
+        if token:
+            return token
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"backend never wrote a usable web UI token at {token_file} within "
+                f"{timeout:.0f}s (file {'blank' if token == '' else 'absent'}). "
+                "Every non-exempt API path and /ws requires 'Authorization: Bearer "
+                "<token>', so there is no unauthenticated fallback to fall back to."
+            )
+        time.sleep(_TOKEN_POLL_S)
+
+
+def _auth_headers(vault: Path) -> dict:
+    """The ``Authorization`` header the backend's ingress boundary requires."""
+    return {"Authorization": f"Bearer {_vault_token(vault)}"}
+
+
+def _http_post_json(url: str, payload: dict, vault: Path, timeout: float = 30.0):
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", **_auth_headers(vault)}
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def _http_post_status(url: str, payload: dict, timeout: float = 10.0) -> int:
+    """POST with **no** credential and return the status code that came back."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
-    with urllib.request.urlopen(request, timeout=timeout) as resp:
-        return resp.status, json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
 
 
 def _collect_events(ws, seconds: float) -> list:
@@ -650,13 +712,19 @@ def _run_single_tool_turn(
     import websockets.sync.client as ws_client  # noqa: PLC0415 - optional dep, lazy import
 
     base_url = f"http://127.0.0.1:{backend_port}"
-    status, body = _http_post_json(f"{base_url}/api/session/create", {"mode": "custom"})
+    auth = _auth_headers(vault)
+    status, body = _http_post_json(f"{base_url}/api/session/create", {"mode": "custom"}, vault)
     assert status in (200, 201), f"session creation failed: {status} {body}"
     session_id = body.get("session_id")
     assert session_id, f"no session_id in create response: {body}"
 
     events = []
-    with ws_client.connect(f"ws://127.0.0.1:{backend_port}/ws", open_timeout=15, close_timeout=5) as ws:
+    with ws_client.connect(
+        f"ws://127.0.0.1:{backend_port}/ws",
+        open_timeout=15,
+        close_timeout=5,
+        additional_headers=auth,
+    ) as ws:
         ws.send(json.dumps({"command": "new_session"}))
         events += _wait_for_session_loaded(ws)
         # test-only fault-injection hook; see _INDUCE_SIGTERM; unset in normal runs
@@ -814,6 +882,20 @@ def test_install_and_start_smoke(monkeypatch):
         # tails are the only backend/launcher evidence a failure in this region
         # would otherwise lack. The wrap re-raises, so nothing is swallowed.
         try:
+            # ---- 3b. the boundary refuses an unauthenticated session create ----
+            # Cheap, and the one assertion that proves this smoke test is driving
+            # a *guarded* backend: 401 is "no credential".  A 2xx would mean the
+            # boundary is not in the path, a 5xx that it crashes on a bare
+            # request, and a 403 that something other than authentication
+            # answered.
+            unauth_status = _http_post_status(
+                f"http://127.0.0.1:{backend_port}/api/session/create", {"mode": "custom"}
+            )
+            assert unauth_status == 401, (
+                "POST /api/session/create with no cookie and no bearer token must be "
+                f"refused with 401 by the ingress boundary, got {unauth_status}"
+            )
+
             tool_results = _run_single_tool_turn(backend_port, vault, proc)
             diagnostic = _events_diagnostic(_LAST_TURN_EVENTS)
             container = [r for r in tool_results if any(m in r["name"].lower() for m in _CONTAINER_MARKERS)]
