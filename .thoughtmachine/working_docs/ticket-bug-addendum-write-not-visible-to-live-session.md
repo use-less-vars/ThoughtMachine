@@ -1,7 +1,7 @@
 # ticket: `bug/addendum-write-not-visible-to-live-session`
 
 **Filed:** 2026-10-31 (W1.5 review of Task 1 trace)
-**Status:** open
+**Status:** FIXED — implemented on branch `w1-5/writer` (base `18f6dc02`), awaiting operator push/PR.
 **Severity:** high
 
 ## Symptom
@@ -101,6 +101,31 @@ implementation would silently settle that ownership question.
 - A regression test proves the live and idle paths behave the same — one test driving the live
   bridge and one driving the store-only path, asserting on the composed prompt, not on the store.
 - Refusal behaviour is unchanged: a refused write still persists nothing and still returns 409.
+
+## Resolution
+
+Ruled: Option A (write-through). Invariant: the live session is the runtime authority, the store is the durability authority; every write touches both under one lock before ack; the cold path is an atomic store read-modify-write.
+
+Commits (branch `w1-5/writer`, base `18f6dc02`):
+
+- `37d8adfe` fix(session): make store writes atomic behind one locked read-modify-write — `_atomic_write_json` (temp file in the same directory + `os.replace`, cleanup on failure), `_save_session_metadata` locked on the metadata path, new `mutate_session` where a single `FileLock` spans read → mutator → atomic rewrite (`should_write=False` writes nothing; unknown id returns `(None, None)`), `_read_session_file`, `load_session` refactor. **Condition (3), deliberately its own commit.**
+- `84a5412b` fix(bridge): serialise session snapshot+save and carry addendum through the fallback — `_session_state_lock` (`threading.RLock`) created in `__init__` and held around the `_session_manager.save_session` delegate (the store builds `to_persistable_dict()` *before* taking its own `FileLock`, so only a lock above the store closes the snapshot/write window); the end-of-turn fallback (`bridge.py`, around line 2232) now carries `summary` and `addendum` through by `deepcopy` instead of rebuilding them from `user_history`. **The rebuild was the wipe**: it wrote a default empty addendum over the stored one. **Condition (4).**
+- `4045ba39` feat(addendum): write through to the live session, read and refuse through one resolver — `_resolve_addendum_session` is the single resolver behind GET/POST/DELETE; `_held_sessions` (`_agent.session` → `_session` → `_loaded_session`, identity-deduped); `_live_bridges` (snapshot of `event_forwarder._active_tab_bridges`, agent-bearing bridges first); `_bridge_lock` (nullcontext fallback); `_write_through` (mutate + persist under the bridge lock, then mirror the accepted set onto the other held copies and the other tabs' copies under their own locks — no lock nesting; cold path delegates to `store.mutate_session`); `_addendum_state(session, boundary)` takes every number from the boundary result; `_refusal_message(result)` uses the boundary's own sentence. The module contains zero `sum(` and zero `len(`. **Conditions (1) and (2).**
+- `5324b367` feat(addendum): let the write boundary report its own verdict — `session/addendum.py` results now carry `attempted_chars`, `budget_chars`, `attempted_entries`, `max_entries`, `total_chars`, `message`; new `addendum_total_chars(session)` is the single char count; `notify=False` suppresses both enqueues. **Also condition (2): the HTTP layer never recomputes the budget math.**
+- `77354f78` test(addendum): write-through, live-chain and no-recompute coverage (+974 lines).
+
+Reviewer caveat: `4045ba39` and `5324b367` are mutually dependent (the route reads the new boundary fields; the boundary was reshaped for the route). They must be taken together — a bisect landing on `4045ba39` alone is not self-contained. Squash-merging the branch is fine.
+
+Evidence (all runs with `TMPDIR=/tmp`):
+
+- Targeted battery, 16 files: **170 passed, 1 xfailed**. Per file: `test_addendum_write_through.py` 17, `test_addendum_live_chain.py` 2, `test_addendum_routes.py` 8, `test_session_store.py` 38, addendum_{budget 6, drain 11, composition 12, schema 15, survival 1}, `test_permission_routes.py` 28 + 1 pre-existing xfail, bridge_{continue_session_config_log 2, load_session_workspace_scope 10, normalize_for_frontend 2, permissions_sync 5, stop_semantics 6}, `test_bridge_dedup.py` 7.
+- Broader sweep, `-k "session or addendum or bridge or persist or store"`: `tests/` → **923 passed, 9 skipped** (4688 deselected, 119.89s); `web_ui/backend/tests/` → **74 passed, 1 xfailed** (6.78s). Zero failures.
+- The fix commits do not touch the frontend. The baseline was measured rather than assumed: worktree 55 files / **697 tests** green (291.61s) vs main checkout 54 files / **692 tests** green (244.48s) — the delta is exactly the new addendum test file. (An earlier quoted baseline of 687/53 was stale and is hereby corrected.)
+- The tests are not vacuous — four negative verifications were run: reverting `_addendum_state` to a pass-through tuple fails `test_a1` with `KeyError: 'attempted_chars'`; monkeypatching `_bridge_lock` to `nullcontext()` fails `test_b7`; replacing `render_addendum_block` with `lambda s: ''` fails both live-chain tests; stripping `addendum` from `to_persistable_dict` fails both live-chain tests.
+- Condition (2) has its own provenance trio in `web_ui/backend/tests/test_addendum_write_through.py`: `test_a1_refusal_reports_the_boundarys_numbers_verbatim` replaces `write_addendum_entry` with a canned refusal (`attempted_chars: 1000001`, `budget_chars: 12345`, `attempted_entries: 3`, `max_entries: 424242`, `total_chars: 999999`) while posting text well under the real budget, then asserts the 409 echoes those numbers and that sentence verbatim — a route that recounted would emit its own length and its own wording; `test_a2_route_never_measures_the_submitted_text` injects a `str` subclass whose `__len__` raises, so any route-side measurement fails loudly (with a meta-assert that the poison was actually measured, so it cannot pass vacuously); `test_a3_route_module_never_sums_or_measures_text` greps `addendum_routes.__file__` for `sum(` and `len(`. Honest limitation: `test_addendum_routes.py` covers the refusal contract (status, caps, non-persistence) but would *not* detect a reintroduced recomputation — the provenance guarantee rests on the a1/a2/a3 trio.
+- Live-chain test, real/fake boundary: REAL `FileSystemSessionStore`, `Session`, `WebAgentBridge` (with the real `_session_state_lock` and real SessionManager) registered in the real `_active_tab_bridges`, real route coroutines, real `write_addendum_entry`, real `Agent.process_query` (composition at `agent.py:1217` `ensure_system_prompt` → `llm_client.py:201` → addendum appended at `llm_client.py:225-227` via `render_addendum_block` at `llm_client.py:128` → context at `agent.py:1334/1344` → outgoing request at `agent.py:1398`), real `bridge.save_session`. The ONLY fake is `agent.llm_client.stream_completion` (`llm_client.py:277`), which captures the outgoing `messages` list — the exact system string the model would have received. The agent is constructed BEFORE the POST, so only per-turn composition can deliver the entry; a stale read cannot pass the test.
+- Recovery path covered: write over budget → HTTP 409 carrying the boundary's own sentence plus `attempted_chars`/`budget_chars` → clear the addendum → the next write succeeds, in both the live and the cold-store cases.
+- Acceptance criteria: met. The full-chain test against a live session asserts the next turn's system string contains the text; the over-budget → clear → next-write-succeeds recovery test exists and passes.
 
 ## Related
 
