@@ -240,7 +240,9 @@ export default function WorkspaceSelector() {
                   key={ws.id}
                 >
                   <div className="gms-card-head">
-                    <h4 className="ws-card-title">{ws.label || ws.id}</h4>
+                    <h4 className="ws-card-title" title={ws.label || ws.id}>
+                      {ws.label || ws.id}
+                    </h4>
                     <span className={`ws-risk ${ws.allow_host_resources ? 'allow' : 'forbid'}`}>
                       Host: {ws.allow_host_resources ? 'allowed' : 'forbidden'}
                     </span>

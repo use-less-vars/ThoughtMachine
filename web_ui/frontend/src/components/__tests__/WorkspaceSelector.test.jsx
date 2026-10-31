@@ -460,4 +460,32 @@ describe('WorkspaceSelector', () => {
     const alert = await screen.findByRole('alert')
     expect(alert.textContent).toBe('Could not delete provider.')
   })
+
+  it('clamps a long workspace label inside the card and keeps the full text in title', async () => {
+    // workspace_registry derives the label from the folder basename and never
+    // truncates it, so the card must clamp it in CSS. One unbroken 64-char
+    // token is the worst case: it is the element's min-content width.
+    const longLabel = 'x'.repeat(64)
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/global/summary'
+          ? {
+              match: r.match,
+              value: jsonOk({
+                ...SUMMARY,
+                workspaces: [{ ...SUMMARY.workspaces[0], label: longLabel }, SUMMARY.workspaces[1]],
+              }),
+            }
+          : r
+      )
+    )
+    const { container } = render(<WorkspaceSelector />)
+
+    const title = await screen.findByRole('heading', { level: 4, name: longLabel })
+    expect(title).toHaveClass('ws-card-title')
+    // The heading is clipped, so the untruncated label must be reachable here.
+    expect(title).toHaveAttribute('title', longLabel)
+    // ...and the host badge sharing that flex row is still rendered.
+    expect(container.querySelector('.ws-card .ws-risk.allow').textContent).toBe('Host: allowed')
+  })
 })
