@@ -122,9 +122,10 @@ _INSTALL_BANNERS = (
 _HEALTH_TIMEOUT_S = 60.0
 _HEALTH_POLL_S = 1.0
 _START_LOG_TIMEOUT_S = 20.0
-# Bounded wait for ``<vault>/state/web_ui_token``: the backend writes it during
-# startup, which can race this process.  Never a skip -- a token that never
-# appears is a failure of the server under test.
+# Bounded wait for ``<vault>/state/web_ui_token``.  The token is NOT minted at
+# boot: the ingress gate writes it lazily, on the first non-exempt request (or
+# on ``GET /``).  Never a skip -- a token that never appears is a failure of the
+# server under test.
 _TOKEN_WAIT_TIMEOUT_S = 30.0
 _TOKEN_POLL_S = 0.25
 _TOOL_NAME = "DateTimeTool"
@@ -447,7 +448,30 @@ def _wait_health(url: str, timeout: float = _HEALTH_TIMEOUT_S) -> bool:
     return False
 
 
-def _vault_token(vault: Path, timeout: float = _TOKEN_WAIT_TIMEOUT_S) -> str:
+def _mint_token(base_url: str) -> None:
+    """Ask the backend for its app shell, which is what mints the token.
+
+    ``AuthBoundaryMiddleware`` resolves the secret *lazily*
+    (``auth_boundary.py:480-500``): booting the server writes nothing, and the
+    first request that needs the gate is what calls ``ensure_token``.  ``GET
+    /`` is the documented trigger -- it is in ``EXEMPT_PATHS`` and in
+    ``COOKIE_MINT_PATHS`` (``auth_boundary.py:175``, ``:197``, ``:607-618``), so
+    it mints without needing a credential.  Minting on demand here keeps the
+    wait independent of which request happened to arrive first.
+
+    Failures are swallowed: the caller's deadline owns the diagnosis, and a
+    backend still binding its port must not fail the request directly.
+    """
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5):
+            pass
+    except Exception:  # noqa: BLE001 - retried by the caller's loop
+        pass
+
+
+def _vault_token(
+    vault: Path, base_url: str | None = None, timeout: float = _TOKEN_WAIT_TIMEOUT_S
+) -> str:
     """Return the token the backend minted inside *vault*, retried until present.
 
     The location is composed from the server's own constants
@@ -460,6 +484,11 @@ def _vault_token(vault: Path, timeout: float = _TOKEN_WAIT_TIMEOUT_S) -> str:
     ``thoughtmachine.vault.vault_root()`` for *this* process, while the backend
     under test was handed ``THOUGHTMACHINE_VAULT_ROOT=<scratch vault>`` and a
     throwaway ``HOME``.  The vault the server was pointed at is the one to read.
+
+    *base_url* makes the wait independent of request ordering: the token is
+    minted lazily, so each pass asks the server for its shell
+    (:func:`_mint_token`) instead of relying on an earlier unauthenticated
+    request having armed the gate.
     """
     token_file = Path(vault) / _TOKEN_STATE_DIRNAME / _TOKEN_FILENAME
     deadline = time.monotonic() + timeout
@@ -470,6 +499,8 @@ def _vault_token(vault: Path, timeout: float = _TOKEN_WAIT_TIMEOUT_S) -> str:
             raise AssertionError(f"web UI token store is unusable: {exc}") from exc
         if token:
             return token
+        if base_url is not None:
+            _mint_token(base_url)
         if time.monotonic() >= deadline:
             raise AssertionError(
                 f"backend never wrote a usable web UI token at {token_file} within "
@@ -480,14 +511,16 @@ def _vault_token(vault: Path, timeout: float = _TOKEN_WAIT_TIMEOUT_S) -> str:
         time.sleep(_TOKEN_POLL_S)
 
 
-def _auth_headers(vault: Path) -> dict:
+def _auth_headers(vault: Path, base_url: str | None = None) -> dict:
     """The ``Authorization`` header the backend's ingress boundary requires."""
-    return {"Authorization": f"Bearer {_vault_token(vault)}"}
+    return {"Authorization": f"Bearer {_vault_token(vault, base_url)}"}
 
 
-def _http_post_json(url: str, payload: dict, vault: Path, timeout: float = 30.0):
+def _http_post_json(
+    url: str, payload: dict, vault: Path, timeout: float = 30.0, base_url: str | None = None
+):
     data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json", **_auth_headers(vault)}
+    headers = {"Content-Type": "application/json", **_auth_headers(vault, base_url)}
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -712,8 +745,10 @@ def _run_single_tool_turn(
     import websockets.sync.client as ws_client  # noqa: PLC0415 - optional dep, lazy import
 
     base_url = f"http://127.0.0.1:{backend_port}"
-    auth = _auth_headers(vault)
-    status, body = _http_post_json(f"{base_url}/api/session/create", {"mode": "custom"}, vault)
+    auth = _auth_headers(vault, base_url)
+    status, body = _http_post_json(
+        f"{base_url}/api/session/create", {"mode": "custom"}, vault, base_url=base_url
+    )
     assert status in (200, 201), f"session creation failed: {status} {body}"
     session_id = body.get("session_id")
     assert session_id, f"no session_id in create response: {body}"
