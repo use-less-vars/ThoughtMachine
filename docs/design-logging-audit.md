@@ -84,8 +84,12 @@ below); age-based retention (nothing in this module deletes by mtime); workspace
   `:1102-1105` *"No session scope on this call; refusing to return the global event
   log."* It reads a widened 500-line tail (`:1123`) and masks message bodies for display
   only (`_redact_event_body`, `:1058-1086`).
-- `web_ui/backend/health_routes.py:214` `entries = EventLogger.instance().get_tail(20)`,
-  returned as `recent_event_log_tail` (`:228-231`).
+- **No longer read by `web_ui/backend/health_routes.py`.** That route served
+  `EventLogger.instance().get_tail(20)` as `recent_event_log_tail` (`:214`, `:228-231`
+  before) until 2026-10-31, when the tail was deleted: one vault-global file has no
+  tail that can be scoped, and the route is now loopback-gated as well. See
+  `ticket-bug-health-route-event-log-tail-unscoped.md`. `check_system` is the only
+  process reader left.
 
 **Who starts/stops it:** `web_ui/backend/server.py:745-746` (`EventLogger()` /
 `.start()`), stopped at `:1060-1062`; per-worker buses attach at
@@ -390,7 +394,7 @@ retention behaviour of (a), (c) and the lifecycle streams.
 
 | file | writer | rotation | age deletion | size deletion | readers |
 |---|---|---|---|---|---|
-| `event_log.jsonl` (+`.1`) | (a) | 5 MB, 1 backup (`event_logger.py:81-90`) | collateral via (b) | none | `check_system` `event_log` query; `/health` tail |
+| `event_log.jsonl` (+`.1`) | (a) | 5 MB, 1 backup (`event_logger.py:81-90`) | collateral via (b) | none | `check_system` `event_log` query (session-scoped, bodies masked at render) |
 | `agent_<session>.jsonl` (+`.<ts>`) | (b) | 10 MB archive (`__init__.py:245-251`) | yes, `TM_LOG_MAX_AGE_DAYS` (`:635`) | yes, `TM_LOG_DIR_MAX_MB` (`:655`) | none found |
 | `agent_fallback.jsonl` | (b) fallback (`:265-269`) | none | yes (same sweep) | yes (matches `agent_*`) | none found |
 | `container_audit.log` (+3) | (c) | 10 MB × 3 (`audit_logger.py:112-117`) | collateral via (b) | none | none found |
@@ -398,10 +402,11 @@ retention behaviour of (a), (c) and the lifecycle streams.
 
 ### 3.3 Deletion decidability per sink
 
-- **(a) `EventLogger`** — *not* a free deletion. Two live readers must be replaced
-  first: `tools/workspace/check_system.py:1088` (agent-visible `event_log` query) and
-  `web_ui/backend/health_routes.py:214` (health payload). Nothing else depends on it;
-  the file has no other consumer.
+- **(a) `EventLogger`** — *not* a free deletion, but cheaper since 2026-10-31. One live
+  reader must be replaced first: `tools/workspace/check_system.py:1088` (agent-visible
+  `event_log` query). The second reader — the `/api/system/health` payload — was deleted
+  outright (`ticket-bug-health-route-event-log-tail-unscoped.md`). Nothing else depends on
+  it; the file has no other consumer.
 - **(b) `agent.logging`** — two separable halves. The *file* half has no reader found in
   code (§1.2) and is the only thing `_cleanup_old_logs` / `_prune_logs_by_size` exist
   for; the *console* half is the actual UI/CLI surface (`unified.log`, `:488-591`) and
@@ -617,8 +622,8 @@ Line-based count, comment-only lines and `def log(` / `def _log_event(` definiti
 | `logger.<level>(` | 11 | 0 | 14 | **25** |
 | `logging.getLogger(` | 10 | 0 | 5 | **15** |
 | `_log_event(` | 42 | 0 | 0 | **42** |
-| EventLogger reference lines | 5 | 0 | 10 | **15** |
-| **total** | **602** | **76** | **405** | **1083** |
+| EventLogger reference lines | 5 | 0 | 6 | **11** |
+| **total** | **602** | **76** | **401** | **1079** |
 
 Of the 986 `log(` sites, **963** resolve on one line to the literal form `log('<LEVEL>', '<tag>', …)`, in **141 (file, level, tag) groups**:
 
@@ -634,7 +639,7 @@ Of the 986 `log(` sites, **963** resolve on one line to the literal form `log('<
 
 420 + 220 + 195 + 125 + 2 + 1 = 963. The remaining **23** `log(` sites are not same-line-literal and are handled individually in §5.5.
 
-> Footnote on precision: a second counting pass with the same regex reported `logger.<level>(` as 33 rather than 25, which would move the grand total to 1091. The discrepancy was not resolved and does not change any marking (all of those sites are `unclear` either way). Treat the `logger.*` row and the 1083 total as correct-to-±8, not as a point estimate.
+> Footnote on precision: a second counting pass with the same regex reported `logger.<level>(` as 33 rather than 25, which would move the grand total to 1087. The discrepancy was not resolved and does not change any marking (all of those sites are `unclear` either way). Treat the `logger.*` row and the 1079 total as correct-to-±8, not as a point estimate.
 
 ### 5.3 Group rules
 
@@ -715,7 +720,7 @@ Tag splits:
 
 ### 5.4 EventLogger — zero emission call sites
 
-There are **zero** `EventLogger(...).emit(...)` call sites anywhere in these three trees. The 15 EventLogger reference lines (§5.2) are the implementation itself (`agent/logging/event_logger.py`, 5), reads in `web_ui/backend/health_routes.py` (4) and construction/reads in `web_ui/backend/server.py` (6). Sink (a) emissions arrive over the event bus, not through a direct `emit()` call. Consequence: there are no emit rows to mark, and **there is no `emit()` call site to attach redaction to** — §2 has to hook the bus subscriber, not the callers.
+There are **zero** `EventLogger(...).emit(...)` call sites anywhere in these three trees. The 11 EventLogger reference lines (§5.2) are the implementation itself (`agent/logging/event_logger.py`, 5) and construction/reads in `web_ui/backend/server.py` (6); `web_ui/backend/health_routes.py` held 4 more until 2026-10-31, when its `get_tail(20)` payload was deleted (`ticket-bug-health-route-event-log-tail-unscoped.md`), leaving that file with none. Sink (a) emissions arrive over the event bus, not through a direct `emit()` call. Consequence: there are no emit rows to mark, and **there is no `emit()` call site to attach redaction to** — §2 has to hook the bus subscriber, not the callers.
 
 ### 5.5 Individual rows (not group-covered)
 
@@ -732,13 +737,13 @@ There are **zero** `EventLogger(...).emit(...)` call sites anywhere in these thr
 
 **`_log_event(` sites: 42 — all delete.** 41 in `agent/logging/__init__.py` are the body of sink (b) itself (the per-event-type writers reached from `_write_jsonl`), and 1 is the forwarding hop `unified.py:580`. Deleting sink (b)'s file half (§3) deletes all 42 by construction; none of them is independently observable.
 
-**EventLogger references: 15 — all keep.** Sink (a) is read: `tools/workspace/check_system.py:1088` and `web_ui/backend/health_routes.py:214` (`EventLogger.instance().get_tail(20)`). Kept as one group, count 15.
+**EventLogger references: 11 — all keep.** Sink (a) is read: `tools/workspace/check_system.py:1088` (`EventLogger.instance().file_path`, `:1107-1108` — the query then reads the file itself). Kept as one group, count 11.
 
 ### 5.6 Arithmetic
 
 ```
-1083 sites    = 986 log(  +  25 logger.*  +  15 getLogger(  +  42 _log_event(  +  15 EventLogger refs
-    per dir    = 986 (534+76+376) + 25 (11+14) + 15 (10+5) + 42 (42+0+0) + 15 (5+0+10)
+1079 sites    = 986 log(  +  25 logger.*  +  15 getLogger(  +  42 _log_event(  +  11 EventLogger refs
+    per dir    = 986 (534+76+376) + 25 (11+14) + 15 (10+5) + 42 (42+0+0) + 11 (5+0+6)
 
 986 log(      = 963 group-covered (141 (file, level, tag) groups) + 23 individual + 0 remainder
 963 literal   = 420 DEBUG + 220 WARNING + 195 INFO + 125 ERROR + 2 EXCEPTION + 1 CRITICAL
@@ -746,16 +751,16 @@ There are **zero** `EventLogger(...).emit(...)` call sites anywhere in these thr
 marking tally
   agent/           134 keep + 440 delete +  28 unclear =  602
   llm_providers/    11 keep +  65 delete +   0 unclear =   76
-  web_ui/backend/  216 keep + 152 delete +  37 unclear =  405
+  web_ui/backend/  212 keep + 152 delete +  37 unclear =  401
   ---------------------------------------------------------------
-                  361 keep + 657 delete +  65 unclear = 1083   ✓
+                  357 keep + 657 delete +  65 unclear = 1079   ✓
 ```
 
-Composition of the tally: keep 361 = 346 `R-K` WARNING/ERROR/CRITICAL + 15 EventLogger refs. Delete 657 = 615 `R-D`/`R-I` DEBUG+INFO + 42 `_log_event`. Unclear 65 = 2 `R-X` EXCEPTION + 23 non-literal `log(` + 25 `logger.*` + 15 `logging.getLogger(`.
+Composition of the tally: keep 357 = 346 `R-K` WARNING/ERROR/CRITICAL + 11 EventLogger refs. Delete 657 = 615 `R-D`/`R-I` DEBUG+INFO + 42 `_log_event`. Unclear 65 = 2 `R-X` EXCEPTION + 23 non-literal `log(` + 25 `logger.*` + 15 `logging.getLogger(`.
 
-Nothing is dropped: 361 + 657 + 65 = 1083, which is the sum of the components in §5.2.
+Nothing is dropped: 357 + 657 + 65 = 1079, which is the sum of the components in §5.2.
 
 ### 5.7 What this implies for Wave 0
 
-**361 keep / 657 delete / 65 unclear of 1083** — 61% of every logging ingress in the product is deletable with no loss of any information anyone currently receives, and the deletions are mechanical: two level filters (`R-D`, `R-I`) and one module (`sink (b)`'s file half, which takes its own 42 `_log_event` sites with it). Wave 0 should therefore be sequenced as (i) delete the DEBUG/INFO surface and the file half of sink (b), which is where the bulk and all of the redaction cost live, then (ii) audit the surviving 346 `R-K` warnings against the duplicate criterion — that is the only judgement-heavy work left, and it is 32% of the original corpus rather than all of it.
+**357 keep / 657 delete / 65 unclear of 1079** — 61% of every logging ingress in the product is deletable with no loss of any information anyone currently receives, and the deletions are mechanical: two level filters (`R-D`, `R-I`) and one module (`sink (b)`'s file half, which takes its own 42 `_log_event` sites with it). Wave 0 should therefore be sequenced as (i) delete the DEBUG/INFO surface and the file half of sink (b), which is where the bulk and all of the redaction cost live, then (ii) audit the surviving 346 `R-K` warnings against the duplicate criterion — that is the only judgement-heavy work left, and it is 32% of the original corpus rather than all of it.
 

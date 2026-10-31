@@ -12,7 +12,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -176,12 +177,53 @@ def _collect_sessions_from_store() -> list[dict]:
     return sessions
 
 
-# ── Endpoints ───────────────────────────────────────────────────────────────
+# -- Local-caller gate -------------------------------------------------------
+#
+# /api/system/health exposes vault-global operator state (the running-worker
+# registry and the open sessions).  It is an operator endpoint and must never be
+# reachable from another host.  This duplicates
+# web_ui/backend/server.py::_localhost_only -- duplicated rather than imported
+# because server.py imports this module, so importing back into it is circular.
+_LOCAL_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# In-process ASGI test-harness address.  Starlette's TestClient puts
+# ``scope["client"] = ("testclient", 50000)`` on every request it builds; the
+# name is not resolvable or routable over any network, so real traffic can
+# never carry it.  Mirrors server.py's constant of the same name.
+_TEST_HARNESS_CLIENT_HOSTS = frozenset({"testclient"})
+
+
+def _localhost_only(request: Request) -> Optional[JSONResponse]:
+    """Return a 403 response when *request* did not come from a local caller.
+
+    ``request.client`` is ``None`` when the ASGI server cannot report a peer
+    address; that is treated as NOT local (fail closed).  The caller's address
+    is deliberately never echoed in the response body.
+    """
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    if host is not None and (
+        host in _LOCAL_CLIENT_HOSTS or host in _TEST_HARNESS_CLIENT_HOSTS
+    ):
+        return None
+    return JSONResponse({"error": "localhost only"}, status_code=403)
+
+
+# ── Endpoints ───────────────────────────────────────────────────────────────────
 
 
 @router.get("/health")
-async def system_health(workspace: Optional[str] = Query(None)):
-    """Aggregate system state: workers, sessions, and recent event log.
+async def system_health(
+    request: Request,
+    workspace: Optional[str] = Query(None),
+):
+    """Aggregate system state: running workers and active sessions.
+
+    Local callers only (see ``_localhost_only``): the payload is vault-global
+    operator state, not per-caller state.  The event log is deliberately NOT
+    part of this payload -- one vault-global file is shared by every session
+    and workspace, so there is no safe way to render a tail here; callers use
+    ``CheckSystem(query="event_log")``, which is session scoped.
 
     Parameters
     ----------
@@ -189,6 +231,10 @@ async def system_health(workspace: Optional[str] = Query(None)):
         If provided, only return workers/sessions whose workspace path
         contains this string (simple substring match).
     """
+    denied = _localhost_only(request)
+    if denied is not None:
+        return denied
+
     # 1. running_workers — from filesystem status.json files
     running_workers = _collect_workers_from_fs()
     if workspace:
@@ -205,28 +251,7 @@ async def system_health(workspace: Optional[str] = Query(None)):
             if workspace in s.get("workspace", "")
         ]
 
-    # 3. recent_event_log_tail — from EventLogger (filesystem)
-    event_log_entries: list[dict] = []
-    event_log_note: Optional[str] = None
-    try:
-        from agent.logging.event_logger import EventLogger
-
-        entries = EventLogger.instance().get_tail(20)
-        if entries:
-            event_log_entries = entries
-        else:
-            event_log_note = (
-                f"Event log is empty or not found at "
-                f"{EventLogger.instance().file_path}"
-            )
-    except Exception as exc:
-        event_log_note = f"EventLogger unavailable: {exc}"
-
     return {
         "running_workers": running_workers,
         "active_sessions": active_sessions,
-        "recent_event_log_tail": {
-            "entries": event_log_entries,
-            "note": event_log_note,
-        },
     }

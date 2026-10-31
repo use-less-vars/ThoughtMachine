@@ -186,7 +186,7 @@ Adjudicated subset (25 of 81). **Un-adjudicated remainder is listed in §5.2b an
 | `POST /api/container-records/{record_id}/restart` (`server.py:5186`) | container | scoped by convention — same optional `workspace_id` | `_record_user_action` `web_ui/backend/server.py:5187` | NONE |
 | `POST /api/container-records/{record_id}/recreate` (`server.py:5194`) | container | scoped by convention — same optional `workspace_id` | `_record_user_action` `web_ui/backend/server.py:5195` | NONE |
 | `GET /api/container-records` (`container_record_routes.py:130`) | container | scoped by convention — record listing; scope is whatever the manager was constructed with | UNOWNED (file-level: `web_ui/backend/container_record_routes.py`) | NONE |
-| `GET /api/system/health` (`health_routes.py:182`) | worker | scoped by convention — the health payload carries worker status; session scoping is a query concern † | UNOWNED (file-level: `web_ui/backend/health_routes.py`) | `test_session_scoped_worker_status` `tests/test_health_endpoint.py:111`; `test_session_scoped_fallback_session_id` `tests/test_health_endpoint.py:137` |
+| `GET /api/system/health` (`health_routes.py:215`) | worker | scoped by convention — gated to loopback peers (`_localhost_only` `:196`), which is a transport control, not a workspace control; the payload carries worker status and session ids only, no event-log content † | UNOWNED (file-level: `web_ui/backend/health_routes.py`) for the worker-status scoping; transport gate `_localhost_only` `web_ui/backend/health_routes.py:196` | `test_session_scoped_worker_status` `tests/test_health_endpoint.py:108`; `test_session_scoped_fallback_session_id` `tests/test_health_endpoint.py:134`; `test_remote_client_is_refused` `tests/test_system_health_local_only.py:139`; `test_remote_client_cannot_reach_workers_or_sessions` `tests/test_system_health_local_only.py:149`; `test_payload_has_no_event_log_content` `tests/test_system_health_local_only.py:195` |
 | `GET /health` (`server.py:3892`) | worker | scoped by convention — the route is gated to localhost, which is a transport control, not a workspace control † | `health` `web_ui/backend/server.py:3893` | NONE |
 | `GET /api/global/summary` (`global_routes.py:322`) | vault | not scoped — one-shot snapshot of *registered workspaces, open sessions and containers*, i.e. all of them | UNOWNED (file-level: `web_ui/backend/global_routes.py`) | NONE |
 | `GET /api/credentials` (`global_routes.py:390`) | vault | not scoped — global credential names; names only, never values | `list_credentials` `web_ui/backend/global_routes.py:391` | NONE |
@@ -222,7 +222,7 @@ Lane coverage is thin **because the tool classes are not enumerable by declarati
 | `set_project` | `ticket-bug-ws-set-project-bypasses-vault-confinement.md` |
 | `security_response` | `ticket-bug-ws-security-response-allows-anonymous-escalation.md` |
 | `create_session` (`POST /api/session/create`) | `ticket-bug-create-session-drops-workspace-id.md` |
-| `/health`, `/api/system/health` | `ticket-bug-health-route-running-workers-bypasses-check-system.md` |
+| `/health`, `/api/system/health` | `ticket-bug-health-route-running-workers-bypasses-check-system.md`, `ticket-bug-health-route-event-log-tail-unscoped.md` |
 | `CheckSystem running_workers` | `ticket-bug-checksystem-running-workers-global-leak.md` — **† withdrawn**: the row's premise is stale as of `d45cebb03`, see F15 |
 | `CheckSystem vault_status`, `GET /api/vault/status` | `ticket-bug-checksystem-vault-status-cross-tenant-leak.md`, `ticket-bug-checksystem-vault-status-issues-unscoped.md` |
 | `CheckSystem event_log` | `ticket-bug-checksystem-event-log-cross-session-leak.md`, `ticket-bug-event-log-global-no-workspace-scope.md` |
@@ -272,7 +272,7 @@ Recorded as `UNOWNED` rows above; this is the count and the reason for each:
 | Entry point | Why no function-level owner |
 |---|---|
 | `GET /api/container-records` (`container_record_routes.py:130`) | route body delegates to a module-level API; the scoping decision is not in a single named function I could point at |
-| `GET /api/system/health` (`health_routes.py:182`) | the payload is assembled across helpers; the worker-status scoping is not localised to one function |
+| `GET /api/system/health` (`health_routes.py:215`) | the payload is assembled across helpers; the worker-status scoping is not localised to one function — the loopback gate added in W3-T1 is a single function (`_localhost_only` `:196`), the payload assembly still is not |
 | `GET /api/global/summary` (`global_routes.py:322`) | same — a summary builder spanning registries |
 | Worker registry key (spawn/stop/reset/sweep) | the key is constructed at several call sites in `tools/workspace/worker_registry.py`; the defect is the *absence* of a field, which has no owner line |
 | `git_read`/`git_write` repo boundary | tool classes are not enumerable by declaration regex in this tree (§4(a)); I did not locate the class |
