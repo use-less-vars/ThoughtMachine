@@ -333,3 +333,17 @@ web_ui/frontend/.npmrc
 !docs/windows_stability_contract.md
 !docs/worker_smoke_checklist.md
 .worktrees/
+
+# Internal audit working documents -- deliberately NOT published to docs/.
+# These nine untracked files are under a pending tier ruling; named explicitly
+# (belt-and-braces on top of the `docs/*` catch-all) so no later `!docs/...`
+# negation above can re-include them.
+/docs/audit-worker-core.md
+/docs/audit/sprint_audit.md
+/docs/backend-audit.md
+/docs/design-input-auth-layer-prerequisite.md
+/docs/frontend-audit.md
+/docs/frontend-state-qa.md
+/docs/system-map.md
+/docs/xray/backend_runtime.md
+/docs/xray/frontend.md
