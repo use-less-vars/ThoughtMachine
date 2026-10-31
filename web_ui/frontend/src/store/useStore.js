@@ -23,6 +23,12 @@
  *   - sessionDrafts: per-session ConfigPanel draft with unsaved edits
  *     ({ [sessionId]: draft }), written by ConfigPanel so unsaved changes
  *     survive tab switches that unmount the panel.
+ *   - addendumEntries: per-session addendum entries keyed by entry_id
+ *     ({ [sessionId]: { [entryId]: entry } }), written from the
+ *     'addendum_updated' runtime event. Keying by entry_id is what makes a
+ *     duplicate or out-of-order event converge instead of duplicating.
+ *   - runtimeNotices: per-session Tier-2 notices for REJECTED addendum writes
+ *     ({ [sessionId]: [{ level, code, message }] }).
  *
  * SessionTab does not keep status/history/tokens/config in local useState —
  * it subscribes via useStore selectors, and the WS event handlers in this
@@ -62,6 +68,8 @@ const initialState = {
   sessionStates: {},       // { [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } }
   sessionErrors: {},        // { [sessionId]: last error message string }
   sessionDrafts: {},        // { [sessionId]: ConfigPanel draft with unsaved edits (survives tab unmount) }
+  addendumEntries: {},      // { [sessionId]: { [entryId]: { id, ts, source, text, pinned } } }
+  runtimeNotices: {},       // { [sessionId]: [{ level, code, message }] }
   permissionDefaults: {},   // safe defaults served by GET /api/permission-defaults (single owner: backend)
 }
 
@@ -112,7 +120,7 @@ const useStore = create((set) => ({
       }
     }),
 
-  // Full purge — must touch all 8 slices defined in initialState.
+  // Full purge — must touch every per-session slice in initialState.
   removeSession: (sessionId) =>
     set((state) => {
       // Destructure-rest: drop the session's entries from ALL per-session slices
@@ -124,6 +132,8 @@ const useStore = create((set) => ({
       const { [sessionId]: _removedMode, ...sessionModes } = state.sessionModes
       const { [sessionId]: _removedRunning, ...tabRunningStates } = state.tabRunningStates
       const { [sessionId]: _removedDraft, ...sessionDrafts } = state.sessionDrafts
+      const { [sessionId]: _removedAddendum, ...addendumEntries } = state.addendumEntries
+      const { [sessionId]: _removedNotices, ...runtimeNotices } = state.runtimeNotices
       return {
         sessionConfigs,
         sessionMessages,
@@ -132,6 +142,8 @@ const useStore = create((set) => ({
         sessionModes,
         tabRunningStates,
         sessionDrafts,
+        addendumEntries,
+        runtimeNotices,
         sessions: state.sessions.filter((s) => s.session_id !== sessionId),
       }
     }),
@@ -303,6 +315,42 @@ const useStore = create((set) => ({
           tokensIn: payload?.input ?? 0,
           tokensOut: payload?.output ?? 0,
         },
+      },
+    })),
+
+  // Tier-1 addendum write notification (design doc §7.3). D-6 requires every
+  // client arm to converge on the same display for duplicate and out-of-order
+  // arrival, so this MERGES the payload's FULL resulting entry set into a map
+  // keyed by entry_id instead of appending: a repeat writes the same keys, and
+  // a late-arriving older set cannot resurrect evicted entries by position.
+  // `entry_id`/`ts`/`source` ride along on the event but the authoritative
+  // list is `entries`, so they are not stored separately.
+  receiveAddendumUpdated: (sessionId, payload) =>
+    set((state) => {
+      const merged = { ...(state.addendumEntries[sessionId] || {}) }
+      for (const entry of payload?.entries || []) {
+        // Entries are { id, ts, source, text, pinned }; skip anything without
+        // an id rather than inventing a key that could collide.
+        if (entry && entry.id) merged[entry.id] = entry
+      }
+      return { addendumEntries: { ...state.addendumEntries, [sessionId]: merged } }
+    }),
+
+  // Tier-2 notice for a REJECTED addendum write. Appended (not overwritten) so
+  // consecutive rejections stay visible; the message alone is useless without
+  // its code, so both are kept.
+  receiveRuntimeNotice: (sessionId, payload) =>
+    set((state) => ({
+      runtimeNotices: {
+        ...state.runtimeNotices,
+        [sessionId]: [
+          ...(state.runtimeNotices[sessionId] || []),
+          {
+            level: payload?.level || 'warning',
+            code: payload?.code || '',
+            message: payload?.message || '',
+          },
+        ],
       },
     })),
 

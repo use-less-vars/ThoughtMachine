@@ -395,6 +395,24 @@ class Agent:
         # Mailbox pattern: pending config update to be applied at next process_query()
         self._pending_config: Optional[AgentConfig] = None
         self._last_config_error: Optional[str] = None
+        # Tier 1 (ruling D-5): addendum writes are queued here and drained at the
+        # per-stream-event poll, so a mid-turn write reaches the UI between tokens
+        # instead of waiting for the turn boundary. The queue is exposed on the
+        # session so the write boundary (session/addendum.py) can enqueue without
+        # holding this Agent; it is NOT persisted -- Session.to_persistable_dict
+        # lists its keys explicitly, so the session file shape is unchanged.
+        # Imported here, not at module scope: ``session/models.py`` imports
+        # ``agent.core.message``, which imports this package, so a module-level
+        # ``session.addendum`` import would close a cycle for anyone who imports
+        # ``session.models`` first (e.g. tests/test_addendum_schema.py).
+        from session.addendum import AddendumQueue
+
+        self._addendum_queue = AddendumQueue()
+        if session is not None:
+            try:
+                session.addendum_queue = self._addendum_queue
+            except Exception as e:
+                log('WARNING', 'core.agent', f'could not attach the addendum queue to the session: {e}')
 
     def should_halt(self) -> bool:
         """
@@ -414,6 +432,24 @@ class Agent:
         except Exception as e:
             log('WARNING', 'core.agent', f'halt_check raised, treating as no halt: {e}')
             return False
+
+    def _drain_addendum_queue(self):
+        """Yield every queued Tier-1 addendum notification exactly once.
+
+        Called from the stream loop immediately after the halt poll and before
+        the event-type ladder, so it runs on EVERY stream event -- text and
+        reasoning deltas, tool calls, ``Done`` and ``Interrupted`` alike -- and
+        always *between* ``__anext__`` calls, which is the only window a
+        synchronous consumer has (ruling D-5, design doc §7.2).
+
+        ``AddendumQueue.drain`` pops, so a payload is delivered at most once
+        even if this is called again later in the same turn. The payloads are
+        runtime-channel dicts (design doc §7.3), never ``StreamEvent``s: they
+        are re-yielded verbatim and never enter the ladder below.
+        """
+        for payload in self._addendum_queue.drain():
+            log('DEBUG', 'core.addendum', f"draining addendum event: {payload.get('type')}")
+            yield payload
 
     def request_config_update(self, new_config: AgentConfig):
         """
@@ -1380,6 +1416,12 @@ class Agent:
                             log('DEBUG', 'core.pause', f'[HALT] hard stop requested mid-stream (turn={turn})')
                             halted = True
                             break
+                        # Tier 1 drain (ruling D-5): fires on EVERY stream event,
+                        # including the Done and Interrupted terminals below,
+                        # because it sits before the type ladder opens. Between
+                        # __anext__ calls is the only window a sync loop has.
+                        for _addendum_event in self._drain_addendum_queue():
+                            yield _addendum_event
                         if isinstance(stream_event, TextDelta):
                             content += stream_event.text or ''
                             yield {'type': 'text_delta', 'text': stream_event.text, 'turn': self._display_turn}
