@@ -62,6 +62,7 @@ The full resolution chain:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -500,6 +501,13 @@ class WebAgentBridge:
         self._worker_event_buffer: List[Dict[str, Any]] = []
         self._worker_event_buffer_max = 100
         self._worker_event_buffer_lock = threading.Lock()
+
+        # Serialises whole-session persistence against live-state mutation
+        # (the addendum REST routes): a snapshot taken while a route mutates
+        # the live Session could otherwise be written after that route's own
+        # save and silently drop the accepted entry.  Re-entrant so a caller
+        # that already holds it can persist without deadlocking.
+        self._session_state_lock = threading.RLock()
 
         # Track last known controller busy state for state_changed is_running
         self._last_state_busy: Optional[bool] = None
@@ -2231,10 +2239,11 @@ class WebAgentBridge:
             persist_dump = self._config_dump_for_persistence()
             if session is None:
                 # Fallback when no session is active — build from existing session data
-                session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
+                loaded = self._loaded_session
+                session_id = loaded.session_id if loaded else str(uuid.uuid4())
                 session = Session(
                     session_id=session_id,
-                    user_history=list(self._loaded_session.user_history) if self._loaded_session else [],
+                    user_history=list(loaded.user_history) if loaded else [],
                     workspace_id=self._workspace_id,
                     metadata={
                         'session_config': (
@@ -2246,6 +2255,19 @@ class WebAgentBridge:
                         'source': 'web_ui',
                     }
                 )
+                # Carry the persisted session state that is NOT derivable from
+                # ``user_history``.  Rebuilding from history alone produced a
+                # Session with the DEFAULT (empty) addendum, and the save below
+                # then wrote that empty addendum over the stored one -- so an
+                # operator entry accepted by the addendum REST endpoint (or one
+                # written by the store's cold-path atomic mutation) was wiped by
+                # this end-of-turn save.  ``summary`` sits in the same position:
+                # it is session state, not conversation history.  Both are
+                # deep-copied so the saved Session never aliases the loaded
+                # one's dicts.
+                if loaded is not None:
+                    session.summary = copy.deepcopy(loaded.summary)
+                    session.addendum = copy.deepcopy(loaded.addendum)
             else:
                 # Update existing session metadata
                 session.metadata.setdefault('session_config', {})
@@ -2267,8 +2289,13 @@ class WebAgentBridge:
                 session.metadata['name'] = self._loaded_session.metadata['name']
             session.ensure_name()
 
-            # Delegate save to SessionManager
-            self._session_manager.save_session(session, session_config=None, name=None)
+            # Delegate save to SessionManager.  Snapshot + write happen under
+            # the same lock the addendum routes take before mutating the live
+            # Session (see _session_state_lock): without it, a route that
+            # mutates the live object between this snapshot and this write
+            # would have its accepted entry overwritten by the stale copy.
+            with self._session_state_lock:
+                self._session_manager.save_session(session, session_config=None, name=None)
 
             self._loaded_session = session
 
