@@ -632,6 +632,32 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
       }
 
+      case 'addendum_updated': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] addendum_updated for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Tier-1 addendum write (design doc §7.3, ruling D-6). The payload
+        // carries entry_id/ts plus the FULL resulting entry set, so the store
+        // merges by entry_id: a duplicate or out-of-order event overwrites the
+        // same keys and converges on the same display instead of replaying a
+        // diff. Stored only - rendering the addendum is a later slice.
+        useStore.getState().receiveAddendumUpdated(msg.session_id || currentSessionIdRef.current, msg)
+        break
+      }
+
+      case 'runtime_notice': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] runtime_notice for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Tier-2 notice for a REJECTED addendum write (design doc §7.3). Stored
+        // next to the entries so the rejection is visible rather than silent;
+        // no render here (the addendum panel is a later slice).
+        useStore.getState().receiveRuntimeNotice(msg.session_id || currentSessionIdRef.current, msg)
+        break
+      }
+
       case 'conversation_changed':
         if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
           console.warn('[SessionTab] conversation_changed for different session, ignoring:', msg.session_id)

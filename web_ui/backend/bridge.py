@@ -3166,6 +3166,34 @@ class WebAgentBridge:
                 "turn": raw_event.get("turn", 0),
             })
 
+        elif event_type == "addendum_updated":
+            # Tier-1 addendum write notification emitted by session/addendum.py
+            # (design doc §7.3). It is a runtime-channel dict, so it needs its
+            # own arm here rather than riding a StreamEvent. Like every arm
+            # above the payload is hand-built (whitelist), and it carries the
+            # FULL resulting entry set together with entry_id/ts so the client
+            # can merge by entry_id and converge on duplicate or out-of-order
+            # arrival (ruling D-6) without replaying a diff.
+            self._forwarder.broadcast(self._session_id, "addendum_updated", {
+                "session_id": self._session_id or raw_event.get("session_id", ""),
+                "entry_id": raw_event.get("entry_id", ""),
+                "ts": raw_event.get("ts"),
+                "source": raw_event.get("source", ""),
+                "entries": raw_event.get("entries", []),
+            })
+
+        elif event_type == "runtime_notice":
+            # Tier-2 notice for a REJECTED addendum write (design doc §7.3):
+            # UI-only, warning level, whitelisted payload. Nothing is rendered
+            # or decided here - the frontend stores it next to the addendum
+            # entries so the rejection is visible instead of silent.
+            self._forwarder.broadcast(self._session_id, "runtime_notice", {
+                "session_id": self._session_id or raw_event.get("session_id", ""),
+                "level": raw_event.get("level", "warning"),
+                "code": raw_event.get("code", ""),
+                "message": raw_event.get("message", ""),
+            })
+
         elif event_type == "interrupted":
             # A hard stop truncated the stream. The agent already committed the
             # partial assistant text to the session (so the version sync above
