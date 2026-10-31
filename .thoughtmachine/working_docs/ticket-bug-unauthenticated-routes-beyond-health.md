@@ -64,3 +64,27 @@ Not gated (no peer check anywhere on the path):
 Reachability therefore rests on `_validate_bind_host` (`server.py:4036`, called once from `main()` at `server.py:6224`) — a start-up check on the *listen address*, not a per-request check on the *caller*. It is waived by `--allow-remote-bind`, and it is transparent to any reverse proxy / port-forward / container network / `ssh -L` tunnel that re-originates a remote connection from a loopback peer.
 
 Recorded in `docs/workspace_isolation_matrix.md` §5.5 (new table) and §7 F17. **Not fixed by W3** (out of the residual scope: it is an authentication boundary, not a workspace-scoping one), and the sweep deliberately does not adjudicate authorisation — see §5.5's scope-limits paragraph.
+
+---
+
+## Correction (2026-10-31) — the tree has more checks than the R3 update says, and the residual is narrower
+
+Appended after a later read of the same tree (`dev = 6e01a004`). Nothing above is rewritten; where this section disagrees with it, this section is what was read out of the code. **The correction does not close the ticket** — the unauthenticated-caller finding stands, smaller than filed.
+
+**1. There is an `Origin` guard on every mutating route, and on the socket.**
+- 38 of the 39 mutating HTTP routes (POST 24 / DELETE 7 / PUT 6 / PATCH 2) call `_origin_check_request` (`web_ui/backend/origin_policy.py:86`), which refuses a foreign `Origin`/`Referer` with 403.
+- The 39th, `POST /api/vault/repair/apply`, calls the stricter `_origin_allowed` (`origin_policy.py:69`) at `vault_repair_routes.py:87`; `GET /api/vault/repair/status` does the same at `:45`.
+- The `WS /ws` handshake validates `Origin` **before** `accept()` (`server.py:1266-1269`, via `websocket_origin_allowed` `origin_policy.py:56-66`), rejecting with close 1008.
+- Exactly 3 surfaces peer-gate (`server.py:4073`, `:5910`, `health_routes.py:234`).
+
+**2. So the residual is three things, not "no gate anywhere".**
+- (i) **42 of the 45 GET routes carry no origin guard** — the exceptions are `GET /api/browse` (`server.py:3901`), `GET /api/{session_id}/addendum` (`addendum_routes.py:318`) and `GET /api/vault/repair/status` (`vault_repair_routes.py:45`). Intersecting with the 3 peer-gated GETs leaves **39 of 45 GETs with neither check**.
+- (ii) **No `Host` validation anywhere** (0 hits for a `Host` read, `TrustedHostMiddleware`, `Sec-Fetch-*`). That is what makes DNS rebinding the live bypass: a rebound page is same-origin with the host it dials, so its `GET`s arrive with no `Origin` and are answered, while its mutations carry a foreign `Origin` and are refused. The guard protects the write half, not the read half — and the read half is where the machine-wide inventory (`/api/global/summary`), `/api/session/list` and `/api/credentials` live.
+- (iii) **The GET half has no structural enforcement.** The mutating half does: `tests/integration/test_origin_guard_enumeration.py` AST-enumerates every route, asserts each non-GET route calls `_origin_check_request` or is pinned in `STRICT_ORIGIN_NON_GET`, and cross-checks that enumeration against `app.openapi()`. GETs are deliberately exempt (`FILESYSTEM_GET_MUST_GUARD` is a must-cover list, not an only-list, `:302-304`), so an unguarded GET fails no test.
+
+**3. Arithmetic.** 85 decorators = **84 HTTP** + **1 WS**. "82 of the 85 route decorators plus the whole `/ws` command surface" (R3 sweep update, paragraph 1) reads as though `/ws` were outside the 85 — it is `server.py:1260`, one of them. Ungated HTTP = **81**; ungated surfaces = 81 + `/ws` = **82 of 85**. "82 of 85 routes" is right; "82 of 85 *HTTP* routes" (`docs/workspace_isolation_matrix.md` §5.5 and F17) is not, and has been corrected there.
+
+**4. Honest limit.** All of the above is a code read plus greps, not a probe: no DNS-rebinding attempt was run against a listening server, so (ii) is a property of the code ("no check exists, the bypass is available in principle"), not a reproduced exploit.
+
+Cross-references: `docs/workspace_isolation_matrix.md` §7a (the same correction in evidence shape), `ticket-bug-origin-predicate-disagreement.md` (the two predicates behind these guards disagree about a *missing* header, which is a functional defect rather than a hole), `docs/design-auth-boundary.md` §10.
+
