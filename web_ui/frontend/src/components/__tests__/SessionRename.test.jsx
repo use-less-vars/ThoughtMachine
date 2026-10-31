@@ -351,12 +351,17 @@ describe('App session rename — tab title updates immediately', () => {
     })
 
     // Page reload: fresh App mount; the persisted strip (renamed title +
-    // activeSessionId) must be restored and open_sessions must NOT clobber it.
+    // activeSessionId) must be restored. The reload's open_sessions carries an
+    // EMPTY name (a session the server has no name for), so R1's reconciliation
+    // branch (`else if (s.name)`) cannot run and the renamed label can ONLY come
+    // from localStorage -- this is what makes the assertion discriminating.
+    // A server name that DISAGREES with the persisted title would WIN; that case
+    // is covered by SessionTabsTitleReconcile.test.jsx.
     cleanup()
     MockWebSocket.instances = []
     render(<App />)
     const hub2 = await connectHub()
-    await seedStrip(hub2, TWO_SESSIONS)  // carries the OLD names S1/S2
+    await seedStrip(hub2, TWO_SESSIONS.map(({ session_id, workspace_id }) => ({ session_id, workspace_id, name: '' })))
 
     await waitFor(() => {
       const bar = tabBar()

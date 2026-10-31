@@ -335,7 +335,13 @@ describe('App session tab strip — open_sessions restore', () => {
     await act(async () =>
       hub.receive({
         type: 'open_sessions',
-        sessions: TWO_SESSIONS.map(({ session_id, name }) => ({ session_id, name })),
+        // EMPTY names: R1's reconciliation branch (`else if (s.name)`) cannot
+        // run, so the restored labels below can ONLY come from localStorage --
+        // that is what makes "the persisted strip is restored" non-vacuous.
+        sessions: [
+          { session_id: 'sess-1', name: '' },
+          { session_id: 'sess-2', name: '' },
+        ],
       })
     )
 
@@ -374,7 +380,13 @@ describe('App session tab strip — open_sessions restore', () => {
     await act(async () =>
       hub2.receive({
         type: 'open_sessions',
-        sessions: TWO_SESSIONS.map(({ session_id, name }) => ({ session_id, name })),
+        // EMPTY names: R1's reconciliation branch (`else if (s.name)`) cannot
+        // run, so the restored labels below can ONLY come from localStorage --
+        // that is what makes "the persisted strip is restored" non-vacuous.
+        sessions: [
+          { session_id: 'sess-1', name: '' },
+          { session_id: 'sess-2', name: '' },
+        ],
       })
     )
     await waitFor(() => {

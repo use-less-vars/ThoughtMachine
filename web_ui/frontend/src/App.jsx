@@ -477,9 +477,12 @@ export default function App() {
             } else if (s.name) {
               // Tab already exists (e.g. opened early by route-driven
               // activation before the hub knew its name) — fill an EMPTY
-              // title, but never clobber a persisted/user-set one.
+              // title, and correct a STALE one: the server-side name is
+              // authoritative, so a persisted title that no longer matches it
+              // is repaired here (an out-of-band rename never reaches this
+              // strip otherwise).
               const existing = entry.tabs.find(t => t.sessionId === s.session_id)
-              if (existing && !existing.title) st.setTabTitle(ws, s.session_id, s.name)
+              if (existing && existing.title !== s.name) st.setTabTitle(ws, s.session_id, s.name)
             }
           })
           // Legacy migration: no persisted tm.sessionTabs.<ws> state, but a

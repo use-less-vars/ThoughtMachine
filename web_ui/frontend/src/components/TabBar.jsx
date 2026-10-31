@@ -46,7 +46,7 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
             onClick={() => onSelectTab(tab.id)}
             title={tab.name}
           >
-            <span className="tab-label">{tab.name}</span>
+            <span className="tab-label">{tab.name || 'Untitled'}</span>
             <button
               className="tab-close-btn"
               onClick={(e) => {
