@@ -30,11 +30,31 @@ from pathlib import Path
 import httpx
 import pytest
 
+# The credential store is imported rather than re-derived: the token path and its
+# parsing live in ``web_ui/backend/auth_token.py``, so this suite follows the
+# server's own definition of "where the token is" and "what the token is".
+from web_ui.backend.auth_token import STATE_DIRNAME as _TOKEN_STATE_DIRNAME
+from web_ui.backend.auth_token import TOKEN_FILENAME as _TOKEN_FILENAME
+from web_ui.backend.auth_token import read_token as _read_token
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_DIR = REPO_ROOT / "web_ui" / "frontend"
 VITE_BIN = FRONTEND_DIR / "node_modules" / "vite" / "bin" / "vite.js"
 
 _HEALTH_TIMEOUT_S = 60.0
+
+# Bounded wait for ``<vault>/state/web_ui_token``.  The token is NOT minted at
+# boot: the ingress gate writes it lazily, on the first non-exempt request (or
+# on ``GET /``).  Never a skip -- a token that never appears is a failure of the
+# server under test.
+_TOKEN_WAIT_TIMEOUT_S = 30.0
+_TOKEN_POLL_S = 0.25
+
+#: Subdirectory of the throwaway ``HOME`` the backend under test is pointed at.
+#: ``_backend_env`` hands the server ``THOUGHTMACHINE_VAULT_ROOT=<HOME>/.thoughtmachine``
+#: (see ``thoughtmachine/vault.py:29-39``), so the vault the server writes its
+#: token into is that subdirectory -- not the HOME itself.
+_VAULT_SUBDIR = ".thoughtmachine"
 
 
 def pytest_addoption(parser):
@@ -87,17 +107,92 @@ def _wait_http_ok(url: str, timeout: float = _HEALTH_TIMEOUT_S) -> None:
     raise TimeoutError(f"timed out waiting for {url} (last error: {last_error!r})")
 
 
+def _vault_root(vault: str) -> Path:
+    """The ``THOUGHTMACHINE_VAULT_ROOT`` the backend under test was handed."""
+    return Path(vault) / _VAULT_SUBDIR
+
+
 def _backend_env(vault: str, port: int) -> dict:
     """Environment for a backend subprocess: isolated vault, no API keys."""
     env = {
         **os.environ,
         "HOME": vault,
-        "THOUGHTMACHINE_VAULT_ROOT": str(Path(vault) / ".thoughtmachine"),
+        "THOUGHTMACHINE_VAULT_ROOT": str(_vault_root(vault)),
         "PORT": str(port),
     }
     for key in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_COMPATIBLE_API_KEY"):
         env.pop(key, None)
     return env
+
+
+def _mint_token(base_url: str) -> None:
+    """Ask the backend for its app shell, which is what mints the token.
+
+    ``AuthBoundaryMiddleware`` resolves the secret *lazily*
+    (``auth_boundary.py:480-500``): booting the server writes nothing, and the
+    first request that needs the gate is what calls ``ensure_token``.  The
+    documented trigger is ``GET /`` -- an exempt path listed in
+    ``COOKIE_MINT_PATHS`` (``auth_boundary.py:197``, ``:607-618``), whose
+    response carries the session cookie.  Hitting it turns "read a token that
+    no one has written yet" into a bounded wait rather than a hang.
+
+    Failures are swallowed: the caller's deadline owns the diagnosis, and a
+    backend that is still binding its port must not fail the request
+    directly.
+    """
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5):
+            pass
+    except Exception:  # noqa: BLE001 - retried by the caller's loop
+        pass
+
+
+def _vault_token(
+    vault: str, base_url: str | None = None, timeout: float = _TOKEN_WAIT_TIMEOUT_S
+) -> str:
+    """Return the token the backend minted inside *vault*, retried until present.
+
+    The location is composed from the server's own constants
+    (``web_ui/backend/auth_token.py``: ``STATE_DIRNAME`` / ``TOKEN_FILENAME`` ->
+    ``<vault>/state/web_ui_token``, where ``<vault>`` is this suite's
+    ``THOUGHTMACHINE_VAULT_ROOT`` = ``<HOME>/.thoughtmachine``) and the value is
+    parsed by the server's own
+    ``read_token`` (which strips whitespace and fails closed on a broken store),
+    so this suite cannot drift from the real credential store.
+
+    ``token_path()`` is deliberately not used: it resolves through
+    ``thoughtmachine.vault.vault_root()`` for *this* process, while the backend
+    under test was handed ``THOUGHTMACHINE_VAULT_ROOT=<scratch vault>`` and a
+    throwaway ``HOME``.  The vault the server was pointed at is the one to read.
+
+    *base_url* is optional but practically required against a real backend:
+    the token is minted lazily, so each pass of the wait loop first asks the
+    server for its shell (:func:`_mint_token`) and then re-reads the file.
+    """
+    token_file = _vault_root(vault) / _TOKEN_STATE_DIRNAME / _TOKEN_FILENAME
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            token = _read_token(token_file)
+        except RuntimeError as exc:  # unusable store: fail closed, do not retry
+            raise AssertionError(f"web UI token store is unusable: {exc}") from exc
+        if token:
+            return token
+        if base_url is not None:
+            _mint_token(base_url)
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"backend never wrote a usable web UI token at {token_file} within "
+                f"{timeout:.0f}s (file {'blank' if token == '' else 'absent'}). "
+                "Every non-exempt API path and /ws requires 'Authorization: Bearer "
+                "<token>', so there is no unauthenticated fallback to fall back to."
+            )
+        time.sleep(_TOKEN_POLL_S)
+
+
+def _auth_headers(vault: str, base_url: str | None = None) -> dict:
+    """The ``Authorization`` header the backend's ingress boundary requires."""
+    return {"Authorization": f"Bearer {_vault_token(vault, base_url)}"}
 
 
 def _start_backend(vault: str, port: int) -> subprocess.Popen:
@@ -182,7 +277,7 @@ def e2e_backend():
     of being leaked.
     """
     vault = tempfile.mkdtemp(prefix="e2e_vault_")
-    (Path(vault) / ".thoughtmachine").mkdir(parents=True, exist_ok=True)
+    _vault_root(vault).mkdir(parents=True, exist_ok=True)
     port = _free_port(8000)
     state = {
         "base_url": f"http://127.0.0.1:{port}",
@@ -235,6 +330,20 @@ def e2e_frontend(e2e_backend):
 
 
 @pytest.fixture(scope="session")
+def e2e_auth_headers(e2e_backend):
+    """``Authorization`` header dict for the real backend under test.
+
+    Every non-exempt API path (and ``/ws``) requires ``Authorization: Bearer
+    <token>`` where the token is the one the backend minted into its own
+    ``<vault>/state/web_ui_token``; tests that build their own ``httpx``
+    clients pass this dict as ``headers=``.  Session scoped because the token
+    file is never regenerated, not even by the ``restart_backend`` fixture
+    (it restarts against the same vault).
+    """
+    return _auth_headers(e2e_backend["vault"], e2e_backend["base_url"])
+
+
+@pytest.fixture(scope="session")
 def workspace(e2e_backend):
     """Create a purpose=research workspace inside the e2e vault."""
     ws_root = Path(e2e_backend["vault"]) / "e2e_ws"
@@ -242,6 +351,7 @@ def workspace(e2e_backend):
     resp = httpx.post(
         f"{e2e_backend['base_url']}/api/workspace",
         json={"path": str(ws_root), "purpose": "research"},
+        headers=_auth_headers(e2e_backend["vault"], e2e_backend["base_url"]),
         timeout=30,
     )
     assert resp.status_code in (200, 201), (

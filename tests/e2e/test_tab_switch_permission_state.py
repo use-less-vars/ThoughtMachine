@@ -81,7 +81,9 @@ def _network_select(page):
     return page.locator("label", has_text="Network").locator("..").locator("select").first
 
 
-def test_tab_switch_permission_state(page, e2e_frontend, e2e_backend, workspace):
+def test_tab_switch_permission_state(
+    page, e2e_frontend, e2e_backend, workspace, e2e_auth_headers
+):
     import httpx
 
     base_url = e2e_frontend["base_url"]
@@ -89,7 +91,7 @@ def test_tab_switch_permission_state(page, e2e_frontend, e2e_backend, workspace)
     backend_url = e2e_backend["base_url"]
 
     # ── Create two sessions via the backend REST API ─────────────────────
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=30, headers=e2e_auth_headers) as client:
         resp_a = client.post(
             f"{backend_url}/api/session/create",
             json={"name": SESSION_A_NAME, "workspace_id": ws_id, "mode": "custom"},
@@ -131,7 +133,12 @@ def test_tab_switch_permission_state(page, e2e_frontend, e2e_backend, workspace)
              {"session_id": sid_a}),
         ):
             try:
-                r = httpx.get(backend_url + path, params=params, timeout=10)
+                r = httpx.get(
+                    backend_url + path,
+                    params=params,
+                    headers=e2e_auth_headers,
+                    timeout=10,
+                )
                 lines.append(f"{label}: {r.status_code} {r.text[:400]}")
             except Exception as exc:
                 lines.append(f"{label}: ERR {exc}")
