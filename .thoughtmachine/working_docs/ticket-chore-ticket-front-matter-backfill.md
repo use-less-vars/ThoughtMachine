@@ -24,6 +24,20 @@ measured partition was 192 files — 10 closed, 3 superseded, 143 open, 36 with 
 - The scrape is *ordering-sensitive* in a way prose invites: an unanchored match on `fixed` buckets
   `filed, not fixed` as closed. The classifier had to be anchored to be correct — that is a
   hand-rolled parser standing in for a field.
+- **The unscrapeable set is 40 of 197, not 36** (measured 2026-10-31, Gen 55 onboarding). The 36
+  figure counts only files with **no `Status:` line at all**. Four more carry a line a naive scrape
+  still cannot read, because the value is **bolded or a phrase**:
+  `**CLOSED 2026-10-29** …` (checkSystem runtime version), `**RESOLVED by read at 9d5ed869** …`
+  (worker spawn-context contradiction), `**fix implemented** on branch …` (worker panel payload
+  drop), `**recorded, NOT fixed** …` (eventbus subscribe returns None). A
+  `^\*\*Status:\*\*\s*(\w+)` match skips all four — the character after the colon is `*`, not a
+  word character — and misfiles them as `stale`. That is the whole gap: a strict run partitions 197
+  as **8 / 3 / 146 / 40**, while the correct reading is **10 / 3 / 148 / 36**.
+- The rule that is correct: capture **to the end of the line**, strip a leading `*`, then take the
+  **leading** word. `CLOSED` and `RESOLVED` then bucket closed, `fix` and `recorded` bucket open —
+  and `recorded, NOT fixed` stays **open**, because the *first* word decides, not the last. That is
+  the same bug as the unanchored `fixed` above, from the other side: a status that is prose instead
+  of a field cannot be read by position.
 - The dashboard now carries an explicit "Interim snapshot" paragraph admitting exactly this, and
   naming the backfill as queued. **This ticket is that queue entry.**
 
