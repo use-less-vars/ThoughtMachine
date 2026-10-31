@@ -58,6 +58,28 @@ def _generate_friendly_filename(session_id: str, session_name: str) -> str:
     return f"{sanitized}_{short_id}.json"
 
 
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Write *data* as JSON to *path* atomically (temp file + ``os.replace``).
+
+    The payload is first written to ``<name>.tmp`` in the SAME directory as the
+    target, then swapped in with :func:`os.replace`, which is atomic on POSIX: a
+    concurrent reader (another process, or a reader in this one) sees either the
+    complete old file or the complete new one, never a half-written one.  Any
+    failure removes the temp file, so a crash cannot leave a stale ``.tmp`` next
+    to a good session file.
+    """
+    temp_path = path.with_suffix('.tmp')
+    os.makedirs(os.path.dirname(str(temp_path)), exist_ok=True)
+    try:
+        with open(temp_path, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(str(temp_path), str(path))
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
 class SessionStore(ABC):
     """Abstract base class for session storage."""
 
@@ -290,16 +312,15 @@ class FileSystemSessionStore(SessionStore):
             'updated_at': session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else session.updated_at,
             'preview': preview,
         }
-        temp_path = meta_path.with_suffix('.tmp')
-        try:
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-            with open(temp_path, 'w') as f:
-                json.dump(meta, f)
-            temp_path.replace(meta_path)
-        except Exception:
-            if temp_path.exists():
-                temp_path.unlink()
-            raise
+        # Same guarantee as the session file itself: swapped in with os.replace
+        # while holding the file lock, so a concurrent reader (the sidebar
+        # listing sessions) can never see a torn meta file.  The lock is on the
+        # META path, which is a different path from the session payload --
+        # callers must never nest two locks on the SAME path (session/lock.py:
+        # a FileLock is re-entrant only per instance, so a second instance on
+        # the same path blocks until the 10s timeout).
+        with FileLock(str(meta_path)):
+            _atomic_write_json(meta_path, meta)
 
     def save_session(self, session: Session, workspace_id: Optional[str] = None) -> None:
         """Save a session to a JSON file.
@@ -413,16 +434,13 @@ class FileSystemSessionStore(SessionStore):
             shutil.move(str(old_path), str(new_path))
 
         # Write the session data atomically via temp file
-        temp_path = new_path.with_suffix('.tmp')
-        logger.debug(f"[SessionStore] Writing to {temp_path} (atomic)")
+        logger.debug(f"[SessionStore] Writing to {new_path} (atomic)")
         # Ensure the target directory exists BEFORE acquiring the file lock,
         # because FileLock also creates a .lock file in the same directory.
-        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+        os.makedirs(os.path.dirname(str(new_path)), exist_ok=True)
         try:
             with FileLock(str(new_path)):
-                with open(temp_path, 'w') as f:
-                    json.dump(data, f, indent=2, default=str)
-                temp_path.replace(new_path)
+                _atomic_write_json(new_path, data)
             logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
             # Invalidate path cache so subsequent _find_session_path re-scans
             self._invalidate_path_cache(session.session_id)
@@ -430,9 +448,84 @@ class FileSystemSessionStore(SessionStore):
             self._save_session_metadata(session, workspace_id=workspace_id)
         except Exception:
             # Clean up temp file on failure
+            temp_path = new_path.with_suffix('.tmp')
             if temp_path.exists():
                 temp_path.unlink()
             raise
+
+    def _read_session_file(self, path: Path) -> dict:
+        """Read + parse one session JSON file.
+
+        Callers MUST already hold the ``FileLock`` for *path*: this is the
+        unlocked half of :meth:`load_session`, factored out so that a
+        read-modify-write can happen under ONE lock instead of two -- a second
+        ``FileLock`` instance on the same path in one process blocks until the
+        10s timeout (``session/lock.py``), so nesting is never an option.
+        """
+        with open(path, 'r') as f:
+            data = json.load(f)
+        if 'metadata' in data and 'external_file_path' in data['metadata']:
+            del data['metadata']['external_file_path']
+        return data
+
+    def mutate_session(self, session_id: str, mutator, workspace_id: Optional[str] = None):
+        """Atomic read-modify-write of ONE stored session (the cold path).
+
+        This is the store-side half of the addendum write-through resolver: when
+        no live tab bridge holds the session in memory, a write must still not be
+        lost, so the caller hands a *mutator* to the store rather than doing
+        ``load_session`` + ``save_session`` (two lock acquisitions, with a window
+        between them in which another writer's change can be overwritten).
+
+        Args:
+            session_id: The session to change.
+            mutator: ``callable(session) -> (result, should_write)``.  It is
+                given the freshly loaded session, mutates it in place and
+                returns an opaque ``result`` for the caller plus whether the
+                session must be persisted.  ``should_write=False`` leaves the
+                file untouched (a refused write persists nothing).
+            workspace_id: Optional workspace scope for the path lookup, exactly
+                as :meth:`load_session`.
+
+        Returns:
+            ``(session, result)``, or ``(None, None)`` when the session does not
+            exist.
+
+        The whole read -> mutate -> replace runs while holding ONE ``FileLock``
+        on the resolved session path, and the rewrite goes through
+        :func:`_atomic_write_json` (temp file + ``os.replace``), so a concurrent
+        reader sees the old file or the new one and never a partial write.  The
+        lock spans the read AND the write, which is what makes the mutation
+        atomic: it can never be built on a read that another writer has since
+        superseded, and two concurrent mutations serialise instead of losing one
+        another's entry.
+
+        The on-disk format is unchanged: the payload is
+        ``Session.to_persistable_dict()``, the same dict :meth:`save_session`
+        writes (minus that method's workspace redirect, rename and size-bounding
+        steps, none of which an in-place addendum mutation needs).
+        """
+        path = self._find_session_path(session_id, workspace_id=workspace_id)
+        if path is None or not path.exists():
+            return None, None
+        with FileLock(str(path)):
+            try:
+                data = self._read_session_file(path)
+            except Exception as exc:
+                logger.error(
+                    f"[SessionStore] Error reading session {session_id} for mutation: {exc}")
+                return None, None
+            session = Session.from_persistable_dict(data)
+            result, should_write = mutator(session)
+            if should_write:
+                session.updated_at = datetime.now()
+                _atomic_write_json(path, session.to_persistable_dict())
+        self._invalidate_path_cache(session_id)
+        self._cached_list = None
+        if should_write:
+            self._save_session_metadata(
+                session, workspace_id=workspace_id or session.workspace_id)
+        return session, result
 
     def load_session(self, session_id: str, workspace_id: Optional[str] = None) -> Optional[Session]:
         """Load a session from a JSON file.
@@ -459,11 +552,7 @@ class FileSystemSessionStore(SessionStore):
             return None
         try:
             with FileLock(str(path)):
-                with open(path, 'r') as f:
-                    data = json.load(f)
-            # Remove external_file_path from metadata if present (legacy concept)
-            if 'metadata' in data and 'external_file_path' in data['metadata']:
-                del data['metadata']['external_file_path']
+                data = self._read_session_file(path)
             session = Session.from_persistable_dict(data)
             # Backward compat: populate workspace_id from metadata.workspace_path for legacy sessions
             if session.workspace_id is None and session.metadata.get('workspace_path'):
