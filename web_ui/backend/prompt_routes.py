@@ -12,7 +12,6 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from web_ui.backend.origin_policy import _origin_check_request
 
 router = APIRouter(prefix="/api/prompts")
 
@@ -99,8 +98,6 @@ async def save_prompt(request: Request, filename: str, body: dict):
 
     Request body must contain a ``content`` key with the file content.
     """
-    if not _origin_check_request(request, route_name="save_prompt"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     content = body.get("content")
     if content is None:
         raise HTTPException(
@@ -122,8 +119,6 @@ async def save_prompt(request: Request, filename: str, body: dict):
 @router.delete("/{filename}")
 async def delete_prompt(request: Request, filename: str):
     """Delete a prompt file."""
-    if not _origin_check_request(request, route_name="delete_prompt"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     path = _resolve_filename(filename)
     if not path.exists():
         raise HTTPException(

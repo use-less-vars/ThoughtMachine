@@ -65,7 +65,6 @@ from session.models import normalize_addendum
 
 from web_ui.backend import session_routes
 from web_ui.backend.event_forwarder import _active_tab_bridges
-from web_ui.backend.origin_policy import _origin_check_request
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
@@ -315,8 +314,6 @@ async def get_session_addendum(request: Request, session_id: str) -> Dict[str, A
     Read-only.  A live session is read off the object the model is reading, not
     off disk, so a client never sees a set the next turn will not see.
     """
-    if not _origin_check_request(request, route_name="get_session_addendum"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         _store, _bridges, session = _resolve_addendum_session(session_id)
         return {**_addendum_state(session), "session_id": session_id}
@@ -351,8 +348,6 @@ async def post_session_addendum(
     UNCHANGED set read back off the session (the boundary reports an empty list
     on a drop) and nothing is persisted.
     """
-    if not _origin_check_request(request, route_name="post_session_addendum"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         store, bridges, _session = _resolve_addendum_session(session_id)
 
@@ -402,8 +397,6 @@ async def delete_session_addendum(
     ``{status: 'cleared', entries: [], total_chars: 0, budget_chars,
     max_entries, session_id}``.
     """
-    if not _origin_check_request(request, route_name="delete_session_addendum"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         store, bridges, _session = _resolve_addendum_session(session_id)
 

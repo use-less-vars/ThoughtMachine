@@ -30,7 +30,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -42,7 +42,6 @@ from tools.host_resource_policy import workspace_allows_host_resources
 from agent.config.provider_profile import ProviderManager
 from agent.events import EventType, create_event, global_event_bus
 
-from web_ui.backend.origin_policy import _origin_check_request
 
 logger = logging.getLogger(__name__)
 
@@ -423,8 +422,6 @@ def list_credentials():
 @router.post("/credentials")
 def upsert_credential(request: Request, payload: CredentialPayload):
     """Create or update a global credential; 400 on invalid names."""
-    if not _origin_check_request(request, route_name="upsert_credential"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     name = (payload.name or "").strip()
     error = _validate_credential_name(name)
     if error:
@@ -443,8 +440,6 @@ def upsert_credential(request: Request, payload: CredentialPayload):
 @router.delete("/credentials/{name}")
 def delete_credential(request: Request, name: str):
     """Delete a global credential; idempotent (missing credentials still 200)."""
-    if not _origin_check_request(request, route_name="delete_credential"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     name = (name or "").strip()
     error = _validate_credential_name(name)
     if error:

@@ -113,6 +113,22 @@ def _build_app() -> FastAPI:
     def secret_write():
         return {"written": True}
 
+    # The two vault-repair verbs, so the strict-origin prefix has a surface to
+    # be strict about.  Adding routes here does not weaken
+    # ``test_exempt_set_is_the_documented_list``, which pins the exemption set
+    # rather than the route table.
+    @app.get("/api/vault/repair/status")
+    def vault_repair_status():
+        return {"findings": []}
+
+    @app.post("/api/vault/repair/apply")
+    def vault_repair_apply():
+        return {"applied": []}
+
+    @app.post("/api/config/mode")
+    def set_config_mode():
+        return {"mode": "chat"}
+
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket):
         await websocket.accept()
@@ -468,6 +484,51 @@ def test_absent_origin_is_allowed_because_the_credential_follows(client):
     with_token = client.get("/api/secret", headers={"authorization": f"Bearer {TOKEN}"})
     assert with_token.status_code == 200
     assert client.get("/api/secret").status_code == 401
+
+
+# ── 5b. the vault repair keeps the strict origin predicate ─────────────────
+
+
+def test_absent_origin_is_refused_on_vault_repair_apply_with_a_credential(client):
+    """``STRICT_ORIGIN_PATH_PREFIXES`` refuses the bare POST before step 5.
+
+    Same client, same credential, same absent ``Origin`` that is accepted on
+    ``/api/secret`` above -- refused here, and refused with the *origin* error
+    rather than the credential one, so the decision is demonstrably step 4's.
+    """
+    response = client.post(
+        "/api/vault/repair/apply", headers={"authorization": f"Bearer {TOKEN}"}
+    )
+    assert response.status_code == 403
+    assert response.json() == {"error": "untrusted origin"}
+
+
+def test_absent_origin_is_refused_on_vault_repair_status(client):
+    """Both verbs under the prefix are strict, not just the mutating one."""
+    response = client.get(
+        "/api/vault/repair/status", headers={"authorization": f"Bearer {TOKEN}"}
+    )
+    assert response.status_code == 403
+    assert response.json() == {"error": "untrusted origin"}
+
+
+def test_absent_origin_falls_through_to_the_credential_gate_elsewhere(client):
+    """The strict set is a set: every other route keeps the lenient allowance."""
+    response = client.post("/api/config/mode", headers={"authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 200
+    assert response.json() != {"error": "untrusted origin"}
+
+
+def test_foreign_origin_is_refused_on_every_vault_repair_verb(client):
+    for method, path in (
+        ("get", "/api/vault/repair/status"),
+        ("post", "/api/vault/repair/apply"),
+    ):
+        response = getattr(client, method)(
+            path, headers={"origin": FOREIGN_ORIGIN, "authorization": f"Bearer {TOKEN}"}
+        )
+        assert response.status_code == 403, path
+        assert response.json() == {"error": "untrusted origin"}, path
 
 
 # ── 6. WebSockets are refused before accept ─────────────────────────────────

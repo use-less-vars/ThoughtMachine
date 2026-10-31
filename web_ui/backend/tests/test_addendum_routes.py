@@ -35,6 +35,12 @@ from web_ui.backend.server import app
 
 client = TestClient(app)
 
+#: The same app, but with a REAL peer address instead of the harness name
+#: ``testclient``: the boundary honours that name only while the suite's
+#: harness-trust flag is on, so a test that must see the gate refuse has to
+#: arrive from a peer that is not the harness.
+gated_client = TestClient(app, client=("127.0.0.1", 51234))
+
 SID = "sess-addendum-001"
 WS = "ws-addendum-a"
 
@@ -357,12 +363,14 @@ def test_g_unknown_session_404_and_foreign_origin_403(vault, stub_store):
     # The origin check runs FIRST: an unknown session behind a foreign Origin is
     # refused as an origin problem, not reported as a missing session.
     for resp in (
-        client.get(url(missing), headers=FOREIGN_ORIGIN),
-        client.post(url(missing), json={"text": TEXT}, headers=FOREIGN_ORIGIN),
-        client.delete(url(missing), headers=FOREIGN_ORIGIN),
+        gated_client.get(url(missing), headers=FOREIGN_ORIGIN),
+        gated_client.post(url(missing), json={"text": TEXT}, headers=FOREIGN_ORIGIN),
+        gated_client.delete(url(missing), headers=FOREIGN_ORIGIN),
     ):
         assert resp.status_code == 403
-        assert resp.json()["detail"] == "origin not permitted"
+        # The boundary's refusal shape (the per-route guard's "origin not
+        # permitted" detail is gone with the guard).
+        assert resp.json()["error"] == "untrusted origin"
 
 
 # ---------------------------------------------------------------------------

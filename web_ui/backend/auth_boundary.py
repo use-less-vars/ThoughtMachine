@@ -5,8 +5,7 @@ at the boundary: *is this caller allowed to drive the agent?*  It had four
 partial answers, each about a different thing:
 
 * ``local_gate.localhost_only`` -- did the request arrive from this machine?
-* ``origin_policy`` + the 39 per-route ``_origin_check_request`` calls -- which
-  web page is the browser on?
+* ``origin_policy``, invoked per route -- which web page is the browser on?
 * the CORS middleware -- which dev-server origins may read the response?
 * the ``--allow-remote-bind`` warning -- a printed sentence, not a check.
 
@@ -22,8 +21,8 @@ enumerating ``server.app.routes``.
 Order of checks (each one is cheap and each one can only refuse)
 ---------------------------------------------------------------
 0. **Peer address.**  The caller must *be* this machine.  This is
-   ``local_gate.localhost_only`` -- imported, not restated, so the boundary and
-   the per-route health gates cannot disagree about what "local" means.
+   ``local_gate.localhost_only`` -- imported, not restated, so there is exactly
+   one definition of "local" in this product.
 1. **Proxy shape.**  A request carrying ``Forwarded``, ``X-Forwarded-For``,
    ``X-Forwarded-Host`` or ``X-Real-IP`` is refused outright, before anything
    else reads the scope.  Nothing in this product proxies to the Web UI, so
@@ -54,9 +53,13 @@ Order of checks (each one is cheap and each one can only refuse)
    check, never the credential: a request that carries one still faces steps 4
    and 5, so a rebinding page pointed at ``http://testserver`` is refused by its
    foreign ``Origin`` like any other.
-4. **Origin.**  Reuses :func:`web_ui.backend.origin_policy._origin_check_request`
-   -- the same predicate the 39 REST guards already use -- so the boundary and
-   the routes can never disagree about what "same site" means.
+4. **Origin.**  Applies, once and for every route, the predicate the per-route
+   guards used to apply individually --
+   :func:`web_ui.backend.origin_policy._origin_check_request` -- so "same site"
+   is decided in one place instead of being restated on each route.  One small
+   surface keeps the stricter
+   :func:`web_ui.backend.origin_policy._origin_allowed` it had before this
+   boundary: see :data:`STRICT_ORIGIN_PATH_PREFIXES`.
 5. **Credential.**  Either the session cookie (an HMAC derived from the token,
    so the cookie never carries the bearer secret, *and* an issue time the MAC
    covers, so the cookie can expire -- see the lifetime bullet below) or
@@ -75,10 +78,15 @@ Deliberate decisions worth arguing with
   and it is only sound while something else authenticates the caller: a
   browser cannot present the credential without the cookie, and the cookie is
   ``SameSite=Strict``.  The stricter ``origin_policy._origin_allowed`` (absent
-  -> refuse) was rejected here for a concrete reason: browsers omit ``Origin``
-  on same-origin subresource GETs, so refusing it would break the frontend this
-  boundary is meant to protect, and it would break the CLI (which sends a
-  bearer token and no ``Origin``) with no security gain.
+  -> refuse) was rejected as the *general* rule for a concrete reason: browsers
+  omit ``Origin`` on same-origin subresource GETs, so refusing it would break the
+  frontend this boundary is meant to protect, and it would break the CLI (which
+  sends a bearer token and no ``Origin``) with no security gain.  It is not
+  rejected everywhere: :data:`STRICT_ORIGIN_PATH_PREFIXES` names the one surface
+  that keeps it -- the filesystem-mutating vault repair, which was guarded with
+  ``_origin_allowed`` before this boundary existed, whose callers are not a
+  browser subresource fetch, and where "no ``Origin`` at all" is itself a
+  decision to refuse rather than to fall back on the credential.
 * **The in-process test harness is trusted only when a flag says so.**
   Starlette's ``TestClient`` puts ``scope["client"] = ("testclient", 50000)``
   on every request, and the pre-existing suite drives the real app through it
@@ -127,7 +135,7 @@ from starlette.websockets import WebSocket
 
 from web_ui.backend import auth_token
 from web_ui.backend.local_gate import TEST_HARNESS_CLIENT_HOSTS, localhost_only
-from web_ui.backend.origin_policy import _origin_check_request
+from web_ui.backend.origin_policy import _origin_allowed, _origin_check_request
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +180,18 @@ EXEMPT_PATHS = frozenset(
 #: references.  A prefix (unlike a path) cannot be confused with an API route,
 #: because every API path in this app starts with ``/api``.
 EXEMPT_PREFIXES = ("/assets/",)
+
+#: Path prefixes that keep the *strict* origin predicate rather than the default
+#: lenient one.  :func:`web_ui.backend.origin_policy._origin_allowed` refuses a
+#: request carrying neither ``Origin`` nor ``Referer``;
+#: :func:`web_ui.backend.origin_policy._origin_check_request` -- the rule
+#: everywhere else, see the module docstring -- allows that case through for
+#: non-browser clients.  Only the filesystem-mutating vault repair is listed:
+#: it was guarded with the strict predicate before this boundary existed, so
+#: keeping it strict here is what makes this a move of the existing decision
+#: rather than a quiet loosening of it.  Everything else is guarded by the
+#: credential that follows, which no bare ``curl`` can supply.
+STRICT_ORIGIN_PATH_PREFIXES = ("/api/vault/repair/",)
 
 #: Exempt paths on which a ``GET`` mints the session cookie.
 COOKIE_MINT_PATHS = frozenset({"/"})
@@ -496,8 +516,8 @@ class AuthBoundaryMiddleware:
         connection = connection_for(scope, receive, send)
 
         # 0. Peer address.  ``local_gate.localhost_only`` is the one definition
-        #    of "this machine" -- imported rather than restated, so the boundary
-        #    and the per-route health gates cannot drift apart.  Its refusal
+        #    of "this machine" -- imported rather than restated, so this gate and
+        #    every other caller of ``local_gate`` cannot drift apart.  Its refusal
         #    (403, ``{"error": "localhost only"}``) is reused verbatim.
         peer_refusal = localhost_only(connection)
         if peer_refusal is not None:
@@ -551,9 +571,16 @@ class AuthBoundaryMiddleware:
             await self._serve_exempt(scope, receive, send)
             return
 
-        # 4. Origin -- the predicate the REST guards use, so the two layers
+        # 4. Origin -- the predicate the REST guards used, so the two layers
         #    cannot drift.  See the module docstring on the absent-Origin case.
-        if not _origin_check_request(connection, "auth_boundary"):
+        #    The vault-repair surface keeps the stricter predicate it was
+        #    guarded with (see STRICT_ORIGIN_PATH_PREFIXES).
+        origin_ok = (
+            _origin_allowed(connection)
+            if path.startswith(STRICT_ORIGIN_PATH_PREFIXES)
+            else _origin_check_request(connection, "auth_boundary")
+        )
+        if not origin_ok:
             await self._refuse(scope, send, FORBIDDEN, {"error": "untrusted origin"})
             return
 
