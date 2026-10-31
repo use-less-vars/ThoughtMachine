@@ -226,6 +226,7 @@ from web_ui.backend.local_gate import (
     TEST_HARNESS_CLIENT_HOSTS as _TEST_HARNESS_CLIENT_HOSTS,
     localhost_only as _localhost_only,
 )
+from web_ui.backend.auth_boundary import AuthBoundaryMiddleware
 from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.addendum_routes import router as addendum_router
 from web_ui.backend.prompt_routes import router as prompt_router
@@ -1202,13 +1203,35 @@ else:
 # Whether --serve-frontend was requested (set in main())
 _SERVE_FRONTEND = False
 
+# ── Authentication boundary ────────────────────────────────────────────────
+# ONE ingress gate for every HTTP request and WebSocket handshake: Host
+# validation, the exemption set, the origin predicate and the credential live
+# in ``web_ui/backend/auth_boundary.py`` (the policy and the ordering are
+# documented there).  Nothing is added per route, so a new route is protected
+# by construction.
+#
+# ORDER MATTERS.  ``add_middleware`` PREPENDS, so the middleware added LAST is
+# the OUTERMOST one.  This registration is deliberately placed BEFORE the CORS
+# registration below: CORS must stay outermost so that a preflight (which
+# carries no credentials by specification) is answered by CORSMiddleware and
+# never reaches the gate.  Moving this call below the CORS block would make the
+# gate outermost and 401 every cross-origin preflight; the boundary still
+# passes unauthenticated ``OPTIONS`` through as a belt-and-braces measure, but
+# the ordering is the real guarantee.
+app.add_middleware(AuthBoundaryMiddleware)
+
+
 # ── CORS (loopback dev-server origins only, no credentials) ────────────────────────
 # The frontend is either served same-origin by this app or by the vite dev
 # server on TM_FRONTEND_PORT (default 5173).  Only those loopback spellings
 # are allowed: ``allow_origins=["*"]`` + ``allow_credentials=True`` (a) is
 # invalid per the CORS spec and (b) let ANY web page drive the local API.
-# This app authenticates with nothing (no cookie, no Authorization header),
-# so ``allow_credentials`` is off.
+# The app now authenticates with a token (see the authentication boundary
+# above), but only on the two mechanisms CORS does not police: the session
+# cookie is ``SameSite=Strict`` and the bearer token is never sent by a
+# browser, so a credentialed CORS grant buys an attacker nothing.  It stays
+# off: ``allow_origins=[...]`` + ``allow_credentials=True`` would let any page
+# on the dev-server origin read responses with the caller's cookie attached.
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
