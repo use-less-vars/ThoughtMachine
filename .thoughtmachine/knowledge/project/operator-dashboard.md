@@ -1,31 +1,44 @@
 # Operator dashboard
-**INTERIM — STALE AT 4c700791 — DO NOT TRUST AS COMPLETE UNTIL chore/ticket-front-matter-backfill CLOSES**
-**Partition:** 197 = 10 closed + 3 superseded + 148 open + 36 unclassified (40 strict regex). **as of 4c700791**
+**INTERIM — COUNTS RE-SCRAPED AT `6e01a004`, BODY PROSE STALE AT 4c700791 — DO NOT TRUST AS COMPLETE UNTIL chore/ticket-front-matter-backfill CLOSES**
+**Partition:** 213 = 13 closed + 3 superseded + 166 open + 31 with no scrapeable `Status:` line. **as of 2026-10-31, HEAD `6e01a004`**
 
-**Status:** **197** `ticket-*.md` files on disk. The buckets below are an explicit partition —
+**Status:** **213** `ticket-*.md` files on disk. The buckets below are an explicit partition —
 every file is counted exactly once, and the four file buckets sum to the total:
 
 | bucket | files |
 |---|---|
-| closed with evidence — the ticket's own `Status:` line opens CLOSED / SHIPPED / FIXED / RESOLVED | **10** |
+| closed with evidence — the ticket's own `Status:` line opens CLOSED / SHIPPED / FIXED / RESOLVED / DONE | **13** |
 | superseded by merge, or retired — `Status:` opens SUPERSEDED / RETIRED | **3** |
-| open — diagnosed, plan known, work unstarted | **148** |
-| stale — **no `Status:` line in the file at all** | **36** |
-| **total** | **197** |
+| open — every other `Status:` word (diagnosed, plan known or not) | **166** |
+| stale — **no `Status:` line in the file at all** | **31** |
+| **total** | **213** |
 
 Five tickets counted in `open` were **filed by bookkeeping passes** —
 `ticket-bug-state-bridge-engineer-mode-deletes-custom-prompt.md`, an operator report that had no
 file on disk; `ticket-chore-ticket-front-matter-backfill.md`, the queue entry this page's own
 "Interim snapshot" note refers to; and three filed by the Gen 55 onboarding pass —
 `ticket-hygiene-flaky-supervisor-soft-timeout.md`, `ticket-docs-status-md-stale.md` and
-`ticket-docs-dashboard-state-of-play-stale.md`. That is why the total is 197, not the 192 measured
-before the pass; none of the five is yet placed in a body section below.
+`ticket-docs-dashboard-state-of-play-stale.md`. Those five took the total from 192 to 197; the five
+filed by the Gen 55 `docs/w4-kb-braindump` pass (below) take it to 213. None of the ten is placed in
+a body section by name; the new five appear only as body bullets.
 
 `non-ticket-rows`: **1** — the committed `.gitignore` merge conflict under `Unknown / needs
-investigation`. It is a page row, not a ticket file, so it sits outside the 197. The open set is
+investigation`. It is a page row, not a ticket file, so it sits outside the 213. The open set is
 overwhelmingly *diagnosed*: the plan is known and the work is unstarted. **8 rows lack a diagnosis**
 — they are the only ones under `Unknown / needs investigation`, and **7 of those 8 are tickets**.
-**Updated:** 2026-10-31 (Gen 55 onboarding) — counts re-measured; body prose from Gen 54.
+**Updated:** 2026-10-31 (Gen 55, `docs/w4-kb-braindump`, HEAD `6e01a004`) — every number in the
+partition re-scraped from disk; body prose from Gen 54.
+**Measurement (literal output, not a recollection):**
+`ls .thoughtmachine/working_docs/ticket-*.md | wc -l` → `213`;
+`ls .thoughtmachine/working_docs/*.md | wc -l` → `219` (6 non-ticket pages, no subdirectories).
+The buckets were recomputed by reading the first `Status:`-ish line of each of the 213 files with
+`^\s*(?:[#>*_-]+\s*)*\*{0,2}\**\s*Status\s*\**\s*:?\s*\**\s*([A-Za-z]+)` (case-insensitive);
+a stricter reader accepting only a bare `Status:` / `**Status:**` prefix returns the same 31 files,
+so 31 is not an artefact of a loose regex. Against the `4c700791` snapshot the movement is closed
+10→13, superseded 3→3, open 148→166, no-`Status:` 36→31, total 197→213. The +16 total is the 5
+tickets filed by this pass plus 11 filed by intervening passes; the bucket deltas are **net
+movement and were not audited file by file** — do not read them as 3 individually confirmed
+closures.
 Built from the `Status:` line of every ticket,
 `project/core.md` (C1-C9 + §0.1), and the newest section of `project/status.md`.
 **Nothing here was executed.** No fix was attempted while writing this page.
@@ -50,6 +63,28 @@ quoting them: the numbers are accurate to the scrape, not to the second.
   have to look at the remote yourself.
 - **First action:** push the two local commits, then read CI on them. Everything below is
   unaffected by whether they land.
+
+## Where the waves stand (2026-10-31)
+
+- **Merged:** W1 (`#260` `4c700791`, `#262` `85b0ed1a`), W1.5 (`#263` `64cfa5d2`), W2
+  (`#264` `7b60f68d`, `#265` `885c28e2`, `#266` `3fe28f84`), W3 (`#267` `389b87b8`, `#268`
+  `6e01a004`). W3 shipped the **audit**, not the isolation work — its unfixed findings are
+  `ticket-residual-w3-isolation-findings-not-fixed.md`.
+- **Next: W4 — Auth Boundary, opening with a design pass, not code.** F17 (found by W3): 82
+  of 85 HTTP routes and the whole `WS /ws` command surface have **no caller gate**; the only
+  peer checks are `/health` (`web_ui/backend/server.py:4073`), `/api/health/containers`
+  (`server.py:5910`) and `/api/system/health` (`health_routes.py:234`). Reachability rests on
+  `_validate_bind_host` (`server.py:4036`, called `:6224`), which is waived by
+  `--allow-remote-bind` (`server.py:6178`) and is transparent to a reverse proxy,
+  port-forward or `-L` tunnel. The decision ticket is a pre-existing placeholder that says
+  **do not start it** — `ticket-design-auth-layer.md` (two ruled candidates: a token per
+  router entry, or formalise localhost-only).
+- **Queued behind it:** the worker-lifecycle design pass (see the two new Worker bullets
+  below) and the resource-composition design pass (`ticket-design-tool-resource-contract.md`).
+- **Phase SSOT** is `project/v3_roadmap.md`, §"2026-10-31 — Wave ledger W1–W4". That file is
+  **gitignored (`.gitignore:221`) and exists in no branch** — this block is the
+  branch-visible copy of it.
+- **That SSOT is itself untracked** — `ticket-hygiene-v3-roadmap-untracked-phase-ssot.md` → `working_agreements.md:4,49` names `project/v3_roadmap.md` as owning phases, `.gitignore:221` ignores it, the eight re-includes at `.gitignore:239-247` skip it, and no git ref carries it. The block above is therefore a **snapshot, not a mirror**.
 
 ## We know what this is and we have a plan
 
@@ -176,6 +211,8 @@ quoting them: the numbers are accurate to the scrape, not to the second.
 - The worker panel intermittently misses tool calls — `ticket-bug-worker-panel-intermittent-missing-tool-calls.md` → fix implemented on a branch; verify and merge.
 - Worker context has null fields — `ticket-hygiene-worker-context-null-fields.md` → fill or omit.
 - Workers time out silently — `ticket-hygiene-worker-silent-timeout.md` → make it audible.
+- **There is no hard timeout at all** — `ticket-bug-worker-hard-timeout.md` → the hard-deadline fallback in `tools/workspace/worker_timeout.py` has **zero callers**; workers are daemon threads, so nothing can stop a wedged one.
+- **Stop does not cascade, and nothing detaches** — `ticket-feat-stop-cascade-detach.md` → there is **no parent/child edge between workers at all** (`_action_spawn` records no parent), so cascade and detach are one design question, not two patches.
 - Worker stream-loop teardown leaks — `ticket-hygiene-worker-stream-loop-teardown-leak.md` → Seam B's teardown half (owned loops are ruled; this is not re-architecture).
 - Worker job lifecycle design — `ticket-design-worker-job-lifecycle.md` → core-adjacent; ruling first.
 - The smoke-test config is never collected — `ticket-bug-smoke-test-config-never-collected.md` → collect it.
@@ -248,6 +285,7 @@ quoting them: the numbers are accurate to the scrape, not to the second.
 
 - Panel actions silently no-op (recon complete) — `ticket-bug-panel-actions-no-op.md` → wire or remove.
 - host-bash output shown in the panel — `ticket-hygiene-panel-host-bash-display.md` → open, **FILE ONLY**.
+- **`host_bash` renders as an ordinary tool call, with no danger signal** — `ticket-ui-host-bash-danger-color.md` → styling is role-only (`MessageBubble.jsx:42-52`); whether the tool *name* reaches the bubble is **unverified** and must be confirmed before implementing.
 - `host_bash` runs in the wrong workspace — `ticket-bug-host-bash-cwd-wrong-workspace.md` → fix the cwd.
 - `host_bash` double-prompts on ask — `ticket-bug-host-bash-double-prompt-on-ask.md` → one prompt.
 - WS frame diagnostics — `ticket-bug-ws-frame-diagnostics.md` → add them.
@@ -266,6 +304,7 @@ quoting them: the numbers are accurate to the scrape, not to the second.
 - Agent role control — `ticket-design-agent-role-control.md` → read before the modes work.
 - Audit trail completeness — `ticket-design-audit-trail-completeness.md`.
 - Security gate transitive pydantic — `ticket-design-security-gate-transitive-pydantic.md` → OPEN, re-scoped.
+- **Vault schema migration engine** — `ticket-feat-vault-migration-engine.md` → `scripts/migrate_vault.py` is a stub pinned to a literal `"2"` and wired to nothing; three version markers disagree; the live path (`vault_repair.py`) is content-based, not version-based.
 
 ## Unknown / needs investigation
 
