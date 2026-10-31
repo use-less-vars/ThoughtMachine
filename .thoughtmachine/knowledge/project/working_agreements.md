@@ -783,3 +783,9 @@ until you have read whether a failure can actually block. Promotion to blocking 
 ## 2026-10-29 — Class: `worktree-cleanup-is-destructive-by-default` (Gen 54)
 A worktree is not removable until its branch is pushed, or its HEAD SHA is recorded in the wave report. Cleanup is an operation on someone else's uncommitted work by default; treat it as a destructive action.
 
+
+## 2026-10-31 — One-owner-per-fact and reader-self-correction
+
+**one-owner-per-fact**: A fact with two holders that believe they are authoritative and are never reconciled is a bug. Three instances in W1: phantom-config (3 comparators), budget-two-owners (boundary vs HTTP), save-clobber (live RAM vs store). The legitimate form is two holders that are co-temporal and co-atomic (write-through cache).
+
+**reader-self-correction**: A self-corrected claim is worth more than a never-corrected one. Two instances: Gen 54 caught Gen 53, and the W1.5 agent corrected its own half-false ticket claim.

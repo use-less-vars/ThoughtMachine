@@ -122,17 +122,39 @@ def _enqueue(session, payload: dict) -> bool:
     return True
 
 
-def _dropped(session, reason: str, message: str) -> dict:
-    """Build the rejection result and report it on the runtime channel."""
+def _dropped(session, reason: str, message: str, notify: bool = True, **extra) -> dict:
+    """Build the rejection result and report it on the runtime channel.
+
+    ``notify=False`` suppresses the ``runtime_notice`` (used by the HTTP write
+    route, whose own thread must not push a payload onto a live Agent's queue:
+    the running turn drains that queue between stream events, so a request
+    thread firing into it would inject a mid-turn event for a write that
+    already has an HTTP response of its own).
+
+    ``**extra`` are boundary-measured numbers (``attempted_chars``,
+    ``budget_chars``, ``attempted_entries``, ``max_entries``, ``total_chars``)
+    copied onto the RESULT so a caller (the 409 body) can report the refusal
+    without recomputing ``sum(len(text))`` a second time.  They are deliberately
+    NOT added to the runtime notice: the notice's key set is fixed by design
+    doc §7.3.
+
+    ``message`` is the boundary's own sentence, returned on the RESULT so a
+    transport that renders a refusal (the 409 body) reuses the very words the
+    boundary logged and measured instead of re-deriving them -- recomputing
+    them in a second place is how a report comes to disagree with its verdict.
+    """
     try:
-        _enqueue(session, _notice_payload(session, reason, message))
+        if notify:
+            _enqueue(session, _notice_payload(session, reason, message))
     except Exception as exc:  # notification must never make the write raise
         log('WARNING', 'core.addendum', f'[addendum] could not enqueue notice: {exc}')
     log('WARNING', 'core.addendum', f'[addendum] write dropped ({reason}): {message}')
-    return {'status': 'dropped', 'entry': None, 'reason': reason, 'entries': []}
+    return {'status': 'dropped', 'entry': None, 'reason': reason,
+            'message': message, 'entries': [], **extra}
 
 
-def write_addendum_entry(session, text, source: str = 'operator') -> dict:
+def write_addendum_entry(session, text, source: str = 'operator',
+                         notify: bool = True) -> dict:
     """Append exactly ONE entry to ``session``'s addendum and notify the queue.
 
     Args:
@@ -143,6 +165,10 @@ def write_addendum_entry(session, text, source: str = 'operator') -> dict:
             stored text is NOT stripped, so an operator's formatting survives.
         source: Who is writing -- ``'operator'`` or ``'mailbox'`` (ruling D-4).
             Nothing else is legal: C2 forbids the model writing its own memory.
+        notify: Whether to report on the session's ``addendum_queue`` (the
+            runtime channel a running Agent drains).  ``True`` for in-process
+            writers; the HTTP write route passes ``False`` because its request
+            thread must not fire turn-loop events -- it answers on HTTP instead.
 
     Returns:
         ``{'status': 'ok'|'dropped', 'entry': dict|None, 'reason': str|None,
@@ -150,6 +176,13 @@ def write_addendum_entry(session, text, source: str = 'operator') -> dict:
         set (empty on a drop). Never raises: a rejection is reported through the
         return value and a ``runtime_notice`` on the queue, because the slice-1
         contract is that one bad write must not cost the session.
+
+        Slice 5 also carries the boundary-measured numbers on the result --
+        ``attempted_chars`` / ``attempted_entries`` (the RESULTING set that was
+        measured, or the accepted set), ``budget_chars`` / ``max_entries`` (the
+        caps in force) and ``total_chars`` (the set as persisted; on a drop, the
+        unchanged set) -- so no caller has to recompute ``sum(len(text))`` and
+        risk disagreeing with the verdict.
 
         A write that would not fit the addendum's budget is one of those drops:
         ``reason`` is ``'budget_exceeded'`` or ``'max_entries_exceeded'``, and
@@ -193,16 +226,28 @@ def write_addendum_entry(session, text, source: str = 'operator') -> dict:
         # already over budget can never accept another write, because its
         # resulting set is over budget too. ``pinned`` exempts nothing.
         total_chars = sum(len(item['text']) for item in entries)
+        # The unchanged set's own size, measured once, here: it is what the
+        # caller reports on a refusal, so the HTTP layer never re-summarises.
+        prior_chars = sum(len(item['text']) for item in addendum['entries'])
+        boundary = {
+            'attempted_chars': total_chars,
+            'budget_chars': normalized['budget_chars'],
+            'attempted_entries': len(entries),
+            'max_entries': normalized['max_entries'],
+            'total_chars': prior_chars,
+        }
         if total_chars > normalized['budget_chars']:
             return _dropped(
                 session, DROP_BUDGET_EXCEEDED,
                 f"addendum budget exceeded: {total_chars} > "
-                f"{normalized['budget_chars']} chars")
+                f"{normalized['budget_chars']} chars",
+                notify=notify, **boundary)
         if len(entries) > normalized['max_entries']:
             return _dropped(
                 session, DROP_MAX_ENTRIES_EXCEEDED,
                 f"addendum entry limit exceeded: {len(entries)} > "
-                f"{normalized['max_entries']} entries")
+                f"{normalized['max_entries']} entries",
+                notify=notify, **boundary)
 
         # Persist on the session's addendum, keeping any key this module does not
         # know about so a later version's field is not silently erased.
@@ -214,16 +259,34 @@ def write_addendum_entry(session, text, source: str = 'operator') -> dict:
         session.addendum = persisted
 
         stored = dict(entries[-1])
-        _enqueue(session, _updated_payload(session, stored, entries))
+        if notify:
+            _enqueue(session, _updated_payload(session, stored, entries))
         log('DEBUG', 'core.addendum',
             f"[addendum] appended entry {stored['id']} from {source} (entries={len(entries)})")
         return {'status': 'ok', 'entry': stored, 'reason': None,
-                'entries': [dict(item) for item in entries]}
+                'entries': [dict(item) for item in entries],
+                'attempted_chars': total_chars,
+                'budget_chars': normalized['budget_chars'],
+                'attempted_entries': len(entries),
+                'max_entries': normalized['max_entries'],
+                'total_chars': total_chars,
+                'notified': notify}
     except Exception as exc:
         # The slice-1 contract, restated for the write path: a failed write is
         # reported, never raised into the caller's turn.
         log('ERROR', 'core.addendum', f'[addendum] write failed unexpectedly: {exc}')
         return {'status': 'dropped', 'entry': None, 'reason': 'exception', 'entries': []}
+
+
+def addendum_total_chars(session) -> int:
+    """Exact character count of the session's CURRENT entry set.
+
+    The boundary measures this number itself; exposing it keeps the HTTP layer
+    free of ``sum(len(...))`` arithmetic, which is what makes a disagreement
+    between the displayed total and the enforced budget impossible.
+    """
+    addendum = normalize_addendum(getattr(session, 'addendum', None))
+    return sum(len(item['text']) for item in addendum['entries'])
 
 
 class AddendumQueue:
