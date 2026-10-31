@@ -105,6 +105,22 @@ class _StubSessionStore:
         self.save_calls.append(session.session_id)
         self._records[session.session_id] = copy.deepcopy(session.to_persistable_dict())
 
+    def mutate_session(self, session_id: str, mutator, workspace_id=None):
+        """Mirror ``FileSystemSessionStore.mutate_session``: one RMW, save on request.
+
+        The cold path of the addendum routes goes through this call, so the stub
+        has to honour the same contract -- read, apply, persist only when the
+        mutator asks for it -- otherwise a refusal would look like a write here
+        and only here.
+        """
+        session = self.load_session(session_id)
+        if session is None:
+            return None, None
+        result, should_write = mutator(session)
+        if should_write:
+            self.save_session(session)
+        return session, result
+
     # -- assertions helpers ------------------------------------------------
 
     def stored_addendum(self, session_id: str = SID) -> dict:
