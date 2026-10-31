@@ -1090,9 +1090,10 @@ class CheckSystem(ToolBase):
 
         The event log is ONE vault-global file shared by every session, so it is
         never served unfiltered: the caller's session id is required (fail
-        closed, per _query_running_workers), the read is widened so a busy
-        neighbour cannot starve the caller, and only attributable records are
-        shown -- with message bodies redacted.
+        closed, per _query_running_workers), the ownership filter is applied
+        while scanning backwards so a busy neighbour cannot starve the caller
+        out of the window, and only attributable records are shown -- with
+        message bodies redacted.
         """
         try:
             # Fail closed: without a session scope there is no safe view.  A
@@ -1109,53 +1110,69 @@ class CheckSystem(ToolBase):
             if not os.path.exists(file_path):
                 return f"[event_log] No log file found at: {file_path}"
 
-            # Widened read (500 lines) so that filtering by owner still leaves a
-            # useful window for this caller on a busy machine.
+            # Filter WHILE scanning backwards, so the read window is spent on
+            # the caller's own records first.  A fixed line window is taken
+            # from the *shared* file before the ownership filter, so on a busy
+            # machine a neighbour can write more records between two of this
+            # session's than the window holds, pushing this session's records
+            # out of the view entirely (R4: starvation, not disclosure -- the
+            # filter still discards every unmatched record).  The scan stops as
+            # soon as ``wanted`` owned records are buffered, and is hard-capped
+            # at ``scan_max_bytes`` so a session with no recent records cannot
+            # turn one query into a full read of a vault-global file.
             #
             # In-process filesystem read (migration category 2), not host
             # execution: the log is a local append-only file this process owns,
-            # so it needs no host process and no host bridge.  Only the tail
-            # window is loaded -- the file itself is unbounded -- by seeking
-            # from EOF backwards in growing chunks until enough newlines are
-            # buffered (or the start of the file is reached).  Encoding matches
-            # EventLogger's writer (utf-8); errors="replace" keeps a torn
-            # multibyte sequence from making the whole query fail.
-            max_lines = 500
+            # so it needs no host process and no host bridge.  Only the scanned
+            # tail is loaded -- the file itself is unbounded -- by seeking from
+            # EOF backwards in growing chunks.  Encoding matches EventLogger's
+            # writer (utf-8); errors="replace" keeps a torn multibyte sequence
+            # from making the whole query fail.
+            wanted = 50
+            scan_max_bytes = 4 * 1024 * 1024
             chunk_size = 8192
-            newlines = 0
-            chunks: list = []
+            owned_reversed: list = []
+            scanned = 0
+            leftover = b""
             with open(file_path, "rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 pos = fh.tell()
-                # max_lines + 1: the window typically starts mid-line, and that
-                # leading fragment is dropped, so one spare newline is needed to
-                # still end up with 500 whole records.
-                while pos > 0 and newlines <= max_lines + 1:
-                    read_size = min(chunk_size, pos)
+                while (
+                    pos > 0
+                    and len(owned_reversed) < wanted
+                    and scanned < scan_max_bytes
+                ):
+                    read_size = min(chunk_size, pos, scan_max_bytes - scanned)
                     pos -= read_size
                     fh.seek(pos)
                     data = fh.read(read_size)
-                    chunks.append(data)
-                    newlines += data.count(b"\n")
-                    chunk_size *= 2
-            text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
-            if pos > 0 and "\n" in text:
-                # The read window opened mid-line: that fragment is not a record.
-                text = text.split("\n", 1)[1]
-            lines = [line for line in text.split("\n") if line.strip()][-max_lines:]
-
-            owned: list = []
-            for line in lines:
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError:
-                    # Unparseable line: cannot be attributed to any session.
-                    continue
-                if not isinstance(parsed, dict):
-                    continue
-                if self._event_belongs_to_session(parsed, sid):
-                    owned.append(parsed)
-            shown = owned[-50:]
+                    scanned += read_size
+                    segments = (data + leftover).split(b"\n")
+                    if pos > 0:
+                        # The chunk opened mid-line: that leading fragment is
+                        # not a record, and the next (earlier) chunk completes
+                        # it.
+                        leftover = segments.pop(0)
+                    else:
+                        leftover = b""
+                    for segment in reversed(segments):
+                        if not segment.strip():
+                            continue
+                        try:
+                            parsed = json.loads(segment.decode("utf-8", errors="replace"))
+                        except json.JSONDecodeError:
+                            # Unparseable line: cannot be attributed to any session.
+                            continue
+                        if not isinstance(parsed, dict):
+                            continue
+                        if not self._event_belongs_to_session(parsed, sid):
+                            continue
+                        # Most recent first; reversed into reading order below.
+                        owned_reversed.append(parsed)
+                        if len(owned_reversed) >= wanted:
+                            break
+                    chunk_size = min(chunk_size * 2, 1024 * 1024)
+            shown = list(reversed(owned_reversed))
 
             parts = [
                 f"Event log ({len(shown)} recent entries, scoped to this session):",
