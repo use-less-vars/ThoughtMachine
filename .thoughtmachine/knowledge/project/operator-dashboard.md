@@ -1,27 +1,32 @@
 # Operator dashboard
+**INTERIM — STALE AT 4c700791 — DO NOT TRUST AS COMPLETE UNTIL chore/ticket-front-matter-backfill CLOSES**
+**Partition:** 197 = 10 closed + 3 superseded + 148 open + 36 unclassified (40 strict regex). **as of 4c700791**
 
-**Status:** **194** `ticket-*.md` files on disk. The buckets below are an explicit partition —
+**Status:** **197** `ticket-*.md` files on disk. The buckets below are an explicit partition —
 every file is counted exactly once, and the four file buckets sum to the total:
 
 | bucket | files |
 |---|---|
 | closed with evidence — the ticket's own `Status:` line opens CLOSED / SHIPPED / FIXED / RESOLVED | **10** |
 | superseded by merge, or retired — `Status:` opens SUPERSEDED / RETIRED | **3** |
-| open — diagnosed, plan known, work unstarted | **145** |
+| open — diagnosed, plan known, work unstarted | **148** |
 | stale — **no `Status:` line in the file at all** | **36** |
-| **total** | **194** |
+| **total** | **197** |
 
-Two tickets counted in `open` were **filed by this reconciliation pass** —
+Five tickets counted in `open` were **filed by bookkeeping passes** —
 `ticket-bug-state-bridge-engineer-mode-deletes-custom-prompt.md`, an operator report that had no
-file on disk, and `ticket-chore-ticket-front-matter-backfill.md`, the queue entry this page's own
-"Interim snapshot" note refers to. That is why the total is 194, not the 192 measured before the
-pass; neither is yet placed in a body section below.
+file on disk; `ticket-chore-ticket-front-matter-backfill.md`, the queue entry this page's own
+"Interim snapshot" note refers to; and three filed by the Gen 55 onboarding pass —
+`ticket-hygiene-flaky-supervisor-soft-timeout.md`, `ticket-docs-status-md-stale.md` and
+`ticket-docs-dashboard-state-of-play-stale.md`. That is why the total is 197, not the 192 measured
+before the pass; none of the five is yet placed in a body section below.
 
 `non-ticket-rows`: **1** — the committed `.gitignore` merge conflict under `Unknown / needs
-investigation`. It is a page row, not a ticket file, so it sits outside the 194. The open set is
+investigation`. It is a page row, not a ticket file, so it sits outside the 197. The open set is
 overwhelmingly *diagnosed*: the plan is known and the work is unstarted. **8 rows lack a diagnosis**
 — they are the only ones under `Unknown / needs investigation`, and **7 of those 8 are tickets**.
-**Updated:** 2026-10-29 (Gen 54). Built from the `Status:` line of every ticket,
+**Updated:** 2026-10-31 (Gen 55 onboarding) — counts re-measured; body prose from Gen 54.
+Built from the `Status:` line of every ticket,
 `project/core.md` (C1-C9 + §0.1), and the newest section of `project/status.md`.
 **Nothing here was executed.** No fix was attempted while writing this page.
 **Interim snapshot — how the counts were obtained:** every number here is scraped from each
