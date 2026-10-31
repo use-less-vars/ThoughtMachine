@@ -122,7 +122,7 @@ pydantic>=2.0.0             pydantic-settings>=2.0.0
 openai>=1.0.0               anthropic>=0.30.0
 tiktoken>=0.5.0             docker>=7.0.0
 PyYAML>=6.0                 python-dotenv>=1.0.0
-httpx>=0.25.0               websockets>=10.0
+httpx>=0.25.0               websockets>=14.0
 python-multipart>=0.0.6     aiofiles>=23.0.0
 markdown>=3.4.0             fast-json-repair>=0.2.0
 libcst>=1.8.0               pathspec>=0.11.0
