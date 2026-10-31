@@ -1,10 +1,6 @@
-**INTERIM — STALE AT 4c700791 — DO NOT TRUST AS COMPLETE UNTIL chore/ticket-front-matter-backfill CLOSES**
-
-**Partition:** 197 = 10 closed + 3 superseded + 148 open + 36 unclassified (40 strict regex). **as of 4c700791**
-
-**INTERIM — STALE AT 4c700791 — DO NOT TRUST AS COMPLETE UNTIL chore/ticket-front-matter-backfill CLOSES**
-
 # Operator dashboard
+**INTERIM — STALE AT 4c700791 — DO NOT TRUST AS COMPLETE UNTIL chore/ticket-front-matter-backfill CLOSES**
+**Partition:** 197 = 10 closed + 3 superseded + 148 open + 36 unclassified (40 strict regex). **as of 4c700791**
 
 **Status:** **197** `ticket-*.md` files on disk. The buckets below are an explicit partition —
 every file is counted exactly once, and the four file buckets sum to the total:
