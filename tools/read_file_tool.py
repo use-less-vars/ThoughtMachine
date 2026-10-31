@@ -65,6 +65,15 @@ class ReadFile(ToolBase):
                     "error": "No workspace path configured — cannot resolve file path.",
                 })
 
+            # Apply the tool-layer path policy first (vault compartment and
+            # workspace sensitive-path block lists), exactly as the other file
+            # tools do via ``ToolBase._validate_path``.  This is additive: the
+            # containment check below stays as the second, narrower gate.
+            try:
+                self._validate_path(self.file_path)
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
+
             # Resolve the path and prevent directory traversal
             root_path = Path(root).resolve()
             target = (root_path / self.file_path).resolve()
