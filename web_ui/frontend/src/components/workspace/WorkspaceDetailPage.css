@@ -9,6 +9,15 @@
   color: #cdd6f4;
   font-size: 0.85rem;
   overflow: hidden;
+  /* Page root: column flex container that can shrink inside its own
+     overflow:hidden parent (.tab-content-area in styles.css). min-height: 0
+     is load-bearing — the automatic minimum size of a column flex item is its
+     content height, so without it the panel never shrinks and the overflow is
+     clipped by the ancestor instead of scrolling in .wdp-body. */
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 /* ── Header ──────────────────────────────────────────────────────────────── */
@@ -20,6 +29,10 @@
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
+  /* .wdp-body takes flex-basis: 0, so the header/tabs auto bases are the only
+     shrinkable ones: without this, a short viewport compresses the chrome
+     instead of letting the body scroll. */
+  flex-shrink: 0;
 }
 
 .wdp-title-block {
@@ -161,6 +174,8 @@
   padding: 0.55rem 1.1rem 0;
   border-bottom: 1px solid #313244;
   flex-wrap: wrap;
+  /* Same as .wdp-header: wrap lets the strip grow, but it must never shrink. */
+  flex-shrink: 0;
 }
 
 .wdp-tab {
@@ -186,6 +201,10 @@
 
 .wdp-body {
   padding: 1.1rem;
+  /* The scroll container for the whole page body. */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .wdp-overview {
