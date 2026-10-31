@@ -71,16 +71,13 @@ class TestHealthEndpoint:
                 # Hermetic: the store must report no open sessions instead of
                 # reading the real ~/.thoughtmachine/sessions (host-dependent).
                 MockStore.return_value.get_open_sessions.return_value = []
-                with patch(
-                    "agent.logging.event_logger.EventLogger.get_tail",
-                    return_value=[],
-                ):
-                    resp = client.get("/api/system/health")
+                resp = client.get("/api/system/health")
             assert resp.status_code == 200
             data = resp.json()
             assert data["running_workers"] == []
             assert data["active_sessions"] == []
-            assert data["recent_event_log_tail"]["entries"] == []
+            # The payload carries no event-log surface at all.
+            assert set(data) == {"running_workers", "active_sessions"}
 
     def test_legacy_worker_status(self, client, tmp_path: Path):
         """status.json in workers/<name>/ is picked up."""
@@ -181,44 +178,6 @@ class TestHealthEndpoint:
             # Only the alpha worker should be returned
             names = [w["worker_name"] for w in data["running_workers"]]
             assert names == ["worker_1"]
-
-    def test_event_log_tail_empty(self, client):
-        """When event log does not exist, return empty entries with a note."""
-        with patch(
-            "web_ui.backend.health_routes._WORKSPACES_DIR",
-            Path(tempfile.mkdtemp(prefix="test_evt_")),
-        ):
-            with patch(
-                "agent.logging.event_logger.EventLogger.get_tail"
-            ) as mock_get_tail:
-                mock_get_tail.return_value = []
-                resp = client.get("/api/system/health")
-                assert resp.status_code == 200
-                data = resp.json()
-                tail = data["recent_event_log_tail"]
-                assert tail["entries"] == []
-                assert tail["note"] is not None
-
-    def test_event_log_tail_with_entries(self, client):
-        """When event log has entries, they are returned."""
-        fake_entries = [
-            {"timestamp": "2025-01-01T00:00:00", "event_type": "test"},
-            {"timestamp": "2025-01-01T00:01:00", "event_type": "test", "data": {"msg": "hello"}},
-        ]
-        with patch(
-            "web_ui.backend.health_routes._WORKSPACES_DIR",
-            Path(tempfile.mkdtemp(prefix="test_evt2_")),
-        ):
-            with patch(
-                "agent.logging.event_logger.EventLogger.get_tail"
-            ) as mock_get_tail:
-                mock_get_tail.return_value = fake_entries
-                resp = client.get("/api/system/health")
-                assert resp.status_code == 200
-                data = resp.json()
-                tail = data["recent_event_log_tail"]
-                assert tail["entries"] == fake_entries
-                assert tail["note"] is None
 
     def test_both_layouts_simultaneously(self, client, tmp_path: Path):
         """Legacy and session-scoped workers both appear."""
