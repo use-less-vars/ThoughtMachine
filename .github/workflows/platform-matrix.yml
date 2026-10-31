@@ -290,11 +290,14 @@ jobs:
         run: python -m pytest web_ui/backend/tests/ --timeout 600 -ra
 
   # ---------------------------------------------------------------------------
-  # Web UI frontend suite (advisory)
+  # Web UI frontend suite (BLOCKING)
   #
-  # Runs the Vitest component/store suite in web_ui/frontend. Advisory for the
-  # same reason as the backend job above: it is not a required status check, so
-  # a red run is reported without blocking the matrix.
+  # Runs the Vitest component/store suite in web_ui/frontend. BLOCKING: no
+  # continue-on-error, so a red frontend run fails this workflow. Promoted
+  # because the alternative -- report the failure and merge anyway -- let real
+  # frontend regressions land green: the suite covers the components and stores
+  # the UI actually renders from, and the floor assertion below means a silently
+  # shrinking collection is caught too.
   #
   # `npm ci` (not `npm install`) installs exactly the locked tree from
   # web_ui/frontend/package-lock.json, and `node-version-file` pins Node to the
@@ -302,11 +305,19 @@ jobs:
   #
   # The JSON report is not decoration: a job that exits 0 having collected three
   # files is worse than no job at all, so the count is asserted against a floor.
+  # Measured on dev (64cfa5d2): the 55 test files under web_ui/frontend/src
+  # collect 697 tests, all passing. Floor 650 sits 47 below that, so losing more
+  # than 47 tests fails the job.
+  #
+  # The trade-off is wall-clock and strictness: the suite is serial
+  # (`fileParallelism: false` in web_ui/frontend/vite.config.js, because
+  # parallel forks OOM under a 512 MiB cgroup), so it costs several minutes of
+  # runner time, and a red run now blocks the workflow instead of being merely
+  # noted. On failure the JSON report is uploaded as an artifact.
   # ---------------------------------------------------------------------------
   web-ui-frontend-suite:
-    name: web-ui-frontend-suite (advisory)
+    name: web-ui-frontend-suite
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -341,6 +352,15 @@ jobs:
           if total < 650:
               sys.exit(f"FAIL: only {total} tests collected (floor 650); the suite is silently shrinking")
           PY
+
+      - name: Upload vitest report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-ui-frontend-vitest-report
+          path: |
+            web_ui/frontend/vitest-report.json
+          if-no-files-found: ignore
 
   # -------------------------------------------------------------------------
   # macOS: install + startup smoke (advisory).
