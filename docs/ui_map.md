@@ -191,7 +191,7 @@ Backend surface with no live UI caller — the operator's list for NEW feature w
 | 4 | GET `/api/providers` | provider_routes:70 | provider | landing list — the defect-(b) bug #2 fix path |
 | 5 | POST `/api/providers` | provider_routes:80 | provider | provider REST CRUD (WS path used + landing stub) |
 | 6 | DELETE `/api/providers/{id}` | provider_routes:111 | provider | provider REST CRUD (WS path used + landing stub) |
-| 7 | GET `/api/system/health` | health_routes:182 | health | App hits `/api/health` instead |
+| 7 | GET `/api/system/health` | health_routes:215 | health | App hits `/api/health` instead |
 | 8 | GET `/api/session/{id}` | session_routes:245 | session | raw detail GET (WS `load_session` used; only orphan `WorkspaceSessionList.jsx:88`) |
 | 9 | POST `/api/session/{id}/rename` | session_routes:281 | session | REST rename (WS `rename_session` used) |
 | 10 | GET `/api/workspace/{id}/mcp_servers` | workspace_routes:770 | workspace | an MCP-server listing panel (no consumer) |
@@ -1519,7 +1519,7 @@ Frontend: `web_ui/frontend/src` (live files only).
 | GET `/api/providers` | provider_routes:70 | UI uses WS `get_providers` |
 | POST `/api/providers` | provider_routes:80 | UI uses WS `save_provider` (no-op, F1) |
 | DELETE `/api/providers/{id}` | provider_routes:111 | UI uses WS `delete_provider` (no-op, F1) |
-| GET `/api/system/health` | health_routes:182 | UI hits `/api/health`, not this |
+| GET `/api/system/health` | health_routes:215 | UI hits `/api/health`, not this |
 | GET `/api/session/{id}` | session_routes:245 | bare GET never fetched (WS `load_session` used); only ORPHAN `WorkspaceSessionList.jsx:88` |
 | POST `/api/session/{id}/rename` | session_routes:281 | grep `session/rename` = 0; UI uses WS `rename_session` |
 | GET `/api/workspace/{id}/mcp_servers` | workspace_routes:770 | grep `mcp_servers` = 0 hits |
@@ -1686,7 +1686,7 @@ Backend **accepts 27**; frontend **sends 18**. 9 accepted commands have no sende
 4. `GET /api/workspace/{id}/containers/{name}/logs` (server.py:3621) — container log
    viewer only exists in the orphan `ContainerLogsModal`.
 5. `GET /api/workspace/{id}/mcp_servers` (workspace_routes:770) — MCP server listing has no UI consumer.
-6. `GET /api/system/health` (health_routes:182) — no UI (App uses `/api/health`).
+6. `GET /api/system/health` (health_routes:215) — no UI (App uses `/api/health`).
 7. `GET /api/workspace/{id}` bare detail (workspace_routes:1774) + `GET /api/workspace/{id}/permissions`
    (1430) — UI reads `/summary` instead; raw detail/permissions GET unused.
 8. WS `get_workspace_capabilities` (2536) / `bootstrap_workspace` (2564) — commands never
@@ -2070,7 +2070,7 @@ vault_repair_router, container_record_router`.
   (112); `GET /mode` (179).
 - **`onboarding_routes.py`** prefix `/api/onboarding`: `GET /status` (86);
   `POST /complete` (92); `POST /test-connection` (122).
-- **`health_routes.py`** prefix `/api/system`: `GET /health` (182).
+- **`health_routes.py`** prefix `/api/system`: `GET /health` (215).
 - **`logging_routes.py`** prefix `/api/logging`: `GET`/`PUT /config` (33/53).
 - **`vault_repair_routes.py`** prefix `/api`: `GET /vault/repair/status` (53);
   `POST /vault/repair/apply` (95) — origin-guarded.

@@ -4,6 +4,8 @@
 **Severity:** Medium — cross-workspace disclosure of worker task text, via a route with no caller-scope check and no auth dependency.
 **Status:** OPEN.
 
+**Update (2026-10-31):** the event-log half of this route is gone — `recent_event_log_tail` was deleted outright and the route is now loopback-gated; see `ticket-bug-health-route-event-log-tail-unscoped.md`. The Evidence bullet listing `recent_event_log_tail` among the response keys therefore describes the pre-2026-10-31 body. The worker-inventory half (this ticket's subject) is unchanged and still open.
+
 ## Bearing
 
 `GET /api/system/health` does not read running workers through the tool layer. It reimplements the collection by walking the filesystem itself — `web_ui/backend/health_routes.py:26 _collect_workers_from_fs()` — while the tool path is `tools/workspace/check_system.py:356` (`"running_workers": lambda: self._query_running_workers()`) → `:796-816 _query_running_workers()`.

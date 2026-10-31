@@ -6,6 +6,31 @@
 **Prior shape (wrong):** "scope the log read to the caller's workspace." Verified
 impossible at read time.
 
+**Update (2026-10-31):** the "`session_id` is dropped at write time / zero occurrences of
+`session_id` or `workspace_id` in the entire file" claim below is **stale**.
+`agent/logging/event_logger.py:162-169` now writes both keys at the top level of every
+record — `session_id` from `EventMetadata.session_id`, and `workspace_id` present but
+always `None` (the field this ticket asks for still does not exist on `EventMetadata`).
+So the read-side filter has a session key today; the writer-side **workspace**
+attribution this ticket prescribes is still missing. See
+`ticket-test-checksystem-event-log-session-workspace-conflation.md`.
+
+**Update (2026-10-31, sequencing):** two things a reader needs before dispatching this.
+
+- **It is a SCHEMA change, so it needs its own wave.** Adding a real `workspace_id` to `EventMetadata` changes
+  the record format of every line in the shared `event_log.jsonl` — the one file every workspace appends to.
+  Old lines carry no such key (and today's carry `workspace_id: None`, `event_logger.py:162-169`), so every
+  reader must tolerate both shapes, and with 5 MB × 1 backup rotation (`event_logger.py:81-90`) mixed
+  generations coexist on disk for as long as the rotation window lasts. It cannot ride along inside a security
+  fix.
+- **It is NOT a security urgency.** The read path is already fail-closed by *session*: `check_system.py:1098-1105`
+  refuses to serve anything without a session scope, and the per-record filter (`_event_belongs_to_session`,
+  `:1030-1055`) drops every record that is not the caller's own. Nothing is exposed while this waits. The gap is
+  that **workspace** isolation of the log cannot be claimed — not that something is leaking today. The
+  alternative is equally legitimate: keep session-as-proxy and stop claiming workspace isolation of the event log
+  in the docs. That is a decision, not a bug, and it should be made explicitly rather than by leaving this ticket
+  open indefinitely.
+
 ## The real finding
 
 `agent/logging/event_logger.py::_on_event` (line ~142) writes records shaped:
