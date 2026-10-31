@@ -55,6 +55,28 @@ one-line `WHERE workspace_id = caller`.
 This is a **shared-writer change** (event_logger.py + every producer that
 should attribute events) and needs its own wave.
 
+## Re-verified 2026-10-31, `docs/w4-kb-braindump` worktree
+
+Re-read, no code change. The 2026-10-31 update above still holds, and the missing
+field can now be named exactly.
+
+- **Writer:** `agent/logging/event_logger.py:162-169`. The comment at `:162-167` says it
+  plainly: *"`workspace_id` is always None for now -- EventMetadata has no such field
+  today; the getattr keeps the key present so readers can rely on it once the model grows
+  one."* `session_id` is stamped at `:168`, `workspace_id` at `:169` via `getattr(..., None)`.
+- **Model:** `agent/events.py:112-118` — `EventMetadata` carries `event_id`, `timestamp`,
+  `source`, `session_id`, `turn`. **No `workspace_id`.**
+- **Serialisation:** `agent/events.py:129-132` — `to_dict()` spreads `**self.data`, so a
+  workspace id can reach the log today only inside `data`, i.e. by producer discipline
+  rather than by contract. Any read-side filter built on it filters on manners.
+
+Verdict unchanged: one field on the model, one line in each producer that should
+attribute, then the read side is a real filter instead of a tail.
+
+**Filename decision:** this file is the canonical home. A separate
+`ticket-bug-event-metadata-missing-workspace-id.md` is deliberately **not** filed — same
+wire, other end; it would be a near-duplicate.
+
 ## Related
 
 - The re-scoped ticket supersedes the original (a)/(b) framing.
