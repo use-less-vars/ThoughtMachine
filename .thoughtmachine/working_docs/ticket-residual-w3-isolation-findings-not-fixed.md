@@ -141,3 +141,17 @@ window grows.
 - Do not read R3 as evidence of cleanliness in either direction.
 - Do not raise the 500-line window as a fix for R4 — that only moves the starvation point and increases the
   per-query cost on a vault-global file.
+
+---
+
+## Status (2026-10-31) — R1–R4 closed, two residuals documented
+
+Branch `w3/residuals` (worktree `.worktrees/w3-resid`). **No commits made.** `web_ui/backend/health_routes.py` untouched (FROZEN).
+
+**R1 — FIXED.** `tools/read_file_tool.py` now calls `self._validate_path(self.file_path)` (the `ToolBase` vault-compartment / sensitive-path policy the other file tools already applied) *before* its existing containment check; containment is unchanged and still runs as the second gate. Tests: `tests/tools/test_read_file_tool_path_policy.py` (14 pass), including a defence-in-depth case that no-ops `_validate_path` and asserts containment still refuses.
+
+**R2 — FIXED for `server.py`, one duplication left by the freeze.** New module `web_ui/backend/local_gate.py` owns `LOCAL_CLIENT_HOSTS`, `TEST_HARNESS_CLIENT_HOSTS` and `localhost_only`. `server.py` now imports all three under its old names (`_LOCAL_CLIENT_HOSTS`, `_TEST_HARNESS_CLIENT_HOSTS`, `_localhost_only`) and its local copies are deleted; `_validate_bind_host` and both call sites are untouched. `health_routes.py` still carries its own copy because it is frozen — that is the **accepted residual**. It is pinned rather than trusted: `web_ui/backend/tests/test_local_gate_shared.py` (28 pass) asserts identity for the `server.py` aliases, source-scans `server.py` for the deleted literals and `def _localhost_only(`, and drives `health_routes._localhost_only`, `server._localhost_only` and `local_gate.localhost_only` through the same host matrix (including `testclient`, `127.0.0.1.evil.com`, empty and `None` peers) asserting identical verdicts and identical 403 bodies. Unfreezing `health_routes.py` collapses the third copy into an import; until then a divergence fails CI.
+
+**R3 — SWEPT, with stated scope limits.** `docs/workspace_isolation_matrix.md` gains §5.5 *Caller gate sweep* (surface × mount site × gate site × verdict), a pointer under §5.2 explaining why the gate is recorded per transport surface rather than per entry-point row, and finding **F17**. Finding: three surfaces gate (`/health`, `/api/health/containers`, `/api/system/health`); 82 of 85 HTTP routes and `WS /ws` do not; reachability rests on a start-up bind-host check that is waivable and proxy-transparent. Also filed into `ticket-bug-unauthenticated-routes-beyond-health.md`. **Limits, so this is not over-read:** the sweep covers peer/caller gating only — not authorisation, not per-fact scoping (§5.1–§5.3 are untouched), and not the vault/tool layers (marked `not audited` in the table). Stale line numbers in §5.2/§5.2b were left stale on purpose and flagged.
+
+**R4 — FIXED, bounded.** `tools/workspace/check_system.py::_query_event_log` no longer reads a fixed 500-line tail and filters afterwards; it scans backwards in growing chunks and applies the session-ownership filter *while* scanning, stopping at 50 owned records. Tests in `tests/test_event_log_scoped.py` (13 pass) cover 1 owned + 600 foreign + 1 owned, and 50 owned behind a 700-record foreign block. **Residual:** the scan is capped at 4 MiB, so a single uninterrupted foreign run larger than that can still starve the window — bounded now, not eliminated.

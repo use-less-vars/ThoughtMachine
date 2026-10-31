@@ -280,6 +280,50 @@ def test_event_log_shows_last_50_after_filtering(event_log_file):
     assert "aid-59" in output
 
 
+def test_event_log_survives_more_than_500_neighbour_records(event_log_file):
+    """R4: neighbour traffic must not starve the caller out of the view.
+
+    The window used to be the last 500 *lines* of the shared file, taken before
+    the ownership filter.  600 neighbour records between two of this session's
+    therefore pushed both of them out of the window and the query truthfully
+    reported an empty view of the caller's own log.  Filtering while scanning
+    backwards spends the window on the caller's records first.
+    """
+    records = [_event("session_start", "src-a-old", {"marker": "mine-old"}, "sess-A")]
+    for i in range(600):
+        records.append(_event("session_start", f"src-b-{i:03d}", {}, "sess-B"))
+    records.append(
+        _event("session_start", "src-a-new", {"marker": "mine-new"}, "sess-A")
+    )
+    _write(event_log_file, records)
+
+    output = _query("sess-A")
+
+    assert "Event log (2 recent entries, scoped to this session):" in output
+    assert "src-a-old" in output
+    assert "src-a-new" in output
+    assert "src-b-" not in output
+
+
+def test_event_log_reads_past_a_neighbour_block_for_a_full_page(event_log_file):
+    """A whole page (50) survives 500+ neighbour records written after it."""
+    records = [
+        _event("session_start", f"src-a-{i:02d}", {"marker": f"mine-{i:02d}"}, "sess-A")
+        for i in range(50)
+    ]
+    records.extend(
+        _event("session_start", f"src-b-{i:03d}", {}, "sess-B") for i in range(700)
+    )
+    _write(event_log_file, records)
+
+    output = _query("sess-A")
+
+    assert "Event log (50 recent entries, scoped to this session):" in output
+    assert "src-a-00" in output
+    assert "src-a-49" in output
+    assert "src-b-" not in output
+
+
 def test_event_log_tolerates_non_string_event_type(event_log_file):
     """A malformed (non-string) ``event_type`` must not abort the whole query."""
     _write(

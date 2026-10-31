@@ -163,6 +163,8 @@ One entry point per `command` string in the dispatch chain of `websocket_endpoin
 
 Adjudicated subset (25 of 81). **Un-adjudicated remainder is listed in §5.2b and counted in §4's coverage table — it is not clean, it is unexamined.**
 
+**Caller gate:** whether a surface refuses a non-local caller *at all* is a property of the transport surface, not of an entry-point × fact row, so it is recorded once in **§5.5** rather than repeated per row. R3 found that three surfaces gate and the rest do not.
+
 | Entry point | Fact | Scoping status | Owner site | Verification |
 |---|---|---|---|---|
 | `GET /api/vault/status` (`web_ui/backend/server.py:3910`) | vault | scoped by convention — the route runs the drift check and returns a report; report scoping is delegated to `_scope_vault_status_report` | `_scope_vault_status_report` `tools/workspace/check_system.py:1216` | `test_default_scope_hides_foreign_workspace` `tests/test_check_system_vault_status_scoping.py:61`; `test_execute_scopes_report_to_caller_workspace` `tests/test_check_system_vault_status_scoping.py:108` |
@@ -229,6 +231,33 @@ Lane coverage is thin **because the tool classes are not enumerable by declarati
 | `host_bash` | `ticket-bug-host-bash-cwd-wrong-workspace.md` |
 | `knowledge_base` | `ticket-hygiene-global-kb-docs-claim-writable-global-scope.md` |
 | WS lane generally | `ticket-bug-ws-commands-unauthenticated.md`, `ticket-bug-ws-handshake-bypasses-cors-origin-check.md` |
+
+---
+
+### 5.5 Caller gate sweep (R3)
+
+Added by W3-R3. The sweep question was: **does any HTTP or WebSocket surface in `web_ui/backend/` refuse a caller that is not on this machine?**
+
+Method: an exhaustive grep of `web_ui/backend/*.py` for the only primitives that can observe a peer — `request.client.host`, `client.host`, `_localhost_only`, `localhost` — plus `Depends(` (no hits), `add_middleware` (one hit: CORS at `server.py:1214`, which sets response headers and refuses nobody), `check_origin`/`origin_policy` (an `Origin`-header check, not a peer check, used at `addendum_routes.py:68`) and `Authorization`/`X-API-Key`/`TrustedHost` (no hits). The tree carries **85 route decorators across 13 modules** and **one WebSocket handler** (`@app.websocket("/ws")` `server.py:1260`).
+
+| Surface | Mount site | Gate site | Verdict |
+|---|---|---|---|
+| `GET /health` | `server.py:4071` | `_localhost_only` `server.py:4073` | **GATED** — loopback peer required |
+| `GET /api/health/containers` | `server.py:5896` | `_localhost_only` `server.py:5910` | **GATED** — loopback peer required |
+| `GET /api/system/health` | `health_routes.py:215` (`@router.get("/health")` on the `prefix="/api/system"` router, `:20`) | `_localhost_only` `health_routes.py:234` — the *call*; the helper is defined at `:196` (a different number for a different thing, see below) | **GATED** — loopback peer required |
+| every other HTTP route (82 of the 85 decorators) | see §5.2 / §5.2b | none | **NOT GATED** — no peer check anywhere on the path |
+| `WS /ws` (all §5.1 methods) | `server.py:1260` | none | **NOT GATED** — the handshake never reads `request.client` |
+| vault / workspace / tool layer | — | — | **not audited here** — that is §5.3 and §6; a tool-layer entitlement is not a caller gate |
+
+`_localhost_only` is a **transport** control, not an authentication control: it compares the peer address against `{"127.0.0.1", "::1", "localhost"}` (plus `{"testclient"}` for the harness), returns `{"error": "localhost only"}` with 403, and fails closed when the peer cannot be read. As of W3-R2 the implementation is shared only where it could be: `web_ui/backend/server.py` imports it (`from web_ui.backend.local_gate import ...` `server.py:224`; module body `local_gate.py:37-62`) and both of its call sites — `/health` and `/api/health/containers` — use the imported function. `web_ui/backend/health_routes.py` does **not** import `local_gate` and contains no reference to it: because the module is frozen, it still defines its own private `_LOCAL_CLIENT_HOSTS` (`:187`), `_TEST_HARNESS_CLIENT_HOSTS` (`:193`) and `def _localhost_only` (`:196`), and its route calls that local copy (`:234`). The third, independent copy is the **accepted residual** of W3-R2 — pinned, not eliminated: `web_ui/backend/tests/test_local_gate_shared.py` imports all three implementations (`local_gate.localhost_only`, `server._localhost_only`, `health_routes._localhost_only`), asserts the `server.py` names are the shared objects, source-scans `server.py` for the deleted literals, and drives one host matrix through all three requiring identical verdicts and identical 403 bodies — so a divergence fails the suite even though the duplication remains. Nothing else in the backend ever asks who is calling.
+
+**Consequence: the reachability of 82 HTTP routes and of the entire `/ws` method surface rests entirely on the process being bound to a loopback address.** That binding is `_validate_bind_host` (`server.py:4036`), called once at start-up from `main()` (`server.py:6224`) — a check on the *listen* address, not a per-request check on the *caller*. Three ways past it, none exotic:
+
+1. **Non-loopback bind.** `--host` / the `HOST` env var (`server.py:6172-6184`) accepts any literal, refused only unless `--allow-remote-bind` is passed — and that flag is documented in its own `--help` as `INSECURE`, the reason being that the API has no caller authentication to fall back on.
+2. **Reverse proxy, port-forward, or container/VM network** that accepts a public connection and re-originates it from a loopback peer. Only the three gated surfaces above would even look; the other 82 and `/ws` cannot tell the difference.
+3. **SSH `-L` tunnel** — the benign instance of the same shape: a remote caller whose peer address is loopback.
+
+Scope limits of this sweep, stated so it is not over-read: it covers **caller/peer gating only**. It does not adjudicate authorisation, does not re-adjudicate the per-fact scoping of §5.1-§5.3, and does not read the vault or tool layers (recorded as `not audited` above). Line numbers in §5.2 for `/health` (`:3892`/`:3893`) and in §5.2b for `/api/health/containers` (`:5698`) are stale — the W3-R2 refactor moved the gate and shifted lines; the current numbers are the ones in this table. They are left un-rewritten because §5.2/§5.2b are historical adjudication records and renumbering them wholesale would make the diff unreviewable; a reader chasing a line should start from this table.
 
 ---
 
@@ -308,3 +337,4 @@ Each row: what is wrong, the one-line blast radius, and the literal tag. **No pa
 | F14 | 50 of the 65 matrix rows | — | 50 of the 65 adjudicated entry-point × fact rows carry verification `NONE`; 15 are pinned by a named test (6 in 5.1 — two of those only **partially** — 5 in 5.2, 4 in 5.3) | the scoping that does hold is largely unpinned — a regression would be a code-review miss, not a CI failure | **RECORDED, NOT FIXED** |
 | F15 | `ticket-bug-checksystem-running-workers-global-leak.md` vs `test_registry_key_has_no_workspace_scope` (`tests/test_worker_workspace_scoping.py:110`) | worker | **two different axes, conflated into one ticket.** (i) *Session* axis — what an agent can read from `query="running_workers"`: closed in `d45cebb03`, scoped from `self.session_id`, fails closed, pinned by two tests. (ii) *Workspace* axis — the registry key `(session_id, worker_name, instance_id)` has **no** workspace component at all, and a test pins that absence as the expected behaviour. Evidence about (i) says nothing about (ii) | leaving the two merged keeps a fixed defect looking open and an open one looking fixed; the ticket should be closed as stale on (i) and a new one opened on (ii) | **RECORDED, NOT FIXED** |
 | F16 | filed ticket asserting the event-log writer "drops `session_id` at write time" | event | **stale as filed.** The writer has stamped `session_id` since `d60ffc92b` (`agent/logging/event_logger.py:168`). What remains is F9's missing `workspace_id` **model field** (`:169`, comment `:165-167`), which no line in the writer can supply | closing the ticket as stale must not close F9 with it — the workspace gap is real, and it is a different object from the session gap | **RECORDED, NOT FIXED** |
+| F17 | 82 of 85 HTTP routes + `WS /ws` (§5.5) | vault, session, container, worker, event | no caller gate: the only peer checks in `web_ui/backend/` are on `/health` (`server.py:4073`), `/api/health/containers` (`server.py:5910`) and `/api/system/health` (`health_routes.py:234`); everything else answers any caller that can open a socket. Reachability rests on `_validate_bind_host` (`server.py:4036`, called `:6224`), a start-up check on the listen address | one `--allow-remote-bind`, or one reverse proxy / port-forward / `-L` tunnel in front of a loopback bind, exposes the machine-wide inventory routes (F11), the credential-name list, the unfiltered `/api/session/list`, the container-record actions and the whole `/ws` command surface to a remote caller with no credential of any kind | **RECORDED, NOT FIXED** |

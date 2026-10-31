@@ -221,6 +221,11 @@ from web_ui.backend.onboarding_routes import router as onboarding_router
 from web_ui.backend.config_routes import router as config_router
 from web_ui.backend.logging_routes import router as logging_router
 from web_ui.backend.health_routes import router as health_router
+from web_ui.backend.local_gate import (
+    LOCAL_CLIENT_HOSTS as _LOCAL_CLIENT_HOSTS,
+    TEST_HARNESS_CLIENT_HOSTS as _TEST_HARNESS_CLIENT_HOSTS,
+    localhost_only as _localhost_only,
+)
 from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.addendum_routes import router as addendum_router
 from web_ui.backend.prompt_routes import router as prompt_router
@@ -4020,14 +4025,12 @@ async def user_home():
 # but the bind can be overridden (``--host``/``HOST``) and a reverse proxy in
 # front of the process would forward a remote caller as a local one.  The health
 # routes therefore check the peer address themselves.
-_LOCAL_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-
-# In-process ASGI test-harness address.  Starlette's TestClient puts
-# ``scope["client"] = ("testclient", 50000)`` on every request it builds
-# (starlette/testclient.py); the name is not resolvable or routable over any
-# network, so real traffic can never carry it.  Kept in its own constant so the
-# allowance is explicit and cannot be confused with the loopback set.
-_TEST_HARNESS_CLIENT_HOSTS = frozenset({"testclient"})
+#
+# The gate lives in ``web_ui/backend/local_gate.py`` and is imported at the top
+# of this module; it used to be a second copy of the one in ``health_routes.py``.
+# ``_LOCAL_CLIENT_HOSTS`` / ``_TEST_HARNESS_CLIENT_HOSTS`` / ``_localhost_only``
+# are bound here as aliases of the shared definitions so the bind-host check
+# below and the existing call sites keep working unchanged.
 
 
 def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> Optional[str]:
@@ -4063,20 +4066,6 @@ def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> O
             f"loopback host (127.0.0.1, ::1, localhost) via --host or the HOST env "
             f"var, or pass --allow-remote-bind to expose the unauthenticated API "
             f"knowingly.")
-
-
-def _localhost_only(request: Request) -> Optional[JSONResponse]:
-    """Return a 403 response when *request* did not come from a local caller.
-
-    ``request.client`` is ``None`` when the ASGI server cannot report a peer
-    address; that is treated as NOT local (fail closed).  The caller's address
-    is deliberately never echoed in the response body.
-    """
-    client = request.client
-    host = client.host if client is not None else None
-    if host in _LOCAL_CLIENT_HOSTS or host in _TEST_HARNESS_CLIENT_HOSTS:
-        return None
-    return JSONResponse({"error": "localhost only"}, status_code=403)
 
 
 @app.get("/health")
