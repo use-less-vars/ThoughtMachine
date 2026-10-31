@@ -429,6 +429,131 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     }
   }
 
+  // ── Addendum (W1.5) ────────────────────────────────────────────────
+  // The operator's addendum is session state reached over its own REST
+  // surface (GET/POST/DELETE /api/session/{id}/addendum), never through the
+  // config draft or apply_config: the write boundary owns the budget verdict
+  // (refuse, never truncate), so the panel only mirrors what the server
+  // returns. The rendered list IS the server's answer — every mutation adopts
+  // the `entries` it came back with, so the panel cannot drift.
+  const [addendumState, setAddendumState] = useState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
+  const [addendumText, setAddendumText] = useState('')
+  const [addendumBusy, setAddendumBusy] = useState(false)
+  const [addendumRefusal, setAddendumRefusal] = useState(null)  // { reason, message } | null — the 409 channel
+  const [addendumError, setAddendumError] = useState(null)      // every other non-2xx
+  const [confirmClearAddendum, setConfirmClearAddendum] = useState(false)
+
+  // Adopt a server payload without inventing numbers: fields the response does
+  // not carry keep their previous value (DELETE and POST both return them, but
+  // a future reader should not silently zero the budget).
+  const adoptAddendum = (data) => {
+    setAddendumState((prev) => ({
+      entries: Array.isArray(data?.entries) ? data.entries : prev.entries,
+      total_chars: typeof data?.total_chars === 'number' ? data.total_chars : prev.total_chars,
+      budget_chars: typeof data?.budget_chars === 'number' ? data.budget_chars : prev.budget_chars,
+      max_entries: typeof data?.max_entries === 'number' ? data.max_entries : prev.max_entries,
+    }))
+  }
+
+  const addendumUrl = () => apiUrl(`/api/session/${encodeURIComponent(sessionId)}/addendum`)
+
+  // Load the entry list on mount and whenever the session changes.
+  useEffect(() => {
+    let cancelled = false
+    setAddendumError(null)
+    setAddendumRefusal(null)
+    setConfirmClearAddendum(false)
+    if (!sessionId) {
+      setAddendumState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
+      return () => { cancelled = true }
+    }
+    fetch(addendumUrl())
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        if (cancelled) return
+        adoptAddendum(data)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setAddendumError('Session addendum unavailable')
+      })
+    return () => { cancelled = true }
+  }, [sessionId])
+
+  // Append one entry. `text` is sent exactly as typed — the boundary measures
+  // it, so trimming here would misreport the budget.
+  const handleAddendumSubmit = async (e) => {
+    e?.preventDefault?.()
+    if (!sessionId || addendumBusy) return
+    const text = addendumText
+    setAddendumBusy(true)
+    setAddendumRefusal(null)
+    setAddendumError(null)
+    try {
+      const res = await fetch(addendumUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      })
+      const data = await res.json().catch(() => null)
+      if (res.status === 409) {
+        // Refusal channel: the write boundary dropped the entry and persisted
+        // nothing, so the stored set is unchanged. Keep the typed text so it can
+        // be edited down; render the boundary's own sentence verbatim.
+        setAddendumRefusal({
+          reason: data?.reason ?? 'refused',
+          message: data?.message ?? 'addendum write refused',
+        })
+        if (Array.isArray(data?.entries)) adoptAddendum(data)
+        return
+      }
+      if (!res.ok || data?.status !== 'accepted') {
+        setAddendumError(`Failed to add entry: HTTP ${res.status}`)
+        return
+      }
+      adoptAddendum(data)
+      // Persisted, not pushed: the REST write lands in the session STORE
+      // (FileSystemSessionStore.load_session() returns a fresh deserialised
+      // Session), so a running Agent's in-memory Session keeps its old addendum
+      // and this entry reaches a turn only once that agent loaded/updated its
+      // session from disk. Hence the store echo here is UI coherence, not
+      // delivery to the model.
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries })
+      setAddendumText('')
+    } catch (err) {
+      setAddendumError(`Failed to add entry: ${err?.message || err}`)
+    } finally {
+      setAddendumBusy(false)
+    }
+  }
+
+  // Clear every entry (two-step: this is the CONFIRMED half).
+  const handleAddendumClear = async () => {
+    if (!sessionId || addendumBusy) return
+    setConfirmClearAddendum(false)
+    setAddendumBusy(true)
+    setAddendumRefusal(null)
+    setAddendumError(null)
+    try {
+      const res = await fetch(addendumUrl(), { method: 'DELETE' })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || data?.status !== 'cleared') {
+        setAddendumError(`Failed to clear addendum: HTTP ${res.status}`)
+        return
+      }
+      adoptAddendum(data)
+      // Same echo as the write. NOTE: receiveAddendumUpdated merges by entry id
+      // and never deletes, so the store cannot represent a clear — the list
+      // above is authoritative and the store slice only gains entries.
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries ?? [] })
+    } catch (err) {
+      setAddendumError(`Failed to clear addendum: ${err?.message || err}`)
+    } finally {
+      setAddendumBusy(false)
+    }
+  }
+
   // ── Apply: PUT permissions first (when a session REST source is loaded),
   // then apply_config for the rest of the draft (never carrying permissions).
   const handleApply = async () => {
@@ -669,6 +794,114 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           </div>
 
           <SessionWorkspaceTab workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} effectivePermissions={sessionPerms?.effective ?? null} />
+
+          {/* ── Addendum (W1.5) ── */}
+          <div style={{ marginTop: '1rem', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
+            <label style={labelStyle}><strong>Addendum</strong></label>
+            <div
+              data-testid="addendum-totals"
+              style={{ margin: '0.25rem 0 0.5rem 0', fontSize: '0.75rem', color: '#a6adc8' }}
+            >
+              {`${addendumState.total_chars} / ${addendumState.budget_chars ?? '—'} chars · ${addendumState.entries.length} / ${addendumState.max_entries ?? '—'} entries`}
+            </div>
+
+            {addendumRefusal && (
+              <div
+                role="alert"
+                data-testid="addendum-refusal"
+                style={{ margin: '0 0 0.5rem 0', padding: '0.4rem 0.6rem', border: '1px solid #f38ba8', borderRadius: '4px', background: '#f38ba811', color: '#f38ba8', fontSize: '0.78rem' }}
+              >
+                <div>{addendumRefusal.message}</div>
+                <div style={{ opacity: 0.75, fontSize: '0.72rem' }}>{addendumRefusal.reason}</div>
+              </div>
+            )}
+            {addendumError && (
+              <div data-testid="addendum-error" style={{ color: '#f38ba8', fontSize: '0.75rem', marginBottom: '0.5rem' }}>
+                {addendumError}
+              </div>
+            )}
+
+            {addendumState.entries.length === 0 ? (
+              <p style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', margin: '0 0 0.5rem 0' }}>
+                No addendum entries.
+              </p>
+            ) : (
+              <ul data-testid="addendum-list" style={{ listStyle: 'none', margin: '0 0 0.5rem 0', padding: 0 }}>
+                {addendumState.entries.map((entry) => (
+                  <li
+                    key={entry.id}
+                    data-testid={`addendum-entry-${entry.id}`}
+                    style={{ marginBottom: '0.4rem', padding: '0.4rem 0.6rem', background: '#1e1e2e', border: '1px solid #45475a', borderRadius: '4px', fontSize: '0.78rem' }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.7rem', color: '#6c7086' }}>
+                      <span>{entry.id}</span>
+                      <span>{(entry.text || '').length} chars</span>
+                    </div>
+                    <div
+                      title={entry.text}
+                      style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
+                    >
+                      {entry.text}
+                    </div>
+                    <div style={{ marginTop: '0.2rem', fontSize: '0.7rem', color: '#6c7086' }}>
+                      {`${entry.ts} · ${entry.source}${entry.pinned ? ' · pinned' : ''}`}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <form onSubmit={handleAddendumSubmit}>
+              <textarea
+                aria-label="Addendum entry text"
+                value={addendumText}
+                onChange={(e) => setAddendumText(e.target.value)}
+                rows={3}
+                style={{ ...inputStyle, resize: 'vertical' }}
+              />
+              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.4rem' }}>
+                <button
+                  type="submit"
+                  className="btn btn-accent"
+                  disabled={addendumBusy || !sessionId}
+                  style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+                >
+                  {addendumBusy ? 'Saving…' : 'Add entry'}
+                </button>
+                {confirmClearAddendum ? (
+                  <>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={addendumBusy}
+                      onClick={handleAddendumClear}
+                      style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+                    >
+                      Confirm clear
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setConfirmClearAddendum(false)}
+                      style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={addendumBusy || addendumState.entries.length === 0}
+                    onClick={() => setConfirmClearAddendum(true)}
+                    style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+                  >
+                    Clear all
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
         </div>
       )}
 
