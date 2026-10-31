@@ -102,7 +102,9 @@ def _wait_effective_filesystem(client, backend_url, ws_id, sid, expected, deadli
     )
 
 
-def test_permission_mutation_ui_persistence(page, e2e_frontend, e2e_backend):
+def test_permission_mutation_ui_persistence(
+    page, e2e_frontend, e2e_backend, e2e_auth_headers
+):
     import httpx
     import re
     import time
@@ -115,7 +117,7 @@ def test_permission_mutation_ui_persistence(page, e2e_frontend, e2e_backend):
     ws_root = Path(e2e_backend["vault"]) / "ui_persist_coding"
     ws_root.mkdir(parents=True, exist_ok=True)
 
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=30, headers=e2e_auth_headers) as client:
         resp = client.post(
             f"{backend_url}/api/workspace",
             json={"path": str(ws_root), "purpose": "coding"},
@@ -167,7 +169,7 @@ def test_permission_mutation_ui_persistence(page, e2e_frontend, e2e_backend):
     # ── 4. Apply — NO backend restart anywhere in this test ──
     page.get_by_role("button", name="Apply", exact=True).click()
 
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=30, headers=e2e_auth_headers) as client:
         # 4a. Backend truth must flip while the SAME backend process runs.
         _wait_effective_filesystem(client, backend_url, ws_id, sid, "write")
         print("[ui-persist] REST effective filesystem after Apply: write (no restart)", flush=True)
@@ -221,7 +223,7 @@ def test_permission_mutation_ui_persistence(page, e2e_frontend, e2e_backend):
     # 5a. Authoritative persistence check: the effective permissions are
     # resolved fresh from the session file on disk AFTER the reload (no
     # restart, no in-memory trust).  This is the pass/fail driver.
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=30, headers=e2e_auth_headers) as client:
         _wait_effective_filesystem(client, backend_url, ws_id, sid, "write")
         eff_after = _effective_filesystem(client, backend_url, ws_id, sid)
         assert eff_after == "write", f"post-reload effective filesystem {eff_after!r}"

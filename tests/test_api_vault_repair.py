@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from web_ui.backend import vault_repair_routes
+from web_ui.backend.auth_boundary import AuthBoundaryMiddleware
 
 import thoughtmachine.vault_repair as vr
 
@@ -135,6 +136,24 @@ def client(app, monkeypatch, tmp_path):
     vault.mkdir(exist_ok=True)
     monkeypatch.setattr("thoughtmachine.vault.vault_root", lambda: vault)
     with TestClient(app) as test_client:
+        yield test_client, vault
+
+
+@pytest.fixture
+def boundary_client(monkeypatch, tmp_path):
+    """A client whose app carries the ONE origin/peer gate (AuthBoundaryMiddleware).
+
+    The per-route guard is gone: the boundary is the enforcement point, so a test
+    about the origin policy composes the boundary the way ``server.py`` does
+    instead of exercising a copy of the decision that no longer exists.
+    """
+    application = FastAPI()
+    application.include_router(vault_repair_routes.router)
+    application.add_middleware(AuthBoundaryMiddleware)
+    vault = tmp_path / "vault"
+    vault.mkdir(exist_ok=True)
+    monkeypatch.setattr("thoughtmachine.vault.vault_root", lambda: vault)
+    with TestClient(application, client=("127.0.0.1", 51234)) as test_client:
         yield test_client, vault
 
 
@@ -325,22 +344,31 @@ def test_apply_requires_exactly_one_selection(client):
     assert _snapshot(vault) == before
 
 
-def test_apply_rejects_disallowed_origins(client):
-    test_client, vault = client
+def test_apply_rejects_disallowed_origins(boundary_client):
+    """Both a foreign and an absent Origin are refused before the repair runs.
+
+    ``/api/vault/repair/*`` is listed in ``auth_boundary.STRICT_ORIGIN_PATH_PREFIXES``,
+    so the boundary applies ``_origin_allowed`` -- the predicate these routes were
+    guarded with before the boundary existed -- instead of the lenient
+    ``_origin_check_request`` used everywhere else.  A request carrying neither
+    ``Origin`` nor ``Referer`` is therefore refused at the boundary, *before* the
+    credential gate: 403, not 401.
+    """
+    test_client, vault = boundary_client
     _clean_vault(vault)
     before = _snapshot(vault)
     payload = {"categories": ["missing_field"], "confirmed": True}
 
     resp = test_client.post("/api/vault/repair/apply", json=payload)
     assert resp.status_code == 403
-    assert "error" in resp.json()
+    assert resp.json() == {"error": "untrusted origin"}
 
     resp = test_client.post(
         "/api/vault/repair/apply", json=payload,
         headers={"Origin": "http://evil.example"},
     )
     assert resp.status_code == 403
-    assert "error" in resp.json()
+    assert resp.json() == {"error": "untrusted origin"}
     assert _snapshot(vault) == before
 
 

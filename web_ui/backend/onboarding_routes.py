@@ -28,7 +28,6 @@ from thoughtmachine.workspace_registry import WorkspaceRegistry
 from llm_providers.factory import ProviderFactory
 from llm_providers.exceptions import ProviderError
 
-from web_ui.backend.origin_policy import _origin_check_request
 
 router = APIRouter(prefix="/api/onboarding")
 
@@ -94,8 +93,6 @@ def get_onboarding_status() -> dict:
 @router.post("/complete")
 def complete_onboarding(request: Request) -> dict:
     """Mark onboarding as complete. Idempotent; atomic marker-file write."""
-    if not _origin_check_request(request, route_name="complete_onboarding"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         _VAULT_DIR.mkdir(parents=True, exist_ok=True)
         if _onboarding_marker_complete():
@@ -126,8 +123,6 @@ def complete_onboarding(request: Request) -> dict:
 @router.post("/test-connection")
 def test_connection(request: Request, body: TestConnectionRequest) -> dict:
     """Test an LLM provider connection. Never returns the API key."""
-    if not _origin_check_request(request, route_name="test_connection"):
-        raise HTTPException(status_code=403, detail="origin not permitted")
     try:
         provider = ProviderFactory.create_provider(
             body.provider,
