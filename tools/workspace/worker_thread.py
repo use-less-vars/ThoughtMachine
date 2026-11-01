@@ -4005,15 +4005,18 @@ class Worker(ToolBase):
             stopped_info = []
             for sid, thread in stale_instances:
                 worker_label = f"{self.worker_name} (session={sid})"
-                logger.info("Force-spawn: stopping stale worker '%s'", worker_label)
+                logger.info("Force-spawn: killing stale worker '%s'", worker_label)
                 # Only a thread that is genuinely gone may be unregistered below:
                 # popping the entry of a live thread would orphan it (alive, but
                 # invisible to every registry lookup, so it can never be stopped,
                 # checked or reaped).
                 survived_force_stop = False
                 try:
-                    thread.stop()
-                    # Robust join with retry (same pattern as _action_stop)
+                    # PHASE 2.1a: force-respawn REPLACES this instance — it must
+                    # terminate. stop() only detaches now (and would leave the
+                    # stale thread parked and alive forever).
+                    thread.kill()
+                    # Robust join with retry (same pattern as _action_kill)
                     _budget = max(30, thread._timeout_seconds)
                     _elapsed = 0.0
                     while _elapsed < _budget:
@@ -4024,7 +4027,7 @@ class Worker(ToolBase):
                     if thread.is_alive():
                         survived_force_stop = True
                 except Exception as exc:
-                    logger.exception("Error stopping stale worker '%s': %s", worker_label, exc)
+                    logger.exception("Error killing stale worker '%s': %s", worker_label, exc)
                     # stop() raised: the thread is only recycled if it actually died.
                     survived_force_stop = bool(
                         getattr(thread, "is_alive", lambda: False)()
@@ -4893,10 +4896,14 @@ class Worker(ToolBase):
             # the worker thread so its run() loop drains, its terminal path
             # runs, and its containers are reclaimed. Never Thread.kill — the
             # thread always terminates via its own run() teardown (which calls
-            # _cleanup_worker_containers). The stop is best-effort: if it
+            # _cleanup_worker_containers).
+            # PHASE 2.1a: this path must TERMINATE — stop() only detaches now
+            # (it would leave the thread parked, alive and un-drained), so the
+            # query timeout calls kill(). Still not Thread.kill (the OS verb):
+            # the thread exits via its own run() teardown. Best-effort: if it
             # raises, run() teardown remains authoritative.
             try:
-                thread.stop()
+                thread.kill()
             except Exception:
                 pass
             # Synchronous reclaim: the worker may be stuck inside a DockerCodeRunner
