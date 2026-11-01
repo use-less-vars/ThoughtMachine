@@ -219,10 +219,13 @@ its `job_id` back at enqueue time — `tools/workspace/job_registry.py:7` —
   caller that enqueued the query may itself be gone — the very condition that let the TTL
   elapse — so the rejection must also be published on the session's runtime channel and
   recorded in the audit log, where an operator can see it after the fact. The concrete
-  channel and log-table identifiers are to be pinned by citation at implementation time:
-  `NOT FOUND — searched the runtime-channel and audit-log surfaces in this document for a
-  TTL-expiry precedent`. `bridge.py:1791` is not an audit path: it is cited for a different
-  claim and must not be reused as one.
+  channel and log-table identifiers are pinned by citation as implemented: the
+  runtime-channel publisher is `_publish_global_worker_event` —
+  `tools/workspace/worker_thread.py:305` — which publishes on the event bus
+  `EventBus.publish` — `agent/events.py:486` — and reaches the browser through the web
+  forwarding hop `web_ui/backend/event_forwarder.py:84`; the audit record is written by
+  `audit_event` — `thoughtmachine/audit_logger.py:125`. `bridge.py:1791` is not an audit
+  path: it is cited for a different claim and must not be reused as one.
 - **Kill discards.** `kill` — and the session Stop cascade, which routes to it — drops the
   queue and rejects the queued queries the same way, because the instance (thread, agent,
   containers) no longer exists to run them.
