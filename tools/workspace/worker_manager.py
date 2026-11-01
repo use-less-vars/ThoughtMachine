@@ -20,11 +20,14 @@ Design constraints
     ``force=True`` path of ``request_worker``) stops and REMOVES the stale
     instance from the registry BEFORE any cap check, so a forced
     replacement is never blocked by the cap.
-  - Stops are always cooperative (``thread.stop()`` + bounded join via
-    ``wait_for_worker_exit``); never ``Thread.kill``.
-  - ``stop_worker`` / ``stop_all`` stop threads but leave their registry
+  - Stops TERMINATE: ``thread.kill()`` + bounded join via
+    ``wait_for_worker_exit``. (Phase 2.1a split: ``thread.stop()`` now
+    DETACHES -- it parks the worker -- so every manager stop path calls
+    ``kill()``.)
+  - ``stop_worker`` / ``stop_all`` kill threads but leave their registry
     entries in place (terminal state visible, same as worker.py's
-    cooperative-stop contract); ``cleanup_dead`` sweeps non-alive entries.
+    kill-and-keep-the-entry contract); ``cleanup_dead`` sweeps non-alive
+    entries.
 
 Orchestration ownership
 -----------------------
@@ -54,6 +57,7 @@ from agent.config.defaults import (
     HEARTBEAT_INTERVAL_S,
     HEARTBEAT_STALE_AFTER_S,
     MAX_WORKERS_PER_SESSION,
+    WORKER_TIMEOUT_SECONDS,
 )
 from tools.workspace.worker_query import (
     WorkerBusyError,  # noqa: F401  (re-exported: callers catch one name)
@@ -113,6 +117,14 @@ class PeriodicStaleCheck(threading.Thread):
     never interrupted. Not auto-started by ``WorkerManager``; call
     ``start()`` (or ``WorkerManager.start_stale_check``) and ``stop()`` /
     ``join()`` to shut it down.
+
+    DETACHED workers (phase 2.1a: ``stop()`` DETACHES -- it parks a worker in
+    status ``"detached"`` instead of terminating it) get a DISTINCT pass that
+    runs BEFORE the heartbeat check: a parked worker is not heartbeating, so
+    the interrupt path must never see it. Instead, a worker that has been
+    detached for longer than ``WORKER_TIMEOUT_SECONDS`` is killed (its
+    containers reclaimed and its registry entry dropped) so a parked
+    instance cannot outlive its TTL.
     """
 
     def __init__(
@@ -138,6 +150,13 @@ class PeriodicStaleCheck(threading.Thread):
 
     def _check_once(self) -> None:
         for key, thread in list(self._registry.get_all_workers().items()):
+            if self._is_detached(thread):
+                # PHASE 2.1a: a detached (parked) worker is alive but NOT
+                # heartbeating, so it must never reach the staleness/interrupt
+                # path below -- it only ever gets the detached TTL.
+                if self._is_alive(thread):
+                    self._check_detached_ttl(key, thread)
+                continue
             if not self._is_alive(thread):
                 continue
             age = self._heartbeat_age(thread)
@@ -151,6 +170,133 @@ class PeriodicStaleCheck(threading.Thread):
                     getattr(thread, "worker_name", key),
                     exc,
                 )
+
+    @staticmethod
+    def _is_detached(thread: Any) -> bool:
+        """True when the worker reports the phase-2.1a ``"detached"`` status."""
+        return getattr(thread, "status", None) == "detached"
+
+    def _check_detached_ttl(self, key: Any, thread: Any) -> None:
+        """Kill a worker that has been detached longer than the TTL.
+
+        The TTL is ``WORKER_TIMEOUT_SECONDS`` (from ``agent.config.defaults``),
+        measured from the worker's own ``_detached_at`` epoch stamp. A worker
+        without a readable stamp is skipped (treated as fresh: never kill on a
+        guess). The kill is announced on the global bus and in the audit log
+        BEFORE it happens, then the instance is killed, its containers are
+        reclaimed and its registry entry is dropped -- a killed worker is never
+        revived, so the entry would only shadow a respawn.
+        """
+        detached_at = getattr(thread, "_detached_at", None)
+        if isinstance(detached_at, bool) or not isinstance(detached_at, (int, float)):
+            return
+        age = time.time() - float(detached_at)
+        if age <= WORKER_TIMEOUT_SECONDS:
+            return
+        session_id, worker_name, _instance_id = self._key_parts(key, thread)
+        logger.info(
+            "detached worker '%s' (session %s) exceeded the %ss detach TTL "
+            "(detached for %.0fs); killing it",
+            worker_name,
+            session_id,
+            WORKER_TIMEOUT_SECONDS,
+            age,
+        )
+        self._announce_detached_ttl_kill(thread, session_id, worker_name, age)
+        # SEAM (phase 2.1b, FIFO query queue): this is the ONE place where a
+        # query queued for a detached worker must be rejected/errored out
+        # instead of being started on a killed instance. Queued queries do not
+        # exist yet (a busy worker still raises WorkerBusyError), so nothing is
+        # rejected here today.
+        self._kill_detached_worker(thread, worker_name)
+        self._forget_worker(key, session_id, worker_name)
+
+    def _announce_detached_ttl_kill(
+        self, thread: Any, session_id: str, worker_name: str, age: float
+    ) -> None:
+        """Publish + audit the detached TTL kill. Best-effort, never raises."""
+        payload = {
+            "worker_name": worker_name,
+            "session_id": session_id,
+            "status": "killed",
+            "reason": "detached_ttl_exceeded",
+            "detached_age_s": round(age, 1),
+            "ttl_s": WORKER_TIMEOUT_SECONDS,
+        }
+        try:
+            from agent.events import EventType
+            from tools.workspace.worker_thread import _publish_global_worker_event
+
+            _publish_global_worker_event(EventType.WORKER_STOPPING, payload)
+        except Exception as exc:  # pragma: no cover - observability only
+            logger.warning(
+                "detached TTL kill event publish failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+        try:
+            from thoughtmachine.audit_logger import audit_event
+
+            audit_event(
+                "WORKER_DETACHED_TTL_KILL",
+                f"worker={worker_name} session={session_id} "
+                f"detached_age_s={age:.0f} ttl_s={WORKER_TIMEOUT_SECONDS}",
+            )
+        except Exception as exc:  # pragma: no cover - observability only
+            logger.warning(
+                "detached TTL kill audit failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+
+    @staticmethod
+    def _kill_detached_worker(thread: Any, worker_name: str) -> None:
+        """Kill the parked instance and reclaim its containers (never raises)."""
+        try:
+            thread.kill()
+        except Exception as exc:
+            logger.warning(
+                "detached TTL kill failed for worker '%s': %s", worker_name, exc
+            )
+        cleanup = getattr(thread, "_cleanup_worker_containers", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception as exc:
+                logger.warning(
+                    "detached TTL container cleanup failed for worker '%s': %s",
+                    worker_name,
+                    exc,
+                )
+
+    @staticmethod
+    def _key_parts(key: Any, thread: Any) -> Tuple[str, str, Any]:
+        """Best-effort ``(session_id, worker_name, instance_id)`` for *key*."""
+        try:
+            session_id, worker_name, instance_id = key
+        except (TypeError, ValueError):
+            session_id = getattr(thread, "session_id", "") or ""
+            worker_name = getattr(thread, "worker_name", None) or "worker"
+            instance_id = getattr(thread, "instance_id", 1)
+        return session_id or "", worker_name, instance_id
+
+    def _forget_worker(self, key: Any, session_id: str, worker_name: str) -> None:
+        """Drop a killed worker's registry entry (never raises)."""
+        try:
+            instance_id = key[2]
+        except (TypeError, IndexError, KeyError):
+            instance_id = 1
+        unregister = getattr(self._registry, "unregister_worker", None)
+        if not callable(unregister):
+            return
+        try:
+            unregister(session_id, worker_name, instance_id=instance_id)
+        except Exception as exc:
+            logger.warning(
+                "detached TTL registry cleanup failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
 
     @staticmethod
     def _is_alive(thread: Any) -> bool:
@@ -652,11 +798,19 @@ class WorkerManager:
         return True
 
     def _stop_thread(self, thread: Any, worker_name: str) -> bool:
-        """Cooperative stop + bounded join (never ``Thread.kill``)."""
-        try:
-            thread.stop()
-        except Exception:
-            pass
+        """Kill + bounded join.
+
+        PHASE 2.1a: ``thread.stop()`` now DETACHES (parks the worker and
+        returns), so a manager stop that leaves the instance running must call
+        ``kill()`` -- with a ``stop()`` fallback for lightweight thread doubles
+        that predate the split.
+        """
+        _killer = getattr(thread, "kill", None) or getattr(thread, "stop", None)
+        if callable(_killer):
+            try:
+                _killer()
+            except Exception:
+                pass
         return wait_for_worker_exit(thread, worker_name)
 
 
