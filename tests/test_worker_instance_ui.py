@@ -38,8 +38,16 @@ from starlette.requests import Request as StarletteRequest
 
 from agent.events import EventBus, EventType, create_event
 
-from tests.test_worker_sync_query_timeout_containment import _spawn_worker, _wait_until
+from tests.test_worker_sync_query_timeout_containment import (
+    _FakeContainerManager,
+    _owned_container,
+    _spawn_worker,
+    _wait_until,
+)
 
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
+
+import tools.workspace.worker_container as worker_container
 from tools.workspace import worker as worker_module
 from tools.workspace.worker import (
     Worker,
@@ -300,8 +308,26 @@ def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
     """A live instance: pause via the route drives the thread to 'paused',
     a query against the paused instance returns the manual-pause envelope,
     resume restores it, and a subsequent query envelope carries
-    instance_id/instance_label."""
-    thread = _spawn_worker(tmp_path, monkeypatch, name="w1", session_id="sess-7")
+    instance_id/instance_label.  The tail then exercises the PHASE 2.1a verb
+    split on the same live thread: ``stop`` only DETACHES (thread alive,
+    registry entry intact, containers untouched) while ``kill`` is what
+    terminates and reclaims."""
+    # The worker owns one reclaimable (ephemeral) container, so the detach
+    # assertions below are meaningful: ``stop`` must leave it untouched while
+    # ``kill`` reclaims exactly this container through the normal teardown path.
+    cm = _FakeContainerManager([
+        _owned_container("c-w1", "tm-sess-7-w1", "sess-7:w1"),
+    ])
+    thread = _spawn_worker(
+        tmp_path,
+        monkeypatch,
+        name="w1",
+        session_id="sess-7",
+        container_manager=cm,
+    )
+    # Ownership is an EXACT match on ``<session id>:<worker name>``; the label
+    # above is that identity (asserted so the container claims cannot drift).
+    assert thread.owner_identity == "sess-7:w1"
     _use_tmp_workspace(monkeypatch, tmp_path)
 
     thread._manual_only_pause = True
@@ -368,13 +394,61 @@ def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
     assert "response" in envelope
     assert "done" in json.dumps(envelope)
 
-    # Stop the thread while the _save_context monkeypatch is still active so
-    # run()'s finally-block save doesn't touch the real implementation after
-    # teardown reverts the patch (same hygiene as the containment suite).
-    thread.stop()
-    assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), (
-        "worker thread still alive after stop"
+    # The worker-owned container must resolve to an EPHEMERAL lifecycle class
+    # for teardown to reclaim it (the predicate is fail-closed otherwise, which
+    # would make the "stop must not reclaim" claim vacuous); the real record
+    # store has no record for the fake id, so patch the record seam.
+    monkeypatch.setattr(
+        worker_container,
+        "find_by_docker_label",
+        lambda record_id, vault_root=None: SimpleNamespace(
+            lifecycle_class=LIFECYCLE_EPHEMERAL,
+        ),
     )
+
+    # ── stop = DETACH (PHASE 2.1a): no termination, no reclaim ──
+    resp3 = asyncio.run(
+        workspace_routes.stop_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
+    assert resp3["status"] == "ok"
+    assert resp3["name"] == "w1"
+    assert _wait_until(lambda: thread.status == "detached", timeout=10.0), (
+        f"worker did not detach (status={thread.status}, error={thread.error})"
+    )
+    # Detached means parked, not dead: the thread stays alive, the stop event
+    # stays clear and the registry entry survives so it can be resumed.
+    assert thread.is_alive(), "stop() must not terminate the worker thread"
+    assert not thread._stop_event.is_set(), "stop() must not set _stop_event"
+    with worker_module._registry_lock:
+        assert worker_module._worker_registry.get(("sess-7", "w1", 1)) is thread
+    # ...and its containers are left alone (no stop/remove on the detach path).
+    assert cm.stopped == []
+    assert cm.removed == []
+    assert [c.id for c in cm.list_containers()] == ["c-w1"]
+
+    # ── kill = TERMINATE: the sibling route is the only terminating verb ──
+    # (Killed while the _save_context monkeypatch is still active, so run()'s
+    # finally-block save doesn't touch the real implementation after teardown
+    # reverts the patch — same hygiene as the containment suite.)
+    resp4 = asyncio.run(
+        workspace_routes.kill_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
+    assert resp4["status"] == "ok"
+    assert resp4["name"] == "w1"
+    assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), (
+        "worker thread still alive after kill"
+    )
+    assert thread.status == "killed"
+    assert thread._stop_event.is_set()
+    # run()'s finally block reclaimed the worker-owned container via the same
+    # teardown path, which is what makes the detach-time emptiness above real.
+    assert [c.id for c in cm.stopped] == ["c-w1"]
+    assert [c.id for c in cm.removed] == ["c-w1"]
+    assert cm.list_containers() == []
 
 
 # ── Bridge: per-instance event bus subscriptions and event stamping ─────────
