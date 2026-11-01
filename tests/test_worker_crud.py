@@ -140,8 +140,9 @@ def test_get_workers_name_filter_and_404(tmp_path, monkeypatch):
 def test_get_active_workers_session_scoped(tmp_path, monkeypatch):
     """Active workers come from the open sessions of this workspace only:
     each handle carries exactly {worker_name, instance_id, status, elapsed,
-    name, session_id, last_heartbeat, container_id}, duplicates are deduped,
-    and the rows are sorted by name then instance."""
+    name, session_id, last_heartbeat, container_id, queued_query_count,
+    queued_query_ids}, duplicates are deduped, and the rows are sorted by
+    name then instance."""
     _use_tmp_workspace(monkeypatch, tmp_path)
     started = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
 
@@ -168,6 +169,7 @@ def test_get_active_workers_session_scoped(tmp_path, monkeypatch):
         assert set(entry.keys()) == {
             "worker_name", "instance_id", "status", "elapsed",
             "name", "session_id", "last_heartbeat", "container_id",
+            "queued_query_count", "queued_query_ids",
         }, entry
 
     by_key = {(e["worker_name"], e["instance_id"]): e for e in rows}
@@ -220,6 +222,7 @@ def test_get_active_workers_fallback_all_registry(tmp_path, monkeypatch):
         assert set(entry.keys()) == {
             "worker_name", "instance_id", "status", "elapsed",
             "name", "session_id", "last_heartbeat", "container_id",
+            "queued_query_count", "queued_query_ids",
         }, entry
 
 
