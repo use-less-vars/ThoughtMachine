@@ -160,6 +160,20 @@ jobs:
     name: Linux - auth e2e (browser)
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # The e2e harness repoints HOME to a hermetic temp vault at import time
+    # (tests/conftest.py:149 -- os.environ["HOME"] = HERMETIC_BASE_DIR, a
+    # tempfile.mkdtemp(prefix="hermetic-vault-base-"); pathlib.Path.home and
+    # os.path.expanduser are repointed to match). Playwright's default browser
+    # directory is $HOME/.cache/ms-playwright, so the Chromium this job installs
+    # under the runner's real HOME is invisible inside the test process. Observed
+    # in CI, verbatim:
+    #   playwright._impl._errors.Error: BrowserType.launch: Executable doesn't exist at
+    #   /tmp/hermetic-vault-base-1rrrvaa0/.cache/ms-playwright/chromium_headless_shell-1248/chrome-headless-shell-linux64/chrome-headless-shell
+    # Hence the absolute override below: PLAYWRIGHT_BROWSERS_PATH is an absolute
+    # path, so it survives the HOME move, and nothing in the repo sets or unsets
+    # it (it is documented for humans at tests/e2e/README.md:37).
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -247,7 +261,13 @@ jobs:
 
       - name: Install Chromium for Playwright
         if: steps.changed.outputs.auth == 'true'
-        run: python -m playwright install --with-deps chromium
+        run: |
+          # PLAYWRIGHT_BROWSERS_PATH is job-level env, so it inherits here: make
+          # the install target explicit and prove where the browser landed.
+          mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"
+          python -m playwright install --with-deps chromium
+          python -m playwright install --dry-run chromium
+          ls "${PLAYWRIGHT_BROWSERS_PATH}"
 
       - name: Install frontend dependencies
         if: steps.changed.outputs.auth == 'true'
