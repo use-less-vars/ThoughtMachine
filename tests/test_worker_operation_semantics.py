@@ -512,6 +512,23 @@ class _OpSemBase(unittest.TestCase):
         )
         return _parse_result(tool.execute())
 
+    def _act(
+        self,
+        action: str,
+        name: str | None = None,
+        worker_query: str | None = "",
+        session: str = SESSION,
+    ) -> dict:
+        """Run a raw tool action, including the operator-only kill/resume."""
+        tool = Worker(
+            action=action,
+            worker_name=name,
+            session_id=session,
+            workspace_path="/tmp/test_ws",
+            worker_query=worker_query,
+        )
+        return _parse_result(tool.execute())
+
     def _registry_keys_for(self, name: str) -> list:
         with self._registry._registry_lock:
             return sorted(
@@ -546,21 +563,6 @@ class _OpSemBase(unittest.TestCase):
     ) -> dict:
         tool = Worker(
             action="pause",
-            worker_name=name,
-            session_id=session,
-            workspace_path="/tmp/test_ws",
-            worker_query=worker_query,
-        )
-        return _parse_result(tool.execute())
-
-    def _resume(
-        self,
-        worker_query: str | None = "",
-        name: str | None = None,
-        session: str = SESSION,
-    ) -> dict:
-        tool = Worker(
-            action="resume",
             worker_name=name,
             session_id=session,
             workspace_path="/tmp/test_ws",
@@ -744,6 +746,29 @@ class TestWorkerPauseResumeSemantics(_OpSemBase):
         self._worker_mod._SESSION_MAIN_PAUSED.clear()
         self._worker_mod._SESSION_MAIN_PAUSED.update(self._old_main_paused)
 
+    def _run_one_agent_turn(self, session_id: str, worker_mode: bool = False) -> list:
+        """Drive one REAL Agent turn (puppet LLM, no network).
+
+        ``session_id`` is the same string the Worker tool receives from the
+        ToolExecutor, so this exercises the real discard path against the real
+        module-level ``_SESSION_MAIN_PAUSED`` set.
+        """
+        from agent.config.models import AgentConfig
+        from agent.core.agent import Agent
+        from tests.mocks.puppet_agent import PuppetLLM
+
+        agent = Agent(
+            config=AgentConfig(
+                api_key="test-key",
+                enable_logging=False,
+                worker_mode=worker_mode,
+            ),
+            session_id=session_id,
+        )
+        puppet = PuppetLLM(scenario=[{"type": "assistant", "content": "ok"}])
+        agent.llm_client.stream_completion = puppet.stream_completion
+        return list(agent.process_query("continue"))
+
     # ── Pause Main ─────────────────────────────────────────────────────────────
 
     def test_pause_main_only_empty_query(self):
@@ -810,20 +835,63 @@ class TestWorkerPauseResumeSemantics(_OpSemBase):
             [("w1", 1)],
         )
 
-    def test_resume_clears_main_and_workers(self):
-        """resume discards the main-pause and resumes paused workers."""
+    def test_resume_action_is_operator_only(self):
+        """``resume`` is no longer an agent action: it is refused and NOTHING
+        is resumed (the main-pause and the paused worker stay as they were)."""
         f1 = self._seed_join_fake(SESSION, "w1", 1)
         self._pause(worker_query="all main")  # main + w1 paused
         self.assertIn(SESSION, self._worker_mod._SESSION_MAIN_PAUSED)
         f1.status = "paused"
         f1._manual_only_pause = True
 
-        result = self._resume(worker_query="all main")
+        result = self._act("resume", name="w1", worker_query="all main")
 
-        self.assertEqual(result.get("status"), "resumed")
+        self.assertIn("operator-only", result.get("error", ""))
+        self.assertNotIn("resume", result.get("available_actions", []))
+        self.assertIn(SESSION, self._worker_mod._SESSION_MAIN_PAUSED)
+        f1.resume.assert_not_called()
+        self.assertEqual(f1.status, "paused")
+        self.assertTrue(f1._manual_only_pause)
+
+    # ── Stranded main-pause marker (cleared at the next operator turn) ────
+
+    def test_next_operator_turn_clears_stranded_main_pause(self):
+        """A new main-agent turn clears the session marker; the tool cannot.
+
+        Regression: dropping the agent-facing ``resume`` action removed the
+        only in-agent discard site for ``_SESSION_MAIN_PAUSED``, so a
+        main-scope ``pause`` left the session reporting ``paused`` to
+        join/wait_for_job forever.  The prescribed discard event is the start
+        of the next genuine operator turn (``Agent.process_query``).
+        """
+        self._seed_join_fake(SESSION, "w1", 1)
+        self._pause(worker_query="main")
+        self.assertIn(SESSION, self._worker_mod._SESSION_MAIN_PAUSED)
+
+        # Negative half: the Worker tool has no way to clear it — no
+        # ``resume`` action, and an explicit resume request is refused without
+        # touching the real set.
+        self.assertNotIn("resume", Worker.VALID_ACTIONS)
+        refused = self._act("resume", name="w1", worker_query="all main")
+        self.assertIn("operator-only", refused.get("error", ""))
+        self.assertNotIn("resume", refused.get("available_actions", []))
+        self.assertIn(SESSION, self._worker_mod._SESSION_MAIN_PAUSED)
+
+        events = self._run_one_agent_turn(SESSION)
+
+        self.assertTrue(events, "sanity: the agent turn really ran")
         self.assertNotIn(SESSION, self._worker_mod._SESSION_MAIN_PAUSED)
-        f1.resume.assert_called_once()
-        self.assertFalse(f1._manual_only_pause)
+
+    def test_worker_turn_does_not_clear_main_pause(self):
+        """Worker turns share the parent session id but are not operator turns."""
+        self._seed_join_fake(SESSION, "w1", 1)
+        self._pause(worker_query="main")
+        self.assertIn(SESSION, self._worker_mod._SESSION_MAIN_PAUSED)
+
+        events = self._run_one_agent_turn(SESSION, worker_mode=True)
+
+        self.assertTrue(events, "sanity: the worker turn really ran")
+        self.assertIn(SESSION, self._worker_mod._SESSION_MAIN_PAUSED)
 
     def test_join_returns_paused_when_main_paused(self):
         """While the main agent is paused, join returns paused promptly."""
@@ -1035,6 +1103,61 @@ def _registry_teardown():
         except Exception:
             pass
         t.join(timeout=5)
+
+
+class TestOperatorOnlyActions(_OpSemBase):
+    """The agent must NOT be able to terminate (kill) or revive (resume).
+
+    Operator ruling: both are operator-only (workspace UI / the workspace HTTP
+    routes).  The agent keeps ``stop``, which DETACHES — a recoverable park,
+    not a termination.
+    """
+
+    def test_kill_and_resume_are_not_agent_actions(self):
+        """The advertised/valid action set excludes the operator-only pair."""
+        self.assertNotIn("kill", Worker.VALID_ACTIONS)
+        self.assertNotIn("resume", Worker.VALID_ACTIONS)
+        # stop (detach) is the agent's option and must stay available.
+        self.assertIn("stop", Worker.VALID_ACTIONS)
+
+    def test_action_kill_errors_and_terminates_nothing(self):
+        """A kill request returns a teaching error and leaves the worker live."""
+        fake = self._seed_fake(SESSION, "w1", 1)
+
+        result = self._act("kill", name="w1")
+
+        self.assertIn("operator-only", result.get("error", ""))
+        self.assertIn("kill", result.get("error", ""))
+        self.assertIn("stop", result.get("error", ""))
+        self.assertEqual(result.get("available_actions"), Worker.VALID_ACTIONS)
+        # Nothing was terminated and nothing was detached.
+        fake.kill.assert_not_called()
+        fake.stop.assert_not_called()
+        self.assertEqual(fake.status, "ready")
+        self.assertIn((SESSION, "w1", 1), self._registry._worker_registry)
+
+    def test_action_kill_on_detached_worker_keeps_it_detached(self):
+        """A kill request cannot reach a parked worker either."""
+        fake = self._seed_fake(SESSION, "w1", 1, status="detached")
+
+        result = self._act("kill", name="w1")
+
+        self.assertIn("operator-only", result.get("error", ""))
+        fake.kill.assert_not_called()
+        self.assertEqual(fake.status, "detached")
+        self.assertIn((SESSION, "w1", 1), self._registry._worker_registry)
+
+    def test_action_stop_still_detaches(self):
+        """stop remains available and DETACHES: registration and thread live on."""
+        fake = self._seed_fake(SESSION, "w1", 1)
+
+        result = self._act("stop", name="w1")
+
+        self.assertEqual(result.get("status"), "detached")
+        fake.stop.assert_called_once()
+        fake.kill.assert_not_called()
+        self.assertEqual(fake.status, "detached")
+        self.assertIn((SESSION, "w1", 1), self._registry._worker_registry)
 
 
 def _fake_tool_loop(self, query):
