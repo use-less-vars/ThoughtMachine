@@ -8,14 +8,16 @@ reads `NOT FOUND — searched <patterns>`.
 
 This revision applies three operator rulings: **R1** Stop means *detach* (Q1), **R2**
 Docker SDK calls need *hard per-call deadlines* (extends Q2), **R3** the agent needs a
-*visual* capability, not merely a read-only tool listing (Q5). Q3 and Q4 are unchanged.
+*visual* capability, not merely a read-only tool listing (Q5). Q3 is unchanged; **Q4 is
+amended by R3** — the `visual` tool is the one bounded exception to synchronous tools
+(operator decision), recorded in Q4 itself.
 
 | # | Question (short) | Recommendation | Risk |
 |---|---|---|---|
-| Q1 | Does Stop/stop detach a worker or terminate it? | **Stop = detach** (park the loop, save state, keep thread + registry); terminate becomes a separate `kill` verb | high |
+| Q1 | Does Stop/stop detach a worker or terminate it? | **Stop = detach** (park the loop, save state, keep thread + registry); terminate becomes a separate `kill` verb; queries arriving while detached are **queued FIFO**, never rejected | high |
 | Q2 | What happens when a worker exceeds its timeout — is the work continued? | Keep timeout terminal, add a **hard deadline on every blocking Docker SDK call**, and delete the dead retry knob | high |
 | Q3 | Does a config/addendum write reach an already-running worker? | Declare spawn-time snapshot as the contract; do not attempt write-through into worker agents | medium |
-| Q4 | Should tool calls return a job handle instead of blocking the turn? | No for v1: keep tools synchronous; reuse the existing `submit_query`/`job_status` shape if async arrives | high |
+| Q4 | Should tool calls return a job handle instead of blocking the turn? | No for v1: keep tools synchronous — the default for **every** tool; the `visual` tool (Q5) is the single, bounded exception and carries its own timeout + cancellation protocol; reuse the existing `submit_query`/`job_status` shape if async ever arrives | high |
 | Q5 | Is there a UI surface for tools / tool authoring? | Keep authoring rejected; add **one** sandboxed, permission-gated `visual` tool so the agent can *see* | medium |
 
 ---
@@ -40,7 +42,7 @@ Docker SDK calls need *hard per-call deadlines* (extends Q2), **R3** the agent n
 | `_worker_max_retries` is resolved and never read | verified | `:1006` — `_retries = _session_cfg.get("worker_max_retries")`; `:1009` — `self._worker_max_retries: int = _retries`; exactly one occurrence repo-wide | deleted (Q2) |
 | Old Q2 quote of `agent/core/state.py:247-248` | **drifted** | actual `:247-248` — `self.last_time_warning_state = TimeState.LOW` / `# Time returned to LOW — this monitor clears its own restrictions`; the quoted "mirrors the turn/token LOW branches" text is not there | quote replaced (Q2, Corrections) |
 | `agent/core/docker_executor.py` (named in the prior draft) | **false** | file does not exist; docker execution is `tools/docker_code_runner.py` | path corrected (Q2, Corrections) |
-| Q1 recommendation "keep stop = terminate, add detach as a separate verb" | **false by ruling (R1)** | operator ruling: Stop *is* detach; Kill is the separate verb | recom­mendation reversed (Q1) |
+| Q1 recommendation "keep stop = terminate, add detach as a separate verb" | **false by ruling (R1)** | operator ruling: Stop *is* detach; Kill is the separate verb | recommendation reversed (Q1) |
 | Q5 recommendation "read-only `/api/tools` suffices" | **false by ruling (R3)** | operator wants the *agent* to view, not the operator to list; `/api/tools` is `web_ui/backend/server.py:3951-3952` — `@app.get("/api/tools")` / `async def api_get_tools():` | recommendation replaced (Q5) |
 | Tool *authoring* from the UI is correctly rejected | verified (ruling upholds it) | `tools/base.py:50-60` injects `session_permissions` / `effective_permissions` from the executor: `:57` — `effective_permissions: Optional[Dict[str, Any]] = Field(` / `:59` — `description='Effective merged permissions (session × workspace) for atomic checks.',` | retained in Q5 |
 | `ImageBlock` exists but has no producer and no provider adapter | verified | `agent/core/ir.py:57` — `class ImageBlock:`; `:67` — `media_type: str  # e.g. "image/png"`; referenced only in `ir.py` + `tests/core/test_ir.py` | prerequisite named (Q5) |
@@ -174,6 +176,44 @@ spawning ──▶ ready ──▶ busy ──▶ ready            (normal turn)
    `now - detached_at > WORKER_TIMEOUT_SECONDS` by the existing
    `cleanup_stale_worker_containers` sweep (`infra/container_manager.py:5104`) or the
    worker-manager tick that replaces the registry pop.
+
+### Queries submitted while the worker is detached
+
+A query that arrives for a `detached` worker is **accepted and queued, never rejected**.
+Detach exists so that the work can continue *later*, so refusing the next query would
+make the verb pointless: the caller keeps the existing `submit_query` contract and gets
+its `job_id` back at enqueue time — `tools/workspace/job_registry.py:7` —
+`callers that used ``submit_query`` (which returns immediately with a job_id)`.
+
+- **Strict FIFO, one queue per worker instance.** Multiple submissions preserve arrival
+  order, and the queue is drained head-first, so two callers cannot interleave or be
+  reordered by whichever thread happens to wake first.
+- **Single in flight, always.** The state machine's invariant is unchanged — never two
+  concurrent queries. A queued entry is dispatched only when the worker is otherwise
+  idle, one at a time, and each dispatch is `detach → resume → query`: the park events
+  are cleared and set first (`worker_thread.py:1546` `self._pause_event.clear()`, `:1547`
+  `self._resume_event.set()`) and only then is the query handed to the loop.
+- **No token burn while queued.** A queued entry is inert until a resume signal: no
+  polling, no periodic wake-ups, no model calls, nothing scheduled on its behalf. The
+  only wait involved is the existing park loop — `worker_thread.py:2436-2443` and
+  `:2685-2694`, `while self._pause_event.is_set() and not self._stop_event.is_set():` /
+  `self._resume_event.wait(1.0)` — which is a once-per-second re-check of two events, not
+  work. Enqueueing **must not** set `_resume_event`: setting it is what *starts* a turn,
+  so a producer that woke the worker on enqueue would turn the queue into exactly the
+  background token spend `web_ui/backend/bridge.py:1791` names as the failure mode.
+- **Expiry rejects, loudly.** If the detached TTL elapses before the worker is resumed,
+  the worker is killed *and* every queued query is rejected with an explicit error naming
+  the TTL — `agent/config/defaults.py:61` — `WORKER_TIMEOUT_SECONDS = 600`, e.g.
+  `worker 'X' detached for longer than WORKER_TIMEOUT_SECONDS (600 s) — queued query
+  discarded`. Queued work never vanishes silently: no TTL path may drop the queue without
+  a job result that says why.
+- **Kill discards.** `kill` — and the session Stop cascade, which routes to it — drops the
+  queue and rejects the queued queries the same way, because the instance (thread, agent,
+  containers) no longer exists to run them.
+- **Reconciling with the chained-query rule above.** "The next `query`/`submit_query` on a
+  detached worker must clear the park events and then dispatch (detach → resume → query)"
+  describes the *first dequeued* entry, not a way around the queue: while a turn is
+  already running, later submissions stay queued behind it.
 
 ### Options
 
@@ -564,6 +604,9 @@ token accounting at `agent/core/tool_executor.py` stays simple. Cost: a long too
 call cannot be interrupted (verbatim at `docs/design-interruptible-tool-calls.md:4`)
 and eats the worker's soft budget (`agent/config/defaults.py:61`) with nothing to
 show if it times out.
+This is the default for **every** tool. The `visual` tool (Q5) is the single named,
+bounded exception, and it is the exception *because* it ships a dedicated timeout and
+cancellation protocol — see the amendment below.
 
 **Option B — thread the tool, keep the string contract (wrapper only).**
 Tradeoff: solves *interruption* without changing any tool's signature — exactly the
@@ -589,6 +632,50 @@ pending result breaks that invariant far more deeply than it buys. Note explicit
 any follow-up that the worker-level `submit_query` precedent
 (`tools/workspace/job_registry.py:4`) is *not* a template for tools — it moves the
 async boundary up to the parent, which is the cheaper lever.
+
+Exactly one tool is excepted, and by operator decision rather than by this reasoning:
+the `visual` tool (Q5), the single bounded exception with its own timeout and
+cancellation protocol (amendment below).
+
+### Amendment — the visual tool is the one bounded exception (operator decision)
+
+**Operator decision, recorded verbatim:** "Tools are synchronous by default, with the
+visual tool (Q5) being the specific, bounded exception requiring a dedicated timeout and
+cancellation protocol."
+
+This bounds the question rather than re-opening it. Option A stays the **default for all
+tools**: nothing in the `execute() -> str` contract (`tools/base.py:41` — `They must
+implement execute() returning a string.`) or in the sequential dispatch loop
+(`agent/core/tool_executor.py:245`) changes for the existing toolset. Exactly one tool is
+exempt — the container-executed `visual` tool specified in Q5
+(`tools/visual_tool.py`, grain `visual: view`). The exception is not "async tools"; it is
+one named tool whose call is long, external and cancellable.
+
+Because the exception is bounded, it must carry its own budget and its own cancellation
+path instead of inheriting the turn's:
+
+- **Dedicated timeout.** The render gets a per-call deadline of its own, not the worker's
+  soft budget (`agent/config/defaults.py:61`), enforced in the container layer with the
+  pattern R2 already standardises for Q2 — thread + `join(timeout)` + `container.kill()`
+  at `infra/container_manager.py:2561-2570` (`raise TimeoutError(f"Command timed out after
+  {timeout} seconds")`). A render that overruns is killed and returned as an error
+  string, never as a pending result.
+- **Dedicated cancellation.** The call must honour the cooperative stop signal *during*
+  the render — `getattr(self.config, "stop_check", None)`, checked at
+  `agent/core/tool_executor.py:252` — which is precisely what the between-calls-only
+  checkpoint at `:246-247` (`# Cooperative cancellation: if a stop was requested between
+  tool` / `# calls, skip execution and record a clean 'stopped' tool result`) cannot do.
+  Cancelling kills the render container (ephemeral per Q5, so nothing leaks) and returns
+  a `stopped` result in the established shape.
+- **Everything else stays Option A.** No job handle, no poll convention, no pending tool
+  result in the transcript: the one exception returns a value or an error,
+  synchronously, under a deadline. Q5 owns the rest of the tool's contract — grain
+  (`visual: view`), one PNG `ImageBlock` capped at 1 MB, and the IR/provider
+  prerequisites.
+
+The alternative — treating the visual tool as the thin end of a general async-tool wedge —
+is what this amendment rules out. One named exception with a timeout and a cancellation
+protocol is reviewable; a second return type on `execute()` is not.
 
 ### Blast radius
 
@@ -800,3 +887,15 @@ can validate it). Ship the IR/provider half as the same change, because an
    unproduced and unadapted; `ToolResultBlock.content` is a `str` (`ir.py:80`). Any
    visual design must change both, which is why Q5 lists them as prerequisites rather
    than as assumptions.
+9. **Q4 amended, not left "unchanged".** The prior revision of this document asserted
+   "Q3 and Q4 are unchanged" in its header while Q5 introduced a container-executed
+   `visual` tool — i.e. it recommended synchronous tools in Q4 and a long, cancellable
+   tool in Q5. A document asserting two contradictory recommendations is a bug, not a
+   nuance: a reader cannot tell whether tools block. The operator decision closes it
+   verbatim — "Tools are synchronous by default, with the visual tool (Q5) being the
+   specific, bounded exception requiring a dedicated timeout and cancellation protocol."
+   Q4's Option A therefore stays *the default for all tools*, the `visual` tool is named
+   as the single bounded exception, and that exception is specified as a dedicated
+   timeout (container-layer hard deadline) plus a dedicated cancellation path
+   (`stop_check` honoured inside the render). The header claim and the summary-table Q4
+   row are corrected to match, for traceability.
