@@ -225,6 +225,7 @@ from web_ui.backend.local_gate import (
     TEST_HARNESS_CLIENT_HOSTS as _TEST_HARNESS_CLIENT_HOSTS,
 )
 from web_ui.backend.auth_boundary import AuthBoundaryMiddleware
+from web_ui.backend import auth_boundary, auth_token
 from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.addendum_routes import router as addendum_router
 from web_ui.backend.prompt_routes import router as prompt_router
@@ -4096,8 +4097,52 @@ async def health(request: Request):
 
 @app.get("/api/health")
 async def api_health(request: Request):
-    """Structured health alias of GET /health (back-compat mirror)."""
-    return await health(request)
+    """Liveness mirror of GET /health -- and only the liveness bit.
+
+    Deliberately NOT ``return await health(request)``.  This path is exempt from
+    the credential (``auth_boundary.EXEMPT_PATHS``), so everything it returns is
+    readable by any unauthenticated caller on loopback -- and ``/health`` also
+    carries the build revision, which is a fact about this deployment rather than
+    a liveness bit.  A probe needs one field; the alias is narrowed to it, and
+    ``/health`` itself keeps its payload because it is not the exempt question.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/api/auth/session")
+async def auth_session(request: Request):
+    """Report whether *this* request carries a usable credential.
+
+    Exempt at the boundary (see ``auth_boundary.EXEMPT_PATHS``) precisely so it
+    can answer -- because the question is about a credential the caller may not
+    have yet, and a refusal from the boundary is indistinguishable from "server
+    down" to a client that never got a response body.  The credential check is
+    therefore repeated here, on the same helper the middleware uses
+    (``auth_boundary.credential_kind``), so there is one policy with two callers
+    rather than a second, drift-prone implementation.
+
+    What it may say is bounded on purpose: the credential *kind* and nothing
+    else.  The token, its length, its file path and the failure reason are all
+    facts about the secret, and a caller who presented no credential must not
+    learn any of them from an unauthenticated endpoint.
+    """
+    try:
+        token = auth_token.ensure_token()
+    except RuntimeError as exc:
+        # A broken credential store is "not authenticated", not a 500: this
+        # route's whole job is to answer, and every other route already fails
+        # closed on the same error inside the middleware.
+        log("ERROR", "server.auth_session",
+            f"credential store unusable: {exc}")
+        return JSONResponse(
+            {"authenticated": False}, status_code=auth_boundary.UNAUTHORIZED
+        )
+    kind = auth_boundary.credential_kind(request.scope, token)
+    if kind is None:
+        return JSONResponse(
+            {"authenticated": False}, status_code=auth_boundary.UNAUTHORIZED
+        )
+    return {"authenticated": True, "credential": kind}
 
 
 @app.get("/api/vault/status")
