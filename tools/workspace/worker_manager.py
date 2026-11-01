@@ -203,11 +203,10 @@ class PeriodicStaleCheck(threading.Thread):
             age,
         )
         self._announce_detached_ttl_kill(thread, session_id, worker_name, age)
-        # SEAM (phase 2.1b, FIFO query queue): this is the ONE place where a
-        # query queued for a detached worker must be rejected/errored out
-        # instead of being started on a killed instance. Queued queries do not
-        # exist yet (a busy worker still raises WorkerBusyError), so nothing is
-        # rejected here today.
+        # PHASE 2.1b: the queue can never be drained once this instance is
+        # killed, so every query queued while it was detached is rejected here
+        # -- loudly (runtime channel + audit log), never silently dropped.
+        self._reject_queued_queries(thread, worker_name)
         self._kill_detached_worker(thread, worker_name)
         self._forget_worker(key, session_id, worker_name)
 
@@ -245,6 +244,31 @@ class PeriodicStaleCheck(threading.Thread):
         except Exception as exc:  # pragma: no cover - observability only
             logger.warning(
                 "detached TTL kill audit failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+
+    @staticmethod
+    def _reject_queued_queries(thread: Any, worker_name: str) -> None:
+        """Reject the detached worker's queued queries before it is killed.
+
+        Delegates to the thread's own ``reject_queued_queries`` so each job is
+        terminalised in the registry AND announced on the runtime channel and
+        audit log. Best-effort: never raises, and a thread without the method
+        (older/duck-typed) is simply skipped.
+        """
+        reject = getattr(thread, "reject_queued_queries", None)
+        if not callable(reject):
+            return
+        try:
+            reject(
+                "detached for longer than WORKER_TIMEOUT_SECONDS "
+                f"({WORKER_TIMEOUT_SECONDS} s)",
+                audit_event_type="WORKER_DETACHED_TTL_QUEUE_REJECTED",
+            )
+        except Exception as exc:
+            logger.warning(
+                "detached TTL queue rejection failed for worker '%s': %s",
                 worker_name,
                 exc,
             )
