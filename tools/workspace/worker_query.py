@@ -338,7 +338,12 @@ def _resolve_terminal(
     else:
         stop_called = True
         try:
-            thread.stop()
+            # PHASE 2.1a: the caller wants this unresponsive instance GONE, so
+            # this must be kill() — stop() only detaches now (the worker would
+            # park, stay alive and hold its containers). kill() with a stop()
+            # fallback for lightweight thread doubles that predate the split.
+            _killer = getattr(thread, "kill", None) or thread.stop
+            _killer()
         except Exception:
             pass
         exited = wait_for_worker_exit(thread, worker_name)

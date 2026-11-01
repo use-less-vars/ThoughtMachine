@@ -261,11 +261,13 @@ def test_sync_worker_docker_blocked_stop_waits_for_exit(tmp_path, monkeypatch):
     assert envelope["error"]
     assert "stopped cooperatively" in envelope["note"]
     assert "Re-spawn" in envelope["note"]
-    assert envelope["status"] in ("stopping", "stopped")
+    # PHASE 2.1a: the timeout path TERMINATES, so the envelope carries the
+    # terminal "killed" status ("stopping"/"stopped" are dead vocabulary).
+    assert envelope["status"] == "killed"
 
-    # The stop guarantee: no alive worker thread when the sync call returns.
+    # The kill guarantee: no alive worker thread when the sync call returns.
     assert not thread.is_alive(), "worker thread still alive after sync call returned"
-    assert thread.status == "stopped"
+    assert thread.status == "killed"
 
     # Containers: owned reclaimed, resource untouched.
     assert [c.id for c in cm.stopped] == ["c-owned"]
@@ -320,10 +322,11 @@ def test_sync_worker_normal_completion_no_early_return(tmp_path, monkeypatch):
         # reply is emitted, so only liveness is asserted here.)
         assert thread.is_alive(), "normal reply must leave the worker alive"
     finally:
-        # Stop the thread while the _save_context monkeypatch is still active
+        # Kill the thread while the _save_context monkeypatch is still active
         # (same hygiene as the containment suite) so run()'s finally-block save
         # does not touch the real implementation after teardown reverts it.
-        thread.stop()
+        # (stop() only detaches; it would leave the thread parked and alive.)
+        thread.kill()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
 
 
@@ -385,10 +388,10 @@ def test_sync_worker_no_orphan_thread_after_return(tmp_path, monkeypatch):
     envelope = tool._action_query([])
     assert envelope["error"]
     assert not thread.is_alive(), "orphan thread survived the sync call"
-    assert thread.status == "stopped"
+    assert thread.status == "killed"
     with worker_module._registry_lock:
         entry = worker_module._worker_registry.get(("sess-s4", "w4"))
-    assert entry is None or entry.status == "stopped"
+    assert entry is None or entry.status == "killed"
 
     # run()'s terminal path ran: the in-flight query drained with a reply.
     assert not reply_q.empty(), "in-flight query never drained to its reply queue"

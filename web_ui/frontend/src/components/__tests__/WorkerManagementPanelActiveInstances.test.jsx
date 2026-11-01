@@ -160,7 +160,10 @@ describe('WorkerManagementPanel — active instances', () => {
     expect(onSelectWorker.mock.calls[1]).toEqual(['coder', WORKSPACE_ID, 2, 'coder#2'])
   })
 
-  it('Stop POSTs to /workers/{name}/stop?instance_id= and flips the row to stopped', async () => {
+  // SEMANTIC: backend stop DETACHES (workspace_routes.py:_stop_worker_instance
+  // writes runtime_status 'detached', worker_thread.py:1494), so the row must
+  // flip to "Detached" — not to a 'stopped' state the backend never sets.
+  it('Stop POSTs to /workers/{name}/stop?instance_id= and flips the row to Detached', async () => {
     const stopRoute = `/api/workspace/${WORKSPACE_ID}/workers/coder/stop`
     const fetchMock = stubFetchByUrl({
       [ACTIVE_URL]: jsonOk([BUSY_WORKER]),
@@ -181,7 +184,7 @@ describe('WorkerManagementPanel — active instances', () => {
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(`${stopRoute}?instance_id=1`, { method: 'POST' })
     )
-    expect(await screen.findByText('stopped')).toBeInTheDocument()
+    expect(await screen.findByText('Detached')).toBeInTheDocument()
   })
 
   it('Pause POSTs to /workers/{name}/pause?instance_id= and shows Pausing…', async () => {

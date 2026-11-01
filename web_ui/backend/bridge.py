@@ -1785,7 +1785,13 @@ class WebAgentBridge:
                                 log('INFO', 'server.bridge', f'Worker resumed: {wname}')
 
     def _stop_session_workers(self) -> int:
-        """Cooperatively stop every worker thread of THIS session.
+        """Terminate (KILL) every worker thread of THIS session.
+
+        PHASE 2.1a: STOP means DETACH, so this cascade must NOT call
+        ``thread.stop()`` -- that would leave the worker parked and alive,
+        still holding its containers, and the Session Stop would no longer
+        terminate the session's work. It calls ``thread.kill()`` instead, the
+        only termination path.
 
         Worker sub-agents are children of the session, not of the parent's
         current turn: unless something stops them here they outlive the Stop
@@ -1797,11 +1803,11 @@ class WebAgentBridge:
         enforces).
 
         The registry is snapshotted under ``_registry_lock`` and the lock is
-        RELEASED before any ``thread.stop()`` is called: a worker's own stop
+        RELEASED before any ``thread.kill()`` is called: a worker's own kill
         path writes status/command files and touches the registry, so calling
         into the worker while holding that lock would deadlock against it.
 
-        Returns the number of workers asked to stop.
+        Returns the number of workers asked to terminate.
         """
         if not (WORKER_BUS_AVAILABLE and _worker_registry is not None
                 and _registry_lock is not None):
@@ -1834,25 +1840,26 @@ class WebAgentBridge:
                         continue
                 except Exception:
                     pass
-            # Already terminal or already stopping: stop() is cooperative and
-            # not idempotent (it re-publishes WORKER_STOPPING), so a second
-            # Stop press must not re-stop a worker that is on its way out.
-            if getattr(thread, 'status', None) in ('stopping', 'stopped'):
+            # Already terminal or already stopping: kill() is not idempotent
+            # (it re-publishes WORKER_STOPPING and re-terminates tracked
+            # executions), so a second Stop press must not re-kill a worker
+            # that is on its way out.
+            if getattr(thread, 'status', None) in ('killed', 'stopping', 'stopped'):
                 continue
-            stop_worker = getattr(thread, 'stop', None)
-            if not callable(stop_worker):
+            kill_worker = getattr(thread, 'kill', None)
+            if not callable(kill_worker):
                 continue
             try:
-                # Cooperative: never Thread.kill. The worker truncates at its
-                # next checkpoint and exits its run loop on its own.
-                stop_worker()
+                # Termination, not detach (PHASE 2.1a: stop() would only park
+                # the worker and it would outlive the Session Stop).
+                kill_worker()
                 stopped += 1
-                log('INFO', 'server.bridge', f'Worker stopped by request_stop(): {wname}')
+                log('INFO', 'server.bridge', f'Worker killed by request_stop(): {wname}')
             except Exception as exc:
-                log('WARNING', 'server.bridge', f'Failed to stop worker {wname}: {exc}')
+                log('WARNING', 'server.bridge', f'Failed to kill worker {wname}: {exc}')
         if stopped:
             log('INFO', 'server.bridge',
-                f'request_stop(): {stopped} worker(s) stopping for session {session_id}')
+                f'request_stop(): {stopped} worker(s) terminated for session {session_id}')
         return stopped
 
     def request_stop(self) -> bool:

@@ -510,6 +510,57 @@ def _worker_elapsed_seconds(started_at: Optional[str]) -> Optional[float]:
         return None
 
 
+def _worker_queued_queries(thread) -> Dict[str, Any]:
+    """Report the queries *thread* has accepted but not yet dequeued.
+
+    The single source of truth is ``WorkerThread.pending_query_jobs()``, which
+    returns a copy of the thread's in-memory deque of accepted job ids; entries
+    leave that deque as the worker loop dequeues them, so the reported count is
+    a live snapshot rather than a ledger.  Reading it is purely observational:
+    no enqueue, resume, registry or audit side effects and no EventBus traffic.
+    ``pending_query_jobs()`` copies the deque under the thread's
+    ``_queued_lock``, a plain ``threading.Lock`` that no holder keeps across I/O
+    or an LLM call, so this cannot stall the route.
+
+    Deliberately defensive: duck-typed thread doubles without a callable
+    ``pending_query_jobs``, a getter that raises, a non-sequence result, and
+    inactive/stopped threads (whose queue is cleared when pending queries are
+    rejected) all report an empty queue instead of failing the request.
+    """
+    getter = getattr(thread, "pending_query_jobs", None)
+    if not callable(getter):
+        # Genuinely no queue to read (duck-typed double, inactive entry):
+        # reporting 0 is correct here, so this path stays silent.
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    worker_name = getattr(thread, "worker_name", "") or ""
+    try:
+        job_ids = getter()
+    except Exception:
+        # The queue state is UNKNOWN but the response says 0 — never let that
+        # silently read as an idle worker.
+        logger.warning(
+            "Worker %r: could not read its queued queries — "
+            "pending_query_jobs() raised, so queued_query_count is reported "
+            "as 0 and any queries it holds are not shown",
+            worker_name,
+            exc_info=True,
+        )
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    if not isinstance(job_ids, (list, tuple)):
+        # Same unknown-state case, without an exception to attach.
+        logger.warning(
+            "Worker %r: could not read its queued queries — "
+            "pending_query_jobs() returned %s instead of a list/tuple, so "
+            "queued_query_count is reported as 0 and any queries it holds "
+            "are not shown",
+            worker_name,
+            type(job_ids).__name__,
+        )
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    ids = [str(job_id) for job_id in job_ids]
+    return {"queued_query_count": len(ids), "queued_query_ids": ids}
+
+
 def _worker_active_entry(thread) -> Dict[str, Any]:
     """Map a live WorkerThread to its compact runtime handle.
 
@@ -517,8 +568,10 @@ def _worker_active_entry(thread) -> Dict[str, Any]:
     its owning session, runtime status and heartbeat freshness.  ``elapsed``
     is seconds since start (None when the start timestamp is missing);
     ``container_id`` is the thread's provisioned container when attributable
-    (None otherwise).  ``worker_name``/``instance_id``/``status``/``elapsed``
-    are kept for backward compatibility with existing consumers.
+    (None otherwise).  ``queued_query_count``/``queued_query_ids`` expose the
+    queries the thread has accepted but not yet dequeued (see
+    ``_worker_queued_queries``); ``worker_name``/``instance_id``/``status``/
+    ``elapsed`` are kept for backward compatibility with existing consumers.
     """
     return {
         "worker_name": getattr(thread, "worker_name", ""),
@@ -529,6 +582,7 @@ def _worker_active_entry(thread) -> Dict[str, Any]:
         "session_id": getattr(thread, "session_id", "") or "",
         "last_heartbeat": getattr(thread, "last_heartbeat", None),
         "container_id": getattr(thread, "container_id", None),
+        **_worker_queued_queries(thread),
     }
 
 
@@ -621,14 +675,17 @@ async def get_active_workers(
     """Return live worker threads for the workspace (runtime handles only).
 
     Each handle carries ``{worker_name, instance_id, status, elapsed, name,
-    session_id, last_heartbeat, container_id}`` where ``elapsed`` is the
-    seconds since the thread started (None when the start timestamp is
-    missing), ``last_heartbeat`` is the thread's last heartbeat ISO timestamp
-    (None when the thread has not heartbeated yet) and ``container_id`` is the
-    thread's provisioned container (None when not attributable).  The
-    optional ``?session_id=`` query param narrows the result to the threads of
-    a single session.  Template definitions are served by
-    ``GET /api/workspace/{ws_id}/workers`` instead.
+    session_id, last_heartbeat, container_id, queued_query_count,
+    queued_query_ids}`` where ``elapsed`` is the seconds since the thread
+    started (None when the start timestamp is missing), ``last_heartbeat`` is
+    the thread's last heartbeat ISO timestamp (None when the thread has not
+    heartbeated yet) and ``container_id`` is the thread's provisioned container
+    (None when not attributable).  ``queued_query_count``/``queued_query_ids``
+    report the queries the thread has accepted but not yet picked up, with the
+    ids in FIFO order (both empty when nothing is pending or the thread cannot
+    report a queue).  The optional ``?session_id=`` query param narrows the
+    result to the threads of a single session.  Template definitions are served
+    by ``GET /api/workspace/{ws_id}/workers`` instead.
     """
     session_id = _query_default(session_id)
     entries = _collect_active_workers(ws_id)
@@ -1069,26 +1126,32 @@ def _stop_worker_instance(
     name: str,
     instance_id: Optional[int] = None,
     session_id: Optional[str] = None,
+    terminate: bool = False,
 ) -> Dict[str, Any]:
-    """Cooperatively stop a single worker instance.
+    """Stop (DETACH) — or with ``terminate``, KILL — one worker instance.
 
-    Shared by the per-worker ``stop`` route and the ``stop_all`` route so
-    both use the exact same semantics:
+    Shared by the per-worker ``stop``/``kill`` routes and the ``stop_all``
+    route so all of them use the exact same directory resolution and error
+    handling:
 
     * resolve the worker directory from the same on-disk layout
       (``workers/<session_id>/<name>[/<name>#<N>]`` session-scoped or legacy
       ``workers/<name>``/``workers/<name>#<N>``),
-    * write ``command.json`` with ``{"action": "stop"}`` so the polling
-      worker thread picks the signal up (within its poll interval),
-    * optimistically write ``status.json`` with
-      ``runtime_status: "completed"`` so the UI sees a terminal state
-      immediately (instead of "jumping back" to "busy" before the worker
-      processes the stop),
+    * write ``command.json`` with ``{"action": "stop"}`` (detach) or
+      ``{"action": "kill"}`` (terminate) so the polling worker thread picks
+      the signal up (within its poll interval),
+    * optimistically write ``status.json`` with the matching
+      ``runtime_status`` (``"detached"`` for stop, ``"killed"`` for kill) so
+      the UI sees the new state immediately (instead of "jumping back" to
+      "busy" before the worker processes the command),
     * fast-path the in-memory registry thread, optionally narrowed by
-      ``session_id`` and ``instance_id`` (no ``Thread.kill`` — the worker
-      stops cooperatively).
+      ``session_id`` and ``instance_id``: ``thread.stop()`` (which detaches,
+      PHASE 2.1a) or, when ``terminate`` is set, ``thread.kill()``.
 
-    Returns the per-worker response dict used by the stop route
+    PHASE 2.1a: ``stop`` no longer terminates anything — it parks the worker
+    (detached); termination is ``kill`` and only ``kill``.
+
+    Returns the per-worker response dict used by both routes
     (``{"status": "ok", "name": name}``, plus ``instance_id`` /
     ``instance_label`` when ``instance_id`` is not None).
     """
@@ -1129,14 +1192,19 @@ def _stop_worker_instance(
             detail={"status": "not_found", "name": name},
         )
 
-    # Write the stop command file — the worker thread polls for this
-    _atomic_write_json({"action": "stop"}, worker_dir / "command.json")
+    # Write the command file — the worker thread polls for this.
+    # PHASE 2.1a: "stop" only DETACHES the worker; "kill" terminates it.
+    _atomic_write_json(
+        {"action": "kill" if terminate else "stop"},
+        worker_dir / "command.json",
+    )
 
-    # Immediately write status.json as "completed" so the UI doesn't
-    # "jump back" to "busy" on the next poll before the worker
-    # thread has a chance to process the stop signal.
+    # Immediately write status.json with the state the worker is heading for
+    # ("detached" on stop, "killed" on kill) so the UI doesn't "jump back"
+    # to "busy" on the next poll before the worker thread has a chance to
+    # process the command.
     _atomic_write_json({
-        "runtime_status": "completed",
+        "runtime_status": "killed" if terminate else "detached",
         "current_task": None,
         "last_heartbeat": datetime.now(timezone.utc).isoformat(),
         "error": None,
@@ -1156,9 +1224,12 @@ def _stop_worker_instance(
             if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
                 continue
             try:
-                thread.stop()
+                if terminate:
+                    thread.kill()
+                else:
+                    thread.stop()
             except Exception:
-                pass  # File-based stop will still work
+                pass  # The file-based command will still work
 
     resp = {"status": "ok", "name": name}
     if target_label is not None:
@@ -1208,15 +1279,16 @@ def _enumerate_worker_instances(
 async def stop_all_workers(
     request: Request, ws_id: str, body: Optional[StopAllWorkersBody] = None
 ):
-    """Cooperatively stop every worker instance in the workspace.
+    """Detach every worker instance in the workspace.
 
     Enumerates instances from the same on-disk layout the per-worker ``stop``
     route uses (``workers/<session_id>/<name>[/<name>#<N>]`` and legacy
     ``workers/<name>``/``workers/<name>#<N>``) and stops each one through the
     shared per-worker helper: a file-based ``command.json`` signal plus an
-    optimistic ``status.json`` (``runtime_status: "completed"``) plus the
-    in-memory registry fast-path.  No ``Thread.kill`` — workers stop
-    cooperatively on their next poll.  No job_registry or container changes.
+    optimistic ``status.json`` (``runtime_status: "detached"``) plus the
+    in-memory registry fast-path.  PHASE 2.1a: ``stop`` DETACHES — no
+    ``Thread.kill``, the workers park and can be resumed; terminate with the
+    per-worker ``kill`` route.  No job_registry or container changes.
 
     An optional JSON body ``{"session_id": "<id>"}`` restricts the stop to
     that session's workers; an absent or empty body stops all instances.
@@ -1273,7 +1345,11 @@ async def stop_worker(
         description="Target a specific worker instance (default: legacy by-name behavior)",
     ),
 ):
-    """Stop a running worker via a file-based command signal.
+    """Detach a running worker via a file-based command signal.
+
+    PHASE 2.1a: ``stop`` means DETACH.  The worker is parked, not killed: its
+    thread, containers and registry entry survive and it can be resumed later.
+    Termination is the sibling ``kill`` route.
 
     Supports both directory layouts:
       - ``workers/<session_id>/<name>/`` (session-scoped)
@@ -1287,12 +1363,12 @@ async def stop_worker(
 
     Writes ``{"action": "stop"}`` to the worker's ``command.json`` so that
     the worker thread (which polls for this file) picks it up within 2 seconds.
-    Also attempts an in-memory stop as a fast path if the thread is in the
-    registry.  Returns immediately — the worker will transition to ``stopped``
-    asynchronously.
+    Also attempts an in-memory detach as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to
+    ``detached`` asynchronously.
 
-    Also immediately writes ``status.json`` with ``runtime_status: "completed"``
-    so the web UI's next poll sees a terminal state right away (instead of
+    Also immediately writes ``status.json`` with ``runtime_status: "detached"``
+    so the web UI's next poll sees the new state right away (instead of
     "jumping back" to "busy" when the optimistic update gets overwritten
     before the worker processes the stop).
 
@@ -1304,6 +1380,54 @@ async def stop_worker(
     ws_dir = _workspace_dir(ws_id)
     instance_id = _query_default(instance_id)
     return _stop_worker_instance(ws_dir, name, instance_id)
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/kill ─────────────────────
+
+@router.post("/{ws_id}/workers/{name}/kill")
+async def kill_worker(
+    request: Request,
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Kill a running worker via a file-based command signal.
+
+    PHASE 2.1a: ``kill`` is the ONLY terminating route — ``stop`` merely
+    detaches.  The worker's run loop exits, its containers are reclaimed by
+    the normal cleanup path and it is never revived.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
+
+    Writes ``{"action": "kill"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory kill as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to ``killed``
+    asynchronously.
+
+    Also immediately writes ``status.json`` with ``runtime_status: "killed"``
+    so the web UI's next poll sees the terminal state right away (instead of
+    "jumping back" to "busy" when the optimistic update gets overwritten
+    before the worker processes the kill).
+
+    Returns:
+        200 with ``{"status": "ok", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    instance_id = _query_default(instance_id)
+    return _stop_worker_instance(ws_dir, name, instance_id, terminate=True)
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/pause ───────────────────────
 

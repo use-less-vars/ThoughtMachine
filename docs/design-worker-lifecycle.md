@@ -213,14 +213,39 @@ its `job_id` back at enqueue time — `tools/workspace/job_registry.py:7` —
   the TTL — `agent/config/defaults.py:61` — `WORKER_TIMEOUT_SECONDS = 600`, e.g.
   `worker 'X' detached for longer than WORKER_TIMEOUT_SECONDS (600 s) — queued query
   discarded`. Queued work never vanishes silently: no TTL path may drop the queue without
-  a job result that says why.
+  a job result that says why. **Operator ruling, recorded verbatim:** "A queued query
+  rejected at TTL expiry must surface on the runtime channel and in the audit log, not just
+  as a return value to a dead caller." The job result alone is insufficient because the
+  caller that enqueued the query may itself be gone — the very condition that let the TTL
+  elapse — so the rejection must also be published on the session's runtime channel and
+  recorded in the audit log, where an operator can see it after the fact. The concrete
+  channel and log-table identifiers are pinned by citation as implemented: the
+  runtime-channel publisher is `_publish_global_worker_event` —
+  `tools/workspace/worker_thread.py:305` — which publishes on the event bus
+  `EventBus.publish` — `agent/events.py:486` — and reaches the browser through the web
+  forwarding hop `web_ui/backend/event_forwarder.py:84`; the audit record is written by
+  `audit_event` — `thoughtmachine/audit_logger.py:125`. `bridge.py:1791` is not an audit
+  path: it is cited for a different claim and must not be reused as one.
 - **Kill discards.** `kill` — and the session Stop cascade, which routes to it — drops the
   queue and rejects the queued queries the same way, because the instance (thread, agent,
   containers) no longer exists to run them.
-- **Reconciling with the chained-query rule above.** "The next `query`/`submit_query` on a
-  detached worker must clear the park events and then dispatch (detach → resume → query)"
-  describes the *first dequeued* entry, not a way around the queue: while a turn is
-  already running, later submissions stay queued behind it.
+- **Reconciling with the chained-query rule above.** The mechanical ordering "clear the
+  park events, then dispatch (detach → resume → query)" describes what a *resume* does to
+  the first queued entry — it is not a description of what a *submission* does. A submission
+  only appends to the queue; the resume signal is the operator's (see below). While a turn
+  is already running, later submissions stay queued behind it.
+
+**Operator ruling, recorded verbatim:** "Resume is operator-initiated in v1. No automatic
+resume. The worker panel shows the queue count and job IDs, and the operator must click
+Resume. The main agent cannot resume a detached worker."
+
+- **Resume is operator-initiated in v1.** Nothing in the system resumes a detached worker
+  automatically — not the queue, not the next submission, not the main agent. The worker
+  panel is the resume surface: it shows the detached worker's **queue count and the job
+  IDs** waiting on it, and the operator clicks Resume. A detached worker whose queue is
+  non-empty is therefore a visible, waiting state, not a self-draining one. The parent agent
+  has **no** API to resume a worker in v1; if one is ever wanted it is a new ruling, not an
+  inference from this design.
 
 ### Options
 
@@ -249,7 +274,9 @@ Detach = `_pause_event.set()` + `_resume_event.clear()` + `_save_context()` +
 `_write_status_file()` with `status = "detached"`, and **no** container reclamation.
 Rationale: the mechanism already exists and is tested by the park loop
 (`worker_thread.py:2436-2443`); only the teardown split, the widened `resume()` guard
-(`:1524`) and the TTL are new.
+(`:1524`) and the TTL are new. Resume is operator-initiated in v1 — the detachment is
+drained only by an explicit operator resume from the worker panel, and no submission, queue
+drain, or parent-agent call can resume a detached worker on its own.
 
 ### Blast radius
 
@@ -711,6 +738,13 @@ The alternative — treating the visual tool as the thin end of a general async-
 is what this amendment rules out. One named exception with a timeout and a cancellation
 protocol is reviewable; a second return type on `execute()` is not.
 
+**Guard, recorded verbatim:** "visual is the ONLY exception in v1. A second long-blocking
+tool requires its own ruling, not a precedent." The exception is enumerated, not a
+category: it names `visual` and only `visual`, so a future tool that blocks for tens of
+seconds cites this paragraph as the reason it needs its own ruling, never as the reason it
+is already allowed. This guard is what keeps the Q4 recommendation from becoming
+"synchronous tools plus one" that quietly erodes into "tools are async now".
+
 ### Blast radius
 
 - Files: `agent/core/tool_executor.py` (dispatch 193-340, restrictions 806-825),
@@ -770,7 +804,9 @@ a product capability.
 
 **The tool.** `visual` (`tools/visual_tool.py`, registered in
 `tools/workspace/worker_thread.py:3389`), one action, two parameters:
-`target` (a `file:///workspace/...` path or an `http(s)://` URL) and `full_page: bool`.
+`target` — in v1 a `file:///workspace/...` path only; an `http(s)://` URL is rejected with
+an actionable error, pending a cited network level (see the network paragraph below) — and
+`full_page: bool`.
 It renders in a **container** and returns a PNG. The tool enforces
 `RENDER_TIMEOUT_SECONDS = 30` per call and honours `stop_check` during the render — the
 Q4 amendment's dedicated timeout and cancellation protocol, restated here as the tool's
@@ -862,8 +898,26 @@ no adapter today, so this design requires (1) `ToolResultBlock` to carry image p
 so the browser image is an operator-owned build artifact, and the tool must not name
 an image outside the allow-list.
 
-**[NEEDS MAIN RULING]** This requires a decision on whether to create a dedicated
-`browser` resource image or extend `RESOURCE_IMAGE_TAG`.
+**Operator ruling, recorded verbatim:** "Dedicated executor image (working name
+VISUAL_RENDER_IMAGE), not RESOURCE_IMAGE_TAG. Built via executor provisioning path, pinned
+by digest. Allow-list of exactly one. Network disabled on render container (renders
+file:///workspace only). If provisioning path cannot parameterize, parameterizing it is a
+W6 sub-task."
+
+- **A dedicated executor image, working name `VISUAL_RENDER_IMAGE`** — a name, not yet a
+  constant.
+- **Not an extension of `RESOURCE_IMAGE_TAG`.** The tag is left untouched; this container
+  does not use it.
+- **Built through the existing executor provisioning path and referenced by *digest*,** not
+  by tag, so the image is immutable for the life of the release.
+- **The admission allow-list for this container holds exactly one entry** — that digest. The
+  `ADMISSION_IMAGE_ALLOWLIST = (DEFAULT_IMAGE, RESOURCE_IMAGE_TAG)` shape at
+  `agent/config/defaults.py:159` is therefore not widened; it is bypassed for this one
+  container by an allow-list of one.
+- **`network` stays `banned`** on the render container, consistent with the file-only v1
+  target list above.
+- **If the provisioning path cannot accept a parameterised image, parameterising it is a W6
+  sub-task** and the tool waits on it. There is no fallback to `RESOURCE_IMAGE_TAG`.
 
 ### Options
 
@@ -967,3 +1021,15 @@ can validate it). Ship the IR/provider half as the same change, because an
    that summary table and adds the detached-queue subsection
    (`### Queries submitted while the worker is detached`, 38 lines); both belong to this
    amendment batch, not to the revision being corrected.
+10. **Four Main rulings written in before merge (this commit).** (i) Resume is
+    operator-initiated in v1 — the queue never self-drains, the panel shows count + job IDs,
+    and the main agent cannot resume; (ii) a TTL-expiry rejection must surface on the
+    runtime channel and in the audit log, not only as a job result to a caller that may be
+    gone; (iii) the Q4 exception is enumerated, not a category — a second long-blocking tool
+    needs its own ruling; (iv) the browser image is a dedicated executor image
+    (`VISUAL_RENDER_IMAGE`), pinned by digest, allow-list of exactly one, network banned,
+    and parameterising the provisioning path is a W6 sub-task if it cannot already take one.
+    The `[NEEDS MAIN RULING]` marker this item replaces is retired. Two contradictions this
+    batch would otherwise have introduced were resolved in the same commit: the
+    chained-query bullet no longer implies that a submission resumes a worker, and the
+    tool's `target` parameter no longer advertises `http(s)://`.

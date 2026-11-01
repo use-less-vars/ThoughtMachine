@@ -75,6 +75,13 @@ const modalBox = {
   color: '#cdd6f4',
 };
 
+// Runtime status vocabulary. These value strings are the BACKEND's own, not
+// invented here: `WorkerThread.status` assignments in
+// tools/workspace/worker_thread.py — detaching (:1481), detached (:1494),
+// killed (:1514, and the terminal kill path :3184), ready (:1655), paused
+// (:2166), busy (:2804), error (:3144), completed (:3184) — surfaced verbatim
+// by `_worker_active_entry` as `"status": getattr(thread, "status", "unknown")`
+// (web_ui/backend/workspace_routes.py:579).
 const STATUS_DOT_COLORS = {
   ready: '#585b70',    /* grey — idle, spawned but not doing anything */
   running: '#a6e3a1',  /* green — real runtime_status for an active worker */
@@ -83,8 +90,55 @@ const STATUS_DOT_COLORS = {
   error: '#f38ba8',    /* red — something went wrong */
   pausing: '#f9e2af',  /* amber — pause in flight (not yet paused) */
   paused: '#f9e2af',   /* amber — paused; matches session StatusBar */
+  detaching: '#f9e2af', /* amber — detach (stop) in flight, not yet parked */
+  detached: '#cba6f7', /* mauve — parked but ALIVE: resumable, queue preserved */
+  killed: '#f38ba8',   /* red — terminated: NOT resumable, queue rejected */
   stopped: '#313244',  /* dark/off — not spawned */
 };
+
+// Display labels for the statuses above. Anything NOT in this map is degraded
+// VISIBLY in the row by statusLabel() — a status this panel does not know must
+// never render blank and must never render as a healthy-looking state.
+const STATUS_LABELS = {
+  ready: 'ready',
+  running: 'running',
+  busy: 'busy',
+  completed: 'completed',
+  error: 'error',
+  pausing: 'Pausing…',
+  paused: 'Paused',
+  detaching: 'Detaching…',
+  detached: 'Detached',
+  killed: 'Killed',
+  stopped: 'stopped',
+};
+
+const STATUS_TEXT_COLORS = {
+  ready: '#a6adc8',
+  running: '#89b4fa',
+  busy: '#89b4fa',
+  completed: '#a6adc8',
+  error: '#f38ba8',
+  pausing: '#f9e2af',
+  paused: '#f9e2af',
+  detaching: '#f9e2af',
+  detached: '#cba6f7',
+  killed: '#f38ba8',
+  stopped: '#a6adc8',
+};
+
+// Unrecognized status → amber, so a status this panel cannot explain never
+// looks like a normal (grey) or healthy (blue/green) state.
+const UNKNOWN_STATUS_COLOR = '#f9e2af';
+
+function statusLabel(status) {
+  if (STATUS_LABELS[status]) return STATUS_LABELS[status];
+  return status ? `${status} (unrecognized)` : 'unknown status';
+}
+
+function statusTextColor(status) {
+  return STATUS_TEXT_COLORS[status] || UNKNOWN_STATUS_COLOR;
+}
 
 // ── Helper: relative time ──────────────────────────────────────────────────
 function relativeTime(ts) {
@@ -132,6 +186,22 @@ function truncate(str, maxLen = 120) {
 // ── Helper: per-instance identity key (name + instance_id) ────────────────
 function workerInstanceKey(w) {
   return `${w.name}#${w.instance_id ?? '0'}`;
+}
+
+// ── Helper: queued-query surface (PHASE 2.1b) ─────────────────────────────
+// `queued_query_count` / `queued_query_ids` come verbatim from the active-
+// worker payload (`**_worker_queued_queries(thread)`,
+// web_ui/backend/workspace_routes.py:585, count/ids at :534), with the ids in
+// FIFO order. Absent/None fields mean "nothing queued" — never a crash and
+// never a fabricated id list.
+function queuedQueryIds(w) {
+  const ids = Array.isArray(w.queued_query_ids) ? w.queued_query_ids : [];
+  return ids.map((id) => String(id));
+}
+
+function queuedQueryCount(w, ids) {
+  const n = w.queued_query_count;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : ids.length;
 }
 
 // ── Status dot ─────────────────────────────────────────────────────────────
@@ -241,6 +311,44 @@ function StopAllConfirm({ onConfirm, onCancel }) {
           </button>
           <button style={btnDanger} onClick={onConfirm}>
             Stop All
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Kill worker confirmation dialog ────────────────────────────────────────
+// PHASE 2.1a: stop and kill are different actions. Stop DETACHES (recoverable,
+// queue preserved); kill TERMINATES and rejects every queued query, so it goes
+// through this panel's existing destructive-confirm pattern before any request
+// is sent.
+function KillConfirm({ label, queuedCount, onConfirm, onCancel }) {
+  const queueText =
+    queuedCount > 0
+      ? `its ${queuedCount} queued ${queuedCount === 1 ? 'query' : 'queries'}`
+      : 'anything it has queued';
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        className="kill-confirm-dialog"
+        style={modalBox}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 0.5rem', fontSize: '1rem', color: '#f38ba8' }}>
+          Kill Worker
+        </h3>
+        <p style={{ fontSize: '0.85rem', color: '#a6adc8', margin: '0 0 1rem' }}>
+          Terminate <strong>{label}</strong>? Killing rejects {queueText} and
+          cannot be undone — the worker cannot be resumed afterwards. Use{' '}
+          <strong>Stop</strong> instead to detach it and keep it recoverable.
+        </p>
+        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+          <button style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }} onClick={onCancel}>
+            Cancel
+          </button>
+          <button style={btnDanger} onClick={onConfirm}>
+            Kill now
           </button>
         </div>
       </div>
@@ -559,6 +667,8 @@ export default function WorkerManagementPanel({
   const [isCreateFromTemplate, setIsCreateFromTemplate] = useState(false);
   const [showStopAllConfirm, setShowStopAllConfirm] = useState(false);
   const [stopAllError, setStopAllError] = useState('');
+  // { name, instanceId, label, queuedCount } for the kill confirmation dialog
+  const [killTarget, setKillTarget] = useState(null);
 
   // ── Auto-open logic (from old WorkersSection) ────────────────────────────
   const prevStatusMapRef = useRef(new Map());
@@ -631,6 +741,8 @@ export default function WorkerManagementPanel({
             current_context_tokens: e.current_context_tokens,
             max_context_tokens: e.max_context_tokens,
             paused_manually: e.paused_manually,
+            queued_query_count: e.queued_query_count,
+            queued_query_ids: e.queued_query_ids,
             time_since_last_query: e.time_since_last_query,
             current_task: e.current_task,
           };
@@ -677,7 +789,9 @@ export default function WorkerManagementPanel({
         setWorkers((prev) =>
           prev.map((w) =>
             w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
-              ? { ...w, runtime_status: 'stopped' }
+              // stop DETACHES (worker_thread.py:1494): the backend reports
+              // 'detached' and the parked worker keeps its queue.
+              ? { ...w, runtime_status: 'detached' }
               : w
           )
         );
@@ -718,7 +832,8 @@ export default function WorkerManagementPanel({
         throw new Error(body?.detail?.error || body?.detail || `HTTP ${res.status}`);
       }
       setStopAllError('');
-      setWorkers((prev) => prev.map((w) => ({ ...w, runtime_status: 'stopped' })));
+      // stop_all detaches every instance (workspace_routes.py:1282).
+      setWorkers((prev) => prev.map((w) => ({ ...w, runtime_status: 'detached' })));
     } catch (err) {
       setStopAllError(err.message);
     } finally {
@@ -782,6 +897,38 @@ export default function WorkerManagementPanel({
     }
   }, [workspaceId]);
 
+  // ── Kill worker (terminate: NOT recoverable, queue rejected) ─────────────
+  const handleKill = useCallback(async (name, instanceId) => {
+    const key = workerInstanceKey({ name, instance_id: instanceId });
+    const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/kill${instanceQuery}`,
+        { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      setWorkers((prev) =>
+        prev.map((w) =>
+          w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+            // A killed worker never drains its queue: WorkerThread.kill()
+            // rejects every queued query (worker_thread.py:1533), so drop the
+            // queue locally instead of showing queries that will never run.
+            ? { ...w, runtime_status: 'killed', queued_query_count: 0, queued_query_ids: [] }
+            : w
+        )
+      );
+      setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+    } catch (err) {
+      setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+      setTimeout(() => {
+        setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+      }, 3000);
+    }
+  }, [workspaceId]);
+
   const canStop = useCallback((status) => {
     return status === 'busy' || status === 'ready' || !status;
   }, []);
@@ -792,6 +939,16 @@ export default function WorkerManagementPanel({
 
   const canResume = useCallback((status) => {
     return status === 'paused';
+  }, []);
+
+  // Statuses that are still alive and therefore killable. 'detached' counts:
+  // killing a detached worker is how its preserved queue gets rejected. A
+  // terminal/unknown status is not offered a kill (we cannot vouch for it).
+  const canKill = useCallback((status) => {
+    return (
+      status === 'busy' || status === 'ready' || status === 'paused' ||
+      status === 'pausing' || status === 'detaching' || status === 'detached'
+    );
   }, []);
 
   // ── Create / Update worker ───────────────────────────────────────────────
@@ -961,13 +1118,16 @@ export default function WorkerManagementPanel({
             <span style={{ flex: '0 0 130px', minWidth: 0 }}>Name</span>
             <span style={{ flex: 1, minWidth: 0 }}>Description</span>
             <span style={{ flex: '0 0 60px', textAlign: 'center' }}>Tools</span>
-            <span style={{ flex: '0 0 90px', textAlign: 'center' }}>Status</span>
+            <span style={{ flex: '0 0 150px', textAlign: 'center' }}>Status</span>
+            <span style={{ flex: '0 0 92px', textAlign: 'center' }}>Queue</span>
             <span style={{ flex: '0 0 80px', textAlign: 'right' }}>Actions</span>
           </div>
 
           {/* Rows */}
           {workers.map((w, i) => {
             const isRunning = canStop(w.runtime_status);
+            const queuedIds = queuedQueryIds(w);
+            const queuedCount = queuedQueryCount(w, queuedIds);
             const toolsList = Array.isArray(w.tools) ? w.tools : [];
             const perms = w.permission_footprint || {};
             const instKey = workerInstanceKey(w);
@@ -1055,7 +1215,7 @@ export default function WorkerManagementPanel({
                 {/* Status + runtime info */}
                 <div
                   style={{
-                    flex: '0 0 90px',
+                    flex: '0 0 150px',
                     textAlign: 'center',
                     display: 'flex',
                     alignItems: 'center',
@@ -1066,23 +1226,11 @@ export default function WorkerManagementPanel({
                 >
                   {w.runtime_status ? (
                     <>
-                      <span
-                        style={{
-                          color:
-                            w.runtime_status === 'error'
-                              ? '#f38ba8'
-                              : w.runtime_status === 'busy' || w.runtime_status === 'running'
-                                ? '#89b4fa'
-                                : w.runtime_status === 'pausing' || w.runtime_status === 'paused'
-                                  ? '#f9e2af'
-                                  : '#a6adc8',
-                        }}
-                      >
-                        {w.runtime_status === 'pausing'
-                          ? 'Pausing…'
-                          : w.runtime_status === 'paused'
-                            ? 'Paused'
-                            : w.runtime_status}
+                      {/* Status text comes from the backend vocabulary only —
+                          statusLabel() degrades an unknown status visibly rather
+                          than printing it as if it were a known healthy state. */}
+                      <span style={{ color: statusTextColor(w.runtime_status) }}>
+                        {statusLabel(w.runtime_status)}
                       </span>
                       {w.elapsed != null && (
                         <span
@@ -1112,6 +1260,39 @@ export default function WorkerManagementPanel({
                             marginRight: '4px',
                           }}
                           title={`Resume ${dispLabel}`}
+                        >
+                          ▶ Resume
+                        </button>
+                      ) : w.runtime_status === 'detached' ? (
+                        // Detached is PARKED BUT ALIVE and keeps its queue
+                        // (worker_thread.py:1494). Resuming only has meaning when
+                        // queued work is actually waiting, so at zero queued
+                        // queries the button stays visible but disabled with a
+                        // title that says why (never a silent no-op).
+                        <button
+                          disabled={queuedCount === 0}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (queuedCount > 0) handleResume(w.name, w.instance_id);
+                          }}
+                          style={{
+                            background: queuedCount > 0 ? '#a6e3a1' : 'transparent',
+                            color: queuedCount > 0 ? '#1e1e2e' : '#6c7086',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: queuedCount > 0 ? 'pointer' : 'not-allowed',
+                            opacity: queuedCount > 0 ? 1 : 0.55,
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginRight: '4px',
+                          }}
+                          title={
+                            queuedCount > 0
+                              ? `Resume ${dispLabel} — runs its ${queuedCount} queued ${queuedCount === 1 ? 'query' : 'queries'} in order (nothing is discarded)`
+                              : `Nothing queued — a detached ${dispLabel} has no work waiting, so there is nothing to resume`
+                          }
                         >
                           ▶ Resume
                         </button>
@@ -1160,12 +1341,44 @@ export default function WorkerManagementPanel({
                           </button>
                         )
                       )}
-                      {/* Stop button */}
+                      {/* Stop button — DETACH (recoverable, queue kept), so it
+                          is styled as a soft outline rather than the solid red
+                          used by the unrecoverable Kill action below. */}
                       {isRunning && (
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
                             handleStop(w.name, w.instance_id);
+                          }}
+                          style={{
+                            background: 'transparent',
+                            color: '#fab387',
+                            border: '1px solid #fab387',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                          }}
+                          title={`Stop ${dispLabel} — detach (recoverable, queued queries are kept)`}
+                        >
+                          Stop
+                        </button>
+                      )}
+                      {/* Kill button — TERMINATE (unrecoverable, queue rejected).
+                          Goes through the KillConfirm dialog; no request is sent
+                          from here. */}
+                      {canKill(w.runtime_status) && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setKillTarget({
+                              name: w.name,
+                              instanceId: w.instance_id,
+                              label: dispLabel,
+                              queuedCount,
+                            });
                           }}
                           style={{
                             background: '#f38ba8',
@@ -1178,9 +1391,9 @@ export default function WorkerManagementPanel({
                             fontSize: '0.65rem',
                             lineHeight: '1.4',
                           }}
-                          title={`Stop ${dispLabel}`}
+                          title={`Kill ${dispLabel} — terminate now (unrecoverable, discards its queued queries)`}
                         >
-                          Stop
+                          Kill
                         </button>
                       )}
                       {/* manual-pause badge (payload.paused_manually) */}
@@ -1224,6 +1437,35 @@ export default function WorkerManagementPanel({
                     </>
                   ) : (
                     <span style={{ color: '#6c7086' }}>—</span>
+                  )}
+                </div>
+
+                {/* Queue: queued_query_count / queued_query_ids (FIFO order) */}
+                <div
+                  style={{
+                    flex: '0 0 92px',
+                    textAlign: 'center',
+                    fontSize: '0.7rem',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {queuedCount > 0 ? (
+                    <span
+                      style={{ color: '#89b4fa', fontWeight: 600 }}
+                      title={
+                        queuedIds.length
+                          ? `Queued queries (FIFO): ${queuedIds.join(', ')}`
+                          : `${queuedCount} queued (ids not reported)`
+                      }
+                    >
+                      ⧗ {queuedCount} queued
+                    </span>
+                  ) : (
+                    <span style={{ color: '#6c7086' }} title="No queued queries">
+                      none queued
+                    </span>
                   )}
                 </div>
 
@@ -1395,6 +1637,20 @@ export default function WorkerManagementPanel({
         <StopAllConfirm
           onConfirm={handleStopAll}
           onCancel={() => setShowStopAllConfirm(false)}
+        />
+      )}
+
+      {/* Kill worker confirmation (terminate — NOT recoverable, queue rejected) */}
+      {killTarget && (
+        <KillConfirm
+          label={killTarget.label}
+          queuedCount={killTarget.queuedCount}
+          onConfirm={() => {
+            const target = killTarget;
+            setKillTarget(null);
+            handleKill(target.name, target.instanceId);
+          }}
+          onCancel={() => setKillTarget(null)}
         />
       )}
 
