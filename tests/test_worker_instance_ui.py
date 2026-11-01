@@ -213,9 +213,11 @@ def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monke
     assert resp["instance_label"] == "default#2"
 
     cmd = json.loads((tmp_path / "workers" / "default#2" / "command.json").read_text())
+    # PHASE 2.1a: the ``stop`` route DETACHES (termination moved to ``kill``),
+    # so the optimistic status.json vocabulary is "detached", not "completed".
     assert cmd == {"action": "stop"}
     status = json.loads((tmp_path / "workers" / "default#2" / "status.json").read_text())
-    assert status["runtime_status"] == "completed"
+    assert status["runtime_status"] == "detached"
 
     t2.stop.assert_called_once()
     t1.stop.assert_not_called()
@@ -626,7 +628,8 @@ def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
         cmd = json.loads((tmp_path / "workers" / sub / "command.json").read_text())
         assert cmd == {"action": "stop"}
         status = json.loads((tmp_path / "workers" / sub / "status.json").read_text())
-        assert status["runtime_status"] == "completed"
+        # PHASE 2.1a: stop_all detaches, so the optimistic vocabulary is "detached".
+        assert status["runtime_status"] == "detached"
     t1.stop.assert_called_once()
     t2.stop.assert_called_once()
     t3.stop.assert_called_once()
