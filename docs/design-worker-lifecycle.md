@@ -125,7 +125,8 @@ i.e. today's `stop` is what Ruling 1 calls `kill`.
 | `POST /{ws_id}/workers/{name}/stop` (`web_ui/backend/workspace_routes.py:1266`) | enqueues the same stop action | **becomes detach** (URL kept — the user-facing word "stop" now means detach); new `POST /{ws_id}/workers/{name}/kill` |
 | `bridge._stop_session_workers()` (`web_ui/backend/bridge.py:1787`, called from `request_stop` `:1881`) | cascades terminate over all session workers | **stays terminate → `kill`** — this is the "no silent background token burn" guard at `bridge.py:1791` |
 | `QueryBar.jsx:74` `stop_session` | session-level turn truncation | **unaffected** (it never addressed workers directly) |
-| `_action_reset` (`tools/workspace/worker_thread.py:5406`) — "Stop a worker, DROP its persisted context, and free its spawn slot." | terminate + delete `context.json`/`status.json`/`command.json` | **unaffected in behaviour**; restate it as `kill` + drop-context so the vocabulary is consistent |
+| `_action_reset` (`tools/workspace/worker_thread.py:5406`) — "Stop a worker, DROP its persisted context, and free its spawn slot." | terminate + delete `context.json`/`status.json`/`command.json` | **behaviour is preserved only because it must call `_action_kill` explicitly, NOT `_action_stop`** (which now detaches). Routing reset through the repointed `_action_stop` would silently turn a context-dropping reset into a detach — the specific implementation trap R1 creates. |
+| `command.json` file channel (`{"action": "stop"}` written at `tools/workspace/worker_thread.py:1467-1468`) | file-watched action; carries whatever `stop` currently means | **inherits the repointed meaning → detach**, not terminate — the same vocabulary change as the tool action it mirrors; `kill` is **not** exposed on this channel in v1 (adding a `kill` verb to `command.json` is explicitly out of scope) |
 | `_action_pause` / `_action_resume` (same dispatch table) | park/wake without teardown | **unaffected**; `detach` is implemented *on top of* them (see below) |
 
 ### Proposed state machine
@@ -173,9 +174,15 @@ spawning ──▶ ready ──▶ busy ──▶ ready            (normal turn)
 3. **Detached TTL.** A detached worker that is never resumed is killed by the same
    budget that already bounds a turn: `agent/config/defaults.py:61` —
    `WORKER_TIMEOUT_SECONDS = 600`, evaluated as
-   `now - detached_at > WORKER_TIMEOUT_SECONDS` by the existing
-   `cleanup_stale_worker_containers` sweep (`infra/container_manager.py:5104`) or the
-   worker-manager tick that replaces the registry pop.
+   `now - detached_at > WORKER_TIMEOUT_SECONDS`. **Operator ruling, recorded verbatim:**
+   "Use the manager tick. Add a distinct `_detached_worker_ttl` check. Explicitly modify
+   `cleanup_stale_worker_containers` to skip containers whose worker status is `detached`.
+   Containers survive detach; the reaper must not touch them." The TTL is therefore
+   enforced by the worker-manager tick (the one that replaces the registry pop) through a
+   distinct `_detached_worker_ttl` check, and
+   `cleanup_stale_worker_containers` (`infra/container_manager.py:5104`) must be modified
+   to **skip** any container belonging to a worker whose status is `detached` — left
+   unmodified it destroys exactly the containers detach exists to preserve.
 
 ### Queries submitted while the worker is detached
 
@@ -375,11 +382,12 @@ and on timeout mark the resource dead. Adopt one helper and route every site abo
 through it:
 
 ```python
-def _call_with_deadline(fn, timeout, *, on_timeout="abandon"):
+def _call_with_deadline(fn, timeout, *, on_timeout="abandon", container=None):
     """Run a blocking SDK call with a hard wall-clock deadline.
 
     Returns (result, None) or (None, TimeoutError). 'abandon' leaks the daemon
     thread (introspection); 'kill' additionally kills the container (exec).
+    on_timeout='kill' requires `container`; without it this raises ValueError.
     """
 ```
 
@@ -387,6 +395,16 @@ def _call_with_deadline(fn, timeout, *, on_timeout="abandon"):
 Python thread cannot be cancelled either way) and is acceptable, but it adds an
 executor lifecycle per call; the inline thread keeps parity with
 `infra/container_manager.py:2553-2570`.
+
+The race is named rather than hidden: `container.kill()` is issued from the *caller*
+thread the moment `join(timeout)` expires, while the abandoned daemon thread may still be
+inside the SDK call — so the kill can land mid-call. That is harmless precisely because
+the container dies: the still-blocked thread's eventual completion or failure operates on
+a resource nobody will read, which is why the handle must be a parameter of the helper
+rather than something it discovers itself. An `abandon` deadline, by contrast, leaks a
+daemon thread that outlives the query; if the detached TTL reaper then kills the worker
+and its containers, that leaked thread is operating on a dead container, so it must
+swallow its own exception rather than propagate it into a worker that no longer exists.
 
 **Per-call vs per-worker.** The hard deadline is a *per-call* primitive; the per-worker
 budget stays soft. Composition rule:
@@ -413,8 +431,11 @@ either clock:
   the designed-in one.
 - The hard deadline does **not** kill the worker; the worker's own envelope
   (`:2917-2918`) remains the only thing that sets `stopped`.
-- `infra/container_manager.py:2566` (`container.kill()`) stays the *only* place a
-  deadline kills a container — i.e. the exec path keeps its existing blast radius.
+- `container.kill()` at `infra/container_manager.py:2566` remains the only *site* at
+  which a deadline kills a container; what changes is that it gains a second caller — the
+  exec path and, per the Q4 amendment, the Q5 render deadline
+  (`RENDER_TIMEOUT_SECONDS = 30`) both reach it. The mechanism and the blast radius are
+  unchanged; the number of callers is not.
 
 ### Options
 
@@ -633,6 +654,11 @@ any follow-up that the worker-level `submit_query` precedent
 (`tools/workspace/job_registry.py:4`) is *not* a template for tools — it moves the
 async boundary up to the parent, which is the cheaper lever.
 
+The interruption requirement for one tool has now arrived, and it is discharged by the
+bounded exception in the amendment below — a call-site implementation inside a single tool
+(thread + `join` + `container.kill()`), **not** Option B. Option B remains unrecommended
+and its tool-thread cancellation protocol is not adopted.
+
 Exactly one tool is excepted, and by operator decision rather than by this reasoning:
 the `visual` tool (Q5), the single bounded exception with its own timeout and
 cancellation protocol (amendment below).
@@ -654,19 +680,27 @@ one named tool whose call is long, external and cancellable.
 Because the exception is bounded, it must carry its own budget and its own cancellation
 path instead of inheriting the turn's:
 
-- **Dedicated timeout.** The render gets a per-call deadline of its own, not the worker's
-  soft budget (`agent/config/defaults.py:61`), enforced in the container layer with the
-  pattern R2 already standardises for Q2 — thread + `join(timeout)` + `container.kill()`
-  at `infra/container_manager.py:2561-2570` (`raise TimeoutError(f"Command timed out after
-  {timeout} seconds")`). A render that overruns is killed and returned as an error
-  string, never as a pending result.
-- **Dedicated cancellation.** The call must honour the cooperative stop signal *during*
-  the render — `getattr(self.config, "stop_check", None)`, checked at
-  `agent/core/tool_executor.py:252` — which is precisely what the between-calls-only
-  checkpoint at `:246-247` (`# Cooperative cancellation: if a stop was requested between
-  tool` / `# calls, skip execution and record a clean 'stopped' tool result`) cannot do.
-  Cancelling kills the render container (ephemeral per Q5, so nothing leaks) and returns
-  a `stopped` result in the established shape.
+- **Dedicated timeout.** **Operator ruling, recorded verbatim:** "Define
+  `RENDER_TIMEOUT_SECONDS = 30` in the design doc. A 30-second hard cap is sufficient for
+  a headless browser screenshot." `RENDER_TIMEOUT_SECONDS = 30` belongs in
+  `agent/config/defaults.py` next to `WORKER_TIMEOUT_SECONDS` (`:61`); the render's
+  deadline is *that* value, not the worker's soft budget, enforced in the container layer
+  with the pattern R2 already standardises for Q2 — thread + `join(timeout)` +
+  `container.kill()` at `infra/container_manager.py:2561-2570` (`raise TimeoutError(f"Command
+  timed out after {timeout} seconds")`). A render that overruns is killed and returned as
+  an error string, never as a pending result.
+- **Dedicated cancellation.** The render runs as a container exec on its own thread and
+  the tool waits for it in a bounded loop: `join(min(CHUNK_SECONDS, remaining))` per
+  iteration (`CHUNK_SECONDS ≈ 0.5` s), calling `getattr(self.config, "stop_check", None)`
+  at each wake-up and issuing `container.kill()` against the render container when it
+  returns true. `agent/core/tool_executor.py:252` is the *hook name and existing call
+  site* this mirrors — it is deliberately **not** the render's call site, and that
+  citation is no longer load-bearing for this design. The between-calls-only checkpoint
+  at `:246-247` (`# Cooperative cancellation: if a stop was requested between tool` /
+  `# calls, skip execution and record a clean 'stopped' tool result`) cannot reach inside
+  a render, which is exactly why the bounded loop exists. Cancelling kills the render
+  container (ephemeral per Q5, so nothing leaks) and returns a `stopped` result in the
+  established shape.
 - **Everything else stays Option A.** No job handle, no poll convention, no pending tool
   result in the transcript: the one exception returns a value or an error,
   synchronously, under a deadline. Q5 owns the rest of the tool's contract — grain
@@ -732,12 +766,15 @@ and `agent/core/ir.py:80` — `class ToolResultBlock:` whose `content` is the fl
 (`requirements-dev.txt:8` — `playwright>=1.40`, plus `/workspace/chrome-libs/`), never as
 a product capability.
 
-### Proposed design — one tool, one grain, one return shape
+### Proposed design — one tool, one grain, one format, one cap, four named outcomes
 
 **The tool.** `visual` (`tools/visual_tool.py`, registered in
 `tools/workspace/worker_thread.py:3389`), one action, two parameters:
 `target` (a `file:///workspace/...` path or an `http(s)://` URL) and `full_page: bool`.
-It renders in a **container** and returns a PNG.
+It renders in a **container** and returns a PNG. The tool enforces
+`RENDER_TIMEOUT_SECONDS = 30` per call and honours `stop_check` during the render — the
+Q4 amendment's dedicated timeout and cancellation protocol, restated here as the tool's
+own contract.
 
 **Execution class: Container, ephemeral.** Per
 `docs/ARCHITECTURE_MACHINE_MODEL.md:28` — `**`host_bash` is the one true host-execution
@@ -747,6 +784,18 @@ browser is neither bounded nor in-process, so it is a container, and per §3 it 
 destroyed", which is exactly the isolation a renderer needs. Declaration mirrors
 `tools/docker_code_runner.py:61` — `required_categories: ClassVar[List[str]] = ["filesystem:write", "container:true"]`
 → `["visual:view", "container:true"]`.
+
+**Container lifecycle and detach interaction.** The container is created per call with
+exactly that call's envelope — image, mounts, `network`, timeouts — and destroyed in a
+`finally`, so it is reclaimed on success, on timeout, on cancellation and on exception
+alike; no path leaves a render container behind. It is never reclaimed by
+`_cleanup_worker_containers()` (`worker_thread.py:2153`), which detach must not run at all
+(Q1). Detach mid-render does **not** interrupt an in-flight render: the park loop only
+takes effect between iterations (`worker_thread.py:2436-2443`, `:2685-2694`), and the
+render is bounded by `RENDER_TIMEOUT_SECONDS = 30`, so a detach issued during a render
+takes effect at the next iteration boundary after at most that long. This is the design,
+not a derived consequence: a render is allowed to finish its bounded call, and detach is a
+park, not a preemption.
 
 **Permission grain: one new resource `visual`, values `["banned", "ask", "view"]`.**
 Three values, not four: `interact` (click/type/scroll) makes the browser a *mutating*
@@ -761,20 +810,28 @@ Implementation points: `security/resource_catalog.py:113-123` —
 session default `agent/config/defaults.py:262-269` —
 `DEFAULT_SESSION_PERMISSIONS = {` (add `"visual": "banned"`).
 
-**Return shape: one `ImageBlock`, PNG only, inline base64, capped.**
+**Return shape: four outcomes — one `ImageBlock`, a capped-text envelope, an error string, or `stopped`.**
 `source` is a base64 string and `media_type` is pinned to `"image/png"`
 (`agent/core/ir.py:57/67`). One format keeps the provider matrix trivial — Anthropic
 accepts `image/png|jpeg|gif|webp` and OpenAI-compatible endpoints accept
 `data:image/png;base64,` URLs, so **PNG is the intersection and is the only format the
-tool emits**. Size cap reuses the existing preview vocabulary rather than inventing a
-second one: the tool downscales and re-encodes until
-`len(base64) <= PREVIEW_CAP` (`agent/config/defaults.py:90` — `PREVIEW_CAP = 8000`) is
-*not* viable for images (8 KB is a thumbnail), so add one constant next to it —
+tool emits**. The *mechanism* reuses the existing preview vocabulary rather than
+inventing a second one — the `_truncate_output` envelope shape (`tools/base.py:312`)
+described below. The *cap* cannot: `PREVIEW_CAP = 8000`
+(`agent/config/defaults.py:90`) is a thumbnail, not an image limit, so one new constant is
+added next to it —
 `IMAGE_CAP_BYTES = 1_000_000` — and on overflow return the existing
 `_truncate_output` shape (`tools/base.py:312` — `def _truncate_output(self, output: str, limit: Optional[int] = None) -> str:`)
 as a text envelope (`{"path": ..., "media_type": "image/png", "bytes": N, "truncated": true}`),
 i.e. the image is still on disk in the workspace for a later read. Both providers cap
 around 5 MB per image, so 1 MB is safely inside.
+
+Four outcomes, named so that none is implied: (a) one `ImageBlock` — PNG, inline base64 —
+on success; (b) the JSON **text** envelope above on size overflow, i.e. the existing
+`_truncate_output` shape (`tools/base.py:312`) rendered as
+`{"path", "media_type", "bytes", "truncated": true}`; (c) an actionable **error
+string** on early refusal — bad target, permission denied, image not allow-listed; (d) a
+`stopped` result on cancellation, in the established stopped-tool-result shape.
 
 **Invocation surface: the agent, not a new route.** No REST endpoint, no UI authoring
 surface, no frontend tab. The Tools tab already lists tools
@@ -785,9 +842,14 @@ viewer is explicitly out of scope.
 must **not** imply it: the container gets exactly the session's network envelope
 (`agent/config/defaults.py:264` — `"network": "banned",`). With `network: banned` the
 tool accepts only `file:///workspace/...` targets (screenshot a generated HTML/report
-artifact); with `network` at `write`/`outbound` it accepts `http(s)://`. Enforcement
-lives in the container profile, not in the tool's string handling — the tool refuses
-early with an actionable error so the model does not retry blindly.
+artifact). The claim this replaces — that with `network` at `write`/`outbound` the tool
+accepts `http(s)://` — is withdrawn: `banned` is the only network value this document can
+evidence (`agent/config/defaults.py:264` — `"network": "banned",`), and a
+`write`/`outbound` level is `NOT FOUND — searched defaults.py/resource_catalog for network
+level names`. Consequence: in v1 `visual` renders `file:///workspace/...` only, and
+`http(s)://` is gated on that unverified level — out of scope for v1. Enforcement lives in
+the container profile, not in the tool's string handling — the tool refuses early with an
+actionable error so the model does not retry blindly.
 
 **Prerequisite, stated because it is the real cost:** `ImageBlock` has no producer and
 no adapter today, so this design requires (1) `ToolResultBlock` to carry image parts
@@ -799,6 +861,9 @@ no adapter today, so this design requires (1) `ToolResultBlock` to carry image p
 (`NOT FOUND — searched *Dockerfile* excluding worktrees and node_modules (0 files)`),
 so the browser image is an operator-owned build artifact, and the tool must not name
 an image outside the allow-list.
+
+**[NEEDS MAIN RULING]** This requires a decision on whether to create a dedicated
+`browser` resource image or extend `RESOURCE_IMAGE_TAG`.
 
 ### Options
 
@@ -898,4 +963,7 @@ can validate it). Ship the IR/provider half as the same change, because an
    as the single bounded exception, and that exception is specified as a dedicated
    timeout (container-layer hard deadline) plus a dedicated cancellation path
    (`stop_check` honoured inside the render). The header claim and the summary-table Q4
-   row are corrected to match, for traceability.
+   row are corrected to match, for traceability. The same commit also corrects the Q1 row of
+   that summary table and adds the detached-queue subsection
+   (`### Queries submitted while the worker is detached`, 38 lines); both belong to this
+   amendment batch, not to the revision being corrected.
