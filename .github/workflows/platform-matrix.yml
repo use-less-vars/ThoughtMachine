@@ -131,6 +131,194 @@ jobs:
           if-no-files-found: ignore
 
   # -------------------------------------------------------------------------
+  # Linux: auth-boundary browser e2e (BLOCKING when it runs).
+  #
+  # WHY THIS JOB EXISTS
+  # The credential check lives in AuthBoundaryMiddleware, i.e. in front of every
+  # route, so a regression there can leave the ordinary pytest suite green: the
+  # unit tests drive a TestClient with fabricated credentials and never cross
+  # the real browser -> Vite proxy -> backend path the product uses. These three
+  # Playwright suites are the ones that cross it (the Permissions tab is only
+  # reachable from an authenticated UI session), and until this job existed no
+  # CI job ran them at all -- they are marked ``e2e`` and skipped unless
+  # ``--run-e2e`` is passed.
+  #
+  # COST CONTROL WITHOUT A WORKFLOW-LEVEL PATHS FILTER
+  # This workflow has no ``paths:`` filter on purpose (see the header comment),
+  # so the job diffs its own change set and skips the expensive browser run
+  # when no auth-relevant file is touched. Ambiguity -- no usable base commit, a
+  # failed diff -- resolves to auth=true, because a gate that can silently skip
+  # itself is worse than one that runs unnecessarily. The skip prints a notice,
+  # so a green check that executed nothing says so in the log.
+  #
+  # BLOCKING, not advisory: a red run is meant to stop an auth change. If it
+  # turns out to be flaky in practice the one-line remedy is
+  # ``continue-on-error: true``; report the flake rather than adding retries to
+  # a credential gate.
+  # -------------------------------------------------------------------------
+  linux-e2e-auth:
+    name: Linux - auth e2e (browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # The e2e harness repoints HOME to a hermetic temp vault at import time
+    # (tests/conftest.py:149 -- os.environ["HOME"] = HERMETIC_BASE_DIR, a
+    # tempfile.mkdtemp(prefix="hermetic-vault-base-"); pathlib.Path.home and
+    # os.path.expanduser are repointed to match). Playwright's default browser
+    # directory is $HOME/.cache/ms-playwright, so the Chromium this job installs
+    # under the runner's real HOME is invisible inside the test process. Observed
+    # in CI, verbatim:
+    #   playwright._impl._errors.Error: BrowserType.launch: Executable doesn't exist at
+    #   /tmp/hermetic-vault-base-1rrrvaa0/.cache/ms-playwright/chromium_headless_shell-1248/chrome-headless-shell-linux64/chrome-headless-shell
+    # Hence the absolute override below: PLAYWRIGHT_BROWSERS_PATH is an absolute
+    # path, so it survives the HOME move, and nothing in the repo sets or unsets
+    # it (it is documented for humans at tests/e2e/README.md:37).
+    #
+    # The value is a deliberate LITERAL, not ${{ runner.temp }}: a job-level
+    # ``env:`` block cannot reference the ``runner`` context (only github, needs,
+    # strategy, matrix, vars, secrets and inputs are allowed there), and GitHub
+    # rejects the whole workflow before any job starts with
+    # "Unrecognized named-value: 'runner'". The remedy for that is a literal, not
+    # a move to step level: the install step and the pytest step must both
+    # inherit the SAME path, and two step-level envs are how they come to
+    # disagree.
+    #
+    # /home/runner/ms-playwright assumes the standard GitHub-hosted ubuntu
+    # runner (user ``runner``, home ``/home/runner``). If this job ever moves to
+    # a self-hosted runner with a different user, THIS is the line to change.
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/ms-playwright
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Change detection diffs against the base commit, so the full history
+          # is required (the default depth-1 clone has no base to diff from).
+          fetch-depth: 0
+
+      - name: Detect auth-relevant changes
+        id: changed
+        run: |
+          set -uo pipefail
+
+          base=""
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+
+          if [ -z "${base}" ] \
+             || [ "${base}" = "0000000000000000000000000000000000000000" ] \
+             || ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "auth=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::no usable base commit (base='${base}'); defaulting auth=true so the gate cannot skip itself"
+            exit 0
+          fi
+
+          if ! files="$(git diff --name-only "${base}" HEAD)"; then
+            echo "auth=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::git diff against ${base} failed; defaulting auth=true"
+            exit 0
+          fi
+
+          # Matched by keyword over the whole path: the boundary, the token, the
+          # credential, the permission model and the session layer are all auth
+          # surface. Over-running costs runner minutes; under-running silently
+          # disables the gate, so the pattern errs wide on purpose.
+          pattern='auth|token|credential|permission|session|health|conftest\.py|platform-matrix\.yml'
+          # ``grep -q`` would exit on the first match and SIGPIPE the writer, and
+          # under ``pipefail`` that reports the pipeline as failed -- i.e. it
+          # would turn a real change into a silent skip. Collect the output
+          # instead and test it for emptiness.
+          matches="$(printf '%s\n' "${files}" | grep -Ei "${pattern}" || true)"
+          if [ -n "${matches}" ]; then
+            echo "auth=true" >> "${GITHUB_OUTPUT}"
+            echo "auth-relevant files changed:"
+            printf '%s\n' "${matches}" | sed 's/^/  - /'
+          else
+            echo "auth=false" >> "${GITHUB_OUTPUT}"
+            echo "no auth-relevant file changed (${base}..HEAD):"
+            printf '%s\n' "${files}" | sed 's/^/  - /'
+          fi
+
+      - name: Report the skip (nothing is proven by a skipped gate)
+        if: steps.changed.outputs.auth != 'true'
+        run: |
+          echo "::notice::SKIPPED -- no auth-relevant file changed between the base commit and HEAD."
+          echo "The three Playwright auth e2e suites did NOT run; this green check says nothing about the auth boundary."
+
+      - name: Set up Python
+        if: steps.changed.outputs.auth == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Set up Node (the Vite dev server the suites drive)
+        if: steps.changed.outputs.auth == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web_ui/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: web_ui/frontend/package-lock.json
+
+      - name: Upgrade pip
+        if: steps.changed.outputs.auth == 'true'
+        run: python -m pip install --upgrade pip
+
+      - name: Install Python dependencies
+        if: steps.changed.outputs.auth == 'true'
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Install Chromium for Playwright
+        if: steps.changed.outputs.auth == 'true'
+        run: |
+          # PLAYWRIGHT_BROWSERS_PATH is job-level env, so it inherits here: make
+          # the install target explicit and prove where the browser landed.
+          mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"
+          python -m playwright install --with-deps chromium
+          python -m playwright install --dry-run chromium
+          ls "${PLAYWRIGHT_BROWSERS_PATH}"
+
+      - name: Install frontend dependencies
+        if: steps.changed.outputs.auth == 'true'
+        working-directory: web_ui/frontend
+        run: npm ci
+
+      - name: Assert collected test count (anti-vacuity)
+        if: steps.changed.outputs.auth == 'true'
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 3
+          tests/e2e/test_permission_persistence.py
+          tests/e2e/test_permission_mutation_ui_persistence.py
+          tests/e2e/test_tab_switch_permission_state.py
+
+      - name: Run auth e2e suites
+        if: steps.changed.outputs.auth == 'true'
+        run: |
+          # --run-e2e is required; tests/e2e/conftest.py skips e2e-keyworded items
+          # without it. The anti-vacuity assert above runs in collection-only mode,
+          # where the flag does not matter -- but here it does: without it this
+          # step would run zero tests and pass.
+          python -m pytest \
+            tests/e2e/test_permission_persistence.py \
+            tests/e2e/test_permission_mutation_ui_persistence.py \
+            tests/e2e/test_tab_switch_permission_state.py \
+            --run-e2e -v -rA --timeout 900
+
+      - name: Upload e2e backend/vite logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-e2e-auth-logs
+          path: |
+            /tmp/e2e_vault_*/**
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
   # Windows: import smoke. Proves the application package imports cleanly on
   # Windows even though the platform-specific code paths are exercised fully
   # only by the thin pytest slice below.

@@ -85,9 +85,26 @@ FOREIGN_ORIGIN_SAMPLE = [
     ("create_directory", "server.py"),
 ]
 
-#: P5 paths: one from ``server.py`` and one from ``health_routes.py``, both
-#: exempt from the credential but NOT from the peer gate.
-PEER_GATED_PATHS = ("/health", "/api/system/health")
+#: P5 paths: every health probe, from ``server.py`` and from
+#: ``health_routes.py``.  What they share is the PEER gate -- none of them
+#: carries its own per-route localhost check any more.  What they do NOT share
+#: is the credential exemption: ``/api/system/health`` reports operator-only
+#: worker/session counts and was taken off ``EXEMPT_PATHS``, so it stays
+#: peer-gated but now requires a credential like any other API path.
+PEER_GATED_PATHS = ("/health", "/api/system/health", "/api/health/containers")
+
+#: The subset of ``PEER_GATED_PATHS`` that is genuinely exempt from the
+#: credential: only these are served 200 to a loopback caller that presents
+#: none.  ``/api/health/containers`` is in the same ``health_routes.py`` module
+#: as ``/api/system/health``, so the module coverage P5 was written for survives
+#: the split.
+CREDENTIAL_EXEMPT_PROBES = ("/health", "/api/health/containers")
+
+#: The probe that is peer-gated but NOT credential-exempt, and the status a
+#: loopback caller with no credential must get from the boundary's credential
+#: gate.  Pinned so that re-exempting the path cannot pass this test silently.
+NON_EXEMPT_PROBE = "/api/system/health"
+NON_EXEMPT_PROBE_STATUS = 401
 
 _Route = namedtuple("_Route", "method path handler module line")
 
@@ -361,7 +378,20 @@ def test_p4_foreign_origin_is_refused_and_loopback_origin_is_served():
 
 
 def test_p5_non_loopback_peer_is_refused_on_the_health_probes():
-    """P5: a remote peer is refused on the probes that no longer carry their own gate."""
+    """P5: a remote peer is refused on the probes that no longer carry their own gate.
+
+    Three assertions, kept apart on purpose because they are three different
+    decisions:
+
+    * the PEER gate covers every health probe -- a non-loopback peer is 403'd
+      whatever else the path does;
+    * the CREDENTIAL exemption covers only the probes that are actually on
+      ``EXEMPT_PATHS`` -- those are served 200 to a loopback caller;
+    * ``/api/system/health`` is peer-gated but no longer credential-exempt, so
+      the same loopback caller gets 401.  Clearing the peer gate must not be
+      read as "the probe is open", and re-exempting the path would turn this
+      assertion red instead of passing quietly.
+    """
     _ensure_repo_root_on_sys_path()
     from fastapi.testclient import TestClient
     from web_ui.backend import server
@@ -374,11 +404,20 @@ def test_p5_non_loopback_peer_is_refused_on_the_health_probes():
             f"GET {path} answered {refused.status_code} for non-loopback peer {REMOTE_PEER}, expected 403 "
             f"from the boundary's peer gate; body={refused.text!r}"
         )
+
+    for path in CREDENTIAL_EXEMPT_PROBES:
         served = local.get(path)
         assert served.status_code == 200, (
             f"GET {path} answered {served.status_code} for loopback peer {LOOPBACK_PEER}, expected 200 "
-            f"(the probe must stay served on this machine); body={served.text!r}"
+            f"(a credential-exempt probe must stay served on this machine); body={served.text!r}"
         )
+
+    uncredentialed = local.get(NON_EXEMPT_PROBE)
+    assert uncredentialed.status_code == NON_EXEMPT_PROBE_STATUS, (
+        f"GET {NON_EXEMPT_PROBE} answered {uncredentialed.status_code} for a loopback peer with no credential, "
+        f"expected {NON_EXEMPT_PROBE_STATUS}: this probe is peer-gated but NOT credential-exempt, so the "
+        f"boundary's credential gate must refuse it; body={uncredentialed.text!r}"
+    )
 
 
 def test_5b_openapi_operations_match_the_ast_enumeration():

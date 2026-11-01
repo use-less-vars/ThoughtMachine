@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
 import SessionWorkspaceTab from './SessionWorkspaceTab';
@@ -272,21 +272,27 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [lastAppliedRaw, setLastAppliedRaw] = useState(null); // raw from the last GET/PUT response
   const [permsLoadError, setPermsLoadError] = useState(null); // muted tab note when GET fails
 
-  // Load the session's permission profile whenever the session changes.
-  useEffect(() => {
-    let cancelled = false;
+  // The STORED (persisted) raw map as of the last GET/PUT echo. A ref, so the
+  // tab-switch reset below can rewind the tab without a network round-trip and
+  // without depending on the identity of any other state value.
+  const persistedRawRef = useRef(null)
+
+  // Single GET path for the tab's stored sidecar.
+  const loadSessionPermissions = useCallback((sid, isCancelled = () => false) => {
     setPermsLoadError(null);
-    if (!sessionId) {
+    if (!sid) {
+      persistedRawRef.current = null;
       setSessionPerms(null);
       setLastAppliedRaw(null);
-      return () => { cancelled = true; };
+      return;
     }
-    fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`))
+    fetch(apiUrl(`/api/session/${encodeURIComponent(sid)}/permissions`))
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (cancelled) return;
+        if (isCancelled()) return;
         const raw = data && typeof data.raw === 'object' && data.raw !== null ? data.raw : {};
+        persistedRawRef.current = { ...raw };
         setSessionPerms({
           raw,
           effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : null,
@@ -297,15 +303,49 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         setLastAppliedRaw(canonicalPermKeySubset(raw));
       })
       .catch(() => {
-        if (cancelled) return;
+        if (isCancelled()) return;
         // No permission source for this session (or server unreachable): the
         // tab falls back to display-only values; Apply skips the PUT.
+        persistedRawRef.current = null;
         setSessionPerms(null);
         setLastAppliedRaw(null);
         setPermsLoadError('Session permissions unavailable — showing stored values');
       });
+  }, []);
+
+  // Load the session's permission profile whenever the session changes.
+  useEffect(() => {
+    let cancelled = false;
+    loadSessionPermissions(sessionId, () => cancelled);
     return () => { cancelled = true; };
-  }, [sessionId]);
+  }, [sessionId, loadSessionPermissions]);
+
+  // ── Tab-switch reset (permissions are DISK-PURE, not a draft) ──────
+  // The session deck keeps every pane mounted (App.jsx
+  // `.session-tab-pane-hidden`) so the window stays alive across tab switches,
+  // which means this panel is NOT remounted when the operator leaves the
+  // session. Permission edits are different from config drafts: the raw map is
+  // a STORED sidecar (GET/PUT /api/session/{id}/permissions), never part of the
+  // draft, so an un-applied edit must not outlive the view. Leaving the tab
+  // rewinds the raw map to the last persisted value; returning re-reads disk.
+  // Panes are keyed by session id, so this only ever fires for one session.
+  // `isActive` undefined means no deck is driving us (unit tests) — no-op.
+  const wasActiveRef = useRef(Boolean(isActive))
+  useEffect(() => {
+    if (typeof isActive !== 'boolean') return;
+    const wasActive = wasActiveRef.current;
+    wasActiveRef.current = isActive;
+    if (!sessionId || wasActive === isActive) return;
+    if (!isActive) {
+      if (persistedRawRef.current) {
+        const stored = persistedRawRef.current;
+        setSessionPerms((prev) => (prev ? { ...prev, raw: { ...stored } } : prev));
+        setLastAppliedRaw(canonicalPermKeySubset(stored));
+      }
+    } else {
+      loadSessionPermissions(sessionId);
+    }
+  }, [isActive, sessionId, loadSessionPermissions]);
 
   // Display map for the Permissions tab: REST raw once loaded, otherwise a
   // normalized seed from config.session_permissions (DISPLAY ONLY).
@@ -405,6 +445,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       resolved_at: data?.resolved_at ?? null,
     }))
     setLastAppliedRaw(payload)
+    // The sidecar is now exactly what we PUT (full replace): keep the
+    // tab-switch reset baseline in sync so returning to the tab shows this.
+    persistedRawRef.current = { ...(persistedRawRef.current ?? {}), ...payload }
     return data
   }
 
@@ -474,9 +517,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         if (cancelled) return
         adoptAddendum(data)
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return
-        setAddendumError('Session addendum unavailable')
+        setAddendumError(`Failed to load addendum: ${err?.message || err}`)
       })
     return () => { cancelled = true }
   }, [sessionId])

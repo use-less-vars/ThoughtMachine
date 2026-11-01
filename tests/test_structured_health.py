@@ -4,7 +4,8 @@ Covers:
 - GET /api/health/containers: structured docker availability payload
   (daemon-down degraded shape and healthy shape) with a faked `docker`
   SDK module — hermetic, never touches a real daemon.
-- GET /api/health: structured alias of GET /health (status/service/revision).
+- GET /api/health: liveness alias -- ``{"status": "ok"}`` and nothing else
+  (identity fields stay on GET /health).
 """
 
 import sys
@@ -135,13 +136,14 @@ def test_health_containers_structured_available(client, monkeypatch):
     assert "checked_at" in body
 
 
-def test_api_health_mirrors_health(client):
-    """GET /api/health returns the same structured payload as /health."""
+def test_api_health_is_a_bare_liveness_alias(client):
+    """GET /api/health is unauthenticated liveness: ``status`` only.
+
+    It is exempt at the auth boundary, so the payload must carry no identity
+    surface that an unauthenticated caller could read; ``service`` and
+    ``revision`` stay on GET /health.
+    """
     resp = client.get("/api/health")
 
     assert resp.status_code == 200
-    body = resp.json()
-    assert "status" in body
-    assert "service" in body
-    assert "revision" in body
-    assert body["service"] == "thoughtmachine-web-ui"
+    assert resp.json() == {"status": "ok"}

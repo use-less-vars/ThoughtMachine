@@ -142,6 +142,13 @@ logger = logging.getLogger(__name__)
 #: Name of the cookie the app shell mints and every same-site request replays.
 COOKIE_NAME = "tm_web_ui_session"
 
+#: Ingress paths a credential can arrive on, as reported by
+#: :func:`credential_kind`.  Constants rather than bare strings because the
+#: kind is echoed to a client by ``GET /api/auth/session``: a rename there would
+#: be a contract change, not a typo a test would catch.
+CREDENTIAL_COOKIE = "cookie"
+CREDENTIAL_BEARER = "bearer"
+
 #: HTTP status used when the credential is missing or wrong.
 UNAUTHORIZED = 401
 
@@ -155,21 +162,26 @@ WS_POLICY_VIOLATION = 1008
 
 #: Paths that need no credential.  EXACT matches -- see :func:`is_exempt`.
 #:
-#: * ``/health``, ``/api/health``, ``/api/system/health`` -- probes, already
-#:   gated on the peer address by ``local_gate``.  ``/api/health`` is here
-#:   because it is the health contract the launcher (``start_thoughtmachine.sh``)
-#:   and the CI smoke jobs poll over loopback with no credential: refusing it
-#:   would report the backend as dead;
+#: * ``/health``, ``/api/health`` -- probes, already gated on the peer address
+#:   by ``local_gate``.  ``/api/health`` is here because it is the health
+#:   contract the launcher (``start_thoughtmachine.sh``) and the CI smoke jobs
+#:   poll over loopback with no credential: refusing it would report the
+#:   backend as dead;
 #: * ``/api/health/containers`` -- container liveness probe;
 #: * ``/api/auth/session`` -- must be able to answer "do you have a credential?"
 #:   *before* the caller has one, otherwise the frontend cannot tell "log in"
 #:   from "server down";
 #: * ``/`` -- the app shell, and the only path that mints the cookie.
+#:
+#: ``/api/system/health`` is deliberately NOT here.  It reports live worker and
+#: session counts -- deployment state, not a liveness bit -- so it belongs
+#: behind the credential like every other ``/api`` route.  Nothing in the
+#: product polls it (the UI uses ``/api/health``; see ``docs/ui_map.md``), so
+#: exempting it only ever widened what an unauthenticated caller could read.
 EXEMPT_PATHS = frozenset(
     {
         "/health",
         "/api/health",
-        "/api/system/health",
         "/api/health/containers",
         "/api/auth/session",
         "/",
@@ -426,14 +438,67 @@ def bearer_credential(scope) -> Optional[str]:
     return value or None
 
 
+def credential_candidates(scope):
+    """Every credential *scope* carries, as ``(kind, value)`` in check order.
+
+    The single place that knows which ingress paths exist.  Both are returned
+    rather than just the first one found: the two are independent, so a caller
+    that sends a *wrong* value on one channel alongside a *right* one on the
+    other must still authenticate -- refusing it would make the answer depend
+    on which header the client happened to put on the wire.  The order is the
+    order the checks run in, and it is fixed: the cookie first, because that is
+    the channel this product's own UI uses.
+    """
+    return (
+        (CREDENTIAL_COOKIE, cookie_credential(scope)),
+        (CREDENTIAL_BEARER, bearer_credential(scope)),
+    )
+
+
+# NOTE: there is deliberately no "first non-empty credential" helper here.  That
+# question ("what did the caller present?", answered without verifying anything)
+# reads like a natural primitive but is never the right one to act on: an
+# unverified value can only be used to decide *something else*, and the only
+# decision this module makes is :func:`credential_ok` / :func:`credential_kind`,
+# which need the expected token and must try every candidate (see
+# :func:`credential_candidates` on why the first one is not enough).
+
+
+def _credential_value_ok(kind: str, value: Optional[str], token: str) -> bool:
+    """Whether *value* from ingress *kind* authenticates against *token*.
+
+    The two channels verify different things: the cookie is a *derived* value
+    (``"<issued-at>.<mac>"``) that needs the signature and the freshness window,
+    while the bearer header carries the secret itself and needs a constant-time
+    comparison against it.
+    """
+    if kind == CREDENTIAL_COOKIE:
+        return session_credential_ok(value, token)
+    return _matches(value, token)
+
+
+def credential_kind(scope, token: str) -> Optional[str]:
+    """The ingress kind carrying a valid credential, or ``None``.
+
+    :func:`credential_ok` with the *reason* kept instead of collapsed to a
+    bool.  Callers that report to a client (``GET /api/auth/session``) need the
+    kind to be derived here rather than sniffed with a second, drift-prone
+    check.  ``None`` and the empty token both mean "not authenticated".
+    """
+    if not token:
+        return None
+    for kind, value in credential_candidates(scope):
+        if _credential_value_ok(kind, value, token):
+            return kind
+    return None
+
+
 def credential_ok(scope, token: str) -> bool:
     """True when *scope* carries a valid session cookie or bearer token."""
     if not token:
         # An empty expected secret would make an empty candidate "match".
         return False
-    if session_credential_ok(cookie_credential(scope), token):
-        return True
-    return _matches(bearer_credential(scope), token)
+    return credential_kind(scope, token) is not None
 
 
 def set_cookie_header(token: str) -> bytes:

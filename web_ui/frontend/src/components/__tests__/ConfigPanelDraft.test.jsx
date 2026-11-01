@@ -108,7 +108,7 @@ function stubBackend() {
 const BASE_CONFIG = { mode: 'custom', session_permissions: { network: 'write' } }
 const APPLIED_CONFIG = { mode: 'custom', session_permissions: { network: 'ask' } }
 
-function panelElement(config, sendCommand) {
+function panelElement(config, sendCommand, isActive) {
   return (
     <ConfigPanel
       config={config}
@@ -118,6 +118,7 @@ function panelElement(config, sendCommand) {
       wsConnected
       workspaceId="ws-1"
       sessionId="s1"
+      isActive={isActive}
     />
   )
 }
@@ -204,6 +205,34 @@ describe('ConfigPanel draft persistence (disk-pure permissions flow)', () => {
     expect(select2.value).toBe(RAW_PROFILE.network)
     expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
     expect(screen.queryByText('Unsaved changes')).not.toBeInTheDocument()
+  })
+
+  // The session deck keeps every pane MOUNTED (App.jsx renders
+  // `.session-tab-pane-hidden` and only toggles `isActive`), so leaving a tab
+  // does NOT unmount ConfigPanel. Permissions are a stored sidecar, not a
+  // draft: an un-applied permission edit must therefore be dropped on the
+  // isActive true→false edge, and returning must show the stored profile.
+  it('drops tab-local permission edits when the pane goes inactive (keep-mounted deck) and re-reads the stored profile on return', async () => {
+    const sendCommand = vi.fn()
+    const { rerender } = render(panelElement(BASE_CONFIG, sendCommand, true))
+    const select = await openPermissionsTabLoaded()
+    fireEvent.change(select, { target: { value: 'ask' } })
+    expect(select.value).toBe('ask')
+    expect(screen.getByText('Unsaved permission changes')).toBeInTheDocument()
+
+    // Same instance, deactivated — no unmount, exactly as the deck does it.
+    rerender(panelElement(BASE_CONFIG, sendCommand, false))
+    await waitFor(() => expect(select.value).toBe(RAW_PROFILE.network))
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
+    expect(screen.queryByText('Unsaved changes')).not.toBeInTheDocument()
+
+    // Reactivated: the tab is clean and shows the stored sidecar, not 'ask'.
+    rerender(panelElement(BASE_CONFIG, sendCommand, true))
+    await waitFor(() => expect(select.value).toBe(RAW_PROFILE.network))
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
+    expect(screen.queryByText('Unsaved changes')).not.toBeInTheDocument()
+    // The dropped edit never reached the store draft either.
+    expect(useStore.getState().sessionDrafts['s1']).toBeUndefined()
   })
 
   it('applies a permission-only change immediately via the session PUT — no apply_config, never queued', async () => {

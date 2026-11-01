@@ -26,6 +26,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -36,6 +37,16 @@ import pytest
 from web_ui.backend.auth_token import STATE_DIRNAME as _TOKEN_STATE_DIRNAME
 from web_ui.backend.auth_token import TOKEN_FILENAME as _TOKEN_FILENAME
 from web_ui.backend.auth_token import read_token as _read_token
+
+# The session cookie a browser context must carry is minted and verified by the
+# boundary's own helpers -- never hand-rolled here: its value is
+# ``"<issued-at>.<mac>"``, not the bearer token, and the format is the server's
+# to define.
+from web_ui.backend.auth_boundary import COOKIE_NAME as _COOKIE_NAME
+from web_ui.backend.auth_boundary import session_credential as _session_credential
+from web_ui.backend.auth_boundary import (
+    session_credential_ok as _session_credential_ok,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_DIR = REPO_ROOT / "web_ui" / "frontend"
@@ -392,3 +403,60 @@ def browser_type_launch_args(browser_type_launch_args):
         **browser_type_launch_args,
         "args": ["--no-sandbox", "--disable-dev-shm-usage"],
     }
+
+
+# ---------------------------------------------------------------------------
+# auth-boundary session cookie -- injected into every browser context
+# ---------------------------------------------------------------------------
+# The boundary is CORRECT and is not worked around here: ``/api/*`` requires a
+# credential, the cookie is minted on ``GET /`` only
+# (``auth_boundary.COOKIE_MINT_PATHS``) and the server sends it as
+# ``Max-Age=43200; HttpOnly; SameSite=Strict; Path=/``. A context that starts
+# empty therefore gets 401 on every frontend fetch and the UI hangs on
+# "Loading config...". Injecting the server's own cookie value into the context
+# IS the missing login step -- nothing is exempted, no token reaches page JS and
+# no route is bypassed.
+#
+# Cookies are host-scoped, NOT port-scoped, so one cookie per distinct hostname
+# covers both the backend port and the Vite port.
+
+
+@pytest.fixture(scope="session")
+def e2e_session_cookies(e2e_backend, e2e_frontend, e2e_auth_headers):
+    """``add_cookies()`` payload: one boundary cookie per distinct hostname."""
+    # Reuse the fixture that already resolved the token; never read the store a
+    # second way.
+    token = e2e_auth_headers["Authorization"].split("Bearer ", 1)[1]
+    value = _session_credential(token)
+    # Self-check: a broken mint must fail here, loudly, not as a mystery hang.
+    assert _session_credential_ok(value, token), (
+        "auth_boundary.session_credential() minted a value its own verifier "
+        "rejects; the browser cookie would be refused at the boundary and the "
+        "UI would hang on 'Loading config...'"
+    )
+    hostnames = {
+        urlparse(url).hostname
+        for url in (e2e_backend["base_url"], e2e_frontend["base_url"])
+    }
+    return [
+        {
+            "name": _COOKIE_NAME,
+            "value": value,
+            "domain": hostname,
+            "path": "/",
+            "httpOnly": True,
+            "sameSite": "Strict",
+        }
+        for hostname in sorted(hostnames)
+        if hostname
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _e2e_authenticated_context(request):
+    """Put the session cookie on the context before any page can navigate."""
+    if "page" not in request.fixturenames and "context" not in request.fixturenames:
+        return
+    cookies = request.getfixturevalue("e2e_session_cookies")
+    context = request.getfixturevalue("context")
+    context.add_cookies(cookies)

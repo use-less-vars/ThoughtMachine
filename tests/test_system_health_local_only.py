@@ -29,6 +29,11 @@ from fastapi.testclient import TestClient
 from web_ui.backend import health_routes
 from web_ui.backend.auth_boundary import AuthBoundaryMiddleware
 
+#: Expected secret injected into the middleware the ``app`` fixture builds --
+#: the loopback test must present it, everything else goes through the peer
+#: name (``testclient``) harness trust.
+TEST_TOKEN = "local-gate-test-token"
+
 # -- Harness -----------------------------------------------------------------
 
 class _StubSessionStore:
@@ -95,7 +100,7 @@ def app():
     # The local-caller gate lives in the boundary middleware, not in the route:
     # compose it as ``server.py`` does, so these tests keep pinning the refusal
     # itself rather than a per-route copy of it that no longer exists.
-    application.add_middleware(AuthBoundaryMiddleware)
+    application.add_middleware(AuthBoundaryMiddleware, token=TEST_TOKEN)
     return application
 
 
@@ -187,9 +192,16 @@ def test_missing_peer_address_is_refused(app, env):
 
 
 def test_loopback_client_is_served(app, env):
-    """A loopback peer still gets the full worker/session payload."""
+    """A loopback peer presenting the credential gets the full payload.
+
+    The peer gate alone no longer serves this route: it was taken off
+    ``EXEMPT_PATHS``, so even a local caller must authenticate.
+    """
     with TestClient(app, client=("127.0.0.1", 45678)) as client:
-        response = client.get("/api/system/health")
+        response = client.get(
+            "/api/system/health",
+            headers={"Authorization": f"Bearer {TEST_TOKEN}"},
+        )
     assert response.status_code == 200
     payload = response.json()
     assert [w["worker_name"] for w in payload["running_workers"]] == ["coder"]
