@@ -3,18 +3,22 @@ E2E regression test: tab switching and the disk-pure permission-draft UX.
 
 Disk-pure UX contract under test
 --------------------------------
-* ConfigPanel permission edits are TAB-LOCAL drafts.  App.jsx mounts ONLY
-  the active SessionTab (``key={activeTab.sessionId}``), so switching tabs
-  unmounts the previous tab's ConfigPanel and destroys its local draft
-  state.
+* ConfigPanel permission edits are TAB-LOCAL state, NOT store drafts.  The
+  session deck keeps every session pane MOUNTED and merely hides the
+  inactive ones (App.jsx renders ``.session-tab-pane-hidden`` and only
+  toggles the ``isActive`` prop; styles.css sets ``display:none``), so
+  switching tabs does NOT unmount ConfigPanel.  The drop is therefore
+  driven by the ``isActive`` edge inside ConfigPanel: on true -> false it
+  rewinds the tab-local raw permission map to the last persisted sidecar,
+  and on false -> true it re-reads ``GET /api/session/{id}/permissions``.
 * An edit that is never Apply'd is therefore DROPPED on a tab round-trip:
-  after A -> B -> A the Permissions tab re-initializes from the last
-  backend config, so the select reverts to its ORIGINAL value and no
-  unsaved-change banner is shown.
-* An edit that IS Apply'd is persisted to the session file (session
-  WebSocket ``apply_config`` -> ``merge_session_permissions``) and survives
-  the round-trip: after A -> B -> A the select still shows the applied
-  value.
+  after A -> B -> A the Permissions tab shows the stored profile, so the
+  select reverts to its ORIGINAL value and no unsaved-change banner is
+  shown.
+* An edit that IS Apply'd is persisted by the disk-pure REST write
+  (``PUT /api/session/{id}/permissions`` - a full replace of the canonical
+  grant map) and survives the round-trip: after A -> B -> A the select
+  still shows the applied value.
 
 Scenario
 --------
