@@ -1644,8 +1644,8 @@ class WorkerThread(threading.Thread):
         # UNIT C: the worker is now actually running again, so the manual-only
         # marker is stale.  Clear it so later queries/spawns do not treat this
         # worker as manually paused (the REST fast-path resume reaches this
-        # method without going through _action_resume, which used to be the
-        # only place that cleared the marker).
+        # method directly; the agent-facing ``resume`` action that used to be
+        # the only other place clearing the marker no longer exists).
         self._manual_only_pause = False
         # PHASE 2.1a: a resumed worker is no longer detached — clear the
         # detach markers and lift the detached registration.
@@ -3704,6 +3704,12 @@ class Worker(ToolBase):
     from a stale or hanging worker of your own.  Force is deliberately
     session-scoped: a worker of the same name owned by another session (and
     therefore by another workspace) is left running untouched.
+
+    Lifecycle authority: ``action='stop'`` DETACHES a worker (recoverable park
+    — the thread, its containers and its registration all survive, and queued
+    queries are kept); it never terminates anything.  Terminating (``kill``)
+    and reviving (``resume``) a worker are operator-only operations exposed in
+    the workspace UI, not actions this tool offers the agent.
     """
 
     tool: str = "Worker"
@@ -3712,7 +3718,13 @@ class Worker(ToolBase):
     required_categories: ClassVar[List[str]] = []
 
     action: str = Field(
-        description="Action: list, spawn, check, query, stop, submit_query, job_status. "
+        description="Action: list, spawn, check, query, stop, submit_query, job_status, "
+        "join, wait_for_job, pause, reset. "
+        "action='stop' DETACHES the worker: it parks (status 'detached', context "
+        "saved, containers and registration kept, queued work preserved) and an "
+        "operator can revive it — a stop is therefore never a termination. "
+        "Killing and resuming a worker are operator-only (workspace UI), not "
+        "agent actions. "
         "When action='spawn' and context has a 'query' key, the spawn call "
         "BLOCKS until the worker finishes the task and returns the full result. "
         "Without a 'query' key, spawn returns immediately; use action='query' later. "
@@ -3788,7 +3800,10 @@ class Worker(ToolBase):
 
     skip_output_truncation: ClassVar[bool] = True
 
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "kill", "submit_query", "job_status", "join", "wait_for_job", "pause", "resume", "reset"]
+    # Termination ("kill") and revival ("resume") are deliberately NOT here:
+    # both are operator-only operations (web UI / workspace HTTP routes), never
+    # agent actions.  The agent's "stop" DETACHES (recoverable park).
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "reset"]
 
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
@@ -3804,6 +3819,22 @@ class Worker(ToolBase):
         from tools.workspace.worker import resolve_workspace_id
         try:
             if self.action not in self.VALID_ACTIONS:
+                if self.action in ("kill", "resume"):
+                    # These exist, but only for an operator.  Teach the agent
+                    # instead of reporting a bare "unknown action".
+                    return json.dumps({
+                        "error": (
+                            f"Action '{self.action}' is operator-only: agents "
+                            f"cannot {self.action} workers, and nothing was "
+                            f"{('killed' if self.action == 'kill' else 'resumed')}. "
+                            "Operators do this from the workspace UI. "
+                            "To park a worker, use action='stop': it DETACHES "
+                            "(status 'detached', context saved, containers and "
+                            "registration kept, queued work preserved) and an "
+                            "operator can revive it later, so nothing is lost."
+                        ),
+                        "available_actions": self.VALID_ACTIONS,
+                    })
                 return json.dumps({
                     "error": f"Unknown action: {self.action}",
                     "available_actions": self.VALID_ACTIONS,
@@ -3846,13 +3877,11 @@ class Worker(ToolBase):
                 "check": lambda: self._action_check(workers),
                 "query": lambda: self._action_query(workers),
                 "stop": lambda: self._action_stop(workers),
-                "kill": lambda: self._action_kill(workers),
                 "submit_query": lambda: self._action_submit_query(workers),
                 "job_status": lambda: self._action_job_status(workers),
                 "join": lambda: self._action_join(workers),
                 "wait_for_job": lambda: self._action_join(workers),
                 "pause": lambda: self._action_pause(workers),
-                "resume": lambda: self._action_resume(workers),
                 "reset": lambda: self._action_reset(workers),
             }[self.action]
 
@@ -4181,7 +4210,8 @@ class Worker(ToolBase):
                     # terminate. stop() only detaches now (and would leave the
                     # stale thread parked and alive forever).
                     thread.kill()
-                    # Robust join with retry (same pattern as _action_kill)
+                    # Robust join with retry (same pattern as the termination
+                    # paths in _action_reset / the session cascade)
                     _budget = max(30, thread._timeout_seconds)
                     _elapsed = 0.0
                     while _elapsed < _budget:
@@ -5453,8 +5483,9 @@ class Worker(ToolBase):
           - ``all`` \u2192 also cooperatively pause every live worker of this
             session (Pause All).
           - ``manual_only`` \u2192 the workers paused by this call are marked
-            manual-only: a later query will NOT auto-resume them; they must be
-            resumed explicitly with the ``resume`` action.
+            manual-only: a later query will NOT auto-resume them; an OPERATOR
+            must resume them (workspace UI / the HTTP resume route).  The
+            agent has no resume action.
         When ``worker_name`` is set, only that worker is paused (the session
         main agent is not paused unless ``main`` is also present).
         """
@@ -5511,96 +5542,16 @@ class Worker(ToolBase):
             "note": note,
         }
 
-    def _action_resume(self, workers: list) -> dict:
-        """Resume a session main-agent and/or worker pause (UNIT C, v2).
-
-        Mirrors ``_action_pause``: clears the session from the main-pause set
-        and (with ``all`` in ``worker_query`` or a ``worker_name``) resumes the
-        matching paused workers cooperatively via ``WorkerThread.resume()``,
-        clearing their manual-only marker.
-        """
-        from tools.workspace.worker import _registry_lock, _worker_registry
-        session_key = self.session_id or _NO_SESSION_KEY
-        spec = (self.worker_query or "").strip().lower()
-        tokens = {t for t in spec.replace(",", " ").split() if t}
-        want_all = "all" in tokens
-        want_main = (not tokens) or ("main" in tokens)
-        if self.worker_name:
-            want_all = True
-            want_main = False
-        if want_main:
-            _SESSION_MAIN_PAUSED.discard(session_key)
-        resumed_workers = []
-        refused_workers = []
-        with _registry_lock:
-            for key, thread in list(_worker_registry.items()):
-                if key[0] != session_key:
-                    continue
-                if self.worker_name is not None and key[1] != self.worker_name:
-                    continue
-                if getattr(thread, "status", None) not in ("paused", "detached"):
-                    continue
-                if not want_all:
-                    continue
-                # A "paused" status is not proof the worker can be revived: a
-                # stop issued out-of-process (command.json, handled at the poll
-                # path) sets _stop_event WITHOUT touching status, so resume()
-                # legitimately refuses. Report that refusal instead of claiming
-                # a resume that did not happen.
-                try:
-                    resume_outcome = thread.resume()
-                except Exception as exc:
-                    resume_outcome = False
-                    logger.warning(
-                        "Resume: worker '%s' instance %s raised on resume: %s",
-                        key[1], key[2] if len(key) >= 3 else 1, exc,
-                    )
-                if resume_outcome is False or _stop_already_pending(thread):
-                    refused_workers.append({
-                        "worker_name": key[1],
-                        "instance_id": key[2] if len(key) >= 3 else 1,
-                        "reason": "stop already in flight",
-                    })
-                    continue
-                try:
-                    thread._manual_only_pause = False
-                except Exception:
-                    pass
-                resumed_workers.append({
-                    "worker_name": key[1],
-                    "instance_id": key[2] if len(key) >= 3 else 1,
-                })
-        if refused_workers and not resumed_workers:
-            # Nothing was revived: do not report this as a successful resume.
-            return {
-                "status": "refused",
-                "session_id": self.session_id,
-                "scope": "all" if want_all else "main",
-                "main_agent_paused": want_main and session_key in _SESSION_MAIN_PAUSED,
-                "workers_resumed": resumed_workers,
-                "workers_refused": refused_workers,
-                "note": (
-                    "No worker was resumed: every matching worker has a stop "
-                    "already in flight. Spawn a fresh instance instead."
-                ),
-            }
-        return {
-            "status": "resumed",
-            "session_id": self.session_id,
-            "scope": "all" if want_all else "main",
-            "main_agent_paused": want_main and session_key in _SESSION_MAIN_PAUSED,
-            "workers_resumed": resumed_workers,
-            "workers_refused": refused_workers,
-            "note": "Main agent resumed." if want_main else "Requested worker(s) resumed.",
-        }
-
     def _action_stop(self, workers: list) -> dict:
         """DETACH a running worker and persist its context (PHASE 2.1a).
 
-        ``stop`` no longer terminates anything: the worker parks with status
-        ``"detached"``, its thread, containers and registry entry all survive,
-        and ``resume`` (or a later query, which resumes implicitly) brings it
-        back.  Termination lives in ``_action_kill`` (action ``"kill"``).
+        ``stop`` never terminates anything: the worker parks with status
+        ``"detached"``, its thread, containers and registry entry all survive.
+        Only an OPERATOR revives it (UI resume / HTTP resume route); a query
+        submitted while it is detached is QUEUED in strict FIFO order and runs
+        after that resume — it is never itself a resume.  Termination is
+        operator-only as well (the UI kill route); this tool offers the agent
+        neither ``kill`` nor ``resume``.
 
         First tries the current session; if not found, falls back to a
         same-session sweep for any remaining instances of the name.  A live
@@ -5690,173 +5641,6 @@ class Worker(ToolBase):
             "message": f"Worker '{self.worker_name}' detached successfully.",
         }
 
-    def _action_kill(self, workers: list) -> dict:
-        """Kill a running worker, reclaim its containers, persist its context.
-
-        PHASE 2.1a: this is the ONLY termination path (action ``"kill"``);
-        ``_action_stop`` detaches.  ``_action_reset``, the detached-worker TTL
-        sweep and the session cascade call THIS, never ``_action_stop``.
-
-        First tries the current session; if not found, falls back to a
-        same-session sweep for any remaining instances of the name.  A live
-        worker of the same name owned by ANOTHER session is never stopped:
-        session scoping is what makes stop workspace-safe.
-        """
-        from tools.workspace.worker import _registry_lock, _worker_registry
-        session_key = self.session_id or _NO_SESSION_KEY
-        try:
-            thread, sid, iid = _resolve_worker_thread(
-                self.worker_name,
-                instance_id=self.instance_id,
-                session_id=session_key,
-            )
-        except _WorkerAmbiguityError as exc:
-            msg = str(exc)
-            all_instances = []
-            if self.instance_id is None and "is not running" in msg:
-                # ── Not found in current session → sweep THIS session only ──
-                # Never sweep the whole registry: a worker of the same name
-                # owned by another session (and therefore another workspace)
-                # is not this caller's property and must survive untouched.
-                # ``self.session_id or None`` keeps the historical unscoped
-                # lookup for a falsy session_id.
-                all_instances = self._find_all_worker_threads(
-                    self.worker_name, session_id=self.session_id or None
-                )
-            if "ambiguous" in msg:
-                # Name maps to multiple live instances — the caller must pass
-                # an explicit instance_id to disambiguate.
-                return {
-                    "error": msg,
-                    "worker_name": self.worker_name,
-                }
-            if not all_instances:
-                # No instances in this session — report as not running
-                entry = self._find_worker(workers, self.worker_name)
-                if entry:
-                    return {
-                        "worker_name": self.worker_name,
-                        "status": "stopped",
-                        "message": f"Worker '{self.worker_name}' was not running.",
-                    }
-                return {
-                    "error": f"Worker '{self.worker_name}' not found",
-                }
-
-            # Found in this session (non-live leftovers) — stop all instances
-            stopped_info = []
-            for sid, t in all_instances:
-                worker_label = f"{self.worker_name} (session={sid})"
-                logger.info("Same-session kill: killing worker '%s'", worker_label)
-                try:
-                    t.kill()
-                    # Robust join with retry (same pattern as _action_kill)
-                    _budget = max(30, t._timeout_seconds)
-                    _elapsed = 0.0
-                    while _elapsed < _budget:
-                        t.join(timeout=2.0)
-                        _elapsed += 2.0
-                        if not t.is_alive():
-                            break
-                    if t.is_alive():
-                        logger.warning(
-                            "Same-session stop: worker '%s' did not stop within %ds",
-                            worker_label, _budget,
-                        )
-                except Exception as exc:
-                    logger.exception("Error killing worker '%s'", worker_label)
-                    stopped_info.append({"session_id": sid, "error": str(exc)})
-                finally:
-                    if t._worker_ctx is not None:
-                        t._worker_ctx.compact_after_summary()
-                    t._save_context()
-                    t._cleanup_worker_containers()
-                    with _registry_lock:
-                        for key, existing_t in list(_worker_registry.items()):
-                            if (
-                                key[0] == sid
-                                and key[1] == self.worker_name
-                                and existing_t is t
-                            ):
-                                _worker_registry.pop(key, None)
-                    if t.status not in [s.get("status") for s in stopped_info]:
-                        stopped_info.append({"session_id": sid, "status": t.status})
-
-            return {
-                "worker_name": self.worker_name,
-                "status": "killed",
-                "message": (
-                    f"Killed {len(stopped_info)} instance(s) of worker "
-                    f"'{self.worker_name}' in this session."
-                ),
-                "killed_instances": stopped_info,
-            }
-
-        # ── Found in current session ──
-        if not thread.is_alive():
-            with _registry_lock:
-                _worker_registry.pop((sid, self.worker_name, iid), None)
-            if thread._worker_ctx is not None:
-                thread._worker_ctx.compact_after_summary()
-            thread._save_context()
-            thread._cleanup_worker_containers()
-            return {
-                "worker_name": self.worker_name,
-                "status": thread.status,
-                "message": f"Worker '{self.worker_name}' is not running.",
-            }
-
-        try:
-            thread.kill()
-            # ── Robust join: retry loop to handle slow LLM API calls ──
-            # The worker's _run_tool_loop can be blocked inside
-            # agent.process_query() waiting for an LLM response that takes
-            # 15-30s.  A single join(timeout=10) would expire before the
-            # _stop_event is checked.  We retry with a longer total budget.
-            _join_budget = max(30, thread._timeout_seconds)
-            _join_elapsed = 0.0
-            _join_step = 2.0
-            while _join_elapsed < _join_budget:
-                thread.join(timeout=_join_step)
-                _join_elapsed += _join_step
-                if not thread.is_alive():
-                    break
-                logger.debug(
-                    "Still waiting for worker '%s' to stop "
-                    "(%.0f/%ds elapsed)",
-                    self.worker_name, _join_elapsed, _join_budget,
-                )
-            if thread.is_alive():
-                logger.warning(
-                    "Worker '%s' did not exit within %ds budget. "
-                    "Popping from registry anyway (daemon thread).",
-                    self.worker_name, _join_budget,
-                )
-        except Exception as exc:
-            logger.exception("Error joining worker '%s' during kill", self.worker_name)
-            return {
-                "error": f"Error killing worker '{self.worker_name}': {exc}",
-            }
-        finally:
-            if thread._worker_ctx is not None:
-                thread._worker_ctx.compact_after_summary()
-            thread._save_context()
-            thread._cleanup_worker_containers()
-            # Terminal status: a killed worker ends as 'killed' (not
-            # 'completed'). Write the status file before removing from the
-            # registry so the terminal state remains observable.
-            if thread.status != "error":
-                thread.status = "killed"
-                thread._write_status_file()
-            with _registry_lock:
-                _worker_registry.pop((sid, self.worker_name, iid), None)
-
-        return {
-            "worker_name": self.worker_name,
-            "status": "killed",
-            "message": f"Worker '{self.worker_name}' killed successfully.",
-        }
-
     def _action_reset(self, workers: list) -> dict:
         """Stop a worker, DROP its persisted context, and free its spawn slot.
 
@@ -5885,8 +5669,9 @@ class Worker(ToolBase):
                 # detached thread's run() finally-block would re-save the
                 # context we are about to drop from disk.
                 t.kill()
-                # Robust join with retry (same pattern as _action_kill): the
-                # worker may be blocked inside a slow LLM call.
+                # Robust join with retry (same pattern as the force-respawn
+                # termination path): the worker may be blocked inside a slow
+                # LLM call.
                 _budget = max(30, t._timeout_seconds)
                 _elapsed = 0.0
                 while _elapsed < _budget:
