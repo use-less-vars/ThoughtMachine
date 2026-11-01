@@ -510,6 +510,57 @@ def _worker_elapsed_seconds(started_at: Optional[str]) -> Optional[float]:
         return None
 
 
+def _worker_queued_queries(thread) -> Dict[str, Any]:
+    """Report the queries *thread* has accepted but not yet dequeued.
+
+    The single source of truth is ``WorkerThread.pending_query_jobs()``, which
+    returns a copy of the thread's in-memory deque of accepted job ids; entries
+    leave that deque as the worker loop dequeues them, so the reported count is
+    a live snapshot rather than a ledger.  Reading it is purely observational:
+    no enqueue, resume, registry or audit side effects and no EventBus traffic.
+    ``pending_query_jobs()`` copies the deque under the thread's
+    ``_queued_lock``, a plain ``threading.Lock`` that no holder keeps across I/O
+    or an LLM call, so this cannot stall the route.
+
+    Deliberately defensive: duck-typed thread doubles without a callable
+    ``pending_query_jobs``, a getter that raises, a non-sequence result, and
+    inactive/stopped threads (whose queue is cleared when pending queries are
+    rejected) all report an empty queue instead of failing the request.
+    """
+    getter = getattr(thread, "pending_query_jobs", None)
+    if not callable(getter):
+        # Genuinely no queue to read (duck-typed double, inactive entry):
+        # reporting 0 is correct here, so this path stays silent.
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    worker_name = getattr(thread, "worker_name", "") or ""
+    try:
+        job_ids = getter()
+    except Exception:
+        # The queue state is UNKNOWN but the response says 0 — never let that
+        # silently read as an idle worker.
+        logger.warning(
+            "Worker %r: could not read its queued queries — "
+            "pending_query_jobs() raised, so queued_query_count is reported "
+            "as 0 and any queries it holds are not shown",
+            worker_name,
+            exc_info=True,
+        )
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    if not isinstance(job_ids, (list, tuple)):
+        # Same unknown-state case, without an exception to attach.
+        logger.warning(
+            "Worker %r: could not read its queued queries — "
+            "pending_query_jobs() returned %s instead of a list/tuple, so "
+            "queued_query_count is reported as 0 and any queries it holds "
+            "are not shown",
+            worker_name,
+            type(job_ids).__name__,
+        )
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    ids = [str(job_id) for job_id in job_ids]
+    return {"queued_query_count": len(ids), "queued_query_ids": ids}
+
+
 def _worker_active_entry(thread) -> Dict[str, Any]:
     """Map a live WorkerThread to its compact runtime handle.
 
@@ -517,8 +568,10 @@ def _worker_active_entry(thread) -> Dict[str, Any]:
     its owning session, runtime status and heartbeat freshness.  ``elapsed``
     is seconds since start (None when the start timestamp is missing);
     ``container_id`` is the thread's provisioned container when attributable
-    (None otherwise).  ``worker_name``/``instance_id``/``status``/``elapsed``
-    are kept for backward compatibility with existing consumers.
+    (None otherwise).  ``queued_query_count``/``queued_query_ids`` expose the
+    queries the thread has accepted but not yet dequeued (see
+    ``_worker_queued_queries``); ``worker_name``/``instance_id``/``status``/
+    ``elapsed`` are kept for backward compatibility with existing consumers.
     """
     return {
         "worker_name": getattr(thread, "worker_name", ""),
@@ -529,6 +582,7 @@ def _worker_active_entry(thread) -> Dict[str, Any]:
         "session_id": getattr(thread, "session_id", "") or "",
         "last_heartbeat": getattr(thread, "last_heartbeat", None),
         "container_id": getattr(thread, "container_id", None),
+        **_worker_queued_queries(thread),
     }
 
 
@@ -621,14 +675,17 @@ async def get_active_workers(
     """Return live worker threads for the workspace (runtime handles only).
 
     Each handle carries ``{worker_name, instance_id, status, elapsed, name,
-    session_id, last_heartbeat, container_id}`` where ``elapsed`` is the
-    seconds since the thread started (None when the start timestamp is
-    missing), ``last_heartbeat`` is the thread's last heartbeat ISO timestamp
-    (None when the thread has not heartbeated yet) and ``container_id`` is the
-    thread's provisioned container (None when not attributable).  The
-    optional ``?session_id=`` query param narrows the result to the threads of
-    a single session.  Template definitions are served by
-    ``GET /api/workspace/{ws_id}/workers`` instead.
+    session_id, last_heartbeat, container_id, queued_query_count,
+    queued_query_ids}`` where ``elapsed`` is the seconds since the thread
+    started (None when the start timestamp is missing), ``last_heartbeat`` is
+    the thread's last heartbeat ISO timestamp (None when the thread has not
+    heartbeated yet) and ``container_id`` is the thread's provisioned container
+    (None when not attributable).  ``queued_query_count``/``queued_query_ids``
+    report the queries the thread has accepted but not yet picked up, with the
+    ids in FIFO order (both empty when nothing is pending or the thread cannot
+    report a queue).  The optional ``?session_id=`` query param narrows the
+    result to the threads of a single session.  Template definitions are served
+    by ``GET /api/workspace/{ws_id}/workers`` instead.
     """
     session_id = _query_default(session_id)
     entries = _collect_active_workers(ws_id)
