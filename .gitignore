@@ -348,3 +348,8 @@ web_ui/frontend/.npmrc
 /docs/system-map.md
 /docs/xray/backend_runtime.md
 /docs/xray/frontend.md
+!.thoughtmachine/knowledge/project/archive/status-archive-gen48-55.md
+# Gen 55 W6 design brief (worker lifecycle): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is
+# never versioned and vanishes on the next clone.
+!docs/design-worker-lifecycle.md
