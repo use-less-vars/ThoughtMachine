@@ -55,14 +55,20 @@ def _live_thread(status: str = "ready") -> MagicMock:
     # conversation_length; a MagicMock would blow up on len().
     t._worker_ctx = None
 
-    def _stop(*_a, **_k):
-        # Realistic stop(): stop() + join ends the thread, so is_alive() turns
-        # False. The force-spawn block only unregisters an instance that really
-        # died (a live one is kept so it is not orphaned).
-        t.status = "stopped"
+    # PHASE 2.1a: model BOTH verbs.  stop() DETACHES: the thread parks and
+    # stays alive, so a detach never unregisters or frees anything.  kill()
+    # TERMINATES: is_alive() turns False, which is the only thing the
+    # force-spawn block will unregister (a live one is kept, never orphaned).
+    def _detach(*_a, **_k):
+        t.status = "detached"
+        t.is_alive.return_value = True
+
+    def _kill(*_a, **_k):
+        t.status = "killed"
         t.is_alive.return_value = False
 
-    t.stop.side_effect = _stop
+    t.stop.side_effect = _detach
+    t.kill.side_effect = _kill
     return t
 
 
@@ -289,13 +295,17 @@ class TestWorkerOperationSemantics(unittest.TestCase):
     # ── 6. force stops ALL instances of the name, then fresh spawn ─────
 
     def test_spawn_force_stops_all_same_name(self):
-        """force=True stops every instance of the name and spawns fresh #1."""
+        """force=True kills every instance of the name and spawns fresh #1."""
         fake1 = self._seed_fake(SESSION, "w3", 1)
         fake2 = self._seed_fake(SESSION, "w3", 2)
 
         result = self._spawn("w3", force=True)
-        fake1.stop.assert_called_once()
-        fake2.stop.assert_called_once()
+        # PHASE 2.1a: force TERMINATES (kill); detaching would leave both
+        # instances parked and alive, holding their keys.
+        fake1.kill.assert_called_once()
+        fake2.kill.assert_called_once()
+        fake1.stop.assert_not_called()
+        fake2.stop.assert_not_called()
         self.assertTrue(result.get("spawned"), f"force spawn: {result}")
         self.assertEqual(result.get("instance_id"), 1)
         self.assertEqual(result.get("instance_label"), "w3")
@@ -305,15 +315,18 @@ class TestWorkerOperationSemantics(unittest.TestCase):
     # ── 6b. force is session-scoped ──────────────────────────────────
 
     def test_spawn_force_does_not_stop_other_session_instance(self):
-        """force=True is session-scoped: another session's instance survives."""
+        """force=True is session-scoped: another session's instance survives
+        BOTH verbs: it is neither detached nor killed."""
         other_session = "sess-op-semantics-other"
         mine = self._seed_fake(SESSION, "w4", 1)
         foreign = self._seed_fake(other_session, "w4", 1)
 
         result = self._spawn("w4", force=True)
 
-        mine.stop.assert_called_once()
+        mine.kill.assert_called_once()
+        mine.stop.assert_not_called()
         foreign.stop.assert_not_called()
+        foreign.kill.assert_not_called()
         self.assertTrue(result.get("spawned"), f"force spawn: {result}")
         self.assertEqual(result.get("instance_id"), 1)
         with self._registry._registry_lock:
