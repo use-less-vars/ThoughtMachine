@@ -472,3 +472,92 @@ class TestKillDiscardsQueue:
         assert thread.pending_query_jobs() == []
         assert [e for e in bus.events if e.type == EventType.WORKER_ERROR] == []
         assert audited == []
+
+
+# -- 6: accept is all-or-nothing (queue AND registry) ----------------------
+
+
+class TestAcceptIsAllOrNothing:
+    """A query is accepted only when it is BOTH queued and registered.
+
+    The positive case resolves the job through the registry's OWN API (the
+    ``job_status`` action reading the real ``WorkerJobRegistry``) rather than
+    trusting a mocked call log: a drifted ``register`` signature would store
+    nothing and the lookup would miss.
+    """
+
+    def test_accepted_query_is_retrievable_through_job_status(
+        self, tmp_path, monkeypatch, registry
+    ):
+        thread = _spawn_worker(tmp_path, monkeypatch)
+        _detach(thread)
+
+        result = json.loads(
+            Worker(
+                action="query",
+                worker_name="w-queue",
+                worker_query="queued work",
+                session_id="s-queue",
+            ).execute()
+        )
+        job_id = result["job_id"]
+        assert result["status"] == "submitted"
+        assert thread.pending_query_jobs() == [job_id]
+
+        polled = json.loads(
+            Worker(
+                action="job_status",
+                worker_name="w-queue",
+                worker_query=job_id,
+                session_id="s-queue",
+            ).execute()
+        )
+        assert polled.get("error") is None, polled
+        assert polled["job_id"] == job_id
+        # "submitted" IS the queued state: the job exists and has not run.
+        assert polled["status"] == "submitted"
+        assert polled["worker_name"] == "w-queue"
+        assert polled["has_result"] is False
+        # The registry holds exactly that one job, keyed by the returned id.
+        assert [j["job_id"] for j in registry.jobs(worker_name="w-queue")] == [job_id]
+
+    def test_register_failure_leaves_no_orphan_and_no_success(
+        self, tmp_path, monkeypatch, registry
+    ):
+        thread = _spawn_worker(tmp_path, monkeypatch)
+        _detach(thread)
+
+        def _drifted_register(job_id, worker_name, session_id):
+            """Signature drift: the real call also passes ``instance_id=``."""
+            raise TypeError(
+                "register() got an unexpected keyword argument 'instance_id'"
+            )
+
+        monkeypatch.setattr(registry, "register", _drifted_register)
+
+        result = json.loads(
+            Worker(
+                action="query",
+                worker_name="w-queue",
+                worker_query="doomed",
+                session_id="s-queue",
+            ).execute()
+        )
+
+        # (a) no success-shaped response: no job handle, no "submitted" status,
+        # and the failure is visible to the caller instead of swallowed.
+        assert "error" in result, result
+        assert "job_id" not in result, result
+        assert result.get("status") != "submitted", result
+        assert "unexpected keyword argument" in result["error"], result
+
+        # (b) the queued entry was rolled back, not left as an orphan.
+        assert thread.pending_query_jobs() == []
+        leftover = []
+        while not thread._input_queue.empty():
+            item = thread._input_queue.get_nowait()
+            if isinstance(item, tuple) and len(item) >= 2 and item[1] == "doomed":
+                leftover.append(item)
+        assert leftover == [], leftover
+        # ...and nothing was recorded behind our back.
+        assert registry.jobs(worker_name="w-queue") == []
