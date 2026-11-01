@@ -517,9 +517,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         if (cancelled) return
         adoptAddendum(data)
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return
-        setAddendumError('Session addendum unavailable')
+        setAddendumError(`Failed to load addendum: ${err?.message || err}`)
       })
     return () => { cancelled = true }
   }, [sessionId])
