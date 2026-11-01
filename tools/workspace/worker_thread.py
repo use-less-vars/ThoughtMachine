@@ -10,6 +10,7 @@ name from this module, so existing importers and tests are unaffected.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -1122,6 +1123,14 @@ class WorkerThread(threading.Thread):
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._resume_event = threading.Event()
+        # PHASE 2.1b: ordered bookkeeping for the per-instance FIFO query
+        # queue. ``_input_queue`` is the queue itself (already a FIFO with a
+        # single query in flight, drained head-first); this deque mirrors the
+        # job_ids of the queries queued through ``enqueue_query`` in the SAME
+        # order, so the pending set is introspectable (panel queue count +
+        # job IDs) and can be rejected as a unit on TTL expiry or kill.
+        self._queued_job_ids: "collections.deque[str]" = collections.deque()
+        self._queued_lock = threading.Lock()
         # Execution tracking (default-on): every in-flight blocking tool call
         # is registered here unconditionally (WLM feature flag on or off) so
         # the interrupt paths (stop(), stale-recovery, WLM timeout/stop) can
@@ -1461,9 +1470,11 @@ class WorkerThread(threading.Thread):
 
         The run loop is unblocked and parks in the detached state, so the
         worker stops pulling queries — but the thread, its containers and its
-        registry entry all survive, and ``resume`` (or a query) revives it.
-        Context is persisted and the worker is registered as detached so the
-        stale-container sweep skips it until the detached TTL expires.
+        registry entry all survive. Only an operator ``resume`` revives it: a
+        query submitted while the worker is detached is QUEUED (see
+        ``enqueue_query``), never a resume. Context is persisted and the
+        worker is registered as detached so the stale-container sweep skips it
+        until the detached TTL expires.
         """
         # Synchronous lifecycle transition: 'detaching' must be observable
         # before the run loop acknowledges the park.
@@ -1516,6 +1527,10 @@ class WorkerThread(threading.Thread):
         # path that unblocks a stuck tool call.
         self._terminate_tracked_executions()
         self._publish_global_event(EventType.WORKER_STOPPING, {"status": "killed", "reason": "kill_requested"})
+        # PHASE 2.1b: a killed worker never drains its queue, so every query
+        # queued for it is rejected (runtime channel + audit log) instead of
+        # being silently dropped or started on a dead instance.
+        self.reject_queued_queries("killed")
         self._stop_event.set()
         # A killed worker is never revived: clear the detach markers so the
         # detached TTL sweep cannot revisit it, and lift the detached
@@ -1640,6 +1655,104 @@ class WorkerThread(threading.Thread):
         self.status = "ready"
         self._write_status_file()
         return True
+
+    # ── PHASE 2.1b: detached-worker FIFO query queue ──────────────────
+
+    def enqueue_query(self, job_id: str, query: str) -> None:
+        """Append a query to this instance's FIFO queue (PHASE 2.1b).
+
+        Appending NEVER sets ``_resume_event``: a detached worker keeps
+        parking in its wait loop, so a queued query burns no tokens until
+        an operator resumes the worker. The ``job_id`` is mirrored in
+        ``_queued_job_ids`` (same order) so the pending set can be
+        introspected and rejected as a unit on TTL expiry or kill.
+
+        Callers own job registration; this only appends.
+        """
+        with self._queued_lock:
+            self._queued_job_ids.append(job_id)
+        self._input_queue.put((job_id, query, None))
+
+    def pending_query_jobs(self) -> List[str]:
+        """Ordered snapshot of the job_ids queued but not yet in flight."""
+        with self._queued_lock:
+            return list(self._queued_job_ids)
+
+    def _discard_pending_job(self, job_id: Any) -> None:
+        """Drop *job_id* from the pending-queue bookkeeping. Never raises."""
+        if job_id is None:
+            return
+        with self._queued_lock:
+            try:
+                self._queued_job_ids.remove(job_id)
+            except ValueError:
+                pass
+
+    def reject_queued_queries(
+        self,
+        reason: str,
+        audit_event_type: str = "WORKER_QUEUED_QUERY_REJECTED",
+    ) -> List[str]:
+        """Reject every queued-but-not-started query (PHASE 2.1b).
+
+        Called when the queue can never be drained: the detached TTL expired
+        or the worker is being killed. Each rejected job is terminalised in
+        the job registry as ``error``, announced on the global runtime
+        channel as a ``worker_error`` event carrying its ``query_id`` (the
+        bridge forwards it to the WebSocket, so the rejection is loud rather
+        than a silently polled job status), and recorded in the audit log.
+
+        ``reason`` is interpolated into the operator-facing message
+        ``worker '<name>' <reason> — queued query discarded``.
+
+        Returns the rejected job_ids in queue order. Never raises.
+        """
+        with self._queued_lock:
+            job_ids = list(self._queued_job_ids)
+            self._queued_job_ids.clear()
+        if not job_ids:
+            return []
+        message = f"worker '{self.worker_name}' {reason} — queued query discarded"
+        try:
+            registry = _get_worker_job_registry()
+        except Exception:
+            registry = None
+        for job_id in job_ids:
+            if registry is not None:
+                try:
+                    registry.terminalize(
+                        job_id,
+                        status="error",
+                        envelope={
+                            "error": message,
+                            "status": "error",
+                            "query_id": job_id,
+                        },
+                    )
+                except Exception:
+                    pass
+            if EventType is not None:
+                try:
+                    _publish_global_worker_event(EventType.WORKER_ERROR, {
+                        "worker_name": self.worker_name,
+                        "session_id": self.session_id or "",
+                        "query_id": job_id,
+                        "error": message,
+                    })
+                except Exception:
+                    pass
+        try:
+            from thoughtmachine.audit_logger import audit_event
+
+            audit_event(
+                audit_event_type,
+                f"worker={self.worker_name} session={self.session_id or ''} "
+                f"reason={reason} count={len(job_ids)} "
+                f"job_ids={','.join(job_ids)}",
+            )
+        except Exception:
+            pass
+        return job_ids
 
     def reset(self) -> Dict[str, Any]:
         """Reset per-query and persisted context state; the thread stays alive.
@@ -2583,15 +2696,20 @@ class WorkerThread(threading.Thread):
                                 pass
                         # Drain stale None/unblock signals left by pause() so
                         # they are not misinterpreted as stop signals.
+                        # PHASE 2.1b: the surviving (real) items are re-appended
+                        # in their ORIGINAL order.  Re-putting only the first
+                        # one would send it to the TAIL and break the strict
+                        # FIFO drain order of the queue.
+                        leftover = []
                         try:
                             while True:
                                 item = self._input_queue.get_nowait()
                                 if item is not None:
-                                    # Real query — put it back in front
-                                    self._input_queue.put(item)
-                                    break
+                                    leftover.append(item)
                         except queue.Empty:
                             pass
+                        for item in leftover:
+                            self._input_queue.put(item)
                         continue
                     # Bare None with no pause and no stop event is the legacy
                     # stop sentinel. Preserve that contract.
@@ -2608,6 +2726,9 @@ class WorkerThread(threading.Thread):
                     reply_q = None
                 else:
                     query_id, query, reply_q = None, raw, None
+                # PHASE 2.1b: the job has left the queue and is now the single
+                # in-flight query, so it is no longer rejectable as queued.
+                self._discard_pending_job(query_id)
                 self._current_query_id = query_id
                 self._current_reply_queue = reply_q
 
@@ -2839,15 +2960,19 @@ class WorkerThread(threading.Thread):
                     # when the worker was busy in _run_tool_loop.  Without
                     # this drain, the main loop interprets them as stop
                     # signals (line 1172) and exits immediately after resume.
+                    # PHASE 2.1b: the surviving (real) items are re-appended in
+                    # their ORIGINAL order — re-putting only the first one
+                    # would send it to the TAIL and break strict FIFO order.
+                    leftover = []
                     try:
                         while True:
                             item = self._input_queue.get_nowait()
                             if item is not None:
-                                # Real query — put it back in front
-                                self._input_queue.put(item)
-                                break
+                                leftover.append(item)
                     except queue.Empty:
                         pass
+                    for item in leftover:
+                        self._input_queue.put(item)
 
                     # Continue the outer loop to wait for next query
                     continue
@@ -4840,19 +4965,52 @@ class Worker(ToolBase):
                 "error": "worker_query is required for action 'query'",
             }
 
-        # SEAM (phase 2.1b, FIFO query queue): a submission against a DETACHED
-        # worker must ENQUEUE (append to the job queue) and return immediately --
-        # it must NOT resume the worker. Resume is operator-initiated only
-        # (amended design doc); resuming from a submission below is a Phase 2.1a
-        # stop-gap. Only the paused branch stays a resume.
-        if thread.status in ("paused", "detached"):
+        # PHASE 2.1b: a submission against a DETACHED worker is QUEUED and
+        # returns immediately -- it does NOT resume the worker. Resuming is
+        # operator-initiated only (docs/design-worker-lifecycle.md, "Queries
+        # submitted while the worker is detached"), so the caller keeps the
+        # submit_query contract and gets its job_id back at enqueue time. Only
+        # the paused branch below stays a resume.
+        if thread.status == "detached":
+            job_id = uuid.uuid4().hex
+            try:
+                enqueue = getattr(thread, "enqueue_query", None)
+                if callable(enqueue):
+                    enqueue(job_id, self.worker_query)
+                else:  # pragma: no cover - duck-typed thread doubles
+                    thread._input_queue.put((job_id, self.worker_query, None))
+            except Exception as exc:
+                return {
+                    "error": f"Failed to enqueue query: {exc}",
+                    "worker_name": self.worker_name,
+                }
+            registry = _get_worker_job_registry()
+            if registry is not None:
+                try:
+                    registry.register(
+                        job_id,
+                        self.worker_name,
+                        self.session_id or "",
+                        instance_id=iid,
+                    )
+                except Exception:
+                    pass
+            return {
+                "worker_name": self.worker_name,
+                "instance_id": iid,
+                "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                "job_id": job_id,
+                "status": "submitted",
+                "note": "Worker is detached: the query was queued (strict FIFO) and "
+                        "runs only once an operator resumes the worker. Poll with "
+                        "action='job_status' / action='join'.",
+            }
+        if thread.status == "paused":
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
             # and reclaimed its containers. Manual-only pauses reject the
             # query immediately (non-destructively); normal pauses are
-            # auto-resumed and the query proceeds normally below.  PHASE 2.1a:
-            # a DETACHED worker takes the same non-destructive route (a query
-            # is an implicit resume).
+            # auto-resumed and the query proceeds normally below.
             if getattr(thread, "_manual_only_pause", False):
                 return {
                     "status": "paused",
@@ -5022,7 +5180,14 @@ class Worker(ToolBase):
             return {"error": "worker_query is required for action 'submit_query'"}
         job_id = uuid.uuid4().hex
         try:
-            thread._input_queue.put((job_id, self.worker_query, None))
+            # PHASE 2.1b: append through the bookkept FIFO appender. This only
+            # ever appends (a busy worker's later submissions queue behind the
+            # running turn; a detached worker stays parked and burns nothing).
+            enqueue = getattr(thread, "enqueue_query", None)
+            if callable(enqueue):
+                enqueue(job_id, self.worker_query)
+            else:  # pragma: no cover - duck-typed thread doubles
+                thread._input_queue.put((job_id, self.worker_query, None))
         except Exception as exc:
             return {"error": f"Failed to enqueue query: {exc}", "worker_name": self.worker_name}
         registry = _get_worker_job_registry()
