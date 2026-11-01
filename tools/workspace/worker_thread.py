@@ -1688,6 +1688,36 @@ class WorkerThread(threading.Thread):
             except ValueError:
                 pass
 
+    def withdraw_queued_query(self, job_id: Any) -> None:
+        """Remove a still-queued job from BOTH the queue and its bookkeeping.
+
+        Used when a submission cannot be completed after it was enqueued (the
+        job registry refused the record), so the query is neither left behind
+        as an orphan nor reported as accepted. Surviving entries \u2014 including
+        ``None`` sentinels \u2014 keep their original order. Never raises.
+        """
+        if job_id is None:
+            return
+        try:
+            self._discard_pending_job(job_id)
+            leftover = []
+            try:
+                while True:
+                    item = self._input_queue.get_nowait()
+                    if (
+                        isinstance(item, tuple)
+                        and len(item) >= 2
+                        and item[0] == job_id
+                    ):
+                        continue
+                    leftover.append(item)
+            except queue.Empty:
+                pass
+            for item in leftover:
+                self._input_queue.put(item)
+        except Exception:  # pragma: no cover - defensive: rollback never raises
+            pass
+
     def reject_queued_queries(
         self,
         reason: str,
@@ -4994,7 +5024,23 @@ class Worker(ToolBase):
                         instance_id=iid,
                     )
                 except Exception:
-                    pass
+                    # All-or-nothing: a query is accepted only when it is BOTH
+                    # queued and registered. Swallowing a registration failure
+                    # would hand back a job_id no later job_status / audit /
+                    # resume path can resolve, so roll the queue entry back and
+                    # let the failure surface (Worker.execute turns it into a
+                    # JSON error envelope; nothing success-shaped is returned).
+                    try:
+                        withdraw = getattr(thread, "withdraw_queued_query", None)
+                        if callable(withdraw):
+                            withdraw(job_id)
+                        else:  # pragma: no cover - duck-typed thread doubles
+                            discard = getattr(thread, "_discard_pending_job", None)
+                            if callable(discard):
+                                discard(job_id)
+                    except Exception:
+                        pass
+                    raise
             return {
                 "worker_name": self.worker_name,
                 "instance_id": iid,
