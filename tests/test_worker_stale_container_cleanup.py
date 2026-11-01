@@ -136,6 +136,81 @@ class StaleWorkerContainerCleanupTest(unittest.TestCase):
 
     # ── invocation from the fresh-create path in start() ───────────────────
 
+    # -- phase 2.1a: DETACHED workers are exempt from the sweep ---------------
+
+    def test_detached_worker_containers_survive_sweep(self):
+        owner = "sess-1:w1"
+        exited = _fake_container("c1", "exited", {_WORKER_LABEL: owner})
+        dead = _fake_container("c2", "dead", {_WORKER_LABEL: owner})
+        client = _FakeDockerClient([exited, dead])
+
+        self.container_manager.register_detached_worker(owner)
+        try:
+            removed = self.cleanup(client, owner)
+        finally:
+            self.container_manager.unregister_detached_worker(owner)
+
+        self.assertEqual(removed, [])
+        exited.remove.assert_not_called()
+        dead.remove.assert_not_called()
+        self.assertEqual(client.list_calls, [])
+
+    def test_explicit_detached_status_skips_without_registry(self):
+        owner = "sess-1:w1"
+        exited = _fake_container("c1", "exited", {_WORKER_LABEL: owner})
+        client = _FakeDockerClient([exited])
+
+        removed = self.cleanup(client, owner, "detached")
+
+        self.assertEqual(removed, [])
+        exited.remove.assert_not_called()
+
+    def test_stale_non_detached_worker_containers_still_reaped(self):
+        owner = "sess-1:w2"
+        exited = _fake_container("c1", "exited", {_WORKER_LABEL: owner})
+        dead = _fake_container("c2", "dead", {_WORKER_LABEL: owner})
+        client = _FakeDockerClient([exited, dead])
+
+        self.container_manager.unregister_detached_worker(owner)
+        removed = self.cleanup(client, owner)
+
+        self.assertEqual(removed, ["c1", "c2"])
+        exited.remove.assert_called_once_with(force=True)
+        dead.remove.assert_called_once_with(force=True)
+
+    def test_stale_non_detached_worker_reaped_with_explicit_status(self):
+        owner = "sess-1:w2"
+        exited = _fake_container("c1", "exited", {_WORKER_LABEL: owner})
+        client = _FakeDockerClient([exited])
+
+        removed = self.cleanup(client, owner, "failed")
+
+        self.assertEqual(removed, ["c1"])
+        exited.remove.assert_called_once_with(force=True)
+
+    def test_unknown_detach_state_does_not_reap(self):
+        owner = "sess-1:w1"
+        exited = _fake_container("c1", "exited", {_WORKER_LABEL: owner})
+        client = _FakeDockerClient([exited])
+
+        with mock.patch.object(self.container_manager,
+                               "_DETACHED_WORKER_IDENTITIES", None):
+            removed = self.cleanup(client, owner)
+
+        self.assertEqual(removed, [])
+        exited.remove.assert_not_called()
+        self.assertEqual(client.list_calls, [])
+
+    def test_detached_registry_roundtrip(self):
+        owner = "sess-1:w3"
+        self.assertEqual(self.container_manager.is_worker_detached(owner), False)
+        self.container_manager.register_detached_worker(owner)
+        try:
+            self.assertTrue(self.container_manager.is_worker_detached(owner))
+        finally:
+            self.container_manager.unregister_detached_worker(owner)
+        self.assertEqual(self.container_manager.is_worker_detached(owner), False)
+
     def test_start_invokes_cleanup_before_fresh_worker_create(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = self.container_manager.ContainerManager.__new__(

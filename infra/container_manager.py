@@ -5100,8 +5100,63 @@ def cleanup_workspace(workspace_id, docker_client):
 _WORKER_LABEL = "thoughtmachine.worker"
 _REMOVABLE_WORKER_STATES = {"created", "exited", "dead"}
 
+# ── Detached-worker registry (phase 2.1a: STOP = DETACH) ──────────────────────
+# Owner identities of workers that are currently DETACHED: parked and awaiting a
+# possible ``resume()``, but still alive and still owning their ephemeral
+# containers.  Since ``stop()`` no longer tears containers down, a detached
+# worker's leftovers are indistinguishable from a crashed worker's leftovers by
+# label/state alone -- so the stale sweep has to ask this registry first.
+#
+# It lives HERE (not in the worker layer) because ``infra`` must never import
+# ``tools.workspace.worker_thread`` (import cycle); the worker imports these
+# helpers lazily and swallows failures (see
+# ``WorkerThread._set_detached_registration``).
+#
+# ``None`` means "registry unavailable": the sweep then treats detach state as
+# UNKNOWN and refuses to reap (see ``_detached_state``).
+_DETACHED_WORKER_IDENTITIES = set()
 
-def cleanup_stale_worker_containers(docker_client, owner_identity):
+
+def register_detached_worker(identity) -> None:
+    """Mark ``identity`` as detached so its containers survive a stale sweep."""
+    global _DETACHED_WORKER_IDENTITIES
+    if not identity:
+        return
+    if _DETACHED_WORKER_IDENTITIES is None:
+        _DETACHED_WORKER_IDENTITIES = set()
+    _DETACHED_WORKER_IDENTITIES.add(str(identity))
+
+
+def unregister_detached_worker(identity) -> None:
+    """Drop ``identity`` from the detached set (killed / resumed / torn down)."""
+    global _DETACHED_WORKER_IDENTITIES
+    if not identity or _DETACHED_WORKER_IDENTITIES is None:
+        return
+    _DETACHED_WORKER_IDENTITIES.discard(str(identity))
+
+
+def is_worker_detached(identity) -> bool:
+    """True iff ``identity`` is registered as detached. Never raises."""
+    return _detached_state(identity) is True
+
+
+def _detached_state(identity):
+    """Tri-state detach lookup: ``True`` / ``False`` / ``None`` (unknown).
+
+    ``None`` means "cannot tell" (registry unavailable, or no identity to look
+    up) -- callers must treat it as "do not reap", never as "not detached".
+    """
+    registry = _DETACHED_WORKER_IDENTITIES
+    if registry is None or not identity:
+        return None
+    try:
+        return str(identity) in registry
+    except Exception:  # pragma: no cover - defensive (non-container registry)
+        return None
+
+
+def cleanup_stale_worker_containers(docker_client, owner_identity,
+                                   worker_status=None):
     """Remove containers a crashed/hung worker session left behind.
 
     Worker containers carry ``thoughtmachine.worker=<owner identity>`` (see
@@ -5117,10 +5172,45 @@ def cleanup_stale_worker_containers(docker_client, owner_identity):
     runs server-side; the per-container checks are defensive for fake/missing
     attributes (all access via ``getattr``).
 
+    DETACHED workers are exempt (phase 2.1a: ``stop()`` detaches instead of
+    tearing down, so a parked worker's containers look exactly like a crashed
+    worker's leftovers). ``worker_status='detached'`` skips the sweep outright;
+    when ``worker_status`` is ``None`` the module-level detached registry
+    (``is_worker_detached``) is consulted instead. If that state cannot be
+    determined the sweep SKIPS ("unknown" never falls to "reap"): removing a
+    live parked worker's containers is unrecoverable, while leaving a crashed
+    worker's containers behind only defers the reclaim to a sweep that CAN
+    tell.
+
     Returns the list of removed container ids. Never raises: failures are
     logged and skipped.
     """
     removed = []
+    # Detach gate -- evaluated BEFORE listing so a parked worker's containers
+    # are never even considered for removal.
+    if worker_status == "detached":
+        detached = True
+    elif worker_status is not None:
+        detached = False
+    else:
+        _state = _detached_state(owner_identity)
+        if _state is None:
+            # Unknown => do not reap (see docstring). Deliberately NOT "fixed"
+            # by refreshing container timestamps: age says nothing about
+            # whether the owner is parked, and a guessed reap is destructive.
+            log("INFO", "docker.container_manager",
+                f"Skipped stale worker container sweep for {owner_identity}: "
+                f"detach state unknown (no worker_status supplied and the "
+                f"detached registry is unavailable) -- refusing to reap on a "
+                f"guess")
+            return removed
+        detached = _state
+    if detached:
+        log("INFO", "docker.container_manager",
+            f"Skipped stale worker container sweep for {owner_identity}: "
+            f"worker is detached (parked workers keep their containers until "
+            f"resume or TTL kill)")
+        return removed
     try:
         matches = docker_client.containers.list(
             all=True,
