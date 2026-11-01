@@ -287,7 +287,9 @@ class TestQueryActionEffectiveTimeout(unittest.TestCase):
         self.assertIn("120.0s", result["error"])
         self.assertIn("stopped cooperatively", result["note"])
         fake.send_query.assert_called_once_with("hello", timeout=120.0)
-        fake.stop.assert_called_once()
+        # PHASE 2.1a: a timed-out query is TERMINATED (kill), not detached.
+        fake.kill.assert_called_once()
+        fake.stop.assert_not_called()
 
 
 # ── 6. Ghost unregister in run() finally ────────────────────────────────

@@ -210,7 +210,7 @@ def test_reset_fallback_is_session_scoped(tmp_path, monkeypatch):
 
 def test_stop_fallback_is_session_scoped(tmp_path, monkeypatch):
     """Same contract for stop: a foreign-session worker of the same name is
-    never stopped, joined or unregistered by the fallback sweep."""
+    never detached, joined or unregistered by the fallback sweep."""
     (tmp_path / "foreign").mkdir()
     foreign = _spawn_worker(
         tmp_path / "foreign", monkeypatch, name="w1", session_id=OTHER_SID
@@ -220,7 +220,9 @@ def test_stop_fallback_is_session_scoped(tmp_path, monkeypatch):
         workers=[_def("w1")]
     )
 
-    assert result["status"] == "stopped"
+    # PHASE 2.1a: ``stop`` is a DETACH, so its envelope carries
+    # "detached" (termination answers "killed").
+    assert result["status"] == "detached"
     assert "was not running" in result["message"]
     assert foreign.is_alive()
     assert worker_module._worker_registry[(OTHER_SID, "w1", 1)] is foreign
@@ -230,7 +232,9 @@ def test_reset_fallback_still_resets_own_dead_instance(tmp_path, monkeypatch):
     """Session scoping must not disable the fallback: a registered but dead
     instance in the caller's OWN session is still swept and reset."""
     thread = _spawn_worker(tmp_path, monkeypatch, name="w1", session_id=SID)
-    thread.stop()
+    # PHASE 2.1a: stop() detaches and leaves the thread parked/alive, so a
+    # DEAD-but-registered instance is produced by kill() only.
+    thread.kill()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0)
     with worker_module._registry_lock:
         assert (SID, "w1", 1) in worker_module._worker_registry
