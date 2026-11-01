@@ -1704,9 +1704,11 @@ class WorkerThread(threading.Thread):
         """
         Check for a ``command.json`` file in the worker's directory.
 
-        If found, the action is ``"stop"``/``"pause"``/``"resume"``: delete
-        the file and signal the corresponding event.  This enables
-        cross-process control (e.g. from the Web UI via the REST API).
+        If found, the action is
+        ``"stop"``/``"kill"``/``"pause"``/``"resume"``: delete the file and
+        signal the corresponding event.  This enables cross-process control
+        (e.g. from the Web UI via the REST API).  PHASE 2.1a: ``"stop"``
+        DETACHES, ``"kill"`` is the only terminating action.
         """
         cmd_path = self._worker_dir / "command.json"
         if not cmd_path.is_file():
@@ -1730,6 +1732,14 @@ class WorkerThread(threading.Thread):
                 self._write_status_file()
                 self._set_detached_registration(True)
                 self._input_queue.put(None)
+            elif action == "kill":
+                # PHASE 2.1a: a cross-process 'kill' TERMINATES.  'stop' only
+                # detaches, so this is the sole terminating signal.  Delegate
+                # to WorkerThread.kill() so the stop event, the global
+                # WORKER_STOPPING publish, the tracked-execution teardown and
+                # the detach-registration cleanup all stay in one place.
+                cmd_path.unlink(missing_ok=True)
+                self.kill()
             elif action == "pause":
                 cmd_path.unlink(missing_ok=True)
                 self._pause_event.set()
@@ -4830,6 +4840,11 @@ class Worker(ToolBase):
                 "error": "worker_query is required for action 'query'",
             }
 
+        # SEAM (phase 2.1b, FIFO query queue): a submission against a DETACHED
+        # worker must ENQUEUE (append to the job queue) and return immediately --
+        # it must NOT resume the worker. Resume is operator-initiated only
+        # (amended design doc); resuming from a submission below is a Phase 2.1a
+        # stop-gap. Only the paused branch stays a resume.
         if thread.status in ("paused", "detached"):
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
