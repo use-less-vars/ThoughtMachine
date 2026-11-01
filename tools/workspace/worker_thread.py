@@ -5246,7 +5246,23 @@ class Worker(ToolBase):
                     instance_id=iid,
                 )
             except Exception:
-                pass
+                # All-or-nothing, same contract as the detached ``query`` path:
+                # a submission is accepted only when it is BOTH queued and
+                # registered. Withdraw the queue entry and re-raise so
+                # Worker.execute surfaces the failure instead of returning a
+                # job_id the registry never stored (which the queue would then
+                # run with no id the job_status / audit / resume path resolves).
+                try:
+                    withdraw = getattr(thread, "withdraw_queued_query", None)
+                    if callable(withdraw):
+                        withdraw(job_id)
+                    else:  # pragma: no cover - duck-typed thread doubles
+                        discard = getattr(thread, "_discard_pending_job", None)
+                        if callable(discard):
+                            discard(job_id)
+                except Exception:
+                    pass
+                raise
         return {
             "worker_name": self.worker_name,
             "instance_id": iid,
