@@ -1265,24 +1265,26 @@ export default function WorkerManagementPanel({
                         </button>
                       ) : w.runtime_status === 'detached' ? (
                         // Detached is PARKED BUT ALIVE and keeps its queue
-                        // (worker_thread.py:1494). Resuming only has meaning when
-                        // queued work is actually waiting, so at zero queued
-                        // queries the button stays visible but disabled with a
-                        // title that says why (never a silent no-op).
+                        // (worker_thread.py:1494). Resume is ALWAYS available:
+                        // an empty queue is not a reason to withhold the
+                        // affordance, because a detached worker with nothing
+                        // queued still needs a path back to accepting fresh
+                        // work — otherwise the only exits are Kill or TTL
+                        // expiry and "detach" is not actually recoverable.
+                        // The title says what the click does in both cases.
                         <button
-                          disabled={queuedCount === 0}
                           onClick={(e) => {
                             e.stopPropagation();
-                            if (queuedCount > 0) handleResume(w.name, w.instance_id);
+                            handleResume(w.name, w.instance_id);
                           }}
                           style={{
-                            background: queuedCount > 0 ? '#a6e3a1' : 'transparent',
-                            color: queuedCount > 0 ? '#1e1e2e' : '#6c7086',
+                            background: '#a6e3a1',
+                            color: '#1e1e2e',
                             border: 'none',
                             borderRadius: '3px',
                             padding: '0.1rem 0.4rem',
-                            cursor: queuedCount > 0 ? 'pointer' : 'not-allowed',
-                            opacity: queuedCount > 0 ? 1 : 0.55,
+                            cursor: 'pointer',
+                            opacity: queuedCount > 0 ? 1 : 0.9,
                             fontWeight: 600,
                             fontSize: '0.65rem',
                             lineHeight: '1.4',
@@ -1291,7 +1293,7 @@ export default function WorkerManagementPanel({
                           title={
                             queuedCount > 0
                               ? `Resume ${dispLabel} — runs its ${queuedCount} queued ${queuedCount === 1 ? 'query' : 'queries'} in order (nothing is discarded)`
-                              : `Nothing queued — a detached ${dispLabel} has no work waiting, so there is nothing to resume`
+                              : `Resume ${dispLabel} — revives the worker so it can accept new work (nothing is queued right now)`
                           }
                         >
                           ▶ Resume
