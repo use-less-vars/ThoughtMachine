@@ -172,8 +172,21 @@ jobs:
     # Hence the absolute override below: PLAYWRIGHT_BROWSERS_PATH is an absolute
     # path, so it survives the HOME move, and nothing in the repo sets or unsets
     # it (it is documented for humans at tests/e2e/README.md:37).
+    #
+    # The value is a deliberate LITERAL, not ${{ runner.temp }}: a job-level
+    # ``env:`` block cannot reference the ``runner`` context (only github, needs,
+    # strategy, matrix, vars, secrets and inputs are allowed there), and GitHub
+    # rejects the whole workflow before any job starts with
+    # "Unrecognized named-value: 'runner'". The remedy for that is a literal, not
+    # a move to step level: the install step and the pytest step must both
+    # inherit the SAME path, and two step-level envs are how they come to
+    # disagree.
+    #
+    # /home/runner/ms-playwright assumes the standard GitHub-hosted ubuntu
+    # runner (user ``runner``, home ``/home/runner``). If this job ever moves to
+    # a self-hosted runner with a different user, THIS is the line to change.
     env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/ms-playwright
     steps:
       - name: Checkout
         uses: actions/checkout@v4
