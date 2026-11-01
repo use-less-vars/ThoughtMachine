@@ -1134,6 +1134,13 @@ class WorkerThread(threading.Thread):
         # sole-paused path); it has to be resumed explicitly via the 'resume'
         # action (which clears the marker).
         self._manual_only_pause: bool = False
+        # PHASE 2.1a: 'stop' DETACHES (thread parks; containers and the
+        # registry entry survive) and 'kill' terminates.  _detach_requested
+        # marks a park entered because of a detach request; _detached_at
+        # stamps its start for the detached-worker TTL sweep
+        # (PeriodicStaleCheck).
+        self._detach_requested: bool = False
+        self._detached_at: Optional[float] = None
 
     # ── public API called from the tool thread ─────────────────────
 
@@ -1442,10 +1449,58 @@ class WorkerThread(threading.Thread):
         return (True, supervisor.process_query(query, timeout=timeout))
 
     def stop(self) -> None:
-        """Signal the worker to stop after completing its current task."""
-        # Synchronous lifecycle transition: 'stopping' must be observable
-        # before the run loop acknowledges the stop event.
-        self.status = "stopping"
+        """Detach the worker: park it without terminating it (PHASE 2.1a).
+
+        ``stop`` is an alias for :meth:`detach`.  Termination is
+        :meth:`kill`.
+        """
+        self.detach()
+
+    def detach(self) -> None:
+        """Park the worker without terminating it.
+
+        The run loop is unblocked and parks in the detached state, so the
+        worker stops pulling queries — but the thread, its containers and its
+        registry entry all survive, and ``resume`` (or a query) revives it.
+        Context is persisted and the worker is registered as detached so the
+        stale-container sweep skips it until the detached TTL expires.
+        """
+        # Synchronous lifecycle transition: 'detaching' must be observable
+        # before the run loop acknowledges the park.
+        self.status = "detaching"
+        self._write_status_file()
+        self._detach_requested = True
+        self._detached_at = time.time()
+        self._pause_event.set()
+        self._resume_event.clear()
+        # Persist the context: a detached worker is expected to be revived
+        # later, possibly by another process.
+        try:
+            self._save_context()
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"Context save failed while detaching worker '{self.worker_name}': {exc}")
+        self.status = "detached"
+        self._write_status_file()
+        self._publish_global_event(EventType.WORKER_STOPPING, {"status": "detached", "reason": "detach_requested"})
+        self._set_detached_registration(True)
+        # Write a stop command file for cross-process signalling
+        try:
+            cmd_path = self._worker_dir / "command.json"
+            cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")
+        except OSError:
+            pass
+        # Unblock the input queue wait
+        self._input_queue.put(None)
+
+    def kill(self) -> None:
+        """Terminate the worker: signal the run loop to exit and reclaim it.
+
+        PHASE 2.1a: this is the ONLY termination path — ``stop`` detaches.
+        """
+        # Synchronous lifecycle transition: 'killed' must be observable before
+        # the run loop acknowledges the stop event.
+        self.status = "killed"
         self._write_status_file()
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
@@ -1460,16 +1515,39 @@ class WorkerThread(threading.Thread):
         # this is an idempotent no-op there; in flag-off mode it is the only
         # path that unblocks a stuck tool call.
         self._terminate_tracked_executions()
-        self._publish_global_event(EventType.WORKER_STOPPING, {"status": "stopping", "reason": "stop_requested"})
+        self._publish_global_event(EventType.WORKER_STOPPING, {"status": "killed", "reason": "kill_requested"})
         self._stop_event.set()
-        # Write a stop command file for cross-process signalling
-        try:
-            cmd_path = self._worker_dir / "command.json"
-            cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")
-        except OSError:
-            pass
+        # A killed worker is never revived: clear the detach markers so the
+        # detached TTL sweep cannot revisit it, and lift the detached
+        # registration so stale-container reaping resumes.
+        self._detach_requested = False
+        self._detached_at = None
+        self._set_detached_registration(False)
         # Unblock the input queue wait
         self._input_queue.put(None)
+
+    def _set_detached_registration(self, detached: bool) -> None:
+        """Register/unregister this worker as detached in the container manager.
+
+        The stale-container sweep consults this so a detached worker's
+        containers are not reaped while it waits to be resumed.  Never raises.
+        """
+        try:
+            identity = self.owner_identity
+        except Exception:
+            return
+        try:
+            from infra.container_manager import (
+                register_detached_worker,
+                unregister_detached_worker,
+            )
+            if detached:
+                register_detached_worker(identity)
+            else:
+                unregister_detached_worker(identity)
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"Detached registration update failed for worker '{self.worker_name}': {exc}")
 
     def _terminate_tracked_executions(self) -> None:
         """Terminate in-flight executions in the default-on tracker.
@@ -1513,18 +1591,21 @@ class WorkerThread(threading.Thread):
     def resume(self) -> bool:
         """Resume a paused worker.
 
-        Returns ``False`` — without touching any state — when a stop is
-        already in progress (``_stop_event`` set, or status ``"stopping"`` /
-        ``"stopped"``).  Reviving such a thread would resurrect a worker that
-        has already been shut down: it would re-enter the main loop with the
-        stop flag set and immediately report ``{"status": "stopped"}`` to the
-        caller instead of running the query.  Callers that need a query to run
-        after a stop must spawn a fresh instance instead.
+        Returns ``False`` — without touching any state — when the worker was
+        KILLED (``_stop_event`` set, or status ``"killed"``).  Reviving such a
+        thread would resurrect a worker that has already been shut down: it
+        would re-enter the main loop with the stop flag set and immediately
+        report ``{"status": "killed"}`` to the caller instead of running the
+        query.  Callers that need a query to run after a kill must spawn a
+        fresh instance instead.
+
+        A DETACHED worker (status ``"detached"``) IS revivable: PHASE 2.1a
+        makes ``stop`` a detach, so resume() is the supported way back.
         """
-        if self._stop_event.is_set() or self.status in ("stopping", "stopped"):
+        if self._stop_event.is_set() or self.status == "killed":
             log("WARNING", "tools.worker",
-                f"Refusing to resume worker '{self.worker_name}': stop already "
-                f"in progress (status={self.status})")
+                f"Refusing to resume worker '{self.worker_name}': worker has been "
+                f"killed (status={self.status})")
             return False
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
@@ -1551,6 +1632,11 @@ class WorkerThread(threading.Thread):
         # method without going through _action_resume, which used to be the
         # only place that cleared the marker).
         self._manual_only_pause = False
+        # PHASE 2.1a: a resumed worker is no longer detached — clear the
+        # detach markers and lift the detached registration.
+        self._detach_requested = False
+        self._detached_at = None
+        self._set_detached_registration(False)
         self.status = "ready"
         self._write_status_file()
         return True
@@ -1629,8 +1715,20 @@ class WorkerThread(threading.Thread):
             data = json.loads(cmd_path.read_text(encoding="utf-8"))
             action = data.get("action")
             if action == "stop":
+                # PHASE 2.1a: a cross-process 'stop' DETACHES.  It must not
+                # set _stop_event — the thread parks and stays revivable.
                 cmd_path.unlink(missing_ok=True)
-                self._stop_event.set()
+                self._detach_requested = True
+                self._detached_at = time.time()
+                self._pause_event.set()
+                self._resume_event.clear()
+                try:
+                    self._save_context()
+                except Exception:
+                    pass
+                self.status = "detached"
+                self._write_status_file()
+                self._set_detached_registration(True)
                 self._input_queue.put(None)
             elif action == "pause":
                 cmd_path.unlink(missing_ok=True)
@@ -2399,7 +2497,9 @@ class WorkerThread(threading.Thread):
                     # the worker: honor the pause here instead of treating the
                     # sentinel as a stop signal (BUG 1).
                     if self._pause_event.is_set():
-                        self.status = "paused"
+                        # PHASE 2.1a: a park entered because of a detach
+                        # reports 'detached', not 'paused'.
+                        self.status = "detached" if self._detach_requested else "paused"
                         self._write_status_file()
                         self._publish_event('worker_paused', {
                             'status': 'paused',
@@ -2612,7 +2712,8 @@ class WorkerThread(threading.Thread):
                 # Check if worker was paused during the tool loop
                 if self._pause_event.is_set():
                     # Preserve paused status — don't overwrite with "ready"
-                    self.status = "paused"
+                    # PHASE 2.1a: a detach-requested park reports 'detached'.
+                    self.status = "detached" if self._detach_requested else "paused"
                     self._write_status_file()
                     self._publish_event('worker_paused', {
                         'status': 'paused',
@@ -2912,9 +3013,9 @@ class WorkerThread(threading.Thread):
                 except Exception:
                     pass
         else:
-            # Terminal status on the stop path is 'stopped' (not 'completed');
-            # a clean drain with no stop request ends as 'completed'.
-            final_status = "stopped" if self._stop_event.is_set() else "completed"
+            # Terminal status on the KILL path is 'killed' (not 'completed');
+            # a clean drain with no kill request ends as 'completed'.
+            final_status = "killed" if self._stop_event.is_set() else "completed"
             self.status = final_status
             self._write_status_file()
             self._publish_event('worker_completed', {'status': final_status, 'worker_name': self.worker_name})
@@ -3522,7 +3623,7 @@ class Worker(ToolBase):
 
     skip_output_truncation: ClassVar[bool] = True
 
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "resume", "reset"]
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "kill", "submit_query", "job_status", "join", "wait_for_job", "pause", "resume", "reset"]
 
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
@@ -3580,6 +3681,7 @@ class Worker(ToolBase):
                 "check": lambda: self._action_check(workers),
                 "query": lambda: self._action_query(workers),
                 "stop": lambda: self._action_stop(workers),
+                "kill": lambda: self._action_kill(workers),
                 "submit_query": lambda: self._action_submit_query(workers),
                 "job_status": lambda: self._action_job_status(workers),
                 "join": lambda: self._action_join(workers),
@@ -4725,12 +4827,14 @@ class Worker(ToolBase):
                 "error": "worker_query is required for action 'query'",
             }
 
-        if thread.status == "paused":
+        if thread.status in ("paused", "detached"):
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
             # and reclaimed its containers. Manual-only pauses reject the
             # query immediately (non-destructively); normal pauses are
-            # auto-resumed and the query proceeds normally below.
+            # auto-resumed and the query proceeds normally below.  PHASE 2.1a:
+            # a DETACHED worker takes the same non-destructive route (a query
+            # is an implicit resume).
             if getattr(thread, "_manual_only_pause", False):
                 return {
                     "status": "paused",
@@ -4966,8 +5070,9 @@ class Worker(ToolBase):
         Polls the job registry in 0.25s slices for a total of ``timeout_seconds``
         (default 60, hard cap 300). Returns early on: job terminal state
         (completed / timeout / error), a partial result (status ``partial_result``
-        + preview), the worker thread pausing (``status == 'paused'``), a stop
-        signal (stop_event set / status stopping / stopped), or thread death.
+        + preview), the worker thread pausing (``status == 'paused'``) or being
+        detached (``status == 'detached'``), a kill signal (stop_event set /
+        status ``killed``), or thread death.
         """
         _JOB_TERMINAL = ("completed", "timeout", "error")
         job_id = (self.worker_query or "").strip()
@@ -5044,25 +5149,25 @@ class Worker(ToolBase):
                     "note": "Session main agent is paused; job remains pending.",
                 }
             # Worker-side wake conditions.
-            if getattr(thread, "status", None) == "paused":
+            if getattr(thread, "status", None) in ("paused", "detached"):
                 return {
                     "worker_name": self.worker_name,
                     "instance_id": iid,
                     "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
                     "job_id": job_id,
                     "status": "paused",
-                    "note": "Worker is paused; job remains pending.",
+                    "note": "Worker is paused/detached; job remains pending.",
                 }
             stop_event = getattr(thread, "_stop_event", None)
             if (stop_event is not None and stop_event.is_set()) or \
-                    getattr(thread, "status", None) in ("stopping", "stopped"):
+                    getattr(thread, "status", None) in ("killed",):
                 return {
                     "worker_name": self.worker_name,
                     "instance_id": iid,
                     "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
                     "job_id": job_id,
                     "status": "stopped",
-                    "note": "Worker is stopping/stopped; job did not reach a terminal state.",
+                    "note": "Worker was killed; job did not reach a terminal state.",
                 }
             if not thread.is_alive():
                 return {
@@ -5184,7 +5289,7 @@ class Worker(ToolBase):
                     continue
                 if self.worker_name is not None and key[1] != self.worker_name:
                     continue
-                if getattr(thread, "status", None) != "paused":
+                if getattr(thread, "status", None) not in ("paused", "detached"):
                     continue
                 if not want_all:
                     continue
@@ -5241,7 +5346,107 @@ class Worker(ToolBase):
         }
 
     def _action_stop(self, workers: list) -> dict:
-        """Stop a running worker and persist its context.
+        """DETACH a running worker and persist its context (PHASE 2.1a).
+
+        ``stop`` no longer terminates anything: the worker parks with status
+        ``"detached"``, its thread, containers and registry entry all survive,
+        and ``resume`` (or a later query, which resumes implicitly) brings it
+        back.  Termination lives in ``_action_kill`` (action ``"kill"``).
+
+        First tries the current session; if not found, falls back to a
+        same-session sweep for any remaining instances of the name.  A live
+        worker of the same name owned by ANOTHER session is never detached:
+        session scoping is what makes stop workspace-safe.
+        """
+        session_key = self.session_id or _NO_SESSION_KEY
+        try:
+            thread, sid, iid = _resolve_worker_thread(
+                self.worker_name,
+                instance_id=self.instance_id,
+                session_id=session_key,
+            )
+        except _WorkerAmbiguityError as exc:
+            msg = str(exc)
+            all_instances = []
+            if self.instance_id is None and "is not running" in msg:
+                # ── Not found in current session → sweep THIS session only ──
+                # Never sweep the whole registry: a worker of the same name
+                # owned by another session (and therefore another workspace)
+                # is not this caller's property and must survive untouched.
+                all_instances = self._find_all_worker_threads(
+                    self.worker_name, session_id=self.session_id or None
+                )
+            if "ambiguous" in msg:
+                return {
+                    "error": msg,
+                    "worker_name": self.worker_name,
+                }
+            if not all_instances:
+                entry = self._find_worker(workers, self.worker_name)
+                if entry:
+                    return {
+                        "worker_name": self.worker_name,
+                        "status": "detached",
+                        "message": f"Worker '{self.worker_name}' was not running.",
+                    }
+                return {
+                    "error": f"Worker '{self.worker_name}' not found",
+                }
+
+            # Found in this session (non-live leftovers) — detach them all.
+            detached_info = []
+            for sid, t in all_instances:
+                worker_label = f"{self.worker_name} (session={sid})"
+                logger.info("Same-session stop: detaching worker '%s'", worker_label)
+                try:
+                    t.stop()
+                except Exception as exc:
+                    logger.exception("Error detaching worker '%s'", worker_label)
+                    detached_info.append({"session_id": sid, "error": str(exc)})
+                    continue
+                # A DETACH reclaims nothing: no join, no container cleanup and
+                # no registry pop — the thread is parked, not terminated.
+                if t._worker_ctx is not None:
+                    t._worker_ctx.compact_after_summary()
+                t._save_context()
+                t._write_status_file()
+                detached_info.append({"session_id": sid, "status": t.status})
+
+            return {
+                "worker_name": self.worker_name,
+                "status": "detached",
+                "message": (
+                    f"Detached {len(detached_info)} instance(s) of worker "
+                    f"'{self.worker_name}' in this session."
+                ),
+                "detached_instances": detached_info,
+            }
+
+        # ── Found in current session ──
+        if not thread.is_alive():
+            return {
+                "worker_name": self.worker_name,
+                "status": thread.status,
+                "message": f"Worker '{self.worker_name}' was not running.",
+            }
+
+        thread.stop()
+        if thread._worker_ctx is not None:
+            thread._worker_ctx.compact_after_summary()
+        thread._save_context()
+        thread._write_status_file()
+        return {
+            "worker_name": self.worker_name,
+            "status": "detached",
+            "message": f"Worker '{self.worker_name}' detached successfully.",
+        }
+
+    def _action_kill(self, workers: list) -> dict:
+        """Kill a running worker, reclaim its containers, persist its context.
+
+        PHASE 2.1a: this is the ONLY termination path (action ``"kill"``);
+        ``_action_stop`` detaches.  ``_action_reset``, the detached-worker TTL
+        sweep and the session cascade call THIS, never ``_action_stop``.
 
         First tries the current session; if not found, falls back to a
         same-session sweep for any remaining instances of the name.  A live
@@ -5293,10 +5498,10 @@ class Worker(ToolBase):
             stopped_info = []
             for sid, t in all_instances:
                 worker_label = f"{self.worker_name} (session={sid})"
-                logger.info("Same-session stop: stopping worker '%s'", worker_label)
+                logger.info("Same-session kill: killing worker '%s'", worker_label)
                 try:
-                    t.stop()
-                    # Robust join with retry (same pattern as _action_stop)
+                    t.kill()
+                    # Robust join with retry (same pattern as _action_kill)
                     _budget = max(30, t._timeout_seconds)
                     _elapsed = 0.0
                     while _elapsed < _budget:
@@ -5310,7 +5515,7 @@ class Worker(ToolBase):
                             worker_label, _budget,
                         )
                 except Exception as exc:
-                    logger.exception("Error stopping worker '%s'", worker_label)
+                    logger.exception("Error killing worker '%s'", worker_label)
                     stopped_info.append({"session_id": sid, "error": str(exc)})
                 finally:
                     if t._worker_ctx is not None:
@@ -5330,12 +5535,12 @@ class Worker(ToolBase):
 
             return {
                 "worker_name": self.worker_name,
-                "status": "stopped",
+                "status": "killed",
                 "message": (
-                    f"Stopped {len(stopped_info)} instance(s) of worker "
+                    f"Killed {len(stopped_info)} instance(s) of worker "
                     f"'{self.worker_name}' in this session."
                 ),
-                "stopped_instances": stopped_info,
+                "killed_instances": stopped_info,
             }
 
         # ── Found in current session ──
@@ -5349,11 +5554,11 @@ class Worker(ToolBase):
             return {
                 "worker_name": self.worker_name,
                 "status": thread.status,
-                "message": f"Worker '{self.worker_name}' was already stopped.",
+                "message": f"Worker '{self.worker_name}' is not running.",
             }
 
         try:
-            thread.stop()
+            thread.kill()
             # ── Robust join: retry loop to handle slow LLM API calls ──
             # The worker's _run_tool_loop can be blocked inside
             # agent.process_query() waiting for an LLM response that takes
@@ -5374,33 +5579,33 @@ class Worker(ToolBase):
                 )
             if thread.is_alive():
                 logger.warning(
-                    "Worker '%s' did not stop within %ds budget. "
+                    "Worker '%s' did not exit within %ds budget. "
                     "Popping from registry anyway (daemon thread).",
                     self.worker_name, _join_budget,
                 )
         except Exception as exc:
-            logger.exception("Error joining worker '%s' during stop", self.worker_name)
+            logger.exception("Error joining worker '%s' during kill", self.worker_name)
             return {
-                "error": f"Error stopping worker '{self.worker_name}': {exc}",
+                "error": f"Error killing worker '{self.worker_name}': {exc}",
             }
         finally:
             if thread._worker_ctx is not None:
                 thread._worker_ctx.compact_after_summary()
             thread._save_context()
             thread._cleanup_worker_containers()
-            # Terminal status: a stopped worker ends as 'stopped' (not
+            # Terminal status: a killed worker ends as 'killed' (not
             # 'completed'). Write the status file before removing from the
             # registry so the terminal state remains observable.
             if thread.status != "error":
-                thread.status = "stopped"
+                thread.status = "killed"
                 thread._write_status_file()
             with _registry_lock:
                 _worker_registry.pop((sid, self.worker_name, iid), None)
 
         return {
             "worker_name": self.worker_name,
-            "status": "stopped",
-            "message": f"Worker '{self.worker_name}' stopped successfully.",
+            "status": "killed",
+            "message": f"Worker '{self.worker_name}' killed successfully.",
         }
 
     def _action_reset(self, workers: list) -> dict:
@@ -5427,8 +5632,11 @@ class Worker(ToolBase):
 
         def _reset_one(t: Any, sid: str) -> dict:
             try:
-                t.stop()
-                # Robust join with retry (same pattern as _action_stop): the
+                # TRAP T1: reset must TERMINATE (kill), never detach — a
+                # detached thread's run() finally-block would re-save the
+                # context we are about to drop from disk.
+                t.kill()
+                # Robust join with retry (same pattern as _action_kill): the
                 # worker may be blocked inside a slow LLM call.
                 _budget = max(30, t._timeout_seconds)
                 _elapsed = 0.0
