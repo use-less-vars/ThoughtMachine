@@ -195,7 +195,13 @@ describe('WorkerManagementPanel — Stop vs Kill', () => {
 })
 
 describe('WorkerManagementPanel — resuming a detached worker', () => {
-  it('disables resume when nothing is queued and says why', async () => {
+  // OPERATOR RULING (supersedes the old gate): resume is enabled unconditionally
+  // on a detached row. A detached worker with an EMPTY queue still needs a path
+  // back to accepting fresh work — with the old `disabled={queuedCount === 0}`
+  // gate, parking an idle worker left Kill or TTL expiry as the only exits, so
+  // "detach" was not recoverable in the common case.
+
+  it('resumes a detached worker with an empty queue (enabled, and it POSTs)', async () => {
     const resumeRoute = `/api/workspace/${WORKSPACE_ID}/workers/coder/resume`
     const fetchMock = renderPanel({
       workers: [makeWorker({ status: 'detached', queued_query_count: 0, queued_query_ids: [] })],
@@ -203,11 +209,55 @@ describe('WorkerManagementPanel — resuming a detached worker', () => {
     })
 
     const resume = await screen.findByRole('button', { name: '▶ Resume' })
-    expect(resume).toBeDisabled()
-    expect(resume.title).toContain('Nothing queued')
+    expect(resume).toBeEnabled()
+    expect(resume).not.toBeDisabled()
 
     fireEvent.click(resume)
-    expect(callsTo(fetchMock, '/resume')).toHaveLength(0)
+
+    // The click must actually reach the route, even with nothing queued.
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(`${resumeRoute}?instance_id=3`, { method: 'POST' })
+    )
+    expect(callsTo(fetchMock, '/workers/coder/resume')).toHaveLength(1)
+    // And the row leaves the parked state: the worker is live again.
+    expect(await screen.findByText('ready')).toBeInTheDocument()
+  })
+
+  it('keeps the zero-queue resume title truthful (never "nothing to resume")', async () => {
+    renderPanel({
+      workers: [makeWorker({ status: 'detached', queued_query_count: 0, queued_query_ids: [] })],
+    })
+
+    const resume = await screen.findByRole('button', { name: '▶ Resume' })
+
+    expect(resume.title).toBeTruthy()
+    expect(resume.title.length).toBeGreaterThan(0)
+    expect(resume.title.toLowerCase()).not.toContain('nothing to resume')
+    // An empty queue must not read as "there is nothing to do here".
+    expect(resume.title).toContain('accept new work')
+    expect(resume.title).toContain('nothing is queued right now')
+  })
+
+  it('still resumes a detached worker that has queued work (no click guard)', async () => {
+    const resumeRoute = `/api/workspace/${WORKSPACE_ID}/workers/coder/resume`
+    const fetchMock = renderPanel({
+      workers: [
+        makeWorker({ status: 'detached', queued_query_count: 2, queued_query_ids: ['q-a', 'q-b'] }),
+      ],
+      routes: { [resumeRoute]: jsonOk({ status: 'resumed' }) },
+    })
+
+    const resume = await screen.findByRole('button', { name: '▶ Resume' })
+    expect(resume).toBeEnabled()
+
+    fireEvent.click(resume)
+
+    // Regression guard for the removed `if (queuedCount > 0)` click guard: the
+    // click must reach the network whether or not anything is queued.
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(`${resumeRoute}?instance_id=3`, { method: 'POST' })
+    )
+    expect(callsTo(fetchMock, '/workers/coder/resume')).toHaveLength(1)
   })
 
   it('resumes a detached worker that has queued work and flips the row to ready', async () => {
