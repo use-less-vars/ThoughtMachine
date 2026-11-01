@@ -203,12 +203,16 @@ def test_health_allows_ipv6_loopback(contract_server):
 
 
 def test_api_health_allows_loopback(contract_server):
-    """GET /api/health from 127.0.0.1 -> 200."""
+    """GET /api/health from 127.0.0.1 -> 200 with the bare liveness body.
+
+    ``/api/health`` is the liveness alias only: it deliberately carries no
+    identity surface (no ``service``/``revision``), which lives on ``/health``.
+    """
     app, _ = contract_server
     status, body = _asgi_get(app, "/api/health", LOOPBACK_CLIENT)
 
     assert status == 200
-    assert b"thoughtmachine-web-ui" in body
+    assert b'"status":"ok"' in body
 
 
 # ════════════════════════════════════════════════════════════════════════════

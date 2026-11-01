@@ -181,7 +181,6 @@ def test_exempt_set_is_the_documented_list():
         {
             "/health",
             "/api/health",
-            "/api/system/health",
             "/api/health/containers",
             "/api/auth/session",
             "/",
@@ -193,7 +192,6 @@ def test_exempt_set_is_the_documented_list():
     "path",
     [
         "/health",
-        "/api/system/health",
         "/api/health/containers",
         "/api/auth/session",
         "/assets/app.js",
