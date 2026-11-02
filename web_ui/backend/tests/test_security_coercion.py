@@ -141,8 +141,11 @@ class TestFileLock:
         assert lock.is_locked is True
         lock.release()
         assert lock.is_locked is False
-        # Lock file should be cleaned up
-        assert not lock._lock_path.exists()
+        # The lock file PERSISTS: it is the rendezvous point every acquirer must
+        # open.  Unlinking it on release lets a waiter holding the OLD inode and
+        # a caller that re-created the path both hold the lock at once (see
+        # tests/test_filelock_mutual_exclusion.py).
+        assert lock._lock_path.exists()
 
     def test_context_manager(self, tmp_path: Path):
         """FileLock works as a context manager."""
@@ -197,15 +200,24 @@ class TestFileLock:
         lock.release()  # should be a no-op
         assert lock.is_locked is False
 
-    def test_lock_file_cleaned_up(self, tmp_path: Path):
-        """The .lock file should be removed after release."""
+    def test_lock_file_left_in_place(self, tmp_path: Path):
+        """The .lock file must SURVIVE release, on the same inode.
+
+        Deleting it hands a waiter that already has the old inode open a lock on
+        an orphaned inode while the next caller locks a freshly created one: two
+        concurrent holders by construction.  Pin the persistence, not a cleanup.
+        """
         target = tmp_path / "cleanup.json"
         lock_path = target.with_suffix(target.suffix + ".lock")
         lock = FileLock(str(target))
         lock.acquire()
         assert lock_path.exists()
+        held_inode = lock_path.stat().st_ino
         lock.release()
-        assert not lock_path.exists()
+        assert lock_path.exists(), "release() must not unlink the lock file"
+        assert lock_path.stat().st_ino == held_inode, (
+            "release() re-created the lock file instead of leaving the inode alone"
+        )
 
     def test_concurrent_threads_exclusive(self, tmp_path: Path):
         """Two threads should not hold the same lock simultaneously."""
@@ -261,8 +273,14 @@ class TestFileLock:
 class TestAtomicSaveWithLock:
     """Verify that FileSystemSessionStore uses locking correctly."""
 
-    def test_save_creates_and_removes_lock(self, session_store, temp_session_dir):
-        """After save_session() completes, the .lock file should be gone."""
+    def test_save_leaves_stable_lock_files(self, session_store, temp_session_dir):
+        """After save_session() the .lock files stay — beside their live target.
+
+        ``FileLock.release()`` must not unlink them (see
+        tests/test_filelock_mutual_exclusion.py), so the invariant this test can
+        hold is: every lock guards a file that is still there, and repeated
+        saves reuse it instead of accumulating new ones.
+        """
         from session.models import Session
         session = Session(
             session_id="lock-test-001",
@@ -270,9 +288,17 @@ class TestAtomicSaveWithLock:
         )
         session_store.save_session(session)
 
-        # Check that no .lock files remain in the sessions dir
-        lock_files = list(Path(temp_session_dir).glob("*.lock"))
-        assert len(lock_files) == 0, f"Lock files left behind: {lock_files}"
+        lock_files = sorted(Path(temp_session_dir).glob("*.lock"))
+        assert lock_files, "save_session() persisted nothing to lock"
+        for lock_file in lock_files:
+            assert Path(str(lock_file)[: -len(".lock")]).exists(), (
+                f"{lock_file.name} guards a file that no longer exists"
+            )
+
+        session_store.save_session(session)
+        assert sorted(p.name for p in Path(temp_session_dir).glob("*.lock")) == [
+            p.name for p in lock_files
+        ], "a second save must reuse the same lock files, not pile up new ones"
 
     def test_load_with_locking(self, session_store, temp_session_dir):
         """Loading a saved session should not produce leftover lock files."""
@@ -286,6 +312,11 @@ class TestAtomicSaveWithLock:
         assert loaded is not None
         assert loaded.metadata.get("name") == "Lock Test Load"
 
-        # No .lock files should remain
-        lock_files = list(Path(temp_session_dir).glob("*.lock"))
-        assert len(lock_files) == 0, f"Lock files left behind: {lock_files}"
+        # Loading takes the lock too, but it must not unlink or duplicate it:
+        # the same stable rendezvous points survive, each beside a live target.
+        lock_files = sorted(Path(temp_session_dir).glob("*.lock"))
+        assert lock_files, "load_session() should have used the persisted locks"
+        for lock_file in lock_files:
+            assert Path(str(lock_file)[: -len(".lock")]).exists(), (
+                f"{lock_file.name} guards a file that no longer exists"
+            )
