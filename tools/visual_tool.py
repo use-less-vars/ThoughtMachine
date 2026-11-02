@@ -286,13 +286,22 @@ class VisualTool(ToolBase):
     one is not in the admission allow-list, before any container is created.
     """
 
-    # Both requirements carry their level on purpose: the gate skips an entry
-    # without a ':' ("if ':' not in req: continue  # malformed, skip",
+    # All three requirements carry their level on purpose: the gate skips an
+    # entry without a ':' ("if ':' not in req: continue  # malformed, skip",
     # security/security_gate.py:1568-1570), so a bare "container" would silently
     # grant nothing.  ``visual:view`` is the grain added for this capability
     # (security/resource_catalog.py:133); ``container:true`` is the same
-    # container-execution grant tools/docker_code_runner.py:61 requires.
-    required_categories: ClassVar[List[str]] = ["visual:view", "container:true"]
+    # container-execution grant tools/docker_code_runner.py:61 requires;
+    # ``filesystem:write`` is what the tool's LAST step needs -- the rendered
+    # PNG is written into the workspace from the HOST side, not by the render
+    # container, so a read-only filesystem session cannot be served by this
+    # tool at all.  Declaring it here makes the outer gate refuse before any
+    # container work; the in-execute() re-check below covers grant drift.
+    required_categories: ClassVar[List[str]] = [
+        "visual:view",
+        "container:true",
+        "filesystem:write",
+    ]
 
     # No ``name`` ClassVar override: ``tool_name()`` then falls back to the
     # class name (tools/base.py:99-101), which is the only form that resolves in
@@ -377,6 +386,41 @@ class VisualTool(ToolBase):
             return self._fail(str(exc), started)
 
         # 4. Artifact destination (host side).
+        #
+        # ``host_artifact.write_bytes`` (step 5b) is a HOST filesystem mutation
+        # performed by THIS process, not a container operation, so neither
+        # ``container:true`` nor the container's own mount governs it.  The
+        # outer gate ran before ``execute()`` at all, against the grants the
+        # session held THEN; that write happens much later, so a grant swapped
+        # in between (an ask resolved after the gate, a worker grant rewrite, a
+        # ceiling change) would never be re-examined.  The write grain is
+        # therefore re-checked atomically here, immediately before the first
+        # host-side mutation, and the check fails CLOSED: an unresolved
+        # ``effective_permissions`` (legacy/direct-call path) and a raising gate
+        # are denials, never a silent pass.
+        effective = self.effective_permissions or {}
+        try:
+            from security.security_gate import check_atomic_operation
+
+            write_allowed = check_atomic_operation(
+                "filesystem:write",
+                effective,
+                "VisualTool",
+                f"write the rendered artifact for {self.target}",
+            )
+        except Exception as exc:  # noqa: BLE001 - an unavailable gate denies
+            logger.warning(
+                "visual: the host artifact write gate is unavailable (%s); "
+                "refusing the write", exc)
+            write_allowed = False
+        if not write_allowed:
+            return self._fail(
+                "visual: writing the rendered artifact into the workspace "
+                "requires filesystem:write "
+                f"(effective filesystem grant: "
+                f"{effective.get('filesystem')!r}). No container was created.",
+                started)
+
         artifact_stem = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
         artifact_name = f"{artifact_stem}.png"
         host_dir = Path(workspace) / ARTIFACT_DIR
