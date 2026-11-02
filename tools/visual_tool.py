@@ -439,18 +439,29 @@ class VisualTool(ToolBase):
                 "the render container cannot be created.", started)
 
         # 5. Render container: ephemeral, no heal, destroyed in the finally.
-        manager = ContainerManager(
-            workspace_path=workspace,
-            session_id=getattr(self, "session_id", None),
-            workspace_id=_resolve_workspace_id(workspace),
-            session_permissions=getattr(self, "session_permissions", None),
-            image=VISUAL_RENDER_IMAGE,
-            # Explicit, not inherited from the manager default: the operator
-            # mandate caps the untrusted renderer at 512 MB, so this call
-            # site must not drift if the global default changes.
-            mem_limit=DEFAULT_MEM_LIMIT,
-            cpu_quota=DEFAULT_CPU_QUOTA,
-        )
+        #
+        # Construction itself can fail: ``ContainerManager.__init__`` ends in
+        # ``docker.from_env()`` (infra/container_manager.py:853), which raises
+        # when no Docker daemon/SDK is usable.  That failure must become the
+        # normal error envelope like every other step here, never a traceback
+        # escaping ``execute()``.
+        try:
+            manager = ContainerManager(
+                workspace_path=workspace,
+                session_id=getattr(self, "session_id", None),
+                workspace_id=_resolve_workspace_id(workspace),
+                session_permissions=getattr(self, "session_permissions", None),
+                image=VISUAL_RENDER_IMAGE,
+                # Explicit, not inherited from the manager default: the operator
+                # mandate caps the untrusted renderer at 512 MB, so this call
+                # site must not drift if the global default changes.
+                mem_limit=DEFAULT_MEM_LIMIT,
+                cpu_quota=DEFAULT_CPU_QUOTA,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface, never mask
+            return self._fail(
+                f"visual: could not create the render container manager: {exc}",
+                started)
         try:
             info = manager.start(
                 image=VISUAL_RENDER_IMAGE,
