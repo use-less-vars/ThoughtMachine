@@ -1784,39 +1784,17 @@ class WebAgentBridge:
                             else:
                                 log('INFO', 'server.bridge', f'Worker resumed: {wname}')
 
-    def _stop_session_workers(self) -> int:
-        """Terminate (KILL) every worker thread of THIS session.
+    def _count_session_workers(self) -> int:
+        """Count the live worker threads of THIS session (read-only).
 
-        PHASE 2.1a: STOP means DETACH, so this cascade must NOT call
-        ``thread.stop()`` -- that would leave the worker parked and alive,
-        still holding its containers, and the Session Stop would no longer
-        terminate the session's work. It calls ``thread.kill()`` instead, the
-        only termination path.
-
-        Worker sub-agents are children of the session, not of the parent's
-        current turn: unless something stops them here they outlive the Stop
-        button and keep consuming tokens and containers in the background.
-
-        Fail-closed on a missing session id: without an id there is no way to
-        tell our workers from another session's, and stopping nothing is the
-        only safe answer (the same rule ``WorkerRegistry.shutdown_workers``
-        enforces).
-
-        The registry is snapshotted under ``_registry_lock`` and the lock is
-        RELEASED before any ``thread.kill()`` is called: a worker's own kill
-        path writes status/command files and touches the registry, so calling
-        into the worker while holding that lock would deadlock against it.
-
-        Returns the number of workers asked to terminate.
+        Stop is turn-scoped: it never touches workers, but the operator log must
+        say how many were deliberately left running.
         """
         if not (WORKER_BUS_AVAILABLE and _worker_registry is not None
                 and _registry_lock is not None):
             return 0
         session_id = self._session_id
         if not session_id:
-            log('WARNING', 'server.bridge',
-                'request_stop(): no session id on this bridge — worker stop '
-                'cascade skipped (stopping nothing rather than every session)')
             return 0
 
         targets: List[Tuple[str, Any]] = []
@@ -1829,8 +1807,12 @@ class WebAgentBridge:
                 if sid == session_id:
                     targets.append((wname, thread))
 
-        stopped = 0
-        for wname, thread in targets:
+        # Counted OUTSIDE the lock: is_alive()/status may read status files and
+        # touch the registry, so they must never run while holding
+        # _registry_lock.  This method is strictly read-only -- it never stops,
+        # detaches or kills a worker.
+        running = 0
+        for _wname, thread in targets:
             if thread is None:
                 continue
             is_alive = getattr(thread, 'is_alive', None)
@@ -1840,27 +1822,10 @@ class WebAgentBridge:
                         continue
                 except Exception:
                     pass
-            # Already terminal or already stopping: kill() is not idempotent
-            # (it re-publishes WORKER_STOPPING and re-terminates tracked
-            # executions), so a second Stop press must not re-kill a worker
-            # that is on its way out.
-            if getattr(thread, 'status', None) in ('killed', 'stopping', 'stopped'):
+            if getattr(thread, 'status', None) in ('killed', 'stopping', 'stopped', 'detached'):
                 continue
-            kill_worker = getattr(thread, 'kill', None)
-            if not callable(kill_worker):
-                continue
-            try:
-                # Termination, not detach (PHASE 2.1a: stop() would only park
-                # the worker and it would outlive the Session Stop).
-                kill_worker()
-                stopped += 1
-                log('INFO', 'server.bridge', f'Worker killed by request_stop(): {wname}')
-            except Exception as exc:
-                log('WARNING', 'server.bridge', f'Failed to kill worker {wname}: {exc}')
-        if stopped:
-            log('INFO', 'server.bridge',
-                f'request_stop(): {stopped} worker(s) terminated for session {session_id}')
-        return stopped
+            running += 1
+        return running
 
     def _interrupt_agent_turn(self) -> bool:
         """Set the main agent's CURRENT-TURN cancellation token, if one is bound.
@@ -1889,16 +1854,22 @@ class WebAgentBridge:
         return True
 
     def request_stop(self) -> bool:
-        """Truncate the CURRENT TURN and keep the bridge thread and session alive.
+        """Truncate the CURRENT TURN only; the session and its workers live on.
 
-        This is the Stop-button path. For the PARENT it is deliberately narrow:
-        it asks the controller for a turn-level halt (the agent breaks out of the
-        stream, commits the partial assistant text it had already produced and
-        emits its 'interrupted' terminal), and touches nothing else — no
-        teardown, no '[STOP]', no thread join, no unregistration, no queued-config
-        drop. The session's worker sub-agents, however, ARE stopped: they are
-        children of the session, so leaving them running would mean the user's
-        Stop only stopped half the work.
+        This is the Stop-button path, and it is deliberately narrow: it asks the
+        controller for a turn-level halt (the agent breaks out of the stream,
+        commits the partial assistant text it had already produced and emits its
+        'interrupted' terminal), and touches nothing else -- no teardown, no
+        '[STOP]', no thread join, no unregistration, no queued-config drop.
+
+        Stop is TURN-scoped, never session-scoped: it deliberately does NOT
+        stop, detach or kill any worker of this session. Workers are stopped
+        only by the explicit worker routes -- ``POST /workers/stop_all`` or the
+        per-worker stop/kill endpoints. The one thing that reaches a worker
+        here is indirect and read-only-ish: a tool blocked in a Worker join
+        polls the MAIN agent's turn token between wait slices, so setting that
+        token unblocks it with ``status='interrupted'``; the job itself is NOT
+        cancelled and stays in the registry, retrievable after the turn.
 
         Contrast with :meth:`stop`, which is TEARDOWN: it shuts the controller
         down (and, on the legacy no-controller path, ends the bridge loop). Use
@@ -1908,24 +1879,24 @@ class WebAgentBridge:
         BEFORE the halt, since the halt itself clears that flag), so a caller can
         distinguish "a turn was halted" from "nothing was running".
         """
-        # Cascade first: the workers must stop whatever the parent path does,
-        # including the legacy no-controller path and the build whose controller
-        # predates request_halt().
-        workers_stopped = self._stop_session_workers()
-
         # Reach the tool that may be blocked RIGHT NOW: container/code-execution
         # waits poll the main agent's turn token between wait slices, so setting
         # it is what actually ends an in-flight exec.  This touches only the
-        # main agent's token -- each worker owns its own, so the cascade above is
-        # unchanged.
+        # main agent's token -- each worker owns its own, and workers are not
+        # stopped here at all.
         turn_token_set = self._interrupt_agent_turn()
+
+        # Read-only accounting: Stop leaves every worker of this session
+        # running, but the operator log must say how many were left alone.
+        workers_left_running = self._count_session_workers()
 
         if self._controller is not None:
             busy = bool(getattr(self._controller, 'is_busy', False))
             log('INFO', 'server.bridge',
                 f'request_stop(): turn-level halt requested (busy={busy}, '
-                f'workers_stopped={workers_stopped}, '
-                f'turn_token_set={turn_token_set}, session retained)')
+                f'workers_left_running={workers_left_running}, '
+                f'turn_token_set={turn_token_set}, session retained; '
+                f'workers stop only via /workers/stop_all)')
             request_halt = getattr(self._controller, 'request_halt', None)
             if not callable(request_halt):
                 log('WARNING', 'server.bridge',
