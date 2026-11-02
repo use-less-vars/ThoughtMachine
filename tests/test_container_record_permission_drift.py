@@ -801,6 +801,7 @@ def test_start_create_arguments_unchanged(vault, monkeypatch, permissive_caps):
         "name": name,
         "network_mode": "bridge",
         "oom_score_adj": 1000,
+        "pids_limit": 512,
         "read_only": True,
         "restart_policy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
         "security_opt": ["no-new-privileges:true"],

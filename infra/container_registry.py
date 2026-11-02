@@ -128,6 +128,7 @@ from agent.config.defaults import (
     DEFAULT_COMMAND,
     DEFAULT_MEM_LIMIT,
     DEFAULT_CPU_QUOTA,
+    DEFAULT_PIDS_LIMIT,
     STOP_TIMEOUT,
 )
 
@@ -146,6 +147,7 @@ class ContainerProfile:
     container_type: str = "user"
     mem_limit: str = DEFAULT_MEM_LIMIT
     cpu_quota: int = DEFAULT_CPU_QUOTA
+    pids_limit: Optional[int] = DEFAULT_PIDS_LIMIT
     oom_score_adj: Optional[int] = None
     network_mode: str = "none"
     labels: dict = field(default_factory=dict)
@@ -499,8 +501,8 @@ class ContainerRegistry:
 
         profile_kwargs = {}
         for field_name in (
-            "mem_limit", "cpu_quota", "oom_score_adj", "labels", "environment",
-            "mounts", "tmpfs", "extra_hosts", "volumes",
+            "mem_limit", "cpu_quota", "pids_limit", "oom_score_adj", "labels",
+            "environment", "mounts", "tmpfs", "extra_hosts", "volumes",
         ):
             value = kwargs.get(field_name)
             if value is not None:

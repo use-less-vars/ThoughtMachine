@@ -30,6 +30,7 @@ from agent.config.defaults import (
     DEFAULT_COMMAND,
     DEFAULT_CPU_QUOTA,
     DEFAULT_MEM_LIMIT,
+    DEFAULT_PIDS_LIMIT,
     DEFAULT_RESOURCE_OOM_SCORE_ADJ,
     DEFAULT_USER_OOM_SCORE_ADJ,
     host_tmpfs,
@@ -285,6 +286,7 @@ class ContainerCreateSpec:
     network_mode: str = "none"
     mem_limit: str = DEFAULT_MEM_LIMIT
     cpu_quota: int = DEFAULT_CPU_QUOTA
+    pids_limit: int | None = DEFAULT_PIDS_LIMIT
     oom_score_adj: int | None = None
     extra_hosts: Mapping[str, str] = field(default_factory=dict)
 
@@ -439,6 +441,10 @@ def create_hardened_container(
             mem_limit=spec.mem_limit,
             memswap_limit=spec.mem_limit,
             cpu_quota=spec.cpu_quota,
+            # docker-py 7.x accepts ``pids_limit``; the spec default is the
+            # live ``DEFAULT_PIDS_LIMIT``, so every create carries a real
+            # ceiling (``None`` would leave ``HostConfig.PidsLimit`` unset).
+            pids_limit=spec.pids_limit,
             tmpfs=dict(spec.tmpfs),
             labels=run_labels,
             environment=env,

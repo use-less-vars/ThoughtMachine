@@ -192,6 +192,7 @@ from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
     CONTAINER_TYPE_LABEL,
     CONTAINER_TYPE_RESOURCE,
+    DEFAULT_CPU_QUOTA,
     DEFAULT_IMAGE,
     DEFAULT_MAX_CONTAINERS,
     DEFAULT_MEM_LIMIT,
@@ -701,6 +702,7 @@ _EFFECTIVE_INTENT_KEYS = (
     "workspace_mode",
     "mem_limit",
     "cpu_quota",
+    "pids_limit",
     "restart_policy",
 )
 
@@ -811,7 +813,7 @@ class ContainerManager:
         session_permissions=None,
         image=DEFAULT_IMAGE,
         mem_limit=DEFAULT_MEM_LIMIT,
-        cpu_quota=100000,
+        cpu_quota=DEFAULT_CPU_QUOTA,
         vault_root=None,
         session_config=None,
     ):

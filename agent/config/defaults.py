@@ -240,6 +240,8 @@ DEFAULT_TMPFS = {
 DEFAULT_COMMAND = ["tail", "-f", "/dev/null"]
 DEFAULT_MEM_LIMIT = "512m"
 DEFAULT_CPU_QUOTA = 100000
+# PID ceiling for created containers (unset -> Docker applies no pids limit).
+DEFAULT_PIDS_LIMIT = 512
 # Graceful-stop timeout used by destroy_container / permission reconciliation.
 STOP_TIMEOUT = 10
 
