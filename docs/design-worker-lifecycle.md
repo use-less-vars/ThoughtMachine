@@ -47,7 +47,7 @@ amended by R3** — the `visual` tool is the one bounded exception to synchronou
 | Tool *authoring* from the UI is correctly rejected | verified (ruling upholds it) | `tools/base.py:50-60` injects `session_permissions` / `effective_permissions` from the executor: `:57` — `effective_permissions: Optional[Dict[str, Any]] = Field(` / `:59` — `description='Effective merged permissions (session × workspace) for atomic checks.',` | retained in Q5 |
 | `ImageBlock` exists but has no producer and no provider adapter | verified | `agent/core/ir.py:57` — `class ImageBlock:`; `:67` — `media_type: str  # e.g. "image/png"`; referenced only in `ir.py` + `tests/core/test_ir.py` | prerequisite named (Q5) |
 | `ToolResultBlock.content` is a `str` | verified | `agent/core/ir.py:80` — `class ToolResultBlock:` (`content` = "the flattened result the executor already produces") | constrains return shape (Q5) |
-| Permission vocabulary is a per-resource allow-list | verified | `security/resource_catalog.py:113-123` — `RESOURCE_CATALOG = {` … `"host_bash": ["banned", "ask", "allow"],`; ranks at `:146` — `GRANT_LEVEL_RANKS: Dict[str, float] = {` | new `visual` resource needed (Q5) |
+| Permission vocabulary is a per-resource allow-list | verified | `security/resource_catalog.py:124-134` — `RESOURCE_CATALOG = {` … `"host_bash": ["banned", "ask", "allow"],`; ranks at `:155` — `GRANT_LEVEL_RANKS: Dict[str, float] = {` | shipped: `"visual": ["banned", "ask", "view"]` at `security/resource_catalog.py:133` |
 | Only `host_bash` executes on the host | verified | `docs/ARCHITECTURE_MACHINE_MODEL.md:28` — `**`host_bash` is the one true host-execution grain.** Every other tool either runs in a container or is bounded in-process.` | visual tool ⇒ container (Q5) |
 
 No premise required a STOP: every ruling is implementable against the current code.
@@ -1262,7 +1262,7 @@ and rendered as a tab at
 `enabled_tools: 'Tools',`), never a definition.
 
 **(b) Authoring is (correctly) not a UI concern.** Tools are code-defined per module —
-`tools/workspace/worker_thread.py:3389` — `def _build_tool_registry() -> dict[str, type["ToolBase"]]:`
+`tools/workspace/worker_thread.py:3739` — `def _build_tool_registry() -> dict[str, type["ToolBase"]]:`
 — and each tool receives its permissions *injected by the executor*:
 `tools/base.py:50-53` — `session_permissions: Optional[Dict[str, Any]] = Field(` /
 `default=None,` / `description='Session permissions dict injected by ToolExecutor.',` /
@@ -1287,8 +1287,8 @@ a product capability.
 
 Two of the design's requirements are already fixed elsewhere and are not re-derived here: the cap is a container-layer hard deadline (**Q2A**), and the protocol for cancelling a render in flight is **Q2D**'s ladder, whose rung 2 (`terminate_all`) is the layer that reaches an exec already running inside a container.
 
-**The tool.** `visual` (`tools/visual_tool.py`, registered in
-`tools/workspace/worker_thread.py:3389`), one action, two parameters:
+**The tool.** `VisualTool` (`tools/visual_tool.py:276`, registered in
+`tools/workspace/worker_thread.py:3739`), one action, two parameters:
 `target` — in v1 a `file:///workspace/...` path only; an `http(s)://` URL is rejected with
 an actionable error, pending a cited network level (see the network paragraph below) — and
 `full_page: bool`.
@@ -1310,9 +1310,9 @@ destroyed", which is exactly the isolation a renderer needs. Declaration mirrors
 exactly that call's envelope — image, mounts, `network`, timeouts — and destroyed in a
 `finally`, so it is reclaimed on success, on timeout, on cancellation and on exception
 alike; no path leaves a render container behind. It is never reclaimed by
-`_cleanup_worker_containers()` (`worker_thread.py:2153`), which detach must not run at all
+`_cleanup_worker_containers()` (`worker_thread.py:2457`), which detach must not run at all
 (Q1). Detach mid-render does **not** interrupt an in-flight render: the park loop only
-takes effect between iterations (`worker_thread.py:2436-2443`, `:2685-2694`), and the
+takes effect between iterations (`worker_thread.py:2744-2761`, `:3022-3033`), and the
 render is bounded by `RENDER_TIMEOUT_SECONDS = 30`, so a detach issued during a render
 takes effect at the next iteration boundary after at most that long. This is the design,
 not a derived consequence: a render is allowed to finish its bounded call, and detach is a
@@ -1321,15 +1321,15 @@ park, not a preemption.
 **Permission grain: one new resource `visual`, values `["banned", "ask", "view"]`.**
 Three values, not four: `interact` (click/type/scroll) makes the browser a *mutating*
 agent against third-party state and would need its own threat model, its own tests and
-its own rate limits — out of scope, deliberately. `view` ranks at the read tier.
-Implementation points: `security/resource_catalog.py:113-123` —
-`RESOURCE_CATALOG = {` … `"host_bash": ["banned", "ask", "allow"],` (add
-`"visual": ["banned", "ask", "view"]`), the rank table at `:146` —
-`GRANT_LEVEL_RANKS: Dict[str, float] = {` (add `"view": 1`), the catalog entry in
+its own rate limits — out of scope, deliberately. `view` ranks at 2.5 — ABOVE `ask` (2) and below `write` (3) — so `banned < ask < view`: an `ask` session value does NOT satisfy a `view` requirement, and an `ask` workspace ceiling caps a `view` grant down to `ask`.
+Implementation points (all shipped): `security/resource_catalog.py:124-134` —
+`RESOURCE_CATALOG = {` … `"host_bash": ["banned", "ask", "allow"],` …
+`"visual": ["banned", "ask", "view"],`, the rank table at `:155` —
+`GRANT_LEVEL_RANKS: Dict[str, float] = {` with `"view": 2.5` (above `ask`), the catalog entry in
 `agent/config/resource_catalog.json` (per-resource `permission_grain_set`,
-`execution_mode: "container"`, `tools: ["visual"]`, `ui_category: "visual"`), and the
-session default `agent/config/defaults.py:262-269` —
-`DEFAULT_SESSION_PERMISSIONS = {` (add `"visual": "banned"`).
+`execution_mode: "container"`, `tools: ["VisualTool"]`, `ui_category: "sandbox"`), and the
+session default `agent/config/defaults.py:273-281` —
+`DEFAULT_SESSION_PERMISSIONS = {` carrying `"visual": "banned"`.
 
 **Return shape: four outcomes — one `ImageBlock`, a capped-text envelope, an error string, or `stopped`.**
 `source` is a base64 string and `media_type` is pinned to `"image/png"`
@@ -1425,8 +1425,8 @@ handling and a much larger test surface; premature for a first visual capability
 
 ### Recommendation
 
-**Option B.** One `visual` tool, container-executed, gated by
-`visual: view` (rank = read tier), returning a single inline PNG `ImageBlock` capped at
+**Option B.** One `VisualTool`, container-executed, gated by
+`visual: view` (rank 2.5, above `ask`), returning a single inline PNG `ImageBlock` capped at
 1 MB. Keep the authoring surface rejected on the grounds already established
 (`tools/base.py:50-60` injects the permission grain from the executor; nothing in the UI
 can validate it). Ship the IR/provider half as the same change, because an
@@ -1434,10 +1434,10 @@ can validate it). Ship the IR/provider half as the same change, because an
 
 ### Blast radius
 
-- Files: `tools/visual_tool.py` (new), `tools/workspace/worker_thread.py:3389`
+- Files: `tools/visual_tool.py` (new), `tools/workspace/worker_thread.py:3739`
   (registry), `tools/base.py:312` (cap helper reuse), `agent/core/ir.py:57-80/124/251`
   (`ToolResultBlock` image parts), `llm_providers/anthropic_provider.py`,
-  `llm_providers/openai_compatible.py`, `security/resource_catalog.py:113/146`,
+  `llm_providers/openai_compatible.py`, `security/resource_catalog.py:124/155`,
   `agent/config/resource_catalog.json`, `agent/config/defaults.py:135/159/262` plus a
   new `IMAGE_CAP_BYTES`.
 - Tests: `tests/core/test_ir.py:41/135` (the only current `ImageBlock` coverage),
