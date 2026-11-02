@@ -36,6 +36,7 @@ import pytest
 
 import web_ui.backend.bridge as bridge_mod
 from agent.config.models import AgentConfig
+from tools.workspace.command_channel import write_command
 from agent.core.agent import Agent
 from session.store import FileSystemSessionStore
 from tools.workspace.worker_thread import WorkerThread
@@ -71,10 +72,9 @@ def _unstarted_thread(tmp_path, name: str = "test-worker",
 
 
 def _write_command(thread: WorkerThread, action: str) -> None:
-    """Drop the cross-process command file where the worker actually polls it."""
-    (thread._worker_dir / "command.json").write_text(
-        json.dumps({"action": action}), encoding="utf-8"
-    )
+    """Write a FENCED command where the worker actually polls for it."""
+    thread._worker_dir.mkdir(parents=True, exist_ok=True)
+    assert write_command(thread._worker_dir, action, thread._fence()) is True
 
 
 # ══════════════════════════════════════════════════════════════════════════════

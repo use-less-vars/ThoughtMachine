@@ -117,19 +117,30 @@ class CommandFence:
         key, ``None``, a numeric string, and a bool where an ``int`` is
         required -- ``type(v) is int`` rather than ``isinstance`` precisely
         because ``True`` IS an ``int`` and would otherwise match
-        ``instance_id=1``.
+        ``instance_id=1``.  The instance is built BY KEYWORD, so the order of
+        ``_FENCE_FIELDS`` can never swap one axis for another.
         """
         if not isinstance(data, dict):
             return None
-        values: list = []
+        values: Dict[str, Any] = {}
         for name, expected_type in _FENCE_FIELDS:
             if name not in data:
                 return None
             value = data[name]
             if type(value) is not expected_type:  # noqa: E721 - see docstring
                 return None
-            values.append(value)
-        return cls(*values)
+            values[name] = value
+        # Keyword construction, NOT ``cls(*values)``: positional construction
+        # would silently couple the parse to the iteration order of
+        # ``_FENCE_FIELDS``, so a future reordering could swap ``session_id``
+        # for ``worker_name``.  A swapped fence is worse than a rejected one:
+        # it still compares, and fails on an axis that looks plausible.
+        return cls(
+            session_id=values["session_id"],
+            worker_name=values["worker_name"],
+            instance_id=values["instance_id"],
+            epoch=values["epoch"],
+        )
 
 
 def _slugify(value: str, max_len: int = _MAX_SLUG_LEN) -> str:
