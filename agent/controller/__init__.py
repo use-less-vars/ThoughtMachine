@@ -370,6 +370,42 @@ class AgentController:
         if os.environ.get('PAUSE_DEBUG'):
             log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: query queued, queue size={self.query_queue.qsize()}')
 
+    def _agent_enter_reading_mode(self, where: str) -> None:
+        """Put the agent into reading mode: it concludes the current turn.
+
+        Reading mode is the Pause button's semantics: the agent finishes the
+        turn it is in (one [SYSTEM NOTIFICATION] nudge asks it to summarise and
+        reply with Respond) but every tool call is refused, because the 'pause'
+        restriction narrows the allow-list to ['Respond']. The turn is NOT
+        aborted, so no turn-truncating 'paused' event is produced.
+
+        Falls back to agent.request_pause() (the alias) for agents that predate
+        the rename, and to a no-op for agents that have neither.
+        """
+        agent = self.agent
+        if agent is None:
+            return
+        try:
+            if hasattr(agent, 'enter_reading_mode'):
+                changed = agent.enter_reading_mode('pause')
+                log('DEBUG', 'core.controller', f'{where}: enter_reading_mode(pause) -> changed={changed}')
+            elif hasattr(agent, 'request_pause'):
+                agent.request_pause()
+                log('DEBUG', 'core.controller', f'{where}: request_pause() (legacy alias)')
+        except Exception as e:
+            log('WARNING', 'core.controller', f'{where}: could not enter reading mode: {e}')
+
+    def _agent_in_reading_mode(self) -> bool:
+        """True while the agent is under a pause-owned restriction.
+
+        In reading mode the pause does NOT abort the running turn -- the agent
+        is concluding it -- so its event stream must keep being consumed.
+        """
+        agent = self.agent
+        if agent is None:
+            return False
+        return getattr(getattr(agent, 'state', None), 'restriction_reason', None) == 'pause'
+
     def request_pause(self):
         """Request agent to pause after current turn.
 
@@ -406,8 +442,10 @@ class AgentController:
                     'new_state': 'pausing',
                 })
                 log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (idle)')
-            if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
-                self.agent.request_pause()
+            # Reading mode: the agent concludes whatever it is doing and takes
+            # no new action. PAUSING above is the session-level 'no new turns'
+            # signal for the UI -- it does not mean 'abort the running turn'.
+            self._agent_enter_reading_mode('request_pause[idle]')
             if hasattr(self, 'agent') and self.agent is not None:
                 from session.context_builder import ContextBuilder
                 if hasattr(self.agent, 'conversation'):
@@ -508,8 +546,8 @@ class AgentController:
                 'new_state': 'pausing',
             })
             log('DEBUG', 'core.pause', f'PAUSE REQUESTED by user (state before: {old_state}), execution_state_change emitted')
-        if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
-            self.agent.request_pause()
+        # Reading mode: conclude the current turn, refuse further tool calls.
+        self._agent_enter_reading_mode('pause')
         if hasattr(self, 'agent') and self.agent is not None:
             from session.context_builder import ContextBuilder
             if hasattr(self.agent, 'conversation'):
@@ -526,6 +564,15 @@ class AgentController:
         self.pause_event.set()
         self._pause_requested = False
         if hasattr(self, 'agent') and self.agent is not None:
+            # Leave reading mode. The clear is OWNER-SCOPED: only a 'pause'
+            # restriction is released here, so a 'token'/'timeout'/'turn'
+            # restriction owned by the agent's monitors survives the resume.
+            if hasattr(self.agent, 'leave_reading_mode'):
+                try:
+                    released = self.agent.leave_reading_mode('pause')
+                    log('DEBUG', 'core.controller', f'resume(): leave_reading_mode(pause) -> released={released}')
+                except Exception as e:
+                    log('WARNING', 'core.controller', f'resume(): leave_reading_mode failed: {e}')
             if hasattr(self.agent, '_pause_requested'):
                 log('DEBUG', 'core.controller', f'Clearing agent._pause_requested (was {self.agent._pause_requested})')
                 if os.environ.get('PAUSE_DEBUG'):
@@ -738,7 +785,7 @@ class AgentController:
                                 self._pause_requested = False
                                 stop_reason = event['stop_reason']
                                 break
-                            if not self.pause_event.is_set():
+                            if not self.pause_event.is_set() and not self._agent_in_reading_mode():
                                 log('DEBUG', 'core.controller', f'pause_event not set between events, breaking loop')
                                 self._pause_requested = False
                                 break
