@@ -95,6 +95,7 @@ _DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
     "mcp": "banned",
     "ci": "banned",
     "credential": "banned",
+    "visual": "banned",
 }
 
 

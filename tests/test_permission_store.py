@@ -124,6 +124,7 @@ def test_session_permissions_object_input_round_trip(tmp_path):
         "mcp": "banned",
         "host_bash": "banned",
         "ci": "banned",
+        "visual": "banned",
         "credential": "banned",
     }
     assert json.loads(target.read_text(encoding="utf-8")) == expected
@@ -345,6 +346,7 @@ def test_session_permissions_accepts_git_write_on_feature_branch(tmp_path):
         "mcp": "banned",
         "host_bash": "banned",
         "ci": "banned",
+        "visual": "banned",
         "credential": "banned",
     }
 

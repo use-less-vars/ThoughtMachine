@@ -62,6 +62,7 @@ CANONICAL_KEYS = {
     "mcp",
     "network",
     "ci",
+    "visual",
     "credential",
 }
 
@@ -73,6 +74,7 @@ DENY_ALL = {
     "mcp": "banned",
     "network": "banned",
     "ci": "banned",
+    "visual": "banned",
     "credential": "banned",
 }
 
@@ -89,6 +91,7 @@ EXPECTED_REAL_PROFILE = {
     "mcp": "banned",
     "network": "banned",
     "ci": "banned",
+    "visual": "banned",
     "credential": "banned",
 }
 
