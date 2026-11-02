@@ -483,8 +483,8 @@ class WebAgentBridge:
 
         # Event primitives
         self._stop_event = threading.Event()
-        self._pause_event = threading.Event()
-        self._pause_event.set()          # start in "running" (not paused)
+        self._park_event = threading.Event()
+        self._park_event.set()          # start in "running" (not paused)
 
         # Query queue — the agent thread pulls from this
         self._query_queue: queue.Queue = queue.Queue()
@@ -1452,7 +1452,7 @@ class WebAgentBridge:
 
     @property
     def is_paused(self) -> bool:
-        return not self._pause_event.is_set()
+        return not self._park_event.is_set()
 
     @property
     def is_processing(self) -> bool:
@@ -1638,7 +1638,7 @@ class WebAgentBridge:
 
         # Reset primitives
         self._stop_event.clear()
-        self._pause_event.set()
+        self._park_event.set()
         self._running = True
         self._processing = False
 
@@ -1728,7 +1728,7 @@ class WebAgentBridge:
         else:
             if not self.is_running:
                 return
-            self._pause_event.clear()
+            self._park_event.clear()
             if self._agent is not None:
                 self._agent.request_pause()
         # Pause all workers for this session
@@ -1755,7 +1755,7 @@ class WebAgentBridge:
         if self._controller is not None:
             self._controller.resume()
         else:
-            self._pause_event.set()
+            self._park_event.set()
             if self._agent is not None:
                 self._agent._pause_requested = False
         # Resume all workers for this session
@@ -1909,7 +1909,7 @@ class WebAgentBridge:
             'is unavailable — falling back to full teardown (_stop_event set, '
             'bridge loop exits)')
         self._stop_event.set()
-        self._pause_event.set()  # unblock if paused
+        self._park_event.set()  # unblock if paused
         return True
 
     def stop(self) -> None:
@@ -1924,7 +1924,7 @@ class WebAgentBridge:
             self._controller.stop()
             return
         self._stop_event.set()
-        self._pause_event.set()  # unblock if paused
+        self._park_event.set()  # unblock if paused
 
     # ── Query API ───────────────────────────────────────────────────────────
 
@@ -3329,8 +3329,8 @@ class WebAgentBridge:
         try:
             while self._running and not self._stop_event.is_set():
                 # Check pause
-                if not self._pause_event.is_set():
-                    self._pause_event.wait(timeout=0.5)
+                if not self._park_event.is_set():
+                    self._park_event.wait(timeout=0.5)
                     continue
 
                 # Wait for a query
@@ -3371,7 +3371,7 @@ class WebAgentBridge:
                                 pass
 
                         # Check pause after each event
-                        if not self._pause_event.is_set():
+                        if not self._park_event.is_set():
                             break
 
                         # If the agent yielded a stop_reason, break

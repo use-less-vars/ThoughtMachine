@@ -45,54 +45,18 @@ MAX_SECONDS: float = 300.0
 # re-checking the interrupt, so cancellation latency is bounded by it.
 SLICE_SECONDS: float = 0.1
 
-# Per-THREAD cancellation holder.  ``WorkerThread`` binds its own
-# ``_turn_cancel`` event for the duration of a turn; nothing here is shared
-# between workers or between threads.
-_tls = threading.local()
-
-
-def bind_turn_cancel(event: threading.Event) -> None:
-    """Bind *event* as the cancellation token of the CURRENT thread."""
-    _tls.event = event
-    _tls.reason = None
-
-
-def unbind() -> None:
-    """Drop the current thread's binding (owning worker calls this at turn end)."""
-    _tls.event = None
-    _tls.reason = None
-
-
-def _fallback_event() -> threading.Event:
-    """Per-thread token used when no turn event is bound (tests, direct use)."""
-    ev = getattr(_tls, "fallback", None)
-    if ev is None:
-        ev = threading.Event()
-        _tls.fallback = ev
-    return ev
-
-
-def _active_event() -> threading.Event:
-    """The current thread's cancellation token (bound turn event or fallback)."""
-    ev = getattr(_tls, "event", None)
-    return ev if ev is not None else _fallback_event()
-
-
-def interrupt(reason: str = "interrupted") -> None:
-    """Cancel the CURRENT thread's in-flight sleep (never crosses threads)."""
-    _tls.reason = reason or "interrupted"
-    _active_event().set()
-
-
-def reset() -> None:
-    """Clear the current thread's cancellation state (tests / direct use)."""
-    _tls.reason = None
-    _active_event().clear()
-
-
-def is_interrupted() -> bool:
-    """True while the CURRENT thread's cancellation token is set."""
-    return _active_event().is_set()
+# The primitives live in ``tools/cancellation.py``; imported and RE-EXPORTED
+# so ``tools.sleep_tool.<name>`` keeps working for existing callers.
+from .cancellation import (  # noqa: F401  (re-exported public API)
+    _active_event,
+    _tls,
+    bind_turn_cancel,
+    cancel_reason,
+    interrupt,
+    is_interrupted,
+    reset,
+    unbind,
+)
 
 
 class Sleep(ToolBase):

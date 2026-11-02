@@ -130,7 +130,7 @@ def _make_stub_worker(tmp_path):
     worker = WorkerThread.__new__(WorkerThread)
     worker._turn_cancel = threading.Event()
     worker._stop_event = threading.Event()
-    worker._pause_event = threading.Event()
+    worker._park_event = threading.Event()
     worker._resume_event = threading.Event()
     worker._input_queue = queue.Queue()
     worker._worker_dir = tmp_path
@@ -196,7 +196,7 @@ def test_detach_cancels_an_in_flight_sleep(tmp_path):
     assert wall < 2.0, f"detach did not cancel the sleep promptly ({wall:.2f}s)"
     # detach() is NOT termination: the terminal kill latch stays clear.
     assert worker._stop_event.is_set() is False
-    assert worker._pause_event.is_set() is True
+    assert worker._park_event.is_set() is True
 
 
 def test_new_query_clears_turn_cancel(tmp_path):

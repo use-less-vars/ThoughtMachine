@@ -64,7 +64,7 @@ _NO_SESSION_KEY = "<no-session>"
 # Input-queue marker meaning ONLY "wake up and re-read the park flags".
 # A bare ``None`` in ``_input_queue`` keeps its unambiguous meaning: STOP.
 # The two were historically the same value, which made a leftover sentinel
-# consumed after ``resume()`` (that clears ``_pause_event``) read as STOP and
+# consumed after ``resume()`` (that clears ``_park_event``) read as STOP and
 # silently drop every query queued behind it.
 _PARK_SENTINEL: Any = object()
 
@@ -1129,11 +1129,12 @@ class WorkerThread(threading.Thread):
         self._input_queue: queue.Queue = queue.Queue()
         self._output_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
-        self._pause_event = threading.Event()
+        # PARK primitive (driven by detach()/resume()) -- deliberately NOT the user-facing pause
+        self._park_event = threading.Event()
         self._resume_event = threading.Event()
         # Per-WORKER, per-TURN cancellation token -- a THIRD, distinct signal:
         #   _stop_event   = terminal kill latch (never cleared; guards resume)
-        #   _pause_event  = park flag (driven by detach()/resume())
+        #   _park_event  = park flag (driven by detach()/resume())
         #   _turn_cancel  = in-flight cancellation token consulted by tools
         # Cleared at the start of EVERY query, set on graceful stop (detach() /
         # cross-process 'stop') and on kill().  Bound to the executing tool
@@ -1504,7 +1505,7 @@ class WorkerThread(threading.Thread):
         self._write_status_file()
         self._detach_requested = True
         self._detached_at = time.time()
-        self._pause_event.set()
+        self._park_event.set()
         self._resume_event.clear()
         # Graceful stop CANCELS the in-flight turn (a long-blocking tool must
         # return instead of holding the park back) -- this is the "Stop now"
@@ -1631,7 +1632,7 @@ class WorkerThread(threading.Thread):
             except Exception as exc:
                 log("WARNING", "tools.worker",
                     f"WLM pause delegation failed for worker '{self.worker_name}': {exc}")
-        self._pause_event.set()
+        self._park_event.set()
         self._resume_event.clear()
         # Write command file for cross-process signalling
         try:
@@ -1670,7 +1671,7 @@ class WorkerThread(threading.Thread):
                     f"WLM resume delegation failed for worker '{self.worker_name}': {exc}")
         # Remove any stale pause command file left by pause() while the
         # worker was busy (it would re-pause the worker on the next poll).
-        # This MUST happen before _pause_event.clear(): the pause park loop
+        # This MUST happen before _park_event.clear(): the pause park loop
         # exits as soon as the event is cleared, so the file must already be
         # gone before the worker can wake and poll it again.  Symmetric with
         # stop()/pause() command file writes.
@@ -1678,7 +1679,7 @@ class WorkerThread(threading.Thread):
             (self._worker_dir / "command.json").unlink(missing_ok=True)
         except OSError:
             pass
-        self._pause_event.clear()
+        self._park_event.clear()
         self._resume_event.set()
         # UNIT C: the worker is now actually running again, so the manual-only
         # marker is stale.  Clear it so later queries/spawns do not treat this
@@ -1914,7 +1915,7 @@ class WorkerThread(threading.Thread):
                 cmd_path.unlink(missing_ok=True)
                 self._detach_requested = True
                 self._detached_at = time.time()
-                self._pause_event.set()
+                self._park_event.set()
                 self._resume_event.clear()
                 # Cross-process graceful stop: same turn-cancel signal as
                 # detach(), since this branch parks the worker inline.
@@ -1939,7 +1940,7 @@ class WorkerThread(threading.Thread):
                 self.kill()
             elif action == "pause":
                 cmd_path.unlink(missing_ok=True)
-                self._pause_event.set()
+                self._park_event.set()
                 self._input_queue.put(_PARK_SENTINEL)
             elif action == "resume":
                 # Resume while a pause is pending (or a leftover from an
@@ -1949,7 +1950,7 @@ class WorkerThread(threading.Thread):
                 # poll).  Events are thread-safe, so this is safe even if the
                 # blocked pause loop is waiting on _resume_event.
                 cmd_path.unlink(missing_ok=True)
-                self._pause_event.clear()
+                self._park_event.clear()
                 self._resume_event.set()
                 # Mirrors WorkerThread.resume(): the worker keeps running, so
                 # the manual-only marker is stale and must be cleared too.
@@ -1957,7 +1958,7 @@ class WorkerThread(threading.Thread):
                 # PHASE 2.1a: mirror WorkerThread.resume() (:1657-1663) -- a
                 # resumed worker is no longer detached, so the markers go and
                 # the registration is lifted BEFORE the park loop above
-                # reports "ready".  Clearing only _pause_event (as this branch
+                # reports "ready".  Clearing only _park_event (as this branch
                 # used to) left a "ready" worker that the stale-container sweep
                 # still skipped as detached, forever.
                 self._detach_requested = False
@@ -2249,7 +2250,7 @@ class WorkerThread(threading.Thread):
                     break
 
                 # Check pause signal
-                if self._pause_event.is_set():
+                if self._park_event.is_set():
                     self._agent.request_pause()
                     self.status = "paused"
                     self._write_status_file()
@@ -2738,9 +2739,9 @@ class WorkerThread(threading.Thread):
                     # nothing else; a bare ``None`` keeps its unambiguous
                     # meaning: STOP.  Both used to be a bare ``None``, so a
                     # leftover wake-up marker consumed after ``resume()`` had
-                    # already cleared ``_pause_event`` read as STOP and broke
+                    # already cleared ``_park_event`` read as STOP and broke
                     # the loop with work still queued (BUG 1).
-                    if self._pause_event.is_set():
+                    if self._park_event.is_set():
                         # PHASE 2.1a: a park entered because of a detach
                         # reports 'detached', not 'paused'.
                         self.status = "detached" if self._detach_requested else "paused"
@@ -2777,7 +2778,7 @@ class WorkerThread(threading.Thread):
                         self.current_task = None
                         self.last_heartbeat = datetime.now(timezone.utc).isoformat()
                         # Block until resumed (or stopped)
-                        while self._pause_event.is_set() and not self._stop_event.is_set():
+                        while self._park_event.is_set() and not self._stop_event.is_set():
                             # DEAF-PARK FIX: a parked worker must still notice
                             # cross-process control.  Without this poll a
                             # command.json 'kill' (the ONLY terminating action,
@@ -2849,7 +2850,7 @@ class WorkerThread(threading.Thread):
                         continue
                     if raw is _PARK_SENTINEL:
                         # A stale wake-up marker: ``resume()`` already cleared
-                        # ``_pause_event``, so this is a no-op -- NOT a stop
+                        # ``_park_event``, so this is a no-op -- NOT a stop
                         # and NOT an immediate re-park.  Discard and continue.
                         continue
                     # Bare None with no pause and no stop event is the legacy
@@ -2982,7 +2983,7 @@ class WorkerThread(threading.Thread):
                         pass
 
                 # Check if worker was paused during the tool loop
-                if self._pause_event.is_set():
+                if self._park_event.is_set():
                     # Preserve paused status — don't overwrite with "ready"
                     # PHASE 2.1a: a detach-requested park reports 'detached'.
                     self.status = "detached" if self._detach_requested else "paused"
@@ -3055,7 +3056,7 @@ class WorkerThread(threading.Thread):
                         self._emit_reply(reply)
 
                     # Block until resumed (or stopped)
-                    while self._pause_event.is_set() and not self._stop_event.is_set():
+                    while self._park_event.is_set() and not self._stop_event.is_set():
                         # DEAF-PARK FIX (same as the park loop above): poll for
                         # a cross-process command while parked, so 'kill'
                         # terminates and 'stop' detaches instead of both being
@@ -5471,7 +5472,10 @@ class Worker(ToolBase):
         (completed / timeout / error), a partial result (status ``partial_result``
         + preview), the worker thread pausing (``status == 'paused'``) or being
         detached (``status == 'detached'``), a kill signal (stop_event set /
-        status ``killed``), or thread death.
+        status ``killed``), or thread death. Also returns early -- WITHOUT
+        cancelling the job -- when the caller's turn is cancelled: the token
+        bound to this tool thread is set, so the WAIT stops but the job stays
+        in the registry (``status == 'interrupted'``, ``interrupted == True``).
         """
         _JOB_TERMINAL = ("completed", "timeout", "error")
         job_id = (self.worker_query or "").strip()
@@ -5586,7 +5590,70 @@ class Worker(ToolBase):
                     "status": "timeout",
                     "note": f"Timed out after {total}s waiting for job; last known status: {last_status}.",
                 }
+            # Interruptible WAIT.  A cancel (detach()/kill()/cross-process
+            # 'stop') stops the WAIT only: the job keeps running and STAYS in
+            # the registry -- nothing here cancels or removes it.  With no
+            # token bound (tests, direct use) this never fires, so the
+            # full-timeout wait is unchanged.
+            cancelled, reason = self._join_cancel_check()
+            if cancelled:
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": reason,
+                    "last_status": last_status,
+                    "completed_jobs": self._join_completed_jobs(registry),
+                    "note": (
+                        "Wait interrupted; the job was NOT cancelled and remains in "
+                        f"the registry (last known status: {last_status})."
+                    ),
+                }
             time.sleep(0.25)
+
+    def _join_cancel_check(self) -> tuple:
+        """``(cancelled, reason)`` for the join poll loop.
+
+        Primary signal: the thread-local turn-cancel token bound by the
+        executing worker (``tools.sleep_tool.bind_turn_cancel``) -- the very
+        token that interrupts ``sleep``.  Secondary: an injected
+        ``agent_config['stop_check']`` probe, mirroring
+        ``Sleep._external_stop`` (normally absent: ``AgentConfig`` strips it).
+        """
+        from tools.sleep_tool import cancel_reason, is_interrupted
+        try:
+            if is_interrupted():
+                return True, cancel_reason() or "turn_cancelled"
+        except Exception:  # pragma: no cover - defensive
+            pass
+        cfg = self.agent_config or {}
+        probe = cfg.get("stop_check") if isinstance(cfg, dict) else None
+        if callable(probe):
+            try:
+                if probe():
+                    return True, "stop_check"
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return False, None
+
+    def _join_completed_jobs(self, registry) -> list:
+        """Jobs of this worker/instance already terminal when a join is interrupted."""
+        try:
+            jobs = registry.jobs(worker_name=self.worker_name or None, instance_id=self.instance_id)
+        except Exception:  # pragma: no cover - defensive
+            return []
+        return [
+            {
+                "job_id": r.get("job_id"),
+                "status": r.get("status"),
+                "completed_at": r.get("completed_at"),
+            }
+            for r in jobs
+            if r.get("status") in ("completed", "timeout", "error")
+        ]
 
     def _action_pause(self, workers: list) -> dict:
         """Pause the session's main agent and/or its workers (UNIT C, v2).

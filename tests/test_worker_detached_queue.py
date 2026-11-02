@@ -197,7 +197,7 @@ def _detach(thread):
     """
     thread.detach()
     assert _wait_until(
-        lambda: thread.status == "detached" and thread._pause_event.is_set()
+        lambda: thread.status == "detached" and thread._park_event.is_set()
     ), (
         f"worker did not park as detached (status={thread.status})"
     )
@@ -234,7 +234,7 @@ class TestEnqueueParksWithoutResuming:
 
         # Contract 3: enqueueing must NOT set _resume_event (no token burn).
         assert thread._resume_event.is_set() is False
-        assert thread._pause_event.is_set() is True
+        assert thread._park_event.is_set() is True
         # Contract 1: accepted + queued, introspectable in FIFO order.
         assert thread.pending_query_jobs() == ["job-a"]
         time.sleep(0.3)
