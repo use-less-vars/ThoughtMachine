@@ -13,6 +13,13 @@ failed: security_gate's transitive imports reach ``tools``, whose
 ``_value_satisfies`` now lives in the import-free leaf module
 ``security.gate_helpers``, so both import orders must work identically.
 
+A second, analogous cycle lived in ``tools/visual_tool.py``: it imported
+``security.admission_gate`` (for ``_image_repo_name``), and
+``security.admission_gate`` imports ``ContainerConfig`` from
+``security.security_gate``.  With that import at module scope, a gate-first
+import dropped ``VisualTool`` the same silent way; the import is now lazy, and
+``test_import_security_gate_then_tools_registers_visual_tool`` pins it.
+
 Each test runs a FRESH interpreter (``sys.executable -c``) so there is no
 in-process ``sys.modules`` pollution between cases.
 """
@@ -49,6 +56,7 @@ def _assert_clean(result: subprocess.CompletedProcess) -> None:
     )
     assert "Failed to import GitReadTool" not in result.stderr
     assert "Failed to import GitWriteTool" not in result.stderr
+    assert "Failed to import VisualTool" not in result.stderr
 
 
 def test_import_security_gate_then_tools_registers_git_tools():
@@ -79,6 +87,35 @@ def test_import_tools_then_security_gate_registers_git_tools():
     _assert_clean(result)
     assert "git_read=present" in result.stdout
     assert "git_write=present" in result.stdout
+
+
+def test_import_security_gate_then_tools_registers_visual_tool():
+    """ORDER-A: security_gate first used to drop VisualTool too.
+
+    ``tools/visual_tool.py`` imported ``security.admission_gate`` at module
+    scope (for ``_image_repo_name``), and ``security.admission_gate`` imports
+    ``ContainerConfig`` from ``security.security_gate``.  The resulting chain
+    security_gate -> tools -> visual_tool -> admission_gate -> *partially
+    initialized* security_gate raised ImportError, ``tools/__init__.py``
+    swallowed it, and ``VisualTool`` was missing from ``TOOL_CLASSES`` -- so
+    ``get_tool_class('VisualTool')`` returned None, which the executor reads as
+    "no such tool".  The import is lazy now (inside
+    ``_render_image_refusal``), so both orders must be identical.
+    """
+    script = (
+        "import security.security_gate\n"
+        "import tools\n"
+        "cls = tools.get_tool_class('VisualTool')\n"
+        "print('visual_class=' + ('present' if cls is not None else 'MISSING'))\n"
+        "print('visual_name=' + (cls.__name__ if cls is not None else 'MISSING'))\n"
+    )
+    result = _run_script(script)
+    _assert_clean(result)
+    assert "visual_class=present" in result.stdout, (
+        f"VisualTool missing from TOOL_CLASSES after a gate-first import\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "visual_name=VisualTool" in result.stdout
 
 
 def test_sandboxed_execution_importable_after_security_gate():
