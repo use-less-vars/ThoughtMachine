@@ -21,6 +21,7 @@ is needed.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from web_ui.backend.server import app
 from thoughtmachine.permission_store import session_grants_path
 from thoughtmachine.security import PERMISSION_SCHEMA, SAFE_DEFAULTS
 from agent.config.resource_catalog import catalog_default_permissions
+from agent.core.message import SYSTEM_NOTICE_PREFIX
 from security.resource_catalog import coerce_resource_permissions
 
 client = TestClient(app)
@@ -732,4 +734,220 @@ class TestWorkspaceEffectivePermissionsRoutes:
         assert effective["host_bash"] == "banned"
         assert effective["mcp"] == "banned"
         assert effective["network"] == "banned"
+
+
+
+# ── live-session permission notice ───────────────────────────────────────────
+
+
+class _RecordingForwarder:
+    """Records ``broadcast`` calls so notice delivery can be asserted."""
+
+    def __init__(self):
+        self.calls = []
+
+    def broadcast(self, session_id, event_type, data=None):
+        self.calls.append((session_id, event_type, data))
+
+    def conversation_events(self):
+        return [call for call in self.calls if call[1] == "conversation_changed"]
+
+
+class _FakeNoticeBridge:
+    """Bridge double that runs the PRODUCTION ``inject_system_notice``.
+
+    The real method touches only ``_agent`` / ``_session`` /
+    ``_loaded_session`` / ``_session_state_lock`` / ``_forwarder`` /
+    ``_session_id`` plus the ``Session`` it appends to, so delegating to the
+    unbound implementation exercises the real code path without constructing a
+    full bridge.
+    """
+
+    def __init__(self, session, workspace_id):
+        self.workspace_id = workspace_id
+        self._agent = None
+        self._session = session
+        self._loaded_session = None
+        self._session_state_lock = threading.RLock()
+        self._session_id = session.session_id
+        self._forwarder = _RecordingForwarder()
+        self._history_version = session.conversation_version
+
+    def inject_system_notice(self, text, *, kind):
+        from web_ui.backend.bridge import WebAgentBridge
+
+        return WebAgentBridge.inject_system_notice(self, text, kind=kind)
+
+    @staticmethod
+    def _normalize_for_frontend(messages):
+        from web_ui.backend.bridge import WebAgentBridge
+
+        return WebAgentBridge._normalize_for_frontend(messages)
+
+
+def _live_session(sid: str, ws: str):
+    """A real ``Session`` plus a bridge double that holds it."""
+    from session.models import Session
+
+    session = Session(session_id=sid, workspace_id=ws)
+    return session, _FakeNoticeBridge(session, ws)
+
+
+def _notices(session):
+    return [m for m in session.user_history if m.get("is_system_notification")]
+
+
+@pytest.fixture
+def live_bridges():
+    """Run against an EMPTY live-bridge registry (restored afterwards)."""
+    from web_ui.backend.event_forwarder import _active_tab_bridges
+
+    saved = set(_active_tab_bridges)
+    _active_tab_bridges.clear()
+    try:
+        yield _active_tab_bridges
+    finally:
+        _active_tab_bridges.clear()
+        _active_tab_bridges.update(saved)
+
+
+class TestSessionPermissionsNotice:
+    """A session-permission PUT tells the live agent its permissions changed."""
+
+    SID = "sess-notice-001"
+    WS = "ws-notice-a"
+
+    def test_put_appends_one_notice_to_the_live_session(
+        self, vault, stub_store, live_bridges
+    ):
+        stub_store.register(self.SID, self.WS)
+        session, bridge = _live_session(self.SID, self.WS)
+        live_bridges.add(bridge)
+
+        put = client.put(
+            f"/api/session/{self.SID}/permissions", json={"filesystem": "write"}
+        )
+        assert put.status_code == 200, put.text
+
+        notices = _notices(session)
+        assert len(notices) == 1
+        notice = notices[0]
+        compact = json.dumps(
+            put.json()["effective"], sort_keys=True, separators=(",", ":")
+        )
+        assert notice["role"] == "user"
+        assert notice["content"].startswith(SYSTEM_NOTICE_PREFIX)
+        assert notice["metadata"]["kind"] == "permissions_changed"
+        assert notice["metadata"]["system_notice"] is True
+        assert notice["content"] == (
+            "[System Notice: Your permissions have been updated. "
+            f"Current permissions: {compact}. Adjust your plan accordingly.]"
+        )
+
+        # Exactly one conversation_changed push, normalised like any snapshot.
+        events = bridge._forwarder.conversation_events()
+        assert len(events) == 1
+        assert events[0][0] == self.SID
+        assert events[0][2]["messages"][-1]["is_system_notification"] is True
+
+        # The permission write itself still persisted.
+        assert session_grants_path(vault, self.WS, self.SID).exists()
+
+    def test_put_without_live_session_succeeds_silently(
+        self, vault, stub_store, live_bridges
+    ):
+        stub_store.register(self.SID, self.WS)
+        assert not live_bridges
+
+        put = client.put(
+            f"/api/session/{self.SID}/permissions", json={"filesystem": "write"}
+        )
+        assert put.status_code == 200, put.text
+        assert put.json()["raw"]["filesystem"] == "write"
+        assert session_grants_path(vault, self.WS, self.SID).exists()
+
+    def test_notice_failure_never_fails_the_write(
+        self, vault, stub_store, live_bridges, monkeypatch
+    ):
+        stub_store.register(self.SID, self.WS)
+        session, bridge = _live_session(self.SID, self.WS)
+        live_bridges.add(bridge)
+
+        def _boom(text, *, kind):
+            raise RuntimeError("bridge exploded")
+
+        monkeypatch.setattr(bridge, "inject_system_notice", _boom)
+
+        put = client.put(
+            f"/api/session/{self.SID}/permissions", json={"filesystem": "write"}
+        )
+        assert put.status_code == 200, put.text
+        assert _notices(session) == []
+
+
+class TestWorkspacePermissionsNotice:
+    """A workspace-ceiling PUT notifies every live session in that workspace."""
+
+    WS = "ws-notice-b"
+    SID = "sess-notice-002"
+
+    def test_put_notifies_only_live_sessions_of_that_workspace(
+        self, vault, live_bridges
+    ):
+        session, bridge = _live_session(self.SID, self.WS)
+        live_bridges.add(bridge)
+        other_session, other_bridge = _live_session("sess-notice-other", "ws-other")
+        live_bridges.add(other_bridge)
+
+        put = client.put(
+            f"/api/workspace/{self.WS}/permissions",
+            json={"permissions": {"filesystem": "write"}},
+        )
+        assert put.status_code == 200, put.text
+
+        notices = _notices(session)
+        assert len(notices) == 1
+        assert notices[0]["metadata"]["kind"] == "permissions_changed"
+        assert notices[0]["content"].startswith(SYSTEM_NOTICE_PREFIX)
+        assert other_session.user_history == []
+
+    def test_broken_bridge_never_fails_the_write(
+        self, vault, live_bridges, monkeypatch
+    ):
+        session, bridge = _live_session(self.SID, self.WS)
+        live_bridges.add(bridge)
+
+        def _boom(text, *, kind):
+            raise RuntimeError("bridge exploded")
+
+        monkeypatch.setattr(bridge, "inject_system_notice", _boom)
+
+        put = client.put(
+            f"/api/workspace/{self.WS}/permissions",
+            json={"permissions": {"filesystem": "write"}},
+        )
+        assert put.status_code == 200, put.text
+        assert _notices(session) == []
+
+
+class TestSystemNoticeNormalisation:
+    """Both notice prefixes must be flagged as system notifications."""
+
+    MESSAGES = [
+        {"role": "user", "content": "[System Notice: permissions changed]"},
+        {"role": "user", "content": "[SYSTEM NOTIFICATION] legacy wording"},
+        {"role": "user", "content": "a real user message"},
+    ]
+
+    def test_bridge_normaliser_marks_both_prefixes(self):
+        from web_ui.backend.bridge import WebAgentBridge
+
+        out = WebAgentBridge._normalize_for_frontend([dict(m) for m in self.MESSAGES])
+        assert [m["is_system_notification"] for m in out] == [True, True, False]
+
+    def test_session_manager_normaliser_marks_both_prefixes(self):
+        from web_ui.backend.session_manager import SessionManager
+
+        out = SessionManager._normalize_for_frontend([dict(m) for m in self.MESSAGES])
+        assert [m["is_system_notification"] for m in out] == [True, True, False]
 

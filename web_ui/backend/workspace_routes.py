@@ -1963,6 +1963,51 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
 # ── PUT /api/workspace/{ws_id}/permissions ─────────────────────────────────────
 
 
+def _notify_workspace_permissions_changed(ws_id: str) -> None:
+    """Best-effort: notify every live session of *ws_id* of the new ceiling.
+
+    A workspace permission write must never fail because a notice could not be
+    delivered, so the whole sweep is wrapped in ``try``/``except`` and logged
+    as a WARNING.  Only bridges reporting this workspace and currently holding
+    a session take part, so the cost is bounded by the number of open tabs;
+    each session gets its own effective profile (its grants merged with the new
+    ceiling) computed by the session routes' own pipeline.
+    """
+    try:
+        from web_ui.backend import session_routes
+        from web_ui.backend.event_forwarder import _active_tab_bridges
+
+        session_ids: List[str] = []
+        for bridge in list(_active_tab_bridges):
+            if getattr(bridge, "workspace_id", None) != ws_id:
+                continue
+            holders = [
+                getattr(getattr(bridge, "_agent", None), "session", None),
+                getattr(bridge, "_session", None),
+                getattr(bridge, "_loaded_session", None),
+            ]
+            for holder in holders:
+                sid = getattr(holder, "session_id", None)
+                if sid and sid not in session_ids:
+                    session_ids.append(sid)
+
+        for sid in session_ids:
+            try:
+                effective = session_routes._compute_effective_session_permissions(
+                    ws_id, sid
+                )
+            except Exception as exc:  # noqa: BLE001 - one session cannot block
+                logger.warning(
+                    "effective permissions for %s/%s unavailable: %s", ws_id, sid, exc
+                )
+                continue
+            session_routes._notify_permissions_changed(sid, effective)
+    except Exception as exc:  # noqa: BLE001 - best-effort by contract
+        logger.warning(
+            "permissions_changed notice for workspace %s failed: %s", ws_id, exc
+        )
+
+
 @router.put("/{ws_id}/permissions")
 async def put_workspace_permissions(
     request: Request,
@@ -1993,6 +2038,7 @@ async def put_workspace_permissions(
         cfg["allow_host_resources"] = bool(body.allow_host_resources)
     cfg["permissions"] = normalized
     _save_workspace_config(ws_id, cfg)
+    _notify_workspace_permissions_changed(ws_id)
 
     purpose = cfg.get("purpose", "general")
     allow_host_resources = bool(cfg.get("allow_host_resources", False))

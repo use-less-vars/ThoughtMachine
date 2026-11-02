@@ -81,6 +81,7 @@ from agent.config import AgentConfig
 from agent.config.provider_profile import ProviderManager
 from agent.config.service import create_agent_config_service
 from agent.controller import AgentController
+from agent.core.message import is_system_notice_text, make_system_notice
 from agent.logging import log
 
 # Import event system for security prompt forwarding
@@ -2412,10 +2413,9 @@ class WebAgentBridge:
             normalized.append(dict(msg))
 
         # ── post-processing: inject is_system_notification for frontend ──
-        from agent.core.message import SYSTEM_NOTIFICATION_PREFIX
         for m in normalized:
             if m.get("role") == "user" and isinstance(m.get("content"), str):
-                if m["content"].startswith(SYSTEM_NOTIFICATION_PREFIX):
+                if is_system_notice_text(m["content"]):
                     m["is_system_notification"] = True
                 else:
                     m.setdefault("is_system_notification", False)
@@ -2937,6 +2937,49 @@ class WebAgentBridge:
         })
         log('INFO', 'server.bridge', "Session cleared for fresh start")
 
+    def inject_system_notice(self, text: str, *, kind: str) -> bool:
+        """Append a system notice to the live conversation and broadcast it.
+
+        Used by callers that live outside the agent loop (the permission
+        routes) to surface a first-class notice in the conversation without
+        waiting for the next agent turn.
+
+        The row is built with ``make_system_notice`` -- role ``user``, flagged
+        ``is_system_notification`` and carrying ``metadata['kind'] == kind`` --
+        so every existing system-notice consumer treats it like a notice the
+        agent loop produced.  It is appended through the normal
+        ``Session.add_message`` path (which bumps ``conversation_version``) and
+        then pushed out as the usual ``conversation_changed`` snapshot.
+
+        Best-effort by contract: returns ``False`` when this tab holds no live
+        session to append to, and the append/broadcast share the existing
+        ``_session_state_lock`` so it cannot interleave with a turn-loop save
+        or an addendum write.  Never raises for missing state.
+        """
+        with self._session_state_lock:
+            session = self._session
+            if session is None:
+                session = self._loaded_session
+            if session is None:
+                log('DEBUG', 'server.bridge',
+                    f'inject_system_notice: no live session (kind={kind!r})')
+                return False
+
+            notice = make_system_notice(text, kind=kind)
+            session.add_message(
+                notice['role'],
+                notice['content'],
+                is_system_notification=notice['is_system_notification'],
+                metadata=notice['metadata'],
+            )
+            self._history_version = session.conversation_version
+            self._forwarder.broadcast(self._session_id, "conversation_changed", {
+                "messages": self._normalize_for_frontend(session.user_history),
+            })
+
+        log('INFO', 'server.bridge', f'injected system notice kind={kind!r}')
+        return True
+
     def _on_controller_event(self, event: Dict[str, Any]) -> None:
         """
         Callback registered with the controller via set_event_callback().
@@ -3077,7 +3120,7 @@ class WebAgentBridge:
             content = last.get('content', '') if hasattr(last, 'get') else ''
         except Exception:
             return False
-        if not isinstance(content, str) or not content.startswith('[SYSTEM NOTIFICATION]'):
+        if not isinstance(content, str) or not is_system_notice_text(content):
             return False
         return raw_message in content
 

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.config.session_config import SessionConfig
 from agent.config.provider_profile import ProviderManager
 from agent.config.audit import log_config_audit
-from agent.core.message import SYSTEM_NOTIFICATION_PREFIX
+from agent.core.message import is_system_notice_text
 from agent.logging import log
 from session.models import Session
 from session.store import FileSystemSessionStore
@@ -685,7 +685,7 @@ class SessionManager:
         # ── post-processing: inject is_system_notification for frontend ──
         for m in normalized:
             if m.get("role") == "user" and isinstance(m.get("content"), str):
-                if m["content"].startswith(SYSTEM_NOTIFICATION_PREFIX):
+                if is_system_notice_text(m["content"]):
                     m["is_system_notification"] = True
                 else:
                     m.setdefault("is_system_notification", False)
