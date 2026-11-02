@@ -580,11 +580,17 @@ def _seed_worker(key, thread):
         worker_module._worker_registry[key] = thread
 
 
-def test_bridge_pause_skips_workers_running_async_jobs():
-    """bridge.pause() must not pause a worker mid-async-job (submit_query:
-    busy + _current_query_id set + no reply queue) but must still pause
-    sync-blocked (reply queue set), idle (even with sticky async attrs),
-    plain-string spawn and already-paused workers — and only this session."""
+def test_bridge_pause_reaches_every_worker_of_the_session():
+    """bridge.pause() pauses EVERY worker of this session, mid-async-job too.
+
+    The old contract skipped workers running a submit_query async job (busy +
+    ``_current_query_id`` set + no reply queue) because pausing them would cut
+    a turn short. Reading mode makes that unnecessary: the worker's agent is
+    restricted to Respond and concludes the turn itself, so a busy async-job
+    worker is paused exactly like a sync-blocked (reply queue set), idle (even
+    with sticky async attrs), plain-string-spawned or already-paused one — and
+    still only for this session.
+    """
     async_busy = _fake_worker(status="busy", query_id="job-1", reply_queue=None)
     sync_busy = _fake_worker(status="busy", query_id="q-1", reply_queue=queue.Queue())
     idle_sticky = _fake_worker(status="ready", query_id="job-2", reply_queue=None)
@@ -613,7 +619,7 @@ def test_bridge_pause_skips_workers_running_async_jobs():
         except Exception:
             pass
 
-    async_busy.pause.assert_not_called()
+    async_busy.pause.assert_called_once()
     foreign.pause.assert_not_called()
     sync_busy.pause.assert_called_once()
     idle_sticky.pause.assert_called_once()

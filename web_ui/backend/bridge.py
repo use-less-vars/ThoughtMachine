@@ -445,23 +445,6 @@ def _validate_workspace_id(workspace_id: Optional[str]) -> Optional[str]:
     return workspace_id
 
 
-def _worker_is_running_async_job(thread: Any) -> bool:
-    """Return True when *thread* is currently executing a submit_query (async) job.
-
-    Async jobs are enqueued by ``action='submit_query'`` as ``(job_id, query,
-    None)`` tuples; the run loop mirrors them onto ``_current_query_id`` (set)
-    while ``_current_reply_queue`` stays None (a synchronous ``send_query``
-    carries a private reply queue instead).  The ``status == "busy"`` guard
-    excludes idle workers whose ``_current_query_id`` is never reset between
-    queries, so only a worker that is actively running an async job is skipped.
-    """
-    return (
-        getattr(thread, "status", None) == "busy"
-        and getattr(thread, "_current_query_id", None) is not None
-        and getattr(thread, "_current_reply_queue", None) is None
-    )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1740,10 +1723,10 @@ class WebAgentBridge:
                     else:
                         sid, wname = key
                     if sid == self._session_id:
-                        if _worker_is_running_async_job(thread):
-                            log('INFO', 'server.bridge',
-                                f'Skip pause of worker {wname}: async job in progress')
-                            continue
+                        # Reading mode makes a pause safe even mid async job:
+                        # the worker's agent is restricted to Respond and
+                        # concludes its turn instead of being truncated, so
+                        # there is nothing to skip here any more.
                         try:
                             thread.pause()
                             log('INFO', 'server.bridge', f'Worker paused: {wname}')
@@ -1757,6 +1740,14 @@ class WebAgentBridge:
         else:
             self._park_event.set()
             if self._agent is not None:
+                # Resume is the owner-scoped release of the 'pause'-owned
+                # reading mode (enter_reading_mode()'s counterpart).  Tolerate
+                # doubles that predate the verb -- the legacy flag below is
+                # still the belt-and-braces clear the checkpoint reads.
+                try:
+                    self._agent.leave_reading_mode('pause')
+                except AttributeError:
+                    pass
                 self._agent._pause_requested = False
         # Resume all workers for this session
         if WORKER_BUS_AVAILABLE and _worker_registry is not None:

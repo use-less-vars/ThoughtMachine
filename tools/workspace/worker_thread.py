@@ -1634,6 +1634,16 @@ class WorkerThread(threading.Thread):
                     f"WLM pause delegation failed for worker '{self.worker_name}': {exc}")
         self._park_event.set()
         self._resume_event.clear()
+        # Reading mode: a paused worker's agent must stop calling tools and
+        # conclude with a Respond, exactly like the main agent's Pause button.
+        # Guarded -- _agent is None before spawn and after teardown.
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            try:
+                agent.enter_reading_mode("pause")
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"enter_reading_mode failed for worker '{self.worker_name}': {exc}")
         # Write command file for cross-process signalling
         try:
             cmd_path = self._worker_dir / "command.json"
@@ -1692,6 +1702,16 @@ class WorkerThread(threading.Thread):
         self._detach_requested = False
         self._detached_at = None
         self._set_detached_registration(False)
+        # Reading mode: release the 'pause'-owned restriction (owner-scoped, so a
+        # 'token'/'timeout'/'turn' restriction survives).  Only reached after the
+        # kill guard above, so a refused resume never lifts the restriction.
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            try:
+                agent.leave_reading_mode("pause")
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"leave_reading_mode failed for worker '{self.worker_name}': {exc}")
         self.status = "ready"
         self._write_status_file()
         return True
@@ -1941,6 +1961,17 @@ class WorkerThread(threading.Thread):
             elif action == "pause":
                 cmd_path.unlink(missing_ok=True)
                 self._park_event.set()
+                # Mirror WorkerThread.pause(): the parked worker's agent enters
+                # reading mode.  Deliberately duplicated instead of calling
+                # self.pause() -- that would rewrite command.json (re-pausing on
+                # the next poll) and re-delegate to the WLM.
+                p_agent = getattr(self, "_agent", None)
+                if p_agent is not None:
+                    try:
+                        p_agent.enter_reading_mode("pause")
+                    except Exception as exc:
+                        log("WARNING", "tools.worker",
+                            f"enter_reading_mode failed for worker '{self.worker_name}': {exc}")
                 self._input_queue.put(_PARK_SENTINEL)
             elif action == "resume":
                 # Resume while a pause is pending (or a leftover from an
@@ -1964,6 +1995,17 @@ class WorkerThread(threading.Thread):
                 self._detach_requested = False
                 self._detached_at = None
                 self._set_detached_registration(False)
+                # Mirror WorkerThread.resume(): release the 'pause'-owned
+                # reading-mode restriction (owner-scoped).  Duplicated rather
+                # than calling self.resume() -- that returns a bool, delegates
+                # to the WLM and would re-log a refusal path.
+                r_agent = getattr(self, "_agent", None)
+                if r_agent is not None:
+                    try:
+                        r_agent.leave_reading_mode("pause")
+                    except Exception as exc:
+                        log("WARNING", "tools.worker",
+                            f"leave_reading_mode failed for worker '{self.worker_name}': {exc}")
                 self.status = "ready"
                 self._write_status_file()
             else:
