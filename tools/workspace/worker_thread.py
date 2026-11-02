@@ -11,6 +11,7 @@ name from this module, so existing importers and tests are unaffected.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -1157,6 +1158,11 @@ class WorkerThread(threading.Thread):
         # (PeriodicStaleCheck).
         self._detach_requested: bool = False
         self._detached_at: Optional[float] = None
+        # Digest of the last ``command.json`` payload that was deliberately NOT
+        # acted on (an unknown action).  Lets _poll_command ignore a stray
+        # command file without unlinking it -- an unlink there would race with
+        # an operator writing the next real command.
+        self._ignored_command_digest: Optional[str] = None
 
     # ── public API called from the tool thread ─────────────────────
 
@@ -1498,10 +1504,17 @@ class WorkerThread(threading.Thread):
         except Exception as exc:
             log("WARNING", "tools.worker",
                 f"Context save failed while detaching worker '{self.worker_name}': {exc}")
+        # PHASE 2.1a ORDERING INVARIANT: the container manager must already
+        # know this worker is detached BEFORE ``status`` reports "detached", so
+        # no reader (the REST status poll, the PeriodicStaleCheck sweep) can
+        # ever observe a detached worker whose containers are still reapable.
+        # ``_set_detached_registration`` never raises and resolves
+        # ``owner_identity`` itself (:1551-1572), so hoisting it here cannot
+        # introduce a new early return or an exception path.
+        self._set_detached_registration(True)
         self.status = "detached"
         self._write_status_file()
         self._publish_global_event(EventType.WORKER_STOPPING, {"status": "detached", "reason": "detach_requested"})
-        self._set_detached_registration(True)
         # Write a stop command file for cross-process signalling
         try:
             cmd_path = self._worker_dir / "command.json"
@@ -1864,7 +1877,17 @@ class WorkerThread(threading.Thread):
         if not cmd_path.is_file():
             return
         try:
-            data = json.loads(cmd_path.read_text(encoding="utf-8"))
+            payload = cmd_path.read_text(encoding="utf-8")
+            # An unknown action is deliberately NOT unlinked (deleting it would
+            # let the poller destroy a legitimate command written between the
+            # read above and the unlink -- the same read/unlink race the known
+            # actions already have, but here it would fire on EVERY poll while
+            # the stray file sits there).  Instead the payload is remembered by
+            # digest and re-polls are a no-op until its content changes.
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            if digest == self._ignored_command_digest:
+                return
+            data = json.loads(payload)
             action = data.get("action")
             if action == "stop":
                 # PHASE 2.1a: a cross-process 'stop' DETACHES.  It must not
@@ -1878,9 +1901,11 @@ class WorkerThread(threading.Thread):
                     self._save_context()
                 except Exception:
                     pass
+                # Same ORDERING INVARIANT as detach(): register first, then
+                # make "detached" observable.
+                self._set_detached_registration(True)
                 self.status = "detached"
                 self._write_status_file()
-                self._set_detached_registration(True)
                 self._input_queue.put(_PARK_SENTINEL)
             elif action == "kill":
                 # PHASE 2.1a: a cross-process 'kill' TERMINATES.  'stop' only
@@ -1907,6 +1932,27 @@ class WorkerThread(threading.Thread):
                 # Mirrors WorkerThread.resume(): the worker keeps running, so
                 # the manual-only marker is stale and must be cleared too.
                 self._manual_only_pause = False
+                # PHASE 2.1a: mirror WorkerThread.resume() (:1657-1663) -- a
+                # resumed worker is no longer detached, so the markers go and
+                # the registration is lifted BEFORE the park loop above
+                # reports "ready".  Clearing only _pause_event (as this branch
+                # used to) left a "ready" worker that the stale-container sweep
+                # still skipped as detached, forever.
+                self._detach_requested = False
+                self._detached_at = None
+                self._set_detached_registration(False)
+                self.status = "ready"
+                self._write_status_file()
+            else:
+                # Not a command this worker understands: ignore it WITHOUT
+                # unlinking it (see the digest guard at the top of this
+                # method), and remember its payload so the next poll -- and
+                # every poll until the file's content changes -- is a cheap
+                # digest comparison instead of a re-parse.
+                self._ignored_command_digest = digest
+                log("WARNING", "tools.worker",
+                    f"Ignoring unknown command action {action!r} for worker "
+                    f"'{self.worker_name}'")
         except (json.JSONDecodeError, OSError):
             # Corrupted file — delete and ignore
             try:
