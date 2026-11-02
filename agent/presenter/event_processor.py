@@ -41,7 +41,7 @@ class EventProcessor:
         log('DEBUG', 'presenter.event_processor', f"event: type={event_type}")
         log('DEBUG', 'presenter.event_processor', f'Processing event: {event_type}')
         log('DEBUG', 'pipeline.event_processor', f"entry: type={event_type}, session_id={event.get('session_id')}")
-        state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
+        state_event_types = ['error', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
         if event_type not in state_event_types:
             event_session_id = event.get('session_id')
             if event_session_id is not None:
@@ -75,8 +75,6 @@ class EventProcessor:
                 self._process_user_interaction_event(event)
             elif event_type == 'user_query':
                 self._process_user_query_event(event)
-            elif event_type == 'paused':
-                self._process_paused_event(event)
             elif event_type == 'stop_reason':
                 self._process_stop_reason_event(event)
             elif event_type in ['stopped', 'max_turns', 'thread_finished']:
@@ -156,18 +154,6 @@ class EventProcessor:
     def _process_user_query_event(self, event: Dict[str, Any]) -> None:
         """Process user query event."""
         log('DEBUG', 'presenter.event_processor', f'Processing user_query event')
-
-    def _process_paused_event(self, event: Dict[str, Any]) -> None:
-        """Process paused event.
-
-        Note: We do NOT transition PAUSING→READY here because that would
-        prevent the GUI from painting 'Pausing…' before immediately jumping
-        to 'Ready'. The session_stop event (which follows 'paused') handles
-        the PAUSING→READY transition naturally.
-        """
-        log('DEBUG', 'presenter.event_processor', f'_process_paused_event: stop_reason={event.get("stop_reason","unknown")}')
-        if self.gui_integration:
-            self.gui_integration.emit_status_message('⏸ Paused')
 
     def _process_stop_reason_event(self, event: Dict[str, Any]) -> None:
         """Process stop_reason event (max_turns_reached, rate_limit)."""

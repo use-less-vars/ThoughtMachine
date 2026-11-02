@@ -124,10 +124,20 @@ def test_reset_clears_pending_interrupt():
 
 
 def _make_stub_worker(tmp_path):
-    """A ``WorkerThread`` with no session: only the attributes detach() touches."""
+    """A ``WorkerThread`` with only the attributes detach() touches.
+
+    ``detach()`` writes a FENCED stop command, so the stub needs the identity a
+    real incarnation has: ``_fence()`` reads ``session_id`` / ``worker_name`` /
+    ``instance_id`` / ``_generation``.  Values are realistic rather than empty
+    so a fence assertion in a test means something.
+    """
     from tools.workspace.worker_thread import WorkerThread
 
     worker = WorkerThread.__new__(WorkerThread)
+    worker.session_id = "sess-stub"
+    worker.worker_name = "stub-worker"
+    worker.instance_id = 1
+    worker._generation = 1
     worker._turn_cancel = threading.Event()
     worker._stop_event = threading.Event()
     worker._park_event = threading.Event()
@@ -197,6 +207,19 @@ def test_detach_cancels_an_in_flight_sleep(tmp_path):
     # detach() is NOT termination: the terminal kill latch stays clear.
     assert worker._stop_event.is_set() is False
     assert worker._park_event.is_set() is True
+
+    # The cross-process half of the same detach: a fenced stop command.  It must
+    # be written, and it must carry THIS incarnation's identity -- an unfenced
+    # or mis-fenced payload is quarantined by the consumer, so the fence is the
+    # signal rather than bookkeeping.
+    command = json.loads((tmp_path / "command.json").read_text())
+    assert command == {
+        "action": "stop",
+        "session_id": "sess-stub",
+        "worker_name": "stub-worker",
+        "instance_id": 1,
+        "epoch": 1,
+    }, command
 
 
 def test_new_query_clears_turn_cancel(tmp_path):
