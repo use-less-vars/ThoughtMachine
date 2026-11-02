@@ -52,11 +52,17 @@ def test_visual_in_canonical_catalog():
     assert RESOURCE_CATALOG["visual"] == ["banned", "ask", "view"]
 
 
-def test_visual_view_ranks_at_the_read_tier():
-    # ``view`` is the visual equivalent of ``read``: it must order exactly with
-    # ``read`` in BOTH projections, or the ceiling maths flips sign.
-    assert GRANT_LEVEL_RANKS["view"] == GRANT_LEVEL_RANKS["read"] == 1
-    assert WORKSPACE_CEILING_LEVELS_RANKS["view"] == 1.0
+def test_visual_view_ranks_above_the_ask_tier():
+    # ``view`` is NOT the read tier (it ranked there until FINDING 1 was fixed):
+    # at the read tier it sits at or below ``_ASK_SILENT_MAX_RANK``, so an
+    # ``ask`` grant is silently satisfied by it and the interactive-ask branch
+    # is unreachable for the grain.  It must therefore rank strictly ABOVE
+    # ``ask`` in BOTH projections, and the two tables must agree (a grant rank
+    # and its ceiling rank differ only for the documented ``write_on_feature_branch``
+    # / ``outbound`` exceptions), or the ceiling maths flips sign.
+    assert GRANT_LEVEL_RANKS["view"] > GRANT_LEVEL_RANKS["ask"]
+    assert GRANT_LEVEL_RANKS["view"] == 2.5
+    assert WORKSPACE_CEILING_LEVELS_RANKS["view"] == GRANT_LEVEL_RANKS["view"]
     assert WORKSPACE_CEILING_LEVELS_RANKS["read"] == 1.0
 
 
@@ -102,8 +108,69 @@ def test_workspace_ceiling_at_view_allows_view():
     assert capped["visual"] == "view"
 
 
-def test_workspace_ceiling_at_ask_does_not_cap_view():
-    # ``ask`` (rank 2.0) is *more permissive* than ``view`` (rank 1.0): a
-    # session ``view`` grant stands unchanged.
+def test_workspace_ceiling_at_ask_caps_view_to_ask():
+    """An ``ask`` workspace ceiling now CAPS a ``view`` session grant to ``ask``.
+
+    ``view`` ranks at 2.5, strictly above ``ask`` (2.0), so the ceiling is the
+    more restrictive side and the "lower rank wins" rule in
+    ``apply_workspace_ceiling`` rewrites the grant to ``ask``.  Before the rank
+    change ``view`` ranked at the read tier (1.0), so this exact call returned
+    ``view`` untouched and the ceiling was a no-op above the grant.
+
+    The capped value is prompt-or-deny, never a pass: ``ask`` no longer
+    satisfies a ``view`` requirement silently, so the value reaches the ask
+    branch -- an interactive prompt when a user exists, an immediate deny when
+    none does (worker context).
+    """
     capped = apply_workspace_ceiling({"visual": "ask"}, {"visual": "view"})
-    assert capped["visual"] == "view"
+    assert capped["visual"] == "ask"
+
+    from security.gate_helpers import _value_satisfies
+    from security.security_gate import check_required_categories
+    from tools.visual_tool import VisualTool
+
+    # The capped value yields the ASK sentinel for a ``view`` requirement --
+    # not ``True`` -- so the decision cannot be a silent pass.
+    assert _value_satisfies("view", capped["visual"]) == "ASK"
+    assert _value_satisfies("view", capped["visual"]) is not True
+
+    allowed, message = check_required_categories(
+        VisualTool.required_categories,
+        {**capped, "container": True},
+        "VisualTool",
+        {},
+        "d",
+        is_worker_context=True,
+    )
+    assert allowed is False
+    assert "ask requires interactive approval" in message
+
+
+# ---------------------------------------------------------------------------
+# (c) FINDING 1: ``ask`` must not be silently satisfied by the ``view`` rank
+# ---------------------------------------------------------------------------
+
+
+def test_ask_is_not_silently_satisfied_by_the_view_rank():
+    """Unit pin: ``_value_satisfies("view", "ask")`` is NOT ``True``.
+
+    ``view`` used to rank at the read tier (1), i.e. at or below
+    ``_ASK_SILENT_MAX_RANK`` (2 = max(banned, read, ask)), so an ``ask``
+    allowed value satisfied a ``view`` requirement SILENTLY: the interactive-ask
+    branch in ``security/security_gate.py`` was unreachable for this grain and
+    ``visual: ask`` behaved exactly like ``visual: view``.  ``view`` now ranks
+    strictly above the silent tier, so the helper returns its ``"ASK"``
+    sentinel -- the sentinel, not ``False``: the gate turns ``"ASK"`` into a
+    prompt, or into an immediate deny when no interactive user exists.  Pinning
+    the rank against ``_ASK_SILENT_MAX_RANK`` (rather than a literal) is what
+    stops a future rank change quietly restoring the no-op.
+    """
+    from security.gate_helpers import _ASK_SILENT_MAX_RANK, _value_satisfies
+
+    assert GRANT_LEVEL_RANKS["view"] > _ASK_SILENT_MAX_RANK
+    assert _value_satisfies("view", "ask") == "ASK"
+    assert _value_satisfies("view", "ask") is not True
+
+    # The rest of the visual scale is unchanged.
+    assert _value_satisfies("view", "view") is True
+    assert _value_satisfies("view", "banned") is False

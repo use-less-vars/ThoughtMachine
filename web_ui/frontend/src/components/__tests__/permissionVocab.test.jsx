@@ -121,7 +121,7 @@ describe('PERMISSION_RANK_ORDER (frontend mirror of backend)', () => {
       none: 1,
       ask: 2,
       read: 1,
-      view: 1,
+      view: 2.5,
       connect: 1,
       outbound: 3.5,
       write: 3,

@@ -139,7 +139,7 @@ canonical_resource_keys = set(RESOURCE_CATALOG)
 #: Session-grant level ranks (single flat order used by the comparison
 #: helpers in ``security.gate_helpers`` / ``security.security_gate``).
 #:
-#:     banned(0) < read(1) == view(1) < ask(2) < write(3)
+#:     banned(0) < read(1) < ask(2) < view(2.5) < write(3)
 #:         == write_on_feature_branch(3) < outbound(3.5) < full(4)
 #:
 #: ``read`` ranks strictly BELOW ``ask`` because read is a strict subset of
@@ -147,11 +147,15 @@ canonical_resource_keys = set(RESOURCE_CATALOG)
 #: tier interactively).  ``write_on_feature_branch`` ranks AT the write tier
 #: (branch restriction is enforced tool-side at commit time); ``outbound``
 #: ranks above plain ``write`` because it is a strict superset grant on
-#: network's scale.
+#: network's scale.  ``view`` ranks strictly ABOVE ``ask`` (2.5): a
+#: visual ``view`` grant is a *tier of its own*, not the read tier, so that a
+#: session ``visual: ask`` is not silently satisfied by the ``view`` rank (see
+#: ``security.gate_helpers._ASK_SILENT_MAX_RANK``) and the interactive-ask
+#: branch stays reachable for the grain.
 GRANT_LEVEL_RANKS: Dict[str, float] = {
     "banned": 0,
     "read": 1,
-    "view": 1,  # visual view grant: the read tier
+    "view": 2.5,  # visual view grant: above the ask tier, below write
     "ask": 2,
     "connect": 1,
     "write": 3,
@@ -163,8 +167,8 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
 
 #: Workspace-ceiling level ranks (``apply_workspace_ceiling`` ordering).
 #:
-#:     banned(0) < read(1) == view(1) == connect(1) == none(1) < ask(2)
-#:         < write_on_feature_branch(2.5) < write(3)
+#:     banned(0) < read(1) == connect(1) == none(1) < ask(2)
+#:         < view(2.5) == write_on_feature_branch(2.5) < write(3)
 #:         < outbound(4) == full(4)
 #:
 #: Ceilings at rank 4.0 (``outbound``/``full``) are unlimited.
@@ -176,7 +180,7 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
 WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
     "banned": 0.0,
     "read": 1.0,
-    "view": 1.0,  # visual view grant: the read tier
+    "view": 2.5,  # visual view grant: mirror of its grant rank (above ask)
     "connect": 1.0,  # session-side mcp level (below ask/2.0)
     "none": 1.0,  # alias used by some purpose presets
     "ask": 2.0,

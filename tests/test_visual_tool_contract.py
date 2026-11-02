@@ -196,37 +196,45 @@ def test_banned_visual_denies_and_names_visual_view():
     assert "visual:banned" in message
 
 
-def test_worker_context_ask_on_visual_is_allowed_without_a_prompt():
-    """PART 0 truth: ``visual: ask`` is ALLOWED in worker context, silently.
+def test_worker_context_ask_on_visual_is_denied():
+    """POST-R1 truth: ``visual: ask`` is DENIED without an interactive user.
 
-    The word "ask" does not reach the ask branch for this tool.  ``view`` ranks
-    at the read tier (``GRANT_LEVEL_RANKS["view"] == 1``), which is at or below
-    ``_ASK_SILENT_MAX_RANK`` (2 = max(banned, read, ask)), so
-    ``_value_satisfies("view", "ask")`` returns ``True`` -- not ``"ASK"`` --
-    and the whole prompt/worker-deny block at
-    ``security/security_gate.py:1614-1626`` is never entered.  Consequences
-    pinned here:
+    ``view`` now ranks at 2.5, strictly above ``_ASK_SILENT_MAX_RANK`` (2 =
+    max(banned, read, ask)), so ``_value_satisfies("view", "ask")`` returns the
+    ``"ASK"`` sentinel -- not ``True`` -- and the prompt/worker-deny block at
+    ``security/security_gate.py:1614-1626`` IS entered.  Consequences pinned
+    here:
 
-    * worker context: allowed (no prompt available, none needed);
-    * non-worker context with no event bus: allowed, identically;
-    * so ``visual=ask`` and ``visual=view`` are indistinguishable for this
-      tool, and the ``ask`` level is a no-op above ``view`` for this grain.
+    * worker context: denied (no interactive user to prompt);
+    * non-worker context with no event bus: denied identically, because there
+      is nobody to answer the prompt either (the block fires on
+      ``event_bus is None``);
+    * so ``visual: ask`` is no longer indistinguishable from ``visual: view``:
+      ``ask`` really asks.  ``view`` stays a silent allow (control below).
 
-    The control case below proves the worker-deny block is alive: an ``ask``
-    session whose requirement ranks ABOVE the silent tier (``write``) is
-    refused without an interactive user.
+    The control case below proves the worker-deny block itself is not
+    visual-specific: an ``ask`` session whose requirement ranks ABOVE the
+    silent tier (``network:write``) is refused the same way.
     """
     permitted = {"visual": "ask", "container": True}
 
+    for kwargs in ({"is_worker_context": True}, {}):
+        allowed, message = check_required_categories(
+            VisualTool.required_categories, dict(permitted), "VisualTool", {}, "d",
+            **kwargs,
+        )
+        assert allowed is False, f"visual:ask must not pass silently ({kwargs})"
+        assert "ask requires interactive approval" in message
+        assert "visual:view" in message, "the denial must name the pending ask"
+
+    # Control (i): ``view`` is still a silent allow in worker context.
     assert check_required_categories(
-        VisualTool.required_categories, dict(permitted), "VisualTool", {}, "d",
-        is_worker_context=True,
-    ) == (True, "")
-    assert check_required_categories(
-        VisualTool.required_categories, dict(permitted), "VisualTool", {}, "d",
+        VisualTool.required_categories, {"visual": "view", "container": True},
+        "VisualTool", {}, "d", is_worker_context=True,
     ) == (True, "")
 
-    # Control: same session value, a requirement above the silent tier.
+    # Control (ii): same ``ask`` session value, a requirement above the
+    # silent tier -- the worker-deny block is alive independently of ``visual``.
     allowed, message = check_required_categories(
         ["network:write"], {"network": "ask"}, "VisualTool", {}, "d",
         is_worker_context=True,

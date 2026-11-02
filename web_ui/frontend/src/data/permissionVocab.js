@@ -27,8 +27,10 @@ export const PERMISSION_RANK_ORDER = {
   none: 1,
   ask: 2,
   read: 1,
-  // visual view grant: same tier as read.
-  view: 1,
+  // visual view grant: ranks ABOVE ask (2) at 2.5, like the backend
+  // security.resource_catalog.GRANT_LEVEL_RANKS table -- an ``ask`` session
+  // value no longer satisfies a ``view`` requirement silently.
+  view: 2.5,
   connect: 1,
   outbound: 3.5,
   write: 3,
