@@ -2696,6 +2696,21 @@ class WorkerThread(threading.Thread):
                         self.last_heartbeat = datetime.now(timezone.utc).isoformat()
                         # Block until resumed (or stopped)
                         while self._pause_event.is_set() and not self._stop_event.is_set():
+                            # DEAF-PARK FIX: a parked worker must still notice
+                            # cross-process control.  Without this poll a
+                            # command.json 'kill' (the ONLY terminating action,
+                            # PHASE 2.1a) was invisible while parked, so the
+                            # worker could not be terminated at all until the
+                            # detached TTL swept it -- and a 'stop' could not
+                            # convert a pause-park into a detach.  Costs one
+                            # stat/parse per wake-up (1 s cadence, no
+                            # busy-spin).
+                            self._poll_command()
+                            # The poll can KILL this worker (a command.json
+                            # 'kill' sets _stop_event): leave the wake-up at
+                            # once instead of sleeping out the remaining wait.
+                            if self._stop_event.is_set():
+                                break
                             self._heartbeat_tick()
                             self._resume_event.wait(1.0)
                         if self._stop_event.is_set():
@@ -2959,6 +2974,15 @@ class WorkerThread(threading.Thread):
 
                     # Block until resumed (or stopped)
                     while self._pause_event.is_set() and not self._stop_event.is_set():
+                        # DEAF-PARK FIX (same as the park loop above): poll for
+                        # a cross-process command while parked, so 'kill'
+                        # terminates and 'stop' detaches instead of both being
+                        # swallowed until the detached TTL expires.
+                        self._poll_command()
+                        # A 'kill' poll sets _stop_event -- do not sleep out the
+                        # rest of this wake-up before leaving the park loop.
+                        if self._stop_event.is_set():
+                            break
                         self._heartbeat_tick()
                         self._resume_event.wait(1.0)
 
