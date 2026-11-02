@@ -309,6 +309,12 @@ try:
 except ImportError as e:
     _record_import_failure("WorkingDocument", e)
 
+try:
+    from .sleep_tool import Sleep
+    TOOL_CLASSES.append(Sleep)
+except ImportError as e:
+    _record_import_failure("Sleep", e)
+
 # MCP tools are registered lazily via register_mcp_tools() when the agent starts.
 # Do NOT call register_mcp_tools() here - it starts MCP server subprocesses
 # which can hang if servers are unavailable (see bug #BUG001).

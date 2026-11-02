@@ -1131,6 +1131,15 @@ class WorkerThread(threading.Thread):
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._resume_event = threading.Event()
+        # Per-WORKER, per-TURN cancellation token -- a THIRD, distinct signal:
+        #   _stop_event   = terminal kill latch (never cleared; guards resume)
+        #   _pause_event  = park flag (driven by detach()/resume())
+        #   _turn_cancel  = in-flight cancellation token consulted by tools
+        # Cleared at the start of EVERY query, set on graceful stop (detach() /
+        # cross-process 'stop') and on kill().  Bound to the executing tool
+        # thread (tools.sleep_tool.bind_turn_cancel) so a tool sees only its own
+        # worker's token: one worker's kill can never cancel another's tool.
+        self._turn_cancel = threading.Event()
         # PHASE 2.1b: ordered bookkeeping for the per-instance FIFO query
         # queue. ``_input_queue`` is the queue itself (already a FIFO with a
         # single query in flight, drained head-first); this deque mirrors the
@@ -1497,6 +1506,11 @@ class WorkerThread(threading.Thread):
         self._detached_at = time.time()
         self._pause_event.set()
         self._resume_event.clear()
+        # Graceful stop CANCELS the in-flight turn (a long-blocking tool must
+        # return instead of holding the park back) -- this is the "Stop now"
+        # signal, NOT termination: _stop_event stays clear so the worker can be
+        # resumed later.
+        self._turn_cancel.set()
         # Persist the context: a detached worker is expected to be revived
         # later, possibly by another process.
         try:
@@ -1552,6 +1566,11 @@ class WorkerThread(threading.Thread):
         # being silently dropped or started on a dead instance.
         self.reject_queued_queries("killed")
         self._stop_event.set()
+        # Cancel THIS worker's in-flight turn so a long-blocking tool (e.g.
+        # ``sleep``) returns instead of waiting out the full block.  This is a
+        # per-worker token, not a process-global interrupt: killing this worker
+        # must never cancel another worker's tool call.
+        self._turn_cancel.set()
         # A killed worker is never revived: clear the detach markers so the
         # detached TTL sweep cannot revisit it, and lift the detached
         # registration so stale-container reaping resumes.
@@ -1897,6 +1916,9 @@ class WorkerThread(threading.Thread):
                 self._detached_at = time.time()
                 self._pause_event.set()
                 self._resume_event.clear()
+                # Cross-process graceful stop: same turn-cancel signal as
+                # detach(), since this branch parks the worker inline.
+                self._turn_cancel.set()
                 try:
                     self._save_context()
                 except Exception:
@@ -2117,6 +2139,11 @@ class WorkerThread(threading.Thread):
         Iterates over all events yielded by the agent, logging heartbeats
         and checking the stop event. Returns the final response text.
         """
+        # One CLEAR per query: a cancel from a previous turn must never abort
+        # this one.  ``_stop_event`` is the terminal kill latch and is NOT
+        # touched here (a killed worker stays killed).
+        self._turn_cancel.clear()
+
         if self._agent is None:
             return json.dumps({"error": "Agent not initialized"})
 
@@ -2176,6 +2203,14 @@ class WorkerThread(threading.Thread):
         _worker_ctx_token = None
         if WORKER_NAME_CONTEXTVAR is not None:
             _worker_ctx_token = WORKER_NAME_CONTEXTVAR.set(self.owner_identity)
+
+        # Bind THIS worker's turn token to the executing thread.  Tools run
+        # inline on this thread (agent/core/tool_executor.py:689), so binding at
+        # the turn boundary is the narrowest point that covers every tool call
+        # without touching the executor.
+        from tools.sleep_tool import bind_turn_cancel as _bind_turn_cancel
+        from tools.sleep_tool import unbind as _unbind_turn_cancel
+        _bind_turn_cancel(self._turn_cancel)
 
         try:
             for event in self._agent.process_query(query):
@@ -2395,6 +2430,7 @@ class WorkerThread(threading.Thread):
             logger.exception("Worker _run_tool_loop failed")
             final_content = json.dumps({"error": f"Worker execution failed: {exc}"})
         finally:
+            _unbind_turn_cancel()
             if _worker_ctx_token is not None and WORKER_NAME_CONTEXTVAR is not None:
                 WORKER_NAME_CONTEXTVAR.reset(_worker_ctx_token)
 
