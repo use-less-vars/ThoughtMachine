@@ -1862,6 +1862,32 @@ class WebAgentBridge:
                 f'request_stop(): {stopped} worker(s) terminated for session {session_id}')
         return stopped
 
+    def _interrupt_agent_turn(self) -> bool:
+        """Set the main agent's CURRENT-TURN cancellation token, if one is bound.
+
+        This is the lever that reaches a tool which is already blocked (a
+        container/code-execution wait polls its turn token between wait slices).
+        The token is set directly rather than through
+        ``tools.cancellation.interrupt``, because that helper is per-THREAD and
+        this method runs on the BRIDGE thread while the turn runs on the agent
+        thread -- here we only hand the turn's own event over to its polling
+        sites, and record *why* on the event so the tool can report a reason.
+
+        Returns True when a token was actually set.
+        """
+        agent = getattr(self, '_agent', None)
+        event = getattr(agent, '_turn_cancel_event', None) if agent is not None else None
+        if event is None:
+            return False
+        try:
+            event.reason = 'stopped_by_operator'
+            event.set()
+        except Exception as exc:  # pragma: no cover - defensive
+            log('WARNING', 'server.bridge',
+                f'_interrupt_agent_turn(): could not set the turn token: {exc}')
+            return False
+        return True
+
     def request_stop(self) -> bool:
         """Truncate the CURRENT TURN and keep the bridge thread and session alive.
 
@@ -1887,11 +1913,19 @@ class WebAgentBridge:
         # predates request_halt().
         workers_stopped = self._stop_session_workers()
 
+        # Reach the tool that may be blocked RIGHT NOW: container/code-execution
+        # waits poll the main agent's turn token between wait slices, so setting
+        # it is what actually ends an in-flight exec.  This touches only the
+        # main agent's token -- each worker owns its own, so the cascade above is
+        # unchanged.
+        turn_token_set = self._interrupt_agent_turn()
+
         if self._controller is not None:
             busy = bool(getattr(self._controller, 'is_busy', False))
             log('INFO', 'server.bridge',
                 f'request_stop(): turn-level halt requested (busy={busy}, '
-                f'workers_stopped={workers_stopped}, session retained)')
+                f'workers_stopped={workers_stopped}, '
+                f'turn_token_set={turn_token_set}, session retained)')
             request_halt = getattr(self._controller, 'request_halt', None)
             if not callable(request_halt):
                 log('WARNING', 'server.bridge',

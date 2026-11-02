@@ -1193,6 +1193,20 @@ class Agent:
         )
         self._emergency_retries = 0
         final_pending = False
+        # TURN CANCELLATION: this thread is about to run a turn, so it needs a
+        # token of its own.  Bind a FRESH event for the whole turn (binding also
+        # drops any stale reason, so the turn starts clear) and publish it on the
+        # agent, because the Stop button runs on the BRIDGE thread and needs a
+        # handle it can set.  Polling sites (container exec waits, sleep) only
+        # ever read this thread's binding.
+        _turn_cancel = threading.Event()
+        try:
+            from tools.cancellation import bind_turn_cancel
+            bind_turn_cancel(_turn_cancel)
+        except Exception as _cancel_exc:  # pragma: no cover - import guard
+            log('WARNING', 'core.agent',
+                f'process_query: turn-cancel binding unavailable: {_cancel_exc}')
+        self._turn_cancel_event = _turn_cancel
         try:
             log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
@@ -1944,6 +1958,15 @@ class Agent:
             yield max_turns_event
             return
         finally:
+            # TURN CANCELLATION: the turn is over.  Drop this thread's binding and
+            # the published handle, so a Stop that arrives after the turn cannot
+            # latch an event nobody polls (the next turn binds a fresh one).
+            try:
+                from tools.cancellation import unbind
+                unbind()
+            except Exception:
+                pass
+            self._turn_cancel_event = None
             self.state.execution_state = ExecutionState.READY
             log('DEBUG', 'core.agent', 'process_query finished, reset execution_state to READY')
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
