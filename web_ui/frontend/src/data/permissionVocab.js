@@ -7,9 +7,10 @@
 // and WorkerManagementPanel (effective-permission pills).
 
 // Session resources are the ONLY keys a session may store / the ConfigPanel may
-// PUT: git, filesystem, container, network, mcp, host_bash (mirrors the backend
-// session-permission store). Legacy frontend resources (system, execution) and
-// gate grains (git_read, git_write) are NOT session resources.
+// PUT: git, filesystem, container, network, mcp, host_bash, credential, visual
+// (mirrors the backend session-permission store). Legacy frontend resources
+// (system, execution) and gate grains (git_read, git_write) are NOT session
+// resources.
 export const SESSION_RESOURCE_VOCAB = {
   git: ['banned', 'ask', 'read', 'write', 'write_on_feature_branch'],
   filesystem: ['banned', 'read', 'write'],
@@ -18,6 +19,7 @@ export const SESSION_RESOURCE_VOCAB = {
   mcp: ['banned', 'connect', 'full'],
   host_bash: ['banned', 'ask', 'allow'],
   credential: ['banned', 'read', 'use'],
+  visual: ['banned', 'ask', 'view'],
 };
 
 export const PERMISSION_RANK_ORDER = {
@@ -25,6 +27,8 @@ export const PERMISSION_RANK_ORDER = {
   none: 1,
   ask: 2,
   read: 1,
+  // visual view grant: same tier as read.
+  view: 1,
   connect: 1,
   outbound: 3.5,
   write: 3,
@@ -41,6 +45,7 @@ export const PILL_COLORS = {
   write: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Write' },
   write_on_feature_branch: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Feature Branch' },
   read: { bg: '#89b4fa', fg: '#1e1e2e', label: 'Read' },
+  view: { bg: '#89b4fa', fg: '#1e1e2e', label: 'View' },
   ask: { bg: '#f9e2af', fg: '#1e1e2e', label: 'Ask' },
   banned: { bg: '#f38ba8', fg: '#1e1e2e', label: 'Banned' },
   true: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Enabled' },

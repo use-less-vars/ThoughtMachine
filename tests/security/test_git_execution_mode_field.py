@@ -30,6 +30,7 @@ _EXPECTED_NAMES = {
     "mcp",
     "ci",
     "credential",
+    "visual",
 }
 _EXECUTION_MODES = {"container", "host"}
 

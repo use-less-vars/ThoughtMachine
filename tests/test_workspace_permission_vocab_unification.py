@@ -211,10 +211,10 @@ class TestEffectivePermissionsUnifiedVocabWiring:
         )
         assert eff["mcp"] == "banned"
         assert eff["filesystem"] == "read"
-        # Effective permissions always carry the full seven-key canonical set.
+        # Effective permissions always carry the full canonical set.
         assert set(eff.keys()) == {
             "container", "network", "filesystem", "git", "mcp", "host_bash",
-            "ci", "credential",
+            "ci", "credential", "visual",
         }
 
     def test_mcp_connect_ceiling_passthrough(self):

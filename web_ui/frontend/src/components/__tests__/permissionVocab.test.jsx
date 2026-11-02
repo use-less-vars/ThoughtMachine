@@ -104,6 +104,7 @@ describe('SESSION_RESOURCE_VOCAB (frontend mirror of backend)', () => {
       mcp: ['banned', 'connect', 'full'],
       host_bash: ['banned', 'ask', 'allow'],
       credential: ['banned', 'read', 'use'],
+      visual: ['banned', 'ask', 'view'],
     });
   });
 
@@ -120,6 +121,7 @@ describe('PERMISSION_RANK_ORDER (frontend mirror of backend)', () => {
       none: 1,
       ask: 2,
       read: 1,
+      view: 1,
       connect: 1,
       outbound: 3.5,
       write: 3,
@@ -148,6 +150,7 @@ describe('PILL_COLORS / getPill', () => {
       write: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Write' },
       write_on_feature_branch: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Feature Branch' },
       read: { bg: '#89b4fa', fg: '#1e1e2e', label: 'Read' },
+      view: { bg: '#89b4fa', fg: '#1e1e2e', label: 'View' },
       ask: { bg: '#f9e2af', fg: '#1e1e2e', label: 'Ask' },
       banned: { bg: '#f38ba8', fg: '#1e1e2e', label: 'Banned' },
       true: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Enabled' },

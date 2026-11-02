@@ -257,8 +257,10 @@ PROMPT_TIMEOUT = 120.0
 DEFAULT_RESPONSE_TOKENS = 4096
 
 # ── agent/core/tool_executor.py ──────────────────────────────────────────────
-# Fallback session-permissions profile (canonical six categories) used when no
-# live SessionPermissions model is available on config.
+# Fallback session-permissions profile used when no live SessionPermissions
+# model is available on config.  NOTE: this literal is still the LEGACY SUBSET
+# of ``thoughtmachine.security.SAFE_DEFAULTS`` -- ``ci``/``credential`` are
+# absent (a pre-existing drift, tracked separately).
 DEFAULT_SESSION_PERMISSIONS = {
     "container": False,
     "network": "banned",
@@ -266,5 +268,6 @@ DEFAULT_SESSION_PERMISSIONS = {
     "git": "read",
     "mcp": "banned",
     "host_bash": "banned",
+    "visual": "banned",
 }
 

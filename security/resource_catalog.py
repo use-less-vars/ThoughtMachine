@@ -5,8 +5,9 @@ Single source of truth for the resource keys and allowed values a session
 permission grant set may carry (permission-simplification effort, see
 ``.thoughtmachine/working_docs/impl_plan_permission_simplification.md``).
 
-Session-grant keys are ``git``, ``filesystem``, ``container``, ``network``,
-``mcp`` and ``host_bash`` -- every session-grant write AND read goes
+Session-grant keys are exactly the keys of :data:`RESOURCE_CATALOG` below
+(``git``, ``filesystem``, ``container``, ``network``, ``mcp``, ``host_bash``,
+``ci``, ``credential``, ``visual``) -- every session-grant write AND read goes
 through :func:`coerce_resource_permissions`.  ``host_bash`` is the
 supervised host-shell grain: it is storable at the session level like any
 catalog key, its ``allow`` level doubles as the workspace-ceiling
@@ -19,9 +20,10 @@ applies.  The workspace ceiling's canonical key for sandboxed execution is
 ``container`` (boolean); the legacy alias ``docker`` is accepted by the
 security gate and normalised onto ``container`` at enforcement time (a
 write-level docker ceiling allows the container grant, banned/read/ask
-denies it).  The ceiling surface is the six canonical resources only
-(``container`` boolean; ``git``, ``filesystem``, ``network``, ``mcp``,
-``host_bash``); the legacy ceiling grains
+denies it).  The ceiling surface is exactly the keys of
+:data:`WORKSPACE_CEILING_VOCAB` (``container`` boolean; ``git``,
+``filesystem``, ``network``, ``mcp``, ``host_bash``, ``ci``, ``credential``,
+``visual``); the legacy ceiling grains
 ``git_read``/``git_write``/``system``/``execution`` were removed from it
 -- legacy stored values are folded onto ``git`` or dropped by the
 workspace-permission loader, and workspace-permission PUT validation
@@ -40,6 +42,9 @@ the same thing in either place.  Session-grant values per canonical key::
     network      banned | ask | write | outbound
     mcp          banned | connect | full
     host_bash    banned | ask | allow     (host shell; ceiling-capped by the gate)
+    ci           banned | read
+    credential   banned | read | use
+    visual       banned | ask | view      (visual/render artifacts)
 
 Workspace-ceiling values, validated by the workspace-permission loader
 (``agent/config/resource_catalog.py``) against the same level strings::
@@ -49,6 +54,9 @@ Workspace-ceiling values, validated by the workspace-permission loader
     network      banned | ask | write | outbound
     mcp          banned | connect | full
     host_bash    banned | ask | allow
+    ci           banned | read
+    credential   banned | read | use
+    visual       banned | ask | view
     container    True | False   (boolean ceiling; no string vocabulary)
 
 Two DERIVED flat rank projections back every comparison helper in this
@@ -122,6 +130,7 @@ RESOURCE_CATALOG = {
     "host_bash": ["banned", "ask", "allow"],
     "ci": ["banned", "read"],
     "credential": ["banned", "read", "use"],
+    "visual": ["banned", "ask", "view"],
 }
 
 #: Set of canonical resource keys (for membership checks / introspection).
@@ -130,8 +139,8 @@ canonical_resource_keys = set(RESOURCE_CATALOG)
 #: Session-grant level ranks (single flat order used by the comparison
 #: helpers in ``security.gate_helpers`` / ``security.security_gate``).
 #:
-#:     banned(0) < read(1) < ask(2) < write(3) == write_on_feature_branch(3)
-#:         < outbound(3.5) < full(4)
+#:     banned(0) < read(1) == view(1) < ask(2) < write(3)
+#:         == write_on_feature_branch(3) < outbound(3.5) < full(4)
 #:
 #: ``read`` ranks strictly BELOW ``ask`` because read is a strict subset of
 #: ask (read-only work needs no prompt; ask additionally authorises the write
@@ -142,6 +151,7 @@ canonical_resource_keys = set(RESOURCE_CATALOG)
 GRANT_LEVEL_RANKS: Dict[str, float] = {
     "banned": 0,
     "read": 1,
+    "view": 1,  # visual view grant: the read tier
     "ask": 2,
     "connect": 1,
     "write": 3,
@@ -153,7 +163,7 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
 
 #: Workspace-ceiling level ranks (``apply_workspace_ceiling`` ordering).
 #:
-#:     banned(0) < read(1) == connect(1) == none(1) < ask(2)
+#:     banned(0) < read(1) == view(1) == connect(1) == none(1) < ask(2)
 #:         < write_on_feature_branch(2.5) < write(3)
 #:         < outbound(4) == full(4)
 #:
@@ -166,6 +176,7 @@ GRANT_LEVEL_RANKS: Dict[str, float] = {
 WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
     "banned": 0.0,
     "read": 1.0,
+    "view": 1.0,  # visual view grant: the read tier
     "connect": 1.0,  # session-side mcp level (below ask/2.0)
     "none": 1.0,  # alias used by some purpose presets
     "ask": 2.0,
@@ -179,7 +190,8 @@ WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
 #: Per-session-key whitelist of workspace-ceiling levels that may ever be
 #: applied to that key (validation vocab used by ``apply_workspace_ceiling``;
 #: a ceiling level outside the key's vocabulary is ignored fail-open).  The
-#: ceiling surface is exactly the six canonical session-grant resources; the
+#: ceiling surface is exactly the canonical session-grant resources listed
+#: below (every catalog key except the boolean-only ``container``); the
 #: legacy ceiling grains ``git_read``/``git_write``/``system``/``execution``
 #: were removed (legacy stored values are folded/dropped by the loader and
 #: PUT validation rejects the names with a legacy hint).  ``container`` is
@@ -199,6 +211,7 @@ WORKSPACE_CEILING_VOCAB: Dict[str, tuple] = {
     "host_bash": ("banned", "ask", "allow"),
     "ci": ("banned", "read"),
     "credential": ("banned", "read", "use"),
+    "visual": ("banned", "ask", "view"),
 }
 
 #: Git-grain *breadth* ranks (broader grant = SMALLER number), consumed by

@@ -180,5 +180,22 @@
     "risk_level": "high",
     "ui_category": "integrations",
     "required_workspace_switch": null
+  },
+  {
+    "name": "visual",
+    "display_name": "Visual",
+    "description": "Visual/render artifacts: render tool output as visual (image/diagram) results.",
+    "permission_grain_set": [
+      "banned",
+      "ask",
+      "view"
+    ],
+    "execution_mode": "container",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": "medium",
+    "ui_category": "sandbox",
+    "required_workspace_switch": "allow_docker"
   }
 ]

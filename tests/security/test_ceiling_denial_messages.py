@@ -79,7 +79,7 @@ class TestCeilingCausedFilesystemDenial:
             {"filesystem": "read"},
         )
         # Content identical to a plain dict merge result — the effective
-        # dict carries exactly the seven canonical category keys.
+        # dict carries exactly the nine canonical category keys.
         assert eff["filesystem"] == "read"
         assert eff == {
             "filesystem": "read",
@@ -90,6 +90,7 @@ class TestCeilingCausedFilesystemDenial:
             "host_bash": "banned",
             "ci": "banned",
             "credential": "banned",
+            "visual": "banned",
         }
         assert json.loads(json.dumps(eff)) == dict(eff)  # JSON-safe subclass
         # … and it carries ceiling provenance for the capped category.

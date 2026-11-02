@@ -35,7 +35,7 @@ def test_canonical_resource_keys_match_catalog():
     assert canonical_resource_keys == set(RESOURCE_CATALOG)
     assert canonical_resource_keys == {
         "git", "filesystem", "container", "network", "mcp", "host_bash",
-        "ci", "credential",
+        "ci", "credential", "visual",
     }
 
 
@@ -48,6 +48,9 @@ def test_catalog_expected_shape():
     assert RESOURCE_CATALOG["network"] == ["banned", "ask", "write", "outbound"]
     assert RESOURCE_CATALOG["mcp"] == ["banned", "connect", "full"]
     assert RESOURCE_CATALOG["host_bash"] == ["banned", "ask", "allow"]
+    assert RESOURCE_CATALOG["ci"] == ["banned", "read"]
+    assert RESOURCE_CATALOG["credential"] == ["banned", "read", "use"]
+    assert RESOURCE_CATALOG["visual"] == ["banned", "ask", "view"]
 
 
 # ---------------------------------------------------------------------------

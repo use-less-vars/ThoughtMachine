@@ -198,6 +198,14 @@ _WORKSPACE_CEILING_LEVELS = WORKSPACE_CEILING_LEVELS_RANKS
 # anything stricter (banned/read/ask) denies it.  Also accepts the
 # session-catalog resources (filesystem, git, network, mcp -- capped on
 # their own scales) plus the canonical ``host_bash`` key.
+#
+# INVARIANT: this map MUST carry an entry for EVERY capped grain.
+# ``_WORKSPACE_CEILING_KEYS`` is derived from ``RESOURCE_CATALOG``, so a
+# catalog key is ACCEPTED as a ceiling name even when it is missing here --
+# and ``apply_workspace_ceiling`` then silently ``continue``s past it, making
+# that grain's workspace ceiling a NO-OP.  NOTE: ``ci`` is absent from this
+# map today; that is a KNOWN, pre-existing defect tracked separately and is
+# NOT the pattern to copy.
 _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "filesystem": "filesystem",
     "docker": "container",
@@ -207,6 +215,7 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "network": "network",
     "mcp": "mcp",
     "credential": "credential",
+    "visual": "visual",
 }
 
 #: Recognised workspace-ceiling resource names: the canonical catalog
@@ -586,6 +595,7 @@ def _merge_with_capabilities(
         "host_bash": session.host_bash,
         "ci": getattr(session, "ci", "banned"),
         "credential": getattr(session, "credential", "banned"),
+        "visual": getattr(session, "visual", "banned"),
     }
 
 

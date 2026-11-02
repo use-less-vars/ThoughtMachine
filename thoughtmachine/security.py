@@ -111,9 +111,10 @@ class SessionPermissions(BaseModel):
     Maps to the permission system used by
     ``tool_executor._check_permissions()``:
 
-    The canonical session permission categories are exactly eight:
+    The canonical session permission categories are exactly the keys of
+    ``security.resource_catalog.RESOURCE_CATALOG``:
     ``container | network | filesystem | git | mcp | host_bash | ci |
-    credential``.
+    credential | visual``.
 
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
@@ -123,6 +124,9 @@ class SessionPermissions(BaseModel):
     - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
     - **credential**: ``'banned' | 'read' | 'use'`` (``read`` lists credential
       names only; ``use`` injects credential values)
+    - **visual**:     ``'banned' | 'ask' | 'view'`` (``view`` may invoke the
+      visual-render tool; the security gate caps the session value by the
+      workspace ceiling)
 
     The legacy ``system``/``execution`` permission categories and the split
     ``git_read``/``git_write`` grains were removed in the permission-schema
@@ -164,6 +168,10 @@ class SessionPermissions(BaseModel):
         default='banned',
         description='Credential access level (read = names only, use = values).',
     )
+    visual: Literal['banned', 'ask', 'view'] = Field(
+        default='banned',
+        description='Visual/render artifact access level (view = may render).',
+    )
 
     @field_validator('network', mode='before')
     @classmethod
@@ -202,8 +210,9 @@ class SessionPermissions(BaseModel):
 # full canonical git tuple below.
 VALID_PERMISSION_LEVELS = tuple(RESOURCE_CATALOG["filesystem"])
 GIT_PERMISSION_LEVELS = tuple(RESOURCE_CATALOG["git"])
-# Canonical permission categories: exactly the six session resources
-# (container, network, filesystem, git, mcp, host_bash). The legacy
+# Canonical permission categories: exactly the ``RESOURCE_CATALOG`` keys
+# (container, network, filesystem, git, mcp, host_bash, ci, credential,
+# visual). The legacy
 # ``system``/``execution`` categories and the split ``git_read``/``git_write``
 # grains no longer exist as permission resources.
 PERMISSION_SCHEMA: Dict[str, tuple] = {
@@ -228,6 +237,7 @@ _SAFE_DEFAULT_LEVELS: Dict[str, Any] = {
     "network": "banned",
     "ci": "banned",
     "credential": "banned",
+    "visual": "banned",
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
     key: _SAFE_DEFAULT_LEVELS[key] for key in RESOURCE_CATALOG
