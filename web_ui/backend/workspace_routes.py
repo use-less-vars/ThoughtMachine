@@ -38,6 +38,11 @@ from thoughtmachine.permission_store import (
 )
 from thoughtmachine.vault import vault_root
 
+from tools.workspace.command_channel import (
+    COMMAND_FILENAME,
+    CommandFence,
+    write_command,
+)
 from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
 _worker_registry = _WorkerRegistry.get_instance()._worker_registry
 _registry_lock = _WorkerRegistry.get_instance()._registry_lock
@@ -305,6 +310,88 @@ def _atomic_write_json(data: Any, file_path: Path, retries: int = 3) -> None:
                     raise exc
 
             time.sleep(0.2 * attempt)
+
+
+def _read_worker_generation(worker_dir: Path) -> Optional[int]:
+    """Read a worker's incarnation counter (``_generation``) off disk.
+
+    The authority is the ``generation`` sidecar that ``WorkerThread`` writes
+    when it allocates a generation; ``context.json`` carries the same value
+    and is the fallback for directories written before that sidecar existed.
+    Returns ``None`` when neither file holds a positive integer -- the caller
+    then has no epoch to fence a command with.
+    """
+    try:
+        value = int((worker_dir / "generation").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pass
+    else:
+        if value > 0:
+            return value
+
+    try:
+        data = json.loads((worker_dir / "context.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    value = data.get("generation") if isinstance(data, dict) else None
+    # ``True`` IS an ``int`` in Python and would otherwise read as epoch 1.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _write_worker_command(
+    worker_dir: Path,
+    action: str,
+    *,
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int,
+) -> None:
+    """Write a fenced ``command.json`` into *worker_dir*.
+
+    The fence (session / worker name / instance / epoch) is what lets the
+    polling worker reject a command addressed to a different incarnation --
+    a stale command from a previous spawn, or one meant for another worker
+    sharing the directory.  The epoch is the worker's own ``_generation`` as
+    persisted in *worker_dir*; when it cannot be read (a directory laid down
+    without a thread, e.g. a pre-seeded fixture) the command is written
+    UNFENCED with a warning rather than dropped, so the caller's request is
+    never silently ignored.
+    """
+    generation = _read_worker_generation(worker_dir)
+    if generation is None:
+        logger.warning(
+            "Worker %s (instance %s, session %s): no generation on disk in %s "
+            "-- writing an UNFENCED %s command, so it cannot be told apart "
+            "from a stale one",
+            worker_name,
+            instance_id,
+            session_id,
+            worker_dir,
+            action,
+        )
+        _atomic_write_json({"action": action}, worker_dir / COMMAND_FILENAME)
+        return
+
+    fence = CommandFence(
+        session_id=session_id or "",
+        worker_name=worker_name,
+        instance_id=instance_id,
+        epoch=generation,
+    )
+    if not write_command(worker_dir, action, fence):
+        logger.warning(
+            "Worker %s (instance %s, session %s): could not write the %s "
+            "command to %s",
+            worker_name,
+            instance_id,
+            session_id,
+            action,
+            worker_dir,
+        )
+
 
 def _atomic_write_text(data: str, file_path: Path, retries: int = 3) -> None:
     """Atomically write a plain-text string to *file_path*, with Windows-safe retries.
@@ -1167,6 +1254,9 @@ def _stop_worker_instance(
 
     # ── Find the worker directory (session-scoped first, then legacy) ──
     worker_dir: Optional[Path] = None
+    # The session the command is addressed to; the ``session_id`` parameter
+    # above stays untouched because the registry fast-path narrows on it.
+    resolved_session_id: Optional[str] = session_id
 
     if workers_dir.is_dir():
         for subdir in workers_dir.iterdir():
@@ -1179,6 +1269,7 @@ def _stop_worker_instance(
                 candidate = subdir / (target_label if target_label is not None else name)
                 if candidate.is_dir():
                     worker_dir = candidate
+                    resolved_session_id = subdir.name
                     break
             else:
                 # Legacy: workers/<name>/ or workers/<name#N>/
@@ -1192,11 +1283,25 @@ def _stop_worker_instance(
             detail={"status": "not_found", "name": name},
         )
 
+    # Instance the resolved directory belongs to: the caller's when given,
+    # else the one the label encodes (``<name>`` is instance 1).
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+
     # Write the command file — the worker thread polls for this.
     # PHASE 2.1a: "stop" only DETACHES the worker; "kill" terminates it.
-    _atomic_write_json(
-        {"action": "kill" if terminate else "stop"},
-        worker_dir / "command.json",
+    # The command carries an identity fence (session / worker name / instance
+    # / epoch) so a worker that reuses this directory can reject a command
+    # meant for a different incarnation.
+    _write_worker_command(
+        worker_dir,
+        "kill" if terminate else "stop",
+        session_id=resolved_session_id,
+        worker_name=name,
+        instance_id=resolved_instance_id,
     )
 
     # Immediately write status.json with the state the worker is heading for
@@ -1242,14 +1347,17 @@ def _enumerate_worker_instances(
     ws_dir: Path,
     session_id: Optional[str] = None,
 ) -> List[tuple]:
-    """Enumerate ``(worker_name, instance_id)`` pairs from the same on-disk
-    layout the per-worker routes use.
+    """Enumerate ``(session_id, worker_name, instance_id)`` triples from the
+    same on-disk layout the per-worker routes use.
 
     Session-scoped directories (``workers/<session_id>/<name>/`` or
-    ``<name>#<N>/``) yield one entry per instance; when ``session_id`` is
-    given only that session's directory is considered.  Legacy directories
-    (``workers/<name>/``, ``workers/<name>#<N>/``) are included only when no
-    ``session_id`` filter is active.  Non-directory entries are skipped.
+    ``<name>#<N>/``) yield one entry per instance, carrying the session the
+    directory sits under -- that is the session a command for it must be
+    fenced with.  When ``session_id`` is given only that session's directory
+    is considered.  Legacy directories (``workers/<name>/``,
+    ``workers/<name>#<N>/``) yield ``session_id=None`` and are included only
+    when no ``session_id`` filter is active.  Non-directory entries are
+    skipped.
     """
     workers_dir = ws_dir / "workers"
     if not workers_dir.is_dir():
@@ -1266,12 +1374,14 @@ def _enumerate_worker_instances(
             for worker_subdir in subdir.iterdir():
                 if not worker_subdir.is_dir():
                     continue
-                targets.append(_worker_instance_key(worker_subdir.name))
+                name, instance_id = _worker_instance_key(worker_subdir.name)
+                targets.append((subdir.name, name, instance_id))
         else:
             # Legacy: workers/<name>/ or workers/<name#N>/
             if session_id is not None:
                 continue
-            targets.append(_worker_instance_key(subdir.name))
+            name, instance_id = _worker_instance_key(subdir.name)
+            targets.append((None, name, instance_id))
     return targets
 
 
@@ -1305,10 +1415,10 @@ async def stop_all_workers(
     session_filter = body.session_id if body is not None else None
     targets = _enumerate_worker_instances(ws_dir, session_id=session_filter)
     results = []
-    for name, instance_id in targets:
+    for target_session_id, name, instance_id in targets:
         try:
             resp = _stop_worker_instance(
-                ws_dir, name, instance_id, session_id=session_filter
+                ws_dir, name, instance_id, session_id=target_session_id
             )
             results.append({
                 "worker_name": name,
@@ -1482,6 +1592,9 @@ async def pause_worker(
 
     # ── Find the worker directory (session-scoped first, then legacy) ──
     worker_dir: Optional[Path] = None
+    # The session the command is addressed to (None when the directory
+    # layout is legacy).
+    resolved_session_id: Optional[str] = None
 
     if workers_dir.is_dir():
         for subdir in workers_dir.iterdir():
@@ -1494,6 +1607,7 @@ async def pause_worker(
                 candidate = subdir / (target_label if target_label is not None else name)
                 if candidate.is_dir():
                     worker_dir = candidate
+                    resolved_session_id = subdir.name
                     break
             else:
                 # Legacy: workers/<name>/ or workers/<name#N>/
@@ -1507,8 +1621,24 @@ async def pause_worker(
             detail={"status": "not_found", "name": name},
         )
 
-    # Write the pause command file — the worker thread polls for this
-    _atomic_write_json({"action": "pause"}, worker_dir / "command.json")
+    # Instance the resolved directory belongs to: the caller's when given,
+    # else the one the label encodes (``<name>`` is instance 1).
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+
+    # Write the pause command file — the worker thread polls for this.  It
+    # carries the worker's identity fence so a stale command (or one meant
+    # for a previous incarnation of this directory) is rejected.
+    _write_worker_command(
+        worker_dir,
+        "pause",
+        session_id=resolved_session_id,
+        worker_name=name,
+        instance_id=resolved_instance_id,
+    )
 
     # Immediately write status.json as "pausing" (the pause is in flight).
     # The worker flips to "paused" only when its current turn completes.
@@ -1591,6 +1721,9 @@ async def resume_worker(
 
     # ── Find the worker directory (session-scoped first, then legacy) ──
     worker_dir: Optional[Path] = None
+    # The session the command is addressed to (None when the directory
+    # layout is legacy).
+    resolved_session_id: Optional[str] = None
 
     if workers_dir.is_dir():
         for subdir in workers_dir.iterdir():
@@ -1603,6 +1736,7 @@ async def resume_worker(
                 candidate = subdir / (target_label if target_label is not None else name)
                 if candidate.is_dir():
                     worker_dir = candidate
+                    resolved_session_id = subdir.name
                     break
             else:
                 # Legacy: workers/<name>/ or workers/<name#N>/
@@ -1616,8 +1750,24 @@ async def resume_worker(
             detail={"status": "not_found", "name": name},
         )
 
-    # Write the resume command file — the worker thread polls for this
-    _atomic_write_json({"action": "resume"}, worker_dir / "command.json")
+    # Instance the resolved directory belongs to: the caller's when given,
+    # else the one the label encodes (``<name>`` is instance 1).
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+
+    # Write the resume command file — the worker thread polls for this.  It
+    # carries the worker's identity fence so a stale command (or one meant
+    # for a previous incarnation of this directory) is rejected.
+    _write_worker_command(
+        worker_dir,
+        "resume",
+        session_id=resolved_session_id,
+        worker_name=name,
+        instance_id=resolved_instance_id,
+    )
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
