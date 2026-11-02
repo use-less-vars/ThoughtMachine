@@ -1077,6 +1077,7 @@ import pytest
 
 from tests.test_worker_sync_query_timeout_containment import (
     _FakeContainerManager,
+    _FakeContext,
     _owned_container,
     _spawn_worker,
     _wait_until,
@@ -1327,5 +1328,345 @@ def test_sync_query_to_manual_only_paused_worker_is_non_destructive(tmp_path, mo
     assert thread.status == "paused" and thread.is_alive()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Cross-process command channel: ``command.json`` -> ``_poll_command``
+#
+# The Web UI never touches the thread object for a cross-process stop/kill:
+# ``web_ui/backend/workspace_routes.py:1197-1200`` (``_stop_worker_instance``)
+# writes ``{"action": "kill" if terminate else "stop"}`` into
+# ``<workspace>/workers/<label>/command.json`` and the worker thread consumes
+# it in ``WorkerThread._poll_command`` (tools/workspace/worker_thread.py:1846,
+# called from the run loop at :2130 and :2635).  These tests drive that exact
+# file through that exact method against REAL threads and assert on real
+# thread/registry/job-registry state -- never on mock call logs.
+# ══════════════════════════════════════════════════════════════════════════
+
+from infra.container_manager import is_worker_detached, unregister_detached_worker
+
+
+def _spawn_ready_persisting_context(tmp_path, monkeypatch, name, session_id):
+    """Spawn a REAL WorkerThread that KEEPS ``_save_context`` live.
+
+    ``_spawn_worker`` neuters ``_save_context`` (``lambda self: None``), which
+    would make every "the detach persisted the context" assertion vacuous.
+    Only ``_load_context`` (no on-disk context is needed) and
+    ``_heartbeat_tick`` are patched here.
+    """
+    monkeypatch.setattr(WorkerThread, "_load_context", lambda self: _FakeContext())
+    monkeypatch.setattr(WorkerThread, "_heartbeat_tick", lambda self: None)
+    thread = WorkerThread(
+        name=name,
+        definition={"name": name, "system_prompt": "You are a test worker."},
+        agent_config={},
+        workspace_dir=tmp_path,
+        session_id=session_id,
+        container_manager=None,
+        max_container_count=4,
+        max_token_usage=None,
+        max_runtime_s=None,
+    )
+    with worker_module._registry_lock:
+        worker_module._worker_registry[(session_id, name, 1)] = thread
+    thread.start()
+    # ``status`` is already "ready" from __init__ (worker_thread.py:1051), so a
+    # status-based wait returns before run() has done anything.  Wait for the
+    # STARTUP context save instead (run() calls _save_context() at :2631): it
+    # is the first observable effect of run() that the tests rely on.
+    ctx_file = thread._context_path()
+    assert _wait_until(ctx_file.is_file), (
+        f"worker {name!r} never persisted {ctx_file} "
+        f"(status={thread.status}, error={thread.error}, "
+        f"alive={thread.is_alive()})"
+    )
+    return thread
+
+
+def _write_command_file(thread, action):
+    """Write ``command.json`` exactly as the REST route does.
+
+    web_ui/backend/workspace_routes.py:1197-1200:
+    ``_atomic_write_json({"action": "kill" if terminate else "stop"},
+    worker_dir / "command.json")``.
+    """
+    path = thread._worker_dir / "command.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"action": action}), encoding="utf-8")
+    return path
+
+
+def _retire_thread(thread, timeout=10.0):
+    """Kill + join so a PARKED (detached) thread never leaks into the next test
+    (``_registry_teardown`` only calls ``stop()``, which detaches)."""
+    try:
+        unregister_detached_worker(thread.owner_identity)
+    except Exception:
+        pass
+    try:
+        thread.kill()
+    except Exception:
+        pass
+    thread.join(timeout=timeout)
+
+
+def test_command_file_stop_detaches_and_keeps_the_registration(tmp_path, monkeypatch):
+    """A cross-process ``{"action": "stop"}`` DETACHES.
+
+    PHASE 2.1a contract (worker_thread.py:1853-1873): the parked worker keeps
+    its thread, its registry entry and its container-manager detach
+    registration, persists its context, and stays revivable.
+    """
+    thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, "w1", "sess-cmd-stop")
+    ctx_file = thread._worker_dir / "context.json"
+    assert ctx_file.is_file(), "run() must persist context.json on startup"
+    # Drop the startup context so the file reappearing below can only be the
+    # STOP branch's own ``_save_context()`` (worker_thread.py:1870-1871).
+    ctx_file.unlink()
+    cmd = _write_command_file(thread, "stop")
+
+    thread._poll_command()
+
+    assert not cmd.exists(), "the consumed command file must be deleted"
+    assert thread.status == "detached"
+    assert thread.is_alive(), "stop must NOT terminate the thread"
+    assert not thread._stop_event.is_set(), "stop must never set the stop event"
+    assert thread._detach_requested is True
+    assert thread._detached_at is not None
+    with worker_module._registry_lock:
+        assert worker_module._worker_registry[("sess-cmd-stop", "w1", 1)] is thread
+    assert is_worker_detached(thread.owner_identity) is True
+    # The stop branch persisted the live context (same instance/generation,
+    # real payload), so the worker is revivable from disk.  The POST-flip
+    # runtime status is carried by status.json: _poll_command saves the context
+    # BEFORE flipping ``self.status`` to "detached", so context.json still holds
+    # the pre-flip status (worker_thread.py:1870-1875).
+    assert ctx_file.is_file(), "the stop branch must persist context.json"
+    persisted = json.loads(ctx_file.read_text(encoding="utf-8"))
+    assert persisted["generation"] == thread._generation
+    assert persisted["user_history"], "the persisted context must carry the conversation"
+    status_doc = json.loads(
+        (thread._worker_dir / "status.json").read_text(encoding="utf-8")
+    )
+    assert status_doc["runtime_status"] == "detached"
+    # A detached worker is revivable -- that is the whole point of a detach.
+    assert thread.resume() is True
+    assert thread.status == "ready"
+    _retire_thread(thread)
+
+
+def test_command_file_kill_terminates_and_rejects_queued_work(tmp_path, monkeypatch):
+    """A cross-process ``{"action": "kill"}`` TERMINATES.
+
+    PHASE 2.1a/2.1b contract (worker_thread.py:1874-1883 -> ``kill()``): the
+    thread exits, the detach markers are cleared, the job is NOT left pending
+    (``reject_queued_queries`` terminalises it as ``error``) and the worker is
+    not revivable.
+    """
+    reg = WorkerJobRegistry(event_bus=None)
+    monkeypatch.setattr(worker_module, "_get_worker_job_registry", lambda: reg)
+    thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, "w1", "sess-cmd-kill")
+    # Park FIRST so the queued query cannot start executing (a parked worker
+    # never drains its queue -- PHASE 2.1b); status == "paused" proves the run
+    # loop reached its park branch and is no longer reading the input queue.
+    thread.pause()
+    assert _wait_until(lambda: thread.status == "paused"), thread.status
+    job_id = "job-cmd-kill-1"
+    reg.register(job_id, "w1", session_id="sess-cmd-kill")
+    thread.enqueue_query(job_id, "queued work")
+    assert thread.pending_query_jobs() == [job_id]
+    cmd = _write_command_file(thread, "kill")
+
+    thread._poll_command()
+
+    assert not cmd.exists()
+    assert thread.status == "killed"
+    assert thread._stop_event.is_set()
+    assert thread._detach_requested is False
+    assert thread._detached_at is None
+    assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), (
+        "a killed worker must terminate"
+    )
+    assert thread.pending_query_jobs() == [], "queued work must be rejected, not left pending"
+    record = reg.job(job_id)
+    assert record["status"] == "error"
+    assert "queued query discarded" in record["result"]["error"]
+    assert is_worker_detached(thread.owner_identity) is False
+    # A killed worker is NOT revivable (resume() refuses without touching state).
+    assert thread.resume() is False
+    assert thread.status == "killed"
+
+
+def _drive_command(tmp_path, monkeypatch, name, session_id, action):
+    """Bring one worker to an IDENTICAL starting state and apply ``action``.
+
+    Starting state: ready -> parked, with exactly one query queued and not yet
+    started.  Returns everything the two actions are supposed to diverge on.
+    """
+    reg = WorkerJobRegistry(event_bus=None)
+    monkeypatch.setattr(worker_module, "_get_worker_job_registry", lambda: reg)
+    thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, name, session_id)
+    thread.pause()
+    assert _wait_until(lambda: thread.status == "paused"), thread.status
+    job_id = f"job-{action}"
+    reg.register(job_id, name, session_id=session_id)
+    thread.enqueue_query(job_id, "queued work")
+    started = {
+        "status": "paused",
+        "alive": thread.is_alive(),
+        "queued": thread.pending_query_jobs() == [job_id],
+        "job_status": reg.job(job_id)["status"],
+        "stop_event": thread._stop_event.is_set(),
+    }
+    cmd = _write_command_file(thread, action)
+    thread._poll_command()
+    assert not cmd.exists()
+    # Sampled HERE: resume() legitimately lifts the detach registration
+    # (worker_thread.py:1645-1650), so post-resume reads cannot see it.
+    registered = is_worker_detached(thread.owner_identity)
+    return thread, reg, job_id, started, registered
+
+
+def test_command_stop_and_kill_diverge_from_the_same_starting_state(tmp_path, monkeypatch):
+    """``stop`` and ``kill`` are driven through the SAME channel from the SAME
+    starting state and must land on opposite outcomes.
+
+    Only the session label differs between the two runs, so the process-global
+    detached-identity set (``infra.container_manager._DETACHED_WORKER_IDENTITIES``,
+    keyed by ``<session>:<name>``) cannot alias across them.
+    """
+    stop_thread, stop_reg, stop_job, stop_start, stop_registered = _drive_command(
+        tmp_path / "stop", monkeypatch, "w1", "sess-cmd-div-stop", "stop"
+    )
+    kill_thread, kill_reg, kill_job, kill_start, kill_registered = _drive_command(
+        tmp_path / "kill", monkeypatch, "w1", "sess-cmd-div-kill", "kill"
+    )
+
+    # ── identical starting state ──
+    assert stop_start == kill_start == {
+        "status": "paused",
+        "alive": True,
+        "queued": True,
+        "job_status": "submitted",
+        "stop_event": False,
+    }
+
+    # ── divergent outcomes ──
+    assert (stop_thread.status, kill_thread.status) == ("detached", "killed")
+    assert stop_thread._stop_event.is_set() is False
+    assert kill_thread._stop_event.is_set() is True
+    assert _wait_until(lambda: not kill_thread.is_alive(), timeout=10.0)
+    assert stop_thread.is_alive() is True
+    # Registration: the parked worker keeps its detach registration, the
+    # killed one clears it.
+    assert (stop_registered, kill_registered) == (True, False)
+
+    # Snapshot the parked worker's queue and job record BEFORE resuming it:
+    # resume() un-parks the run loop, which by design re-drains the FIFO and
+    # may start the queued job, so reading them afterwards races the worker
+    # (a post-resume empty pending set is legitimate, not a defect).
+    stop_pending_before_resume = stop_thread.pending_query_jobs()
+    stop_job_status_before_resume = stop_reg.job(stop_job)["status"]
+
+    # Revivability: the parked worker comes back, the killed one cannot.
+    assert stop_thread.resume() is True
+    assert kill_thread.resume() is False
+
+    # The kill terminates the queued job; the detach keeps it queued for later.
+    assert kill_thread.pending_query_jobs() == []
+    assert kill_reg.job(kill_job)["status"] == "error"
+    assert stop_pending_before_resume == [stop_job]
+    assert stop_job_status_before_resume == "submitted"
+
+    _retire_thread(stop_thread)
+
+
+def test_stale_park_sentinel_after_resume_is_not_read_as_stop(tmp_path, monkeypatch):
+    """A wake-up marker still queued when ``resume()`` clears the pause event
+    must be a NO-OP, never a stop.
+
+    Interleaving under test (deterministic -- no sleep-based racing): the worker
+    is BUSY inside ``_run_tool_loop``, blocked on a test gate, so it cannot
+    consume its input queue at all.  While it is blocked the test calls
+    ``pause()``, which enqueues the park wake-up marker
+    (``worker_thread.py:1611``) and sets ``_pause_event``, and then ``resume()``,
+    which clears ``_pause_event`` (``worker_thread.py:1649``) BEFORE the loop
+    ever looks at the queue.  When the in-flight query finishes and the loop
+    drains the queue it therefore finds that marker with the pause flag already
+    cleared -- the exact "leftover marker after resume" shape.
+
+    Pre-fix that marker was a bare ``None``, i.e. the same value as the STOP
+    sentinel, so the loop took the ``break`` at ``worker_thread.py:2760``: the
+    thread exited, ``status`` reported ``completed``, and every query queued
+    behind the marker was silently dropped.  Post-fix the marker is
+    ``_PARK_SENTINEL`` and the stale branch at ``worker_thread.py:2753``
+    discards it, so the loop keeps running and the next query executes.
+
+    Assertions are on the REAL thread, the real job registry and the real reply
+    queue -- never on a mock's call log.
+    """
+    reg = WorkerJobRegistry(event_bus=None)
+    monkeypatch.setattr(worker_module, "_get_worker_job_registry", lambda: reg)
+    thread = _spawn_worker(tmp_path, monkeypatch, "w1", "sess-park-sentinel")
+
+    busy_started = threading.Event()
+    release = threading.Event()
+
+    def blocking_tool_loop(self, query):
+        busy_started.set()
+        assert release.wait(timeout=15)
+        self._last_elapsed_val = 0.0
+        return json.dumps({"response": "done", "query": query})
+
+    monkeypatch.setattr(WorkerThread, "_run_tool_loop", blocking_tool_loop)
+    thread._agent = object()
+
+    # ── 1. the worker is genuinely busy: it cannot consume the queue ──────
+    reply_q = queue.Queue()
+    thread._input_queue.put(("job-inflight", "first", reply_q))
+    assert busy_started.wait(timeout=5.0), "worker never became busy"
+    assert thread.status == "busy"
+
+    # ── 2. enqueue the marker, then clear the pause flag under it ─────────
+    thread.pause()      # put(_PARK_SENTINEL), _pause_event.set()   (:1611)
+    thread.resume()     # _pause_event.clear(), _resume_event.set() (:1649)
+    assert thread._pause_event.is_set() is False
+    assert thread.status == "ready"
+
+    # The in-flight query completes normally, and only THEN does the loop get
+    # back to the queue and meet the now-stale marker.
+    release.set()
+    envelope_a = json.loads(reply_q.get(timeout=10))
+    assert json.loads(envelope_a["content"])["response"] == "done"
+
+    # ── 3. the stale marker must not have stopped the loop ────────────────
+    # Bounded wait: pre-fix the run loop exits here, post-fix it does not.
+    died = _wait_until(lambda: not thread.is_alive(), timeout=2.0)
+    assert died is False, (
+        "the stale park marker killed the run loop "
+        f"(alive={thread.is_alive()}, status={thread.status!r}, "
+        f"error={thread.error!r})"
+    )
+    assert thread.status != "completed", (
+        f"the stale park marker reported the worker as completed: {thread.status!r}"
+    )
+    assert thread._stop_event.is_set() is False
+
+    # ── 4. real work queued AFTER the resume still runs ───────────────────
+    reply_q2 = queue.Queue()
+    thread._input_queue.put(("job-after", "second", reply_q2))
+    try:
+        envelope_b = json.loads(reply_q2.get(timeout=10))
+    except queue.Empty:
+        raise AssertionError(
+            "the query enqueued after resume was never answered "
+            f"(alive={thread.is_alive()}, status={thread.status!r})"
+        )
+    assert json.loads(envelope_b["content"])["response"] == "done"
+    assert json.loads(envelope_b["content"])["query"] == "second"
+
+    _retire_thread(thread)
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
