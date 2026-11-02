@@ -358,3 +358,4 @@ web_ui/frontend/.npmrc
 # `docs/*` above is a catch-all, so the negation is required or the file is never
 # versioned and vanishes on the next clone.
 !docs/design-process-isolation.md
+!docs/design-pause-reading-mode.md
