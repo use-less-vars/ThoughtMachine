@@ -60,6 +60,13 @@ from agent.config.defaults import (
 WORKER_DEFAULT_MAX_RUNTIME_S: Optional[float] = None
 _NO_SESSION_KEY = "<no-session>"
 
+# Input-queue marker meaning ONLY "wake up and re-read the park flags".
+# A bare ``None`` in ``_input_queue`` keeps its unambiguous meaning: STOP.
+# The two were historically the same value, which made a leftover sentinel
+# consumed after ``resume()`` (that clears ``_pause_event``) read as STOP and
+# silently drop every query queued behind it.
+_PARK_SENTINEL: Any = object()
+
 
 def _stop_already_pending(thread: Any) -> bool:
     """True when *thread* has a stop request in flight.
@@ -1501,8 +1508,8 @@ class WorkerThread(threading.Thread):
             cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")
         except OSError:
             pass
-        # Unblock the input queue wait
-        self._input_queue.put(None)
+        # Unblock the input queue wait so the park flags are re-read.
+        self._input_queue.put(_PARK_SENTINEL)
 
     def kill(self) -> None:
         """Terminate the worker: signal the run loop to exit and reclaim it.
@@ -1601,7 +1608,7 @@ class WorkerThread(threading.Thread):
         except OSError:
             pass
         # Unblock the input queue wait so it can check the pause event
-        self._input_queue.put(None)
+        self._input_queue.put(_PARK_SENTINEL)
 
     def resume(self) -> bool:
         """Resume a paused worker.
@@ -1694,7 +1701,7 @@ class WorkerThread(threading.Thread):
         Used when a submission cannot be completed after it was enqueued (the
         job registry refused the record), so the query is neither left behind
         as an orphan nor reported as accepted. Surviving entries \u2014 including
-        ``None`` sentinels \u2014 keep their original order. Never raises.
+        ``None``/park markers \u2014 keep their original order. Never raises.
         """
         if job_id is None:
             return
@@ -1874,7 +1881,7 @@ class WorkerThread(threading.Thread):
                 self.status = "detached"
                 self._write_status_file()
                 self._set_detached_registration(True)
-                self._input_queue.put(None)
+                self._input_queue.put(_PARK_SENTINEL)
             elif action == "kill":
                 # PHASE 2.1a: a cross-process 'kill' TERMINATES.  'stop' only
                 # detaches, so this is the sole terminating signal.  Delegate
@@ -1886,7 +1893,7 @@ class WorkerThread(threading.Thread):
             elif action == "pause":
                 cmd_path.unlink(missing_ok=True)
                 self._pause_event.set()
-                self._input_queue.put(None)
+                self._input_queue.put(_PARK_SENTINEL)
             elif action == "resume":
                 # Resume while a pause is pending (or a leftover from an
                 # earlier REST resume): cancel the pause so the worker keeps
@@ -2644,11 +2651,13 @@ class WorkerThread(threading.Thread):
                     continue
                 if self._stop_event.is_set():
                     break
-                if raw is None:
-                    # A bare None normally means stop, but when a pause was
-                    # requested while the worker is idle it must NOT terminate
-                    # the worker: honor the pause here instead of treating the
-                    # sentinel as a stop signal (BUG 1).
+                if raw is _PARK_SENTINEL or raw is None:
+                    # ``_PARK_SENTINEL`` means "wake and re-read the flags" and
+                    # nothing else; a bare ``None`` keeps its unambiguous
+                    # meaning: STOP.  Both used to be a bare ``None``, so a
+                    # leftover wake-up marker consumed after ``resume()`` had
+                    # already cleared ``_pause_event`` read as STOP and broke
+                    # the loop with work still queued (BUG 1).
                     if self._pause_event.is_set():
                         # PHASE 2.1a: a park entered because of a detach
                         # reports 'detached', not 'paused'.
@@ -2724,8 +2733,8 @@ class WorkerThread(threading.Thread):
                                 global_event_bus.publish(evt)
                             except Exception:
                                 pass
-                        # Drain stale None/unblock signals left by pause() so
-                        # they are not misinterpreted as stop signals.
+                        # Drain stale park markers / None unblock signals left
+                        # by pause() so they are not mistaken for a stop.
                         # PHASE 2.1b: the surviving (real) items are re-appended
                         # in their ORIGINAL order.  Re-putting only the first
                         # one would send it to the TAIL and break the strict
@@ -2734,12 +2743,17 @@ class WorkerThread(threading.Thread):
                         try:
                             while True:
                                 item = self._input_queue.get_nowait()
-                                if item is not None:
+                                if item is not None and item is not _PARK_SENTINEL:
                                     leftover.append(item)
                         except queue.Empty:
                             pass
                         for item in leftover:
                             self._input_queue.put(item)
+                        continue
+                    if raw is _PARK_SENTINEL:
+                        # A stale wake-up marker: ``resume()`` already cleared
+                        # ``_pause_event``, so this is a no-op -- NOT a stop
+                        # and NOT an immediate re-park.  Discard and continue.
                         continue
                     # Bare None with no pause and no stop event is the legacy
                     # stop sentinel. Preserve that contract.
@@ -2985,8 +2999,8 @@ class WorkerThread(threading.Thread):
                         except Exception:
                             pass
 
-                    # Drain stale None/unblock signals from input queue.
-                    # These are left behind by pause() or _poll_command()
+                    # Drain stale park markers / None unblock signals from the
+                    # input queue.  These are left behind by pause() or _poll_command()
                     # when the worker was busy in _run_tool_loop.  Without
                     # this drain, the main loop interprets them as stop
                     # signals (line 1172) and exits immediately after resume.
@@ -2997,7 +3011,7 @@ class WorkerThread(threading.Thread):
                     try:
                         while True:
                             item = self._input_queue.get_nowait()
-                            if item is not None:
+                            if item is not None and item is not _PARK_SENTINEL:
                                 leftover.append(item)
                     except queue.Empty:
                         pass
@@ -4467,15 +4481,15 @@ class Worker(ToolBase):
                 if isinstance(self.context, dict)
                 else str(self.context or "")
             )
-            # Drain stale None signals left by pause() in the input queue.
-            # If a real query was queued by someone else, keep it — but the
+            # Drain stale park markers / None signals left by pause() in the
+            # input queue.  If a real query was queued by someone else, keep it — but the
             # NEW spawn query runs FIRST (F4 FIFO): it is enqueued before the
             # stale item, which is re-queued at the tail and processed after.
             stale_query = None
             try:
                 while True:
                     item = resume_paused_worker._input_queue.get_nowait()
-                    if item is not None:
+                    if item is not None and item is not _PARK_SENTINEL:
                         stale_query = item
                         break
             except queue.Empty:
