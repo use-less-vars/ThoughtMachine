@@ -389,22 +389,89 @@ class AgentState:
         events.extend(self.set_session_state(SessionState.NEW))
         return events
 
+    def restrict(self, reason: str) -> bool:
+        """Enter restricted mode, attributing it to `reason`.
+
+        `reason` must be a non-empty string ('token', 'turn', 'timeout',
+        'pause', ...). It is what get_allowed_tools() keys the allow-list
+        off, so a falsy or blank reason is rejected with ValueError rather
+        than left unattributable.
+
+        Returns True only when the state actually changed. This is
+        last-writer-wins: a repeat call with the same reason is a no-op
+        (returns False), a different reason re-attributes the restriction
+        (returns True).
+
+        Safe to call from another thread: no lock is taken, each attribute
+        write is individually atomic and every reader tolerates the
+        intermediate mixture. Correctness under concurrent use comes from
+        ownership on clear, not from mutual exclusion -- see
+        clear_restriction().
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError('restrict() requires a non-empty reason string')
+        was_active = bool(getattr(self, 'restrictions_active', False))
+        was_reason = getattr(self, 'restriction_reason', None)
+        already = was_active and was_reason == reason
+        self.restrictions_active = True
+        self.restrictions_pending = False
+        self.restriction_reason = reason
+        return not already
+
+    def clear_restriction(self, reason: Optional[str] = None) -> bool:
+        """Leave restricted mode, optionally only if `reason` owns it.
+
+        Without `reason` the restriction is cleared unconditionally -- the
+        owner-agnostic exit. With `reason` it is only cleared when
+        `restriction_reason` matches, so a subsystem that pauses the agent
+        can never release a token/timeout restriction it does not own.
+
+        Returns True only when it actually cleared the restriction; False
+        when the state was already idle or when the restriction belongs to
+        a different reason.
+
+        Safe to call from another thread: no lock is taken, each attribute
+        write is individually atomic, and ownership-on-clear is exactly
+        what stops one caller from clobbering another's restriction.
+        """
+        was_active = bool(getattr(self, 'restrictions_active', False))
+        was_pending = bool(getattr(self, 'restrictions_pending', False))
+        was_reason = getattr(self, 'restriction_reason', None)
+        if not was_active and not was_pending and was_reason is None:
+            return False
+        if reason is not None and was_reason != reason:
+            return False
+        self.restrictions_active = False
+        self.restrictions_pending = False
+        self.restriction_reason = None
+        return True
+
     def get_allowed_tools(self) -> List[str]:
         """Get list of allowed tool names based on current states.
 
-        When restrictions_active is True, tool access is limited based on reason:
+        Returns an empty list when the state is unrestricted (callers treat
+        an empty allow-list as "no restriction"). When restrictions_active
+        is True the allow-list is chosen strictly by restriction_reason:
+
         - 'turn': Only Respond is allowed (agent must finish immediately).
         - 'timeout': Only Respond is allowed (agent exceeded runtime limit).
-        - 'token': Respond + SummarizeTool allowed (SummarizeTool needed to reduce context).
+        - 'pause': Only Respond is allowed (externally paused; wait it out).
+        - 'token': Respond + SummarizeTool allowed (SummarizeTool needed to
+          reduce context).
+        - anything else (unknown, None, empty string): Only Respond.
+
+        The final branch is a fail-safe: an unattributable reason must never
+        grant a broader allow-list than the narrowest one, otherwise a
+        misspelled or future reason would silently re-enable tool access.
         """
-        if self.restrictions_active:
-            if self.restriction_reason == 'timeout':
-                return ['Respond']
-            if self.restriction_reason == 'turn':
-                return ['Respond']
-            # 'token' — allow SummarizeTool so agent can reduce context size
+        if not getattr(self, 'restrictions_active', False):
+            return []
+        reason = getattr(self, 'restriction_reason', None)
+        if reason == 'token':
             return ['Respond', 'SummarizeTool']
-        return []
+        # 'timeout', 'turn', 'pause' and every unrecognised reason: fail safe
+        # to Respond-only rather than assuming the token allow-list.
+        return ['Respond']
 
     def is_tool_allowed(self, tool_name: str) -> bool:
         """Check if a specific tool is allowed in current state."""
