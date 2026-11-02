@@ -773,23 +773,27 @@ a cross-process reaper today cannot distinguish *busy* from *dead*.
    `:2294`, so the decision is reproducible from the container alone even if the state
    directory was wiped.
 
-### Liveness vs abandonment (two clocks, not one)
+### Liveness vs abandonment (one reap TTL, two strikes)
 
 | verdict | condition | clock |
 |---|---|---|
 | **LIVE** | `heartbeat.json` younger than `3 × HEARTBEAT_INTERVAL_S` = 90 s | none — never reaped |
 | **LIVE (wedged)** | owner pid alive with matching `boot_id`, heartbeat stale | none — a wedged owner is `PeriodicStaleCheck`'s job (`worker_manager.py:151`, `HEARTBEAT_STALE_AFTER_S` 600 s `defaults.py:43`) |
-| **ABANDONED** | pid gone, or `boot_id` mismatch, or no heartbeat for `ORPHAN_ABANDON_AFTER_S` = 600 s (= `WORKER_TIMEOUT_SECONDS`, `defaults.py:61`) | starts at the last heartbeat |
-| **ORPHAN (reapable)** | ABANDONED **and** `ORPHAN_REAP_AFTER_S` = 3600 s since the last heartbeat **and** confirmed on two consecutive sweeps | reap |
+| **ABANDONED** | pid gone, or `boot_id` mismatch, or no heartbeat for `ORPHAN_REAP_AFTER_S` = 3600 s | starts at the last heartbeat |
+| **ORPHAN (reapable)** | ABANDONED **and** confirmed on two consecutive sweeps | reap |
 
-Why 600 s for abandonment: it equals the worker ceiling, so a merely slow worker can never be
-reaped — the same reasoning that made `HEARTBEAT_STALE_AFTER_S = 600` (`defaults.py:43`) safe
-in-process. Why 3600 s to actually reap: 6× the ceiling, four times the 900 s
-exited-ephemeral TTL (`container_manager.py:5400`), and far below the 86400 s record
-retention (`server.py:519-521`), so a reaped container's record is still inspectable. These
-are policy numbers; what must hold is the *shape* — one generous clock for "is it slow?", one
-stricter one for "is it ours to delete?". A single TTL conflates the two and is how reapers
-delete live workers during a GC pause.
+Why 3600 s: it is the operator's deliberate default — 1 h is the human patience budget, not
+a number derived from the worker ceiling. Nobody can possibly still be waiting on a worker
+whose heartbeat is an hour old, and every in-process stall (a queued container operation, a
+stalled `docker` daemon, a long GC pause) finishes far sooner than that, so 3600 s cannot reap
+a live worker. The earlier form derived a 600 s abandonment floor from
+`WORKER_TIMEOUT_SECONDS` (`defaults.py:61`); the ceiling is a *turn* budget and far too short
+to carry a *delete* authority, so it no longer feeds this clock. 3600 s is also four times the
+900 s exited-ephemeral TTL (`container_manager.py:5400`) and far below the 86400 s record
+retention (`server.py:519-521`), so a reaped container's record is still inspectable. One
+clock, not two: the TTL is the delete authority and the second sample is the only extra guard.
+A second, stricter clock buys no safety once the first already sits an hour past any plausibly
+live worker — it only adds a way to reap early.
 
 The second-sample rule mirrors the existing precedent, `cleanup_stale_worker_containers`
 (`:5183-5193`): *unknown never falls to reap*.
@@ -822,7 +826,7 @@ deployment change, not a design one; it is out of scope here.
 | `dry_run` | as above | compute only | as above | nothing | counts only — same pattern as `sweep_exited_workspace_containers(..., dry_run=True)` (`:5345`) |
 
 Knobs, named to match the existing family (`server.py:509`, `:519`, `:613`):
-`THOUGHTMACHINE_ORPHAN_WORKER_REAP_AFTER_S` (3600) and
+`THOUGHTMACHINE_ORPHAN_WORKER_REAP_AFTER_S` (3600 — 1 h, the operator's deliberate default) and
 `THOUGHTMACHINE_ORPHAN_WORKER_DRY_RUN` (0). Rollout: dry-run for one release, then armed.
 
 ### Blast radius
@@ -836,7 +840,7 @@ Knobs, named to match the existing family (`server.py:509`, `:519`, `:613`):
   tests, a liveness truth table over (pid alive, pid dead, boot-id mismatch, heartbeat
   fresh/stale), a two-strike test, and a "detached orphan is never reaped" test.
 - Risk: **medium** — the reaper deletes live-looking containers. Every mitigation is cheap
-  and mandatory: two strikes, a 600 s abandonment floor, heartbeat-based (not
+  and mandatory: two strikes, a 3600 s (1 h) reap TTL, heartbeat-based (not
   timestamp-based) liveness, the detached exemption, and a dry-run rollout.
 
 ---
@@ -1553,3 +1557,5 @@ revision.
     chained-query bullet no longer implies that a submission resumes a worker, and the
     tool's `target` parameter no longer advertises `http(s)://`.
 11. **Q2A–Q2D added in this pass (2026-11-02), and two of this document's own prior assumptions corrected.** Q2's Option A above is preserved intact, but it is only half the answer: keeping the timeout terminal and putting a hard deadline on every blocking Docker SDK call both act *inside* the worker process, so they need a cross-process cancellation token to be reachable from the panel (Q2B), a reaper for the cases the process cannot act on because it is the thing that died (Q2C), and a bounded cascade so each layer stops waiting on the layer below (Q2D). Stating Option A alone would have implied the problem closes in-process. The same pass records two factual corrections. (a) **A periodic sweep loop already exists** — `web_ui/backend/server.py:613-614` (`THOUGHTMACHINE_CONTAINER_SWEEP_INTERVAL_S`, 300 s), `_periodic_container_sweep_loop` `:709-728`, `_run_container_sweeps` `:676-707`, started at `:1043-1048` — so Q2C adds a fourth entry to that loop instead of a second scheduler. An earlier draft of Q2C assumed the sweeps were startup-only and would have duplicated it; the reuse map in Q2C is the result. (b) The stale-check watchdog class is `PeriodicStaleCheck` (`tools/workspace/worker_manager.py:107`), not `PeriodicStaleChecker`, and the appendix row 7 citation is corrected from `:130-145` to `:107` accordingly.
+12. **Q2C's reaper TTL corrected to 3600 s on an operator ruling (this pass).** Q2C originally derived a 600 s abandonment floor from `WORKER_TIMEOUT_SECONDS` (`agent/config/defaults.py:61`) and then reaped at 3600 s — a two-clock scheme. The operator ruling replaces it: the orphan reaper's default TTL is **1 h (3600 s)**, deliberately chosen ("nobody can possibly still be waiting after an hour") rather than derived from the worker ceiling, so the verdict table now has one clock — `ORPHAN_REAP_AFTER_S` = 3600 s — with the two-consecutive-sweeps confirmation retained as the only additional guard, and the section's former "one generous clock for is-it-slow, one stricter one for is-it-ours-to-delete" rationale is retired along with the 600 s floor it justified. Unrelated 600 s values are deliberately untouched because they are different mechanisms: the turn ceiling (Q2A), the in-process `HEARTBEAT_STALE_AFTER_S = 600` shown in the "LIVE (wedged)" row, `EXEC_KILL_GRACE`'s neighbouring build/exec timeouts, the parked/detached TTL (`worker_manager.py:179-205`), and the 900 s exited-ephemeral container TTL.
+
