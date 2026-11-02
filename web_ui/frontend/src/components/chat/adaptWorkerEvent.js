@@ -381,12 +381,18 @@ export default function adaptWorkerEvent(evt) {
         is_system_notification: true,
       }
 
+    // stopped / paused / resumed describe a TRANSIENT state change, not
+    // conversation content: they are flagged `client_only` so the transcript
+    // can render them as the ephemeral bubble family (muted, dashed) instead
+    // of the enclosed, persisted system-notice family. Worker events never
+    // reach receiveConversationChanged(), so the flag has no store effect.
     case 'stopped':
       return {
         _id: eventId(evt),
         role: 'system',
         content: WORKER_STOPPED_TEXT,
         is_system_notification: true,
+        client_only: true,
       }
 
     case 'paused':
@@ -395,6 +401,7 @@ export default function adaptWorkerEvent(evt) {
         role: 'system',
         content: WORKER_PAUSED_TEXT,
         is_system_notification: true,
+        client_only: true,
       }
 
     case 'resumed':
@@ -403,6 +410,7 @@ export default function adaptWorkerEvent(evt) {
         role: 'system',
         content: WORKER_RESUMED_TEXT,
         is_system_notification: true,
+        client_only: true,
       }
 
     // ── Error ─────────────────────────────────────────────────────

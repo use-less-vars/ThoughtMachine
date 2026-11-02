@@ -81,6 +81,7 @@ from agent.config import AgentConfig
 from agent.config.provider_profile import ProviderManager
 from agent.config.service import create_agent_config_service
 from agent.controller import AgentController
+from agent.core.message import is_system_notice_text, make_system_notice
 from agent.logging import log
 
 # Import event system for security prompt forwarding
@@ -445,23 +446,6 @@ def _validate_workspace_id(workspace_id: Optional[str]) -> Optional[str]:
     return workspace_id
 
 
-def _worker_is_running_async_job(thread: Any) -> bool:
-    """Return True when *thread* is currently executing a submit_query (async) job.
-
-    Async jobs are enqueued by ``action='submit_query'`` as ``(job_id, query,
-    None)`` tuples; the run loop mirrors them onto ``_current_query_id`` (set)
-    while ``_current_reply_queue`` stays None (a synchronous ``send_query``
-    carries a private reply queue instead).  The ``status == "busy"`` guard
-    excludes idle workers whose ``_current_query_id`` is never reset between
-    queries, so only a worker that is actively running an async job is skipped.
-    """
-    return (
-        getattr(thread, "status", None) == "busy"
-        and getattr(thread, "_current_query_id", None) is not None
-        and getattr(thread, "_current_reply_queue", None) is None
-    )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -483,8 +467,8 @@ class WebAgentBridge:
 
         # Event primitives
         self._stop_event = threading.Event()
-        self._pause_event = threading.Event()
-        self._pause_event.set()          # start in "running" (not paused)
+        self._park_event = threading.Event()
+        self._park_event.set()          # start in "running" (not paused)
 
         # Query queue — the agent thread pulls from this
         self._query_queue: queue.Queue = queue.Queue()
@@ -1452,7 +1436,7 @@ class WebAgentBridge:
 
     @property
     def is_paused(self) -> bool:
-        return not self._pause_event.is_set()
+        return not self._park_event.is_set()
 
     @property
     def is_processing(self) -> bool:
@@ -1638,7 +1622,7 @@ class WebAgentBridge:
 
         # Reset primitives
         self._stop_event.clear()
-        self._pause_event.set()
+        self._park_event.set()
         self._running = True
         self._processing = False
 
@@ -1728,7 +1712,7 @@ class WebAgentBridge:
         else:
             if not self.is_running:
                 return
-            self._pause_event.clear()
+            self._park_event.clear()
             if self._agent is not None:
                 self._agent.request_pause()
         # Pause all workers for this session
@@ -1740,10 +1724,10 @@ class WebAgentBridge:
                     else:
                         sid, wname = key
                     if sid == self._session_id:
-                        if _worker_is_running_async_job(thread):
-                            log('INFO', 'server.bridge',
-                                f'Skip pause of worker {wname}: async job in progress')
-                            continue
+                        # Reading mode makes a pause safe even mid async job:
+                        # the worker's agent is restricted to Respond and
+                        # concludes its turn instead of being truncated, so
+                        # there is nothing to skip here any more.
                         try:
                             thread.pause()
                             log('INFO', 'server.bridge', f'Worker paused: {wname}')
@@ -1755,8 +1739,16 @@ class WebAgentBridge:
         if self._controller is not None:
             self._controller.resume()
         else:
-            self._pause_event.set()
+            self._park_event.set()
             if self._agent is not None:
+                # Resume is the owner-scoped release of the 'pause'-owned
+                # reading mode (enter_reading_mode()'s counterpart).  Tolerate
+                # doubles that predate the verb -- the legacy flag below is
+                # still the belt-and-braces clear the checkpoint reads.
+                try:
+                    self._agent.leave_reading_mode('pause')
+                except AttributeError:
+                    pass
                 self._agent._pause_requested = False
         # Resume all workers for this session
         if WORKER_BUS_AVAILABLE and _worker_registry is not None:
@@ -1784,39 +1776,17 @@ class WebAgentBridge:
                             else:
                                 log('INFO', 'server.bridge', f'Worker resumed: {wname}')
 
-    def _stop_session_workers(self) -> int:
-        """Terminate (KILL) every worker thread of THIS session.
+    def _count_session_workers(self) -> int:
+        """Count the live worker threads of THIS session (read-only).
 
-        PHASE 2.1a: STOP means DETACH, so this cascade must NOT call
-        ``thread.stop()`` -- that would leave the worker parked and alive,
-        still holding its containers, and the Session Stop would no longer
-        terminate the session's work. It calls ``thread.kill()`` instead, the
-        only termination path.
-
-        Worker sub-agents are children of the session, not of the parent's
-        current turn: unless something stops them here they outlive the Stop
-        button and keep consuming tokens and containers in the background.
-
-        Fail-closed on a missing session id: without an id there is no way to
-        tell our workers from another session's, and stopping nothing is the
-        only safe answer (the same rule ``WorkerRegistry.shutdown_workers``
-        enforces).
-
-        The registry is snapshotted under ``_registry_lock`` and the lock is
-        RELEASED before any ``thread.kill()`` is called: a worker's own kill
-        path writes status/command files and touches the registry, so calling
-        into the worker while holding that lock would deadlock against it.
-
-        Returns the number of workers asked to terminate.
+        Stop is turn-scoped: it never touches workers, but the operator log must
+        say how many were deliberately left running.
         """
         if not (WORKER_BUS_AVAILABLE and _worker_registry is not None
                 and _registry_lock is not None):
             return 0
         session_id = self._session_id
         if not session_id:
-            log('WARNING', 'server.bridge',
-                'request_stop(): no session id on this bridge — worker stop '
-                'cascade skipped (stopping nothing rather than every session)')
             return 0
 
         targets: List[Tuple[str, Any]] = []
@@ -1829,8 +1799,12 @@ class WebAgentBridge:
                 if sid == session_id:
                     targets.append((wname, thread))
 
-        stopped = 0
-        for wname, thread in targets:
+        # Counted OUTSIDE the lock: is_alive()/status may read status files and
+        # touch the registry, so they must never run while holding
+        # _registry_lock.  This method is strictly read-only -- it never stops,
+        # detaches or kills a worker.
+        running = 0
+        for _wname, thread in targets:
             if thread is None:
                 continue
             is_alive = getattr(thread, 'is_alive', None)
@@ -1840,39 +1814,54 @@ class WebAgentBridge:
                         continue
                 except Exception:
                     pass
-            # Already terminal or already stopping: kill() is not idempotent
-            # (it re-publishes WORKER_STOPPING and re-terminates tracked
-            # executions), so a second Stop press must not re-kill a worker
-            # that is on its way out.
-            if getattr(thread, 'status', None) in ('killed', 'stopping', 'stopped'):
+            if getattr(thread, 'status', None) in ('killed', 'stopping', 'stopped', 'detached'):
                 continue
-            kill_worker = getattr(thread, 'kill', None)
-            if not callable(kill_worker):
-                continue
-            try:
-                # Termination, not detach (PHASE 2.1a: stop() would only park
-                # the worker and it would outlive the Session Stop).
-                kill_worker()
-                stopped += 1
-                log('INFO', 'server.bridge', f'Worker killed by request_stop(): {wname}')
-            except Exception as exc:
-                log('WARNING', 'server.bridge', f'Failed to kill worker {wname}: {exc}')
-        if stopped:
-            log('INFO', 'server.bridge',
-                f'request_stop(): {stopped} worker(s) terminated for session {session_id}')
-        return stopped
+            running += 1
+        return running
+
+    def _interrupt_agent_turn(self) -> bool:
+        """Set the main agent's CURRENT-TURN cancellation token, if one is bound.
+
+        This is the lever that reaches a tool which is already blocked (a
+        container/code-execution wait polls its turn token between wait slices).
+        The token is set directly rather than through
+        ``tools.cancellation.interrupt``, because that helper is per-THREAD and
+        this method runs on the BRIDGE thread while the turn runs on the agent
+        thread -- here we only hand the turn's own event over to its polling
+        sites, and record *why* on the event so the tool can report a reason.
+
+        Returns True when a token was actually set.
+        """
+        agent = getattr(self, '_agent', None)
+        event = getattr(agent, '_turn_cancel_event', None) if agent is not None else None
+        if event is None:
+            return False
+        try:
+            event.reason = 'stopped_by_operator'
+            event.set()
+        except Exception as exc:  # pragma: no cover - defensive
+            log('WARNING', 'server.bridge',
+                f'_interrupt_agent_turn(): could not set the turn token: {exc}')
+            return False
+        return True
 
     def request_stop(self) -> bool:
-        """Truncate the CURRENT TURN and keep the bridge thread and session alive.
+        """Truncate the CURRENT TURN only; the session and its workers live on.
 
-        This is the Stop-button path. For the PARENT it is deliberately narrow:
-        it asks the controller for a turn-level halt (the agent breaks out of the
-        stream, commits the partial assistant text it had already produced and
-        emits its 'interrupted' terminal), and touches nothing else — no
-        teardown, no '[STOP]', no thread join, no unregistration, no queued-config
-        drop. The session's worker sub-agents, however, ARE stopped: they are
-        children of the session, so leaving them running would mean the user's
-        Stop only stopped half the work.
+        This is the Stop-button path, and it is deliberately narrow: it asks the
+        controller for a turn-level halt (the agent breaks out of the stream,
+        commits the partial assistant text it had already produced and emits its
+        'interrupted' terminal), and touches nothing else -- no teardown, no
+        '[STOP]', no thread join, no unregistration, no queued-config drop.
+
+        Stop is TURN-scoped, never session-scoped: it deliberately does NOT
+        stop, detach or kill any worker of this session. Workers are stopped
+        only by the explicit worker routes -- ``POST /workers/stop_all`` or the
+        per-worker stop/kill endpoints. The one thing that reaches a worker
+        here is indirect and read-only-ish: a tool blocked in a Worker join
+        polls the MAIN agent's turn token between wait slices, so setting that
+        token unblocks it with ``status='interrupted'``; the job itself is NOT
+        cancelled and stays in the registry, retrievable after the turn.
 
         Contrast with :meth:`stop`, which is TEARDOWN: it shuts the controller
         down (and, on the legacy no-controller path, ends the bridge loop). Use
@@ -1882,16 +1871,24 @@ class WebAgentBridge:
         BEFORE the halt, since the halt itself clears that flag), so a caller can
         distinguish "a turn was halted" from "nothing was running".
         """
-        # Cascade first: the workers must stop whatever the parent path does,
-        # including the legacy no-controller path and the build whose controller
-        # predates request_halt().
-        workers_stopped = self._stop_session_workers()
+        # Reach the tool that may be blocked RIGHT NOW: container/code-execution
+        # waits poll the main agent's turn token between wait slices, so setting
+        # it is what actually ends an in-flight exec.  This touches only the
+        # main agent's token -- each worker owns its own, and workers are not
+        # stopped here at all.
+        turn_token_set = self._interrupt_agent_turn()
+
+        # Read-only accounting: Stop leaves every worker of this session
+        # running, but the operator log must say how many were left alone.
+        workers_left_running = self._count_session_workers()
 
         if self._controller is not None:
             busy = bool(getattr(self._controller, 'is_busy', False))
             log('INFO', 'server.bridge',
                 f'request_stop(): turn-level halt requested (busy={busy}, '
-                f'workers_stopped={workers_stopped}, session retained)')
+                f'workers_left_running={workers_left_running}, '
+                f'turn_token_set={turn_token_set}, session retained; '
+                f'workers stop only via /workers/stop_all)')
             request_halt = getattr(self._controller, 'request_halt', None)
             if not callable(request_halt):
                 log('WARNING', 'server.bridge',
@@ -1909,7 +1906,7 @@ class WebAgentBridge:
             'is unavailable — falling back to full teardown (_stop_event set, '
             'bridge loop exits)')
         self._stop_event.set()
-        self._pause_event.set()  # unblock if paused
+        self._park_event.set()  # unblock if paused
         return True
 
     def stop(self) -> None:
@@ -1924,7 +1921,7 @@ class WebAgentBridge:
             self._controller.stop()
             return
         self._stop_event.set()
-        self._pause_event.set()  # unblock if paused
+        self._park_event.set()  # unblock if paused
 
     # ── Query API ───────────────────────────────────────────────────────────
 
@@ -2416,10 +2413,9 @@ class WebAgentBridge:
             normalized.append(dict(msg))
 
         # ── post-processing: inject is_system_notification for frontend ──
-        from agent.core.message import SYSTEM_NOTIFICATION_PREFIX
         for m in normalized:
             if m.get("role") == "user" and isinstance(m.get("content"), str):
-                if m["content"].startswith(SYSTEM_NOTIFICATION_PREFIX):
+                if is_system_notice_text(m["content"]):
                     m["is_system_notification"] = True
                 else:
                     m.setdefault("is_system_notification", False)
@@ -2941,6 +2937,49 @@ class WebAgentBridge:
         })
         log('INFO', 'server.bridge', "Session cleared for fresh start")
 
+    def inject_system_notice(self, text: str, *, kind: str) -> bool:
+        """Append a system notice to the live conversation and broadcast it.
+
+        Used by callers that live outside the agent loop (the permission
+        routes) to surface a first-class notice in the conversation without
+        waiting for the next agent turn.
+
+        The row is built with ``make_system_notice`` -- role ``user``, flagged
+        ``is_system_notification`` and carrying ``metadata['kind'] == kind`` --
+        so every existing system-notice consumer treats it like a notice the
+        agent loop produced.  It is appended through the normal
+        ``Session.add_message`` path (which bumps ``conversation_version``) and
+        then pushed out as the usual ``conversation_changed`` snapshot.
+
+        Best-effort by contract: returns ``False`` when this tab holds no live
+        session to append to, and the append/broadcast share the existing
+        ``_session_state_lock`` so it cannot interleave with a turn-loop save
+        or an addendum write.  Never raises for missing state.
+        """
+        with self._session_state_lock:
+            session = self._session
+            if session is None:
+                session = self._loaded_session
+            if session is None:
+                log('DEBUG', 'server.bridge',
+                    f'inject_system_notice: no live session (kind={kind!r})')
+                return False
+
+            notice = make_system_notice(text, kind=kind)
+            session.add_message(
+                notice['role'],
+                notice['content'],
+                is_system_notification=notice['is_system_notification'],
+                metadata=notice['metadata'],
+            )
+            self._history_version = session.conversation_version
+            self._forwarder.broadcast(self._session_id, "conversation_changed", {
+                "messages": self._normalize_for_frontend(session.user_history),
+            })
+
+        log('INFO', 'server.bridge', f'injected system notice kind={kind!r}')
+        return True
+
     def _on_controller_event(self, event: Dict[str, Any]) -> None:
         """
         Callback registered with the controller via set_event_callback().
@@ -3081,7 +3120,7 @@ class WebAgentBridge:
             content = last.get('content', '') if hasattr(last, 'get') else ''
         except Exception:
             return False
-        if not isinstance(content, str) or not content.startswith('[SYSTEM NOTIFICATION]'):
+        if not isinstance(content, str) or not is_system_notice_text(content):
             return False
         return raw_message in content
 
@@ -3329,8 +3368,8 @@ class WebAgentBridge:
         try:
             while self._running and not self._stop_event.is_set():
                 # Check pause
-                if not self._pause_event.is_set():
-                    self._pause_event.wait(timeout=0.5)
+                if not self._park_event.is_set():
+                    self._park_event.wait(timeout=0.5)
                     continue
 
                 # Wait for a query
@@ -3371,7 +3410,7 @@ class WebAgentBridge:
                                 pass
 
                         # Check pause after each event
-                        if not self._pause_event.is_set():
+                        if not self._park_event.is_set():
                             break
 
                         # If the agent yielded a stop_reason, break

@@ -374,6 +374,27 @@ class ContainerExecTool(_ContainerControlBase):
                 workdir=self.workdir,
                 environment=self.environment,
             )
+            # A cancelled turn comes back from exec as an INTERRUPTED payload:
+            # the wait was abandoned, the in-container process was NOT killed.
+            # Surface it instead of reading exit_code=None as a normal exit.
+            if isinstance(result, dict) and result.get("status") == "interrupted":
+                return self._respond(
+                    False,
+                    status="interrupted",
+                    interrupted=True,
+                    exit_code=-3,
+                    reason=result.get("reason"),
+                    stdout=result.get("stdout", "") or "",
+                    stderr=result.get("stderr", "") or "",
+                    command=self.command,
+                    duration=time.time() - start_time,
+                    timed_out=False,
+                    error=(
+                        "Turn was cancelled while waiting for the command. The "
+                        "process inside the container was NOT killed and may "
+                        "still be running."
+                    ),
+                )
             timed_out = result["exit_code"] == -2
             fields = dict(
                 exit_code=result["exit_code"],

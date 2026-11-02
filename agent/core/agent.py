@@ -30,7 +30,7 @@ from llm_providers.exceptions import ProviderError, RateLimitExceeded
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
-from agent.core.message import Message
+from agent.core.message import Message, is_system_notice_text, make_system_notice
 from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
 from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
@@ -416,6 +416,10 @@ class Agent:
         self._paused = False
         self._should_reset = False
         self._pause_requested = False
+        # Reading mode: at most ONE pause nudge per turn.
+        self._pause_nudge_sent = False
+        # Stop: at most ONE stop notice per turn.
+        self._stop_notice_sent = False
         self.rate_limit_delay = 1.0
         self.rate_limit_base_wait = 10.0
         self.rate_limit_backoff_factor = 1.2
@@ -844,6 +848,7 @@ class Agent:
             self._paused = False
             self._pause_requested = False
             self._should_reset = False
+            self._pause_nudge_sent = False
 
             # Update config reference
             self.config = new_config
@@ -1054,7 +1059,7 @@ class Agent:
         content = message.get('content', '')
         is_sys_notif = message.get('is_system_notification', False)
         content_preview = content[:100]
-        if content.startswith('[SYSTEM NOTIFICATION]'):
+        if is_system_notice_text(content):
             if is_sys_notif is not True:
                 log('WARNING', 'core.validation', 'Flag inconsistency detected', {
                     'reason': 'missing is_system_notification flag',
@@ -1176,10 +1181,105 @@ class Agent:
         self.rate_limit_count = 0
         self.rate_limit_active = False
 
-    def request_pause(self):
-        """Request pause at the next atomic turn boundary."""
-        pause_debug(f'request_pause called, setting _pause_requested=True')
+    def enter_reading_mode(self, reason: str = 'pause') -> bool:
+        """Put the agent into reading mode: it concludes, it does not act.
+
+        This is what the Pause button calls. It does NOT stop, truncate or
+        interrupt the running turn -- the turn concludes itself. The turn
+        thread's pause checkpoint (see _apply_pause_reading_mode) notices the
+        restriction and nudges the model to wrap up with a Respond, and every
+        further tool call is refused by the executor, because
+        AgentState.get_allowed_tools() narrows the allow-list to ['Respond']
+        for the 'pause' reason. So the agent stops taking actions without the
+        turn being cut short.
+
+        CROSS-THREAD BOUNDARY: this runs on the bridge thread (Pause button)
+        or a worker's manager thread -- never on the agent's turn thread. It
+        therefore performs single atomic assignments only: the state
+        restriction plus the _pause_requested flag that makes the turn
+        thread's checkpoint fire. NO Message is constructed or appended here;
+        all message construction happens on the turn thread inside
+        _apply_pause_reading_mode().
+
+        Returns whatever AgentState.restrict() returned: True only when this
+        call changed the restriction, False when 'pause' was already in force.
+        """
+        changed = self.state.restrict(reason)
         self._pause_requested = True
+        pause_debug(f'enter_reading_mode({reason!r}) -> changed={changed}')
+        return changed
+
+    def leave_reading_mode(self, reason: str = 'pause') -> bool:
+        """Take the agent out of reading mode.
+
+        CROSS-THREAD BOUNDARY: same rule as enter_reading_mode() -- flags and
+        state attributes only, no message construction, no turn interaction.
+
+        The clear is OWNER-SCOPED: with the default reason='pause' only a
+        pause-owned restriction is released, so resuming a paused session can
+        never wipe a 'token'/'timeout'/'turn' restriction owned by the
+        monitors. Pass reason=None for the owner-agnostic clear.
+
+        Returns True only when this call actually released the restriction.
+        """
+        released = self.state.clear_restriction(reason)
+        if released:
+            self._pause_requested = False
+            self._pause_nudge_sent = False
+        pause_debug(f'leave_reading_mode({reason!r}) -> released={released}')
+        return released
+
+    def _apply_pause_reading_mode(self, tool_calls=None) -> None:
+        """Reading-mode checkpoint: nudge the model to conclude, never halt.
+
+        Runs ON THE TURN THREAD, after the LLM response has been received and
+        before the pending tool calls execute. When the active restriction is
+        owned by 'pause' it buffers at most one [System Notice: ...] message
+        asking the model to summarise and reply with Respond, then consumes
+        the pause request.
+
+        Delivery: the nudge is pushed onto _pending_warnings -- the very same
+        buffer the token/timeout/turn monitors use -- which the tool-execution
+        branch flushes after turn_transaction.commit(). The nudge therefore
+        lands in user_history AFTER the tool results and is part of the
+        messages the NEXT LLM iteration reads.
+
+        It deliberately does none of the following: no early return, no state
+        transition to PAUSING, no halt flag, no truncation of the turn, and no
+        hand-rejection of the pending tool calls (the executor refuses them
+        because of the restriction -- one rejection path, not two).
+
+        A restriction owned by anything other than 'pause' makes this a no-op:
+        the monitors own those and inject their own warnings.
+        """
+        if getattr(self.state, 'restriction_reason', None) != 'pause':
+            return
+        if not self._pause_nudge_sent and tool_calls:
+            nudge = make_system_notice(
+                'You were paused by the user. Do not start new work and do not call tools — '
+                'tool calls are refused. Summarize what you have done and what remains, then '
+                'reply with Respond. The session stays paused until it is resumed.',
+                kind='pause_nudge',
+                pause_nudge=True,
+            )
+            self._pending_warnings.append(nudge)
+            self._pause_nudge_sent = True
+            log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: reading-mode nudge buffered')
+        # Reading mode is in force, so there is nothing left to pause: consume
+        # the request. The turn keeps running and concludes with a Respond.
+        if self._pause_requested:
+            pause_debug('Consuming _pause_requested: reading mode is in force')
+            self._pause_requested = False
+
+    def request_pause(self):
+        """Request pause at the next atomic turn boundary.
+
+        Kept as a thin alias of enter_reading_mode() for existing callers
+        (tools/workspace/worker_thread.py, web_ui/backend/bridge.py). See
+        enter_reading_mode() for the actual semantics.
+        """
+        pause_debug(f'request_pause -> enter_reading_mode(pause)')
+        return self.enter_reading_mode('pause')
 
     def process_query(self, query):
         """Process a user query, appending it to conversation and running the agent.
@@ -1193,6 +1293,20 @@ class Agent:
         )
         self._emergency_retries = 0
         final_pending = False
+        # TURN CANCELLATION: this thread is about to run a turn, so it needs a
+        # token of its own.  Bind a FRESH event for the whole turn (binding also
+        # drops any stale reason, so the turn starts clear) and publish it on the
+        # agent, because the Stop button runs on the BRIDGE thread and needs a
+        # handle it can set.  Polling sites (container exec waits, sleep) only
+        # ever read this thread's binding.
+        _turn_cancel = threading.Event()
+        try:
+            from tools.cancellation import bind_turn_cancel
+            bind_turn_cancel(_turn_cancel)
+        except Exception as _cancel_exc:  # pragma: no cover - import guard
+            log('WARNING', 'core.agent',
+                f'process_query: turn-cancel binding unavailable: {_cancel_exc}')
+        self._turn_cancel_event = _turn_cancel
         try:
             log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
@@ -1258,6 +1372,8 @@ class Agent:
             self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
             pause_debug(f'Clearing _pause_requested (was {self._pause_requested})')
             self._pause_requested = False
+            self._pause_nudge_sent = False
+            self._stop_notice_sent = False
             current_exec_state = self.state.execution_state
             if current_exec_state == ExecutionState.RUNNING:
                 log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
@@ -1530,6 +1646,19 @@ class Agent:
                             halt_tx.commit_assistant_only()
                         else:
                             halt_tx.rollback()
+                        # The model has to learn WHY its stream vanished, or the
+                        # next turn resumes as if the answer had been finished.
+                        # This cannot go through _pending_warnings: every flush
+                        # site is behind the `return` below, so it is written
+                        # straight to history -- and only now, AFTER the partial
+                        # assistant message committed above, so the truncated
+                        # answer stays ahead of the notice that explains it.
+                        if not self._stop_notice_sent:
+                            self._add_to_conversation(make_system_notice(
+                                'You were stopped by the user. Review your current progress and resume.',
+                                kind='stop_notice',
+                            ))
+                            self._stop_notice_sent = True
                         self.total_input_tokens += input_tokens
                         self.total_output_tokens += output_tokens
                         interrupted_event = {
@@ -1687,40 +1816,16 @@ class Agent:
                 user_interaction_message = None
                 pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [2] after_llm: _pause_requested={self._pause_requested}, has_tool_calls={bool(tool_calls)}')
-                if self._pause_requested:
-                    if tool_calls:
-                        log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: DEFERRED (tool_calls present)')
-                        # Defer pause: tools need to execute first.
-                        # _pause_requested stays True -> checkpoint 2 (line ~998) will catch it
-                        # after tools have run and turn_transaction has been committed.
-                        pause_debug(f'Pause requested but tool_calls present, deferring to after tool execution')
-                    else:
-                        log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: DETECTED')
-                        pause_debug(f'Pause detected! Transitioning to PAUSING')
-                        # Save grace turn: commit LLM response to user_history BEFORE yielding pause
-                        assistant_msg = {'role': 'assistant', 'content': content}
-                        if reasoning is not None:
-                            assistant_msg['reasoning_content'] = reasoning
-                        elif tool_calls:
-                            assistant_msg['reasoning_content'] = ''
-                        # Don't include tool_calls — they weren't executed
-                        grace_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
-                        grace_tx.add_assistant_message(assistant_msg)
-                        grace_tx.commit()
-                        events = self.state.set_execution_state(ExecutionState.PAUSING)
-                        for event in events:
-                            for yielded_event in self._handle_state_event(event):
-                                yield yielded_event
-                        pause_debug(f'Clearing _pause_requested after pause')
-                        self._pause_requested = False
-                        pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
-                        self._add_conversation_data_to_event(pause_event)
-                        yield pause_event
-                        turn_duration = time.time() - turn_start_time
-                        if self.logger:
-                            self.logger.log_system_resources()
-                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                        return
+                # READING MODE (pause): the turn is never halted or truncated
+                # here. If a pause is in force the helper buffers a one-shot
+                # nudge telling the model to wrap up with Respond. The tool
+                # calls below are still handed to the executor, which refuses
+                # them because the state restriction limits the allow-list to
+                # ['Respond']. The old "defer until the tools have executed"
+                # branch is gone -- with reading mode there is nothing to
+                # defer to, and the old no-tool-calls branch is gone too: that
+                # turn was already concluding.
+                self._apply_pause_reading_mode(tool_calls)
                 turn_transaction = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
                 assistant_msg = {'role': 'assistant', 'content': content}
                 if reasoning is not None:
@@ -1864,23 +1969,17 @@ class Agent:
                         return
                 pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [3] after_turn: _pause_requested={self._pause_requested}')
-                if self._pause_requested:
-                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [3] after_turn: DETECTED')
-                    pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING')
-                    events = self.state.set_execution_state(ExecutionState.PAUSING)
-                    for event in events:
-                        for yielded_event in self._handle_state_event(event):
-                            yield yielded_event
-                    pause_debug(f'Clearing _pause_requested after pause (after turn processing)')
-                    self._pause_requested = False
-                    pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
-                    self._add_conversation_data_to_event(pause_event)
-                    yield pause_event
-                    turn_duration = time.time() - turn_start_time
-                    if self.logger:
-                        self.logger.log_system_resources()
-                        self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                    return
+                # A pause that arrived WHILE the tools were executing used to
+                # truncate the turn here (PAUSING + 'paused' event + return).
+                # It is the same reading mode as checkpoint [2]: one nudge to
+                # conclude with a Respond, and the turn runs on. Checkpoint
+                # [2]'s flush point (after the turn commit) is already behind
+                # us, so the nudge is flushed inline; that flush also cleared
+                # _pending_warnings, so only the helper's nudge can be in it.
+                self._apply_pause_reading_mode(tool_calls)
+                for warning in self._pending_warnings:
+                    self._add_to_conversation(warning)
+                self._pending_warnings.clear()
                 if not tool_calls:
                     log('DEBUG', 'core.agent', f'No tool calls in turn {turn}, committing directly and yielding final')
                     if turn_transaction and turn_transaction.has_assistant_message():
@@ -1944,6 +2043,15 @@ class Agent:
             yield max_turns_event
             return
         finally:
+            # TURN CANCELLATION: the turn is over.  Drop this thread's binding and
+            # the published handle, so a Stop that arrives after the turn cannot
+            # latch an event nobody polls (the next turn binds a fresh one).
+            try:
+                from tools.cancellation import unbind
+                unbind()
+            except Exception:
+                pass
+            self._turn_cancel_event = None
             self.state.execution_state = ExecutionState.READY
             log('DEBUG', 'core.agent', 'process_query finished, reset execution_state to READY')
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):

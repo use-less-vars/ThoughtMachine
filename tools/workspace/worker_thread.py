@@ -27,6 +27,14 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 from pydantic import Field, field_validator
 
 from tools.base import ToolBase
+from tools.workspace.command_channel import (
+    CommandFence,
+    claim_command,
+    discard,
+    fence_rejection_reason,
+    quarantine,
+    write_command,
+)
 
 try:
     from agent.logging import log
@@ -64,7 +72,7 @@ _NO_SESSION_KEY = "<no-session>"
 # Input-queue marker meaning ONLY "wake up and re-read the park flags".
 # A bare ``None`` in ``_input_queue`` keeps its unambiguous meaning: STOP.
 # The two were historically the same value, which made a leftover sentinel
-# consumed after ``resume()`` (that clears ``_pause_event``) read as STOP and
+# consumed after ``resume()`` (that clears ``_park_event``) read as STOP and
 # silently drop every query queued behind it.
 _PARK_SENTINEL: Any = object()
 
@@ -1129,8 +1137,18 @@ class WorkerThread(threading.Thread):
         self._input_queue: queue.Queue = queue.Queue()
         self._output_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
-        self._pause_event = threading.Event()
+        # PARK primitive (driven by detach()/resume()) -- deliberately NOT the user-facing pause
+        self._park_event = threading.Event()
         self._resume_event = threading.Event()
+        # Per-WORKER, per-TURN cancellation token -- a THIRD, distinct signal:
+        #   _stop_event   = terminal kill latch (never cleared; guards resume)
+        #   _park_event  = park flag (driven by detach()/resume())
+        #   _turn_cancel  = in-flight cancellation token consulted by tools
+        # Cleared at the start of EVERY query, set on graceful stop (detach() /
+        # cross-process 'stop') and on kill().  Bound to the executing tool
+        # thread (tools.sleep_tool.bind_turn_cancel) so a tool sees only its own
+        # worker's token: one worker's kill can never cancel another's tool.
+        self._turn_cancel = threading.Event()
         # PHASE 2.1b: ordered bookkeeping for the per-instance FIFO query
         # queue. ``_input_queue`` is the queue itself (already a FIFO with a
         # single query in flight, drained head-first); this deque mirrors the
@@ -1162,7 +1180,6 @@ class WorkerThread(threading.Thread):
         # acted on (an unknown action).  Lets _poll_command ignore a stray
         # command file without unlinking it -- an unlink there would race with
         # an operator writing the next real command.
-        self._ignored_command_digest: Optional[str] = None
 
     # ── public API called from the tool thread ─────────────────────
 
@@ -1495,8 +1512,13 @@ class WorkerThread(threading.Thread):
         self._write_status_file()
         self._detach_requested = True
         self._detached_at = time.time()
-        self._pause_event.set()
+        self._park_event.set()
         self._resume_event.clear()
+        # Graceful stop CANCELS the in-flight turn (a long-blocking tool must
+        # return instead of holding the park back) -- this is the "Stop now"
+        # signal, NOT termination: _stop_event stays clear so the worker can be
+        # resumed later.
+        self._turn_cancel.set()
         # Persist the context: a detached worker is expected to be revived
         # later, possibly by another process.
         try:
@@ -1515,12 +1537,13 @@ class WorkerThread(threading.Thread):
         self.status = "detached"
         self._write_status_file()
         self._publish_global_event(EventType.WORKER_STOPPING, {"status": "detached", "reason": "detach_requested"})
-        # Write a stop command file for cross-process signalling
-        try:
-            cmd_path = self._worker_dir / "command.json"
-            cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")
-        except OSError:
-            pass
+        # Write a STOP command for cross-process signalling.  Fenced: an
+        # unfenced payload is UNADDRESSED, and the consumer quarantines
+        # anything it cannot prove was meant for this incarnation, so the
+        # fence is what makes this signal deliverable at all.  Best effort --
+        # ``write_command`` reports failure through its return value and never
+        # raises, so a failed write cannot change the control flow of a detach.
+        write_command(self._worker_dir, "stop", self._fence())
         # Unblock the input queue wait so the park flags are re-read.
         self._input_queue.put(_PARK_SENTINEL)
 
@@ -1552,6 +1575,11 @@ class WorkerThread(threading.Thread):
         # being silently dropped or started on a dead instance.
         self.reject_queued_queries("killed")
         self._stop_event.set()
+        # Cancel THIS worker's in-flight turn so a long-blocking tool (e.g.
+        # ``sleep``) returns instead of waiting out the full block.  This is a
+        # per-worker token, not a process-global interrupt: killing this worker
+        # must never cancel another worker's tool call.
+        self._turn_cancel.set()
         # A killed worker is never revived: clear the detach markers so the
         # detached TTL sweep cannot revisit it, and lift the detached
         # registration so stale-container reaping resumes.
@@ -1612,14 +1640,22 @@ class WorkerThread(threading.Thread):
             except Exception as exc:
                 log("WARNING", "tools.worker",
                     f"WLM pause delegation failed for worker '{self.worker_name}': {exc}")
-        self._pause_event.set()
+        self._park_event.set()
         self._resume_event.clear()
-        # Write command file for cross-process signalling
-        try:
-            cmd_path = self._worker_dir / "command.json"
-            cmd_path.write_text(json.dumps({"action": "pause"}), encoding="utf-8")
-        except OSError:
-            pass
+        # Reading mode: a paused worker's agent must stop calling tools and
+        # conclude with a Respond, exactly like the main agent's Pause button.
+        # Guarded -- _agent is None before spawn and after teardown.
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            try:
+                agent.enter_reading_mode("pause")
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"enter_reading_mode failed for worker '{self.worker_name}': {exc}")
+        # Write a PAUSE command for cross-process signalling (fenced, for the
+        # same reason as stop(): an unaddressed payload is quarantined, and a
+        # best-effort return value never changes this method's control flow).
+        write_command(self._worker_dir, "pause", self._fence())
         # Unblock the input queue wait so it can check the pause event
         self._input_queue.put(_PARK_SENTINEL)
 
@@ -1649,17 +1685,26 @@ class WorkerThread(threading.Thread):
             except Exception as exc:
                 log("WARNING", "tools.worker",
                     f"WLM resume delegation failed for worker '{self.worker_name}': {exc}")
-        # Remove any stale pause command file left by pause() while the
-        # worker was busy (it would re-pause the worker on the next poll).
-        # This MUST happen before _pause_event.clear(): the pause park loop
-        # exits as soon as the event is cleared, so the file must already be
-        # gone before the worker can wake and poll it again.  Symmetric with
-        # stop()/pause() command file writes.
-        try:
-            (self._worker_dir / "command.json").unlink(missing_ok=True)
-        except OSError:
-            pass
-        self._pause_event.clear()
+        # Cancel any stale pause command left by pause() while the worker was
+        # busy (it would re-pause the worker on the next poll).  This MUST
+        # happen before _park_event.clear(): the pause park loop exits as soon
+        # as the event is cleared, so the channel must already be settled
+        # before the worker can wake and poll it again.  Symmetric with the
+        # stop()/pause() command writes.
+        #
+        # The old code UNLINKED the live command.json here.  That is now
+        # forbidden (the producer must never delete the live path -- it is
+        # exactly the read/unlink race), and claim-then-discard would be
+        # CONTENT-BLIND deletion: it would just as happily eat a pending
+        # 'kill' an operator wrote while this worker was busy.  So the stale
+        # pause is cancelled by the channel's own means instead: a fenced
+        # 'resume' command, which atomically REPLACES the pause (no window in
+        # which the channel is empty) and is idempotent -- the poller's
+        # 'resume' branch mirrors this method.  It is also fenced to THIS
+        # incarnation, so a leftover one is quarantined, never obeyed, by a
+        # future incarnation with a different epoch.
+        write_command(self._worker_dir, "resume", self._fence())
+        self._park_event.clear()
         self._resume_event.set()
         # UNIT C: the worker is now actually running again, so the manual-only
         # marker is stale.  Clear it so later queries/spawns do not treat this
@@ -1672,6 +1717,16 @@ class WorkerThread(threading.Thread):
         self._detach_requested = False
         self._detached_at = None
         self._set_detached_registration(False)
+        # Reading mode: release the 'pause'-owned restriction (owner-scoped, so a
+        # 'token'/'timeout'/'turn' restriction survives).  Only reached after the
+        # kill guard above, so a refused resume never lifts the restriction.
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            try:
+                agent.leave_reading_mode("pause")
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"leave_reading_mode failed for worker '{self.worker_name}': {exc}")
         self.status = "ready"
         self._write_status_file()
         return True
@@ -1863,102 +1918,178 @@ class WorkerThread(threading.Thread):
             "generation": self._generation,
         }
 
-    def _poll_command(self) -> None:
-        """
-        Check for a ``command.json`` file in the worker's directory.
+    def _fence(self) -> CommandFence:
+        """The identity fence every command addressed to THIS incarnation carries.
 
-        If found, the action is
-        ``"stop"``/``"kill"``/``"pause"``/``"resume"``: delete the file and
-        signal the corresponding event.  This enables cross-process control
-        (e.g. from the Web UI via the REST API).  PHASE 2.1a: ``"stop"``
-        DETACHES, ``"kill"`` is the only terminating action.
+        Built FRESH on every call and never cached in ``__init__``:
+        ``_generation`` is re-allocated on each spawn
+        (``_reset_for_new_generation``), so a cached fence would reject this
+        worker's own commands after the first reset.
+
+        ``epoch`` is ``_generation`` -- deliberately NOT a second counter. The
+        fence epoch has to BE the worker's real incarnation number, or commands
+        written by this very worker would be rejected by its own consumer.
         """
-        cmd_path = self._worker_dir / "command.json"
-        if not cmd_path.is_file():
+        return CommandFence(
+            session_id=self.session_id or "",
+            worker_name=self.worker_name,
+            instance_id=self.instance_id,
+            epoch=self._generation,
+        )
+
+    def _poll_command(self) -> None:
+        """Consume one command from this worker's fenced cross-process channel.
+
+        The channel is ``<workspace>/workers/<label>/command.json``. Every
+        payload written by ``command_channel.write_command`` carries a FENCE
+        (``session_id`` / ``worker_name`` / ``instance_id`` / ``epoch``) and the
+        worker obeys a command only when all four match :meth:`_fence` -- which
+        is re-derived from the live ``_generation`` on every poll, so a command
+        addressed to an older incarnation is refused rather than obeyed.
+
+        Two rules, and both of them are the point of ``command_channel``:
+
+        * NEVER read or unlink the LIVE path. The file is claimed first
+          (``claim_command`` ``os.replace``-s it to a private name), so a
+          command written the instant after a claim survives, untouched, for
+          the next poll: the read/unlink race that used to destroy commands is
+          gone by construction, and two consumers cannot both claim one command.
+        * NEVER DELETE a command this worker refuses. Every refusal path -- a
+          disagreeing fence, no fence, a malformed fence, corrupt JSON, an
+          unknown action -- quarantines the claimed file to
+          ``command.json.rejected-*`` and logs a WARNING. A refused command is
+          the only evidence that something addressed this worker and was not
+          obeyed, so it stays on disk for post-mortem.
+
+        A handled action is discarded and signalled. PHASE 2.1a: ``"stop"``
+        DETACHES, ``"kill"`` is the only terminating action.
+
+        The old ``_ignored_command_digest`` memo is GONE. It existed only
+        because this loop used to unlink the live path, which made any deletion
+        capable of destroying a command written in the read/unlink window --
+        hence "leave the stray file where it is and remember its digest so
+        re-polls are cheap". Claiming removes that threat entirely: the claimed
+        file is exclusively ours, so quarantining it can never destroy someone
+        else's write. A memo justified by a race that no longer exists is
+        misleading residue, and the channel now DRAINS instead of re-reading an
+        unactionable payload on every poll.
+        """
+        claim = claim_command(self._worker_dir)
+        if claim is None:
             return
+        claimed, payload = claim
+
         try:
-            payload = cmd_path.read_text(encoding="utf-8")
-            # An unknown action is deliberately NOT unlinked (deleting it would
-            # let the poller destroy a legitimate command written between the
-            # read above and the unlink -- the same read/unlink race the known
-            # actions already have, but here it would fire on EVERY poll while
-            # the stray file sits there).  Instead the payload is remembered by
-            # digest and re-polls are a no-op until its content changes.
-            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-            if digest == self._ignored_command_digest:
-                return
             data = json.loads(payload)
-            action = data.get("action")
-            if action == "stop":
-                # PHASE 2.1a: a cross-process 'stop' DETACHES.  It must not
-                # set _stop_event — the thread parks and stays revivable.
-                cmd_path.unlink(missing_ok=True)
-                self._detach_requested = True
-                self._detached_at = time.time()
-                self._pause_event.set()
-                self._resume_event.clear()
-                try:
-                    self._save_context()
-                except Exception:
-                    pass
-                # Same ORDERING INVARIANT as detach(): register first, then
-                # make "detached" observable.
-                self._set_detached_registration(True)
-                self.status = "detached"
-                self._write_status_file()
-                self._input_queue.put(_PARK_SENTINEL)
-            elif action == "kill":
-                # PHASE 2.1a: a cross-process 'kill' TERMINATES.  'stop' only
-                # detaches, so this is the sole terminating signal.  Delegate
-                # to WorkerThread.kill() so the stop event, the global
-                # WORKER_STOPPING publish, the tracked-execution teardown and
-                # the detach-registration cleanup all stay in one place.
-                cmd_path.unlink(missing_ok=True)
-                self.kill()
-            elif action == "pause":
-                cmd_path.unlink(missing_ok=True)
-                self._pause_event.set()
-                self._input_queue.put(_PARK_SENTINEL)
-            elif action == "resume":
-                # Resume while a pause is pending (or a leftover from an
-                # earlier REST resume): cancel the pause so the worker keeps
-                # running.  Mirrors WorkerThread.resume() semantics; without
-                # this the command.json would linger forever (no-op on every
-                # poll).  Events are thread-safe, so this is safe even if the
-                # blocked pause loop is waiting on _resume_event.
-                cmd_path.unlink(missing_ok=True)
-                self._pause_event.clear()
-                self._resume_event.set()
-                # Mirrors WorkerThread.resume(): the worker keeps running, so
-                # the manual-only marker is stale and must be cleared too.
-                self._manual_only_pause = False
-                # PHASE 2.1a: mirror WorkerThread.resume() (:1657-1663) -- a
-                # resumed worker is no longer detached, so the markers go and
-                # the registration is lifted BEFORE the park loop above
-                # reports "ready".  Clearing only _pause_event (as this branch
-                # used to) left a "ready" worker that the stale-container sweep
-                # still skipped as detached, forever.
-                self._detach_requested = False
-                self._detached_at = None
-                self._set_detached_registration(False)
-                self.status = "ready"
-                self._write_status_file()
-            else:
-                # Not a command this worker understands: ignore it WITHOUT
-                # unlinking it (see the digest guard at the top of this
-                # method), and remember its payload so the next poll -- and
-                # every poll until the file's content changes -- is a cheap
-                # digest comparison instead of a re-parse.
-                self._ignored_command_digest = digest
-                log("WARNING", "tools.worker",
-                    f"Ignoring unknown command action {action!r} for worker "
-                    f"'{self.worker_name}'")
-        except (json.JSONDecodeError, OSError):
-            # Corrupted file — delete and ignore
+        except json.JSONDecodeError:
+            # Corrupt payload: keep the evidence, obey nothing.
+            quarantine(claimed, "corrupt-json")
+            log("WARNING", "tools.worker",
+                f"Quarantined a corrupt (invalid JSON) command for worker "
+                f"'{self.worker_name}'")
+            return
+
+        reason = fence_rejection_reason(self._fence(), data)
+        if reason is not None:
+            # Unaddressed or wrongly-addressed payload. Obeying it is exactly
+            # the cross-talk bug this fence exists to prevent.
+            quarantine(claimed, reason)
+            log("WARNING", "tools.worker",
+                f"Rejected command for worker '{self.worker_name}' "
+                f"(instance_id={self.instance_id}): {reason}")
+            return
+
+        action = data.get("action")
+        if action == "stop":
+            # PHASE 2.1a: a cross-process 'stop' DETACHES.  It must not
+            # set _stop_event — the thread parks and stays revivable.
+            discard(claimed)
+            self._detach_requested = True
+            self._detached_at = time.time()
+            self._park_event.set()
+            self._resume_event.clear()
+            # Cross-process graceful stop: same turn-cancel signal as
+            # detach(), since this branch parks the worker inline.
+            self._turn_cancel.set()
             try:
-                cmd_path.unlink(missing_ok=True)
-            except OSError:
+                self._save_context()
+            except Exception:
                 pass
+            # Same ORDERING INVARIANT as detach(): register first, then
+            # make "detached" observable.
+            self._set_detached_registration(True)
+            self.status = "detached"
+            self._write_status_file()
+            self._input_queue.put(_PARK_SENTINEL)
+        elif action == "kill":
+            # PHASE 2.1a: a cross-process 'kill' TERMINATES.  'stop' only
+            # detaches, so this is the sole terminating signal.  Delegate
+            # to WorkerThread.kill() so the stop event, the global
+            # WORKER_STOPPING publish, the tracked-execution teardown and
+            # the detach-registration cleanup all stay in one place.
+            discard(claimed)
+            self.kill()
+        elif action == "pause":
+            discard(claimed)
+            self._park_event.set()
+            # Mirror WorkerThread.pause(): the parked worker's agent enters
+            # reading mode.  Deliberately duplicated instead of calling
+            # self.pause() -- that would rewrite command.json (re-pausing on
+            # the next poll) and re-delegate to the WLM.
+            p_agent = getattr(self, "_agent", None)
+            if p_agent is not None:
+                try:
+                    p_agent.enter_reading_mode("pause")
+                except Exception as exc:
+                    log("WARNING", "tools.worker",
+                        f"enter_reading_mode failed for worker '{self.worker_name}': {exc}")
+            self._input_queue.put(_PARK_SENTINEL)
+        elif action == "resume":
+            # Resume while a pause is pending (or a leftover from an
+            # earlier REST resume): cancel the pause so the worker keeps
+            # running.  Mirrors WorkerThread.resume() semantics; without
+            # this the command.json would linger forever (no-op on every
+            # poll).  Events are thread-safe, so this is safe even if the
+            # blocked pause loop is waiting on _resume_event.
+            discard(claimed)
+            self._park_event.clear()
+            self._resume_event.set()
+            # Mirrors WorkerThread.resume(): the worker keeps running, so
+            # the manual-only marker is stale and must be cleared too.
+            self._manual_only_pause = False
+            # PHASE 2.1a: mirror WorkerThread.resume() (:1657-1663) -- a
+            # resumed worker is no longer detached, so the markers go and
+            # the registration is lifted BEFORE the park loop above
+            # reports "ready".  Clearing only _park_event (as this branch
+            # used to) left a "ready" worker that the stale-container sweep
+            # still skipped as detached, forever.
+            self._detach_requested = False
+            self._detached_at = None
+            self._set_detached_registration(False)
+            # Mirror WorkerThread.resume(): release the 'pause'-owned
+            # reading-mode restriction (owner-scoped).  Duplicated rather
+            # than calling self.resume() -- that returns a bool, delegates
+            # to the WLM and would re-log a refusal path.
+            r_agent = getattr(self, "_agent", None)
+            if r_agent is not None:
+                try:
+                    r_agent.leave_reading_mode("pause")
+                except Exception as exc:
+                    log("WARNING", "tools.worker",
+                        f"leave_reading_mode failed for worker '{self.worker_name}': {exc}")
+            self.status = "ready"
+            self._write_status_file()
+        else:
+            # Not a command this worker understands.  Unchanged POLICY (do not
+            # obey it, do not delete it) but the mechanism changed with the
+            # claim: the payload has already been moved out of the live name,
+            # so "leave it there and memoise its digest" no longer describes
+            # anything real.  Quarantined like every other refusal, which both
+            # preserves the evidence and lets the channel drain.
+            quarantine(claimed, "unknown-action-%s" % (action,))
+            log("WARNING", "tools.worker",
+                f"Ignoring unknown command action {action!r} for worker "
+                f"'{self.worker_name}'")
 
     def _last_elapsed(self) -> Optional[float]:
         """Return elapsed seconds from the most recent query execution."""
@@ -2117,6 +2248,11 @@ class WorkerThread(threading.Thread):
         Iterates over all events yielded by the agent, logging heartbeats
         and checking the stop event. Returns the final response text.
         """
+        # One CLEAR per query: a cancel from a previous turn must never abort
+        # this one.  ``_stop_event`` is the terminal kill latch and is NOT
+        # touched here (a killed worker stays killed).
+        self._turn_cancel.clear()
+
         if self._agent is None:
             return json.dumps({"error": "Agent not initialized"})
 
@@ -2177,6 +2313,14 @@ class WorkerThread(threading.Thread):
         if WORKER_NAME_CONTEXTVAR is not None:
             _worker_ctx_token = WORKER_NAME_CONTEXTVAR.set(self.owner_identity)
 
+        # Bind THIS worker's turn token to the executing thread.  Tools run
+        # inline on this thread (agent/core/tool_executor.py:689), so binding at
+        # the turn boundary is the narrowest point that covers every tool call
+        # without touching the executor.
+        from tools.sleep_tool import bind_turn_cancel as _bind_turn_cancel
+        from tools.sleep_tool import unbind as _unbind_turn_cancel
+        _bind_turn_cancel(self._turn_cancel)
+
         try:
             for event in self._agent.process_query(query):
                                 # Fix 1.1B: Poll for stop command on every event
@@ -2214,7 +2358,7 @@ class WorkerThread(threading.Thread):
                     break
 
                 # Check pause signal
-                if self._pause_event.is_set():
+                if self._park_event.is_set():
                     self._agent.request_pause()
                     self.status = "paused"
                     self._write_status_file()
@@ -2395,6 +2539,7 @@ class WorkerThread(threading.Thread):
             logger.exception("Worker _run_tool_loop failed")
             final_content = json.dumps({"error": f"Worker execution failed: {exc}"})
         finally:
+            _unbind_turn_cancel()
             if _worker_ctx_token is not None and WORKER_NAME_CONTEXTVAR is not None:
                 WORKER_NAME_CONTEXTVAR.reset(_worker_ctx_token)
 
@@ -2702,9 +2847,9 @@ class WorkerThread(threading.Thread):
                     # nothing else; a bare ``None`` keeps its unambiguous
                     # meaning: STOP.  Both used to be a bare ``None``, so a
                     # leftover wake-up marker consumed after ``resume()`` had
-                    # already cleared ``_pause_event`` read as STOP and broke
+                    # already cleared ``_park_event`` read as STOP and broke
                     # the loop with work still queued (BUG 1).
-                    if self._pause_event.is_set():
+                    if self._park_event.is_set():
                         # PHASE 2.1a: a park entered because of a detach
                         # reports 'detached', not 'paused'.
                         self.status = "detached" if self._detach_requested else "paused"
@@ -2741,7 +2886,7 @@ class WorkerThread(threading.Thread):
                         self.current_task = None
                         self.last_heartbeat = datetime.now(timezone.utc).isoformat()
                         # Block until resumed (or stopped)
-                        while self._pause_event.is_set() and not self._stop_event.is_set():
+                        while self._park_event.is_set() and not self._stop_event.is_set():
                             # DEAF-PARK FIX: a parked worker must still notice
                             # cross-process control.  Without this poll a
                             # command.json 'kill' (the ONLY terminating action,
@@ -2813,7 +2958,7 @@ class WorkerThread(threading.Thread):
                         continue
                     if raw is _PARK_SENTINEL:
                         # A stale wake-up marker: ``resume()`` already cleared
-                        # ``_pause_event``, so this is a no-op -- NOT a stop
+                        # ``_park_event``, so this is a no-op -- NOT a stop
                         # and NOT an immediate re-park.  Discard and continue.
                         continue
                     # Bare None with no pause and no stop event is the legacy
@@ -2946,7 +3091,7 @@ class WorkerThread(threading.Thread):
                         pass
 
                 # Check if worker was paused during the tool loop
-                if self._pause_event.is_set():
+                if self._park_event.is_set():
                     # Preserve paused status — don't overwrite with "ready"
                     # PHASE 2.1a: a detach-requested park reports 'detached'.
                     self.status = "detached" if self._detach_requested else "paused"
@@ -3019,7 +3164,7 @@ class WorkerThread(threading.Thread):
                         self._emit_reply(reply)
 
                     # Block until resumed (or stopped)
-                    while self._pause_event.is_set() and not self._stop_event.is_set():
+                    while self._park_event.is_set() and not self._stop_event.is_set():
                         # DEAF-PARK FIX (same as the park loop above): poll for
                         # a cross-process command while parked, so 'kill'
                         # terminates and 'stop' detaches instead of both being
@@ -4783,13 +4928,16 @@ class Worker(ToolBase):
         # replacing it. This ensures worker conversation state persists across
         # spawn/query boundaries.
 
-        # ── Fix 1.1A: Clean up stale command.json before starting ──
-        # TODO(ticket): command.json carries no instance/id fence — a foreign
-        # stop (e.g. another session's worker sharing the directory) can race
-        # this spawn-time cleanup and re-issue a stop to the fresh thread.
-        cmd_path = thread._worker_dir / "command.json"
-        if cmd_path.exists():
-            cmd_path.unlink(missing_ok=True)
+        # -- Command channel: a stale command.json is left IN PLACE --
+        # There is deliberately no spawn-time cleanup here any more.  The
+        # TODO that used to sit at this spot ("command.json carries no
+        # instance/id fence") described the race the CommandFence closes:
+        # ``_generation`` is re-allocated for every spawn, so a command a
+        # PREVIOUS incarnation (or another session sharing the directory)
+        # wrote can never match the new epoch and is QUARANTINED by
+        # ``_poll_command`` on the first poll.  Unlinking it here would
+        # destroy the only evidence that a foreign writer addressed this
+        # worker -- and could delete a command that is mid-claim.
 
         # ── Fix 1 (P0.1): Double-checked locking for spawn concurrency ──
         # Re-check under lock before registering to prevent TOCTOU race:
@@ -5435,7 +5583,10 @@ class Worker(ToolBase):
         (completed / timeout / error), a partial result (status ``partial_result``
         + preview), the worker thread pausing (``status == 'paused'``) or being
         detached (``status == 'detached'``), a kill signal (stop_event set /
-        status ``killed``), or thread death.
+        status ``killed``), or thread death. Also returns early -- WITHOUT
+        cancelling the job -- when the caller's turn is cancelled: the token
+        bound to this tool thread is set, so the WAIT stops but the job stays
+        in the registry (``status == 'interrupted'``, ``interrupted == True``).
         """
         _JOB_TERMINAL = ("completed", "timeout", "error")
         job_id = (self.worker_query or "").strip()
@@ -5550,7 +5701,70 @@ class Worker(ToolBase):
                     "status": "timeout",
                     "note": f"Timed out after {total}s waiting for job; last known status: {last_status}.",
                 }
+            # Interruptible WAIT.  A cancel (detach()/kill()/cross-process
+            # 'stop') stops the WAIT only: the job keeps running and STAYS in
+            # the registry -- nothing here cancels or removes it.  With no
+            # token bound (tests, direct use) this never fires, so the
+            # full-timeout wait is unchanged.
+            cancelled, reason = self._join_cancel_check()
+            if cancelled:
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": reason,
+                    "last_status": last_status,
+                    "completed_jobs": self._join_completed_jobs(registry),
+                    "note": (
+                        "Wait interrupted; the job was NOT cancelled and remains in "
+                        f"the registry (last known status: {last_status})."
+                    ),
+                }
             time.sleep(0.25)
+
+    def _join_cancel_check(self) -> tuple:
+        """``(cancelled, reason)`` for the join poll loop.
+
+        Primary signal: the thread-local turn-cancel token bound by the
+        executing worker (``tools.sleep_tool.bind_turn_cancel``) -- the very
+        token that interrupts ``sleep``.  Secondary: an injected
+        ``agent_config['stop_check']`` probe, mirroring
+        ``Sleep._external_stop`` (normally absent: ``AgentConfig`` strips it).
+        """
+        from tools.sleep_tool import cancel_reason, is_interrupted
+        try:
+            if is_interrupted():
+                return True, cancel_reason() or "turn_cancelled"
+        except Exception:  # pragma: no cover - defensive
+            pass
+        cfg = self.agent_config or {}
+        probe = cfg.get("stop_check") if isinstance(cfg, dict) else None
+        if callable(probe):
+            try:
+                if probe():
+                    return True, "stop_check"
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return False, None
+
+    def _join_completed_jobs(self, registry) -> list:
+        """Jobs of this worker/instance already terminal when a join is interrupted."""
+        try:
+            jobs = registry.jobs(worker_name=self.worker_name or None, instance_id=self.instance_id)
+        except Exception:  # pragma: no cover - defensive
+            return []
+        return [
+            {
+                "job_id": r.get("job_id"),
+                "status": r.get("status"),
+                "completed_at": r.get("completed_at"),
+            }
+            for r in jobs
+            if r.get("status") in ("completed", "timeout", "error")
+        ]
 
     def _action_pause(self, workers: list) -> dict:
         """Pause the session's main agent and/or its workers (UNIT C, v2).

@@ -191,7 +191,18 @@ class SessionLifecycle:
             raise
 
     def pause_session(self):
-        """Request pause of current session."""
+        """Request pause of current session.
+
+        Pause is READING MODE, not a halt: the controller puts the agent under a
+        'pause'-owned restriction, so the turn in flight concludes itself with a
+        Respond while every further tool call is refused. Nothing here aborts
+        the running turn -- the PAUSING state below only tells the UI that the
+        session accepts no new turns.
+
+        The release side lives in Controller.resume() (reached from
+        continue_session), which calls Agent.leave_reading_mode('pause'); there
+        is no separate resume entry point on the presenter.
+        """
         log('DEBUG', 'presenter.lifecycle', f'pause_session called, state={self.state}')
         if self.state == ExecutionState.RUNNING:
             self.controller.request_pause()

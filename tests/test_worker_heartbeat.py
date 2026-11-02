@@ -136,7 +136,7 @@ class TestPausedHeartbeat(_RunSafetyPatches):
         with tempfile.TemporaryDirectory() as tmp:
             thread = make_thread(tmp, name="w-hb-p")
             thread._last_heartbeat_monotonic = 0.0
-            thread._pause_event.set()
+            thread._park_event.set()
             thread.status = "paused"
             with mock.patch("tools.workspace.worker.time.monotonic",
                             side_effect=[31.0]):

@@ -406,7 +406,7 @@ class TestForceSpawnResurrection(unittest.TestCase):
             for terminal_status in ("stopped", "stopping"):
                 with self.subTest(status=terminal_status):
                     thread._stop_event.set()
-                    thread._pause_event.set()
+                    thread._park_event.set()
                     thread.status = terminal_status
 
                     outcome = thread.resume()
@@ -423,7 +423,7 @@ class TestForceSpawnResurrection(unittest.TestCase):
                         "resume() cleared the stop event of a stopped worker",
                     )
                     self.assertTrue(
-                        thread._pause_event.is_set(),
+                        thread._park_event.is_set(),
                         "resume() cleared the pause state of a stopped worker",
                     )
 

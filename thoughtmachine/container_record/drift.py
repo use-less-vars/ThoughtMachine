@@ -109,6 +109,9 @@ EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED = "container_record_auto_recreated
 
 #: Axis sets, in the order axes within a class are compared.
 _POLICY_AXES = ("network_mode", "workspace_mode")
+#: ``pids_limit`` is deliberately ABSENT: container snapshots do not record it
+#: yet, so listing it here would report permanent false drift (recorded=None vs
+#: live=512) on every single container.  Add it only once snapshots carry it.
 _RUNTIME_AXES = ("network_mode", "workspace_mode", "mem_limit", "cpu_quota", "oom_score_adj")
 _IMAGE_AXES = ("image_ref", "image_hash")
 

@@ -108,6 +108,41 @@ def _write_json(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+#: Epoch seeded into every fixture worker directory.  Deliberately not 1: a
+#: fence that defaulted or dropped its epoch must fail these tests, not pass by
+#: accident.
+_SEEDED_GENERATION = 7
+
+
+def _seed_worker_dir(worker_dir, generation=_SEEDED_GENERATION):
+    """Create *worker_dir* and give it the ``generation`` sidecar that
+    ``WorkerThread.__init__`` allocates, so routed commands take the FENCED
+    path; the bare-action write is only the degraded fallback for a directory
+    that never hosted a thread."""
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    (worker_dir / "generation").write_text(str(generation), encoding="utf-8")
+    return worker_dir
+
+
+def _assert_fenced_command(
+    worker_dir, action, *, session_id, worker_name, instance_id, epoch=_SEEDED_GENERATION
+):
+    """Assert ``command.json`` carries *action* and a complete, correct fence."""
+    payload = json.loads((worker_dir / "command.json").read_text(encoding="utf-8"))
+    assert payload["action"] == action, payload
+    assert payload["session_id"] == session_id, payload
+    assert payload["worker_name"] == worker_name, payload
+    assert payload["instance_id"] == instance_id, payload
+    assert payload["epoch"] == epoch, payload
+    assert set(payload) == {
+        "action",
+        "session_id",
+        "worker_name",
+        "instance_id",
+        "epoch",
+    }, payload
+
+
 # ── GET /api/workspace/{ws_id}/workers ──────────────────────────────────────
 
 
@@ -208,6 +243,7 @@ def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monke
     with workspace_routes._registry_lock:
         workspace_routes._worker_registry[("sess-x", "default", 1)] = t1 = MagicMock()
         workspace_routes._worker_registry[("sess-x", "default", 2)] = t2 = MagicMock()
+    _seed_worker_dir(tmp_path / "workers" / "default#2", generation=11)
     _write_json(tmp_path / "workers" / "default#2" / "status.json", {})
 
     resp = asyncio.run(
@@ -220,10 +256,16 @@ def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monke
     assert resp["instance_id"] == 2
     assert resp["instance_label"] == "default#2"
 
-    cmd = json.loads((tmp_path / "workers" / "default#2" / "command.json").read_text())
     # PHASE 2.1a: the ``stop`` route DETACHES (termination moved to ``kill``),
     # so the optimistic status.json vocabulary is "detached", not "completed".
-    assert cmd == {"action": "stop"}
+    _assert_fenced_command(
+        tmp_path / "workers" / "default#2",
+        "stop",
+        session_id="",
+        worker_name="default",
+        instance_id=2,
+        epoch=11,
+    )
     status = json.loads((tmp_path / "workers" / "default#2" / "status.json").read_text())
     assert status["runtime_status"] == "detached"
 
@@ -236,7 +278,7 @@ def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
     instance fields in the response, command files in the bare <name> dir,
     and every registered instance of that name is fast-pathed."""
     _use_tmp_workspace(monkeypatch, tmp_path)
-    (tmp_path / "workers" / "default").mkdir(parents=True, exist_ok=True)
+    _seed_worker_dir(tmp_path / "workers" / "default")
     with workspace_routes._registry_lock:
         workspace_routes._worker_registry[("sess-x", "default", 1)] = t1 = MagicMock()
 
@@ -249,8 +291,13 @@ def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
     assert resp["name"] == "default"
     assert "instance_id" not in resp
     assert "instance_label" not in resp
-    cmd = json.loads((tmp_path / "workers" / "default" / "command.json").read_text())
-    assert cmd == {"action": "pause"}
+    _assert_fenced_command(
+        tmp_path / "workers" / "default",
+        "pause",
+        session_id="",
+        worker_name="default",
+        instance_id=1,
+    )
     status = json.loads((tmp_path / "workers" / "default" / "status.json").read_text())
     assert status["runtime_status"] == "pausing"
     t1.pause.assert_called_once()
@@ -263,8 +310,13 @@ def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
     assert resp2["status"] == "resumed"
     assert resp2["name"] == "default"
     assert "instance_id" not in resp2
-    cmd2 = json.loads((tmp_path / "workers" / "default" / "command.json").read_text())
-    assert cmd2 == {"action": "resume"}
+    _assert_fenced_command(
+        tmp_path / "workers" / "default",
+        "resume",
+        session_id="",
+        worker_name="default",
+        instance_id=1,
+    )
     t1.resume.assert_called_once()
 
 
@@ -286,7 +338,7 @@ def test_pause_with_instance_id_resolves_instance_dir(tmp_path, monkeypatch):
     """pause_worker(instance_id=2) resolves the <name>#2 directory (no
     status file needed) and returns the instance fields."""
     _use_tmp_workspace(monkeypatch, tmp_path)
-    (tmp_path / "workers" / "default#2").mkdir(parents=True, exist_ok=True)
+    _seed_worker_dir(tmp_path / "workers" / "default#2")
 
     resp = asyncio.run(
         workspace_routes.pause_worker(
@@ -297,8 +349,13 @@ def test_pause_with_instance_id_resolves_instance_dir(tmp_path, monkeypatch):
     assert resp["name"] == "default"
     assert resp["instance_id"] == 2
     assert resp["instance_label"] == "default#2"
-    cmd = json.loads((tmp_path / "workers" / "default#2" / "command.json").read_text())
-    assert cmd == {"action": "pause"}
+    _assert_fenced_command(
+        tmp_path / "workers" / "default#2",
+        "pause",
+        session_id="",
+        worker_name="default",
+        instance_id=2,
+    )
 
 
 # ── Worker tool: instance-aware pause/query semantics ───────────────────────
@@ -580,11 +637,17 @@ def _seed_worker(key, thread):
         worker_module._worker_registry[key] = thread
 
 
-def test_bridge_pause_skips_workers_running_async_jobs():
-    """bridge.pause() must not pause a worker mid-async-job (submit_query:
-    busy + _current_query_id set + no reply queue) but must still pause
-    sync-blocked (reply queue set), idle (even with sticky async attrs),
-    plain-string spawn and already-paused workers — and only this session."""
+def test_bridge_pause_reaches_every_worker_of_the_session():
+    """bridge.pause() pauses EVERY worker of this session, mid-async-job too.
+
+    The old contract skipped workers running a submit_query async job (busy +
+    ``_current_query_id`` set + no reply queue) because pausing them would cut
+    a turn short. Reading mode makes that unnecessary: the worker's agent is
+    restricted to Respond and concludes the turn itself, so a busy async-job
+    worker is paused exactly like a sync-blocked (reply queue set), idle (even
+    with sticky async attrs), plain-string-spawned or already-paused one — and
+    still only for this session.
+    """
     async_busy = _fake_worker(status="busy", query_id="job-1", reply_queue=None)
     sync_busy = _fake_worker(status="busy", query_id="q-1", reply_queue=queue.Queue())
     idle_sticky = _fake_worker(status="ready", query_id="job-2", reply_queue=None)
@@ -613,7 +676,7 @@ def test_bridge_pause_skips_workers_running_async_jobs():
         except Exception:
             pass
 
-    async_busy.pause.assert_not_called()
+    async_busy.pause.assert_called_once()
     foreign.pause.assert_not_called()
     sync_busy.pause.assert_called_once()
     idle_sticky.pause.assert_called_once()
@@ -684,6 +747,7 @@ def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
         workspace_routes._worker_registry[("sess-a", "alpha", 1)] = t3 = MagicMock()
         workspace_routes._worker_registry[("sess-b", "beta", 1)] = t4 = MagicMock()
     for sub in ("default", "default#2", "sess-a/alpha", "sess-b/beta"):
+        _seed_worker_dir(tmp_path / "workers" / sub)
         _write_json(tmp_path / "workers" / sub / "status.json", {})
 
     results = asyncio.run(
@@ -698,9 +762,22 @@ def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
     assert sorted(r["instance_id"] for r in results if r["worker_name"] == "default") == [1, 2]
     assert sorted(r["worker_name"] for r in results) == ["alpha", "beta", "default", "default"]
 
-    for sub in ("default", "default#2", "sess-a/alpha", "sess-b/beta"):
-        cmd = json.loads((tmp_path / "workers" / sub / "command.json").read_text())
-        assert cmd == {"action": "stop"}
+    # The fence names the session the directory sits under: a session-scoped
+    # target carries its real session id, a legacy one carries "".
+    stop_fences = {
+        "default": ("", "default", 1),
+        "default#2": ("", "default", 2),
+        "sess-a/alpha": ("sess-a", "alpha", 1),
+        "sess-b/beta": ("sess-b", "beta", 1),
+    }
+    for sub, (session_id, worker_name, instance_id) in stop_fences.items():
+        _assert_fenced_command(
+            tmp_path / "workers" / sub,
+            "stop",
+            session_id=session_id,
+            worker_name=worker_name,
+            instance_id=instance_id,
+        )
         status = json.loads((tmp_path / "workers" / sub / "status.json").read_text())
         # PHASE 2.1a: stop_all detaches, so the optimistic vocabulary is "detached".
         assert status["runtime_status"] == "detached"
@@ -711,6 +788,7 @@ def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
 
     # Session filter: only sess-a's workers are touched; other sessions
     # (existing and a freshly added one) are left alone.
+    _seed_worker_dir(tmp_path / "workers" / "sess-c" / "gamma")
     _write_json(tmp_path / "workers" / "sess-c" / "gamma" / "status.json", {})
     results = asyncio.run(
         workspace_routes.stop_all_workers(
@@ -739,7 +817,9 @@ def test_stop_all_returns_per_worker_results_and_continues_on_failure(tmp_path, 
     _use_tmp_workspace(monkeypatch, tmp_path)
     with workspace_routes._registry_lock:
         workspace_routes._worker_registry[("sess-x", "good", 1)] = tg = MagicMock()
+    _seed_worker_dir(tmp_path / "workers" / "good")
     _write_json(tmp_path / "workers" / "good" / "status.json", {})
+    _seed_worker_dir(tmp_path / "workers" / "ghost")
     _write_json(tmp_path / "workers" / "ghost" / "status.json", {})
 
     real_stop = workspace_routes._stop_worker_instance
@@ -763,8 +843,13 @@ def test_stop_all_returns_per_worker_results_and_continues_on_failure(tmp_path, 
     assert good["instance_id"] == 1
     assert good["status"] == "ok"
     assert good["error"] is None
-    cmd = json.loads((tmp_path / "workers" / "good" / "command.json").read_text())
-    assert cmd == {"action": "stop"}
+    _assert_fenced_command(
+        tmp_path / "workers" / "good",
+        "stop",
+        session_id="",
+        worker_name="good",
+        instance_id=1,
+    )
     tg.stop.assert_called_once()
 
     ghost = by_name["ghost"]

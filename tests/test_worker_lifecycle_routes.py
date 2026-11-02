@@ -84,15 +84,46 @@ def _url(name: str, verb: str) -> str:
     return f"{WORKERS}/{name}/{verb}"
 
 
+#: Epoch seeded into every fixture worker directory.  Deliberately not 1: a
+#: fence that defaulted or dropped its epoch must fail these tests, not pass by
+#: accident.
+_SEEDED_GENERATION = 7
+
+
 def _seed_worker_dir(ws_dir, name: str):
-    """Real worker directory in the LEGACY layout (``workers/<name>/``)."""
+    """Real worker directory in the LEGACY layout (``workers/<name>/``).
+
+    Also writes the ``generation`` sidecar that ``WorkerThread.__init__``
+    allocates, so routed commands take the FENCED path; the bare-action write
+    is only the degraded fallback for a directory that never hosted a thread.
+    """
     worker_dir = ws_dir / "workers" / name
     worker_dir.mkdir(parents=True, exist_ok=True)
+    (worker_dir / "generation").write_text(str(_SEEDED_GENERATION), encoding="utf-8")
     return worker_dir
 
 
 def _read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _assert_fenced_command(
+    worker_dir, action, *, session_id, worker_name, instance_id, epoch=_SEEDED_GENERATION
+):
+    """Assert ``command.json`` carries *action* and a complete, correct fence."""
+    payload = _read_json(worker_dir / "command.json")
+    assert payload["action"] == action, payload
+    assert payload["session_id"] == session_id, payload
+    assert payload["worker_name"] == worker_name, payload
+    assert payload["instance_id"] == instance_id, payload
+    assert payload["epoch"] == epoch, payload
+    assert set(payload) == {
+        "action",
+        "session_id",
+        "worker_name",
+        "instance_id",
+        "epoch",
+    }, payload
 
 
 def _fake_tool_loop(self, query):  # pragma: no cover - executed by the thread
@@ -115,7 +146,9 @@ def test_kill_returns_200_and_writes_kill_artifacts(monkeypatch, tmp_path):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"status": "ok", "name": "kw-kill"}
 
-    assert _read_json(worker_dir / "command.json") == {"action": "kill"}
+    _assert_fenced_command(
+        worker_dir, "kill", session_id="", worker_name="kw-kill", instance_id=1
+    )
 
     status = _read_json(worker_dir / "status.json")
     assert status["runtime_status"] == "killed"
@@ -170,7 +203,9 @@ def test_resume_returns_200_and_revives_a_detached_worker(monkeypatch, tmp_path)
 
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"status": "resumed", "name": "rw-resume"}
-    assert _read_json(worker_dir / "command.json") == {"action": "resume"}
+    _assert_fenced_command(
+        worker_dir, "resume", session_id="", worker_name="rw-resume", instance_id=1
+    )
 
     # The in-memory fast-path really resumed THIS thread: the detach markers
     # are cleared and it left the detached state.  (The resume/pause events are
@@ -219,7 +254,9 @@ def test_resume_reports_refused_when_a_stop_is_in_flight(monkeypatch, tmp_path):
     assert "Spawn a fresh instance instead" in body["note"]
 
     # The command file is written before the refusal is decided ...
-    assert _read_json(worker_dir / "command.json") == {"action": "resume"}
+    _assert_fenced_command(
+        worker_dir, "resume", session_id="", worker_name="rw-dying", instance_id=1
+    )
     # ... and the live instance was genuinely NOT revived.
     assert dying.status == "detached"
 
@@ -255,11 +292,101 @@ def test_stop_and_kill_are_distinguishable_over_http(monkeypatch, tmp_path):
     assert stop_resp.json() == {"status": "ok", "name": "vw-stop"}
     assert kill_resp.json() == {"status": "ok", "name": "vw-kill"}
 
-    stop_cmd = _read_json(stop_dir / "command.json")
-    kill_cmd = _read_json(kill_dir / "command.json")
-    assert stop_cmd == {"action": "stop"}
-    assert kill_cmd == {"action": "kill"}
-    assert stop_cmd != kill_cmd
+    _assert_fenced_command(
+        stop_dir, "stop", session_id="", worker_name="vw-stop", instance_id=1
+    )
+    _assert_fenced_command(
+        kill_dir, "kill", session_id="", worker_name="vw-kill", instance_id=1
+    )
+    # The two verbs stay distinguishable on disk, fence and all.
+    assert _read_json(stop_dir / "command.json") != _read_json(kill_dir / "command.json")
 
     assert _read_json(stop_dir / "status.json")["runtime_status"] == "detached"
     assert _read_json(kill_dir / "status.json")["runtime_status"] == "killed"
+
+
+# ── the command fence helpers ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "sidecar, context, expected",
+    [
+        ("5", None, 5),  # the sidecar is the authority
+        (None, {"generation": 4}, 4),  # context.json is the fallback
+        ("9", {"generation": 4}, 9),  # sidecar wins when they disagree
+        (None, None, None),  # nothing on disk
+        ("abc", None, None),  # junk sidecar
+        ("0", None, None),  # epoch 0 is not an incarnation
+        ("-3", None, None),  # negative epoch
+        (None, {"generation": True}, None),  # bool is not an epoch
+        (None, {}, None),  # context.json without the key
+        ("abc", {"generation": 4}, 4),  # unreadable sidecar -> fallback
+    ],
+)
+def test_read_worker_generation(tmp_path, sidecar, context, expected):
+    """``_read_worker_generation`` prefers the sidecar, falls back to
+    ``context.json`` and refuses anything that is not a positive int."""
+    worker_dir = tmp_path / "worker"
+    worker_dir.mkdir()
+    if sidecar is not None:
+        (worker_dir / "generation").write_text(sidecar, encoding="utf-8")
+    if context is not None:
+        (worker_dir / "context.json").write_text(json.dumps(context), encoding="utf-8")
+
+    assert workspace_routes._read_worker_generation(worker_dir) == expected
+
+
+def test_write_worker_command_writes_the_full_fence(tmp_path):
+    """With a generation on disk the command carries all five keys: the action
+    plus the identity of the incarnation it is addressed to."""
+    worker_dir = tmp_path / "worker"
+    worker_dir.mkdir()
+    (worker_dir / "generation").write_text("11", encoding="utf-8")
+
+    workspace_routes._write_worker_command(
+        worker_dir, "stop", session_id="sess-x", worker_name="w1", instance_id=2
+    )
+
+    assert _read_json(worker_dir / "command.json") == {
+        "action": "stop",
+        "session_id": "sess-x",
+        "worker_name": "w1",
+        "instance_id": 2,
+        "epoch": 11,
+    }
+
+
+def test_write_worker_command_maps_missing_session_to_empty_string(tmp_path):
+    """A legacy worker has no session dir: the fence carries ``""``, never
+    null, so the consumer's ``type(v) is str`` gate still accepts it."""
+    worker_dir = tmp_path / "worker"
+    worker_dir.mkdir()
+    (worker_dir / "generation").write_text("3", encoding="utf-8")
+
+    workspace_routes._write_worker_command(
+        worker_dir, "resume", session_id=None, worker_name="w1", instance_id=1
+    )
+
+    assert _read_json(worker_dir / "command.json") == {
+        "action": "resume",
+        "session_id": "",
+        "worker_name": "w1",
+        "instance_id": 1,
+        "epoch": 3,
+    }
+
+
+def test_write_worker_command_without_a_generation_degrades_to_the_bare_action(
+    tmp_path,
+):
+    """A directory that never hosted a thread has no epoch: the command is
+    written UNFENCED (documented degradation) rather than dropped."""
+    worker_dir = tmp_path / "worker"
+    worker_dir.mkdir()
+
+    workspace_routes._write_worker_command(
+        worker_dir, "stop", session_id=None, worker_name="w1", instance_id=1
+    )
+
+    assert _read_json(worker_dir / "command.json") == {"action": "stop"}
+

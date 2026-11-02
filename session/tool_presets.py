@@ -58,6 +58,8 @@ _ALL_TOOLS = [
     "ContainerLogsTool",
     # Date/time
     "DateTimeTool",
+    # Blocking wait (interruptible; P0 proof for per-session tool execution)
+    "Sleep",
     # Session & agent utilities
     "SummarizeTool",
     "KnowledgeBaseTool",

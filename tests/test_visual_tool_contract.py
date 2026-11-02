@@ -23,6 +23,16 @@ The tool has three independent contract surfaces, each pinned here:
    confines rendering to ``/workspace`` with a distinct message per escape
    route.
 
+4. **The host-write gate.**  The rendered PNG is written by the HOST process,
+   not by the render container, so it needs a write-capable ``filesystem``
+   grain of its own.  ``filesystem:write`` is declared in
+   ``required_categories`` AND re-checked inside ``execute()``, immediately
+   before the first host-side mutation: the outer gate ran before
+   ``execute()``, so a grant swapped in between must not ride through.
+   Read-only, banned, ``ask``, missing and unresolved grants all refuse, and a
+   gate that raises refuses too -- with no container created and no artifact
+   directory made.
+
 Style: mock-based and hermetic (no Docker daemon, no render image, no network),
 mirroring ``tests/security/test_git_info_tool_operations.py`` (a recording
 fake manager monkeypatched onto the tool module, no live container) and
@@ -62,6 +72,12 @@ from tools.visual_tool import (  # noqa: E402
 #: A minimal, structurally valid PNG (signature + filler).  The tool verifies
 #: the signature, never the image, so filler bytes are enough.
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"render" * 8
+
+#: Grant set that both gate surfaces need for a render to complete: the two
+#: grains the outer gate checks (``visual:view``, ``container:true``) plus the
+#: host-write grain (``filesystem:write``) the in-``execute()`` re-check reads
+#: from ``effective_permissions``.
+WRITE_GRANTS = {"visual": "view", "container": True, "filesystem": "write"}
 
 #: Image reference the fake "provisioned" build admits; the repo ships
 #: ``VISUAL_RENDER_IMAGE = None``, so every execution test has to provision one.
@@ -177,7 +193,11 @@ def test_bare_visual_requirement_is_skipped_by_the_gate():
     assert (allowed, message) == (True, ""), "the bare-'visual' trap moved"
 
     # ...and the tool never relies on that trap.
-    assert VisualTool.required_categories == ["visual:view", "container:true"]
+    assert VisualTool.required_categories == [
+        "visual:view",
+        "container:true",
+        "filesystem:write",
+    ]
     for requirement in VisualTool.required_categories:
         assert ":" in requirement, f"malformed requirement would be skipped: {requirement!r}"
 
@@ -216,7 +236,7 @@ def test_worker_context_ask_on_visual_is_denied():
     visual-specific: an ``ask`` session whose requirement ranks ABOVE the
     silent tier (``network:write``) is refused the same way.
     """
-    permitted = {"visual": "ask", "container": True}
+    permitted = {"visual": "ask", "container": True, "filesystem": "write"}
 
     for kwargs in ({"is_worker_context": True}, {}):
         allowed, message = check_required_categories(
@@ -229,7 +249,7 @@ def test_worker_context_ask_on_visual_is_denied():
 
     # Control (i): ``view`` is still a silent allow in worker context.
     assert check_required_categories(
-        VisualTool.required_categories, {"visual": "view", "container": True},
+        VisualTool.required_categories, dict(WRITE_GRANTS),
         "VisualTool", {}, "d", is_worker_context=True,
     ) == (True, "")
 
@@ -243,11 +263,11 @@ def test_worker_context_ask_on_visual_is_denied():
     assert "ask requires interactive approval" in message
 
 
-def test_view_and_container_allow():
-    """The documented working session: ``visual: view`` + ``container: true``."""
+def test_view_container_and_filesystem_write_allow():
+    """The documented working session: the three grains the tool really needs."""
     assert check_required_categories(
         VisualTool.required_categories,
-        {"visual": "view", "container": True},
+        dict(WRITE_GRANTS),
         "VisualTool",
         {},
         "d",
@@ -256,8 +276,9 @@ def test_view_and_container_allow():
 
 def test_get_required_categories_ignores_params():
     """The requirement set is static: params can never widen or narrow it."""
-    assert VisualTool.get_required_categories({}) == ["visual:view", "container:true"]
-    assert VisualTool.get_required_categories(None) == ["visual:view", "container:true"]
+    expected = ["visual:view", "container:true", "filesystem:write"]
+    assert VisualTool.get_required_categories({}) == expected
+    assert VisualTool.get_required_categories(None) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +397,7 @@ def test_teardown_runs_when_an_exception_escapes(
     monkeypatch.setattr(visual_tool, "_render_argv", _boom)
 
     with pytest.raises(RuntimeError, match="argv exploded"):
-        _tool(workspace).execute()
+        _tool(workspace, effective_permissions=dict(WRITE_GRANTS)).execute()
 
     assert len(_FakeManager.instances) == 1
     assert _FakeManager.instances[0].remove_calls == ["render-container-1"]
@@ -391,7 +412,9 @@ def test_teardown_failure_does_not_mask_the_result(
     )
 
     with caplog.at_level(logging.WARNING, logger="tools.visual_tool"):
-        result = _result(_tool(workspace).execute())
+        result = _result(
+            _tool(workspace, effective_permissions=dict(WRITE_GRANTS)).execute()
+        )
 
     assert result["success"] is True
     assert result["mime_type"] == "image/png"
@@ -406,7 +429,13 @@ def test_start_receives_ephemeral_lifecycle_and_no_heal(
     workspace, fake_manager, provisioned_image, hermetic_ids
 ):
     """The render container is ephemeral, never healed, and pinned to the image."""
-    result = _result(_tool(workspace, worker_name="w-1").execute())
+    result = _result(
+        _tool(
+            workspace,
+            worker_name="w-1",
+            effective_permissions=dict(WRITE_GRANTS),
+        ).execute()
+    )
 
     assert result["success"] is True
     manager = _FakeManager.instances[0]
@@ -435,7 +464,9 @@ def test_render_container_is_memory_capped(
     pins the concrete numbers rather than ``is not None``: deleting the
     kwargs, or drifting either constant, must fail here.
     """
-    result = _result(_tool(workspace).execute())
+    result = _result(
+        _tool(workspace, effective_permissions=dict(WRITE_GRANTS)).execute()
+    )
 
     assert result["success"] is True
     manager = _FakeManager.instances[0]
@@ -444,7 +475,108 @@ def test_render_container_is_memory_capped(
 
 
 # ---------------------------------------------------------------------------
-# 5. Registration surfaces
+# 5. The host-write gate: filesystem:write, re-checked before the host write
+# ---------------------------------------------------------------------------
+def test_host_write_gate_allows_a_write_capable_filesystem_grant(
+    workspace, fake_manager, provisioned_image, hermetic_ids
+):
+    """(a) ``filesystem: write`` -> the rendered PNG is written to the workspace."""
+    result = _result(
+        _tool(workspace, effective_permissions=dict(WRITE_GRANTS)).execute()
+    )
+
+    assert result["success"] is True
+    written = workspace / result["artifact_path"]
+    assert written.exists(), "success must mean the artifact is really on disk"
+    assert written.read_bytes() == PNG_BYTES
+    assert result["bytes"] == len(PNG_BYTES)
+
+
+@pytest.mark.parametrize("filesystem_grant", ["read", "banned", "ask", "none", None, "MISSING"])
+def test_host_write_gate_refuses_every_non_write_grant(
+    workspace, fake_manager, provisioned_image, hermetic_ids, filesystem_grant
+):
+    """(b,c,d) read/banned/ask/None/missing all refuse before any container.
+
+    ``ask`` is refused on purpose: the in-tool atomic re-check treats a not
+    pre-approved escalation as DENIED (``check_atomic_operation``), and there
+    is no user to prompt this late in the call anyway.  ``None`` (present but
+    unset) and a MISSING key are both fail-closed, so a session whose
+    ``filesystem`` grain was never resolved can never write.
+    """
+    fake_manager.raise_on_init = True
+    grants = dict(WRITE_GRANTS)
+    if filesystem_grant == "MISSING":
+        grants.pop("filesystem")
+    else:
+        grants["filesystem"] = filesystem_grant
+
+    result = _result(_tool(workspace, effective_permissions=grants).execute())
+
+    assert result["success"] is False
+    assert "filesystem:write" in result["error"], result["error"]
+    assert "effective filesystem grant" in result["error"], result["error"]
+    assert "No container was created" in result["error"], result["error"]
+    # (d) the refusal precedes ALL container work, and creates no directory.
+    assert fake_manager.instances == []
+    assert not (workspace / "artifacts").exists()
+
+
+def test_host_write_gate_fails_closed_without_effective_permissions(
+    workspace, fake_manager, provisioned_image, hermetic_ids
+):
+    """An unresolved ``effective_permissions`` refuses; it never means "allow"."""
+    fake_manager.raise_on_init = True
+
+    result = _result(_tool(workspace).execute())
+
+    assert result["success"] is False
+    assert "filesystem:write" in result["error"]
+    assert fake_manager.instances == []
+    assert not (workspace / "artifacts").exists()
+
+
+def test_host_write_gate_refuses_when_the_gate_itself_raises(
+    monkeypatch, workspace, fake_manager, provisioned_image, hermetic_ids
+):
+    """A gate that cannot be consulted is a refusal, not a bypass."""
+    import security.security_gate as gate
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("gate unavailable")
+
+    monkeypatch.setattr(gate, "check_atomic_operation", _boom)
+    fake_manager.raise_on_init = True
+
+    result = _result(
+        _tool(workspace, effective_permissions=dict(WRITE_GRANTS)).execute()
+    )
+
+    assert result["success"] is False
+    assert "filesystem:write" in result["error"]
+    assert fake_manager.instances == []
+
+
+def test_required_categories_pin_the_host_write_grain():
+    """(e) ``filesystem:write`` is declared, level-qualified and enforced."""
+    assert "filesystem:write" in VisualTool.required_categories
+    assert VisualTool.required_categories.count("filesystem:write") == 1
+
+    # The declaration is only worth something if the gate can parse it AND the
+    # level is ``write``: a bare "filesystem" is skipped outright, and
+    # "filesystem:read" would admit a read-only session to the host write.
+    allowed, message = check_required_categories(
+        ["filesystem:write"], {"filesystem": "read"}, "VisualTool", {}, "d"
+    )
+    assert allowed is False
+    assert "filesystem" in message
+    assert check_required_categories(
+        ["filesystem:write"], {"filesystem": "write"}, "VisualTool", {}, "d"
+    ) == (True, "")
+
+
+# ---------------------------------------------------------------------------
+# 6. Registration surfaces
 # ---------------------------------------------------------------------------
 def test_catalog_and_manifest_visual_entry_agree():
     """The shipped ``visual`` metadata in B (catalog) and D (manifest) agree.

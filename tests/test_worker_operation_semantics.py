@@ -29,6 +29,7 @@ instead of MagicMock serializations.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import queue
 import unittest
@@ -36,6 +37,7 @@ from unittest import mock
 from unittest.mock import MagicMock
 
 from agent.config.defaults import WORKER_TIMEOUT_SECONDS as _DETACHED_TTL_SECONDS
+from tools.workspace.command_channel import COMMAND_FILENAME, write_command
 from tools.workspace.worker import Worker
 
 SESSION = "sess-op-semantics"
@@ -398,6 +400,7 @@ class TestWorkerOperationSemantics(unittest.TestCase):
 # Unit C — pause/resume v2 (main-agent pause, Pause All, manual-only)
 #══════════════════════════════════════════════════════════════════════
 
+import pytest
 import threading
 import time
 from types import SimpleNamespace
@@ -1384,16 +1387,17 @@ def _spawn_ready_persisting_context(tmp_path, monkeypatch, name, session_id):
 
 
 def _write_command_file(thread, action):
-    """Write ``command.json`` exactly as the REST route does.
+    """Write a FENCED ``command.json`` through the production writer.
 
-    web_ui/backend/workspace_routes.py:1197-1200:
-    ``_atomic_write_json({"action": "kill" if terminate else "stop"},
-    worker_dir / "command.json")``.
+    This mirrors the producer side, ``command_channel.write_command``: the
+    payload carries ``thread._fence()``, because an UNFENCED command is now
+    refused and quarantined by the consumer (see the CommandFence section
+    at the bottom of this module).  A bare ``{"action": ...}`` written here
+    would only exercise a wire format the consumer no longer accepts.
     """
-    path = thread._worker_dir / "command.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"action": action}), encoding="utf-8")
-    return path
+    thread._worker_dir.mkdir(parents=True, exist_ok=True)
+    assert write_command(thread._worker_dir, action, thread._fence()) is True
+    return thread._worker_dir / COMMAND_FILENAME
 
 
 def _retire_thread(thread, timeout=10.0):
@@ -1589,8 +1593,8 @@ def test_stale_park_sentinel_after_resume_is_not_read_as_stop(tmp_path, monkeypa
     is BUSY inside ``_run_tool_loop``, blocked on a test gate, so it cannot
     consume its input queue at all.  While it is blocked the test calls
     ``pause()``, which enqueues the park wake-up marker
-    (``worker_thread.py:1611``) and sets ``_pause_event``, and then ``resume()``,
-    which clears ``_pause_event`` (``worker_thread.py:1649``) BEFORE the loop
+    (``worker_thread.py:1611``) and sets ``_park_event``, and then ``resume()``,
+    which clears ``_park_event`` (``worker_thread.py:1649``) BEFORE the loop
     ever looks at the queue.  When the in-flight query finishes and the loop
     drains the queue it therefore finds that marker with the pause flag already
     cleared -- the exact "leftover marker after resume" shape.
@@ -1628,9 +1632,9 @@ def test_stale_park_sentinel_after_resume_is_not_read_as_stop(tmp_path, monkeypa
     assert thread.status == "busy"
 
     # ── 2. enqueue the marker, then clear the pause flag under it ─────────
-    thread.pause()      # put(_PARK_SENTINEL), _pause_event.set()   (:1611)
-    thread.resume()     # _pause_event.clear(), _resume_event.set() (:1649)
-    assert thread._pause_event.is_set() is False
+    thread.pause()      # put(_PARK_SENTINEL), _park_event.set()   (:1611)
+    thread.resume()     # _park_event.clear(), _resume_event.set() (:1649)
+    assert thread._park_event.is_set() is False
     assert thread.status == "ready"
 
     # The in-flight query completes normally, and only THEN does the loop get
@@ -1690,7 +1694,7 @@ def test_command_file_kill_is_seen_while_parked(tmp_path, monkeypatch):
     thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, "w1", "sess-park-kill")
     thread.pause()
     assert _wait_until(lambda: thread.status == "paused"), thread.status
-    assert thread._pause_event.is_set(), "the worker must be genuinely parked"
+    assert thread._park_event.is_set(), "the worker must be genuinely parked"
     # From here on only run()'s ``finally`` (worker_thread.py:3242-3243) saves
     # the context -- kill() does not -- so a REAPPEARING context.json proves
     # the finally block ran after the park loop broke out.
@@ -1743,7 +1747,7 @@ def test_command_file_detach_is_seen_while_parked(tmp_path, monkeypatch):
     thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, "w1", "sess-park-stop")
     thread.pause()
     assert _wait_until(lambda: thread.status == "paused"), thread.status
-    assert thread._pause_event.is_set(), "the worker must be genuinely parked"
+    assert thread._park_event.is_set(), "the worker must be genuinely parked"
     assert thread._detach_requested is False
 
     cmd = _write_command_file(thread, "stop")
@@ -1765,7 +1769,7 @@ def test_command_file_detach_is_seen_while_parked(tmp_path, monkeypatch):
     assert not cmd.exists(), "the consumed command file must be deleted"
     assert thread.is_alive(), "stop must NOT terminate the thread"
     assert thread._stop_event.is_set() is False, "stop must never set the stop event"
-    assert thread._pause_event.is_set(), "a detached worker keeps parking"
+    assert thread._park_event.is_set(), "a detached worker keeps parking"
     assert thread._detach_requested is True
     assert thread._detached_at is not None
     assert _wait_until(lambda: is_worker_detached(thread.owner_identity) is True, timeout=10.0), thread.owner_identity
@@ -1880,7 +1884,7 @@ def test_detached_status_is_never_observable_before_the_registration(
 def test_command_file_resume_lifts_the_detached_registration(tmp_path, monkeypatch):
     """A cross-process ``{"action": "resume"}`` must fully revive a detached worker.
 
-    ``_poll_command``'s 'resume' branch used to clear ``_pause_event`` only, so
+    ``_poll_command``'s 'resume' branch used to clear ``_park_event`` only, so
     the park loop exited and wrote ``status = "ready"`` (worker_thread.py:2719)
     while ``_detach_requested`` stayed True and the container manager still had
     the worker registered as detached -- a worker that advertises "ready" but
@@ -1893,7 +1897,7 @@ def test_command_file_resume_lifts_the_detached_registration(tmp_path, monkeypat
     thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, "w1", "sess-cmd-resume")
     thread.pause()
     assert _wait_until(lambda: thread.status == "paused"), thread.status
-    assert thread._pause_event.is_set(), "the worker must be genuinely parked"
+    assert thread._park_event.is_set(), "the worker must be genuinely parked"
 
     detach_cmd = _write_command_file(thread, "stop")
     assert _wait_until(lambda: thread.status == "detached", timeout=10.0), (
@@ -1917,7 +1921,7 @@ def test_command_file_resume_lifts_the_detached_registration(tmp_path, monkeypat
     assert not resume_cmd.exists(), "the consumed command file must be deleted"
     assert thread.is_alive(), "resume must not terminate the thread"
     assert thread._stop_event.is_set() is False
-    assert thread._pause_event.is_set() is False, "resume must unpark the worker"
+    assert thread._park_event.is_set() is False, "resume must unpark the worker"
     assert thread._detach_requested is False
     assert thread._detached_at is None
     assert _wait_until(
@@ -1942,79 +1946,108 @@ def test_command_file_resume_lifts_the_detached_registration(tmp_path, monkeypat
     _retire_thread(thread)
 
 
-class _CountingJson:
-    """``worker_thread.json`` shim that records every parse (TEST C)."""
-
-    JSONDecodeError = json.JSONDecodeError
-
-    def __init__(self):
-        self.loads_calls = []
-
-    def loads(self, text, *args, **kwargs):
-        self.loads_calls.append(text)
-        return json.loads(text, *args, **kwargs)
-
-    def dumps(self, *args, **kwargs):
-        return json.dumps(*args, **kwargs)
-
-    def dump(self, *args, **kwargs):
-        return json.dump(*args, **kwargs)
-
-
-def test_unknown_command_action_is_ignored_without_eating_later_commands(
-    tmp_path, monkeypatch
-):
-    """An unparseable ACTION must be ignored once, never re-processed forever.
-
-    A ``command.json`` whose action the worker does not understand used to fall
-    through every branch and stay on disk, so every poll (1 s while parked at
-    worker_thread.py:2708/:2981, 2 s while idle at :2642) re-read and re-parsed
-    it, forever.  Deleting it is NOT the fix: the poller reads then unlinks, so
-    an operator writing the next real command in that window would have it
-    silently destroyed -- and with a stray file sitting there that unlink fires
-    on EVERY poll.  The branch now records the payload digest and re-polls are a
-    no-op until the content changes.
-
-    The parse count is the direct observable of "not re-processed"; the later
-    ``kill`` proves the ignore is not a blanket mute.
-    """
-    shim = _CountingJson()
-    monkeypatch.setattr(worker_thread_module, "json", shim)
-
+def test_unknown_command_action_is_quarantined_without_eating_later_commands(tmp_path):
+    """An unknown ACTION is refused, recorded, and does not mute the channel."""
     thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-unknown")
     cmd = _write_command_file(thread, "frobnicate")
-
     for _ in range(3):
         thread._poll_command()
-
-    assert len(shim.loads_calls) == 1, (
-        "an unknown action must be parsed exactly ONCE, not on every poll "
-        f"(parses={len(shim.loads_calls)}, payloads={shim.loads_calls})"
-    )
-    assert thread._ignored_command_digest is not None, (
-        "the ignored payload must be remembered so later polls can skip it"
-    )
-    # Ignoring means no state change at all -- not a pause, not a detach.
     assert thread.status == "ready"
     assert thread._stop_event.is_set() is False
-    assert thread._pause_event.is_set() is False
+    assert thread._park_event.is_set() is False
     assert thread._detach_requested is False
-    assert cmd.is_file(), (
-        "the unknown command must NOT be unlinked: an unlink here would race "
-        "an operator writing the next real command"
-    )
-
-    # A legitimate command replacing the ignored payload is still honoured --
-    # the digest guard must not mute the channel.
+    assert not cmd.exists()
+    quarantined = _rejected(thread)
+    assert len(quarantined) == 1, quarantined
+    assert json.loads(quarantined[0].read_text(encoding="utf-8"))["action"] == "frobnicate"
     _write_command_file(thread, "kill")
     thread._poll_command()
-
-    assert len(shim.loads_calls) == 2, "a CHANGED payload must be re-parsed"
     assert thread._stop_event.is_set() is True, (
-        "a legitimate 'kill' written after an ignored 'frobnicate' was lost"
+        "a legitimate 'kill' written after a quarantined 'frobnicate' was lost"
     )
     assert thread.status == "killed"
-    assert not cmd.exists(), "the consumed 'kill' command file must be deleted"
+
+
+def _write_raw_command(thread, payload):
+    """Write a payload directly, deliberately BYPASSING write_command."""
+    path = thread._worker_dir / COMMAND_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _rejected(thread):
+    return sorted(thread._worker_dir.glob(COMMAND_FILENAME + ".rejected-*"))
+
+
+def _assert_quarantined(thread, cmd, action):
+    assert not cmd.exists(), "a refused command must be claimed, not left in place"
+    quarantined = _rejected(thread)
+    assert len(quarantined) == 1, quarantined
+    payload = json.loads(quarantined[0].read_text(encoding="utf-8"))
+    assert payload["action"] == action, payload
+
+
+def test_an_unfenced_kill_payload_is_ignored_and_quarantined(tmp_path):
+    thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-unfenced")
+    cmd = _write_raw_command(thread, {"action": "kill"})
+    thread._poll_command()
+    assert thread._stop_event.is_set() is False, "an UNFENCED kill was obeyed"
+    assert thread.status == "ready"
+    _assert_quarantined(thread, cmd, "kill")
+
+
+def test_a_foreign_instance_fence_is_ignored_and_quarantined(tmp_path):
+    thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-foreign")
+    mine = thread._fence()
+    foreign = dataclasses.replace(mine, instance_id=mine.instance_id + 1)
+    cmd = _write_raw_command(thread, dict({"action": "stop"}, **foreign.to_payload()))
+    thread._poll_command()
+    assert thread._detach_requested is False
+    assert thread._stop_event.is_set() is False
+    assert thread.status == "ready"
+    _assert_quarantined(thread, cmd, "stop")
+
+
+@pytest.mark.parametrize("axis,other", [
+    ("session_id", lambda f: f.session_id + "-someone-else"),
+    ("worker_name", lambda f: f.worker_name + "-other"),
+    ("instance_id", lambda f: f.instance_id + 1),
+    ("epoch", lambda f: f.epoch + 1),
+])
+def test_each_mismatched_axis_is_rejected(tmp_path, axis, other):
+    thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-axis-" + axis)
+    mine = thread._fence()
+    wrong = dataclasses.replace(mine, **{axis: other(mine)})
+    assert wrong != mine
+    cmd = _write_raw_command(thread, dict({"action": "kill"}, **wrong.to_payload()))
+    thread._poll_command()
+    assert thread._stop_event.is_set() is False, "axis %r is not enforced" % (axis,)
+    assert thread.status == "ready"
+    _assert_quarantined(thread, cmd, "kill")
+
+
+def test_a_stale_epoch_command_is_rejected(tmp_path):
+    thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-stale-epoch")
+    mine = thread._fence()
+    stale = dataclasses.replace(mine, epoch=mine.epoch - 1)
+    cmd = _write_raw_command(thread, dict({"action": "stop"}, **stale.to_payload()))
+    thread._poll_command()
+    assert thread._detach_requested is False
+    assert thread._stop_event.is_set() is False
+    assert thread.status == "ready"
+    _assert_quarantined(thread, cmd, "stop")
+
+
+def test_a_correctly_fenced_command_is_still_obeyed(tmp_path):
+    """POSITIVE CONTROL: a fence that rejects EVERYTHING would pass all the above."""
+    thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-fenced-ok")
+    cmd = _write_command_file(thread, "kill")
+    thread._poll_command()
+    assert thread._stop_event.is_set() is True
+    assert thread.status == "killed"
+    assert not cmd.exists()
+    assert _rejected(thread) == []
 
 
 if __name__ == "__main__":

@@ -101,7 +101,7 @@ def test_halt_after_first_delta_keeps_partial_text_and_closes_stream():
     assistants = _assistant_messages(agent)
     assert len(assistants) == 1, assistants
     assert assistants[0]["content"] == "Par"
-    assert len(agent.conversation) == history_before + 2, agent.conversation  # user + assistant
+    assert len(agent.conversation) == history_before + 3, agent.conversation  # user + assistant + stop notice
 
     # The abandoned stream was closed by _iter_stream_events' finally.
     assert llm.closed is True
@@ -131,9 +131,10 @@ def test_halt_before_any_delta_commits_no_assistant_message():
     assert interrupted[0]["stop_reason"] == "interrupted"
     assert interrupted[0]["content"] == ""
 
-    # No blank assistant bubble in history. Only the user query was added.
+    # No blank assistant bubble in history: the user query plus the system
+    # notice explaining the halt, and nothing else.
     assert _assistant_messages(agent) == [], agent.conversation
-    assert len(agent.conversation) == history_before + 1, agent.conversation
+    assert len(agent.conversation) == history_before + 2, agent.conversation
 
 
 def test_has_assistant_message_is_content_based():

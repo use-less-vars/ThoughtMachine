@@ -457,6 +457,32 @@ chmod +x "{script_path}"
             finally:
                 manager.stop(info["id"])
 
+            # A cancelled turn comes back from exec as an INTERRUPTED payload:
+            # the wait was abandoned, the in-container process was NOT killed.
+            # Surface it verbatim instead of reading it as a normal exit (the
+            # exit code is None on that path, so the checks below would mistake
+            # it for a clean run).
+            if isinstance(result, dict) and result.get("status") == "interrupted":
+                _interrupted_payload = {
+                    "success": False,
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "exit_code": -3,
+                    "reason": result.get("reason"),
+                    "stdout": result.get("stdout", "") or "",
+                    "stderr": result.get("stderr", "") or "",
+                    "command": actual_command,
+                    "duration": time.time() - start_time,
+                    "timed_out": False,
+                    "error": (
+                        "Turn was cancelled while waiting for the command. The "
+                        "process inside the container was NOT killed and may "
+                        "still be running."
+                    ),
+                    "note": result.get("note"),
+                }
+                return self._truncate_output(json.dumps(_interrupted_payload, indent=2))
+
             stdout = result["stdout"]
             stderr = result["stderr"]
             exit_code = result["exit_code"]

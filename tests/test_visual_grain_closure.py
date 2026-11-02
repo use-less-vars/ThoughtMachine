@@ -136,7 +136,7 @@ def test_workspace_ceiling_at_ask_caps_view_to_ask():
 
     allowed, message = check_required_categories(
         VisualTool.required_categories,
-        {**capped, "container": True},
+        {**capped, "container": True, "filesystem": "write"},
         "VisualTool",
         {},
         "d",

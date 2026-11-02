@@ -475,6 +475,55 @@ async def get_session_permissions(session_id: str) -> Dict[str, Any]:
         )
 
 
+# ── live-session permission notice ───────────────────────────────────────────
+
+_PERMISSIONS_CHANGED_KIND = "permissions_changed"
+
+
+def _permissions_changed_text(effective: Dict[str, Any]) -> str:
+    """The notice body shown to a live agent after a permission change."""
+    compact = json.dumps(effective, sort_keys=True, separators=(",", ":"))
+    return (
+        "Your permissions have been updated. Current permissions: "
+        f"{compact}. Adjust your plan accordingly."
+    )
+
+
+def _notify_permissions_changed(session_id: str, effective: Dict[str, Any]) -> None:
+    """Best-effort: append a permissions notice to live sessions of *session_id*.
+
+    A permission write must never fail because the notice could not be
+    delivered, so every failure (including a broken bridge) is logged as a
+    WARNING and swallowed.  Only bridges currently holding *session_id* get a
+    notice: with no live session the caller's write still returns normally and
+    the new permissions apply from the next turn.
+
+    ``_live_bridges`` is imported lazily on purpose -- ``addendum_routes``
+    imports this module at import time, so a module-level import here would be
+    a cycle.
+    """
+    try:
+        from web_ui.backend.addendum_routes import _live_bridges
+
+        live = _live_bridges(session_id)
+        if not live:
+            return
+        text = _permissions_changed_text(effective)
+        seen: set = set()
+        for bridge, held in live:
+            session = held[0]
+            if id(session) in seen:
+                continue
+            seen.add(id(session))
+            bridge.inject_system_notice(text, kind=_PERMISSIONS_CHANGED_KIND)
+    except Exception as exc:  # noqa: BLE001 - best-effort by contract
+        log(
+            "WARNING",
+            "session_routes",
+            f"permissions_changed notice failed for {session_id}: {exc}",
+        )
+
+
 @router.put("/{session_id}/permissions")
 async def put_session_permissions(
     request: Request,
@@ -527,6 +576,7 @@ async def put_session_permissions(
         normalized = coerce_session_permissions(body)
         write_session_permissions(vault, ws_id, session_id, normalized)
         effective = _compute_effective_session_permissions(ws_id, session_id)
+        _notify_permissions_changed(session_id, effective)
         return {
             "raw": normalized,
             "effective": effective,

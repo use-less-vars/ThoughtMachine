@@ -171,3 +171,30 @@ def test_callback_swallow_is_logged(monkeypatch, capsys):
 
     # One bad callback does not stop the others.
     assert calls == ['boom', 'ok']
+
+
+def test_paused_event_is_inert_and_the_handler_is_gone():
+    """A raw 'paused' event has no handler and emits no pause bubble.
+
+    The presenter's ``_process_paused_event`` branch was unreachable (nothing
+    emits a 'paused' event: the pause path concludes with ``session_stop`` +
+    ``stop_reason='paused'``), so both the branch and the method are gone.
+    This test locks the whole cleanup: an orphan method is invisible to the
+    dispatch ladder but very visible to the next grep, so deletion -- not just
+    de-dispatching -- is what must not silently regress.
+
+    What an unmatched event type still gets is the generic pre/post-dispatch
+    work (Path A's ``emit_conversation_changed`` and the ``Event: <type>``
+    status trace).  What it must NOT get is a '\u23f8 Paused' bubble, an
+    exception, or a session write.
+    """
+    processor, lifecycle, gui, _state_bridge = _make_processor()
+
+    assert not hasattr(processor, '_process_paused_event')
+
+    processor.process_event({'type': 'paused', 'session_id': 'sess-1', 'stop_reason': 'paused'})
+
+    # The only status emission left for this event type is the generic
+    # post-dispatch trace: no '\u23f8 Paused' bubble comes back.
+    assert gui.status_messages == ['Event: paused'], gui.status_messages
+    assert lifecycle.save_count == 0

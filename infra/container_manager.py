@@ -192,6 +192,7 @@ from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
     CONTAINER_TYPE_LABEL,
     CONTAINER_TYPE_RESOURCE,
+    DEFAULT_CPU_QUOTA,
     DEFAULT_IMAGE,
     DEFAULT_MAX_CONTAINERS,
     DEFAULT_MEM_LIMIT,
@@ -701,6 +702,7 @@ _EFFECTIVE_INTENT_KEYS = (
     "workspace_mode",
     "mem_limit",
     "cpu_quota",
+    "pids_limit",
     "restart_policy",
 )
 
@@ -811,7 +813,7 @@ class ContainerManager:
         session_permissions=None,
         image=DEFAULT_IMAGE,
         mem_limit=DEFAULT_MEM_LIMIT,
-        cpu_quota=100000,
+        cpu_quota=DEFAULT_CPU_QUOTA,
         vault_root=None,
         session_config=None,
     ):
@@ -2559,7 +2561,72 @@ class ContainerManager:
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        thread.join(timeout)
+
+        # ── Interruptible wait ──────────────────────────────────────────────
+        # The exec itself runs on the daemon thread above; what used to block
+        # here was a SINGLE full-timeout ``join``, so a Stop pressed mid-command
+        # could not be honoured until the timeout expired.  Wait in short slices
+        # instead and poll the CURRENT TURN's cancellation token between them
+        # (0.5 s: quick enough that a Stop feels immediate, coarse enough that we
+        # are not spinning a core through a 300 s command).
+        #
+        # Interrupting the WAIT is all that happens here.  The in-container
+        # process was never launched as a killable handle (``exec_run`` hands us
+        # no handle to signal), so this does NOT kill the container, does NOT
+        # drop it and does NOT claim the command was cancelled: it reports that
+        # we stopped waiting on a process that may still be running.  Real
+        # cleanup would need the exec id captured from ``exec_inspect`` (or the
+        # in-container pid) and signalled explicitly -- future work, not this
+        # layer's business.
+        _WAIT_SLICE_SECONDS = 0.5
+        try:  # per-thread turn token; a no-op when nothing is bound
+            from tools.cancellation import cancel_reason as _cancel_reason
+            from tools.cancellation import is_interrupted as _is_interrupted
+        except Exception:  # pragma: no cover - tools package is a hard dep
+            def _is_interrupted():
+                return False
+
+            def _cancel_reason():
+                return None
+
+        def _interrupt_reason():
+            """Why this turn was cancelled: thread-local reason first, then the event's."""
+            reason = _cancel_reason()
+            if reason:
+                return reason
+            try:
+                from tools.cancellation import _active_event
+                return getattr(_active_event(), "reason", None) or "turn_cancelled"
+            except Exception:  # pragma: no cover - defensive
+                return "turn_cancelled"
+
+        _wait_started = time.monotonic()
+        _deadline = _wait_started + timeout
+        while thread.is_alive():
+            thread.join(max(0.0, min(_WAIT_SLICE_SECONDS, _deadline - time.monotonic())))
+            if not thread.is_alive():
+                break
+            if _is_interrupted():
+                return {
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": _interrupt_reason(),
+                    "exec": "container_exec",
+                    "container_id": container_id,
+                    "command": command,
+                    "elapsed": round(time.monotonic() - _wait_started, 3),
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "note": (
+                        "Stopped WAITING because the turn was cancelled. The "
+                        "process inside the container was NOT killed and may "
+                        "still be running: interrupting the wait cannot kill a "
+                        "process that was never launched as a killable handle."
+                    ),
+                }
+            if time.monotonic() >= _deadline:
+                break
 
         if thread.is_alive():
             try:
