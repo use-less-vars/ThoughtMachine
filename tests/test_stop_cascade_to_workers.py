@@ -9,14 +9,16 @@ the one control that did not.
 
 Contract under test (RED before the fix):
 
-  * ``request_stop()`` asks every worker of THIS bridge's session to stop
-    cooperatively (``thread.stop()`` -- never ``Thread.kill``), and touches no
-    other session's workers.
+  * ``request_stop()`` TERMINATES (``thread.kill()``) every worker of THIS
+    bridge's session and touches no other session's workers.  PHASE 2.1a:
+    ``thread.stop()`` now DETACHES, so routing the cascade through it would
+    leave the session's workers parked and alive -- the exact leak this
+    cascade exists to prevent.
   * ``request_stop()`` keeps its turn-scoped meaning: no ``controller.stop()``,
     no ``_stop_event`` on the controller path -- the session survives.
   * The cascade is fail-closed when the bridge has no session id (stop nothing
-    rather than everything), idempotent, skips dead/already-stopping workers,
-    and never calls ``stop()`` while holding the registry lock (a worker's stop
+    rather than everything), idempotent, skips dead/already-terminal workers,
+    and never calls ``kill()`` while holding the registry lock (a worker's kill
     path touches the registry, so holding the lock there would deadlock).
   * The legacy no-controller path cascades too: the workers are a property of
     the session, not of the controller object.
@@ -61,11 +63,16 @@ class _FakeController:
 
 
 class _FakeWorker:
-    """Registry stand-in: records ``stop()`` and probes the registry lock.
+    """Registry stand-in: records ``kill()``/``stop()`` and probes the lock.
 
-    A real ``WorkerThread.stop()`` sets its status, writes status/command files
+    PHASE 2.1a: ``stop()`` DETACHES (parks the worker, thread survives) and
+    ``kill()`` TERMINATES.  The Session Stop cascade must call ``kill()``:
+    a detach would leave the worker alive and holding its containers, which is
+    exactly the leak the cascade exists to prevent.
+
+    A real ``WorkerThread.kill()`` sets its status, writes status/command files
     and can touch the worker registry, so the probe below turns "the cascade
-    called ``stop()`` while holding ``_registry_lock``" into a clean failure
+    called ``kill()`` while holding ``_registry_lock``" into a clean failure
     instead of a deadlock.
     """
 
@@ -74,21 +81,28 @@ class _FakeWorker:
         self.status = status
         self.alive = alive
         self.stop_calls = 0
-        self.lock_acquired_during_stop = None
+        self.kill_calls = 0
+        self.lock_acquired_during_kill = None
         self._probe_lock = probe_lock
 
     def is_alive(self):
         return self.alive
 
     def stop(self):
+        # PHASE 2.1a: detach only -- the thread and its containers survive.
         self.stop_calls += 1
-        # Faithful to WorkerThread.stop(): the thread marks itself 'stopping'
-        # synchronously and winds down cooperatively from there.
         if self.alive:
-            self.status = "stopping"
-        if self._probe_lock is not None and self.lock_acquired_during_stop is None:
+            self.status = "detached"
+
+    def kill(self):
+        self.kill_calls += 1
+        # Faithful to WorkerThread.kill(): the thread marks itself 'killed'
+        # synchronously and exits its run loop from there.
+        if self.alive:
+            self.status = "killed"
+        if self._probe_lock is not None and self.lock_acquired_during_kill is None:
             acquired = self._probe_lock.acquire(timeout=0.5)
-            self.lock_acquired_during_stop = acquired
+            self.lock_acquired_during_kill = acquired
             if acquired:
                 self._probe_lock.release()
 
@@ -155,8 +169,11 @@ def test_request_stop_stops_every_worker_of_the_session(bridge, monkeypatch):
 
     assert bridge.request_stop() is True
 
-    assert w1.stop_calls == 1, "worker w1 was left running by the Stop button"
-    assert w2.stop_calls == 1, (
+    assert w1.kill_calls == 1, "worker w1 was left running by the Stop button"
+    assert w1.stop_calls == 0, (
+        "PHASE 2.1a: stop() only DETACHES -- the cascade must terminate, not park"
+    )
+    assert w2.kill_calls == 1, (
         "instance-2 workers are keyed (session, name, instance_id) and must "
         "cascade too"
     )
@@ -184,9 +201,9 @@ def test_request_stop_leaves_other_sessions_workers_alone(bridge, monkeypatch):
 
     bridge.request_stop()
 
-    assert mine.stop_calls == 1
-    assert foreign.stop_calls == 0, "another session's worker was stopped"
-    assert foreign2.stop_calls == 0, "another session's instance-2 worker was stopped"
+    assert mine.kill_calls == 1
+    assert foreign.kill_calls == 0, "another session's worker was stopped"
+    assert foreign2.kill_calls == 0, "another session's instance-2 worker was stopped"
 
 
 def test_request_stop_without_session_id_stops_nothing(bridge, monkeypatch):
@@ -199,8 +216,8 @@ def test_request_stop_without_session_id_stops_nothing(bridge, monkeypatch):
 
     bridge.request_stop()
 
-    assert a.stop_calls == 0, "no session id -> nothing may be stopped"
-    assert b.stop_calls == 0
+    assert a.kill_calls == 0, "no session id -> nothing may be stopped"
+    assert b.kill_calls == 0
 
 
 def test_request_stop_cascade_is_idempotent_and_skips_dead_workers(bridge, monkeypatch):
@@ -208,6 +225,7 @@ def test_request_stop_cascade_is_idempotent_and_skips_dead_workers(bridge, monke
     _record_log(monkeypatch)
     bridge._controller = _FakeController(busy=True)
     live = _register(SID, "live", _FakeWorker("live"))
+    killed = _register(SID, "killed", _FakeWorker("killed", status="killed"))
     stopping = _register(SID, "stopping", _FakeWorker("stopping", status="stopping"))
     stopped = _register(SID, "stopped", _FakeWorker("stopped", status="stopped"))
     dead = _register(SID, "dead", _FakeWorker("dead", alive=False))
@@ -215,10 +233,11 @@ def test_request_stop_cascade_is_idempotent_and_skips_dead_workers(bridge, monke
     bridge.request_stop()
     bridge.request_stop()
 
-    assert live.stop_calls == 1, "a second Stop must not re-stop a worker"
-    assert stopping.stop_calls == 0, "a worker already stopping must be left alone"
-    assert stopped.stop_calls == 0, "a stopped worker must be left alone"
-    assert dead.stop_calls == 0, "a dead worker has nothing to stop"
+    assert live.kill_calls == 1, "a second Stop must not re-kill a worker"
+    assert killed.kill_calls == 0, "an already-killed worker must be left alone"
+    assert stopping.kill_calls == 0, "a worker already stopping must be left alone"
+    assert stopped.kill_calls == 0, "a stopped worker must be left alone"
+    assert dead.kill_calls == 0, "a dead worker has nothing to stop"
 
 
 def test_request_stop_calls_worker_stop_outside_the_registry_lock(bridge, monkeypatch):
@@ -231,8 +250,8 @@ def test_request_stop_calls_worker_stop_outside_the_registry_lock(bridge, monkey
 
     bridge.request_stop()
 
-    assert worker.stop_calls == 1
-    assert worker.lock_acquired_during_stop is True, (
+    assert worker.kill_calls == 1
+    assert worker.lock_acquired_during_kill is True, (
         "stop() was called while the cascade held _registry_lock — a real "
         "worker's stop path takes that lock, so this deadlocks in production"
     )
@@ -246,7 +265,7 @@ def test_request_stop_cascades_on_the_legacy_no_controller_path(bridge, monkeypa
 
     bridge.request_stop()
 
-    assert worker.stop_calls == 1, (
+    assert worker.kill_calls == 1, (
         "the legacy no-controller path must still stop the session's workers"
     )
     assert bridge._stop_event.is_set(), "the legacy path keeps its teardown fallback"

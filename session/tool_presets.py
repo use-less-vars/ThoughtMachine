@@ -46,6 +46,7 @@ _ALL_TOOLS = [
     "host_bash",
     # Execution
     "DockerCodeRunner",
+    "VisualTool",
     "ContainerStartTool",
     "ContainerExecTool",
     "ContainerStopTool",
@@ -77,6 +78,7 @@ AGENT_TOOLS = [
     "DirectoryCreator",
     "DirectoryTreeTool",
     "DockerCodeRunner",
+    "VisualTool",
     "ContainerStartTool",
     "ContainerExecTool",
     "ContainerStopTool",

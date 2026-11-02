@@ -3,7 +3,7 @@
 Verifies the cooperative-stop contract in ``Worker._action_query``
 (tools/workspace/worker.py): when a synchronous query times out
 (``TimeoutError`` from ``send_query``), the worker thread is STOPPED
-COOPERATIVELY (``thread.stop()`` — never ``Thread.kill``), its run()
+COOPERATIVELY (``thread.kill()`` — never ``Thread.kill``), its run()
 terminal path executes, and its containers are reclaimed while resource
 containers are left untouched.
 
@@ -257,12 +257,14 @@ def test_query_timeout_invokes_cooperative_stop_and_returns_envelope(tmp_path, m
     assert "stopped cooperatively" in envelope["note"]
     assert "Re-spawn" in envelope["note"]
     assert envelope["worker_name"] == "w1"
-    assert envelope["status"] in ("stopping", "stopped")
+    # PHASE 2.1a: the timeout path TERMINATES (kill), so the envelope and the
+    # terminal thread status read "killed"; "stopping"/"stopped" are dead.
+    assert envelope["status"] == "killed"
 
     # 2) terminal state visible in the registry afterwards
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     with worker_module._registry_lock:
-        assert worker_module._worker_registry[("sess-1", "w1", 1)].status == "stopped"
+        assert worker_module._worker_registry[("sess-1", "w1", 1)].status == "killed"
 
     # 3) owned container stopped + removed
     assert [c.id for c in cm.stopped] == ["c-owned"]
@@ -304,10 +306,12 @@ def test_cleanup_reclaims_owned_containers_from_real_cm_style_dicts(tmp_path, mo
         tmp_path, monkeypatch, name="w-d", session_id="sess-d", container_manager=cm
     )
 
-    thread.stop()
+    # stop() now only DETACHES; termination (and the reclamation this test is
+    # about) is produced by kill().
+    thread.kill()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     with worker_module._registry_lock:
-        assert worker_module._worker_registry[("sess-d", "w-d", 1)].status == "stopped"
+        assert worker_module._worker_registry[("sess-d", "w-d", 1)].status == "killed"
 
     # only the exact-owner dict entry is reclaimed (targeted by container_id)
     assert cm.stopped == ["c-owned"]
@@ -332,10 +336,11 @@ def test_cooperative_stop_reclaims_worker_containers_only(tmp_path, monkeypatch)
         tmp_path, monkeypatch, name="w2", session_id="sess-2", container_manager=cm
     )
 
-    thread.stop()
+    # stop() now only DETACHES; kill() is the terminating path.
+    thread.kill()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     with worker_module._registry_lock:
-        assert worker_module._worker_registry[("sess-2", "w2", 1)].status == "stopped"
+        assert worker_module._worker_registry[("sess-2", "w2", 1)].status == "killed"
 
     assert [c.id for c in cm.stopped] == ["c-owned"]
     assert [c.id for c in cm.removed] == ["c-owned"]
@@ -391,18 +396,20 @@ def test_stop_during_busy_query_drains_and_cleans_up(tmp_path, monkeypatch):
     assert thread.status == "busy"
     assert thread.is_alive()
 
-    thread.stop()  # cooperative stop while busy
-    assert thread.status == "stopping"
+    # PHASE 2.1a: kill() is the terminating request; its status is set
+    # synchronously (thread still alive, still inside _run_tool_loop).
+    thread.kill()
+    assert thread.status == "killed"
     assert thread._stop_event.is_set()
 
     # The in-flight query drains to completion AFTER the stop signal, then the
     # loop observes the stop event and terminates via its own run() teardown.
     release.set()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
-    assert thread.status == "stopped"
+    assert thread.status == "killed"
     with worker_module._registry_lock:
         entry = worker_module._worker_registry.get(("sess-3", "w3", 1))
-    assert entry is None or entry.status == "stopped"
+    assert entry is None or entry.status == "killed"
     assert not reply_q.empty(), "in-flight query never drained to its reply queue"
     envelope = json.loads(reply_q.get_nowait())
     assert json.loads(envelope["content"]).get("response") == "done"
@@ -418,7 +425,7 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     """Query timeout while the worker is GENUINELY BUSY inside _run_tool_loop
     (stuck in a DockerCodeRunner call): the timeout branch must reclaim
     worker-owned containers SYNCHRONOUSLY (thread._cleanup_worker_containers)
-    right after thread.stop(), not merely via run()'s finally safety net."""
+    right after thread.kill(), not merely via run()'s finally safety net."""
     owner = "sess-4:w4"
     cm = _FakeContainerManager(
         [
@@ -449,7 +456,9 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     # Recorders proving DIRECT invocation from the timeout branch.
     stop_calls = []
     orig_stop = thread.stop
-    thread.stop = lambda: (stop_calls.append(True), orig_stop())[1]
+    orig_kill = thread.kill
+    # PHASE 2.1a: the timeout branch calls kill(), not stop() (detach).
+    thread.kill = lambda: (stop_calls.append(True), orig_kill())[1]
     # Recorder distinguishes WHO invoked cleanup: the timeout branch runs on
     # the caller thread (recorded as False), run()'s finally teardown runs on
     # the worker thread (recorded as True). Both are idempotent; the guarantee
@@ -494,10 +503,10 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     assert envelope["error"]
     assert "stopped cooperatively" in envelope["note"]
     assert "Re-spawn" in envelope["note"]
-    assert envelope["status"] in ("stopping", "stopped")
+    assert envelope["status"] == "killed"
     assert envelope["worker_name"] == "w4"
 
-    # (2) thread.stop() invoked from the timeout branch.
+    # (2) thread.kill() invoked from the timeout branch.
     assert stop_calls == [True]
 
     # (3) _cleanup_worker_containers() invoked DIRECTLY from the timeout branch
@@ -508,7 +517,7 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     # (4) STOP GUARANTEE: the sync call returned only after the worker thread
     # actually exited — no orphan thread survives the call.
     assert not thread.is_alive(), "worker thread still alive after sync call returned"
-    assert thread.status == "stopped"
+    assert thread.status == "killed"
     assert [c.id for c in cm.stopped] == ["c-owned"]
     assert [c.id for c in cm.removed] == ["c-owned"]
     assert not any(c.labels.get(_WORKER_CONTAINER_LABEL) == owner for c in cm.containers)
@@ -517,10 +526,10 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     assert any(c.id == "c-res" for c in cm.containers)
     assert [c.id for c in cm.stopped + cm.removed].count("c-res") == 0
 
-    # (6) Terminal path ran: registry shows stopped; in-flight query drained.
+    # (6) Terminal path ran: registry shows the KILLED terminal status; in-flight query drained.
     with worker_module._registry_lock:
         entry = worker_module._worker_registry.get(("sess-4", "w4", 1))
-    assert entry is None or entry.status == "stopped"
+    assert entry is None or entry.status == "killed"
     assert not reply_q.empty(), "in-flight query never drained to its reply queue"
     env2 = json.loads(reply_q.get_nowait())
     assert json.loads(env2["content"]).get("response") == "done"
@@ -871,7 +880,7 @@ def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch
             worker_module._worker_registry.pop(("sess-live", "wlive", 1), None)
         if thread is not None and thread.is_alive():
             try:
-                thread.stop()
+                thread.kill()
             except Exception:
                 pass
             thread.join(timeout=5)

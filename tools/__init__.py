@@ -184,6 +184,12 @@ except ImportError as e:
     _record_import_failure("DockerCodeRunner", e)
 
 try:
+    from .visual_tool import VisualTool
+    TOOL_CLASSES.append(VisualTool)
+except ImportError as e:
+    _record_import_failure("VisualTool", e)
+
+try:
     from .container_control import (
         ContainerStartTool,
         ContainerExecTool,

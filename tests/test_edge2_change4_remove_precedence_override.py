@@ -51,6 +51,7 @@ ALL_BANNED = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "visual": "banned",
     "credential": "banned",
 }
 
@@ -148,6 +149,7 @@ def test_fail_closed_sentinels_intact_and_still_imported():
         "network": "banned",
         "mcp": "banned",
         "ci": "banned",
+        "visual": "banned",
         "credential": "banned",
     }
 

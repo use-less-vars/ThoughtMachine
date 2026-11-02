@@ -40,14 +40,20 @@ def _live_thread(status: str = "ready") -> MagicMock:
     t._timeout_seconds = 30  # keep the force-path join loop bounded
     t._stop_event = threading.Event()
 
-    def _stop(*_a, **_k):
-        # A real stop() + join ends the thread, so is_alive() turns False and
-        # the registry may drop the entry instead of leaving it behind.
-        t.status = "stopped"
+    # PHASE 2.1a: model BOTH verbs.  stop() DETACHES (parks the thread: still
+    # alive, stop event clear, no slot freed); kill() TERMINATES (is_alive()
+    # False, so the registry may drop the entry and free the slot).
+    def _detach(*_a, **_k):
+        t.status = "detached"
+        t.is_alive.return_value = True
+
+    def _kill(*_a, **_k):
+        t.status = "killed"
         t._stop_event.set()
         t.is_alive.return_value = False
 
-    t.stop.side_effect = _stop
+    t.stop.side_effect = _detach
+    t.kill.side_effect = _kill
     return t
 
 

@@ -32,24 +32,17 @@ import web_ui.backend.workspace_routes as workspace_routes
 from web_ui.backend.server import app
 from thoughtmachine.permission_store import session_grants_path
 from thoughtmachine.security import PERMISSION_SCHEMA, SAFE_DEFAULTS
+from agent.config.resource_catalog import catalog_default_permissions
 from security.resource_catalog import coerce_resource_permissions
 
 client = TestClient(app)
 
 SESSION_SCHEMA_KEYS = sorted(PERMISSION_SCHEMA.keys())
 
-# Canonical eight-key workspace purpose presets (agent/config/workspace_purpose).
-# "general" preset == catalog defaults.
-CATALOG_DEFAULTS = {
-    "container": False,
-    "filesystem": "read",
-    "git": "read",
-    "host_bash": "banned",
-    "mcp": "banned",
-    "network": "banned",
-    "ci": "banned",
-    "credential": "banned",
-}
+# The "general" purpose preset IS the catalog default map, so derive it from the
+# catalog instead of hand-copying the grain list: a literal here silently drifts
+# every time a grain is added (the `visual` grain broke exactly that way).
+CATALOG_DEFAULTS = catalog_default_permissions()
 
 CODING_PRESET = {
     "container": False,

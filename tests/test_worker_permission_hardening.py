@@ -436,15 +436,21 @@ class TestMaxWorkersCap:
                 t._timeout_seconds = 30
                 t._stop_event = threading.Event()
 
-                def _stop(*_a, _t=t, **_k):
-                    # A real stop() + join ends the thread; is_alive() is what
-                    # the force path and the cap counter consult, so a stopped
-                    # fake must report False instead of staying "live" forever.
-                    _t.status = "stopped"
+                # PHASE 2.1a: model BOTH verbs.  stop() DETACHES (thread parks:
+                # alive, stop event clear, slot NOT freed); kill() TERMINATES
+                # (is_alive() False).  is_alive() is what both the force path
+                # and the cap counter consult, so the two MUST differ.
+                def _detach(*_a, _t=t, **_k):
+                    _t.status = "detached"
+                    _t.is_alive.return_value = True
+
+                def _kill(*_a, _t=t, **_k):
+                    _t.status = "killed"
                     _t._stop_event.set()
                     _t.is_alive.return_value = False
 
-                t.stop.side_effect = _stop
+                t.stop.side_effect = _detach
+                t.kill.side_effect = _kill
                 harness.registry._worker_registry[(session, name, 1)] = t
 
     def test_default_cap_refuses_sixth(self, spawn_harness):

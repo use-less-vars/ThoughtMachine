@@ -42,9 +42,11 @@ Cases (each maps to the fix it pins):
   7. force over an instance that SURVIVES force-stop refuses with an honest
      error instead of orphaning or duplicating the registry entry.
 
-The mocked threads in cases 1-4 model a real stop: ``stop()`` flips
-``is_alive()`` to False (unless ``stubborn_stop=True``), because a thread the
-registry may legally unregister is one that actually died.
+The mocked threads in cases 1-4 model BOTH verbs (PHASE 2.1a): ``stop()``
+detaches (status ``"detached"``, thread still alive, ``_stop_event`` clear) and
+``kill()`` terminates (status ``"killed"``, ``_stop_event`` set, ``is_alive()``
+False unless ``stubborn_stop=True``), because a thread the registry may legally
+unregister is one that actually died.
 
 Harness mirrors ``tests/test_worker_operation_semantics.py`` (real
 ``WorkerRegistry`` singleton; ``resolve_workspace_id`` / ``_workspace_dir`` /
@@ -176,10 +178,14 @@ class TestForceSpawnResurrection(unittest.TestCase):
         output queue still holds the stopped envelope a previous caller never
         consumed.
 
-        ``stop()`` modelled realistically: a real ``stop()`` + join kills the
-        thread, so ``is_alive()`` turns False and ``_stop_event`` stays set.
+        PHASE 2.1a: the double models BOTH verbs with their real meanings.
+        ``stop()`` is a DETACH: the thread parks with status ``"detached"``,
+        ``is_alive()`` stays True and ``_stop_event`` stays CLEAR (a detached
+        worker must stay resumable, so nothing may mark it terminated).
+        ``kill()`` is the only TERMINATION path: status ``"killed"``,
+        ``_stop_event`` set, ``is_alive()`` following the thread's real fate.
         Only a thread that is genuinely gone may be unregistered.  Pass
-        ``stubborn_stop=True`` for a thread that ignores ``stop()`` (survives
+        ``stubborn_stop=True`` for a thread that ignores termination (survives
         force-stop) — the case that must be reported, not hidden.
         """
         from tools.workspace.worker_registry import WorkerRegistry
@@ -201,14 +207,21 @@ class TestForceSpawnResurrection(unittest.TestCase):
         if stopped:
             t._stop_event.set()
 
-        def _stop(*_a, **_k):
-            # A real stop() + join ends the thread; is_alive() is what the
-            # force block and the registry double-check consult.
-            t.status = "stopped"
+        def _detach(*_a, **_k):
+            # stop() DETACHES: the thread parks and stays alive; the stop event
+            # is deliberately NOT set, because a detached worker is resumable.
+            t.status = "detached"
+            t.is_alive.return_value = True
+
+        def _kill(*_a, **_k):
+            # kill() TERMINATES: is_alive() is what the force block and the
+            # registry double-check consult, so it follows the thread's fate.
+            t.status = "killed"
             t._stop_event.set()
             t.is_alive.return_value = stubborn_stop
 
-        t.stop.side_effect = _stop
+        t.stop.side_effect = _detach
+        t.kill.side_effect = _kill
         with self._registry._registry_lock:
             self._registry._worker_registry[(session, name, iid)] = t
         return t
@@ -299,7 +312,10 @@ class TestForceSpawnResurrection(unittest.TestCase):
 
         result = self._spawn("w2", force=True, context={"query": "restart"})
 
-        live.stop.assert_called_once()
+        # PHASE 2.1a: force must TERMINATE the old instance (kill), never
+        # merely detach it (a detached thread would still hold the key).
+        live.kill.assert_called_once()
+        live.stop.assert_not_called()
         live.resume.assert_not_called()
         live._output_queue.get.assert_not_called()
         self.assertTrue(result.get("spawned"), f"force spawn: {result}")
@@ -322,7 +338,9 @@ class TestForceSpawnResurrection(unittest.TestCase):
 
         result = self._spawn("w3", force=True, context={"query": "mine"})
 
+        # Untouched by EITHER verb: not detached, not killed.
         foreign.stop.assert_not_called()
+        foreign.kill.assert_not_called()
         foreign.resume.assert_not_called()
         self.assertIs(
             self._registered((OTHER_SESSION, "w3", 1)),
@@ -361,7 +379,9 @@ class TestForceSpawnResurrection(unittest.TestCase):
 
         result = self._spawn("w4", force=True, context={"query": "workspace B work"})
 
+        # Untouched by EITHER verb: not detached, not killed.
         workspace_a_worker.stop.assert_not_called()
+        workspace_a_worker.kill.assert_not_called()
         workspace_a_worker.resume.assert_not_called()
         self.assertIs(
             self._registered((OTHER_SESSION, "w4", 1)),
@@ -475,7 +495,7 @@ class TestForceSpawnResurrection(unittest.TestCase):
     # ── 7. force over an instance that survived force-stop ──────────
 
     def test_force_spawn_refuses_when_instance_survives_force_stop(self):
-        """Force over a live instance that ignores ``stop()`` must return an
+        """Force over a live instance that ignores ``kill()`` must return an
         honest error and leave the registry consistent.
 
         The old code popped the registry entry after stopping regardless of
@@ -492,7 +512,9 @@ class TestForceSpawnResurrection(unittest.TestCase):
             "w7", force=True, instance_id=1, context={"query": "x"}
         )
 
-        stale.stop.assert_called_once()
+        # PHASE 2.1a: the force block calls kill(); this double survives it.
+        stale.kill.assert_called_once()
+        stale.stop.assert_not_called()
         self.assertIn("error", result, f"expected a refusal, got {result}")
         message = str(result["error"]).lower()
         self.assertIn(

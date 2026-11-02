@@ -40,6 +40,7 @@ CANONICAL_KEYS = {
     "mcp",
     "network",
     "ci",
+    "visual",
     "credential",
 }
 
@@ -51,6 +52,7 @@ DENY_ALL = {
     "mcp": "banned",
     "network": "banned",
     "ci": "banned",
+    "visual": "banned",
     "credential": "banned",
 }
 
@@ -180,5 +182,6 @@ def test_disk_mode_reads_store_and_applies_ceiling(monkeypatch, tmp_path):
         "mcp": "banned",
         "network": "banned",
         "ci": "banned",
+        "visual": "banned",
         "credential": "banned",
     }

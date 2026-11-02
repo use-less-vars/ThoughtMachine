@@ -34,8 +34,13 @@ const CEILING_RANK = {
   connect: 1,
   none: 1,
   ask: 2,
+  // visual view grant: ranks ABOVE ask (2) at 2.5, mirror of the backend
+  // security.resource_catalog.WORKSPACE_CEILING_LEVELS_RANKS table.
+  view: 2.5,
   write_on_feature_branch: 2.5,
   write: 3,
+  // credential value-injection grant: same tier as write.
+  use: 3,
   outbound: 4,
   full: 4,
 }

@@ -224,7 +224,12 @@ class WorkerRegistry:
             worker_label = self._key_label(key)
             logger.info("Shutting down worker '%s' (status=%s)", worker_label, thread.status)
             try:
-                thread.stop()
+                # PHASE 2.1a: session/process shutdown wants the instance GONE,
+                # not parked — stop() only detaches now, and a detached thread
+                # would never exit the bounded join below. kill() with a stop()
+                # fallback for lightweight thread doubles that predate the split.
+                _killer = getattr(thread, "kill", None) or thread.stop
+                _killer()
                 thread.join(timeout=timeout)
             except Exception:
                 logger.exception("Error joining worker '%s' during shutdown", worker_label)

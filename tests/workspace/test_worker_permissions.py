@@ -6,8 +6,9 @@ session permissions — the session acts as a ceiling that the worker
 cannot exceed, though the worker may impose stricter limits.
 
 Canonical permission schema (permission-schema unification):
-  Exactly six categories: container | network | filesystem | git | mcp |
-  host_bash.  The legacy ``system``/``execution`` categories and the split
+  Exactly the ``security.resource_catalog.RESOURCE_CATALOG`` categories:
+  container | network | filesystem | git | mcp | host_bash | ci | credential
+  | visual.  The legacy ``system``/``execution`` categories and the split
   ``git_read``/``git_write`` grains no longer exist; worker definitions
   that still request them are merged fail-closed (a canonical category
   absent from the session resolves to its SAFE_DEFAULTS level) and any

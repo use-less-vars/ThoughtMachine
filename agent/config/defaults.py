@@ -133,6 +133,15 @@ RESOURCE_MEM_LIMIT = "512m"
 RESOURCE_CPU_QUOTA = 50000
 # Default image used by container_manager.
 DEFAULT_IMAGE = "agent-executor"
+# Dedicated render image for tools/visual_tool.py (the working name the
+# operator ruling in docs/design-worker-lifecycle.md settles on).  ``None``
+# means NO render image is provisioned in this build: the visual tool then
+# refuses fail-closed and never falls back to DEFAULT_IMAGE /
+# RESOURCE_IMAGE_TAG.  When a reference is configured it must ALSO appear in
+# ADMISSION_IMAGE_ALLOWLIST below -- the gate stays the single authority for
+# what may run -- and the tool refuses before creating any container when it
+# does not.
+VISUAL_RENDER_IMAGE: str | None = None
 # Workspace config.json default max_containers (infra/container_manager.py: ContainerManager.max_containers).
 DEFAULT_MAX_CONTAINERS = 6
 # Valid container_type values ("git" is represented as "resource"; mcp/proxy
@@ -257,8 +266,10 @@ PROMPT_TIMEOUT = 120.0
 DEFAULT_RESPONSE_TOKENS = 4096
 
 # ── agent/core/tool_executor.py ──────────────────────────────────────────────
-# Fallback session-permissions profile (canonical six categories) used when no
-# live SessionPermissions model is available on config.
+# Fallback session-permissions profile used when no live SessionPermissions
+# model is available on config.  NOTE: this literal is still the LEGACY SUBSET
+# of ``thoughtmachine.security.SAFE_DEFAULTS`` -- ``ci``/``credential`` are
+# absent (a pre-existing drift, tracked separately).
 DEFAULT_SESSION_PERMISSIONS = {
     "container": False,
     "network": "banned",
@@ -266,5 +277,6 @@ DEFAULT_SESSION_PERMISSIONS = {
     "git": "read",
     "mcp": "banned",
     "host_bash": "banned",
+    "visual": "banned",
 }
 

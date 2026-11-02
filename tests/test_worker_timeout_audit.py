@@ -222,7 +222,9 @@ class TestQueryActionTimeout(unittest.TestCase):
         self.assertIn("Re-spawn", result["note"])
         self.assertEqual(result["worker_name"], "w-query")
         fake.send_query.assert_called_once_with("hello", timeout=300.0)
-        fake.stop.assert_called_once()
+        # PHASE 2.1a: the timeout branch TERMINATES (kill); stop() only detaches.
+        fake.kill.assert_called_once()
+        fake.stop.assert_not_called()
         fake._cleanup_worker_containers.assert_called_once()
 
 
@@ -739,7 +741,9 @@ class TestWlmWorkerDelegation(_RunSafetyPatches):
             thread.resume()
             self.assertEqual(thread._wlm.resume_calls, [True])
 
-    def test_wlm_stop_delegation_flag_on(self):
+    def test_wlm_kill_delegation_flag_on(self):
+        # PHASE 2.1a: WLM stop delegation moved from stop() (now a detach,
+        # which must NOT reclaim containers) to kill().
         with tempfile.TemporaryDirectory() as tmp:
             thread = make_thread(tmp, name="w-wlm-stop")
             thread._agent_config_dict = {
@@ -747,7 +751,7 @@ class TestWlmWorkerDelegation(_RunSafetyPatches):
                 "session_config": {"use_workspace_lifecycle_manager": True},
             }
             thread._wlm = _FakeWlmSupervisor()
-            thread.stop()
+            thread.kill()
             self.assertEqual(thread._wlm.stop_calls, [True])
 
     def test_wlm_prune_abandoned_attempt_flag_on(self):

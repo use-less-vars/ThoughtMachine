@@ -136,8 +136,9 @@ class TestEffectivePermissionsMerge:
     def test_all_max(self):
         """All-session-max with all-workspace-true yields maximum effective permissions.
 
-        The effective dict carries exactly the seven canonical category keys
-        (filesystem | network | container | git | mcp | host_bash | ci); the
+        The effective dict carries exactly the canonical category keys
+        (filesystem | network | container | git | mcp | host_bash | ci |
+        credential | visual); the
         legacy ``system`` grain was removed in the permission-schema
         unification and is never emitted.
         """
@@ -160,7 +161,10 @@ class TestEffectivePermissionsMerge:
         assert eff["git"] == "write"
         assert eff["mcp"] == "banned"  # session default
         assert eff["host_bash"] == "banned"  # session default
-        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci", "credential"}
+        assert set(eff) == {
+            "filesystem", "network", "container", "git", "mcp", "host_bash",
+            "ci", "credential", "visual",
+        }
 
     def test_network_workspace_denied(self):
         """Workspace allow_network=False → effective network=False."""
@@ -238,7 +242,10 @@ class TestEffectivePermissionsMerge:
         eff = get_effective_permissions(session, workspace)
         assert "system" not in eff
         assert "execution" not in eff
-        assert set(eff) == {"filesystem", "network", "container", "git", "mcp", "host_bash", "ci", "credential"}
+        assert set(eff) == {
+            "filesystem", "network", "container", "git", "mcp", "host_bash",
+            "ci", "credential", "visual",
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════

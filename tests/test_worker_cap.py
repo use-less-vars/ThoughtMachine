@@ -20,12 +20,13 @@ from types import SimpleNamespace
 import pytest
 
 from tools.workspace import worker as worker_module
-from tools.workspace.worker import Worker
+from tools.workspace.worker import Worker, WorkerThread
 import tools.workspace.worker_container as worker_container
 from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
 
 from tests.test_worker_sync_query_timeout_containment import (
     _FakeContainerManager,
+    _FakeContext,
     _owned_container,
     _resource_container,
     _spawn_worker,
@@ -210,7 +211,7 @@ def test_reset_fallback_is_session_scoped(tmp_path, monkeypatch):
 
 def test_stop_fallback_is_session_scoped(tmp_path, monkeypatch):
     """Same contract for stop: a foreign-session worker of the same name is
-    never stopped, joined or unregistered by the fallback sweep."""
+    never detached, joined or unregistered by the fallback sweep."""
     (tmp_path / "foreign").mkdir()
     foreign = _spawn_worker(
         tmp_path / "foreign", monkeypatch, name="w1", session_id=OTHER_SID
@@ -220,7 +221,9 @@ def test_stop_fallback_is_session_scoped(tmp_path, monkeypatch):
         workers=[_def("w1")]
     )
 
-    assert result["status"] == "stopped"
+    # PHASE 2.1a: ``stop`` is a DETACH, so its envelope carries
+    # "detached" (termination answers "killed").
+    assert result["status"] == "detached"
     assert "was not running" in result["message"]
     assert foreign.is_alive()
     assert worker_module._worker_registry[(OTHER_SID, "w1", 1)] is foreign
@@ -230,7 +233,9 @@ def test_reset_fallback_still_resets_own_dead_instance(tmp_path, monkeypatch):
     """Session scoping must not disable the fallback: a registered but dead
     instance in the caller's OWN session is still swept and reset."""
     thread = _spawn_worker(tmp_path, monkeypatch, name="w1", session_id=SID)
-    thread.stop()
+    # PHASE 2.1a: stop() detaches and leaves the thread parked/alive, so a
+    # DEAD-but-registered instance is produced by kill() only.
+    thread.kill()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0)
     with worker_module._registry_lock:
         assert (SID, "w1", 1) in worker_module._worker_registry
@@ -257,6 +262,75 @@ def test_default_cap_is_three(tmp_path, monkeypatch):
     assert "spawn limit reached" in result["error"]
     assert result["max_workers"] == 3
     assert result["live_workers"] == 3
+
+
+def _spawn_worker_with_live_context_saves(tmp_path, monkeypatch, name, session_id):
+    """Spawn a worker whose ``_save_context`` is REAL.
+
+    ``_spawn_worker`` neuters ``_save_context`` (``lambda self: None``), so the
+    terminating thread's run() finally-block re-save never reaches disk and any
+    "context was dropped" assertion is vacuously true.  Only ``_load_context``
+    (no on-disk context is needed) and ``_heartbeat_tick`` are patched here.
+    """
+    monkeypatch.setattr(WorkerThread, "_load_context", lambda self: _FakeContext())
+    monkeypatch.setattr(WorkerThread, "_heartbeat_tick", lambda self: None)
+    thread = WorkerThread(
+        name=name,
+        definition={"name": name, "system_prompt": "You are a test worker."},
+        agent_config={},
+        workspace_dir=tmp_path,
+        session_id=session_id,
+        container_manager=None,
+        max_container_count=4,
+        max_token_usage=None,
+        max_runtime_s=None,
+    )
+    with worker_module._registry_lock:
+        worker_module._worker_registry[(session_id, name, 1)] = thread
+    thread.start()
+    # ``status`` is already "ready" from __init__ (worker_thread.py:1051), so a
+    # status-based wait returns before run() has done anything.  Wait for the
+    # STARTUP context save instead (run() calls _save_context() at :2631).
+    ctx_file = thread._context_path()
+    assert _wait_until(ctx_file.is_file), (
+        f"worker {name!r} never persisted {ctx_file} "
+        f"(status={thread.status}, error={thread.error}, "
+        f"alive={thread.is_alive()})"
+    )
+    return thread
+
+
+def test_reset_drops_state_files_after_the_threads_final_save(tmp_path, monkeypatch):
+    """reset must delete the state files AFTER the join.
+
+    The terminating thread's run() finally-block re-saves context.json
+    (worker_thread.py:3228-3229 ``if self._worker_ctx is not None:
+    self._save_context()``), so a delete placed before the join would be
+    resurrected on disk.  Unlike ``test_reset_worker_stops_and_frees_slot``
+    this spawn keeps the REAL ``_save_context``, so that final save actually
+    writes: the ordering, not just the call, is on trial.
+    """
+    thread = _spawn_worker_with_live_context_saves(tmp_path, monkeypatch, "w1", SID)
+    worker_dir = thread._worker_dir
+    ctx_file = worker_dir / "context.json"
+    status_file = worker_dir / "status.json"
+    assert ctx_file.is_file(), "run() must persist context.json on startup"
+    assert status_file.is_file()
+
+    result = Worker(action="reset", worker_name="w1", session_id=SID)._action_reset(
+        workers=[_def("w1")]
+    )
+
+    assert result["status"] == "reset"
+    assert result["freed_slot"] is True
+    assert result["live_workers"] == 0
+    assert result["max_workers"] == worker_module.MAX_WORKERS_PER_SESSION
+    assert not thread.is_alive()
+    assert not ctx_file.exists(), "reset left a context.json behind (re-saved by the dying thread?)"
+    assert not status_file.exists()
+    assert not (worker_dir / "command.json").exists()
+    with worker_module._registry_lock:
+        assert (SID, "w1", 1) not in worker_module._worker_registry
 
 
 def test_user_override_cap_allows_more_workers(tmp_path, monkeypatch):

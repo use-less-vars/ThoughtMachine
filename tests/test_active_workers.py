@@ -4,8 +4,13 @@ Covers the runtime/template split from the live-thread side:
 
 * ``GET /api/workspace/{ws_id}/workers/active`` returns per-instance runtime
   handles ``{worker_name, instance_id, status, elapsed, name, session_id,
-  last_heartbeat, container_id}`` and never leaks template fields; the
-  optional ``?session_id=`` query param narrows to a single session.
+  last_heartbeat, container_id, queued_query_count, queued_query_ids}`` and
+  never leaks template fields; the optional ``?session_id=`` query param
+  narrows to a single session.
+* The same handles report the queries a worker has accepted but not yet
+  dequeued (``queued_query_count``/``queued_query_ids``, FIFO order), sourced
+  from ``WorkerThread.pending_query_jobs()`` and degrading to an empty queue
+  for threads (or double) that cannot report one.
 * ``GET /api/workspace/{ws_id}/workers`` returns the raw ``workers.json``
   template dicts and never merges in runtime/instance fields, even when
   live threads exist for the same workspace.
@@ -15,6 +20,7 @@ All workspace filesystem access is redirected to the pytest tmp_path.
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -106,6 +112,7 @@ def test_active_workers_returns_instances_not_templates(tmp_path, monkeypatch):
         assert set(entry.keys()) == {
             "worker_name", "instance_id", "status", "elapsed",
             "name", "session_id", "last_heartbeat", "container_id",
+            "queued_query_count", "queued_query_ids",
         }, entry
         for template_key in ("system_prompt", "tool_classes", "tools",
                              "instance_label", "runtime_status"):
@@ -190,3 +197,158 @@ def test_active_workers_filter_by_session(tmp_path, monkeypatch):
         workspace_routes.get_active_workers("ws-1", session_id=Query(None))
     )
     assert via_query_sentinel == unfiltered
+
+
+# ── queued (accepted-but-not-dequeued) query surface ─────────────────────────
+
+
+def _real_thread(tmp_path, name="w-queue", instance_id=1, session_id="s1"):
+    """An unstarted REAL WorkerThread — constructing one starts no thread."""
+    from tools.workspace.worker import WorkerThread
+
+    return WorkerThread(
+        name=name,
+        definition={"name": name},
+        agent_config={},
+        workspace_dir=tmp_path,
+        session_id=session_id,
+        instance_id=instance_id,
+    )
+
+
+def _serve_threads(monkeypatch, threads):
+    """Route ``active`` through *threads* for session s1 of workspace ws-1."""
+    _patch_manager(
+        monkeypatch, SimpleNamespace(list_workers=lambda sid: list(threads))
+    )
+    _patch_session_registry(monkeypatch, {
+        "s1": {"session_id": "s1", "workspace_id": "ws-1", "is_open": True},
+    })
+
+
+def test_active_workers_surface_queued_query_count_and_ids_in_fifo_order(
+        tmp_path, monkeypatch):
+    """Queries a worker accepted but has not dequeued are visible per instance:
+    ``queued_query_count`` plus the job ids in strict FIFO order."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    thread = _real_thread(tmp_path)
+    thread.enqueue_query("job-a", "first query")
+    thread.enqueue_query("job-b", "second query")
+    _serve_threads(monkeypatch, [thread])
+
+    rows = asyncio.run(workspace_routes.get_active_workers("ws-1"))
+    assert len(rows) == 1, rows
+    entry = rows[0]
+    assert entry["worker_name"] == "w-queue"
+    assert entry["queued_query_count"] == 2
+    assert entry["queued_query_ids"] == ["job-a", "job-b"]
+    assert isinstance(entry["queued_query_ids"], list)
+
+
+def test_active_workers_empty_queue_reports_zero(tmp_path, monkeypatch):
+    """A worker with nothing queued reports an explicit zero / empty list."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    thread = _real_thread(tmp_path)
+    _serve_threads(monkeypatch, [thread])
+
+    rows = asyncio.run(workspace_routes.get_active_workers("ws-1"))
+    assert len(rows) == 1, rows
+    entry = rows[0]
+    assert entry["queued_query_count"] == 0
+    assert entry["queued_query_ids"] == []
+
+
+def test_active_workers_entry_without_pending_query_jobs_does_not_fail_route(
+        tmp_path, monkeypatch, caplog):
+    """Duck-typed thread doubles (missing / exploding / non-sequence getter)
+    report an empty queue instead of failing the whole request — but an
+    UNREADABLE queue (raise / non-sequence) is warned about, because a silent
+    zero reads as an idle worker, while a genuinely absent getter is silent."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    caplog.set_level(logging.WARNING, logger=workspace_routes.logger.name)
+
+    def _explode():
+        raise RuntimeError("pending_query_jobs boom")
+
+    no_attr = _thread("w1")
+    exploding = _thread("w2")
+    exploding.pending_query_jobs = _explode
+    non_sequence = _thread("w3")
+    non_sequence.pending_query_jobs = lambda: 42
+    _serve_threads(monkeypatch, [no_attr, exploding, non_sequence])
+
+    rows = asyncio.run(workspace_routes.get_active_workers("ws-1"))
+    assert [e["worker_name"] for e in rows] == ["w1", "w2", "w3"], rows
+    for entry in rows:
+        assert entry["queued_query_count"] == 0, entry
+        assert entry["queued_query_ids"] == [], entry
+
+    # The degraded payload is unchanged — the visibility comes from the log.
+    queue_warnings = [
+        record for record in caplog.records
+        if record.name == workspace_routes.logger.name
+        and record.levelno >= logging.WARNING
+        and "queued" in record.getMessage().lower()
+    ]
+
+    def _warning_mentioning(worker_name):
+        matches = [r for r in queue_warnings if worker_name in r.getMessage()]
+        assert len(matches) == 1, [r.getMessage() for r in queue_warnings]
+        return matches[0]
+
+    # Raising getter: warned with the traceback attached.
+    exploding_warning = _warning_mentioning("w2")
+    assert "as 0" in exploding_warning.getMessage()
+    assert exploding_warning.exc_info is not None, (
+        "the raise path must log exc_info=True"
+    )
+
+    # Non-sequence getter: warned (no exception) and names the type received.
+    non_sequence_warning = _warning_mentioning("w3")
+    assert "as 0" in non_sequence_warning.getMessage()
+    assert "int" in non_sequence_warning.getMessage(), (
+        non_sequence_warning.getMessage()
+    )
+    assert non_sequence_warning.exc_info is None, (
+        "the non-sequence path has no exception to attach"
+    )
+
+    # Missing attribute = genuinely no queue: must stay silent, or a future
+    # "log everything" change turns the healthy empty case into noise.
+    assert not any("w1" in r.getMessage() for r in queue_warnings), (
+        [r.getMessage() for r in queue_warnings]
+    )
+    assert len(queue_warnings) == 2, [r.getMessage() for r in queue_warnings]
+
+
+def test_active_workers_stopped_or_killed_worker_reports_empty_queue(
+        tmp_path, monkeypatch):
+    """Killing a worker rejects its pending queries, so a killed entry reports
+    an empty queue rather than ids that can never run."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    thread = _real_thread(tmp_path)
+    thread.enqueue_query("job-a", "queued then killed")
+    assert thread.pending_query_jobs() == ["job-a"]
+
+    # Keep the rejection path hermetic: no job registry, no global event bus,
+    # no audit row (the rejection itself is covered by its own phase tests).
+    reject_globals = type(thread).reject_queued_queries.__globals__
+    monkeypatch.setitem(reject_globals, "_get_worker_job_registry", lambda: None)
+    monkeypatch.setitem(
+        reject_globals, "_publish_global_worker_event", lambda *a, **kw: None
+    )
+    import thoughtmachine.audit_logger as audit_logger
+
+    monkeypatch.setattr(audit_logger, "audit_event", lambda *a, **kw: None,
+                        raising=False)
+
+    assert thread.reject_queued_queries("killed") == ["job-a"]
+    thread.status = "killed"
+    _serve_threads(monkeypatch, [thread])
+
+    rows = asyncio.run(workspace_routes.get_active_workers("ws-1"))
+    assert len(rows) == 1, rows
+    entry = rows[0]
+    assert entry["status"] == "killed"
+    assert entry["queued_query_count"] == 0
+    assert entry["queued_query_ids"] == []

@@ -253,6 +253,25 @@
           "risk_level": "high",
           "ui_category": "integrations",
           "required_workspace_switch": null
+        },
+        {
+          "name": "visual",
+          "display_name": "Visual",
+          "description": "Screenshots one file from the workspace (file:///workspace/...) in an ephemeral container and returns its path; no network access, one render per call. Requires a provisioned render image; refuses to run until one is admitted.",
+          "permission_grain_set": [
+            "banned",
+            "ask",
+            "view"
+          ],
+          "execution_mode": "container",
+          "container_image": null,
+          "dockerfile_reference": null,
+          "tools": [
+            "VisualTool"
+          ],
+          "risk_level": "medium",
+          "ui_category": "sandbox",
+          "required_workspace_switch": "allow_docker"
         }
       ],
       "root_type": "list",

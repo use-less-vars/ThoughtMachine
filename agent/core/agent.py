@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import queue
+import sys
 import time
 import threading
 import traceback
@@ -286,6 +287,39 @@ def _exception_for_interrupted(reason: str):
     if error_type == 'rate_limit_exceeded':
         return RateLimitExceeded(message)
     return LLMError(error_type=error_type, message=message)
+
+
+def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool) -> bool:
+    """Drop a stranded session-level "main agent paused" marker.
+
+    ``Worker(action="pause")`` with main scope records the session id in
+    ``tools.workspace.worker_thread._SESSION_MAIN_PAUSED``; while an id is in
+    that set ``join`` / ``wait_for_job`` short-circuit to
+    ``{"status": "paused"}`` and ``pause`` keeps reporting
+    ``main_agent_paused: true``.  The operator-facing resume path (workspace
+    HTTP route -> ``WorkerThread.resume()``) only clears the WORKER-scope
+    ``_manual_only_pause`` marker, and the agent-facing ``resume`` action no
+    longer exists (operator-only), so the session marker would otherwise
+    outlive the pause forever.  The genuine "this session is no longer
+    paused" event is the start of the next operator turn, which is where this
+    is called.
+
+    Worker (sub-)agent turns share the parent ``session_id`` (``WorkerThread``
+    builds its ``WorkerContext`` from it), so ``worker_mode`` turns must NOT
+    clear the marker: a worker finishing a turn is not an operator turn.
+
+    Returns True when a marker was actually discarded.
+    """
+    if worker_mode or not session_id:
+        return False
+    # The marker lives in the worker stack; if that module was never imported
+    # in this process the set cannot have been populated, so skip the import.
+    module = sys.modules.get("tools.workspace.worker_thread")
+    paused = getattr(module, "_SESSION_MAIN_PAUSED", None) if module is not None else None
+    if not paused or session_id not in paused:
+        return False
+    paused.discard(session_id)
+    return True
 
 
 class Agent:
@@ -1150,6 +1184,13 @@ class Agent:
     def process_query(self, query):
         """Process a user query, appending it to conversation and running the agent.
         Yields events as dicts."""
+        # PHASE 2.1a: a new operator turn un-pauses the session.  Drop any
+        # stranded main-pause marker here so join/wait_for_job stop reporting
+        # "paused" for a pause that ended turns ago (see the helper).
+        _discard_session_main_pause(
+            self.session_id,
+            worker_mode=bool(getattr(self.config, 'worker_mode', False)),
+        )
         self._emergency_retries = 0
         final_pending = False
         try:

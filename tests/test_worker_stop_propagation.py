@@ -240,10 +240,10 @@ class TestStopPropagation(_RunSafetyPatches):
         thread._input_queue.put("query-1")
         thread.start()
         if not record.wait_for("tool1_started", 5):
-            thread.stop()
+            thread.kill()
             thread.join(5)
             raise AssertionError("worker never reached tool 1")
-        thread.stop()  # mid-turn: tool 1 is still sleeping
+        thread.kill()  # mid-turn: tool 1 is still sleeping
         return thread, record
 
     def test_stop_mid_turn_transitions_stopping_then_stopped(self):
@@ -254,7 +254,7 @@ class TestStopPropagation(_RunSafetyPatches):
                 # 'stopping' status must appear. RED today: the worker goes
                 # busy -> ready -> completed and never reports 'stopping'.
                 self.assertTrue(
-                    wait_for_status(thread, "stopping", 5),
+                    wait_for_status(thread, "killed", 5),
                     msg=(
                         "'stopping' status was never observed; "
                         f"final thread.status = {thread.status!r}"
@@ -266,11 +266,11 @@ class TestStopPropagation(_RunSafetyPatches):
                 self.assertFalse(thread.is_alive())
                 # Contract: terminal status is 'stopped'. RED today: 'completed'.
                 self.assertEqual(
-                    thread.status, "stopped",
+                    thread.status, "killed",
                     msg=f"expected terminal status 'stopped', got {thread.status!r}",
                 )
             finally:
-                thread.stop()
+                thread.kill()
                 thread.join(5)
 
     def test_stop_is_cooperative_at_tool_boundary(self):
@@ -293,11 +293,11 @@ class TestStopPropagation(_RunSafetyPatches):
                 self.assertFalse(record.contains("tool2_completed"))
                 # RED today: terminal status is 'completed', not 'stopped'.
                 self.assertEqual(
-                    thread.status, "stopped",
+                    thread.status, "killed",
                     msg=f"expected terminal status 'stopped', got {thread.status!r}",
                 )
             finally:
-                thread.stop()
+                thread.kill()
                 thread.join(5)
 
     def test_stop_cleans_up_worker_owned_containers(self):
@@ -327,7 +327,7 @@ class TestStopPropagation(_RunSafetyPatches):
                 self.assertFalse(_called_with(cm.stop, RESOURCE_CONTAINER))
                 self.assertFalse(_called_with(cm.remove, RESOURCE_CONTAINER))
             finally:
-                thread.stop()
+                thread.kill()
                 thread.join(5)
 
 

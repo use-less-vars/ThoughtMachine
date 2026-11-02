@@ -68,6 +68,7 @@ _PERMISSION_KEYS = (
     "mcp",
     "host_bash",
     "ci",
+    "visual",
     "credential",
 )
 
@@ -98,6 +99,7 @@ STORED_PERMS = {
     # against ``config.effective``.
     "host_bash": "banned",
     "ci": "banned",
+    "visual": "banned",
     "credential": "use",
 }
 
@@ -110,6 +112,7 @@ CURRENT_PERMS = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "visual": "banned",
     "credential": "banned",
 }
 

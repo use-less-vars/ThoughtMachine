@@ -53,6 +53,7 @@ FAIL_CLOSED = {
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
+    "visual": "banned",
     "credential": "banned",
 }
 
@@ -112,6 +113,7 @@ def test_readable_ceiling_caps_session_grants(tmp_path, monkeypatch):
         "mcp": "banned",
         "host_bash": "banned",
         "ci": "banned",
+        "visual": "banned",
         "credential": "banned",
     }
 
