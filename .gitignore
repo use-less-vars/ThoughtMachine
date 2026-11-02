@@ -353,3 +353,8 @@ web_ui/frontend/.npmrc
 # `docs/*` above is a catch-all, so the negation is required or the file is
 # never versioned and vanishes on the next clone.
 !docs/design-worker-lifecycle.md
+
+# Gen 56 W7 design brief (process isolation): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design-process-isolation.md
