@@ -30,7 +30,7 @@ from llm_providers.exceptions import ProviderError, RateLimitExceeded
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
-from agent.core.message import Message
+from agent.core.message import Message, is_system_notice_text, make_system_notice
 from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
 from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
@@ -418,6 +418,8 @@ class Agent:
         self._pause_requested = False
         # Reading mode: at most ONE pause nudge per turn.
         self._pause_nudge_sent = False
+        # Stop: at most ONE stop notice per turn.
+        self._stop_notice_sent = False
         self.rate_limit_delay = 1.0
         self.rate_limit_base_wait = 10.0
         self.rate_limit_backoff_factor = 1.2
@@ -1057,7 +1059,7 @@ class Agent:
         content = message.get('content', '')
         is_sys_notif = message.get('is_system_notification', False)
         content_preview = content[:100]
-        if content.startswith('[SYSTEM NOTIFICATION]'):
+        if is_system_notice_text(content):
             if is_sys_notif is not True:
                 log('WARNING', 'core.validation', 'Flag inconsistency detected', {
                     'reason': 'missing is_system_notification flag',
@@ -1232,7 +1234,7 @@ class Agent:
 
         Runs ON THE TURN THREAD, after the LLM response has been received and
         before the pending tool calls execute. When the active restriction is
-        owned by 'pause' it buffers at most one [SYSTEM NOTIFICATION] message
+        owned by 'pause' it buffers at most one [System Notice: ...] message
         asking the model to summarise and reply with Respond, then consumes
         the pause request.
 
@@ -1253,17 +1255,12 @@ class Agent:
         if getattr(self.state, 'restriction_reason', None) != 'pause':
             return
         if not self._pause_nudge_sent and tool_calls:
-            nudge = Message(
-                role='user',
-                content=(
-                    '[SYSTEM NOTIFICATION] The operator has paused this session. '
-                    'Do not start new work and do not call tools; tool calls will '
-                    'be refused. Summarize what you have done and what remains, '
-                    'then reply with Respond. The session will stay paused until '
-                    'it is resumed.'
-                ),
-                is_system_notification=True,
-                metadata={'warning_id': str(uuid.uuid4()), 'pause_nudge': True},
+            nudge = make_system_notice(
+                'You were paused by the user. Do not start new work and do not call tools — '
+                'tool calls are refused. Summarize what you have done and what remains, then '
+                'reply with Respond. The session stays paused until it is resumed.',
+                kind='pause_nudge',
+                pause_nudge=True,
             )
             self._pending_warnings.append(nudge)
             self._pause_nudge_sent = True
@@ -1376,6 +1373,7 @@ class Agent:
             pause_debug(f'Clearing _pause_requested (was {self._pause_requested})')
             self._pause_requested = False
             self._pause_nudge_sent = False
+            self._stop_notice_sent = False
             current_exec_state = self.state.execution_state
             if current_exec_state == ExecutionState.RUNNING:
                 log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
@@ -1648,6 +1646,19 @@ class Agent:
                             halt_tx.commit_assistant_only()
                         else:
                             halt_tx.rollback()
+                        # The model has to learn WHY its stream vanished, or the
+                        # next turn resumes as if the answer had been finished.
+                        # This cannot go through _pending_warnings: every flush
+                        # site is behind the `return` below, so it is written
+                        # straight to history -- and only now, AFTER the partial
+                        # assistant message committed above, so the truncated
+                        # answer stays ahead of the notice that explains it.
+                        if not self._stop_notice_sent:
+                            self._add_to_conversation(make_system_notice(
+                                'You were stopped by the user. Review your current progress and resume.',
+                                kind='stop_notice',
+                            ))
+                            self._stop_notice_sent = True
                         self.total_input_tokens += input_tokens
                         self.total_output_tokens += output_tokens
                         interrupted_event = {

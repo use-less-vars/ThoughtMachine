@@ -3,7 +3,7 @@
 Pause is implemented as a state restriction owned by the reason 'pause'
 (AgentState.restrict('pause')), which narrows the allow-list to ['Respond'].
 The Pause button calls enter_reading_mode(); the turn thread's checkpoint
-(_apply_pause_reading_mode) buffers at most ONE [SYSTEM NOTIFICATION] nudge
+(_apply_pause_reading_mode) buffers at most ONE [System Notice: ...] nudge
 asking the model to wrap up with a Respond, and the turn concludes normally.
 
 These tests pin that contract at the Agent level (no truncation, one nudge per
@@ -17,6 +17,9 @@ from __future__ import annotations
 
 from agent.config.models import AgentConfig
 from agent.core.agent import Agent
+from agent.core.message import SYSTEM_NOTICE_PREFIX, is_system_notice_text
+from agent.core.stream_events import Done, TextDelta
+from tests.test_agent_stop_midstream import _ScriptedLLM
 
 
 def _make_agent() -> Agent:
@@ -42,6 +45,37 @@ def _nudges(agent: Agent):
         if metadata and metadata.get("pause_nudge"):
             out.append(message)
     return out
+
+
+def _halt_agent(session_id: str, turns=None) -> Agent:
+    """An agent wired to halt mid-stream after the first delta.
+
+    Reuses the scripted-stream harness from tests/test_agent_stop_midstream.py
+    (the halt contract's own tests) rather than building a second one.
+    """
+    if turns is None:
+        turns = [[TextDelta(text="Par"), TextDelta(text="tial"), Done()]]
+    agent = Agent(config=AgentConfig(api_key="test-key", enable_logging=False), session_id=session_id)
+    llm = _ScriptedLLM(turns)
+    agent.llm_client.stream_completion = llm.stream_completion
+    polls = {"n": 0}
+
+    def halt_check():
+        # False on the first poll (delta #1 is allowed through), True after.
+        polls["n"] += 1
+        return polls["n"] > 1
+
+    agent.halt_check = halt_check
+    return agent
+
+
+def _stop_notices(agent: Agent):
+    """Committed stop notices (Message is a dict subclass -> use .get())."""
+    return [
+        message
+        for message in agent.conversation
+        if (message.get("metadata") or {}).get("kind") == "stop_notice"
+    ]
 
 
 class TestEnterLeaveReadingMode:
@@ -110,7 +144,7 @@ class TestPauseCheckpoint:
         nudge = _nudges(agent)[0]
         assert nudge["role"] == "user"
         assert nudge["is_system_notification"] is True
-        assert "[SYSTEM NOTIFICATION]" in nudge["content"]
+        assert nudge["content"].startswith(SYSTEM_NOTICE_PREFIX)
         assert "paused" in nudge["content"]
         assert "Respond" in nudge["content"]
 
@@ -252,3 +286,66 @@ class TestCheckpointThreeIsStructuralOnly:
         assert [line for line in code_lines if line == "return"] == []
         # ...and the removed branch is gone from the whole class, not just here.
         assert "Pause detected after turn processing" not in source
+
+
+class TestStopNotice:
+    """A hard stop leaves a notice in history, AFTER the partial answer it explains."""
+
+    def test_halt_appends_a_stop_notice_after_the_partial_answer(self):
+        agent = _halt_agent("test-stop-notice")
+
+        events = list(agent.process_query("tell me a long story"))
+        assert "interrupted" in [event["type"] for event in events], events
+
+        notices = _stop_notices(agent)
+        assert len(notices) == 1, agent.conversation
+        notice = notices[0]
+        assert notice["role"] == "user"
+        assert notice["is_system_notification"] is True
+        assert notice["content"] == (
+            "[System Notice: You were stopped by the user. "
+            "Review your current progress and resume.]"
+        )
+
+        # Ordering: the truncated answer stays ahead of the notice about it.
+        notice_at = next(i for i, message in enumerate(agent.conversation) if message is notice)
+        last_assistant = max(
+            i for i, message in enumerate(agent.conversation) if message.get("role") == "assistant"
+        )
+        assert agent.conversation[last_assistant]["content"] == "Par"
+        assert notice_at == last_assistant + 1, agent.conversation
+
+    def test_stop_notice_and_pause_nudge_share_the_notice_predicate(self):
+        agent = _halt_agent("test-stop-notice-predicate", [[TextDelta(text="Par"), Done()]])
+        list(agent.process_query("tell me a long story"))
+        stop_notice = _stop_notices(agent)[0]
+
+        paused = _make_agent()
+        paused.enter_reading_mode()
+        paused._apply_pause_reading_mode(_fake_tool_calls())
+        pause_nudge = _nudges(paused)[0]
+
+        for message in (stop_notice, pause_nudge):
+            assert message["role"] == "user"
+            assert message["is_system_notification"] is True
+            assert is_system_notice_text(message["content"]) is True
+            assert message["content"].startswith(SYSTEM_NOTICE_PREFIX)
+            assert message["content"].endswith("]")
+            # ...and neither is a monitor notification any more.
+            assert "[SYSTEM NOTIFICATION]" not in message["content"]
+
+    def test_each_halted_turn_gets_its_own_notice(self):
+        agent = _halt_agent(
+            "test-stop-notice-twice",
+            [
+                [TextDelta(text="Par"), TextDelta(text="tial"), Done()],
+                [TextDelta(text="Second"), Done()],
+            ],
+        )
+
+        list(agent.process_query("first query"))
+        assert agent._stop_notice_sent is True
+
+        # The per-turn reset lets the next stopped turn explain itself too.
+        list(agent.process_query("second query"))
+        assert len(_stop_notices(agent)) == 2, agent.conversation
