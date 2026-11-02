@@ -1266,3 +1266,27 @@ describe('ACCEPTANCE — two interleaved tool calls, reversed results (step 2)',
   });
 });
 
+
+// ==========================================================================
+// 12. client_only flag on the transient lifecycle events
+// ==========================================================================
+// stopped / paused / resumed are state changes, not conversation content: they
+// must be flagged client_only so MessageBubble renders them as the ephemeral
+// bubble family (dashed, muted) rather than as a persisted system notice.
+// started / completed intentionally stay unflagged (see the report).
+describe('transient lifecycle events are client_only', () => {
+  it('marks stopped, paused and resumed', () => {
+    for (const event of ['stopped', 'paused', 'resumed']) {
+      const result = adaptWorkerEvent(makeEvent({ event }));
+      expect(result.client_only).toBe(true);
+    }
+  });
+
+  it('does not flag started / completed', () => {
+    for (const event of ['started', 'completed']) {
+      const result = adaptWorkerEvent(makeEvent({ event }));
+      expect(result.client_only).toBeUndefined();
+    }
+  });
+});
+

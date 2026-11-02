@@ -594,6 +594,21 @@ body {
   border-radius: var(--radius);
 }
 
+/* Ephemeral (client-only) system bubbles.
+ *
+ * Modifier, not a role class: it composes with whatever role class the bubble
+ * already carries (.message-system-as-user) and overrides its enclosure.
+ * Those notices are NOT part of the stored conversation — status acks and
+ * worker state changes that vanish on the next server-driven replace — so they
+ * read as hollow and dashed, while persisted notices stay enclosed and solid. */
+.message-ephemeral {
+  background-color: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    QueryBar
    ────────────────────────────────────────────────────────────────────────── */

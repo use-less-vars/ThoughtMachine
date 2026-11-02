@@ -180,6 +180,57 @@ function AssistantContent({ msg }) {
   )
 }
 
+/* ── System-notice wrapper ──
+ *
+ * A system notice is stored as an ordinary message whose text the backend
+ * prefixes with a bracketed tag (agent/core/message.py). TWO families are
+ * live on this branch, and they differ in a way the renderer has to respect:
+ *
+ *   * '[System Notice: <text>]' -- SYSTEM_NOTICE_PREFIX, built by
+ *     make_system_notice() (pause nudge, stop notice, permission notices).
+ *     The CURRENT family, and it CLOSES its own bracket, so tag and matching
+ *     closer are both stripped.
+ *   * '[SYSTEM NOTIFICATION] <text>' -- SYSTEM_NOTIFICATION_PREFIX, the
+ *     legacy family. Prefix only, no closer: the body is the operator-visible
+ *     text verbatim, so its own brackets (e.g. 'see [docs]') are NEVER
+ *     trimmed.
+ *
+ * Either tag is transport metadata, not part of what the operator wrote, so
+ * both are hidden in the transcript: the bubble shows the inner text and
+ * keeps the raw string in `title`.
+ *
+ * Only applied to messages already rendering as system -- a real user message
+ * that happens to start with a tag keeps its text verbatim.
+ */
+const SYSTEM_NOTICE_WRAPPERS = [
+  { tag: '[System Notice:', stripsClosingBracket: true },
+  { tag: '[SYSTEM NOTIFICATION]', stripsClosingBracket: false },
+]
+
+function stripSystemNoticeWrapper(text) {
+  if (typeof text !== 'string') return text == null ? '' : String(text)
+  const lower = text.toLowerCase()
+  for (const wrapper of SYSTEM_NOTICE_WRAPPERS) {
+    if (!lower.startsWith(wrapper.tag.toLowerCase())) continue
+    /* Drop the tag and the separator that follows it. */
+    let inner = text.slice(wrapper.tag.length).replace(/^[\]\s:]+/, '')
+    /* Only the modern family closes its bracket; a legacy body keeps its own. */
+    if (wrapper.stripsClosingBracket) inner = inner.replace(/\s*\]\s*$/, '')
+    return inner.trim() ? inner : text
+  }
+  return text
+}
+
+/* Muted system-notice paragraph; exposes the unstripped text on hover. */
+function SystemNoticeText({ content }) {
+  const text = stripSystemNoticeWrapper(content)
+  return (
+    <p className="system-text" title={text === content ? undefined : content}>
+      {text}
+    </p>
+  )
+}
+
 /* ── Route content based on role ── */
 function MessageContent({ msg }) {
   /* Summary results: dark golden, full markdown, no truncation */
@@ -215,15 +266,15 @@ function MessageContent({ msg }) {
     case 'tool_result':
       return <TruncatableContent text={msg.content} />
     case 'system':
-      return <p className="system-text">{msg.content}</p>
+      return <SystemNoticeText content={msg.content} />
     default:
       /* System notification messages with role 'user' render as system style */
       if (msg.is_system_notification) {
         /* Token warnings use the same muted style as other system notifications */
         if (msg.content && (msg.content.toLowerCase().includes('token') || msg.content.includes('⚠️'))) {
-          return <p className="system-text">{msg.content}</p>
+          return <SystemNoticeText content={msg.content} />
         }
-        return <p className="system-text">{msg.content}</p>
+        return <SystemNoticeText content={msg.content} />
       }
       return <p className="message-text">{msg.content}</p>
   }
@@ -237,11 +288,16 @@ const MessageBubble = React.memo(
     ? (msg.response_type === 'question' ? 'question' : 'final')
     : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
   const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
+  /* Client-only notices (status acks, worker state changes) are NOT part of
+   * the stored conversation — they disappear on the next server-driven
+   * replace. They get an extra modifier class so the transcript can tell them
+   * apart from the enclosed, persisted system notices above. */
+  const isEphemeral = msg.client_only === true
   const copyText = msg.reasoning_content
     ? `${msg.reasoning_content}\n\n---\n\n${msg.content}`
     : msg.content
   return (
-    <div className={`message ${style.className}`} key={index}>
+    <div className={`message ${style.className}${isEphemeral ? ' message-ephemeral' : ''}`} key={index}>
       <div className="message-sender">
         {style.label}
         <CopyButton text={copyText} label="📋" />
@@ -260,6 +316,7 @@ const MessageBubble = React.memo(
     prev.msg.is_summary === next.msg.is_summary &&
     prev.msg.response_type === next.msg.response_type &&
     prev.msg.is_streaming === next.msg.is_streaming &&
+    prev.msg.client_only === next.msg.client_only &&
     // Merged tool bubbles: content is intentionally UNCHANGED when a result
     // lands on an existing call bubble (content is first-insert authoritative),
     // so the fields that DO change on merge must be compared here or the
@@ -270,5 +327,5 @@ const MessageBubble = React.memo(
     prev.msg.status === next.msg.status
 )
 
-export { MessageBubble, MessageContent, CopyButton }
+export { MessageBubble, MessageContent, CopyButton, stripSystemNoticeWrapper }
 export default MessageBubble
