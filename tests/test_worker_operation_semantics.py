@@ -35,6 +35,7 @@ import unittest
 from unittest import mock
 from unittest.mock import MagicMock
 
+from agent.config.defaults import WORKER_TIMEOUT_SECONDS as _DETACHED_TTL_SECONDS
 from tools.workspace.worker import Worker
 
 SESSION = "sess-op-semantics"
@@ -1665,6 +1666,117 @@ def test_stale_park_sentinel_after_resume_is_not_read_as_stop(tmp_path, monkeypa
 
     _retire_thread(thread)
 
+
+# A detached worker is only reaped once it has been detached for longer than
+# WORKER_TIMEOUT_SECONDS (tools/workspace/worker_manager.py:179-195), so every
+# latency asserted below must be orders of magnitude smaller than this.
+
+
+def test_command_file_kill_is_seen_while_parked(tmp_path, monkeypatch):
+    """A cross-process ``{"action": "kill"}`` must reach a PARKED worker.
+
+    ``kill`` is the only TERMINATING action (PHASE 2.1a), but both park loops
+    (worker_thread.py:2698 and :2961) waited on ``_resume_event`` alone: nothing
+    polled ``command.json`` while parked, so a kill written by another process
+    (web_ui/backend/workspace_routes.py:1197-1200) was never seen -- the worker
+    stayed parked until the detached TTL (``WORKER_TIMEOUT_SECONDS`` = 600 s)
+    killed it, and even then only through the sweep.  The run loops now poll
+    ``_poll_command()`` on each 1 s park wake-up.
+
+    Assertions are on the REAL thread, its real status files and the container
+    manager's detached registry -- never on a mock's call log.
+    """
+    thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, "w1", "sess-park-kill")
+    thread.pause()
+    assert _wait_until(lambda: thread.status == "paused"), thread.status
+    assert thread._pause_event.is_set(), "the worker must be genuinely parked"
+    # From here on only run()'s ``finally`` (worker_thread.py:3242-3243) saves
+    # the context -- kill() does not -- so a REAPPEARING context.json proves
+    # the finally block ran after the park loop broke out.
+    ctx_file = thread._worker_dir / "context.json"
+    ctx_file.unlink()
+
+    cmd = _write_command_file(thread, "kill")
+    started = time.monotonic()
+    died = _wait_until(lambda: not thread.is_alive(), timeout=10.0)
+    elapsed = time.monotonic() - started
+    assert died, (
+        "a command.json 'kill' was NOT seen while the worker was parked "
+        f"(alive={thread.is_alive()}, status={thread.status!r}, "
+        f"detach_requested={thread._detach_requested!r}, "
+        f"command_file_still_present={cmd.exists()}) -- the park loop is deaf"
+    )
+    assert elapsed < 10.0, f"kill latency while parked was {elapsed:.1f}s"
+    assert elapsed < _DETACHED_TTL_SECONDS / 10.0, (
+        f"kill latency while parked ({elapsed:.1f}s) is not far below the "
+        f"{_DETACHED_TTL_SECONDS}s detached TTL"
+    )
+
+    # The kill path won: the park loop broke out with the stop event set, so
+    # the loop's exit branch reported 'killed' (worker_thread.py:3197) and NOT
+    # the resume transition (:2703-2706), which would have written 'ready'.
+    assert thread.status == "killed"
+    assert thread._stop_event.is_set()
+    assert not cmd.exists(), "the consumed command file must be deleted"
+    assert thread._detach_requested is False
+    assert thread._detached_at is None
+    assert is_worker_detached(thread.owner_identity) is False
+    status_doc = json.loads(
+        (thread._worker_dir / "status.json").read_text(encoding="utf-8")
+    )
+    assert status_doc["runtime_status"] == "killed"
+    assert ctx_file.is_file(), "run()'s finally must still persist the context"
+    assert thread.resume() is False, "a killed worker is not revivable"
+    _retire_thread(thread)
+
+
+def test_command_file_detach_is_seen_while_parked(tmp_path, monkeypatch):
+    """A cross-process ``{"action": "stop"}`` must DETACH a PARKED worker.
+
+    Same deaf-park defect, opposite outcome: ``stop`` never sets the stop event
+    (PHASE 2.1a -- it parks the worker), so the park loop keeps waiting and what
+    the operator must observe instead is the DETACH transition itself (status
+    'detached', the detach markers, the container-manager registration).  It
+    must land within a park wake-up, not after the detached TTL.
+    """
+    thread = _spawn_ready_persisting_context(tmp_path, monkeypatch, "w1", "sess-park-stop")
+    thread.pause()
+    assert _wait_until(lambda: thread.status == "paused"), thread.status
+    assert thread._pause_event.is_set(), "the worker must be genuinely parked"
+    assert thread._detach_requested is False
+
+    cmd = _write_command_file(thread, "stop")
+    started = time.monotonic()
+    detached = _wait_until(lambda: thread.status == "detached", timeout=10.0)
+    elapsed = time.monotonic() - started
+    assert detached, (
+        "a command.json 'stop' was NOT seen while the worker was parked "
+        f"(alive={thread.is_alive()}, status={thread.status!r}, "
+        f"detach_requested={thread._detach_requested!r}, "
+        f"command_file_still_present={cmd.exists()}) -- the park loop is deaf"
+    )
+    assert elapsed < 10.0, f"detach latency while parked was {elapsed:.1f}s"
+    assert elapsed < _DETACHED_TTL_SECONDS / 10.0, (
+        f"detach latency while parked ({elapsed:.1f}s) is not far below the "
+        f"{_DETACHED_TTL_SECONDS}s detached TTL"
+    )
+
+    assert not cmd.exists(), "the consumed command file must be deleted"
+    assert thread.is_alive(), "stop must NOT terminate the thread"
+    assert thread._stop_event.is_set() is False, "stop must never set the stop event"
+    assert thread._pause_event.is_set(), "a detached worker keeps parking"
+    assert thread._detach_requested is True
+    assert thread._detached_at is not None
+    assert _wait_until(lambda: is_worker_detached(thread.owner_identity) is True, timeout=10.0), thread.owner_identity
+    status_doc = json.loads(
+        (thread._worker_dir / "status.json").read_text(encoding="utf-8")
+    )
+    assert status_doc["runtime_status"] == "detached"
+    # A detached worker is revivable -- that is the whole point of a detach --
+    # and resume() lifts the registration again (worker_thread.py:1657-1661).
+    assert thread.resume() is True
+    assert thread.status == "ready"
+    _retire_thread(thread)
 
 
 if __name__ == "__main__":
