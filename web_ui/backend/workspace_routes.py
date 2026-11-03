@@ -409,7 +409,20 @@ def _write_worker_command(
     """
     handle = runtime_handle_for(session_id, worker_name, instance_id)
     if handle is not None:
-        return _dispatch_via_runtime(handle, action)
+        try:
+            _dispatch_via_runtime(handle, action)
+        except Exception:
+            logger.warning(
+                "Worker %s (instance %s, session %s): runtime dispatch of %s "
+                "failed -- falling back to the fenced command channel",
+                worker_name,
+                instance_id,
+                session_id,
+                action,
+                exc_info=True,
+            )
+        else:
+            return
 
     generation = _read_worker_generation(worker_dir)
     if generation is None:
