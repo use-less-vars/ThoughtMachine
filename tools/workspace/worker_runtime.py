@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -266,15 +267,20 @@ def cached_frame_age_seconds(
     all need a ``WorkerThread`` -- which the supervisor does not have for a
     worker whose body runs in another OS process.
 
-    *frame_at* is the epoch timestamp :meth:`WorkerRuntimeHandle.on_frame`
-    cached: local receipt time, not the child's reported time, so a skewed
-    child clock can neither fake freshness nor fake staleness. ``None`` (no
-    frame yet) answers ``None``: absence of evidence is not an age, and 0.0
-    would claim we just heard from a worker we have never heard from.
+    *frame_at* is one of the two epoch timestamps
+    :meth:`WorkerRuntimeHandle.on_frame` caches -- ``Heartbeat.at`` parsed to
+    UTC epoch seconds (:func:`heartbeat_age_seconds`) or the supervisor's own
+    receipt time (:func:`frame_arrival_age_seconds`). ``None`` (nothing cached
+    yet) answers ``None``: absence of evidence is not an age, and 0.0 would
+    claim we just heard from a worker we have never heard from.
 
     Pure in its arguments; the only impurity is the clock read supplying
     *now*. Clock skew (or a caller's slightly-behind *now*) clamps to 0.0
     rather than going negative.
+
+    Kept as the one primitive the two wrappers below share: the arithmetic is
+    identical and only the QUESTION differs, so the difference belongs in the
+    names and their docstrings rather than in two copies of ``max(0.0, ...)``.
     """
     if frame_at is None:
         return None
@@ -283,6 +289,79 @@ def cached_frame_age_seconds(
         return max(0.0, reference - float(frame_at))
     except (TypeError, ValueError):
         return None
+
+
+def heartbeat_age_seconds(
+    at: Optional[float], *, now: Optional[float] = None
+) -> Optional[float]:
+    """How long since the worker SAID it ticked (D1, primary reading).
+
+    *at* is ``Heartbeat.at`` parsed to UTC epoch seconds -- the child's own
+    statement of when it last ran a tick -- so this answers, for a worker whose
+    thread the supervisor cannot see, the question
+    ``worker_thread._heartbeat_summary`` / ``worker_manager._heartbeat_age`` /
+    ``worker_lifecycle._heartbeat_age`` answer for a ``WorkerThread`` in
+    process.
+
+    Why this one is primary, and why the other one is kept rather than
+    collapsed into it: the supervisor and the runtime child are two processes
+    on the same host, so ``datetime.now(timezone.utc)`` is the same clock on
+    both sides to within microseconds and ``at`` can be believed. The one
+    failure it has is a clock STEP (NTP) landing between the child writing
+    ``at`` and the supervisor comparing it, which makes a live worker read as
+    stale or a stale one read as fresh -- and that is precisely the case
+    :func:`frame_arrival_age_seconds` cannot get wrong, because receipt time
+    never leaves this machine's own clock. One reading, one blind spot; the
+    pair covers each other, so both stay.
+
+    ``None`` in, ``None`` out: no heartbeat yet is not an age of zero.
+    """
+    return cached_frame_age_seconds(at, now=now)
+
+
+def frame_arrival_age_seconds(
+    received_at: Optional[float], *, now: Optional[float] = None
+) -> Optional[float]:
+    """How long since frames ARRIVED (D1, NTP-jump backstop).
+
+    *received_at* is the supervisor's own receipt time -- the clock no child
+    can influence, and the one that keeps ticking when the child's does not.
+    It moves for any accepted frame, not only a heartbeat, so it says "the
+    transport is delivering" rather than "the worker is ticking"; the two
+    agree unless a clock step sits between them, which is the single case
+    :func:`heartbeat_age_seconds` cannot see.
+
+    ``None`` in, ``None`` out: no frame yet is not an age of zero.
+    """
+    return cached_frame_age_seconds(received_at, now=now)
+
+
+def _epoch_seconds_from_iso8601(value: Any) -> Optional[float]:
+    """UTC epoch seconds for an ISO-8601 timestamp, or ``None`` if unreadable.
+
+    The same idiom ``worker_manager._heartbeat_age`` and
+    ``worker_lifecycle._heartbeat_age`` already apply to a ``WorkerThread``:
+    ``datetime.fromisoformat``, then "naive means UTC". ``Heartbeat.at``
+    carries the very string ``WorkerThread.last_heartbeat`` holds -- written
+    into ``status.json`` as TEXT -- so whatever parses there parses here,
+    including the trailing ``Z`` Python 3.11+ accepts.
+
+    ``None`` instead of an exception: this is called from
+    :meth:`WorkerRuntimeHandle.on_frame`, which runs on the socket read loop
+    and has to survive a timestamp it cannot read. A caller can tell "no
+    heartbeat yet" from "heartbeat we could not date" only by which slot it
+    passed in -- both are ``None``, and a guess here would be worse than the
+    ignorance.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 class WorkerRuntimeHandle:
@@ -306,11 +385,17 @@ class WorkerRuntimeHandle:
         # ``None`` until the first ``dispatch_query`` asks for them.
         self._spec: Optional[dict] = None
         self._process_runtime: Optional[Any] = None
-        # S4: what the last frame from a process-mode worker said, and when we
-        # received it (local receipt time). Filled by ``on_frame``, read by
-        # ``state`` before it falls back to the ``status.json`` mirror.
+        # S4: what the last frame from a process-mode worker said, and the two
+        # clocks it carried (D1). Filled by ``on_frame``; ``state`` reads the
+        # state cache before it falls back to the ``status.json`` mirror.
         self._last_worker_state: Optional[WorkerState] = None
-        self._last_frame_at: Optional[float] = None
+        # ``Heartbeat.at`` as UTC epoch seconds -- when the worker says it
+        # ticked (``heartbeat_age_seconds``).
+        self._last_heartbeat_at: Optional[float] = None
+        # Local receipt time of the last accepted frame of EITHER kind -- when
+        # the transport last delivered (``frame_arrival_age_seconds``). Two
+        # slots because they answer two questions; see ``on_frame``.
+        self._last_received_at: Optional[float] = None
 
     @classmethod
     def spawn(
@@ -414,14 +499,26 @@ class WorkerRuntimeHandle:
         from the cache before it falls back to the ``status.json`` mirror.
 
         Only the two frame kinds that exist are dispatched -- ``WorkerState``
-        refreshes the state cache, ``Heartbeat`` refreshes the arrival
+        refreshes the state cache, ``Heartbeat`` refreshes the heartbeat
         timestamp -- and anything else is ignored: a frame kind this stage
         does not know is not an error, it is simply not ours to interpret.
 
-        ``_last_frame_at`` is *receipt* time, not ``Heartbeat.at``. The two
-        processes share a filesystem but not a clock, so trusting the child's
-        own timestamp would let a skewed child fake freshness or staleness;
-        liveness is measured on the supervisor's clock or not at all.
+        Two clocks are cached, because D1 asks two questions and they do not
+        have the same answer on the same frame:
+
+        * ``_last_heartbeat_at`` -- ``Heartbeat.at`` parsed to UTC epoch
+          seconds, i.e. when the WORKER says it ticked. The primary liveness
+          reading (:func:`heartbeat_age_seconds`): both processes are on the
+          same host, so the clocks agree to microseconds.
+        * ``_last_received_at`` -- local receipt time, refreshed by BOTH frame
+          kinds, i.e. when the TRANSPORT last delivered
+          (:func:`frame_arrival_age_seconds`). The backstop for the one case
+          ``at`` can lie about, a clock step between the child writing ``at``
+          and the supervisor reading it.
+
+        A ``Heartbeat.at`` that will not parse caches ``None`` rather than a
+        guess; the arrival time is still recorded, so a malformed timestamp
+        costs the ``at`` reading and nothing else.
 
         Never raises, does no I/O, takes no lock and calls nothing back into
         the worker: this runs on the socket read loop, and a frame that
@@ -433,10 +530,10 @@ class WorkerRuntimeHandle:
             if isinstance(frame, WorkerState):
                 self._last_worker_state = frame
             elif isinstance(frame, Heartbeat):
-                pass
+                self._last_heartbeat_at = _epoch_seconds_from_iso8601(frame.at)
             else:
                 return
-            self._last_frame_at = time.time()
+            self._last_received_at = time.time()
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("worker runtime frame was not cacheable: %s", exc)
 

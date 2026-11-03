@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -505,9 +506,11 @@ def test_on_frame_ignores_garbage_and_never_raises() -> None:
     handle.on_frame(object())
     handle.on_frame("nonsense")
 
-    # An unknown kind is ignored, not interpreted, and nothing was cached.
+    # An unknown kind is ignored, not interpreted, and nothing was cached --
+    # neither clock, since neither frame was one of ours.
     assert handle._last_worker_state is None
-    assert handle._last_frame_at is None
+    assert handle._last_heartbeat_at is None
+    assert handle._last_received_at is None
 
 
 def test_on_frame_never_raises_even_when_the_clock_does(monkeypatch) -> None:
@@ -526,7 +529,11 @@ def test_on_frame_never_raises_even_when_the_clock_does(monkeypatch) -> None:
         )
     )
 
-    assert handle._last_frame_at is None
+    # The state half was cached before the clock was read, and the clock half
+    # stayed empty rather than raising: a broken read loop is worse than a
+    # missing timestamp.
+    assert handle._last_worker_state.status == "ready"
+    assert handle._last_received_at is None
 
 
 def test_on_frame_caches_a_heartbeat_timestamp() -> None:
@@ -544,10 +551,10 @@ def test_on_frame_caches_a_heartbeat_timestamp() -> None:
     # A heartbeat is freshness, not state: the state cache stays empty and the
     # arrival time is what gets recorded.
     assert handle._last_worker_state is None
-    assert isinstance(handle._last_frame_at, float)
+    assert isinstance(handle._last_received_at, float)
     assert (
-        worker_runtime.cached_frame_age_seconds(
-            handle._last_frame_at, now=handle._last_frame_at + 5.0
+        worker_runtime.frame_arrival_age_seconds(
+            handle._last_received_at, now=handle._last_received_at + 5.0
         )
         == 5.0
     )
@@ -559,3 +566,87 @@ def test_cached_frame_age_seconds() -> None:
     assert worker_runtime.cached_frame_age_seconds(None) is None
     # Skew clamps at 0.0 instead of going negative.
     assert worker_runtime.cached_frame_age_seconds(200.0, now=100.0) == 0.0
+
+def _heartbeat(at: str) -> Heartbeat:
+    return Heartbeat(
+        at=at,
+        status="ready",
+        current_context_tokens=0,
+        max_context_tokens=8192,
+    )
+
+
+def test_heartbeat_caches_the_reported_tick_and_the_arrival() -> None:
+    # D1's primary reading: ``at`` is the worker's own statement of when it
+    # ticked, so the handle keeps it as epoch seconds -- the same value
+    # status.json carries as text, read the way ``worker_manager._heartbeat_age``
+    # reads it (fromisoformat, naive-means-UTC).
+    handle = _process_handle(SimpleNamespace())
+
+    handle.on_frame(_heartbeat("2026-01-01T00:00:00+00:00"))
+
+    assert handle._last_heartbeat_at == datetime(
+        2026, 1, 1, tzinfo=timezone.utc
+    ).timestamp()
+    # ...and the receipt clock moved too: one frame, two clocks.
+    assert isinstance(handle._last_received_at, float)
+    assert handle._last_worker_state is None
+
+    # A naive timestamp is UTC, not local time, exactly as in the thread-side
+    # helpers -- otherwise the age shifts by the host's offset.
+    handle.on_frame(_heartbeat("2026-01-01T00:00:00"))
+    assert handle._last_heartbeat_at == datetime(
+        2026, 1, 1, tzinfo=timezone.utc
+    ).timestamp()
+
+
+def test_a_stale_tick_with_a_fresh_delivery_reads_both_ways() -> None:
+    # The reason both readings exist rather than one: a worker that says it
+    # ticked long ago but whose frames are arriving right now is stale by its
+    # own clock and alive by the transport's. Collapsing them would have to
+    # pick a lie.
+    handle = _process_handle(SimpleNamespace())
+
+    handle.on_frame(_heartbeat("2020-01-01T00:00:00+00:00"))
+
+    now = handle._last_received_at
+    heartbeat_age = worker_runtime.heartbeat_age_seconds(
+        handle._last_heartbeat_at, now=now
+    )
+    arrival_age = worker_runtime.frame_arrival_age_seconds(now, now=now)
+
+    assert heartbeat_age != arrival_age
+    assert heartbeat_age > 3600.0
+    assert arrival_age == 0.0
+
+
+def test_a_malformed_heartbeat_timestamp_costs_only_the_tick_reading() -> None:
+    # ``at`` is the child's text, and text can be wrong. The frame still proves
+    # delivery: reading an unparseable timestamp must not lose that, and must
+    # not raise on the read loop.
+    handle = _process_handle(SimpleNamespace())
+
+    handle.on_frame(_heartbeat("not-a-timestamp"))
+
+    assert handle._last_heartbeat_at is None
+    assert worker_runtime.heartbeat_age_seconds(handle._last_heartbeat_at) is None
+    assert isinstance(handle._last_received_at, float)
+
+
+def test_every_age_reading_reports_ignorance_rather_than_zero() -> None:
+    # "Nothing cached" is not "just now": 0.0 is the freshest possible reading
+    # and would be a lie about a worker we have never heard from.
+    empty = _process_handle(SimpleNamespace())
+
+    assert worker_runtime.heartbeat_age_seconds(empty._last_heartbeat_at) is None
+    assert worker_runtime.frame_arrival_age_seconds(empty._last_received_at) is None
+    assert worker_runtime.heartbeat_age_seconds(None) is None
+    assert worker_runtime.frame_arrival_age_seconds(None) is None
+    # A WorkerState frame moves only the receipt clock: it carries no tick.
+    empty.on_frame(
+        WorkerState(
+            status="ready", current_task=None, error=None, paused_manually=False
+        )
+    )
+    assert empty._last_heartbeat_at is None
+    assert isinstance(empty._last_received_at, float)
