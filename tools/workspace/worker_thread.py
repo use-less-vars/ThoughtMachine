@@ -22,7 +22,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Union
 
 from pydantic import Field, field_validator
 
@@ -35,6 +35,7 @@ from tools.workspace.command_channel import (
     quarantine,
     write_command,
 )
+from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
 
 try:
     from agent.logging import log
@@ -75,6 +76,42 @@ _NO_SESSION_KEY = "<no-session>"
 # consumed after ``resume()`` (that clears ``_park_event``) read as STOP and
 # silently drop every query queued behind it.
 _PARK_SENTINEL: Any = object()
+
+# Bounded attempts for ``WorkerThread._allocate_generation``. A retry is only
+# taken when a concurrent allocator overwrote the sidecar after our rename
+# (see the post-rename verification there).
+_GENERATION_ALLOCATE_ATTEMPTS = 5
+# One-shot latch for the degraded (no ``session.lock``) generation warning.
+_UNLOCKED_GENERATION_WARNED = False
+# Per-worker-dir in-process locks serialising generation allocation.  See
+# ``_generation_thread_lock`` for why ``FileLock`` alone is not enough.
+_generation_thread_locks: Dict[str, "threading.Lock"] = {}
+_generation_thread_locks_guard = threading.Lock()
+
+
+def _generation_thread_lock(key: str) -> "threading.Lock":
+    """Return the process-wide lock serialising allocations for ``key``.
+
+    ``session.lock.FileLock`` USED to unlink its lock file on release, which let
+    a waiter that had opened the *old* inode lock an orphaned inode while a
+    third caller locked a freshly created one: two critical sections then ran
+    concurrently (measured on this repo: overlapping windows in 14 of 40
+    acquisitions under 8-thread contention; 0 once the lock file was never
+    unlinked).  That defect is FIXED -- ``session/lock.py`` ``release()``
+    leaves the lock file in place, so the lock is inode-stable again and every
+    acquirer meets the same rendezvous point.  This in-process lock is kept
+    anyway: spawns are threads of one backend process, so serialising them here
+    costs one uncontended ``threading.Lock`` instead of a ``flock`` poll loop,
+    and the allocation stays correct even if path-level churn ever returns.
+    ``FileLock`` is still taken for the cross-process case, and the
+    post-rename verification below still covers its leftover exposure.
+    """
+    with _generation_thread_locks_guard:
+        lock = _generation_thread_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _generation_thread_locks[key] = lock
+        return lock
 
 
 def _stop_already_pending(thread: Any) -> bool:
@@ -951,7 +988,12 @@ class WorkerThread(threading.Thread):
         max_container_count: Optional[int] = None,
         max_token_usage: Optional[int] = None,
         max_runtime_s: Optional[float] = None,
+        frame_sink: Optional[Callable[[Any], None]] = None,
     ) -> None:
+        # S4a: assigned before anything else -- every other attribute below can
+        # reach a helper that calls _write_status_file, so the sink is set
+        # first rather than left to a getattr() default.
+        self._frame_sink = frame_sink
         self.instance_id = instance_id
         instance_label = _WorkerRegistry.instance_label(name, instance_id)
         super().__init__(daemon=True, name=f"worker-{instance_label}")
@@ -965,6 +1007,11 @@ class WorkerThread(threading.Thread):
         self._container_manager: Optional[Any] = container_manager
         self._worker_dir = workspace_dir / "workers" / instance_label
         self._worker_dir.mkdir(parents=True, exist_ok=True)
+        # The workspace root under its own name (as passed, not re-derived by
+        # walking back out of ``workers/<label>/``): process mode rebuilds this
+        # worker in a child interpreter from ``spec_from_worker``, which reads
+        # ``workspace_dir`` off the object (§3.3).
+        self.workspace_dir: Path = workspace_dir
 
         # F2: generation token — a monotonic per-worker counter that guards
         # context.json against stale-thread overwrites after a force-spawn
@@ -3467,50 +3514,139 @@ class WorkerThread(threading.Thread):
     def _allocate_generation(self) -> int:
         """F2: allocate a monotonic per-worker generation token.
 
-        Reads the current generation from a small sidecar file
-        (``worker_dir/generation``) plus any generation already persisted in
-        context.json, then writes ``max + 1`` back to the sidecar.  Every new
-        WorkerThread instance therefore holds a strictly higher generation than
+        Every new WorkerThread instance holds a strictly higher generation than
         any thread it replaces, so a still-alive stale thread's
         ``_save_context()`` is rejected by the guard once the replacement has
-        persisted.  The context.json fallback keeps the counter monotonic even
-        if the sidecar file is lost.
+        persisted.  The counter is the ``worker_dir/generation`` sidecar folded
+        together with any ``generation`` already persisted in context.json (so
+        a lost sidecar does not restart the counter at 1).
+
+        SINGLE-LOCK INVARIANT: the entire read-modify-write -- sidecar read,
+        context.json read, ``base + 1``, temp-file write, ``os.replace`` -- runs
+        inside ONE ``FileLock`` on the sidecar, itself nested in a per-worker
+        ``threading.Lock`` (see ``_generation_thread_lock``: the in-process lock
+        is the cheap serialiser for spawns, which are threads of one backend
+        process).  A read taken before the lock
+        is worthless: two concurrent spawners would see the same base and both
+        persist the same epoch, which is precisely the race this guard closes.
+
+        FAIL-CLOSED: nothing here swallows a persistence error.  A lock timeout
+        (``FileLockTimeoutError``), a write failure or a rename failure
+        propagates.  Both call sites propagate: ``__init__`` (spawn) and
+        ``reset()``.  A worker that cannot be given a strictly greater epoch
+        must not be spawned, and a reset that could not raise the epoch must
+        not be reported as done.
+
+        BELT-AND-BRACES: ``FileLock.release()`` USED to unlink the lock file, so
+        a third acquirer could lock a fresh inode the previous holder's waiter
+        still had open.  That defect is fixed in ``session/lock.py``: release no
+        longer unlinks, so the inode -- and therefore the mutual exclusion -- is
+        stable for every acquirer, in this process or another.  The guard below
+        is kept regardless, because it costs one stat: the rename is verified
+        afterwards (value AND inode) and the whole allocation retried under a
+        fresh lock, bounded by ``_GENERATION_ALLOCATE_ATTEMPTS``.  An epoch is
+        only ever returned after it has been observed persisted, so whatever
+        exposure is left over (a cross-process holder, a filesystem where
+        locking is advisory) surfaces as a retry rather than as a duplicate
+        epoch.
+
+        DEGRADED: when ``session.lock`` is unavailable the counter is still
+        allocated unlocked, and a one-shot warning records that monotonicity is
+        not guaranteed.
         """
+        global _UNLOCKED_GENERATION_WARNED
+
         gen_file = self._worker_dir / "generation"
-        base = 0
-        try:
-            if gen_file.exists():
-                base = max(base, int(gen_file.read_text(encoding="utf-8").strip() or 0))
-        except (OSError, ValueError):
-            pass
         ctx_path = self._context_path()
+
+        if FileLock is None:
+            if not _UNLOCKED_GENERATION_WARNED:
+                _UNLOCKED_GENERATION_WARNED = True
+                log(
+                    "WARNING", "tools.worker",
+                    f"session.lock unavailable: generation allocation for "
+                    f"{self._worker_dir} is unlocked, so generation "
+                    f"monotonicity is NOT guaranteed across concurrent spawns",
+                )
+            with _generation_thread_lock(str(gen_file)):
+                new_gen, _ino = self._write_generation(gen_file, ctx_path)
+            return new_gen
+
+        with _generation_thread_lock(str(gen_file)):
+            for _attempt in range(_GENERATION_ALLOCATE_ATTEMPTS):
+                with FileLock(str(gen_file)):
+                    new_gen, ino = self._write_generation(gen_file, ctx_path)
+                    if self._generation_persisted(gen_file, new_gen, ino):
+                        return new_gen
+        raise RuntimeError(
+            f"could not allocate a generation for {self._worker_dir}: "
+            f"{_GENERATION_ALLOCATE_ATTEMPTS} consecutive attempts were each "
+            f"overwritten by a concurrent allocator (two holders raced the same "
+            f"read-modify-write); refusing to return an epoch that was never "
+            f"observed persisted"
+        )
+
+    def _write_generation(self, gen_file: Path, ctx_path: Path) -> tuple:
+        """Read-modify-write the sidecar; return ``(epoch, renamed_inode)``.
+
+        The caller MUST already hold the ``FileLock`` on ``gen_file`` -- that is
+        the single-lock invariant.  On any failure the temp file is removed and
+        the exception is re-raised: a partially applied increment must never be
+        reported as an allocated epoch.
+        """
+        base = self._read_generation_sidecar(gen_file)
+        # context.json is only a fallback for a LOST sidecar, so no shape of it
+        # may brick a spawn: anything unreadable just means "no counter here".
         if ctx_path.exists():
             try:
                 base = max(base, int(json.loads(ctx_path.read_text(encoding="utf-8")).get("generation") or 0))
             except (json.JSONDecodeError, OSError, TypeError, ValueError):
                 pass
         new_gen = base + 1
+        fd, tmp_path_str = tempfile.mkstemp(
+            dir=str(self._worker_dir), prefix=".generation_", suffix=".tmp",
+        )
         try:
-            fd, tmp_path_str = tempfile.mkstemp(
-                dir=str(self._worker_dir), prefix=".generation_", suffix=".tmp",
-            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(new_gen))
+            # os.replace preserves the source inode, so this identifies OUR
+            # write later (see _generation_persisted).
+            ino = os.stat(tmp_path_str).st_ino
+            os.replace(tmp_path_str, str(gen_file))
+        except BaseException:
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(str(new_gen))
-                if FileLock is not None:
-                    with FileLock(str(gen_file)):
-                        os.replace(tmp_path_str, str(gen_file))
-                else:
-                    os.replace(tmp_path_str, str(gen_file))
-            except Exception:
-                try:
-                    if os.path.exists(tmp_path_str):
-                        os.unlink(tmp_path_str)
-                except OSError:
-                    pass
-        except OSError:
-            pass
-        return new_gen
+                os.unlink(tmp_path_str)
+            except OSError:
+                pass
+            raise
+        return new_gen, ino
+
+    @staticmethod
+    def _read_generation_sidecar(gen_file: Path) -> int:
+        """Current sidecar value, or 0 when the sidecar is absent/unparsable.
+
+        The sidecar is authoritative, so a real OSError (permissions, I/O)
+        propagates instead of silently resetting the counter -- that reset is
+        exactly what would let a stale thread keep saving.
+        """
+        try:
+            return int(gen_file.read_text(encoding="utf-8").strip() or 0)
+        except (FileNotFoundError, ValueError):
+            return 0
+
+    @staticmethod
+    def _generation_persisted(gen_file: Path, new_gen: int, ino: int) -> bool:
+        """True iff the sidecar now holds exactly the epoch WE renamed in.
+
+        The inode half is what makes this meaningful: a sidecar carrying our
+        value on a different inode means a concurrent allocator won the rename
+        (possibly writing the same value), so the allocation must be retried.
+        """
+        try:
+            value = int(gen_file.read_text(encoding="utf-8").strip() or 0)
+            return value == new_gen and os.stat(gen_file).st_ino == ino
+        except (OSError, ValueError):
+            return False
 
     def _load_context(self) -> Optional[WorkerContext]:
         """Load WorkerContext from disk, if present. Returns None if not found."""
@@ -3629,6 +3765,31 @@ class WorkerThread(threading.Thread):
             self.worker_name,
         )
 
+    def _emit_frame(self, frame: Any) -> None:
+        """Hand *frame* to the supervisor sink, when one is installed.
+
+        ``frame_sink`` is the runtime -> supervisor seam (S4a): the in-process
+        worker thread publishes ``worker_state`` frames through the same
+        callable a process runtime will write to its socket, so the supervisor
+        consumes one code path in both modes. ``None`` (the production default
+        until the supervisor wires a sink) makes this a no-op.
+
+        It never raises: a broken sink must not take the worker down, so the
+        failure is logged and swallowed. That guarantee covers *this* call
+        only. The sink runs on the worker's own thread, so a sink that blocks
+        delays the status write that triggered it, and a sink that calls back
+        into ``_write_status_file`` re-enters here -- there is deliberately no
+        re-entrancy guard, because a guard would silently drop the inner frame
+        instead of making the recursion visible.
+        """
+        sink = self._frame_sink
+        if sink is None:
+            return
+        try:
+            sink(frame)
+        except Exception as exc:
+            log("WARNING", "tools.worker", f"frame_sink failed: {exc}")
+
     def _write_status_file(self) -> None:
         """
         Write runtime status to ``status.json`` so the web API backend
@@ -3666,6 +3827,20 @@ class WorkerThread(threading.Thread):
                     os.replace(tmp_path_str, str(target))
             else:
                 os.replace(tmp_path_str, str(target))
+            # S4a: publish the state frame only after status.json is durably
+            # in place and the FileLock is released (see _emit_frame for why
+            # the lock must not be held across the sink). The except branch
+            # deliberately emits nothing: a status write that failed has no
+            # state worth announcing, and its logger.error is the evidence.
+            if self._frame_sink is not None:
+                self._emit_frame(
+                    WorkerState(
+                        status=data["runtime_status"],
+                        current_task=data["current_task"],
+                        error=data["error"],
+                        paused_manually=data["paused_manually"],
+                    )
+                )
         except (OSError, Exception) as exc:
             logger.error("Failed to write worker status file: %s", exc)
             try:
@@ -3801,13 +3976,27 @@ class WorkerThread(threading.Thread):
             return
         self._last_heartbeat_monotonic = now
         self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+        current_context_tokens = self.get_current_context_tokens()
         self._publish_global_event(EventType.WORKER_HEARTBEAT, {
             "status": self.status,
             "current_task": self.current_task,
             "last_heartbeat": self.last_heartbeat,
-            "current_context_tokens": self.get_current_context_tokens(),
+            "current_context_tokens": current_context_tokens,
             "max_context_tokens": self.max_context_tokens,
         })
+        # S5: the same tick also crosses the frame seam, so a supervisor that
+        # cannot see this thread (process mode) learns the worker is alive.
+        # ``last_heartbeat`` is the ISO-8601 string the protocol field carries
+        # (``Heartbeat.at``); the token counts are the same two sources the
+        # global-bus event above already reports.
+        self._emit_frame(
+            Heartbeat(
+                at=self.last_heartbeat,
+                status=self.status,
+                current_context_tokens=current_context_tokens,
+                max_context_tokens=self.max_context_tokens,
+            )
+        )
 
 
 
@@ -4907,6 +5096,21 @@ class Worker(ToolBase):
             instance_id=spawn_iid,
             container_manager=container_manager,
         )
+
+        # S5: close the runtime -> supervisor frame seam for this worker. The
+        # handle is built here and never started, so nothing about the thread's
+        # own run() changes; it only receives the frames the thread emits
+        # (WorkerState / Heartbeat) from this point on -- before thread.start(),
+        # because a status write or heartbeat in the first turn is exactly the
+        # window where a late sink loses frames. The import is function-local
+        # to match this method's existing local-import block (worker_runtime is
+        # a supervisor-side module; importing it at module level would put it in
+        # the worker body's import graph, which the child process also loads),
+        # not because of an import cycle -- worker_runtime imports only the
+        # protocol module.
+        from tools.workspace.worker_runtime import attach_thread_frame_sink
+
+        attach_thread_frame_sink(thread)
 
         # Store initial context for the thread to pick up in run()
         if self.context is not None and isinstance(self.context, dict):

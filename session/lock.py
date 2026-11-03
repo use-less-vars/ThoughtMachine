@@ -163,10 +163,15 @@ class FileLock:
             os.close(fd)
         except OSError:
             pass
-        try:
-            self._lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # DO NOT unlink ``self._lock_path`` here.  Mutual exclusion is
+        # inode-based (``flock`` locks the inode, not the path), so the lock
+        # file must persist for as long as the lock is useful: deleting it on
+        # release hands a waiter that already has the OLD inode open a lock on
+        # an orphaned inode, while the next caller recreates the path and locks
+        # a FRESH one -- two concurrent holders by construction.  A leftover
+        # ``.lock`` file (holding the last holder's PID, a few bytes) is the
+        # intended steady state, not litter; it is the rendezvous point every
+        # acquirer must meet on.
         logger.debug("Lock released: %s", self._lock_path)
 
     @property

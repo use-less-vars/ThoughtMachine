@@ -491,8 +491,14 @@ def test_c2_cold_refusal_persists_nothing(routes_store):
     assert _fingerprint(routes_store) == before
 
 
-def test_c3_cold_paths_leave_no_temp_or_lock_files(routes_store, tmp_path):
-    """Atomicity is temp-file + replace under a lock: neither may be left behind."""
+def test_c3_cold_paths_leave_no_temp_litter_and_stable_locks(routes_store, tmp_path):
+    """Atomicity is temp-file + replace under a lock: no temp litter.
+
+    ``.lock`` files are different: ``FileLock.release()`` never unlinks them,
+    because the inode is the rendezvous point (see
+    tests/test_filelock_mutual_exclusion.py).  They must therefore persist —
+    each one beside the file it guards, never orphaned and never piled up.
+    """
     _seed(routes_store)
 
     _post_text(TEXT)
@@ -500,12 +506,18 @@ def test_c3_cold_paths_leave_no_temp_or_lock_files(routes_store, tmp_path):
     _post_text("z" * 100000)  # over budget: refused
     _delete()
 
-    leftovers = sorted(
+    temp_leftovers = sorted(
         str(path.relative_to(tmp_path))
         for path in tmp_path.rglob("*")
-        if path.is_file() and path.suffix in (".tmp", ".lock")
+        if path.is_file() and path.suffix == ".tmp"
     )
-    assert leftovers == []
+    assert temp_leftovers == [], "cold paths must leave no temp file behind"
+
+    lock_files = sorted(p for p in tmp_path.rglob("*.lock") if p.is_file())
+    for lock_file in lock_files:
+        assert Path(str(lock_file)[: -len(".lock")]).exists(), (
+            f"{lock_file.relative_to(tmp_path)} guards a file that is gone"
+        )
 
 
 # ── (d) the store's atomic read-modify-write ────────────────────────────────

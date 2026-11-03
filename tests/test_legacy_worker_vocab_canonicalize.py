@@ -11,7 +11,7 @@ network tool.  The definition LOAD boundary (``WorkerThread.__init__``) now
 folds the legacy form onto the canonical level.
 """
 
-from unittest.mock import MagicMock
+from pathlib import Path
 
 import pytest
 
@@ -23,22 +23,32 @@ from tools.workspace.worker_thread import (
 )
 
 
-def make_worker_thread(definition: dict, session_permissions: dict | None = None) -> WorkerThread:
-    """Create a WorkerThread with minimal required params for testing."""
+def make_worker_thread(
+    workspace_dir: Path,
+    definition: dict,
+    session_permissions: dict | None = None,
+) -> WorkerThread:
+    """Create a WorkerThread against a real, per-test worker directory.
+
+    ``WorkerThread.__init__`` allocates the generation sidecar on real disk, so
+    the worker dir must be a real path (the test's own ``tmp_path``).  These
+    tests only assert on the footprint/gate logic built after that point.
+    """
     return WorkerThread(
         name="test-worker",
         definition=definition,
         agent_config={"provider": "test-provider", "model": "test-model"},
-        workspace_dir=MagicMock(),
+        workspace_dir=workspace_dir,
         session_permissions=session_permissions or {},
         project_root="/tmp",
     )
 
 
 # ── 1. legacy bool network True -> write ────────────────────────────────────
-def test_legacy_bool_network_true_folds_to_write():
+def test_legacy_bool_network_true_folds_to_write(tmp_path):
     """``network: True`` in a definition is loaded as the canonical ``write``."""
     wt = make_worker_thread(
+        tmp_path,
         {"name": "w", "permission_footprint": {"network": True}},
         {"network": "write"},
     )
@@ -46,10 +56,11 @@ def test_legacy_bool_network_true_folds_to_write():
 
 
 # ── 2. legacy bool network False -> banned ──────────────────────────────────
-def test_legacy_bool_network_false_folds_to_banned():
+def test_legacy_bool_network_false_folds_to_banned(tmp_path):
     """``network: False`` is loaded as ``banned`` -- i.e. still a hard deny,
     but expressed in canonical vocabulary instead of an unresolvable bool."""
     wt = make_worker_thread(
+        tmp_path,
         {"name": "w", "permission_footprint": {"network": False}},
         {"network": "write"},
     )
@@ -59,9 +70,10 @@ def test_legacy_bool_network_false_folds_to_banned():
 
 
 # ── 3. end-to-end: the gate no longer hard-denies the legacy form ────────────
-def test_legacy_bool_network_is_not_hard_denied_by_the_gate():
+def test_legacy_bool_network_is_not_hard_denied_by_the_gate(tmp_path):
     """Before: raw legacy footprint hard-denies.  After: canonical does not."""
     wt = make_worker_thread(
+        tmp_path,
         {"name": "w", "permission_footprint": {"network": True}},
         {"network": "write"},
     )
@@ -92,12 +104,12 @@ def test_legacy_bool_network_is_not_hard_denied_by_the_gate():
 
 
 # ── 4. idempotent for canonical input ───────────────────────────────────────
-def test_canonical_footprint_is_loaded_unchanged_and_idempotent():
+def test_canonical_footprint_is_loaded_unchanged_and_idempotent(tmp_path):
     """A canonical footprint survives the boundary verbatim, twice."""
     footprint = {"network": "outbound", "filesystem": "read", "container": True}
     session = {"network": "outbound", "filesystem": "write", "container": True}
 
-    wt = make_worker_thread({"name": "w", "permission_footprint": footprint}, session)
+    wt = make_worker_thread(tmp_path, {"name": "w", "permission_footprint": footprint}, session)
     assert wt._permission_footprint == footprint
     assert _canonicalize_worker_footprint(wt._permission_footprint) == footprint
     # The spawn-time merge is unchanged for canonical input (worker stricter
@@ -110,10 +122,11 @@ def test_canonical_footprint_is_loaded_unchanged_and_idempotent():
 
 
 # ── 5. unknown category fails LOUDLY at load time, naming key + value ───────
-def test_unknown_footprint_category_raises_naming_key_and_value():
+def test_unknown_footprint_category_raises_naming_key_and_value(tmp_path):
     """An unresolvable definition is a load error, never a silent deny."""
     with pytest.raises(ValueError) as excinfo:
         make_worker_thread(
+            tmp_path,
             {"name": "w", "permission_footprint": {"teleport": "whenever"}},
             {"network": "write"},
         )
@@ -124,9 +137,10 @@ def test_unknown_footprint_category_raises_naming_key_and_value():
 
 
 # ── 6. legacy grains are stripped, not mapped ───────────────────────────────
-def test_legacy_grains_are_stripped_from_the_declared_footprint():
+def test_legacy_grains_are_stripped_from_the_declared_footprint(tmp_path):
     """``git_read``/``git_write``/``system``/``execution`` never reach the gate."""
     wt = make_worker_thread(
+        tmp_path,
         {
             "name": "w",
             "permission_footprint": {
