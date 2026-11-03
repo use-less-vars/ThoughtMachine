@@ -789,3 +789,47 @@ A worktree is not removable until its branch is pushed, or its HEAD SHA is recor
 **one-owner-per-fact**: A fact with two holders that believe they are authoritative and are never reconciled is a bug. Three instances in W1: phantom-config (3 comparators), budget-two-owners (boundary vs HTTP), save-clobber (live RAM vs store). The legitimate form is two holders that are co-temporal and co-atomic (write-through cache).
 
 **reader-self-correction**: A self-corrected claim is worth more than a never-corrected one. Two instances: Gen 54 caught Gen 53, and the W1.5 agent corrected its own half-false ticket claim.
+
+## 2026-11-02 — The Third-Strike Architectural Rule (Gen 56)
+
+*If a subsystem (e.g., Stop/Pause, Docker timeout) has been "fixed" or touched three times and still feels fragile, opaque, or hacky, STOP fixing it. Escalate to a design pass. The defect is not in the code; it is in the substrate. Patching a substrate flaw creates technical debt that compounds. The third bug is the signal that the architecture is wrong.*
+
+Worked example from the generation that adopted it: Stop/Pause had been patched repeatedly (park sentinel, detached registration, resume gating, UI optimistic status) and still produced a defect capable of silently killing queued work. The response was not a fourth patch — it was `docs/design-worker-lifecycle.md` Q2A-Q2D: one process-agnostic CancellationToken, a three-level timeout hierarchy, an orphan reaper, and a bounded unwind cascade. The audit that preceded the design became the implementation acceptance criterion.
+
+## 2026-11-03 — The Inert Default Trap (Gen 56b)
+
+*A guard that degrades silently to the unguarded behaviour is not a guard. A default that manufactures a plausible value is worse than a refusal, because it is indistinguishable from a real one.*
+
+Two live instances on `dev` `f419c721`:
+
+- **Unlocked fallback.** `tools/workspace/worker_thread.py:3500` reads `if FileLock is not None:` and `:3503-3504` takes the `else` branch — `os.replace(...)` **with no lock at all**. If the import ever fails, the safety property becomes exactly nothing, with no log line and no error, while the code still reads as protected. Grep for this shape as `is not None` around a lock.
+- **Invented default.** `web_ui/backend/bridge.py:3170` ends the state map with `.get(new_state.lower(), new_state.upper())`. An unmapped internal state is not rejected — it is *manufactured* into a token (`stopping` → `STOPPING`) that `web_ui/frontend/src/components/TabBar.jsx:19-31` does not enumerate, so it silently falls to `default: return 'idle'`. The UI shows a plausible wrong answer instead of an error.
+
+**Rule:** a fallback functionally weaker than the guarded path must be loud (log, counter, raise) or absent; a default that synthesises a value must be distinguishable from a value that was actually supplied.
+
+## 2026-11-03 — Green for the Wrong Reason (Gen 56b)
+
+*A green suite over changed behaviour is a finding, not a receipt. First ask which tiers did not run.*
+
+W6's closing gate read **5950 passed / 69 skipped / 5 xfailed / 0 failed** — genuinely green, and genuinely incomplete: it was produced from **8 foreground chunks, not one process** (a single `pytest` run cannot finish behind the ~180 s dispatch wall), and **the JS tier never executed at all** (`no node_modules`). A whole tier was unrun and the headline number still read `0 failed`.
+
+**Rule:** a pass count is evidence only for the tiers actually executed. Quote the unexecuted tiers *beside* the number, never after it. `xfailed` is a pass that did not assert what the ticket says it asserts — read them.
+
+## 2026-11-03 — The Epoch Race (Gen 56b, verified)
+
+*Locking the write is not locking the counter. A read-modify-write is one atomic unit or it is unprotected.*
+
+`tools/workspace/worker_thread.py:3467-3513` (`_allocate_generation`) promises in its own docstring that "every new `WorkerThread` instance holds a strictly higher generation than any thread it replaces". It does not:
+
+- `:3482` reads `worker_dir/generation` **outside** the lock.
+- `:3486-3491` reads `generation` out of `context.json` **outside** the lock.
+- `:3492` computes `new_gen = base + 1` from those unlocked reads.
+- `:3500-3502` takes `FileLock(gen_file)` around **only** `os.replace(tmp, gen_file)`.
+
+Two threads allocating concurrently both read `base = N`, both write `N + 1`, and the monotonic guarantee is silently void — which is precisely the guard the F2 stale-thread `_save_context()` rejection depends on. **W7 makes this more likely, not less:** one runtime process per session is a *second allocator*, so the race moves from theoretical to routine.
+
+**Rule:** acquire the lock **before** the read and release it after the write; allocate the counter inside the critical section. Any `lock around the write only` is a bug of this class. When you see `with FileLock(...)` in a function that also reads the same file, check the reads.
+
+## 2026-11-03 — Don't start appended content with a heading (Gen 56b)
+
+The KB append tool prefixes its own `## <date> — <first ~60 chars>...` line. If the appended body *also* begins with `## `, the file accumulates `## 2026-11-02 — ## The Heading (Gen 56)` followed by a truncated duplicate. This is **systemic, not new**: ~40 instances across `knowledge/` since 2026-08 (`personal/handoffs.md`, `personal/lessons_learned.md`, `personal/task_tracker.md`, `personal/parking_lot.md`, `project/working_agreements.md`). Cosmetic, so it has never been worth a cleanup pass — but it is why a section can appear to exist twice. **Append prose bodies, not headings.**

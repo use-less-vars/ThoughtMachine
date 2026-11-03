@@ -40,11 +40,41 @@ port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
 
 ## Current state — 2026-10-28, Gen 54 mid-session
+**Gen 56 close — 2026-11-02.** (Section content replaced in place; the heading above still carries the Gen 54 date.)
+**dev HEAD:** `f419c721` — `feat(w7): interruptible control plane & system notices (#278)`. *(The W6-closing reading below recorded `6c2061f7` = `feat(w6): Stop=Detach & FIFO Queue (#277)`, squash-merged after docs revision `#276`; #278 has landed on top of it since. Read from `git log` on `dev`, 2026-11-03.)*
+**W7 first increment merged:** `#278` — the interruptible control plane and system notices.
 
-**Supersedes the Gen 52 close (kept below as historical record).**
-**dev HEAD:** `12bd6408`
+**W6: CLOSED.** The blocking-thread era is over. What shipped:
+- **Stop = Detach + FIFO queue.** A kill and a detach are both observed while a worker is parked; the park loop consumes cross-process commands instead of going deaf; the detached worker is registered *before* it is published, so it can always be killed.
+- **`visual` permission grain** (`banned | ask | view`) across backend catalog, security gate, worker preset maps and the UI ceiling table.
+- **VisualTool** — a render tool that is fail-closed until `VISUAL_RENDER_IMAGE` is set *and* the repo name is in `ADMISSION_IMAGE_ALLOWLIST`. Ephemeral container, `heal_missing=False`, removed in `finally`, read-only workspace mount, PNG-magic-checked artifacts with an 8 MiB cap and a host-chosen filename.
 
-Gen 53 (`fix/stream-loop-thread-safety`, `44d0dda`) and the `docs/kb-catchup` wave (#235, `d8fda869`) closed without a status.md block; they are recorded here so the chain has no gap.
+**Gate:** whole tree proven green — 5950 passed / 69 skipped / 5 xfailed / **0 failed**, every directory in `testpaths`. This figure comes from **8 foreground chunks, not one process**: a single `pytest tests/ web_ui/backend/tests/` cannot finish behind the ~180 s dispatch wall, and backgrounded runs die. JS tests remain unrun (no `node_modules`).
+
+**Rulings carried forward (do not re-litigate):**
+- **R1** — `view` ranks 2.5, *above* the `ask` tier. Consequence accepted: an `ask` workspace ceiling now **caps a `view` grant down to `ask`** (prompt/deny). This is the only non-fail-open option.
+- No PID limit exists anywhere in the codebase. Operator agreed it is a **W7 prerequisite**, deliberately not patched into W6.
+
+**W7: IN PROGRESS — Process Isolation & Security Hardening.** Control plane merged (`#278`). Three scope items: (A) move workers out of the API server's threads so the cancellation token crosses a real process boundary; (B) `pids_limit` on container config so a fork bomb dies in the container instead of taking the host; (C) route the Visual tool's `artifacts/visual/*.png` host write through the existing host-write permission gate — reuse, do not invent.
+
+**P3 (socket extraction) — being implemented, stage S0.** Worktree `.worktrees/w8-p3s0` carries `tools/workspace/worker_runtime.py` (180 lines), `tools/workspace/worker_runtime_protocol.py` (1009 lines) and `tests/test_worker_runtime_protocol.py` (987 lines). S0 is the **spawn-time seam**, not the transport: the activation flag is read at spawn (`worker_runtime.py:125-131`) and never memoised, and the module states in terms that `spawn + AF_UNIX socketpair + framed dispatch` lands in **stage S2** (`worker_runtime.py:72`). Nothing in `.worktrees/w7-isolation` contains a `socketpair` or `get_context` call — the design lives there, the code does not. Per `docs/design-process-isolation.md:693-699`, **P2 (`command.json` fence) is a hard gate for P3**: a second reader is only safe after the fence exists.
+
+**Open residuals carried into W7:** the ungated visual artifact write (C above); container leak window if `start()` raises after creation; `_render_argv` contract unverified; `ci` missing from `_WORKSPACE_RESOURCE_MAP` (same fail-open class as the fixed `visual` gap); `_worker_registry` survives a poll-kill; `tool_presets` 4-of-36 unresolvable; `infra/container_manager.py:814` hardcodes `cpu_quota=100000` instead of `DEFAULT_CPU_QUOTA`.
+
+## W8 backlog — filed 2026-11-03 (Gen 56b)
+
+Four items were handed down to be filed. Only one survived verification against `dev` `f419c721`. The other three are recorded here **with their evidence** so the next seat does not re-file them as phantom tickets — the failure mode the W2 wave already paid for once.
+
+1. **Core Stats UI badge — STILL OPEN.** Not investigated this pass; no cite came with the brief. Carried forward unchanged.
+2. **`"paused": "PAUSED"` (`web_ui/backend/bridge.py:3163`) — WITHDRAWN, not a defect.** The *cite* is correct (line 3163 is exactly `"paused": "PAUSED"`; note the file is `web_ui/backend/bridge.py`, not `agent/presenter/`). But the entry is live: `:3158` receives `execution_state_change`, builds `frontend_state`, and `:3171` broadcasts `state_changed` — precisely what the frontend consumes at `web_ui/frontend/src/components/TabBar.jsx:23` (`case 'PAUSED'`), covered by `web_ui/frontend/src/components/__tests__/SessionTabHubStatus.test.jsx`. The paired half of this ticket — a "dead `'paused'` handler in `agent/presenter/event_processor.py:78`" — **does not exist**: that file contains no `paused` match at all, and line 78 is `elif event_type == 'stop_reason':`. Removing either would have been a change with no defect behind it.
+   - *Real residue, if anyone wants it:* the fallback at `:3170` (`.get(new_state.lower(), new_state.upper())`) **manufactures** a state token for any unmapped key, and `TabBar._tabStatusClass` (`:19-31`) paints unknown tokens `idle`. That is an instance of the **Inert Default Trap** (see `working_agreements.md`), not dead code. Deferred as cosmetic — the fallback is also the only reason `stopping` renders at all.
+3. **Line-number drift in `docs/design-worker-lifecycle.md` — CONFIRMED, both bounds measured.** Against `dev` `f419c721`, `tools/workspace/worker_thread.py` (6097 lines):
+   - `_park_event` / `_resume_event`: doc cites `:1123-1124` → actual `:1141` / `:1142` = **+18**.
+   - park loop `while self._park_event.is_set() and not self._stop_event.is_set()`: doc cites `:2436` / `:2685` → actual `:2889` / `:3167` = **+453** / **+482**.
+   So `+18..+482` was right, and the cite `:2436` now lands on `if _partial_content:`. The doc carries **99** `worker_thread.py:` cites, so this is a bounded mechanical re-pin — do it with a verification script that fails on mismatch, never by hand.
+4. **`tools/visual_tool.py:442` (exception outside `try`) — WITHDRAWN, already fixed.** Line 442 is a comment. The `ContainerManager(...)` construction is inside a `try` whose `except Exception` returns the existing `_fail` envelope, and `manager.start()` carries its own `try`/`except` → `_fail`. The fail-closed property holds; filing this would have been a phantom ticket.
+
+
 
 ## The generation in one line
 
@@ -146,3 +176,25 @@ Six waves landed; the last one — tool refusals reported to the UI as success �
 **Next: D1** — request-time form of the `--allow-remote-bind` boot-time declaration, with `origin_policy._origin_allowed` as default for state-changing routes. Then D4-note. Then credential-delivery.
 
 **On disk only (gitignored):** `redteam-surface-complete.md`, `vault-ownership-sites.md`, `brief-d3-ownership-refusal.md` (§Corrections 13 items), `brief-d2-binding-authority.md`, `pr-body-d2.md`, `pr-body-three-tickets.md`, `pr-body-kb-close.md`.
+
+## 2026-11-02 — W7 design pass COMPLETE — commit 00a1f091 on branch w7/isola...
+
+W7 design pass COMPLETE — commit 00a1f091 on branch w7/isolation (worktree .worktrees/w7-isolation, based on 6c2061f7). NOT PUSHED (network banned); operator must push.
+
+`docs/design-process-isolation.md` (744 lines) + `.gitignore` negation line (public-doc tier rule: `docs/*` is a catch-all, every public doc needs its own `!docs/...` line or it never gets versioned — this is why the first `git add` was refused).
+
+DESIGN DECISION (one choice, defended, alternatives rejected in §4.3):
+- One worker-runtime **process per session**, `multiprocessing.get_context("spawn")`, supervised by the API process over a single duplex AF_UNIX socketpair with length-prefixed JSON frames. `fork` disqualified by live lock+socket inheritance in a threaded parent (Docker client socket at infra/container_manager.py:853).
+- `WorkerThread` objects survive unchanged — threads change *which process* owns them. FIFO `_queued_job_ids` (worker_thread.py:1140) stays single-writer inside the child. Containers are label-addressable (worker_container.py:30-36) so a replacement runtime reattaches rather than recreates.
+- Phase order P0 itemC → P1 pids_limit → **P2 command.json fence (HARD GATE)** → P3 socket extraction → P4 event pump → P5 death detection → P6 retire fast-paths.
+
+THREE PREMISE CORRECTIONS now on the record:
+1. No `CancellationToken` class exists in this repo. Cancellation = per-worker `threading.Event` triple (worker_thread.py:1131/:1132/:1133) + module-global `_prompt_cancelled` (thoughtmachine/security.py:50). Intent crosses the boundary; the flags do not.
+2. `thoughtmachine/host_port.py` is the host **command launcher** (`host_run`, only module allowed to import subprocess), NOT a write gate. Item C routes through the security gate.
+3. The command channel is ALREADY filesystem-mediated (routes write command.json, worker polls it; the direct method call is a documented best-effort fast-path). So W7-A is not "invent IPC" — it is "retire in-process fast-path assumptions + serialise the event bus". Smaller wave than the brief implied.
+
+RECON CORRECTION (my own error, corrected by the writer): the per-operation gate is `security/security_gate.py:1386 check_atomic_operation(operation_required, effective_permissions, tool_name, description="") -> bool`, NOT `thoughtmachine/security.py:1066 is_allowed` (which is the config-level tool allowance check). `ask` is treated as DENIED there.
+
+FINDING that re-scopes item C: `tools/visual_tool.py:295` DOES declare `required_categories` — but as `["visual:view", "container:true"]`, i.e. gated on the wrong axes. Fix is declarative (add `filesystem:write`) + one atomic re-check before the write at :501, refusal via the existing `_fail` envelope (:351), not an exception.
+
+OPEN: `pids_limit` needs the seam at container_create.py:439-441 plus 5 hand-set create sites (drift surface) + a structural parity test; `infra/container_manager.py:814 cpu_quota=100000` is a hardcoded literal where DEFAULT_CPU_QUOTA belongs (latent defect).
