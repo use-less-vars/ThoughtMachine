@@ -388,3 +388,52 @@ class WorkerRegistry:
                 return WorkerRegistry.instance_label(key[1], key[2])
             return key[1]
         return str(key)
+
+
+def stored_epoch_for(session_id: Any, worker_name: Any) -> int | None:
+    """Highest epoch ever recorded for one ``(session_id, worker_name)`` pair.
+
+    The fence is per PAIR, not per exact key. Epochs increase strictly for a
+    worker name inside a session, so the newest incarnation of that worker is
+    the maximum over every key the pair has used -- the 3-tuple
+    ``(session, name, instance)`` of each instance, and the legacy 2-tuple
+    ``(session, name)`` if anything ever wrote one. Reading only the exact key
+    the caller happens to hold would miss a successor that took a DIFFERENT
+    instance id, which is exactly the case this answers: instance ids restart,
+    so a successor can reuse instance 1 while the predecessor still holds a
+    handle for it.
+
+    Read-only, and never raises: the lock is held for the scan and never
+    across a dispatch, an unreadable registry or an entry that cannot even be
+    compared is skipped, and ``None`` means "no evidence" -- not "epoch 0".
+    The session component is normalized with ``session_id or ""`` to match the
+    key form used by ``register_worker`` / ``unregister_worker`` /
+    ``register_event_bus`` / ``unregister_event_bus``, so a caller holding
+    ``session_id=None`` still finds the evidence.
+    """
+    try:
+        registry = WorkerRegistry.get_instance()
+        sid = session_id or ""
+        with registry._registry_lock:
+            entries = list(registry._worker_epochs.items())
+        best: int | None = None
+        for key, stored in entries:
+            if not isinstance(key, tuple) or len(key) < 2:
+                continue
+            if key[0] != sid or key[1] != worker_name:
+                continue
+            epoch = _coerce_epoch(stored)
+            if epoch is None:
+                continue
+            if best is None or epoch > best:
+                best = epoch
+        return best
+    except Exception as exc:  # noqa: BLE001 - a read may never break the caller
+        logger.debug(
+            "stored_epoch_for(%r, %r) could not read the epoch map (%s); "
+            "treating it as no evidence",
+            session_id,
+            worker_name,
+            exc,
+        )
+        return None

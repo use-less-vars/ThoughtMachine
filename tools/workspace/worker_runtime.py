@@ -364,6 +364,53 @@ def _epoch_seconds_from_iso8601(value: Any) -> Optional[float]:
     return parsed.timestamp()
 
 
+def _epoch_or_none(value: Any) -> Optional[int]:
+    """*value* only if it is genuinely an incarnation epoch, else ``None``.
+
+    The SAME rule the worker registry applies to its own ``epoch=`` arguments
+    (``WorkerRegistry._coerce_epoch``), imported rather than copied: an epoch
+    this module believes is real while the registry believes it is absent
+    would make the fence compare against a number no mutation ever recorded.
+    ``bool`` is excluded on purpose -- ``True`` is an ``int`` in Python and
+    would silently mean epoch 1.
+    """
+    from tools.workspace.worker_registry import _coerce_epoch
+
+    return _coerce_epoch(value)
+
+
+class StaleWorkerFence(RuntimeError):
+    """This handle's incarnation is gone; it must not dispatch again.
+
+    The invariant: a handle speaks for exactly ONE incarnation. Once a
+    successor owns the worker key -- proven by an epoch that moved, or by a
+    dead body, or by a newer epoch in the registry -- the handle is a leftover
+    of the past and any query sent through it would reach either a corpse or
+    the successor's queue under the predecessor's identity. Neither is a
+    dispatch; both are lost work wearing a reply.
+
+    A ``RuntimeError`` and not a ``ValueError``: nothing about the ARGUMENTS
+    is wrong, the world moved. ``expected_epoch`` is what the handle was built
+    for, ``observed_epoch`` what it found (``None`` when the observation was
+    not an int, e.g. a body that cannot say).
+
+    Fail open on absence, closed on evidence: an unreadable or missing epoch
+    is NOT staleness, because a build with no incarnation identity at all is
+    the shipped state -- so only a positively established successor raises.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        expected_epoch: Optional[int] = None,
+        observed_epoch: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.expected_epoch = expected_epoch
+        self.observed_epoch = observed_epoch
+
+
 class WorkerRuntimeHandle:
     """The supervisor's view of one worker runtime (S2: thread or process).
 
@@ -373,13 +420,43 @@ class WorkerRuntimeHandle:
     invariant stay exactly as they are (§3.3, D7).
     """
 
-    def __init__(self, worker: Any, *, mode: str = MODE_THREAD) -> None:
+    def __init__(
+        self,
+        worker: Any,
+        *,
+        mode: str = MODE_THREAD,
+        session_id: Optional[str] = None,
+        worker_name: Optional[str] = None,
+        instance_id: Optional[int] = None,
+    ) -> None:
         if mode not in RUNTIME_MODES:
             raise InvalidRuntimeModeError(
                 f"mode must be one of {RUNTIME_MODES}, got {mode!r}"
             )
         self._worker = worker
         self._mode = mode
+        # S7a-2: the incarnation this handle speaks for, captured ONCE here.
+        # A handle is the supervisor's memory of one incarnation, so re-reading
+        # the live attributes on every dispatch would let it silently become
+        # the successor's handle. Explicit arguments win (S7a-3 will pass the
+        # identity it already knows); otherwise the worker answers for itself,
+        # and anything it cannot answer stays ``None`` -- "unknown", never a
+        # guess. The epoch goes through the registry's int-not-bool rule so a
+        # duck-typed or mocked ``_generation`` becomes unknown instead of a
+        # truthy object that would compare unequal to every real epoch.
+        self._session_id = (
+            session_id if session_id is not None
+            else getattr(worker, "session_id", None)
+        )
+        self._worker_name = (
+            worker_name if worker_name is not None
+            else getattr(worker, "worker_name", None) or getattr(worker, "name", None)
+        )
+        self._instance_id = (
+            instance_id if instance_id is not None
+            else getattr(worker, "instance_id", None)
+        )
+        self._epoch = _epoch_or_none(getattr(worker, "_generation", None))
         # Process mode is built lazily: constructing a handle must not spawn an
         # OS process (§7), so the runtime spec and the runtime itself stay
         # ``None`` until the first ``dispatch_query`` asks for them.
@@ -404,7 +481,13 @@ class WorkerRuntimeHandle:
 
     @classmethod
     def spawn(
-        cls, worker: Any, *, environ: Optional[Mapping[str, str]] = None
+        cls,
+        worker: Any,
+        *,
+        environ: Optional[Mapping[str, str]] = None,
+        session_id: Optional[str] = None,
+        worker_name: Optional[str] = None,
+        instance_id: Optional[int] = None,
     ) -> "WorkerRuntimeHandle":
         """Build a handle using the mode in force *now* (§10, D11).
 
@@ -413,13 +496,116 @@ class WorkerRuntimeHandle:
         convention. In S2 ``process`` resolves to a handle that spawns its
         runtime on the first ``dispatch_query``, so spawning a handle still
         drives nothing (§7).
+
+        The three identity arguments are passed straight through to
+        ``__init__`` and resolved there, once: a caller that knows the worker's
+        ``(session, name, instance)`` can hand it over in the same call that
+        picks the mode, instead of constructing a handle and correcting it
+        afterwards.
         """
-        return cls(worker, mode=resolve_runtime_mode(environ))
+        return cls(
+            worker,
+            mode=resolve_runtime_mode(environ),
+            session_id=session_id,
+            worker_name=worker_name,
+            instance_id=instance_id,
+        )
 
     @property
     def mode(self) -> str:
         """The mode this handle was built in."""
         return self._mode
+
+    @property
+    def epoch(self) -> Optional[int]:
+        """The incarnation epoch this handle was built for; ``None`` if unknown.
+
+        Fixed at construction and never re-derived: it is the identity the
+        dispatch fence compares against, so a value that drifted with the live
+        worker would make the fence agree with whatever it found.
+        """
+        return self._epoch
+
+    def _fence_message(self, reason: str, *, observed: Optional[int]) -> str:
+        """Describe *reason* with this handle's identity and both epochs."""
+        return (
+            f"worker runtime handle is stale: {reason} "
+            f"(session_id={self._session_id!r}, "
+            f"worker_name={self._worker_name!r}, "
+            f"instance_id={self._instance_id!r}, "
+            f"expected epoch={self._epoch!r}, "
+            f"observed epoch={'unknown' if observed is None else observed!r})"
+        )
+
+    def _assert_current(self) -> None:
+        """Raise :class:`StaleWorkerFence` if this handle's incarnation is gone.
+
+        A handle speaks for exactly ONE incarnation, so before it touches the
+        worker it checks the three things that can prove that incarnation is
+        no longer the live one (S7a-2):
+
+        1. **epoch drift** -- the worker now reports a different
+           ``_generation`` than the one latched at construction;
+        2. **death** -- the worker's own ``is_alive()`` answers ``False``, so
+           no dispatch can ever be answered;
+        3. **a successor in the registry** -- the registry has recorded a
+           higher epoch for this ``(session_id, worker_name)`` pair, i.e. the
+           replacement was announced even if this object cannot see it.
+
+        Absence of evidence is never a fence: a worker that reports no epoch,
+        has no ``is_alive``, or matches no registry entry passes. That keeps
+        the check fail-open for hand-built doubles and for the window before
+        S7a-3 registers anything, and it is why only *positive* evidence
+        raises. Any other exception raised while checking is a bug in the
+        check rather than evidence about the incarnation, so it is logged at
+        DEBUG and the call proceeds.
+        """
+        try:
+            worker = self._worker
+            expected = self._epoch
+            observed = _epoch_or_none(getattr(worker, "_generation", None))
+            if (
+                isinstance(expected, int)
+                and isinstance(observed, int)
+                and expected != observed
+            ):
+                raise StaleWorkerFence(
+                    self._fence_message(
+                        "the worker's _generation moved", observed=observed
+                    ),
+                    expected_epoch=expected,
+                    observed_epoch=observed,
+                )
+            is_alive = getattr(worker, "is_alive", None)
+            if callable(is_alive) and is_alive() is False:
+                raise StaleWorkerFence(
+                    self._fence_message(
+                        "the worker is no longer alive", observed=observed
+                    ),
+                    expected_epoch=expected,
+                    observed_epoch=observed,
+                )
+            from tools.workspace.worker_registry import stored_epoch_for
+
+            stored = stored_epoch_for(self._session_id, self._worker_name)
+            if isinstance(stored, int) and (expected is None or stored > expected):
+                raise StaleWorkerFence(
+                    self._fence_message(
+                        "the registry has recorded a newer epoch", observed=stored
+                    ),
+                    expected_epoch=expected,
+                    observed_epoch=stored,
+                )
+        except StaleWorkerFence:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "runtime handle fence could not be evaluated for (%r, %r): %s; "
+                "treating it as no evidence",
+                self._session_id,
+                self._worker_name,
+                exc,
+            )
 
     def dispatch_query(self, query: str, timeout: float = 120.0) -> str:
         """Run *query* and return the reply.
@@ -432,7 +618,12 @@ class WorkerRuntimeHandle:
         is matched on its ``query_id`` against the ``reply`` frame (§4.8), and
         the wait happens on the pending future inside
         ``ProcessWorkerRuntime``.
+
+        The S7a-2 fence runs first, in both modes: a handle whose incarnation
+        has been replaced raises :class:`StaleWorkerFence` instead of
+        dispatching into whatever now occupies the worker slot.
         """
+        self._assert_current()
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().dispatch_query(
                 query, timeout=timeout
@@ -449,7 +640,15 @@ class WorkerRuntimeHandle:
         ``epoch`` is taken from the worker's ``_generation`` so the child can
         report which incarnation it believes it is serving in
         ``Hello.epoch_seen`` (§4.4).
+
+        The S7a-2 fence is re-evaluated on *every* call, not only the one that
+        builds the runtime: that is what makes the control verbs routing
+        through here (:meth:`stop`, :meth:`pause`, :meth:`resume`,
+        :meth:`kill`, :meth:`cancel`) raise :class:`StaleWorkerFence` rather
+        than act on a successor, and it means a stale handle cannot build a
+        *second* :class:`ProcessWorkerRuntime` either.
         """
+        self._assert_current()
         if self._process_runtime is None:
             from tools.workspace.worker_runtime_process import (
                 ProcessWorkerRuntime,
@@ -623,6 +822,9 @@ class WorkerRuntimeHandle:
         Process mode: a ``control`` frame, and the verdict is the ack's ``ok``.
         A refusal is an answer and not an exception -- it says the runtime is
         alive and declined.
+
+        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
+        handle raises :class:`StaleWorkerFence` instead of parking a successor.
         """
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().stop()
@@ -630,7 +832,11 @@ class WorkerRuntimeHandle:
         return True
 
     def pause(self) -> bool:
-        """Pause the worker's turn loop (§4.3); see :meth:`stop`."""
+        """Pause the worker's turn loop (§4.3); see :meth:`stop`.
+
+        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
+        handle raises :class:`StaleWorkerFence` instead of pausing a successor.
+        """
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().pause()
         self._worker.pause()
@@ -643,6 +849,10 @@ class WorkerRuntimeHandle:
         rather than the transport's: ``WorkerThread.resume`` refuses a killed
         worker and says so with ``False``, which is exactly what an ``ok=False``
         ack means on the other side.
+
+        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
+        handle raises :class:`StaleWorkerFence` instead of resuming a
+        successor.
         """
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().resume()
@@ -656,6 +866,9 @@ class WorkerRuntimeHandle:
         still up and then closes, so the handle drops its reference to a runtime
         that has already shut itself down -- the same reference :meth:`close`
         would have dropped.
+
+        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
+        handle raises :class:`StaleWorkerFence` instead of killing a successor.
         """
         if self._mode == MODE_PROCESS:
             runtime = self._ensure_process_runtime()
@@ -696,6 +909,10 @@ class WorkerRuntimeHandle:
         (``worker_runtime_main._handle_cancel``): both modes must agree on when
         there is nothing to cancel, so the agreement is one shared constant
         rather than two copies of the rule.
+
+        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
+        handle raises :class:`StaleWorkerFence` instead of cancelling a
+        successor's turn.
         """
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().cancel()
