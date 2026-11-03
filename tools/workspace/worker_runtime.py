@@ -51,11 +51,14 @@ and "run in-process" are very different statements about isolation. Only an
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from tools.workspace.worker_runtime_protocol import WorkerState
+from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
 
 #: The flag that selects the runtime mode (§10, D11).
 WORKER_RUNTIME_MODE_ENV = "WORKER_RUNTIME_MODE"
@@ -83,7 +86,7 @@ RUNTIME_MODES = (MODE_THREAD, MODE_PROCESS)
 #: status (it survives only in a comment, ``worker_thread.py:1103``), so listing
 #: it would describe a state no worker can be in.
 CANCEL_TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"killed", "detached", "error", "completed"}
+    {"killed", "detaching", "detached", "error", "completed"}
 )
 
 #: Live :class:`WorkerRuntimeHandle` objects, keyed the way the worker registry
@@ -245,6 +248,43 @@ def resolve_runtime_mode(environ: Optional[Mapping[str, str]] = None) -> str:
     )
 
 
+#: What :meth:`WorkerRuntimeHandle.state` reports when it has neither a cached
+#: frame nor a readable ``status.json`` mirror. A status no worker can be in,
+#: so "I cannot see this worker" is never mistaken for a real state -- the same
+#: reasoning that keeps ``stopped`` out of :data:`CANCEL_TERMINAL_STATUSES`.
+UNKNOWN_WORKER_STATUS = "unknown"
+
+
+def cached_frame_age_seconds(
+    frame_at: Optional[float], *, now: Optional[float] = None
+) -> Optional[float]:
+    """Age in seconds of the last frame received from a worker runtime.
+
+    The supervisor-side half of D1: ONE function, taking a timestamp rather
+    than a worker object. ``worker_thread._heartbeat_summary``,
+    ``worker_manager._heartbeat_age`` and ``worker_lifecycle._heartbeat_age``
+    all need a ``WorkerThread`` -- which the supervisor does not have for a
+    worker whose body runs in another OS process.
+
+    *frame_at* is the epoch timestamp :meth:`WorkerRuntimeHandle.on_frame`
+    cached: local receipt time, not the child's reported time, so a skewed
+    child clock can neither fake freshness nor fake staleness. ``None`` (no
+    frame yet) answers ``None``: absence of evidence is not an age, and 0.0
+    would claim we just heard from a worker we have never heard from.
+
+    Pure in its arguments; the only impurity is the clock read supplying
+    *now*. Clock skew (or a caller's slightly-behind *now*) clamps to 0.0
+    rather than going negative.
+    """
+    if frame_at is None:
+        return None
+    try:
+        reference = time.time() if now is None else float(now)
+        return max(0.0, reference - float(frame_at))
+    except (TypeError, ValueError):
+        return None
+
+
 class WorkerRuntimeHandle:
     """The supervisor's view of one worker runtime (S2: thread or process).
 
@@ -266,6 +306,11 @@ class WorkerRuntimeHandle:
         # ``None`` until the first ``dispatch_query`` asks for them.
         self._spec: Optional[dict] = None
         self._process_runtime: Optional[Any] = None
+        # S4: what the last frame from a process-mode worker said, and when we
+        # received it (local receipt time). Filled by ``on_frame``, read by
+        # ``state`` before it falls back to the ``status.json`` mirror.
+        self._last_worker_state: Optional[WorkerState] = None
+        self._last_frame_at: Optional[float] = None
 
     @classmethod
     def spawn(
@@ -339,16 +384,20 @@ class WorkerRuntimeHandle:
         is derived from ``_manual_only_pause`` by design (see
         ``WorkerThread.__init__``).
 
-        Process mode has no such attributes to read in this process: the
-        ``worker_state`` frame is S4 (§10), so this raises rather than
-        returning a state it cannot actually observe.
+        Process mode has no such attributes to read here, so it answers in
+        two steps: the frame cache (filled by :meth:`on_frame`) first, then the
+        ``status.json`` mirror the worker writes -- the same file
+        ``worker_thread.py`` itself falls back to. Cache before file because
+        the cache is what the worker actually reported; the file is a mirror
+        that may lag. Neither available is not an error: it is
+        :data:`UNKNOWN_WORKER_STATUS`, a status no worker can be in, so "I
+        cannot see this worker" is never mistaken for a real one.
         """
         if self._mode == MODE_PROCESS:
-            raise NotImplementedError(
-                f"{WORKER_RUNTIME_MODE_ENV}={MODE_PROCESS!r} cannot report state "
-                "before the worker_state frame exists: it lands in stage S4 -- "
-                "see docs/design-worker-runtime-process.md §10."
-            )
+            cached = self._last_worker_state
+            if cached is not None:
+                return cached
+            return self._mirrored_state()
         worker = self._worker
         return WorkerState(
             status=worker.status,
@@ -356,6 +405,98 @@ class WorkerRuntimeHandle:
             error=worker.error,
             paused_manually=bool(worker._manual_only_pause),
         )
+
+    def on_frame(self, frame: Any) -> None:
+        """Cache what the last frame told us about the worker (S4, D1).
+
+        The supervisor-side half of the frame seam: whatever arrives from a
+        process-mode worker passes through here, and :meth:`state` answers
+        from the cache before it falls back to the ``status.json`` mirror.
+
+        Only the two frame kinds that exist are dispatched -- ``WorkerState``
+        refreshes the state cache, ``Heartbeat`` refreshes the arrival
+        timestamp -- and anything else is ignored: a frame kind this stage
+        does not know is not an error, it is simply not ours to interpret.
+
+        ``_last_frame_at`` is *receipt* time, not ``Heartbeat.at``. The two
+        processes share a filesystem but not a clock, so trusting the child's
+        own timestamp would let a skewed child fake freshness or staleness;
+        liveness is measured on the supervisor's clock or not at all.
+
+        Never raises, does no I/O, takes no lock and calls nothing back into
+        the worker: this runs on the socket read loop, and a frame that
+        surprises us must not be able to take the transport down.
+        ``Heartbeat`` has no producer yet -- nothing emits one -- so that
+        branch is the cache doing the right thing in advance.
+        """
+        try:
+            if isinstance(frame, WorkerState):
+                self._last_worker_state = frame
+            elif isinstance(frame, Heartbeat):
+                pass
+            else:
+                return
+            self._last_frame_at = time.time()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("worker runtime frame was not cacheable: %s", exc)
+
+    def _mirrored_state(self) -> WorkerState:
+        """Read the worker's ``status.json`` mirror as a ``WorkerState``.
+
+        The fallback for a handle that has received no frame yet: the worker
+        writes exactly the file ``worker_thread.py`` writes, so it is the one
+        description of the worker both sides already agree on. Used only under
+        ``MODE_PROCESS``, and only after the frame cache misses --
+        :meth:`state` prefers observed frames to a file that may lag.
+
+        Six of the file's keys are dropped for want of a field in
+        ``WorkerState`` (``last_heartbeat``, ``session_id``,
+        ``current_context_tokens``, ``max_context_tokens``, ``started_at``,
+        ``last_query_at``): the frame shape is the contract, and widening it
+        to mirror the file would make the two disagree the other way.
+        """
+        path = self._status_json_path()
+        if path is None:
+            return WorkerState(UNKNOWN_WORKER_STATUS, None, None, False)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return WorkerState(UNKNOWN_WORKER_STATUS, None, None, False)
+        if not isinstance(data, dict):
+            return WorkerState(UNKNOWN_WORKER_STATUS, None, None, False)
+        status = data.get("runtime_status")
+        if not isinstance(status, str) or not status:
+            status = UNKNOWN_WORKER_STATUS
+        current_task = data.get("current_task")
+        if not isinstance(current_task, str):
+            current_task = None
+        error = data.get("error")
+        if not isinstance(error, str):
+            error = None
+        return WorkerState(
+            status=status,
+            current_task=current_task,
+            error=error,
+            paused_manually=bool(data.get("paused_manually")),
+        )
+
+    def _status_json_path(self) -> Optional[Path]:
+        """Where this worker's status mirror lives, or ``None`` (S4).
+
+        The same resolution ``worker_thread.py`` uses for its own fallback --
+        ``<worker_dir>/status.json`` -- read through the private
+        ``_worker_dir`` attribute because that is the only handle either side
+        has on the directory. Absent (a stand-in worker, a test double) means
+        "no mirror", not an error: the caller degrades to
+        :data:`UNKNOWN_WORKER_STATUS`.
+        """
+        worker_dir = getattr(self._worker, "_worker_dir", None)
+        if worker_dir is None:
+            return None
+        try:
+            return Path(worker_dir) / "status.json"
+        except TypeError:
+            return None
 
     # ------------------------------------------------------------------
     # Control plane (§10)

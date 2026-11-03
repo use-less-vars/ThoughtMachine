@@ -12,10 +12,14 @@ registered, and prove the command-file path is unchanged when it is not.
 from __future__ import annotations
 
 import json
+import threading
+from types import SimpleNamespace
 
 import pytest
 
 from tools.workspace import worker_runtime
+from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
+from tools.workspace.worker_thread import WorkerThread
 from web_ui.backend import workspace_routes
 
 
@@ -246,3 +250,312 @@ def test_runtime_mode_report_agrees_with_resolve_runtime_mode() -> None:
     )
     assert bad["mode"] is None
     assert "nonsense" in bad["error"]
+
+# ──────────────────────────────────────── S4a: the runtime -> supervisor frame sink ────────
+
+
+def _make_worker(workspace_dir, frame_sink=None):
+    """A real ``WorkerThread`` with hermetic defaults (no ``Agent`` built).
+
+    ``__init__`` only lays down ``workers/<label>/`` and never starts the
+    thread, so a per-test instance is cheap.  Same construction as
+    ``tests/test_worker_budgets.py``.
+    """
+    return WorkerThread(
+        name="seam-w",
+        definition={},
+        agent_config={"provider": "openai", "model": "gpt-4"},
+        workspace_dir=workspace_dir,
+        session_permissions={},
+        instance_id=1,
+        frame_sink=frame_sink,
+    )
+
+
+def _status_on_disk(worker):
+    return json.loads(
+        (worker._worker_dir / "status.json").read_text(encoding="utf-8")
+    )
+
+
+def test_status_write_emits_one_worker_state_frame(tmp_path) -> None:
+    # One status write == one frame, and the four fields that exist on both
+    # sides agree with the file the supervisor mirrors.
+    frames = []
+    worker = _make_worker(tmp_path, frames.append)
+    worker.status = "working"
+    worker.current_task = "read the docs"
+    worker.error = None
+
+    worker._write_status_file()
+
+    assert len(frames) == 1
+    frame = frames[0]
+    assert isinstance(frame, WorkerState)
+    assert frame.KIND == "worker_state"
+    data = _status_on_disk(worker)
+    assert frame.to_payload() == {
+        "status": data["runtime_status"],
+        "current_task": data["current_task"],
+        "error": data["error"],
+        "paused_manually": data["paused_manually"],
+    }
+    assert frame.status == "working"
+    assert frame.current_task == "read the docs"
+
+
+def test_frame_carries_error_and_paused_manually_verbatim(tmp_path) -> None:
+    frames = []
+    worker = _make_worker(tmp_path, frames.append)
+    worker.status = "error"
+    worker.error = "boom"
+    worker._manual_only_pause = True
+
+    worker._write_status_file()
+
+    frame = frames[-1]
+    assert frame.status == "error"
+    assert frame.error == "boom"
+    # ``paused_manually`` is the bool() of ``_manual_only_pause``; the frame
+    # carries the coerced value, not the raw attribute.
+    assert frame.paused_manually is True
+
+
+def test_frame_is_emitted_only_after_status_json_is_in_place(tmp_path) -> None:
+    # The emit lives inside the ``try`` *after* the FileLock block, so a sink
+    # never sees a half-written file and never runs while the lock is held.
+    seen = []
+
+    def sink(frame):
+        seen.append((frame.status, _status_on_disk(worker)["runtime_status"]))
+
+    worker = _make_worker(tmp_path, sink)
+    worker.status = "running"
+
+    worker._write_status_file()
+
+    assert seen == [("running", "running")]
+
+
+def test_no_sink_writes_the_same_file_and_emits_nothing(tmp_path) -> None:
+    # The production default (``frame_sink=None``) must leave status.json
+    # byte-for-byte what it was before the seam existed.
+    worker = _make_worker(tmp_path)
+    assert worker._frame_sink is None
+    worker.status = "paused"
+    worker._manual_only_pause = True
+
+    worker._write_status_file()
+
+    expected = {
+        "runtime_status": "paused",
+        "current_task": None,
+        "last_heartbeat": None,
+        "error": None,
+        "session_id": None,
+        "current_context_tokens": 0,
+        "max_context_tokens": worker.max_context_tokens,
+        "started_at": None,
+        "last_query_at": None,
+        "paused_manually": True,
+    }
+    text = (worker._worker_dir / "status.json").read_text(encoding="utf-8")
+    assert text == json.dumps(expected, indent=2, default=str)
+    # No sink: _emit_frame is a silent no-op rather than an error.
+    worker._emit_frame(object())
+
+
+def test_raising_sink_is_swallowed_and_the_write_still_lands(tmp_path) -> None:
+    # A broken sink must not take the worker down with it.
+    def sink(frame):
+        raise RuntimeError("sink exploded")
+
+    worker = _make_worker(tmp_path, sink)
+    worker.status = "error"
+    worker.error = "kaput"
+
+    worker._write_status_file()
+
+    assert _status_on_disk(worker)["runtime_status"] == "error"
+    assert _status_on_disk(worker)["error"] == "kaput"
+
+
+# ────────────────────────────── S4a (B): the supervisor-side state cache ──────────────────────────────
+
+
+def test_detaching_is_terminal_for_cancel() -> None:
+    # ``detaching`` is a status WorkerThread really assigns
+    # (worker_thread.py:1553), so a cancel there has no turn left to interrupt
+    # -- it belongs with the other terminal statuses.
+    assert "detaching" in worker_runtime.CANCEL_TERMINAL_STATUSES
+    worker = SimpleNamespace(status="detaching", _turn_cancel=threading.Event())
+    handle = worker_runtime.WorkerRuntimeHandle(worker)
+
+    assert handle.cancel() == "refused"
+    assert worker._turn_cancel.is_set() is False
+
+
+def _write_mirror(directory, **overrides):
+    """The full 10-key ``status.json`` ``_write_status_file`` lays down."""
+    data = {
+        "runtime_status": "busy",
+        "current_task": "task-1",
+        "last_heartbeat": "2026-01-01T00:00:00+00:00",
+        "error": None,
+        "session_id": "s-1",
+        "current_context_tokens": 7,
+        "max_context_tokens": 8192,
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "last_query_at": None,
+        "paused_manually": True,
+    }
+    data.update(overrides)
+    (directory / "status.json").write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+def _process_handle(worker):
+    return worker_runtime.WorkerRuntimeHandle(
+        worker, mode=worker_runtime.MODE_PROCESS
+    )
+
+
+def test_state_reads_the_status_json_mirror_in_process_mode(tmp_path) -> None:
+    # No frame yet: the fallback is the very file the web backend already
+    # reads, so the supervisor needs no new source of truth.
+    _write_mirror(tmp_path)
+    handle = _process_handle(SimpleNamespace(_worker_dir=tmp_path))
+
+    state = handle.state()
+
+    assert state == WorkerState(
+        status="busy", current_task="task-1", error=None, paused_manually=True
+    )
+    # Only the four fields WorkerState declares survive; the other six keys of
+    # status.json have no field to land in.
+    assert len(state.to_payload()) == 4
+
+
+def test_status_json_path_resolves_the_real_worker_thread_mirror(tmp_path) -> None:
+    # The production shape. A process-mode handle wraps a real ``WorkerThread``
+    # (the documented contract, and what ``spec_from_worker`` requires), so the
+    # mirror has to be found through the same ``workers/<label>/`` directory the
+    # thread itself writes to -- not through an attribute only the doubles have.
+    worker = _make_worker(tmp_path)
+    handle = _process_handle(worker)
+
+    assert worker._worker_dir == tmp_path / "workers" / "seam-w"
+    assert handle._status_json_path() == worker._worker_dir / "status.json"
+
+    # ...and the file the thread writes is the file the handle reads back, so
+    # the fallback is wired end to end rather than merely path-shaped.
+    worker.status = "working"
+    worker.current_task = "read the docs"
+    worker.error = None
+    worker._write_status_file()
+
+    assert handle.state() == WorkerState(
+        status="working",
+        current_task="read the docs",
+        error=None,
+        paused_manually=False,
+    )
+
+
+def test_state_without_cache_or_mirror_reports_unknown(tmp_path) -> None:
+    # Neither sight nor file: say so, and say it with a status no worker can
+    # be in, rather than raising or inventing ``ready``.
+    handle = _process_handle(SimpleNamespace(_worker_dir=tmp_path))
+
+    state = handle.state()
+
+    assert state == WorkerState(
+        status=worker_runtime.UNKNOWN_WORKER_STATUS,
+        current_task=None,
+        error=None,
+        paused_manually=False,
+    )
+    assert state.status == "unknown"
+
+
+def test_corrupt_mirror_falls_back_to_unknown(tmp_path) -> None:
+    (tmp_path / "status.json").write_text("{not json", encoding="utf-8")
+    handle = _process_handle(SimpleNamespace(_worker_dir=tmp_path))
+
+    assert handle.state().status == worker_runtime.UNKNOWN_WORKER_STATUS
+
+
+def test_state_prefers_the_cached_frame_over_a_stale_mirror(tmp_path) -> None:
+    # The cache is what the worker reported; the file is a mirror that may
+    # lag. Observed beats mirrored.
+    _write_mirror(tmp_path)
+    handle = _process_handle(SimpleNamespace(_worker_dir=tmp_path))
+    frame = WorkerState(
+        status="paused", current_task="t2", error=None, paused_manually=False
+    )
+
+    handle.on_frame(frame)
+
+    assert handle.state() == frame
+
+
+def test_on_frame_ignores_garbage_and_never_raises() -> None:
+    handle = _process_handle(SimpleNamespace())
+
+    handle.on_frame(object())
+    handle.on_frame("nonsense")
+
+    # An unknown kind is ignored, not interpreted, and nothing was cached.
+    assert handle._last_worker_state is None
+    assert handle._last_frame_at is None
+
+
+def test_on_frame_never_raises_even_when_the_clock_does(monkeypatch) -> None:
+    handle = _process_handle(SimpleNamespace())
+
+    def boom():
+        raise RuntimeError("clock exploded")
+
+    monkeypatch.setattr(worker_runtime.time, "time", boom)
+
+    # This runs on the read loop: a frame that surprises us must not be able
+    # to take the transport down.
+    handle.on_frame(
+        WorkerState(
+            status="ready", current_task=None, error=None, paused_manually=False
+        )
+    )
+
+    assert handle._last_frame_at is None
+
+
+def test_on_frame_caches_a_heartbeat_timestamp() -> None:
+    handle = _process_handle(SimpleNamespace())
+
+    handle.on_frame(
+        Heartbeat(
+            at="2026-01-01T00:00:00+00:00",
+            status="ready",
+            current_context_tokens=0,
+            max_context_tokens=8192,
+        )
+    )
+
+    # A heartbeat is freshness, not state: the state cache stays empty and the
+    # arrival time is what gets recorded.
+    assert handle._last_worker_state is None
+    assert isinstance(handle._last_frame_at, float)
+    assert (
+        worker_runtime.cached_frame_age_seconds(
+            handle._last_frame_at, now=handle._last_frame_at + 5.0
+        )
+        == 5.0
+    )
+
+
+def test_cached_frame_age_seconds() -> None:
+    assert worker_runtime.cached_frame_age_seconds(100.0, now=130.0) == 30.0
+    # No frame yet is not an age of zero -- it is ignorance.
+    assert worker_runtime.cached_frame_age_seconds(None) is None
+    # Skew clamps at 0.0 instead of going negative.
+    assert worker_runtime.cached_frame_age_seconds(200.0, now=100.0) == 0.0

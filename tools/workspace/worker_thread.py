@@ -22,7 +22,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Union
 
 from pydantic import Field, field_validator
 
@@ -35,6 +35,7 @@ from tools.workspace.command_channel import (
     quarantine,
     write_command,
 )
+from tools.workspace.worker_runtime_protocol import WorkerState
 
 try:
     from agent.logging import log
@@ -987,7 +988,12 @@ class WorkerThread(threading.Thread):
         max_container_count: Optional[int] = None,
         max_token_usage: Optional[int] = None,
         max_runtime_s: Optional[float] = None,
+        frame_sink: Optional[Callable[[Any], None]] = None,
     ) -> None:
+        # S4a: assigned before anything else -- every other attribute below can
+        # reach a helper that calls _write_status_file, so the sink is set
+        # first rather than left to a getattr() default.
+        self._frame_sink = frame_sink
         self.instance_id = instance_id
         instance_label = _WorkerRegistry.instance_label(name, instance_id)
         super().__init__(daemon=True, name=f"worker-{instance_label}")
@@ -3754,6 +3760,31 @@ class WorkerThread(threading.Thread):
             self.worker_name,
         )
 
+    def _emit_frame(self, frame: Any) -> None:
+        """Hand *frame* to the supervisor sink, when one is installed.
+
+        ``frame_sink`` is the runtime -> supervisor seam (S4a): the in-process
+        worker thread publishes ``worker_state`` frames through the same
+        callable a process runtime will write to its socket, so the supervisor
+        consumes one code path in both modes. ``None`` (the production default
+        until the supervisor wires a sink) makes this a no-op.
+
+        It never raises: a broken sink must not take the worker down, so the
+        failure is logged and swallowed. That guarantee covers *this* call
+        only. The sink runs on the worker's own thread, so a sink that blocks
+        delays the status write that triggered it, and a sink that calls back
+        into ``_write_status_file`` re-enters here -- there is deliberately no
+        re-entrancy guard, because a guard would silently drop the inner frame
+        instead of making the recursion visible.
+        """
+        sink = self._frame_sink
+        if sink is None:
+            return
+        try:
+            sink(frame)
+        except Exception as exc:
+            log("WARNING", "tools.worker", f"frame_sink failed: {exc}")
+
     def _write_status_file(self) -> None:
         """
         Write runtime status to ``status.json`` so the web API backend
@@ -3791,6 +3822,20 @@ class WorkerThread(threading.Thread):
                     os.replace(tmp_path_str, str(target))
             else:
                 os.replace(tmp_path_str, str(target))
+            # S4a: publish the state frame only after status.json is durably
+            # in place and the FileLock is released (see _emit_frame for why
+            # the lock must not be held across the sink). The except branch
+            # deliberately emits nothing: a status write that failed has no
+            # state worth announcing, and its logger.error is the evidence.
+            if self._frame_sink is not None:
+                self._emit_frame(
+                    WorkerState(
+                        status=data["runtime_status"],
+                        current_task=data["current_task"],
+                        error=data["error"],
+                        paused_manually=data["paused_manually"],
+                    )
+                )
         except (OSError, Exception) as exc:
             logger.error("Failed to write worker status file: %s", exc)
             try:

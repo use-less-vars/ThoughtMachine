@@ -173,7 +173,7 @@ def test_control_verb_exception_acks_not_ok() -> None:
 _ACCEPTING_STATUSES = ("ready", "busy", "paused")
 
 #: The statuses a cancel is REFUSED from: the turn is already over.
-_REFUSING_STATUSES = ("killed", "detached", "error", "completed")
+_REFUSING_STATUSES = ("killed", "detaching", "detached", "error", "completed")
 
 
 @pytest.mark.parametrize("status", _ACCEPTING_STATUSES)
@@ -243,7 +243,7 @@ def test_cancel_predicate_is_one_shared_constant() -> None:
         is worker_runtime.CANCEL_TERMINAL_STATUSES
     )
     assert worker_runtime.CANCEL_TERMINAL_STATUSES == frozenset(
-        {"killed", "detached", "error", "completed"}
+        {"killed", "detaching", "detached", "error", "completed"}
     )
     # ``stopped`` is never assigned by ``WorkerThread`` (comment-only at
     # worker_thread.py:1103), so a cancel must never be refused on it.
