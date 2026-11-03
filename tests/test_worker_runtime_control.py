@@ -12,6 +12,7 @@ import threading
 
 import pytest
 
+from tools.workspace import worker_runtime, worker_runtime_main
 from tools.workspace.worker_runtime_main import (
     _handle_cancel,
     _handle_control,
@@ -167,9 +168,39 @@ def test_control_verb_exception_acks_not_ok() -> None:
     assert "RuntimeError" in ack.status
 
 
-def test_cancel_refused_when_worker_is_idle() -> None:
-    # Not "busy" means nothing is mid-turn, so there is nothing to cancel.
-    worker = _FakeWorker(status="working")
+#: The statuses a cancel is ACCEPTED from (S3b): each still owns a turn loop
+#: with a ``_turn_cancel`` event, so there is a turn to interrupt.
+_ACCEPTING_STATUSES = ("ready", "busy", "paused")
+
+#: The statuses a cancel is REFUSED from: the turn is already over.
+_REFUSING_STATUSES = ("killed", "detached", "error", "completed")
+
+
+@pytest.mark.parametrize("status", _ACCEPTING_STATUSES)
+def test_cancel_accepted_from_a_live_status(status: str) -> None:
+    # "busy" is no longer the rule: a READY or PAUSED worker still has a turn
+    # loop, so a cancel it can act on is accepted from those too.
+    worker = _FakeWorker(status=status)
+    outbox = _FakeOutbox()
+
+    _handle_cancel(
+        worker,
+        outbox,
+        Cancel(request_id="5", reason="operator_kill", deadline_ms=5000),
+    )
+
+    assert len(outbox.messages) == 1
+    ack = outbox.messages[0]
+    assert isinstance(ack, CancelAck)
+    assert ack.request_id == "5"
+    assert ack.phase == "accepted"
+    # An "accepted" that did not set the token would be a lie.
+    assert worker._turn_cancel.is_set() is True
+
+
+@pytest.mark.parametrize("status", _REFUSING_STATUSES)
+def test_cancel_refused_from_a_terminal_status(status: str) -> None:
+    worker = _FakeWorker(status=status)
     outbox = _FakeOutbox()
 
     _handle_cancel(
@@ -184,6 +215,39 @@ def test_cancel_refused_when_worker_is_idle() -> None:
     assert ack.request_id == "5"
     assert ack.phase == "refused"
     assert worker._turn_cancel.is_set() is False
+
+
+@pytest.mark.parametrize("status", _ACCEPTING_STATUSES)
+def test_handle_cancel_accepts_the_same_live_statuses(status: str) -> None:
+    # Thread mode must answer exactly what the child answers, from the same set.
+    worker = _FakeWorker(status=status)
+    handle = worker_runtime.WorkerRuntimeHandle(worker)
+
+    assert handle.cancel() == "accepted"
+    assert worker._turn_cancel.is_set() is True
+
+
+@pytest.mark.parametrize("status", _REFUSING_STATUSES)
+def test_handle_cancel_refuses_the_same_terminal_statuses(status: str) -> None:
+    worker = _FakeWorker(status=status)
+    handle = worker_runtime.WorkerRuntimeHandle(worker)
+
+    assert handle.cancel() == "refused"
+    assert worker._turn_cancel.is_set() is False
+
+
+def test_cancel_predicate_is_one_shared_constant() -> None:
+    """One definition, consumed by both modes -- not two copies of the rule."""
+    assert (
+        worker_runtime_main.CANCEL_TERMINAL_STATUSES
+        is worker_runtime.CANCEL_TERMINAL_STATUSES
+    )
+    assert worker_runtime.CANCEL_TERMINAL_STATUSES == frozenset(
+        {"killed", "detached", "error", "completed"}
+    )
+    # ``stopped`` is never assigned by ``WorkerThread`` (comment-only at
+    # worker_thread.py:1103), so a cancel must never be refused on it.
+    assert "stopped" not in worker_runtime.CANCEL_TERMINAL_STATUSES
 
 
 def test_cancel_accepted_when_worker_is_busy() -> None:

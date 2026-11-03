@@ -44,6 +44,7 @@ from tools.workspace.command_channel import (
     write_command,
 )
 from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+from tools.workspace.worker_runtime import runtime_handle_for
 _worker_registry = _WorkerRegistry.get_instance()._worker_registry
 _registry_lock = _WorkerRegistry.get_instance()._registry_lock
 
@@ -341,6 +342,47 @@ def _read_worker_generation(worker_dir: Path) -> Optional[int]:
     return value
 
 
+#: Command-file action -> the ``WorkerRuntimeHandle`` verb that carries it out.
+#: The same four actions ``WorkerThread._poll_command`` obeys, with the same
+#: meanings (``stop`` parks/revives, ``kill`` is the only terminating verb), so
+#: a command routed through a handle and one polled off disk cannot disagree.
+_RUNTIME_COMMAND_VERBS = {
+    "stop": "stop",
+    "kill": "kill",
+    "pause": "pause",
+    "resume": "resume",
+}
+
+
+def _dispatch_via_runtime(handle: Any, action: str) -> None:
+    """Deliver one command verb straight to a live runtime *handle*.
+
+    Reached only when :func:`tools.workspace.worker_runtime.runtime_handle_for`
+    found a handle for this worker -- i.e. never in production today, where the
+    registry is empty and the ``command.json`` path below carries every command.
+    When there IS a handle the supervisor can reach the runtime in-process, so
+    the direct call is the transport and no command file is written: one
+    command, one transport.
+
+    An action with no handle equivalent raises :class:`ValueError` rather than
+    being silently swallowed -- a verb this seam cannot honour has to be
+    visible, and every current caller passes one of the four mapped verbs.
+    """
+    verb = _RUNTIME_COMMAND_VERBS.get(action)
+    if verb is None:
+        raise ValueError(
+            f"no WorkerRuntimeHandle verb for worker command {action!r}; "
+            f"mapped actions: {sorted(_RUNTIME_COMMAND_VERBS)}"
+        )
+    result = getattr(handle, verb)()
+    logger.debug(
+        "Worker command %r delivered to the runtime handle (%s -> %r)",
+        action,
+        verb,
+        result,
+    )
+
+
 def _write_worker_command(
     worker_dir: Path,
     action: str,
@@ -351,6 +393,11 @@ def _write_worker_command(
 ) -> None:
     """Write a fenced ``command.json`` into *worker_dir*.
 
+    If the supervisor holds a live ``WorkerRuntimeHandle`` for this worker the
+    command goes straight to it (:func:`_dispatch_via_runtime`) and nothing is
+    written to disk; that registry is empty today, so in practice every command
+    still lands in ``command.json`` exactly as before.
+
     The fence (session / worker name / instance / epoch) is what lets the
     polling worker reject a command addressed to a different incarnation --
     a stale command from a previous spawn, or one meant for another worker
@@ -360,6 +407,10 @@ def _write_worker_command(
     UNFENCED with a warning rather than dropped, so the caller's request is
     never silently ignored.
     """
+    handle = runtime_handle_for(session_id, worker_name, instance_id)
+    if handle is not None:
+        return _dispatch_via_runtime(handle, action)
+
     generation = _read_worker_generation(worker_dir)
     if generation is None:
         logger.warning(

@@ -44,6 +44,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
+from tools.workspace.worker_runtime import CANCEL_TERMINAL_STATUSES
 from tools.workspace.worker_runtime_protocol import (
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
@@ -326,16 +327,17 @@ def _handle_cancel(worker: Any, outbox: _Outbox, message: Cancel) -> None:
     """Answer the first rung of the cancel ladder without waiting (§5.4).
 
     The ack is queued and the reader returns -- nothing here sleeps, joins or
-    waits on the worker. A worker that is demonstrably not mid-turn has
-    nothing to cancel, so it is ``refused``; otherwise the thread's own
-    ``_turn_cancel`` event is set (closing/latest-wins: it is an event, not a
-    queue) and it is ``accepted``.
+    waits on the worker. A worker in a terminal status
+    (:data:`CANCEL_TERMINAL_STATUSES` -- the same constant the in-process handle
+    consults) has no turn left to interrupt, so it is ``refused``; otherwise the
+    thread's own ``_turn_cancel`` event is set (closing/latest-wins: it is an
+    event, not a queue) and it is ``accepted``.
 
     Only this first rung is emitted in stage S3: the later ``observed`` and
     ``completed`` rungs of the same ladder (§5.4) are not implemented yet, so
     no request id is remembered and no turn-completion path closes them.
     """
-    if _worker_status(worker) != "busy":
+    if _worker_status(worker) in CANCEL_TERMINAL_STATUSES:
         outbox.put(CancelAck(request_id=message.request_id, phase="refused"))
         return
     try:

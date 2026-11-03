@@ -917,11 +917,14 @@ def test_cancel_accepted_when_busy():
     assert worker.calls == []
 
 
-def test_cancel_refused_when_not_busy():
+def test_cancel_refused_when_the_worker_is_terminal():
     # §5.4: refusal is a verdict about the worker ("nothing is running"), given
     # for the same reason the child-side handler gives it -- both modes agree.
+    # S3b widened the rule from "must be busy": acceptance now depends on the
+    # worker NOT being in CANCEL_TERMINAL_STATUSES, so the refusal case has to
+    # be a terminal status (a "working" worker is accepted today).
     worker = FakeWorker()
-    worker.status = "working"
+    worker.status = "killed"
     worker._turn_cancel = threading.Event()
     assert WorkerRuntimeHandle.spawn(worker, environ={}).cancel() == "refused"
     assert worker._turn_cancel.is_set() is False

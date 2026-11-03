@@ -51,8 +51,9 @@ and "run in-process" are very different statements about isolation. Only an
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from tools.workspace.worker_runtime_protocol import WorkerState
 
@@ -67,6 +68,153 @@ MODE_PROCESS = "process"
 
 #: Exactly what the flag accepts. Nothing else is a mode.
 RUNTIME_MODES = (MODE_THREAD, MODE_PROCESS)
+
+#: The worker statuses a cancel is REFUSED for (§5.4) -- and the single source
+#: of truth for cancel acceptability across BOTH modes.
+#:
+#: Two objects consult this constant and neither keeps a copy of the rule: the
+#: in-process handle (:meth:`WorkerRuntimeHandle.cancel`) and the runtime child
+#: (``worker_runtime_main._handle_cancel``). A cancel is refused iff the worker's
+#: status is in this set, and accepted otherwise -- ``ready`` / ``busy`` /
+#: ``paused`` all still own a ``_turn_cancel`` event, so there is a turn to
+#: interrupt in each of them.
+#:
+#: ``stopped`` is deliberately absent: ``WorkerThread`` never assigns that
+#: status (it survives only in a comment, ``worker_thread.py:1103``), so listing
+#: it would describe a state no worker can be in.
+CANCEL_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"killed", "detached", "error", "completed"}
+)
+
+#: Live :class:`WorkerRuntimeHandle` objects, keyed the way the worker registry
+#: keys its threads: ``(session_id, worker_name)`` or
+#: ``(session_id, worker_name, instance_id)``.
+#:
+#: EMPTY IN PRODUCTION TODAY. Nothing outside the tests constructs a
+#: ``WorkerRuntimeHandle``, so every lookup misses and every caller keeps the
+#: behaviour it had before this seam existed. Stage S4 is expected to populate
+#: the registry with the handles the supervisor builds; until then the seam must
+#: stay behaviour-neutral, which is exactly what "empty" buys.
+_RUNTIME_HANDLES: Dict[tuple, "WorkerRuntimeHandle"] = {}
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _runtime_handle_key(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: Optional[int] = None,
+) -> Tuple:
+    """The registry key for one worker instance.
+
+    Identity, not a predicate: an instance-scoped lookup is a three-tuple, a
+    name-scoped one is a two-tuple, and nothing is inferred about either.
+    """
+    if instance_id is None:
+        return (session_id, worker_name)
+    return (session_id, worker_name, instance_id)
+
+
+def register_runtime_handle(
+    handle: "WorkerRuntimeHandle",
+    *,
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: Optional[int] = None,
+) -> Tuple:
+    """Publish *handle* as the live runtime for one worker; returns its key.
+
+    Called by whoever owns the handle's lifetime (S4). Re-registering the same
+    key overwrites: a handle is replaced, never accumulated.
+    """
+    key = _runtime_handle_key(session_id, worker_name, instance_id)
+    _RUNTIME_HANDLES[key] = handle
+    return key
+
+
+def unregister_runtime_handle(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: Optional[int] = None,
+) -> Optional["WorkerRuntimeHandle"]:
+    """Drop the handle for one worker; returns it, or ``None`` if there was none.
+
+    Idempotent on purpose: the owner of a handle may be gone by the time its
+    exit path runs, and "already unregistered" is not an error.
+    """
+    return _RUNTIME_HANDLES.pop(
+        _runtime_handle_key(session_id, worker_name, instance_id), None
+    )
+
+
+def runtime_handle_for(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: Optional[int] = None,
+) -> Optional["WorkerRuntimeHandle"]:
+    """The live handle for one worker, or ``None`` when there is none.
+
+    The registry is EMPTY IN PRODUCTION TODAY: nothing outside the tests builds
+    a ``WorkerRuntimeHandle`` yet, so this returns ``None`` for every real
+    caller and the command path is byte-identical to what it was before the
+    seam. Stage S4 is expected to populate the registry.
+
+    Never raises. A miss is an ordinary answer (it means "use the old path"),
+    so it is logged at DEBUG and returned as ``None`` -- including for a key
+    that cannot even be used as one, because a lookup must never be the thing
+    that breaks a supervisor endpoint.
+    """
+    try:
+        key = _runtime_handle_key(session_id, worker_name, instance_id)
+        handle = _RUNTIME_HANDLES.get(key)
+    except Exception as exc:  # noqa: BLE001 - a lookup may never break the caller
+        _LOGGER.debug(
+            "runtime handle lookup for worker %r (session %r, instance %r) "
+            "failed (%s); treating it as absent",
+            worker_name,
+            session_id,
+            instance_id,
+            exc,
+        )
+        return None
+    if handle is None:
+        _LOGGER.debug(
+            "no runtime handle for worker %r (session %r, instance %r); the "
+            "command-file path handles this request",
+            worker_name,
+            session_id,
+            instance_id,
+        )
+        return None
+    return handle
+
+
+def runtime_mode_report(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Report the runtime mode in force and how full the seam is.
+
+    ``mode`` is whatever :func:`resolve_runtime_mode` resolves for *environ* --
+    the same spawn-time rule, never cached -- so this cannot report a mode a
+    spawn would not pick. An unusable flag is reported as ``error`` with
+    ``mode`` left ``None`` rather than raised: this helper exists for
+    diagnostics, and the fail-closed refusal still happens where it belongs, at
+    spawn time.
+    """
+    mode: Optional[str]
+    error: Optional[str]
+    try:
+        mode = resolve_runtime_mode(environ)
+        error = None
+    except InvalidRuntimeModeError as exc:
+        mode = None
+        error = str(exc)
+    return {
+        "mode": mode,
+        "error": error,
+        "registered_handles": len(_RUNTIME_HANDLES),
+    }
+
 
 
 class InvalidRuntimeModeError(ValueError):
@@ -292,14 +440,16 @@ class WorkerRuntimeHandle:
 
         Thread mode has no ``cancel`` method to call -- ``_turn_cancel`` is
         already the token every tool consults, so setting it is the whole
-        signal. A thread that is not mid-turn is refused, for the same reason
-        ``worker_runtime_main._handle_cancel`` refuses it: both modes must agree
-        on when there is nothing to cancel.
+        signal. A thread already in one of :data:`CANCEL_TERMINAL_STATUSES` is
+        refused, and that set is the *same object* the child refuses on
+        (``worker_runtime_main._handle_cancel``): both modes must agree on when
+        there is nothing to cancel, so the agreement is one shared constant
+        rather than two copies of the rule.
         """
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().cancel()
         worker = self._worker
-        if worker.status != "busy":
+        if str(getattr(worker, "status", "") or "") in CANCEL_TERMINAL_STATUSES:
             return "refused"
         worker._turn_cancel.set()
         return "accepted"
