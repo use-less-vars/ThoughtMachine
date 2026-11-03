@@ -59,7 +59,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
+from tools.workspace.worker_runtime_protocol import Event, Heartbeat, WorkerState
 
 #: The flag that selects the runtime mode (§10, D11).
 WORKER_RUNTIME_MODE_ENV = "WORKER_RUNTIME_MODE"
@@ -389,6 +389,11 @@ class WorkerRuntimeHandle:
         # clocks it carried (D1). Filled by ``on_frame``; ``state`` reads the
         # state cache before it falls back to the ``status.json`` mirror.
         self._last_worker_state: Optional[WorkerState] = None
+        # S4b: the last ``event`` a process-mode worker published, verbatim.
+        # The LAST one only -- a cache is not a queue: no consumer reads a
+        # backlog here yet, and an unbounded buffer with no drain would be a
+        # leak with a nicer name.
+        self._last_event: Optional[Event] = None
         # ``Heartbeat.at`` as UTC epoch seconds -- when the worker says it
         # ticked (``heartbeat_age_seconds``).
         self._last_heartbeat_at: Optional[float] = None
@@ -454,7 +459,7 @@ class WorkerRuntimeHandle:
             self._spec = spec_from_worker(
                 self._worker, epoch=getattr(self._worker, "_generation", 0)
             )
-            runtime = ProcessWorkerRuntime(self._spec)
+            runtime = ProcessWorkerRuntime(self._spec, on_frame=self.on_frame)
             runtime.start()
             self._process_runtime = runtime
         return self._process_runtime
@@ -498,10 +503,11 @@ class WorkerRuntimeHandle:
         process-mode worker passes through here, and :meth:`state` answers
         from the cache before it falls back to the ``status.json`` mirror.
 
-        Only the two frame kinds that exist are dispatched -- ``WorkerState``
-        refreshes the state cache, ``Heartbeat`` refreshes the heartbeat
-        timestamp -- and anything else is ignored: a frame kind this stage
-        does not know is not an error, it is simply not ours to interpret.
+        Three frame kinds are dispatched -- ``WorkerState`` refreshes the state
+        cache, ``Heartbeat`` refreshes the heartbeat timestamp, ``Event``
+        refreshes the last-event cache -- and anything else is ignored: a frame
+        kind this stage does not know is not an error, it is simply not ours to
+        interpret.
 
         Two clocks are cached, because D1 asks two questions and they do not
         have the same answer on the same frame:
@@ -524,13 +530,18 @@ class WorkerRuntimeHandle:
         the worker: this runs on the socket read loop, and a frame that
         surprises us must not be able to take the transport down.
         ``Heartbeat`` has no producer yet -- nothing emits one -- so that
-        branch is the cache doing the right thing in advance.
+        branch is the cache doing the right thing in advance. ``Event`` is the
+        one kind with a producer today (S4b): the child forwards every event it
+        publishes, so this branch is where a forwarder reads one without
+        touching the socket.
         """
         try:
             if isinstance(frame, WorkerState):
                 self._last_worker_state = frame
             elif isinstance(frame, Heartbeat):
                 self._last_heartbeat_at = _epoch_seconds_from_iso8601(frame.at)
+            elif isinstance(frame, Event):
+                self._last_event = frame
             else:
                 return
             self._last_received_at = time.time()

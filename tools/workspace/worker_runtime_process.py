@@ -58,14 +58,17 @@ from tools.workspace.worker_runtime_protocol import (
     Control,
     ControlAck,
     DispatchQuery,
+    Event,
     Fatal,
     FrameDecoder,
     FrameEmitter,
+    Heartbeat,
     Hello,
     QueryAccepted,
     Reply,
     Shutdown,
     WorkerRuntimeProtocolError,
+    WorkerState,
     encode_frame,
 )
 
@@ -297,10 +300,18 @@ class ProcessWorkerRuntime:
         *,
         worker_factory: Optional[Callable[..., Any]] = None,
         start_method: str = "spawn",
+        on_frame: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self._spec = dict(spec)
         self._worker_factory = worker_factory
         self._start_method = start_method
+        #: Sink for the frames this stage routes instead of consuming --
+        #: ``event`` / ``heartbeat`` / ``worker_state`` (S4b). Bound at
+        #: CONSTRUCTION and not at ``start``: the child emits ``hello`` last,
+        #: so a frame that arrives ahead of the handshake (``worker_spawned``
+        #: is published before it) is already routable and must not be
+        #: dropped on the floor (D3).
+        self._on_frame = on_frame
         self._process: Optional[Any] = None
         self._sock: Optional[Any] = None
         self._outbox: Optional[_Outbox] = None
@@ -784,14 +795,53 @@ class ProcessWorkerRuntime:
         if kind == CancelAck.KIND:
             self._deliver_ack(CancelAck.from_frame(frame))
             return
-        # Anything else (event / heartbeat / worker_state) belongs to a later
-        # stage (§10, S4). The decoder already owns the "malformed stream"
-        # refusal (§4.5), so an unexpected *valid* frame is a scope fact, not a
-        # protocol error: log it and go on.
+        # S4b: the supervisory frames are routed, not swallowed. The child
+        # publishes ``event`` / ``heartbeat`` / ``worker_state``; each one is
+        # decoded here and handed to the sink the handle installed. Decode and
+        # delivery share one guard (``_deliver``) because both run on the
+        # reader thread with no lock held: a frame the sink chokes on may cost
+        # the stream that frame, never the connection (§4.7).
+        if kind == Event.KIND:
+            self._deliver(Event, frame)
+            return
+        if kind == Heartbeat.KIND:
+            self._deliver(Heartbeat, frame)
+            return
+        if kind == WorkerState.KIND:
+            self._deliver(WorkerState, frame)
+            return
+        # Every from-runtime kind the protocol declares is routed above, so a
+        # *valid* frame that still lands here is one this stage has no consumer
+        # for. The decoder already owns the "malformed stream" refusal (§4.5),
+        # so an unexpected valid frame is a scope fact, not a protocol error:
+        # log it and go on.
         print(
-            f"worker_runtime_process: ignoring {kind} frame (not in S2 scope)",
+            f"worker_runtime_process: ignoring {kind} frame (no consumer at "
+            f"this stage)",
             file=sys.stderr,
         )
+
+    def _deliver(self, message_type: Any, frame: Dict[str, Any]) -> None:
+        """Decode one supervisory frame and hand it to ``self._on_frame`` (S4b).
+
+        Runs on the reader thread with no lock held, so the sink is free to
+        call back into the runtime. A sink that raises -- or a payload this
+        side cannot read -- is reported and dropped: these frames are
+        observational (§4.4), and letting the exception escape ``_route`` would
+        end ``_read_loop`` and mark the runtime lost over something no caller
+        can act on.
+        """
+        sink = self._on_frame
+        if sink is None:
+            return
+        try:
+            sink(message_type.from_frame(frame))
+        except Exception as exc:  # noqa: BLE001 -- the stream must survive it
+            print(
+                "worker_runtime_process: dropping an unreadable or unhandled "
+                f"{message_type.KIND} frame: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     def _deliver_ack(self, message: Any) -> None:
         """Close the request *message* answers, if anyone is still waiting (§10).
