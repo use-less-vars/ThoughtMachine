@@ -720,3 +720,33 @@ class WorkerRuntimeHandle:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
+
+
+def attach_thread_frame_sink(
+    worker: Any, *, mode: str = MODE_THREAD
+) -> "WorkerRuntimeHandle":
+    """Build a handle around *worker* and install its ``on_frame`` as the sink.
+
+    This is the S5 production construction site: the one place a real
+    ``WorkerThread`` gets a :class:`WorkerRuntimeHandle` and the runtime ->
+    supervisor frame seam is closed in-process. The worker keeps its own
+    ``run()`` loop, fence and ``_turn_cancel`` -- the handle receives only what
+    the worker chooses to emit through ``_frame_sink`` (S4a ``WorkerState``,
+    S5 ``Heartbeat``), so thread mode stays byte-identical in observable
+    behaviour to calling the thread directly (§11.1).
+
+    Registration in :data:`_RUNTIME_HANDLES` is deliberately deferred: the
+    supervisor command path (``web_ui.backend.workspace_routes`` ->
+    ``runtime_handle_for`` -> ``_dispatch_via_runtime``) prefers a registered
+    handle and would then bypass ``command.json``, which is the only command
+    channel the running worker actually reads.
+
+    The handle is also recorded as ``worker._runtime_handle`` so its lifetime
+    is tied to the worker's: the worker owns the only reference either side
+    needs, and nothing else has to remember to close a handle that owns no
+    resource of its own in thread mode (``close`` is a no-op there).
+    """
+    handle = WorkerRuntimeHandle(worker, mode=mode)
+    worker._frame_sink = handle.on_frame
+    worker._runtime_handle = handle
+    return handle

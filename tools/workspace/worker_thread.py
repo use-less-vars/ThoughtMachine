@@ -35,7 +35,7 @@ from tools.workspace.command_channel import (
     quarantine,
     write_command,
 )
-from tools.workspace.worker_runtime_protocol import WorkerState
+from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
 
 try:
     from agent.logging import log
@@ -3976,13 +3976,27 @@ class WorkerThread(threading.Thread):
             return
         self._last_heartbeat_monotonic = now
         self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+        current_context_tokens = self.get_current_context_tokens()
         self._publish_global_event(EventType.WORKER_HEARTBEAT, {
             "status": self.status,
             "current_task": self.current_task,
             "last_heartbeat": self.last_heartbeat,
-            "current_context_tokens": self.get_current_context_tokens(),
+            "current_context_tokens": current_context_tokens,
             "max_context_tokens": self.max_context_tokens,
         })
+        # S5: the same tick also crosses the frame seam, so a supervisor that
+        # cannot see this thread (process mode) learns the worker is alive.
+        # ``last_heartbeat`` is the ISO-8601 string the protocol field carries
+        # (``Heartbeat.at``); the token counts are the same two sources the
+        # global-bus event above already reports.
+        self._emit_frame(
+            Heartbeat(
+                at=self.last_heartbeat,
+                status=self.status,
+                current_context_tokens=current_context_tokens,
+                max_context_tokens=self.max_context_tokens,
+            )
+        )
 
 
 
@@ -5082,6 +5096,21 @@ class Worker(ToolBase):
             instance_id=spawn_iid,
             container_manager=container_manager,
         )
+
+        # S5: close the runtime -> supervisor frame seam for this worker. The
+        # handle is built here and never started, so nothing about the thread's
+        # own run() changes; it only receives the frames the thread emits
+        # (WorkerState / Heartbeat) from this point on -- before thread.start(),
+        # because a status write or heartbeat in the first turn is exactly the
+        # window where a late sink loses frames. The import is function-local
+        # to match this method's existing local-import block (worker_runtime is
+        # a supervisor-side module; importing it at module level would put it in
+        # the worker body's import graph, which the child process also loads),
+        # not because of an import cycle -- worker_runtime imports only the
+        # protocol module.
+        from tools.workspace.worker_runtime import attach_thread_frame_sink
+
+        attach_thread_frame_sink(thread)
 
         # Store initial context for the thread to pick up in run()
         if self.context is not None and isinstance(self.context, dict):
