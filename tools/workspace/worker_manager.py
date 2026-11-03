@@ -208,7 +208,7 @@ class PeriodicStaleCheck(threading.Thread):
         # -- loudly (runtime channel + audit log), never silently dropped.
         self._reject_queued_queries(thread, worker_name)
         self._kill_detached_worker(thread, worker_name)
-        self._forget_worker(key, session_id, worker_name)
+        self._forget_worker(key, session_id, worker_name, thread)
 
     def _announce_detached_ttl_kill(
         self, thread: Any, session_id: str, worker_name: str, age: float
@@ -304,7 +304,9 @@ class PeriodicStaleCheck(threading.Thread):
             instance_id = getattr(thread, "instance_id", 1)
         return session_id or "", worker_name, instance_id
 
-    def _forget_worker(self, key: Any, session_id: str, worker_name: str) -> None:
+    def _forget_worker(
+        self, key: Any, session_id: str, worker_name: str, thread: Any = None
+    ) -> None:
         """Drop a killed worker's registry entry (never raises)."""
         try:
             instance_id = key[2]
@@ -313,8 +315,12 @@ class PeriodicStaleCheck(threading.Thread):
         unregister = getattr(self._registry, "unregister_worker", None)
         if not callable(unregister):
             return
+        kwargs = {"instance_id": instance_id}
+        _epoch = getattr(thread, "_generation", None)
+        if _epoch is not None:
+            kwargs["epoch"] = _epoch
         try:
-            unregister(session_id, worker_name, instance_id=instance_id)
+            unregister(session_id, worker_name, **kwargs)
         except Exception as exc:
             logger.warning(
                 "detached TTL registry cleanup failed for worker '%s': %s",
@@ -428,8 +434,13 @@ class WorkerManager:
         instance_id: int = 1,
     ) -> None:
         """Register a worker thread under ``(session_id, worker_name, instance_id)``."""
+        # S7a: tag the registration with the incarnation's epoch, so a stale incarnation cannot displace it later.
         self._registry.register_worker(
-            session_id or "", worker_name, thread, instance_id=instance_id
+            session_id or "",
+            worker_name,
+            thread,
+            instance_id=instance_id,
+            epoch=getattr(thread, "_generation", None),
         )
 
     def unregister_worker(
@@ -438,10 +449,22 @@ class WorkerManager:
         worker_name: str,
         instance_id: int = 1,
         default: Any = None,
+        *,
+        epoch: int | None = None,
     ) -> Any:
         """Unregister and return the thread, or *default* if absent."""
+        if epoch is None:
+            epoch = getattr(
+                self.get_worker(session_id, worker_name, instance_id=instance_id),
+                "_generation",
+                None,
+            )
         return self._registry.unregister_worker(
-            session_id or "", worker_name, instance_id=instance_id, default=default
+            session_id or "",
+            worker_name,
+            instance_id=instance_id,
+            default=default,
+            epoch=epoch,
         )
 
     def get_worker(
@@ -580,6 +603,7 @@ class WorkerManager:
                 key[1],
                 key[2] if len(key) >= 3 else 1,
                 default=None,
+                epoch=getattr(thread, "_generation", None),
             )
             removed += 1
         return removed
@@ -606,6 +630,7 @@ class WorkerManager:
                 key[1],
                 key[2] if len(key) >= 3 else 1,
                 default=None,
+                epoch=getattr(thread, "_generation", None),
             )
             results.append(
                 {
@@ -804,7 +829,12 @@ class WorkerManager:
             self._registry.get_all_workers().items()
         ):
             if sid == key:
-                self.unregister_worker(sid, _name, instance_id=_iid)
+                self.unregister_worker(
+                    sid,
+                    _name,
+                    instance_id=_iid,
+                    epoch=getattr(_thread, "_generation", None),
+                )
 
     # -- internals ----------------------------------------------------------
 

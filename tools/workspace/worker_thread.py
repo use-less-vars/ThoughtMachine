@@ -709,13 +709,21 @@ _worker_registry = _registry_instance._worker_registry
 _registry_lock = _registry_instance._registry_lock
 _worker_event_bus_registry = _registry_instance._worker_event_bus_registry
 _bus_registry_lock = _registry_instance._bus_registry_lock
-def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any, instance_id: int = 1) -> None:
-    """Delegate to WorkerRegistry singleton (backward compat)."""
-    _WorkerRegistry.get_instance().register_event_bus(session_id, worker_name, event_bus, instance_id=instance_id)
+def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any, instance_id: int = 1, *, epoch: int | None = None) -> Any:
+    """Delegate to WorkerRegistry singleton (backward compat).
 
-def unregister_worker_event_bus(session_id: str, worker_name: str, instance_id: int = 1) -> None:
-    """Delegate to WorkerRegistry singleton (backward compat)."""
-    _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name, instance_id=instance_id)
+    *epoch* is the owning incarnation's ``WorkerThread._generation``, passed
+    straight through so the registry can refuse a stale (older) registration.
+    """
+    return _WorkerRegistry.get_instance().register_event_bus(session_id, worker_name, event_bus, instance_id=instance_id, epoch=epoch)
+
+def unregister_worker_event_bus(session_id: str, worker_name: str, instance_id: int = 1, *, epoch: int | None = None) -> Any:
+    """Delegate to WorkerRegistry singleton (backward compat).
+
+    *epoch* is the owning incarnation's ``WorkerThread._generation``, passed
+    straight through so the registry can refuse a stale (older) teardown.
+    """
+    return _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name, instance_id=instance_id, epoch=epoch)
 
 class _WorkerAmbiguityError(Exception):
     """Raised when a worker name maps to multiple live instances and no
@@ -2761,7 +2769,7 @@ class WorkerThread(threading.Thread):
                     "stop for this instance)")
             # Create per-worker EventBus early so _publish_event below works
             self._event_bus = EventBus()
-            register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus, instance_id=self.instance_id)
+            register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus, instance_id=self.instance_id, epoch=self._generation)
             # Attach EventLogger to this worker's per-worker bus
             try:
                 from agent.logging.event_logger import EventLogger
@@ -3494,11 +3502,12 @@ class WorkerThread(threading.Thread):
                     _WorkerRegistry.get_instance().unregister_worker(
                         self.session_id or "", self.worker_name,
                         instance_id=self.instance_id,
+                        epoch=getattr(self, "_generation", None),
                     )
                 except Exception:
                     pass
             try:
-                unregister_worker_event_bus(self.session_id or "", self.worker_name, instance_id=self.instance_id)
+                unregister_worker_event_bus(self.session_id or "", self.worker_name, instance_id=self.instance_id, epoch=getattr(self, "_generation", None))
             except Exception:
                 pass
             if self._worker_ctx is not None:
@@ -5210,6 +5219,26 @@ class Worker(ToolBase):
                     "live_workers": live_now,
                 }
             _worker_registry[(session_key, self.worker_name, spawn_iid)] = thread
+            # S7a: seed the epoch record in THIS SAME critical section. Without
+            # it the raw write above registers a thread with no epoch, so the
+            # fenced run() teardown (CAS on the thread's own _generation) can
+            # never match and the entry would leak in _worker_registry forever.
+            # register_worker() cannot be used here: it takes this very
+            # (non-reentrant) _registry_lock, and moving the registration
+            # outside the block would re-open the capped-spawn TOCTOU race this
+            # block exists to close.
+            _spawn_epoch = getattr(thread, "_generation", None)
+            # S7a: mirror WorkerRegistry._coerce_epoch — only a real int may become
+            # an epoch; a duck-typed/mocked _generation must degrade to unversioned
+            # rather than poisoning the map with a value that breaks later int
+            # comparisons on this key.
+            if not isinstance(_spawn_epoch, int) or isinstance(_spawn_epoch, bool):
+                _spawn_epoch = None
+            if _spawn_epoch is not None:
+                _spawn_key = (session_key, self.worker_name, spawn_iid)
+                _stored_epoch = _registry_instance._worker_epochs.get(_spawn_key)
+                if _stored_epoch is None or _stored_epoch <= _spawn_epoch:
+                    _registry_instance._worker_epochs[_spawn_key] = _spawn_epoch
 
         # ── Commit 8: dispatch window opens — the worker thread starts here ──
         dispatch_started_at = time.time()
@@ -6277,7 +6306,9 @@ class Worker(ToolBase):
         # ── Found in current session ──
         if not thread.is_alive():
             with _registry_lock:
-                _worker_registry.pop((sid, self.worker_name, iid), None)
+                _reset_key = (sid, self.worker_name, iid)
+                if _worker_registry.get(_reset_key) is thread:
+                    _worker_registry.pop(_reset_key, None)
             thread._cleanup_worker_containers()
             _drop_persisted_files(thread)
             return {

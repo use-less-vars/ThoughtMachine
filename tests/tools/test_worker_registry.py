@@ -173,12 +173,12 @@ class TestWorkerRegistryIntegration:
 
             w.register_worker_event_bus("s", "w", "bus")
             mock_registry.register_event_bus.assert_called_once_with(
-                "s", "w", "bus", instance_id=1
+                "s", "w", "bus", instance_id=1, epoch=None
             )
 
             w.unregister_worker_event_bus("s", "w")
             mock_registry.unregister_event_bus.assert_called_once_with(
-                "s", "w", instance_id=1
+                "s", "w", instance_id=1, epoch=None
             )
 
             w.get_worker_event_bus("s", "w")

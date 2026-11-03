@@ -35,6 +35,44 @@ cannot stop another session's worker threads.
 """
 
 
+# ── Epoch fencing (S7a) ────────────────────────────────────────────────────
+# Every registry mutation can be tagged with the caller's epoch: the owning
+# ``WorkerThread._generation``, a monotonic counter allocated under the
+# cross-process spawn lock, so a later incarnation always carries a strictly
+# greater epoch than any earlier one -- including across processes.
+#
+# Why not fold the epoch into the stored value (a record type instead of a
+# bare WorkerThread / EventBus)?  Because these dicts' OBJECT IDENTITY is
+# aliased by other modules -- ``worker_thread.py`` binds
+# ``_worker_registry`` / ``_worker_event_bus_registry`` directly and
+# ``check_system.py`` does too -- and a record refactor would force every one
+# of those readers to change.  Two parallel epoch maps keep the stored values
+# exactly what they are today.
+#
+# Why keep an epoch record after an unregister succeeds?  Deleting it would
+# re-open the very race this closes: a stale late writer (a killed
+# incarnation's ``finally:`` block) would find no record, treat the key as
+# fresh/unversioned and pop or resurrect the SUCCESSOR's entry.  Retaining the
+# newest epoch is precisely what makes every later stale mutation refuse.
+#
+# Growth is bounded and deliberately unreclaimed: the keys are
+# (session id, worker name, instance id), instances per name are few, and the
+# payload is one small int, so leaking a handful of ints per worker name per
+# process life is cheaper than a sweep that would re-open the race.
+
+
+def _coerce_epoch(epoch: Any) -> int | None:
+    """Return *epoch* only if it is genuinely an int, else ``None``.
+
+    Callers pass ``getattr(thread, '_generation', None)``; duck-typed and
+    mocked objects can yield a non-int (a ``MagicMock``, a string), which
+    would raise on the int comparison inside the registry.  Treating such a
+    value as absent degrades to the legacy unversioned path -- fail open on
+    TYPE, never on ORDER: a real int is still compared strictly.
+    """
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+
+
 class WorkerRegistry:
     """Thread-safe singleton registry for worker threads and per-worker EventBuses.
 
@@ -57,10 +95,17 @@ class WorkerRegistry:
         # (session_id, worker_name, instance_id) → WorkerThread
         self._worker_registry: dict[tuple[str, str, int], Any] = {}
         self._registry_lock = threading.Lock()
+        # (session_id, worker_name, instance_id) → last accepted register epoch.
+        # Parallel to _worker_registry, guarded by the SAME _registry_lock (see
+        # the epoch-fencing comment above the class).
+        self._worker_epochs: dict[tuple[str, str, int], int] = {}
 
         # (session_id, worker_name, instance_id) → per-worker EventBus
         self._worker_event_bus_registry: Dict[Tuple[str, str, int], Any] = {}
         self._bus_registry_lock = threading.Lock()
+        # (session_id, worker_name, instance_id) → last accepted register epoch.
+        # Parallel to _worker_event_bus_registry, guarded by _bus_registry_lock.
+        self._bus_epochs: dict[tuple[str, str, int], int] = {}
 
         # Register the shutdown handler once. The whole-registry sweep is the
         # process-exit semantics, so the handler passes the ALL_SESSIONS
@@ -94,12 +139,29 @@ class WorkerRegistry:
     # -- Worker thread registry ----------------------------------------------
 
     def register_worker(self, session_id: str, worker_name: str, thread: Any,
-                        instance_id: int = 1) -> None:
-        """Register a worker thread under (session_id, worker_name, instance_id)."""
+                        instance_id: int = 1, *, epoch: int | None = None) -> Any:
+        """Register a worker thread under (session_id, worker_name, instance_id).
+
+        With an int *epoch* the write is compare-and-set: it is refused
+        (returns ``False``, registry untouched) when a strictly greater epoch
+        is already recorded for this key, so a stale incarnation can never
+        displace its successor.  An equal epoch is an idempotent overwrite;
+        on success the epoch is recorded and ``True`` is returned.
+        ``epoch=None`` is the legacy unversioned path: it always writes and
+        returns ``None`` as before, leaving the epoch map untouched.  A
+        non-int *epoch* is treated as absent.
+        """
+        epoch = _coerce_epoch(epoch)
         key = (session_id or "", worker_name, instance_id)
         with self._registry_lock:
+            if epoch is not None:
+                stored = self._worker_epochs.get(key)
+                if stored is not None and stored > epoch:
+                    return False
+                self._worker_epochs[key] = epoch
             self._worker_registry[key] = thread
         log_worker_event(worker_name, 'spawned', session_id=session_id or '')
+        return True if epoch is not None else None
 
     def get_worker(self, session_id: str, worker_name: str,
                    instance_id: int = 1) -> Any:
@@ -109,15 +171,47 @@ class WorkerRegistry:
             return self._worker_registry.get(key)
 
     def unregister_worker(self, session_id: str, worker_name: str,
-                          instance_id: int = 1, default: Any = None) -> Any:
-        """Unregister and return a worker thread, or *default* if not found."""
+                          instance_id: int = 1, default: Any = None,
+                          *, epoch: int | None = None) -> Any:
+        """Unregister and return a worker thread, or *default* if not found.
+
+        With an int *epoch* the pop is compare-and-set on ``stored <= epoch``:
+        it happens when the recorded epoch is less than or equal to *epoch* (or
+        when no record exists) and then returns ``True`` instead of the popped
+        thread; it refuses (``False``, entry left in place) only when the
+        recorded epoch is STRICTLY GREATER than *epoch*.  On a successful pop
+        the recorded epoch is raised to *epoch* and never lowered.
+        ``epoch=None`` is the legacy unversioned path (returns the popped
+        value / *default*, epoch map untouched).  A non-int *epoch* is treated
+        as absent.
+        """
+        epoch = _coerce_epoch(epoch)
         key = (session_id or "", worker_name, instance_id)
+        if epoch is None:
+            with self._registry_lock:
+                existed = key in self._worker_registry
+                popped = self._worker_registry.pop(key, default)
+            if existed:
+                log_worker_event(worker_name, 'stopped', session_id=session_id or '')
+            return popped
         with self._registry_lock:
+            stored = self._worker_epochs.get(key)
+            # The record only ever increases, so ``stored > epoch`` is precisely
+            # the case where a newer incarnation owns the key; a missing record
+            # means the key was never version-registered, and popping it is the
+            # pre-S7a behaviour.
+            if stored is not None and stored > epoch:
+                return False
             existed = key in self._worker_registry
-            popped = self._worker_registry.pop(key, default)
+            self._worker_registry.pop(key, None)
+            # Retain AND raise the record to this caller's epoch (we only get
+            # here when ``stored is None or stored <= epoch``, so this is
+            # ``max(stored, epoch)``): the newest epoch survives the pop, so no
+            # later stale register or unregister can touch this key.
+            self._worker_epochs[key] = epoch
         if existed:
             log_worker_event(worker_name, 'stopped', session_id=session_id or '')
-        return popped
+        return True
 
     def get_all_workers(self) -> dict[tuple[str, str, int], Any]:
         """Return a snapshot of all registered worker threads."""
@@ -149,18 +243,61 @@ class WorkerRegistry:
     # -- Per-worker EventBus registry ----------------------------------------
 
     def register_event_bus(self, session_id: str, worker_name: str, event_bus: Any,
-                           instance_id: int = 1) -> None:
-        """Register a worker's per-worker EventBus."""
+                           instance_id: int = 1, *, epoch: int | None = None) -> Any:
+        """Register a worker's per-worker EventBus.
+
+        With an int *epoch* the write is compare-and-set against the bus epoch
+        map: refused (``False``, nothing written) when a strictly greater epoch
+        is recorded for this key, applied and ``True`` otherwise (equal epoch
+        is an idempotent overwrite).  ``epoch=None`` is the legacy unversioned
+        path: always writes, returns ``None``, epoch map untouched.  A non-int
+        *epoch* is treated as absent.
+        """
+        epoch = _coerce_epoch(epoch)
         key = (session_id or "", worker_name, instance_id)
         with self._bus_registry_lock:
+            if epoch is not None:
+                stored = self._bus_epochs.get(key)
+                if stored is not None and stored > epoch:
+                    return False
+                self._bus_epochs[key] = epoch
             self._worker_event_bus_registry[key] = event_bus
+        return True if epoch is not None else None
 
     def unregister_event_bus(self, session_id: str, worker_name: str,
-                             instance_id: int = 1) -> None:
-        """Unregister a worker's per-worker EventBus."""
+                             instance_id: int = 1, *,
+                             epoch: int | None = None) -> Any:
+        """Unregister a worker's per-worker EventBus.
+
+        With an int *epoch* the pop is compare-and-set on ``stored <= epoch``:
+        performed when the recorded epoch is less than or equal to *epoch* (or
+        when no record exists) and then returns ``True``; it refuses (``False``,
+        bus left registered) only when the recorded epoch is STRICTLY GREATER
+        than *epoch*.  On a successful pop the recorded epoch is raised to
+        *epoch* and never lowered.
+        ``epoch=None`` is the legacy unversioned path (always
+        pops, returns ``None``).  A non-int *epoch* is treated as absent.
+        """
+        epoch = _coerce_epoch(epoch)
         key = (session_id or "", worker_name, instance_id)
         with self._bus_registry_lock:
+            if epoch is None:
+                self._worker_event_bus_registry.pop(key, None)
+                return None
+            stored = self._bus_epochs.get(key)
+            # The record only ever increases, so ``stored > epoch`` is precisely
+            # the case where a newer incarnation owns the key; a missing record
+            # means the key was never version-registered, and popping it is the
+            # pre-S7a behaviour.
+            if stored is not None and stored > epoch:
+                return False
             self._worker_event_bus_registry.pop(key, None)
+            # Retain AND raise the record to this caller's epoch (we only get
+            # here when ``stored is None or stored <= epoch``, so this is
+            # ``max(stored, epoch)``): the newest epoch survives the pop, so no
+            # later stale register or unregister can touch this key.
+            self._bus_epochs[key] = epoch
+        return True
 
     def get_event_bus(self, session_id: str, worker_name: str,
                       instance_id: int = 1) -> Any:
