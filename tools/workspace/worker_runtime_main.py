@@ -54,6 +54,7 @@ from tools.workspace.worker_runtime_protocol import (
     Control,
     ControlAck,
     DispatchQuery,
+    Event,
     Fatal,
     FrameDecoder,
     FrameEmitter,
@@ -145,6 +146,110 @@ class _Outbox:
         self._thread.join(timeout)
 
 
+#: How long the worker's OWN ``EventBus`` gets to appear before the wildcard
+#: subscription is given up on (see :func:`_subscribe_worker_bus`). Only the
+#: per-worker bus is waited for at all; the module-level one exists already.
+BUS_ATTACH_TIMEOUT_SECONDS = 5.0
+
+#: Poll interval while waiting for that bus.
+BUS_ATTACH_POLL_SECONDS = 0.01
+
+
+def _event_publisher(outbox: "_Outbox") -> Callable[[Any], None]:
+    """Build the wildcard subscriber that turns a published event into a frame.
+
+    ``EventBus.publish`` runs its subscribers on the PUBLISHER's stack -- the
+    worker's own turn loop -- so this callback must never block, raise or do
+    I/O. It hands the frame to the single-writer outbox (§4.6) and returns:
+    ``encode_frame`` is called by that one thread, not here, which is what keeps
+    ``seq`` in emission order. Every failure is swallowed and reported, because
+    a bad frame is not worth taking a publisher down for.
+    """
+
+    def forward(event: Any) -> None:
+        try:
+            # ``mode="json"`` on the dump is what makes the payload frame-safe:
+            # without it an enum or a datetime inside the event would only fail
+            # later, inside ``json.dumps`` on the outbox thread, where the loss
+            # is silent and the seq has already been spent.
+            dumped = event.model_dump(mode="json")
+            outbox.put(
+                Event(event_type=str(dumped.get("type") or ""), data=dumped)
+            )
+        except Exception as exc:  # noqa: BLE001 - the publisher must not see it
+            print(
+                "worker_runtime_main: dropping an event frame: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    return forward
+
+
+def _subscribe_worker_bus(worker: Any, publish: Callable[[Any], None]) -> None:
+    """Wildcard-subscribe the worker's OWN bus, once the worker has made it.
+
+    ``WorkerThread`` creates ``self._event_bus`` inside ``run``, not in
+    ``__init__``, and it offers no hook to be told when that happened -- so the
+    bus cannot be reached before the thread starts and there is nothing to
+    register against. A bounded poll on a throwaway thread is the smallest thing
+    that sees it without delaying the socket reader (§11.2 rule 1); a worker
+    that never gets that far costs this daemon its timeout and nothing else, and
+    the global bus still carries the lifecycle events.
+    """
+    deadline = time.monotonic() + BUS_ATTACH_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        bus = getattr(worker, "event_bus", None)
+        if bus is not None:
+            try:
+                bus.subscribe(None, publish)
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                print(
+                    "worker_runtime_main: could not subscribe the worker's "
+                    f"event bus: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            return
+        time.sleep(BUS_ATTACH_POLL_SECONDS)
+
+
+def _subscribe_child_events(worker: Any, outbox: "_Outbox") -> None:
+    """Open the child side of the event seam, on both buses it publishes to.
+
+    One child process is one worker, so a wildcard subscription is all the
+    attribution this needs: the events already carry ``worker_name``,
+    ``source`` and ``session_id``, and the frame's own fence is stamped by the
+    emitter. Called BEFORE ``worker.start()`` so the ``worker_spawned`` that
+    ``start`` publishes is not missed -- which is only possible because the
+    outbox is built before the worker too (§4.6).
+    """
+    publish = _event_publisher(outbox)
+    try:
+        from agent.events import global_event_bus
+    except Exception as exc:  # noqa: BLE001 - no bus, no seam, still a worker
+        print(
+            "worker_runtime_main: no global event bus to subscribe: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        global_event_bus = None
+    if global_event_bus is not None:
+        try:
+            global_event_bus.subscribe(None, publish)
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            print(
+                "worker_runtime_main: could not subscribe the global event "
+                f"bus: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+    threading.Thread(
+        target=_subscribe_worker_bus,
+        args=(worker, publish),
+        name="runtime-event-subscribe",
+        daemon=True,
+    ).start()
+
+
 def worker_runtime_main(
     sock: Any,
     spec: Dict[str, Any],
@@ -174,7 +279,12 @@ def worker_runtime_main(
             factory = _resolve_factory(spec.get("worker_factory"))
         kwargs = dict(spec.get("worker_kwargs") or {})
         worker = _build_worker(factory, kwargs)
-        worker.start()
+        # The outbox exists BEFORE the worker starts (§4.6). ``start`` runs the
+        # turn loop on its own thread and publishes ``worker_spawned`` on the
+        # way in, so an outbox built after ``start`` returned would drop -- or,
+        # worse, reorder against a later reply -- the first events of this
+        # incarnation. The fence comes off the spec, which is in hand already,
+        # so nothing has to be buffered to make this work.
         outbox = _Outbox(
             sock,
             FrameEmitter(
@@ -184,6 +294,8 @@ def worker_runtime_main(
                 epoch=epoch,
             ),
         )
+        _subscribe_child_events(worker, outbox)
+        worker.start()
         outbox.put(
             Hello(
                 pid=os.getpid(),
