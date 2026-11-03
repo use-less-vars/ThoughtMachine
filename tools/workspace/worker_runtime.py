@@ -54,10 +54,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from tools.workspace.worker_runtime_protocol import Event, Heartbeat, WorkerState
 
@@ -94,12 +95,20 @@ CANCEL_TERMINAL_STATUSES: frozenset[str] = frozenset(
 #: keys its threads: ``(session_id, worker_name)`` or
 #: ``(session_id, worker_name, instance_id)``.
 #:
-#: EMPTY IN PRODUCTION TODAY. Nothing outside the tests constructs a
-#: ``WorkerRuntimeHandle``, so every lookup misses and every caller keeps the
-#: behaviour it had before this seam existed. Stage S4 is expected to populate
-#: the registry with the handles the supervisor builds; until then the seam must
-#: stay behaviour-neutral, which is exactly what "empty" buys.
+#: POPULATED IN PRODUCTION since S7a-3: ``worker_thread._action_spawn``
+#: registers the handle ``attach_thread_frame_sink`` built for the thread it just
+#: started, under the raw ``session_id`` the routes look up with. A miss is still
+#: an ordinary answer -- it means "there is no in-process handle for this worker,
+#: use the command file" -- so the seam stays behaviour-neutral for every worker
+#: that has none (legacy spawns, other processes, name-scoped lookups).
 _RUNTIME_HANDLES: Dict[tuple, "WorkerRuntimeHandle"] = {}
+
+#: Guards :data:`_RUNTIME_HANDLES` and nothing else. Held for one dict read, write
+#: or pop; never across a dispatch or any call into a handle, and never while
+#: holding a registry lock -- the compare-and-set decisions below are a single
+#: dict operation, and everything a handle does happens after the lock is
+#: released.
+_RUNTIME_HANDLES_LOCK = threading.Lock()
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -125,30 +134,92 @@ def register_runtime_handle(
     session_id: Optional[str],
     worker_name: str,
     instance_id: Optional[int] = None,
-) -> Tuple:
-    """Publish *handle* as the live runtime for one worker; returns its key.
+    epoch: Optional[int] = None,
+) -> Union[Tuple, bool]:
+    """Publish *handle* as the live runtime for one worker.
 
-    Called by whoever owns the handle's lifetime (S4). Re-registering the same
-    key overwrites: a handle is replaced, never accumulated.
+    ``epoch=None`` (the default) is the pre-S7a-3 behaviour byte for byte: the
+    handle is written and its key is returned. Called by whoever owns the
+    handle's lifetime. Re-registering the same key overwrites: a handle is
+    replaced, never accumulated.
+
+    An explicit *epoch* turns the write into a compare-and-set against the
+    incumbent's epoch, mirroring ``WorkerRegistry.register_worker``: the write is
+    refused whenever the incumbent is strictly newer, so a registration that was
+    overtaken while it was being prepared cannot overwrite the handle of a
+    worker born after it. The verdict is then ``True`` (registered) or ``False``
+    (refused).
+
+    Fail open on unreadable bookkeeping (an epoch that is not an int): a spawn
+    must never be blocked by what amounts to a missing number, and a wrongly
+    registered handle is still fenced at dispatch.
     """
     key = _runtime_handle_key(session_id, worker_name, instance_id)
-    _RUNTIME_HANDLES[key] = handle
-    return key
+    if epoch is None:
+        with _RUNTIME_HANDLES_LOCK:
+            _RUNTIME_HANDLES[key] = handle
+        return key
+    caller_epoch = _epoch_or_none(epoch)
+    with _RUNTIME_HANDLES_LOCK:
+        incumbent = _RUNTIME_HANDLES.get(key)
+        incumbent_epoch = _epoch_or_none(getattr(incumbent, "epoch", None))
+        if (
+            caller_epoch is not None
+            and incumbent_epoch is not None
+            and incumbent_epoch > caller_epoch
+        ):
+            return False
+        _RUNTIME_HANDLES[key] = handle
+    return True
 
 
 def unregister_runtime_handle(
     session_id: Optional[str],
     worker_name: str,
     instance_id: Optional[int] = None,
-) -> Optional["WorkerRuntimeHandle"]:
-    """Drop the handle for one worker; returns it, or ``None`` if there was none.
+    epoch: Optional[int] = None,
+) -> Union["WorkerRuntimeHandle", bool, None]:
+    """Drop the handle for one worker.
 
-    Idempotent on purpose: the owner of a handle may be gone by the time its
-    exit path runs, and "already unregistered" is not an error.
+    ``epoch=None`` (the default) is the pre-S7a-3 behaviour byte for byte: the
+    entry is popped unconditionally and the handle is returned, or ``None`` when
+    there was none. Idempotent on purpose: the owner of a handle may be gone by
+    the time its exit path runs, and "already unregistered" is not an error.
+
+    An explicit *epoch* turns the pop into a compare-and-set, and the bug class
+    it closes is the one S7a-1 closed for the event bus: a dying predecessor's
+    teardown must not unplug its successor's handle. The entry is therefore
+    dropped only when the incumbent is not newer than the caller -- ``True``
+    means the entry is gone (including when there was none, because the
+    post-condition holds either way), ``False`` means the removal was refused
+    and the successor's handle is untouched.
+
+    Deliberately asymmetric with S7a-1: this store needs no high-water epoch
+    map, because a resurrected stale handle is harmless here -- dispatch fences
+    it (a dead body answers ``is_alive() is False``, a live successor shows up
+    through the registry epoch leg). The event bus had no such fence to lean on,
+    which is why it needed the map and the handle store does not.
+
+    Never raises. A caller that cannot say which incarnation it is (an epoch
+    that is not an int) is not trusted to remove an incumbent that can, so the
+    comparison only ever fails closed on the removal side.
     """
-    return _RUNTIME_HANDLES.pop(
-        _runtime_handle_key(session_id, worker_name, instance_id), None
-    )
+    key = _runtime_handle_key(session_id, worker_name, instance_id)
+    if epoch is None:
+        with _RUNTIME_HANDLES_LOCK:
+            return _RUNTIME_HANDLES.pop(key, None)
+    caller_epoch = _epoch_or_none(epoch)
+    with _RUNTIME_HANDLES_LOCK:
+        incumbent = _RUNTIME_HANDLES.get(key)
+        if incumbent is None:
+            return True
+        incumbent_epoch = _epoch_or_none(getattr(incumbent, "epoch", None))
+        if incumbent_epoch is not None and (
+            caller_epoch is None or incumbent_epoch > caller_epoch
+        ):
+            return False
+        _RUNTIME_HANDLES.pop(key, None)
+    return True
 
 
 def runtime_handle_for(
@@ -158,15 +229,18 @@ def runtime_handle_for(
 ) -> Optional["WorkerRuntimeHandle"]:
     """The live handle for one worker, or ``None`` when there is none.
 
-    The registry is EMPTY IN PRODUCTION TODAY: nothing outside the tests builds
-    a ``WorkerRuntimeHandle`` yet, so this returns ``None`` for every real
-    caller and the command path is byte-identical to what it was before the
-    seam. Stage S4 is expected to populate the registry.
+    Populated since S7a-3: the spawn path registers the handle it built, so for
+    a worker spawned by this process a hit is the ordinary case and the
+    in-process handle is the preferred transport for its control verbs.
 
-    Never raises. A miss is an ordinary answer (it means "use the old path"),
-    so it is logged at DEBUG and returned as ``None`` -- including for a key
-    that cannot even be used as one, because a lookup must never be the thing
-    that breaks a supervisor endpoint.
+    A miss is equally ordinary -- a worker spawned before the registration
+    existed, one owned by another process, or a name-scoped lookup against an
+    instance-scoped key -- and it means "there is no handle, use the command
+    file".
+
+    Never raises. A miss is logged at DEBUG and returned as ``None`` -- including
+    for a key that cannot even be used as one, because a lookup must never be
+    the thing that breaks a supervisor endpoint.
     """
     try:
         key = _runtime_handle_key(session_id, worker_name, instance_id)
@@ -823,9 +897,12 @@ class WorkerRuntimeHandle:
         A refusal is an answer and not an exception -- it says the runtime is
         alive and declined.
 
-        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
-        handle raises :class:`StaleWorkerFence` instead of parking a successor.
+        Both modes fence: :meth:`_assert_current` runs before the mode branch, so
+        a stale handle raises :class:`StaleWorkerFence` instead of parking a
+        successor, and process mode re-evaluates the same fence on every call
+        because the verb goes through :meth:`_ensure_process_runtime`.
         """
+        self._assert_current()
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().stop()
         self._worker.stop()
@@ -834,9 +911,12 @@ class WorkerRuntimeHandle:
     def pause(self) -> bool:
         """Pause the worker's turn loop (§4.3); see :meth:`stop`.
 
-        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
-        handle raises :class:`StaleWorkerFence` instead of pausing a successor.
+        Both modes fence: :meth:`_assert_current` runs before the mode branch, so
+        a stale handle raises :class:`StaleWorkerFence` instead of pausing a
+        successor, and process mode re-evaluates the same fence on every call
+        because the verb goes through :meth:`_ensure_process_runtime`.
         """
+        self._assert_current()
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().pause()
         self._worker.pause()
@@ -850,10 +930,12 @@ class WorkerRuntimeHandle:
         worker and says so with ``False``, which is exactly what an ``ok=False``
         ack means on the other side.
 
-        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
-        handle raises :class:`StaleWorkerFence` instead of resuming a
-        successor.
+        Both modes fence: :meth:`_assert_current` runs before the mode branch, so
+        a stale handle raises :class:`StaleWorkerFence` instead of resuming a
+        successor, and process mode re-evaluates the same fence on every call
+        because the verb goes through :meth:`_ensure_process_runtime`.
         """
+        self._assert_current()
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().resume()
         return bool(self._worker.resume())
@@ -867,9 +949,12 @@ class WorkerRuntimeHandle:
         that has already shut itself down -- the same reference :meth:`close`
         would have dropped.
 
-        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
-        handle raises :class:`StaleWorkerFence` instead of killing a successor.
+        Both modes fence: :meth:`_assert_current` runs before the mode branch, so
+        a stale handle raises :class:`StaleWorkerFence` instead of killing a
+        successor, and process mode re-evaluates the same fence on every call
+        because the verb goes through :meth:`_ensure_process_runtime`.
         """
+        self._assert_current()
         if self._mode == MODE_PROCESS:
             runtime = self._ensure_process_runtime()
             try:
@@ -910,10 +995,12 @@ class WorkerRuntimeHandle:
         there is nothing to cancel, so the agreement is one shared constant
         rather than two copies of the rule.
 
-        Process mode goes through :meth:`_ensure_process_runtime`, so a stale
-        handle raises :class:`StaleWorkerFence` instead of cancelling a
-        successor's turn.
+        Both modes fence: :meth:`_assert_current` runs before the mode branch, so
+        a stale handle raises :class:`StaleWorkerFence` instead of cancelling a
+        successor's turn, and process mode re-evaluates the same fence on every
+        call because the verb goes through :meth:`_ensure_process_runtime`.
         """
+        self._assert_current()
         if self._mode == MODE_PROCESS:
             return self._ensure_process_runtime().cancel()
         worker = self._worker
@@ -954,11 +1041,18 @@ def attach_thread_frame_sink(
     S5 ``Heartbeat``), so thread mode stays byte-identical in observable
     behaviour to calling the thread directly (§11.1).
 
-    Registration in :data:`_RUNTIME_HANDLES` is deliberately deferred: the
-    supervisor command path (``web_ui.backend.workspace_routes`` ->
-    ``runtime_handle_for`` -> ``_dispatch_via_runtime``) prefers a registered
-    handle and would then bypass ``command.json``, which is the only command
-    channel the running worker actually reads.
+    Registration in :data:`_RUNTIME_HANDLES` used to be deferred here, back when
+    the supervisor command path (``web_ui.backend.workspace_routes`` ->
+    ``runtime_handle_for`` -> ``_dispatch_via_runtime``) would have preferred a
+    registered handle and thereby bypassed ``command.json``. S7a-3 replaces that
+    deferral with registration at the spawn site itself
+    (``worker_thread._action_spawn``), which can key the handle by the instance
+    id it just allocated, and that is safe now for two reasons: the in-process
+    call is the preferred transport rather than a bypass (a thread-mode verb is a
+    direct method call on the very object the command file would steer, so both
+    channels reach the same worker), and the fallback is still there -- a fenced
+    or failing dispatch degrades to the command file, so one command still has
+    exactly one effective transport.
 
     The handle is also recorded as ``worker._runtime_handle`` so its lifetime
     is tied to the worker's: the worker owns the only reference either side

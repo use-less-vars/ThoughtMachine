@@ -236,11 +236,14 @@ def test_empty_registry_still_degrades_to_the_bare_action(tmp_path) -> None:
 
 
 def test_runtime_mode_report_agrees_with_resolve_runtime_mode() -> None:
-    assert worker_runtime.runtime_mode_report({}) == {
-        "mode": worker_runtime.MODE_THREAD,
-        "error": None,
-        "registered_handles": 0,
-    }
+    report = worker_runtime.runtime_mode_report({})
+    assert report["mode"] == worker_runtime.MODE_THREAD
+    assert report["error"] is None
+    # S7a-3 makes the spawn path register for real, so this count is process
+    # history (whoever this process spawned and has not torn down), not a
+    # world-state fact.  Pin agreement with the store instead of a zero.
+    assert isinstance(report["registered_handles"], int)
+    assert report["registered_handles"] == len(worker_runtime._RUNTIME_HANDLES)
     process = {worker_runtime.WORKER_RUNTIME_MODE_ENV: worker_runtime.MODE_PROCESS}
     assert worker_runtime.runtime_mode_report(process)["mode"] == (
         worker_runtime.MODE_PROCESS

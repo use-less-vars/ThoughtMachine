@@ -725,6 +725,57 @@ def unregister_worker_event_bus(session_id: str, worker_name: str, instance_id: 
     """
     return _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name, instance_id=instance_id, epoch=epoch)
 
+def _unregister_runtime_handles(entries: Any, *, epoch: int | None = None) -> None:
+    """Best-effort, epoch-fenced removal of the runtime handles for *entries*.
+
+    *entries* is an iterable of registry keys -- ``(session_id, worker_name)``
+    or ``(session_id, worker_name, instance_id)``, the two shapes
+    ``_worker_registry`` itself uses -- so a caller can hand over exactly the
+    entries it just removed from the registry.  S7a-3 mirrors handle removal
+    onto the paths that already remove the registry entry and invents no
+    lifecycle semantics of its own: a parked or cooperatively stopped worker
+    keeps its registry entry, and therefore keeps its handle.
+
+    *epoch* is the dying incarnation's ``_generation``, passed straight through
+    for the reason ``WorkerRegistry`` fences its own removal: a predecessor's
+    teardown must not unplug its successor's handle (the S7a-1 EventBus bug,
+    moved to the store that feeds the supervisor's command path).
+
+    Never raises, and never called with ``_registry_lock`` held: the handle
+    store takes its own lock and the ordering is registry -> handle, never back.
+    Both properties matter because this runs in teardown paths, where
+    bookkeeping must never be the thing that breaks the exit.
+    """
+    try:
+        from tools.workspace.worker_runtime import unregister_runtime_handle
+    except Exception:
+        logger.debug(
+            "runtime handle store unavailable; no handle to unregister",
+            exc_info=True,
+        )
+        return
+    for entry in entries or ():
+        try:
+            session_id = entry[0]
+            worker_name = entry[1]
+            instance_id = entry[2] if len(entry) >= 3 else None
+        except Exception:
+            logger.debug("unusable runtime handle key %r; skipped", entry)
+            continue
+        try:
+            unregister_runtime_handle(
+                session_id, worker_name, instance_id=instance_id, epoch=epoch
+            )
+        except Exception:
+            logger.debug(
+                "could not unregister the runtime handle for worker %r "
+                "(session %r, instance %r)",
+                worker_name,
+                session_id,
+                instance_id,
+                exc_info=True,
+            )
+
 class _WorkerAmbiguityError(Exception):
     """Raised when a worker name maps to multiple live instances and no
     ``instance_id`` was given to disambiguate."""
@@ -3506,6 +3557,14 @@ class WorkerThread(threading.Thread):
                     )
                 except Exception:
                     pass
+                # S7a-3: mirror that removal onto the handle store, with the
+                # same epoch -- a dying predecessor's finally must not unplug
+                # its successor's handle.  Keyed by the RAW session id, the
+                # value spawn registered under and the routes look up with.
+                _unregister_runtime_handles(
+                    [(self.session_id, self.worker_name, self.instance_id)],
+                    epoch=getattr(self, "_generation", None),
+                )
             try:
                 unregister_worker_event_bus(self.session_id or "", self.worker_name, instance_id=self.instance_id, epoch=getattr(self, "_generation", None))
             except Exception:
@@ -4671,6 +4730,7 @@ class Worker(ToolBase):
                             getattr(thread, "instance_id", None),
                         )
                     else:
+                        _replaced_handle_keys = []
                         with _registry_lock:
                             for key, t in list(_worker_registry.items()):
                                 if (
@@ -4679,6 +4739,15 @@ class Worker(ToolBase):
                                     and t is thread
                                 ):
                                     _worker_registry.pop(key, None)
+                                    _replaced_handle_keys.append(key)
+                        # S7a-3: drop the replaced incarnation's handle too,
+                        # outside the registry lock and fenced with ITS epoch, so
+                        # this teardown can never unplug the handle of the
+                        # instance this spawn is about to create.
+                        _unregister_runtime_handles(
+                            _replaced_handle_keys,
+                            epoch=getattr(thread, "_generation", None),
+                        )
                 stopped_info.append({"session_id": sid, "status": thread.status})
             if stopped_info:
                 logger.info(
@@ -5124,9 +5193,12 @@ class Worker(ToolBase):
         # the worker body's import graph, which the child process also loads),
         # not because of an import cycle -- worker_runtime imports only the
         # protocol module.
-        from tools.workspace.worker_runtime import attach_thread_frame_sink
+        from tools.workspace.worker_runtime import (
+            attach_thread_frame_sink,
+            register_runtime_handle,
+        )
 
-        attach_thread_frame_sink(thread)
+        _runtime_handle = attach_thread_frame_sink(thread)
 
         # Store initial context for the thread to pick up in run().  This is a
         # COPY, not an alias: the caller may reuse one context dict across
@@ -5239,6 +5311,55 @@ class Worker(ToolBase):
                 _stored_epoch = _registry_instance._worker_epochs.get(_spawn_key)
                 if _stored_epoch is None or _stored_epoch <= _spawn_epoch:
                     _registry_instance._worker_epochs[_spawn_key] = _spawn_epoch
+
+        # S7a-3: publish the handle the frame-sink attachment just built, so the
+        # supervisor's command path can reach this worker in process instead of
+        # only through ``command.json``.
+        #
+        # Placement is AFTER the critical section above, never inside it: the
+        # handle store takes its own lock, and the ordering every caller
+        # respects is registry -> handle, never the other way round.  The
+        # section itself is not restructured for this -- moving the registry
+        # write out of it would re-open the capped-spawn TOCTOU race the block
+        # exists to close.
+        #
+        # The key's session id is the RAW ``self.session_id``, not
+        # ``session_key``: the routes look a handle up with exactly the value
+        # they address the worker with, and ``_NO_SESSION_KEY`` is a
+        # registry-only sentinel -- keying handles with it would make every
+        # legacy worker's handle unreachable, a silent miss instead of a
+        # visible failure.
+        #
+        # Fail open, like the other spawn-side bookkeeping here: an instance id
+        # that is not an int cannot key a handle, and a spawn must never break
+        # over it (nor invent a default).  ``epoch`` is the same coerced value
+        # seeded into ``_worker_epochs`` above, so the store's compare-and-set
+        # speaks the registry's language; ``None`` means "unversioned" and
+        # registers exactly as it did before this change.
+        try:
+            if isinstance(spawn_iid, int) and not isinstance(spawn_iid, bool):
+                register_runtime_handle(
+                    _runtime_handle,
+                    session_id=self.session_id,
+                    worker_name=self.worker_name,
+                    instance_id=spawn_iid,
+                    epoch=_spawn_epoch,
+                )
+            else:
+                logger.debug(
+                    "Spawn: not registering a runtime handle for worker '%s' "
+                    "instance %r: the instance id is not an int",
+                    self.worker_name,
+                    spawn_iid,
+                )
+        except Exception:
+            logger.debug(
+                "Spawn: could not register a runtime handle for worker '%s' "
+                "instance %r",
+                self.worker_name,
+                spawn_iid,
+                exc_info=True,
+            )
 
         # ── Commit 8: dispatch window opens — the worker thread starts here ──
         dispatch_started_at = time.time()
@@ -6231,6 +6352,7 @@ class Worker(ToolBase):
                 return {"session_id": sid, "error": str(exc)}
             finally:
                 t._cleanup_worker_containers()
+                _reset_handle_keys = []
                 with _registry_lock:
                     for key, existing_t in list(_worker_registry.items()):
                         if (
@@ -6239,6 +6361,13 @@ class Worker(ToolBase):
                             and existing_t is t
                         ):
                             _worker_registry.pop(key, None)
+                            _reset_handle_keys.append(key)
+                # S7a-3: the reset just killed this incarnation, so its handle
+                # goes with the registry entry -- fenced with its own epoch, out
+                # side the registry lock.
+                _unregister_runtime_handles(
+                    _reset_handle_keys, epoch=getattr(t, "_generation", None)
+                )
                 # Delete AFTER the join completes so the thread's run()
                 # finally-block (which re-saves the context) cannot resurrect it.
                 _drop_persisted_files(t)
@@ -6305,10 +6434,18 @@ class Worker(ToolBase):
 
         # ── Found in current session ──
         if not thread.is_alive():
+            _reset_dropped_keys = []
             with _registry_lock:
                 _reset_key = (sid, self.worker_name, iid)
                 if _worker_registry.get(_reset_key) is thread:
                     _worker_registry.pop(_reset_key, None)
+                    _reset_dropped_keys.append(_reset_key)
+            # S7a-3: same identity guard for the handle store -- only the
+            # incarnation that was actually still registered loses its handle,
+            # and the removal is fenced with that incarnation's epoch.
+            _unregister_runtime_handles(
+                _reset_dropped_keys, epoch=getattr(thread, "_generation", None)
+            )
             thread._cleanup_worker_containers()
             _drop_persisted_files(thread)
             return {
