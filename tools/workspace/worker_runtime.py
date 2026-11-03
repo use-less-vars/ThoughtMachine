@@ -25,10 +25,11 @@ call that asked for it, so a second method would be a stub with nothing to do;
 in process mode ``dispatch_query`` waits on the pending future itself (§4.8),
 which is why the socket read loop lives in ``ProcessWorkerRuntime`` and not on
 this object.
-*No ``stop`` / ``pause`` / ``resume`` / ``kill``.* They arrive with the
-``control`` frame in S3 (§10) -- faking them now would ship untested
-behaviour and give the impression that control has crossed the boundary when
-it has not.
+*No verb the frame cannot carry.* The control verbs (``stop`` / ``pause`` /
+``resume`` / ``kill``, plus the ``cancel`` ladder) are on the handle because
+S3 built the ``control`` frame to carry them (§10): each one is a frame in
+``MODE_PROCESS`` and the ``WorkerThread`` method of the same name in
+``MODE_THREAD``, so neither mode is a stub of the other.
 *No ``seq`` / framing state.* The handle owns none: the emitter, the decoder
 and the sequence tracker live in the runtime objects
 (``ProcessWorkerRuntime`` supervisor-side, ``worker_runtime_main``
@@ -208,25 +209,100 @@ class WorkerRuntimeHandle:
             paused_manually=bool(worker._manual_only_pause),
         )
 
-    def cancel(self) -> None:
-        """Interrupt the in-flight turn, leaving the worker alive (§5.1).
+    # ------------------------------------------------------------------
+    # Control plane (§10)
+    # ------------------------------------------------------------------
 
-        S0 delegates to ``detach()``, which is the existing in-process
-        cancellation path: it sets ``_turn_cancel`` and leaves ``_stop_event``
-        clear. The ``reason`` attribution a ``cancel`` frame carries (§4.3)
-        has no consumer until the S3 frame exists, so it is not a parameter
-        here -- adding it now would be an argument the handle silently drops.
+    def stop(self) -> bool:
+        """Park the worker without terminating it (§4.3, §5.1).
 
-        Process mode has no cancel frame until S3 (§10), so it raises instead
-        of detaching a thread that lives in another process.
+        Thread mode: ``WorkerThread.stop`` is an alias for ``detach`` and
+        answers ``None``, so the verdict here is ``True`` -- an in-process call
+        either returned or raised, and a thread that cannot be parked raises
+        rather than declining quietly.
+
+        Process mode: a ``control`` frame, and the verdict is the ack's ``ok``.
+        A refusal is an answer and not an exception -- it says the runtime is
+        alive and declined.
         """
         if self._mode == MODE_PROCESS:
-            raise NotImplementedError(
-                f"{WORKER_RUNTIME_MODE_ENV}={MODE_PROCESS!r} cannot cancel yet: "
-                "the cancel frame lands in stage S3 -- see "
-                "docs/design-worker-runtime-process.md §10."
-            )
+            return self._ensure_process_runtime().stop()
+        self._worker.stop()
+        return True
+
+    def pause(self) -> bool:
+        """Pause the worker's turn loop (§4.3); see :meth:`stop`."""
+        if self._mode == MODE_PROCESS:
+            return self._ensure_process_runtime().pause()
+        self._worker.pause()
+        return True
+
+    def resume(self) -> bool:
+        """Resume a paused worker (§4.3).
+
+        Both modes answer ``bool``, and in both it is the worker's own verdict
+        rather than the transport's: ``WorkerThread.resume`` refuses a killed
+        worker and says so with ``False``, which is exactly what an ``ok=False``
+        ack means on the other side.
+        """
+        if self._mode == MODE_PROCESS:
+            return self._ensure_process_runtime().resume()
+        return bool(self._worker.resume())
+
+    def kill(self) -> bool:
+        """Terminate the worker (§4.3, §5.1) -- the terminating verb.
+
+        Process mode kills the worker first and the runtime process second:
+        ``ProcessWorkerRuntime.kill`` sends the frame while the ack channel is
+        still up and then closes, so the handle drops its reference to a runtime
+        that has already shut itself down -- the same reference :meth:`close`
+        would have dropped.
+        """
+        if self._mode == MODE_PROCESS:
+            runtime = self._ensure_process_runtime()
+            try:
+                return runtime.kill()
+            finally:
+                self._process_runtime = None
+        self._worker.kill()
+        return True
+
+    def detach(self) -> None:
+        """Park the worker, leaving it revivable (§5.1); returns nothing.
+
+        Thread mode calls ``WorkerThread.detach`` directly, which is where the
+        in-process cancellation token is set and the park flags are raised.
+        Process mode has no ``detach`` frame of its own: ``stop`` *is* the
+        detach on both sides (``WorkerThread.stop`` is an alias for it), so the
+        frame is sent and its verdict dropped to keep this method's return value
+        mode-independent.
+        """
+        if self._mode == MODE_PROCESS:
+            self.stop()
+            return
         self._worker.detach()
+
+    def cancel(self) -> str:
+        """Interrupt the in-flight turn, leaving the worker alive (§5.1, §5.4).
+
+        Answers the first rung of the ack ladder, ``"accepted"`` or
+        ``"refused"``, in both modes: refusal is a verdict about the worker
+        ("nothing is running"), so folding it into ``False`` would throw away
+        the half of the answer a caller can act on.
+
+        Thread mode has no ``cancel`` method to call -- ``_turn_cancel`` is
+        already the token every tool consults, so setting it is the whole
+        signal. A thread that is not mid-turn is refused, for the same reason
+        ``worker_runtime_main._handle_cancel`` refuses it: both modes must agree
+        on when there is nothing to cancel.
+        """
+        if self._mode == MODE_PROCESS:
+            return self._ensure_process_runtime().cancel()
+        worker = self._worker
+        if worker.status != "busy":
+            return "refused"
+        worker._turn_cancel.set()
+        return "accepted"
 
     def close(self, *, grace_ms: int = 5000) -> None:
         """Stop the process runtime, if one was ever spawned.

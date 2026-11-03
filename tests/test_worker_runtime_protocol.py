@@ -905,10 +905,27 @@ def test_dispatch_query_delegates_verbatim():
     assert worker.calls[-1] == ("send_query", "hey", 5)
 
 
-def test_cancel_delegates_to_detach():
+def test_cancel_accepted_when_busy():
+    # S3 (§5.1, §5.4): thread mode has no ``cancel`` to call -- the turn token
+    # IS the signal -- and a worker that is mid-turn accepts the request.
     worker = FakeWorker()
-    WorkerRuntimeHandle.spawn(worker, environ={}).cancel()
-    assert worker.calls == [("detach",)]
+    worker.status = "busy"
+    worker._turn_cancel = threading.Event()
+    assert WorkerRuntimeHandle.spawn(worker, environ={}).cancel() == "accepted"
+    assert worker._turn_cancel.is_set() is True
+    # Not a detach: parking the worker is ``stop``'s job, not ``cancel``'s.
+    assert worker.calls == []
+
+
+def test_cancel_refused_when_not_busy():
+    # §5.4: refusal is a verdict about the worker ("nothing is running"), given
+    # for the same reason the child-side handler gives it -- both modes agree.
+    worker = FakeWorker()
+    worker.status = "working"
+    worker._turn_cancel = threading.Event()
+    assert WorkerRuntimeHandle.spawn(worker, environ={}).cancel() == "refused"
+    assert worker._turn_cancel.is_set() is False
+    assert worker.calls == []
 
 
 def test_state_mirrors_the_thread_in_the_worker_state_shape():

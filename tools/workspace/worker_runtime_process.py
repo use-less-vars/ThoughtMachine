@@ -23,7 +23,11 @@ raised, not returned.
 
 What is *not* here
 ------------------
-No control plane (§10, S3), no ``worker_state``/``heartbeat`` frames (§10, S4),
+The supervisor half of the control plane is here (§10): the ``control`` and
+``cancel`` verbs, a per-runtime monotonic ``request_id`` source, and the ack
+routing that lets a verb wait for its own ``control_ack``/``cancel_ack`` while
+the reader keeps draining the socket. There are no ``worker_state``/``heartbeat``
+frames (§10, S4),
 no container adoption (§3.4: the supervisor owns that, not the socket), and no
 retry. A lost runtime is reported once and stays lost until a new
 :class:`ProcessWorkerRuntime` is built, because silently re-spawning a worker
@@ -32,6 +36,7 @@ would discard the conversation state the old process held.
 
 from __future__ import annotations
 
+import itertools
 import json
 import multiprocessing
 import queue
@@ -48,6 +53,10 @@ from tools.workspace.worker_runtime_protocol import (
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
     Bye,
+    Cancel,
+    CancelAck,
+    Control,
+    ControlAck,
     DispatchQuery,
     Fatal,
     FrameDecoder,
@@ -68,6 +77,23 @@ RECV_CHUNK_BYTES = 65536
 #: runtime that cannot greet us is not a runtime, so this is a start failure and
 #: not a retryable condition.
 HELLO_TIMEOUT_SECONDS = 30.0
+
+#: How long a ``control`` verb waits for its ``control_ack`` (§4.4, §10). A
+#: bound rather than an unbounded wait: the caller is a supervisor deciding
+#: whether a worker stopped, and "no answer" has to become an exception it can
+#: act on instead of a thread parked forever behind a wedged runtime.
+ACK_TIMEOUT_SECONDS = 5.0
+
+#: The ``deadline_ms`` a ``cancel`` carries (§4.3). It rides in the frame so the
+#: runtime can honour it; the supervisor's own wait is bounded by
+#: :data:`ACK_TIMEOUT_SECONDS` regardless, because a deadline the far side owns
+#: must never become the near side's timeout.
+CANCEL_DEADLINE_MS = 5000
+
+#: Default ``cancel`` attribution (§4.3): a supervisor asking for a kill, as
+#: opposed to a budget ceiling noticing one. A reason is a diagnostic string and
+#: not control flow -- the runtime acts on the cancel either way.
+CANCEL_REASON_OPERATOR_KILL = "operator_kill"
 
 #: Attribute names :func:`spec_from_worker` copies verbatim from the
 #: ``WorkerThread`` it is handed. Listed as data so the "which attributes cross
@@ -214,6 +240,45 @@ class _Outbox:
 _SENTINEL = object()
 
 
+class _AckSlot:
+    """One outstanding request waiting for one ``*_ack`` frame (§10).
+
+    The event and the frame slot travel together so the reader can close a
+    request with a single ``set()`` and no per-request bookkeeping: whoever is
+    waiting owns the object and the reader only has to find it. ``message`` is
+    written *before* ``event`` is set, so a waiter that wakes always sees the
+    frame that woke it.
+    """
+
+    __slots__ = ("event", "message")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        #: The ack frame, or ``None`` when the stream ended instead (§4.7).
+        self.message: Optional[Any] = None
+
+
+class _RequestIdSource:
+    """Monotonic ``request_id`` source for one runtime (§10).
+
+    One counter per runtime, because a request id is only ever correlated
+    against acks that came back down *this* socket: a process-wide counter would
+    put two runtimes' requests in one namespace for no gain. ``str`` because the
+    frame field is a ``str``, and monotonic rather than a uuid because the value
+    of a request id is that a log line or a stray ack names its place in this
+    runtime's request sequence, not that it is unguessable.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counter = itertools.count(1)
+
+    def next(self) -> str:
+        """Return the next id. Verbs are called from any thread (§11.2)."""
+        with self._lock:
+            return str(next(self._counter))
+
+
 class ProcessWorkerRuntime:
     """The supervisor's handle on one worker runtime running in its own process.
 
@@ -251,6 +316,15 @@ class ProcessWorkerRuntime:
         #: dispatch reached the worker before its reply did.
         self._accepted: set = set()
         self._accepted_events: Dict[str, threading.Event] = {}
+        #: ``request_id -> _AckSlot`` for ``control`` / ``cancel`` requests whose
+        #: first ack has not arrived (§10). Guarded by a lock rather than by the
+        #: GIL-atomic rule ``_pending`` uses, because these entries are *popped*
+        #: by whoever gets there first: a check-then-pop race there would let one
+        #: ack close two waiters, or close the wrong one.
+        self._acks: Dict[str, _AckSlot] = {}
+        self._acks_lock = threading.Lock()
+        #: Monotonic request-id source, one per runtime (§10).
+        self._request_ids = _RequestIdSource()
         self._hello: Optional[Hello] = None
         self._hello_event = threading.Event()
         self._bye_seen = False
@@ -433,6 +507,185 @@ class ProcessWorkerRuntime:
         return json.dumps(envelope)
 
     # ------------------------------------------------------------------
+    # Control plane (§10)
+    # ------------------------------------------------------------------
+
+    def stop(self, *, timeout: float = ACK_TIMEOUT_SECONDS) -> bool:
+        """Detach the worker without terminating it (§4.3).
+
+        Returns the ``control_ack.ok`` the runtime sent. A refusal is an answer
+        and not an exception -- it tells the caller the runtime is alive and
+        declined -- so ``False`` here is information, not a failure.
+        """
+        return self._control("stop", timeout=timeout).ok
+
+    def pause(self, *, timeout: float = ACK_TIMEOUT_SECONDS) -> bool:
+        """Pause the worker's turn loop (§4.3); see :meth:`stop`."""
+        return self._control("pause", timeout=timeout).ok
+
+    def resume(self, *, timeout: float = ACK_TIMEOUT_SECONDS) -> bool:
+        """Resume a paused worker (§4.3); see :meth:`stop`."""
+        return self._control("resume", timeout=timeout).ok
+
+    def kill(self, *, timeout: float = ACK_TIMEOUT_SECONDS) -> bool:
+        """Kill the worker, then the runtime process (§4.3, §10).
+
+        Two halves, in this order: ``control kill`` kills the *worker* while the
+        process -- and therefore the ack channel -- is still up, and
+        :meth:`close` then sends ``shutdown`` and joins the process with the same
+        bounded patience it always had (§3.3).
+
+        The return value is the ack, not a guarantee. An ack that never arrives
+        is tolerated: a runtime that died while handling ``kill`` has already
+        produced the outcome this call exists to produce, and :meth:`close`
+        asserts the process really is gone before returning. A runtime that was
+        already lost *before* the frame was sent still raises
+        :class:`WorkerRuntimeLost` -- nothing was asked of it and the caller
+        deserves to know -- but only after ``close`` has made sure nothing is
+        left running.
+        """
+        acknowledged = False
+        try:
+            acknowledged = bool(self._control("kill", timeout=timeout).ok)
+        except (WorkerRuntimeLost, WorkerQueryTimeout):
+            # "No usable answer from a runtime we are killing anyway." The
+            # forceful half below is what actually makes the promise true, so
+            # this is not swallowed unverified: close() asserts.
+            acknowledged = False
+        finally:
+            self.close()
+        return acknowledged
+
+    def cancel(
+        self,
+        reason: str = CANCEL_REASON_OPERATOR_KILL,
+        deadline_ms: int = CANCEL_DEADLINE_MS,
+        *,
+        timeout: float = ACK_TIMEOUT_SECONDS,
+    ) -> str:
+        """Ask the runtime to interrupt the in-flight turn (§4.3, §5.4).
+
+        Returns the first rung of the ack ladder -- ``"accepted"`` or
+        ``"refused"`` -- rather than a bool, because refusal is a verdict about
+        the worker ("nothing is running") and folding it into ``False`` would
+        throw away the half of the answer the caller can act on.
+
+        Later rungs (``observed`` / ``completed``) arrive with nobody waiting and
+        are dropped by :meth:`_deliver_ack` by design: cancellation here is
+        latest-wins, so making the caller's latency depend on how long the turn
+        takes to notice would be a latency bug wearing a thoroughness costume.
+        """
+        outbox = self._require_sendable("cancel")
+        request_id = self._request_ids.next()
+        slot = self._register_ack(request_id)
+        outbox.put(
+            Cancel(
+                request_id=request_id,
+                reason=str(reason),
+                deadline_ms=int(deadline_ms),
+            )
+        )
+        message = self._await_ack(request_id, slot, timeout, what="cancel")
+        return str(message.phase)
+
+    def _control(
+        self, action: str, *, timeout: float = ACK_TIMEOUT_SECONDS
+    ) -> ControlAck:
+        """Send one ``control`` verb and wait for exactly one ``control_ack``.
+
+        The two failures are kept apart on purpose: a dead stream is
+        :class:`WorkerRuntimeLost` (respawn, do not retry) and a live-but-silent
+        runtime is :class:`WorkerQueryTimeout` (look at the worker, retry, or
+        escalate to :meth:`kill`). Collapsing them would leave the caller unable
+        to tell "there is nothing there" from "there is something there that is
+        not answering".
+        """
+        outbox = self._require_sendable(f"control {action!r}")
+        request_id = self._request_ids.next()
+        slot = self._register_ack(request_id)
+        outbox.put(Control(request_id=request_id, action=action))
+        message = self._await_ack(
+            request_id, slot, timeout, what=f"control {action!r}"
+        )
+        return message
+
+    def _register_ack(self, request_id: str) -> _AckSlot:
+        """Open a slot for *request_id* before the frame is sent (§10).
+
+        Registered first, sent second: the ack can come back on the reader
+        thread the instant the runtime sees the request, and a slot created
+        after the send would miss it and cost the caller a full timeout.
+        """
+        slot = _AckSlot()
+        with self._acks_lock:
+            self._acks[request_id] = slot
+        return slot
+
+    def _await_ack(
+        self,
+        request_id: str,
+        slot: _AckSlot,
+        timeout: float,
+        *,
+        what: str,
+    ) -> Any:
+        """Wait for *slot* to close, or fail with the reason it could not (§10).
+
+        Three ways out, and they are not interchangeable: woken with a frame
+        (the ack), woken without one (the stream ended --
+        :class:`WorkerRuntimeLost` now, not in ``timeout`` seconds), or never
+        woken (a live runtime that did not answer --
+        :class:`WorkerQueryTimeout`).
+        """
+        if slot.message is None and self._lost:
+            with self._acks_lock:
+                self._acks.pop(request_id, None)
+            raise WorkerRuntimeLost(
+                f"the runtime for {self._spec['worker']!r} is gone: {what} "
+                f"{request_id} could not be sent (§4.7)",
+                reply=_terminal_reply(request_id, "runtime_lost"),
+            )
+        if not slot.event.wait(timeout):
+            # Forget the request: a late ack must not close a later one, and
+            # nothing else may wait on this id (§10).
+            with self._acks_lock:
+                self._acks.pop(request_id, None)
+            if self._lost:
+                raise WorkerRuntimeLost(
+                    f"the runtime for {self._spec['worker']!r} is gone: stream "
+                    f"ended while waiting for {what} {request_id} (§4.7)",
+                    reply=_terminal_reply(request_id, "runtime_lost"),
+                )
+            raise WorkerQueryTimeout(
+                f"{what} {request_id} got no ack within {timeout}s (§4.4)",
+                reply=_terminal_reply(request_id, "ack_timeout"),
+            )
+        if slot.message is None:
+            # Woken by _on_eof: the end of the stream closed the slot empty.
+            raise WorkerRuntimeLost(
+                f"the runtime for {self._spec['worker']!r} is gone: stream ended "
+                f"while waiting for {what} {request_id} (§4.7)",
+                reply=_terminal_reply(request_id, "runtime_lost"),
+            )
+        return slot.message
+
+    def _require_sendable(self, what: str) -> _Outbox:
+        """The outbox, or :class:`WorkerRuntimeLost` if there is nobody to ask."""
+        if self._lost:
+            raise WorkerRuntimeLost(
+                f"the runtime for {self._spec['worker']!r} is gone: cannot send "
+                f"{what} (§4.7)",
+                reply=_terminal_reply("", "runtime_lost"),
+            )
+        if self._outbox is None:
+            raise WorkerRuntimeLost(
+                f"the runtime for {self._spec['worker']!r} was never started "
+                "(§3.3)",
+                reply=_terminal_reply("", "not_started"),
+            )
+        return self._outbox
+
+    # ------------------------------------------------------------------
     # Observation
     # ------------------------------------------------------------------
 
@@ -525,14 +778,38 @@ class ProcessWorkerRuntime:
         if kind == Fatal.KIND:
             self._fatal = Fatal.from_frame(frame)
             return
-        # Anything else (event / heartbeat / worker_state / cancel_ack /
-        # control_ack) belongs to a later stage (§10, S3/S4). The decoder
-        # already owns the "malformed stream" refusal (§4.5), so an unexpected
-        # *valid* frame is a scope fact, not a protocol error: log it and go on.
+        if kind == ControlAck.KIND:
+            self._deliver_ack(ControlAck.from_frame(frame))
+            return
+        if kind == CancelAck.KIND:
+            self._deliver_ack(CancelAck.from_frame(frame))
+            return
+        # Anything else (event / heartbeat / worker_state) belongs to a later
+        # stage (§10, S4). The decoder already owns the "malformed stream"
+        # refusal (§4.5), so an unexpected *valid* frame is a scope fact, not a
+        # protocol error: log it and go on.
         print(
             f"worker_runtime_process: ignoring {kind} frame (not in S2 scope)",
             file=sys.stderr,
         )
+
+    def _deliver_ack(self, message: Any) -> None:
+        """Close the request *message* answers, if anyone is still waiting (§10).
+
+        Runs on the reader thread, so it never blocks and never sleeps: a control
+        verb that has not been called yet must not cost the stream a single
+        ``recv``. An unknown id is dropped **silently** on purpose -- the later
+        rungs of the cancel ladder (``observed`` / ``completed``) arrive after
+        their first rung already closed the slot, and a duplicate ack is a
+        runtime bug the caller cannot act on, so there is nothing truthful to
+        raise and nothing useful to say.
+        """
+        with self._acks_lock:
+            slot = self._acks.pop(message.request_id, None)
+        if slot is None:
+            return
+        slot.message = message
+        slot.event.set()
 
     def _on_eof(self) -> None:
         """Fail every still-pending query with a terminal ``reply`` (§4.7)."""
@@ -541,6 +818,15 @@ class ProcessWorkerRuntime:
             if not future.done():
                 future.set_result(_terminal_reply(query_id, "runtime_lost"))
         self._pending.clear()
+        # A control verb waiting on an ack must fail now rather than wait out
+        # its timeout: the ack can never arrive on a dead stream. The slot is
+        # closed *empty*, which is how ``_await_ack`` tells "woken with no
+        # frame" (lost) from "never woken" (slow).
+        with self._acks_lock:
+            orphans = list(self._acks.values())
+            self._acks.clear()
+        for slot in orphans:
+            slot.event.set()
 
 
 def _terminal_reply(query_id: str, status: str) -> Reply:

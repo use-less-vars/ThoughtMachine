@@ -48,6 +48,10 @@ from tools.workspace.worker_runtime_protocol import (
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
     Bye,
+    Cancel,
+    CancelAck,
+    Control,
+    ControlAck,
     DispatchQuery,
     Fatal,
     FrameDecoder,
@@ -191,6 +195,9 @@ def worker_runtime_main(
         while True:
             chunk = sock.recv(RECV_CHUNK_BYTES)
             if not chunk:
+                # Link loss, not an orderly stop (§4.3): the supervisor is
+                # gone, so nothing else will ever stop this worker.
+                _kill_on_link_loss(worker)
                 break
             for frame in decoder.feed(chunk):
                 kind = frame["kind"]
@@ -214,6 +221,14 @@ def worker_runtime_main(
                     outbox.put(Bye())
                     outbox.drain(SHUTDOWN_DRAIN_SECONDS)
                     return 0
+                elif kind == Control.KIND:
+                    _handle_control(
+                        worker, outbox, Control.from_frame(frame)
+                    )
+                elif kind == Cancel.KIND:
+                    _handle_cancel(
+                        worker, outbox, Cancel.from_frame(frame)
+                    )
                 elif kind == Ping.KIND:
                     # Liveness probe only: S2 has nothing to answer it with,
                     # and the frame's whole purpose is "the socket is silent
@@ -250,6 +265,99 @@ def worker_runtime_main(
             sock.close()
         except OSError:
             pass
+
+
+#: ``Control`` action -> the ``WorkerThread`` verb that carries it out
+#: (§4.3). ``resume`` answers a bool; the other three return ``None``.
+_CONTROL_VERBS = {
+    "stop": "stop",
+    "pause": "pause",
+    "resume": "resume",
+    "kill": "kill",
+}
+
+
+def _worker_status(worker: Any) -> str:
+    """The worker's own status string, or ``""`` when it has none."""
+    return str(getattr(worker, "status", "") or "")
+
+
+def _handle_control(worker: Any, outbox: _Outbox, message: Control) -> None:
+    """Run one ``control`` verb and answer exactly one ``control_ack``.
+
+    Never raises: an unknown action and a verb that throws are both answered
+    ``ok=False`` so the supervisor's ladder still closes, and the reader loop
+    survives either (§11.2 rule 1).
+    """
+    verb = _CONTROL_VERBS.get(message.action)
+    if verb is None:
+        outbox.put(
+            ControlAck(
+                request_id=message.request_id,
+                action=message.action,
+                ok=False,
+                status=f"unknown action {message.action!r}"[:200],
+            )
+        )
+        return
+    try:
+        result = getattr(worker, verb)()
+    except Exception as exc:  # noqa: BLE001 - answered, never swallowed
+        outbox.put(
+            ControlAck(
+                request_id=message.request_id,
+                action=message.action,
+                ok=False,
+                status=f"{type(exc).__name__}: {exc}"[:200],
+            )
+        )
+        return
+    outbox.put(
+        ControlAck(
+            request_id=message.request_id,
+            action=message.action,
+            ok=True if result is None else bool(result),
+            status=_worker_status(worker),
+        )
+    )
+
+
+def _handle_cancel(worker: Any, outbox: _Outbox, message: Cancel) -> None:
+    """Answer the first rung of the cancel ladder without waiting (§5.4).
+
+    The ack is queued and the reader returns -- nothing here sleeps, joins or
+    waits on the worker. A worker that is demonstrably not mid-turn has
+    nothing to cancel, so it is ``refused``; otherwise the thread's own
+    ``_turn_cancel`` event is set (closing/latest-wins: it is an event, not a
+    queue) and it is ``accepted``.
+
+    Only this first rung is emitted in stage S3: the later ``observed`` and
+    ``completed`` rungs of the same ladder (§5.4) are not implemented yet, so
+    no request id is remembered and no turn-completion path closes them.
+    """
+    if _worker_status(worker) != "busy":
+        outbox.put(CancelAck(request_id=message.request_id, phase="refused"))
+        return
+    try:
+        worker._turn_cancel.set()
+    except Exception:  # noqa: BLE001 - refused is still an honest answer
+        outbox.put(CancelAck(request_id=message.request_id, phase="refused"))
+        return
+    outbox.put(CancelAck(request_id=message.request_id, phase="accepted"))
+
+
+def _kill_on_link_loss(worker: Any) -> None:
+    """Kill the worker when the supervisor's socket dies (§4.3).
+
+    EOF means nobody is left to stop it, so a live child would be orphaned.
+    Idempotent by the worker's own contract: ``kill`` on a stopped or already
+    killed thread is a no-op, and any failure here is dropped because the
+    link that would report it is gone.
+    """
+    try:
+        worker.kill()
+    except Exception:  # noqa: BLE001 - the link is already gone
+        pass
 
 
 def pump_query(
