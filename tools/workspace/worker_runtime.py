@@ -529,9 +529,11 @@ class WorkerRuntimeHandle:
         Never raises, does no I/O, takes no lock and calls nothing back into
         the worker: this runs on the socket read loop, and a frame that
         surprises us must not be able to take the transport down.
-        ``Heartbeat`` has no producer yet -- nothing emits one -- so that
-        branch is the cache doing the right thing in advance. ``Event`` is the
-        one kind with a producer today (S4b): the child forwards every event it
+        ``Heartbeat`` has a producer as of S6b: the child side installs an
+        outbox-backed sink in ``worker_runtime_main``, so process mode emits one
+        on every ``_heartbeat_tick`` and this branch is what keeps
+        ``heartbeat_age_seconds`` answerable. ``Event`` is the
+        other kind with a producer today (S4b): the child forwards every event it
         publishes, so this branch is where a forwarder reads one without
         touching the socket.
         """

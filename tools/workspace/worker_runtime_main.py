@@ -294,6 +294,15 @@ def worker_runtime_main(
                 epoch=epoch,
             ),
         )
+        # S6b: the child side of the frame seam. ``worker_thread._heartbeat_tick``
+        # already emits a ``Heartbeat`` (S5), but ``_emit_frame`` no-ops while
+        # ``_frame_sink`` is None -- and nothing in this process ever installed
+        # one, so a process-mode worker never put a heartbeat on the wire and the
+        # supervisor's ``on_frame`` cache stayed empty. The outbox is this
+        # process's only writer, so the sink is one ``put``: the fence is stamped
+        # by the emitter, ``seq`` keeps its single owner (\u00a74.6), and ``put``
+        # never blocks, so a tick never waits on the socket.
+        worker._frame_sink = outbox.put
         _subscribe_child_events(worker, outbox)
         worker.start()
         outbox.put(
