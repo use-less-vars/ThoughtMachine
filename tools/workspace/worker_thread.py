@@ -5081,6 +5081,13 @@ class Worker(ToolBase):
             except Exception:
                 container_manager = None
 
+        # Spawn-time snapshot semantics must be enforced by COPY: passing the
+        # supervisor's object by reference would leave every worker of a
+        # session sharing ONE mutable permissions dict.
+        _spawn_permissions = self.effective_permissions or self.session_permissions
+        if _spawn_permissions is not None:
+            _spawn_permissions = dict(_spawn_permissions)
+
         # Create and start the worker thread
         thread = WorkerThread(
             name=self.worker_name,
@@ -5088,7 +5095,7 @@ class Worker(ToolBase):
             agent_config=agent_config,
             workspace_dir=ws_dir,
             tool_classes=tool_classes if tool_classes else None,
-            session_permissions=self.effective_permissions or self.session_permissions,
+            session_permissions=_spawn_permissions,
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
@@ -5112,13 +5119,16 @@ class Worker(ToolBase):
 
         attach_thread_frame_sink(thread)
 
-        # Store initial context for the thread to pick up in run()
+        # Store initial context for the thread to pick up in run().  This is a
+        # COPY, not an alias: the caller may reuse one context dict across
+        # several spawns, so aliasing it and then mutating it in place would
+        # cross-contaminate workers and mutate caller-owned state.
         if self.context is not None and isinstance(self.context, dict):
-            thread._initial_context = self.context
+            thread._initial_context = dict(self.context)
         else:
             thread._initial_context = {}
 
-        # Merge purpose, style, meta into initial context
+        # Merge purpose, style, meta into the COPY (never into self.context)
         if self.purpose is not None:
             thread._initial_context["purpose"] = self.purpose
         if self.style is not None:
