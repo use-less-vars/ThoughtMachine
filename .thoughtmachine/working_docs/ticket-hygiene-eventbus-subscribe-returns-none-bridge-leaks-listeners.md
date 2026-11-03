@@ -1,8 +1,10 @@
 # Ticket: hygiene/eventbus-subscribe-returns-none-bridge-leaks-listeners
 
-**Status:** **recorded, NOT fixed** — out of scope of `fix/worker-panel-payload-drop`. Nothing in this document is code that exists; it is a defect description plus options.
+**Status:** **FIXED** by `1e405615` on `fix/recording-forwarder-leak`.
+**Status as filed (preserved for history):** **recorded, NOT fixed** — out of scope of `fix/worker-panel-payload-drop`. Nothing in this document is code that exists; it is a defect description plus options.
 **Filed:** 2026-10-22, surfaced while writing the payload-drop fix (see `ticket-bug-worker-panel-intermittent-missing-tool-calls.md:97`, where it was first recorded as a bullet). Line numbers read from the working tree of `ThoughtMachine-dev` at the time of writing.
 **Severity:** LOW for correctness today, MEDIUM for longevity — the leak is bounded per bridge instance and every leaked handler is session-guarded, so it does not corrupt the panel. It becomes load-bearing if the session guard is ever removed, or on a long-lived server where each reconnect adds another permanent subscriber set to a process-global bus.
+*Severity left as filed — not revised when the fix landed.*
 **Fix type:** hygiene / resource lifetime. No data loss, no user-visible symptom, no test asserts on it.
 
 ## The defect
@@ -108,3 +110,26 @@ print(len(seen))                                # 2 — still subscribed; nothin
 - `agent/events.py:471-485` — the publish loop's copy-then-invoke-under-no-lock shape, and the per-subscriber `try/except` with a log. Both are the reason a raising subscriber loses only its own events; tightening it to propagate would turn one bad subscriber into a global outage.
 - `agent/events.py:492-507` — `unsubscribe`'s idempotent, silent `ValueError` handling. Callers rely on double-unsubscribe being safe.
 - `tests/test_worker_bus_respawn_bridge.py:45-56` — do not weaken the per-test `session_id` while this defect exists; it is the only thing keeping the leaked listeners inert across tests in one process.
+
+## Resolution (2026-10-25)
+
+- **Implemented:** Option 2 — pair stored at the call site. No producer-side (bus) change. Options above left unedited and unrenumbered; this section records the outcome only.
+- **`agent/events.py`: NOT modified.** `subscribe` / `publish` / `unsubscribe` semantics unchanged; `subscribe()` still returns `None`.
+- **Changed file: `web_ui/backend/bridge.py` only.**
+  - New module-level helper `_subscribe_global(event_type, callback)` — subscribes on `global_event_bus` and returns the `(event_type, callback)` pair; its docstring carries the why plus a citation to this ticket.
+  - All eight subscription sites now store that pair: `_security_subscription` (in `_subscribe_to_security_events`) and the seven `_worker_*_sub` attributes (in `_subscribe_to_worker_events`).
+  - `_unsubscribe_security_events` / `_unsubscribe_worker_events` unpack the pair and detach with the two-argument `global_event_bus.unsubscribe(event_type, callback)`, behind the existing `hasattr(...)` guard, then set the attribute to `None`.
+  - `is not None` guards kept → "never subscribed" (event system unavailable, `EVENT_SYSTEM_AVAILABLE` false) still skips quietly.
+  - `_unsubscribe_worker_bus` and all per-worker bus teardown untouched — per-worker buses were never affected.
+- **New test file:** `tests/test_event_bus_subscription_leak.py`. No pre-existing test modified.
+  - **(A) `test_leaked_bridge_is_detached_on_close`** — bridge whose `_forwarder` is swapped for a double exposing `broadcast` but no `_callbacks`; `stop()` it, then publish `WORKER_SPAWNED` and assert `agent.events.log` records no `Error in event subscriber`. (`caplog` cannot see this: `agent/events.py` does `from agent.logging import log`, so the module-level binding is monkeypatched instead.)
+  - **(B) `test_stored_subscription_is_usable_to_detach`** — behaviour-only: the stored `_worker_spawned_sub` is a 2-tuple whose `unsubscribe(event_type, callback)` actually removes `_on_worker_spawned` from `global_event_bus._subscribers[WORKER_SPAWNED]`.
+  - **(C) `test_bridge_stores_a_non_none_subscription_for_every_global_sub`** — all eight attributes non-`None` after construction.
+  - Fixture `clean_global_bus` snapshots / clears / restores `_subscribers` and `_wildcard_subscribers` under `_lock`, so a failing run cannot poison the rest of the session.
+- **RED (pre-fix): `3 failed`.** A → `Error in event subscriber for EventType.WORKER_SPAWNED: '_ForwarderWithoutCallbacks' object has no attribute '_callbacks'`; B → stored value is `None`, not a pair; C → all eight attributes `None`.
+- **GREEN (post-fix):** new file alone `3 passed`; with `tests/test_bridge_stop_semantics.py` + `tests/test_per_worker_eventbus_bridge.py` `11 passed`; adding `tests/test_worker_bus_respawn_bridge.py` `14 passed`.
+- **Mutation check:** re-monkeypatching `_unsubscribe_worker_events` to the old one-argument `unsubscribe(sub)` turns A red again (`1 failed, 2 passed`) → A passes because the leak is closed, not because the assertion was weakened. A and C are byte-identical to their RED versions; only B was relaxed, because its original form pinned `subscribe() is not None`, which Option 2 deliberately does not provide.
+- **One-argument `unsubscribe` is a *silent no-op* — this is why Option 1 alone would have been insufficient.** `unsubscribe(self, event_type=None, callback=None)` binds the bare callback to `event_type` with `callback=None`, lands in the wildcard branch, `remove(None)` raises `ValueError`, and that is swallowed: no exception, no log, nothing detached. Verified empirically — patching only `subscribe` to `return callback` left C and B green but **A still red**. So a `subscribe()`-returns-a-handle fix must be accompanied by a call-site change (two-argument detach, or an `unsubscribe(handle)` overload) before a single listener actually comes off the bus.
+- **Full-suite verification:** `python -m pytest tests -m "not docker and not e2e"` → `5823 passed, 64 skipped, 3 deselected, 12 subtests passed in 498.36s`; original victim file `tests/test_worker_lifecycle_routes.py` → `19 passed`.
+- **Implementation shape vs Option 2's sketch:** the eight named attributes are kept, each holding its own `(event_type, callback)` pair filled by `_subscribe_global`; Option 2's illustrative single `self._global_subs` list was **not** introduced. Teardown keeps iterating the existing `worker_subs` attribute list, so nothing outside `bridge.py` and no other call site changed.
+
