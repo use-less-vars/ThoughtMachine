@@ -13,7 +13,8 @@ four claims that turn the seam on:
   nothing when it is not (the gate, not ``_emit_frame``'s own ``None`` check);
 * the spawn site wires the sink BEFORE ``thread.start()`` -- the window the
   S4b2 test proves matters, and the one thing a future refactor can silently
-  drop.
+  drop (pinned behaviourally: the real ``_action_spawn`` runs, and the fake
+  thread snapshots its own ``_frame_sink`` inside ``start()``).
 
 Harness style follows ``test_worker_runtime_child_events_consumer.py``: real
 objects where they are cheap, duck-typed fakes where they are not, no sleeps.
@@ -21,11 +22,13 @@ objects where they are cheap, duck-typed fakes where they are not, no sleeps.
 
 from __future__ import annotations
 
-import inspect
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, List
 
+import tools.workspace.worker as worker_module
+import tools.workspace.worker_thread as worker_thread_module
+from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
     MODE_THREAD,
     WorkerRuntimeHandle,
@@ -176,26 +179,99 @@ def test_status_write_emits_worker_state_only_with_a_sink(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_spawn_site_attaches_the_sink_before_starting_the_thread():
-    """S5-A: the sink is installed in the spawn window, before ``thread.start()``.
+class _FakeThread:
+    """Stands in for ``WorkerThread``: records its ctor kwargs, never runs.
 
-    Asserts the two anchors and their order, nothing else -- a refactor may move
-    or rename everything around them, but a sink installed after the thread is
-    running loses the first turn's status write and heartbeat.
+    The real attributes are set because ``_action_spawn`` reads them back
+    (``instance_id``/``instance_label`` in the envelope and the registry key,
+    ``_initial_context`` for the auto-query branch). ``start()`` is where the
+    observation happens -- see the test below.
     """
-    source = inspect.getsource(Worker._action_spawn)
-    # Comment lines are dropped first: an anchor mentioned in prose (including
-    # the "attach before thread.start()" comment itself) is not a call.
-    code = "\n".join(
-        line for line in source.splitlines() if not line.lstrip().startswith("#")
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.ctor_kwargs = kwargs
+        self.name = kwargs["name"]
+        self.instance_id = kwargs["instance_id"]
+        self.instance_label = WorkerRegistry.instance_label(
+            kwargs["name"], kwargs["instance_id"]
+        )
+        self.status = "ready"
+        self._timeout_seconds = kwargs.get("timeout_seconds") or 30
+        self.session_id = kwargs.get("session_id")
+        self.workspace_id = kwargs.get("workspace_id")
+        self._initial_context: dict = {}
+        self.started = False
+        self.sink_at_start: Any = None
+
+    def start(self) -> None:
+        # Snapshot taken INSIDE start(), i.e. at the instant the real thread
+        # would begin emitting: this is the ordering proof, not a source scan.
+        self.sink_at_start = getattr(self, "_frame_sink", None)
+        self.started = True
+
+
+def test_spawn_site_attaches_the_sink_before_starting_the_thread(tmp_path, monkeypatch):
+    """S5-A: the REAL spawn path installs the sink before ``thread.start()``.
+
+    Behavioural, not textual: ``Worker._action_spawn`` runs end to end against a
+    fake thread class, and the real ``attach_thread_frame_sink`` is allowed to
+    run (it only assigns two attributes, so it works on any object). If the
+    attach call is deleted from the spawn site, ``sink_at_start`` is ``None``
+    and this test goes red.
+    """
+    # Unique per test: the registry is a process-wide singleton, so an id no
+    # other test uses keeps the spawn-cap / continue-existing routing out of it.
+    session_id = f"sess-sink-spawn-{abs(hash(str(tmp_path)))}"
+    created: List[_FakeThread] = []
+
+    def _factory(**kwargs: Any) -> _FakeThread:
+        fake = _FakeThread(**kwargs)
+        created.append(fake)
+        return fake
+
+    # Patch 1: the thread class. ``_action_spawn`` does a function-local
+    # ``from tools.workspace.worker import ... WorkerThread``, so the attribute
+    # to patch is on THAT module. Nothing is started: ``start()`` is ours.
+    monkeypatch.setattr(worker_module, "WorkerThread", _factory)
+    # Patch 2: workspace resolution. The spawn path needs a real directory (it
+    # reads ``<ws>/config.json`` and tolerates only FileNotFoundError/OSError),
+    # and ``_resolve_ws_dir`` short-circuits when capabilities are unavailable.
+    monkeypatch.setattr(worker_module, "_workspace_dir", lambda ws_id: tmp_path)
+    monkeypatch.setattr(worker_thread_module, "CAPABILITIES_AVAILABLE", True)
+    # Patch 3: no ContainerManager. Constructing one probes docker; the spawn
+    # site only needs it to be ``None`` (its own try/except would swallow the
+    # failure, but not the cost).
+    monkeypatch.setattr(worker_thread_module, "_CM", None)
+
+    tool = Worker(
+        action="spawn",
+        worker_name=WORKER,
+        session_id=session_id,
+        workspace_path=str(tmp_path),
+        agent_config={"provider": "openai", "model": "gpt-4"},
     )
 
-    attach_at = code.find("attach_thread_frame_sink(thread)")
-    start_at = code.find("thread.start()")
+    key = (session_id, WORKER, 1)
+    try:
+        # A real ws_id is required: with ``None`` the path returns early at
+        # "no workspace directory resolved" and never reaches the ctor.
+        result = tool._action_spawn([{"name": WORKER, "status": "ready"}], "ws-sink-test")
+        (fake,) = created
 
-    assert attach_at != -1, "the spawn site never attaches a frame sink"
-    assert start_at != -1, "the spawn site no longer starts a thread"
-    assert attach_at < start_at, (
-        "the frame sink must be attached BEFORE thread.start(), or the first "
-        "turn's worker_state/heartbeat frames are lost"
-    )
+        assert fake.started, "the spawn site never started the thread"
+        # 1. Ordering + live wiring: the sink was already installed when
+        #    start() ran. Delete the attach call and this is None.
+        assert fake.sink_at_start is not None, (
+            "the frame sink must be attached BEFORE thread.start(), or the "
+            "first turn's worker_state/heartbeat frames are lost"
+        )
+        # 2. It is the handle's ``on_frame``. ``==`` not ``is``: each attribute
+        #    access on a bound method builds a new object.
+        assert fake._frame_sink == fake._runtime_handle.on_frame
+        # 3. The spawn reported success and the registry holds THIS thread.
+        assert result["spawned"] is True
+        assert result["worker_name"] == WORKER
+        assert result["instance_id"] == 1
+        assert worker_module._worker_registry[(session_id, WORKER, 1)] is fake
+    finally:
+        worker_module._worker_registry.pop(key, None)
