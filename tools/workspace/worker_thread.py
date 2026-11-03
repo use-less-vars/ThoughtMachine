@@ -1007,6 +1007,11 @@ class WorkerThread(threading.Thread):
         self._container_manager: Optional[Any] = container_manager
         self._worker_dir = workspace_dir / "workers" / instance_label
         self._worker_dir.mkdir(parents=True, exist_ok=True)
+        # The workspace root under its own name (as passed, not re-derived by
+        # walking back out of ``workers/<label>/``): process mode rebuilds this
+        # worker in a child interpreter from ``spec_from_worker``, which reads
+        # ``workspace_dir`` off the object (§3.3).
+        self.workspace_dir: Path = workspace_dir
 
         # F2: generation token — a monotonic per-worker counter that guards
         # context.json against stale-thread overwrites after a force-spawn

@@ -45,6 +45,7 @@ from tools.workspace.worker_runtime_protocol import (
     FrameEmitter,
     Shutdown,
 )
+from tools.workspace.worker_thread import WorkerThread
 
 mp = multiprocessing.get_context("spawn")
 
@@ -410,3 +411,33 @@ def test_spec_from_worker_refuses_a_worker_it_cannot_rebuild():
             )
         )
 
+def test_spec_from_worker_accepts_a_real_worker_thread(tmp_path):
+    """§3.3: the contract is a real ``WorkerThread``, not a stub that fits.
+
+    ``workspace_dir`` is the one attribute the thread used to hold only in its
+    derived form (``workers/<label>/``), so ``spec_from_worker`` refused every
+    production worker while the stub-based tests above stayed green -- a stub
+    can carry any attribute, and only the real object can be missing one. The
+    worker here is the real thing, built the cheapest way ``__init__`` allows:
+    it lays down ``workers/<label>/`` and never starts the thread.
+    """
+    worker = WorkerThread(
+        name="probe-w",
+        definition={},
+        agent_config={"provider": "openai", "model": "gpt-4"},
+        workspace_dir=tmp_path,
+        session_permissions={},
+        instance_id=1,
+    )
+
+    spec = spec_from_worker(worker)
+
+    # The canonical root as constructed -- not one re-derived from
+    # ``_worker_dir``, which would hand the child ``<root>/workers/probe-w``
+    # and nest a second ``workers/`` tree inside the first.
+    assert worker.workspace_dir == tmp_path
+    assert spec["worker_kwargs"]["workspace_dir"] == str(worker.workspace_dir)
+    assert spec["worker_kwargs"]["workspace_dir"] == str(tmp_path)
+    assert isinstance(spec["worker_kwargs"]["workspace_dir"], str)
+    assert spec["worker"] == "probe-w"
+    assert spec["instance"] == 1
