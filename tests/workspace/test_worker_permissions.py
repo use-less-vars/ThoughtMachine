@@ -22,6 +22,7 @@ Key behavioural change (2025-04):
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -241,10 +242,16 @@ def _mock_agent_config():
 
 
 def make_worker_thread(
+    workspace_dir: Path,
     definition: dict,
     session_permissions: dict | None = None,
 ) -> WorkerThread:
-    """Create a WorkerThread with minimal required params for testing."""
+    """Create a WorkerThread against a real, per-test worker directory.
+
+    ``WorkerThread.__init__`` allocates the generation sidecar on real disk, so
+    the worker dir must be a real path (the test's own ``tmp_path``).  These
+    tests only assert on the permission merge built after that point.
+    """
     return WorkerThread(
         name="test-worker",
         definition=definition,
@@ -252,7 +259,7 @@ def make_worker_thread(
             "provider": "test-provider",
             "model": "test-model",
         },
-        workspace_dir=MagicMock(),
+        workspace_dir=workspace_dir,
         session_permissions=session_permissions or {},
         project_root="/tmp",
     )
@@ -261,7 +268,7 @@ def make_worker_thread(
 class TestWorkerPermissionsMergeIntegration:
     """Integration tests via _build_agent_config."""
 
-    def test_session_ceiling_enforced(self, _mock_agent_config):
+    def test_session_ceiling_enforced(self, tmp_path, _mock_agent_config):
         """Session False denies even if worker requests True.
 
         Canonical category the session does not expose (network) is filled
@@ -277,7 +284,7 @@ class TestWorkerPermissionsMergeIntegration:
                 "execution": "full",
             },
         }
-        wt = make_worker_thread(definition, session_perms)
+        wt = make_worker_thread(tmp_path, definition, session_perms)
 
         with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
             wt._build_agent_config()
@@ -292,14 +299,14 @@ class TestWorkerPermissionsMergeIntegration:
         }, f"Expected container=False (ceiling), got {merged}"
         assert "execution" not in merged
 
-    def test_worker_can_strengthen(self, _mock_agent_config):
+    def test_worker_can_strengthen(self, tmp_path, _mock_agent_config):
         """Worker can make a permission stricter than the session."""
         session_perms = {"container": True, "filesystem": "write", "git": "write"}
         definition = {
             "name": "test-worker",
             "permission_footprint": {"filesystem": "read", "execution": "deny"},
         }
-        wt = make_worker_thread(definition, session_perms)
+        wt = make_worker_thread(tmp_path, definition, session_perms)
 
         with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
             wt._build_agent_config()
@@ -313,14 +320,14 @@ class TestWorkerPermissionsMergeIntegration:
         }, f"Expected filesystem=read (worker stricter), got {merged}"
         assert "execution" not in merged
 
-    def test_backward_compat_worker_permissions_key(self, _mock_agent_config):
+    def test_backward_compat_worker_permissions_key(self, tmp_path, _mock_agent_config):
         """'worker_permissions' key (backward compat) is used when 'permission_footprint' not present."""
         session_perms = {"container": False, "filesystem": "read"}
         definition = {
             "name": "test-worker",
             "worker_permissions": {"filesystem": "none", "execution": "deny"},
         }
-        wt = make_worker_thread(definition, session_perms)
+        wt = make_worker_thread(tmp_path, definition, session_perms)
 
         with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
             wt._build_agent_config()
@@ -333,11 +340,11 @@ class TestWorkerPermissionsMergeIntegration:
         }, f"Expected filesystem=none (worker stricter), got {merged}"
         assert "execution" not in merged
 
-    def test_no_permission_footprint(self, _mock_agent_config):
+    def test_no_permission_footprint(self, tmp_path, _mock_agent_config):
         """When worker has neither permission_footprint nor worker_permissions, session permissions pass through unchanged."""
         session_perms = {"container": False, "filesystem": "read"}
         definition = {"name": "test-worker"}
-        wt = make_worker_thread(definition, session_perms)
+        wt = make_worker_thread(tmp_path, definition, session_perms)
 
         with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
             wt._build_agent_config()
@@ -349,7 +356,7 @@ class TestWorkerPermissionsMergeIntegration:
             "filesystem": "read",
         }, f"Expected unchanged session permissions, got {merged}"
 
-    def test_worker_cannot_fill_gap(self, _mock_agent_config):
+    def test_worker_cannot_fill_gap(self, tmp_path, _mock_agent_config):
         """Worker requesting a category not in session permissions is fail-closed.
 
         A canonical category (network) absent from the session resolves to its
@@ -361,7 +368,7 @@ class TestWorkerPermissionsMergeIntegration:
             "name": "test-worker",
             "permission_footprint": {"network": "write", "execution": "allow"},
         }
-        wt = make_worker_thread(definition, session_perms)
+        wt = make_worker_thread(tmp_path, definition, session_perms)
 
         with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
             wt._build_agent_config()
@@ -374,10 +381,10 @@ class TestWorkerPermissionsMergeIntegration:
         }, f"Expected network to fall back to safe default, got {merged}"
         assert "execution" not in merged
 
-    def test_default_tool_set(self, _mock_agent_config):
+    def test_default_tool_set(self, tmp_path, _mock_agent_config):
         """When definition has no 'tools', enabled_tools = SIMPLIFIED_TOOL_CLASSES minus blocklist."""
         definition = {"name": "test-worker"}
-        wt = make_worker_thread(definition)
+        wt = make_worker_thread(tmp_path, definition)
 
         with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
             wt._build_agent_config()
@@ -393,10 +400,10 @@ class TestWorkerPermissionsMergeIntegration:
             f"got {set(enabled) ^ set(expected)} difference"
         )
 
-    def test_default_system_prompt(self, _mock_agent_config):
+    def test_default_system_prompt(self, tmp_path, _mock_agent_config):
         """When definition has no system_prompt, DEFAULT_WORKER_SYSTEM_PROMPT is used."""
         definition = {"name": "test-worker"}
-        wt = make_worker_thread(definition)
+        wt = make_worker_thread(tmp_path, definition)
 
         with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
             wt._build_agent_config()
