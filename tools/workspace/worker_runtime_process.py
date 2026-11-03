@@ -1,0 +1,558 @@
+# tools/workspace/worker_runtime_process.py
+"""Supervisor half of the worker-runtime split -- stage S2 (§3.3, §4.8).
+
+What this is
+------------
+One :class:`ProcessWorkerRuntime` per worker *instance* (D1): an ``spawn``-ed
+OS process running :func:`tools.workspace.worker_runtime_main.worker_runtime_main`,
+an ``AF_UNIX`` socketpair between the two (§4.1), one :class:`FrameEmitter` and
+one :class:`FrameDecoder` **per direction** (§4.2), and a ``pending`` map from
+``query_id`` to a :class:`concurrent.futures.Future` (§4.8).
+
+Why the return type does not change
+-----------------------------------
+``dispatch_query`` returns ``str`` in both modes, exactly as the S0 thread-mode
+handle does, and a failure is an **exception that carries the terminal
+``Reply``** (:class:`WorkerRuntimeLost`, :class:`WorkerQueryTimeout`). The
+tempting alternative -- return the envelope when the reply says ``ok=False`` --
+would make the return type mode-dependent and let a caller read a failure
+envelope as if it were a response; the caller that wanted the details can read
+``exc.reply`` and lose nothing, and the caller that did not keeps working
+unchanged. That is the same rule the thread path already follows: trouble is
+raised, not returned.
+
+What is *not* here
+------------------
+No control plane (§10, S3), no ``worker_state``/``heartbeat`` frames (§10, S4),
+no container adoption (§3.4: the supervisor owns that, not the socket), and no
+retry. A lost runtime is reported once and stays lost until a new
+:class:`ProcessWorkerRuntime` is built, because silently re-spawning a worker
+would discard the conversation state the old process held.
+"""
+
+from __future__ import annotations
+
+import json
+import multiprocessing
+import queue
+import socket
+import sys
+import threading
+import time
+import uuid
+from concurrent import futures
+from typing import Any, Callable, Dict, Optional
+
+from tools.workspace.worker_runtime_main import worker_runtime_main
+from tools.workspace.worker_runtime_protocol import (
+    DIRECTION_FROM_RUNTIME,
+    DIRECTION_TO_RUNTIME,
+    Bye,
+    DispatchQuery,
+    Fatal,
+    FrameDecoder,
+    FrameEmitter,
+    Hello,
+    QueryAccepted,
+    Reply,
+    Shutdown,
+    WorkerRuntimeProtocolError,
+    encode_frame,
+)
+
+#: One ``recv`` inside the reader thread; the decoder reassembles frames
+#: regardless of how the bytes are chunked (§4.2).
+RECV_CHUNK_BYTES = 65536
+
+#: How long :meth:`ProcessWorkerRuntime.start` waits for ``hello`` (§4.4). A
+#: runtime that cannot greet us is not a runtime, so this is a start failure and
+#: not a retryable condition.
+HELLO_TIMEOUT_SECONDS = 30.0
+
+#: Attribute names :func:`spec_from_worker` copies verbatim from the
+#: ``WorkerThread`` it is handed. Listed as data so the "which attributes cross
+#: the boundary" question has one answer that a reader can audit.
+_OPTIONAL_KWARGS = (
+    ("tool_classes", "_tool_classes"),
+    ("session_permissions", "_session_permissions"),
+    ("project_root", "_project_root"),
+    ("timeout_seconds", "_timeout_seconds"),
+    ("session_id", "session_id"),
+    ("workspace_id", "workspace_id"),
+    ("max_container_count", "max_container_count"),
+    ("max_token_usage", "max_token_usage"),
+    ("max_runtime_s", "max_runtime_s"),
+)
+
+
+class RuntimeSpecError(ValueError):
+    """The worker cannot be described as a picklable runtime spec (§3.3)."""
+
+
+class WorkerRuntimeLost(RuntimeError):
+    """The runtime process is gone, or answered ``ok=False`` (§4.7).
+
+    Carries the terminal :class:`Reply` so the supervisor can mirror the
+    ``status`` it would have got in thread mode without parsing a message.
+    """
+
+    def __init__(self, message: str, *, reply: Reply) -> None:
+        super().__init__(message)
+        #: The ``reply`` frame that ends this query, synthesised when the
+        #: process died without one (§4.7).
+        self.reply = reply
+
+
+class WorkerQueryTimeout(TimeoutError):
+    """No ``reply`` arrived inside the caller's timeout (§4.4)."""
+
+    def __init__(self, message: str, *, reply: Reply) -> None:
+        super().__init__(message)
+        #: The terminal ``reply`` this side synthesised; ``ok`` is ``False``.
+        self.reply = reply
+
+
+def spec_from_worker(worker: Any, *, epoch: Optional[int] = None) -> Dict[str, Any]:
+    """Describe *worker* as the picklable dict the runtime side reconstructs.
+
+    The handle in thread mode wraps a *live* object; the process mode has to
+    rebuild that object in a child interpreter from data alone, so this is
+    where "which parts of a ``WorkerThread`` are its identity" is decided --
+    once, and in public view. The fence axes (``worker`` / ``instance`` /
+    ``epoch``) travel as data (§4.2); the configuration travels as
+    ``worker_kwargs`` and is passed straight back into ``WorkerThread``.
+
+    *epoch* defaults to the worker's own generation counter, because that is
+    the value the command channel already fences this incarnation by; passing it
+    explicitly keeps the spec deterministic in tests.
+    """
+    for attribute in ("worker_name", "instance_id", "definition", "workspace_dir"):
+        if not hasattr(worker, attribute):
+            raise RuntimeSpecError(
+                f"{type(worker).__name__} has no {attribute!r} attribute: process "
+                "mode needs a worker constructed with definition, agent_config "
+                "and workspace_dir (§3.3)"
+            )
+    agent_config = getattr(worker, "_agent_config_dict", None)
+    if agent_config is None:
+        agent_config = getattr(worker, "agent_config", None)
+    if agent_config is None:
+        raise RuntimeSpecError(
+            f"{type(worker).__name__} has no agent_config: process mode needs a "
+            "worker constructed with definition, agent_config and workspace_dir "
+            "(§3.3)"
+        )
+    kwargs: Dict[str, Any] = {
+        "name": worker.worker_name,
+        "definition": worker.definition,
+        "agent_config": agent_config,
+        # A str rather than a Path: the spec has to pickle into a spawn child,
+        # and the child's working directory is an implementation detail.
+        "workspace_dir": str(worker.workspace_dir),
+        "instance_id": int(worker.instance_id),
+    }
+    for target, source in _OPTIONAL_KWARGS:
+        kwargs[target] = getattr(worker, source, None)
+    # ``container_manager`` is deliberately NOT carried: it holds live handles,
+    # locks and possibly client objects and cannot be pickled. Container
+    # adoption after a restart is the supervisor's concern (§3.4), not something
+    # a worker thread can pass across a process boundary.
+    return {
+        "worker": str(worker.worker_name),
+        "instance": int(worker.instance_id),
+        "epoch": int(epoch if epoch is not None else getattr(worker, "_generation", 0) or 0),
+        "worker_factory": getattr(worker, "_runtime_worker_factory", None),
+        "worker_kwargs": kwargs,
+    }
+
+
+class _Outbox:
+    """Single writer for the supervisor -> runtime direction (§4.6).
+
+    One thread, one FIFO, so ``seq`` has exactly one owner. A deliberate local
+    copy of the runtime's outbox rather than a shared helper: the two live in
+    different processes and each owns a different direction, and a queue shared
+    across that boundary is precisely the mutable state §4.6 forbids.
+    """
+
+    def __init__(self, sock: Any, emitter: FrameEmitter) -> None:
+        self._sock = sock
+        self._emitter = emitter
+        self._q: "queue.Queue[Any]" = queue.Queue()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name="supervisor-outbox", daemon=True
+        )
+        self._thread.start()
+
+    def put(self, message: Any) -> None:
+        """Queue *message* for the writer. Never blocks, never sends."""
+        self._q.put(message)
+
+    def _run(self) -> None:
+        while True:
+            message = self._q.get()
+            if message is _SENTINEL:
+                return
+            if self._closed:
+                continue
+            try:
+                self._sock.sendall(encode_frame(self._emitter.emit(message)))
+            except OSError:
+                self._closed = True
+                self._discard()
+                return
+
+    def _discard(self) -> None:
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                return
+
+
+_SENTINEL = object()
+
+
+class ProcessWorkerRuntime:
+    """The supervisor's handle on one worker runtime running in its own process.
+
+    Lifecycle: construct -> :meth:`start` (spawn + ``hello``) -> any number of
+    :meth:`dispatch_query` calls -> :meth:`close` (``shutdown`` + ``bye``, then
+    ``SIGKILL`` if the process will not go). :meth:`start` is not called from
+    ``__init__`` because a constructor that spawns a process turns a mode typo
+    into an observable side effect; the handle in
+    :mod:`tools.workspace.worker_runtime` relies on that when it defers the
+    spawn to the first dispatch.
+    """
+
+    def __init__(
+        self,
+        spec: Dict[str, Any],
+        *,
+        worker_factory: Optional[Callable[..., Any]] = None,
+        start_method: str = "spawn",
+    ) -> None:
+        self._spec = dict(spec)
+        self._worker_factory = worker_factory
+        self._start_method = start_method
+        self._process: Optional[Any] = None
+        self._sock: Optional[Any] = None
+        self._outbox: Optional[_Outbox] = None
+        self._emitter: Optional[FrameEmitter] = None
+        self._decoder: Optional[FrameDecoder] = None
+        self._reader: Optional[threading.Thread] = None
+        #: ``query_id -> Future`` for queries whose ``reply`` has not arrived
+        #: (§4.8). Written by dispatchers, drained by the reader thread; every
+        #: access is a single GIL-atomic dict operation on a key only one side
+        #: touches at a time, so no lock is needed to keep it coherent.
+        self._pending: Dict[str, "futures.Future[Reply]"] = {}
+        #: ``query_id`` values the runtime acknowledged (§4.4): evidence that a
+        #: dispatch reached the worker before its reply did.
+        self._accepted: set = set()
+        self._accepted_events: Dict[str, threading.Event] = {}
+        self._hello: Optional[Hello] = None
+        self._hello_event = threading.Event()
+        self._bye_seen = False
+        self._fatal: Optional[Fatal] = None
+        self._lost = False
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> Hello:
+        """Spawn the runtime process and wait for its ``hello`` (§4.4)."""
+        if self._started:
+            raise RuntimeError("ProcessWorkerRuntime.start() may be called once")
+        self._started = True
+        context = multiprocessing.get_context(self._start_method)
+        parent_sock, child_sock = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_STREAM
+        )
+        process = context.Process(
+            target=worker_runtime_main,
+            args=(child_sock, self._spec),
+            kwargs={"worker_factory": self._worker_factory},
+            name=(
+                f"worker-runtime-{self._spec['worker']}-{self._spec['instance']}"
+            ),
+            daemon=False,
+        )
+        process.start()
+        # The child holds its own duplicate now. Keeping this copy open would
+        # keep the socket alive after the child dies, so the reader would never
+        # see EOF and every pending query would wait out its full timeout
+        # instead of failing (§4.7).
+        child_sock.close()
+        self._process = process
+        self._sock = parent_sock
+        self._emitter = FrameEmitter(
+            DIRECTION_TO_RUNTIME,
+            worker=self._spec["worker"],
+            instance=int(self._spec["instance"]),
+            epoch=int(self._spec["epoch"]),
+        )
+        self._outbox = _Outbox(parent_sock, self._emitter)
+        self._decoder = FrameDecoder(DIRECTION_FROM_RUNTIME)
+        self._reader = threading.Thread(
+            target=self._read_loop,
+            name=f"worker-runtime-reader-{self._spec['worker']}",
+            daemon=True,
+        )
+        self._reader.start()
+        if not self._hello_event.wait(HELLO_TIMEOUT_SECONDS):
+            self._lost = True
+            raise WorkerRuntimeLost(
+                f"the runtime for {self._spec['worker']!r} sent no hello within "
+                f"{HELLO_TIMEOUT_SECONDS}s (§4.4)",
+                reply=_terminal_reply("", "hello_timeout"),
+            )
+        hello = self._hello
+        assert hello is not None  # set together with the event
+        if hello.pid != process.pid:
+            raise WorkerRuntimeLost(
+                f"hello claims pid {hello.pid}, but the process we spawned is "
+                f"{process.pid}: frames from another incarnation are refused (§4.7)",
+                reply=_terminal_reply("", "pid_mismatch"),
+            )
+        if hello.epoch_seen != int(self._spec["epoch"]):
+            raise WorkerRuntimeLost(
+                f"hello reports epoch {hello.epoch_seen}, expected "
+                f"{self._spec['epoch']}: the runtime is not the incarnation we "
+                "asked for (§4.7)",
+                reply=_terminal_reply("", "epoch_mismatch"),
+            )
+        return hello
+
+    def close(self, grace_ms: int = 5000) -> None:
+        """Ask the runtime to stop, then make sure the process is gone (§3.3).
+
+        Best effort on the polite half -- a runtime that is already dead cannot
+        receive ``shutdown`` -- and non-negotiable on the forceful half: the
+        process is ``SIGKILL``-ed if it outlives the grace period, because a
+        supervisor that leaves orphans behind is worse than one that drops a
+        few trailing events.
+        """
+        process = self._process
+        if process is None:
+            return
+        grace_seconds = max(float(grace_ms), 0.0) / 1000.0
+        if self._outbox is not None:
+            self._outbox.put(Shutdown(grace_ms=int(grace_ms)))
+        deadline = time.monotonic() + grace_seconds
+        # Stop waiting as soon as the process is gone: waiting the full grace
+        # for a ``bye`` that can never arrive would turn every crash into a
+        # multi-second shutdown.
+        while (
+            time.monotonic() < deadline
+            and not self._bye_seen
+            and process.is_alive()
+        ):
+            time.sleep(0.01)
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        process.join(timeout=grace_seconds)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        assert not process.is_alive(), (
+            "the runtime process outlived SIGKILL: a supervisor that cannot stop "
+            "a runtime has not isolated it (§3.3)"
+        )
+
+    def __enter__(self) -> "ProcessWorkerRuntime":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    def dispatch_query(self, query: str, timeout: float = 120.0) -> str:
+        """Send *query* and return the reply's response, exactly as thread mode does.
+
+        The return type is deliberately ``str`` in both modes: the thread path
+        returns whatever ``WorkerThread.send_query`` returns, and a caller must
+        not have to know which mode it is in to read an answer. Failures are
+        raised with the terminal ``Reply`` attached (§4.7), so nothing is lost
+        by not returning the envelope.
+        """
+        if self._lost:
+            raise WorkerRuntimeLost(
+                f"the runtime for {self._spec['worker']!r} is gone: no process to "
+                "dispatch to (§4.7)",
+                reply=_terminal_reply("", "runtime_lost"),
+            )
+        if self._outbox is None:
+            raise WorkerRuntimeLost(
+                f"the runtime for {self._spec['worker']!r} was never started (§3.3)",
+                reply=_terminal_reply("", "not_started"),
+            )
+        query_id = uuid.uuid4().hex
+        future: "futures.Future[Reply]" = futures.Future()
+        acceptance = threading.Event()
+        self._pending[query_id] = future
+        self._accepted_events[query_id] = acceptance
+        try:
+            self._outbox.put(
+                DispatchQuery(
+                    query_id=query_id,
+                    query=str(query),
+                    timeout_seconds=float(timeout),
+                )
+            )
+            reply = future.result(timeout=timeout)
+        except futures.TimeoutError:
+            # Forget the query: a reply that arrives later must not be handed
+            # to the next dispatch (§4.8), and nothing else may wait on this id.
+            self._pending.pop(query_id, None)
+            self._accepted_events.pop(query_id, None)
+            raise WorkerQueryTimeout(
+                f"query {query_id} got no reply within {timeout}s (§4.4)",
+                reply=_terminal_reply(query_id, "timeout"),
+            ) from None
+        finally:
+            self._accepted_events.pop(query_id, None)
+        if not reply.ok:
+            raise WorkerRuntimeLost(
+                f"query {query_id} failed in the runtime: "
+                f"{reply.envelope.get('status')!r} (§4.4)",
+                reply=reply,
+            )
+        envelope = reply.envelope or {}
+        raw = envelope.get("response")
+        if isinstance(raw, str):
+            return raw
+        return json.dumps(envelope)
+
+    # ------------------------------------------------------------------
+    # Observation
+    # ------------------------------------------------------------------
+
+    @property
+    def pid(self) -> Optional[int]:
+        """OS pid of the runtime process, or ``None`` before :meth:`start`."""
+        return None if self._process is None else self._process.pid
+
+    @property
+    def alive(self) -> bool:
+        """True while the runtime process is running (§4.4 ``hello``/EOF)."""
+        return self._process is not None and self._process.is_alive()
+
+    @property
+    def lost(self) -> bool:
+        """True once the stream ended: EOF, a protocol error, or a fatal frame."""
+        return self._lost
+
+    @property
+    def hello(self) -> Optional[Hello]:
+        """The runtime's ``hello`` frame, once received (§4.4)."""
+        return self._hello
+
+    @property
+    def accepted(self) -> frozenset:
+        """``query_id`` values the runtime acknowledged, for correlation checks."""
+        return frozenset(self._accepted)
+
+    # ------------------------------------------------------------------
+    # Reader
+    # ------------------------------------------------------------------
+
+    def _read_loop(self) -> None:
+        """Drain the socket on its own thread until it ends (§11.2 rule 1)."""
+        sock = self._sock
+        decoder = self._decoder
+        assert sock is not None and decoder is not None  # start() ran
+        try:
+            while True:
+                chunk = sock.recv(RECV_CHUNK_BYTES)
+                if not chunk:
+                    break
+                for frame in decoder.feed(chunk):
+                    self._route(frame)
+        except (OSError, WorkerRuntimeProtocolError) as exc:
+            # A decoder that refuses the stream has already decided the
+            # connection is unusable (§4.5); letting the exception escape this
+            # thread would skip _on_eof and leave every pending query waiting
+            # out its timeout instead of failing now.
+            print(
+                f"worker_runtime_process: reader for {self._spec['worker']!r} "
+                f"stopped: {exc}",
+                file=sys.stderr,
+            )
+        finally:
+            self._on_eof()
+
+    def _route(self, frame: Dict[str, Any]) -> None:
+        """Hand one decoded frame to its consumer (§4.4)."""
+        kind = frame["kind"]
+        if kind == Hello.KIND:
+            self._hello = Hello.from_frame(frame)
+            self._hello_event.set()
+            return
+        if kind == QueryAccepted.KIND:
+            message = QueryAccepted.from_frame(frame)
+            self._accepted.add(message.query_id)
+            accepted = self._accepted_events.get(message.query_id)
+            if accepted is not None:
+                accepted.set()
+            return
+        if kind == Reply.KIND:
+            message = Reply.from_frame(frame)
+            future = self._pending.pop(message.query_id, None)
+            if future is None or future.done():
+                # Nothing is waiting: a reply for a timed-out query, or for one
+                # this generation never sent. Dropping it is the whole point of
+                # correlating on query_id rather than on arrival order (§4.8).
+                print(
+                    "worker_runtime_process: dropping a reply nobody is waiting "
+                    f"for (query_id={message.query_id!r}) (§4.8)",
+                    file=sys.stderr,
+                )
+                return
+            future.set_result(message)
+            return
+        if kind == Bye.KIND:
+            self._bye_seen = True
+            return
+        if kind == Fatal.KIND:
+            self._fatal = Fatal.from_frame(frame)
+            return
+        # Anything else (event / heartbeat / worker_state / cancel_ack /
+        # control_ack) belongs to a later stage (§10, S3/S4). The decoder
+        # already owns the "malformed stream" refusal (§4.5), so an unexpected
+        # *valid* frame is a scope fact, not a protocol error: log it and go on.
+        print(
+            f"worker_runtime_process: ignoring {kind} frame (not in S2 scope)",
+            file=sys.stderr,
+        )
+
+    def _on_eof(self) -> None:
+        """Fail every still-pending query with a terminal ``reply`` (§4.7)."""
+        self._lost = True
+        for query_id, future in list(self._pending.items()):
+            if not future.done():
+                future.set_result(_terminal_reply(query_id, "runtime_lost"))
+        self._pending.clear()
+
+
+def _terminal_reply(query_id: str, status: str) -> Reply:
+    """Build the ``Reply`` that ends a query this side had to give up on.
+
+    Synthesised rather than invented at each call site so every failure path
+    hands the caller the same shape it would have got from a live runtime: an
+    ``ok=False`` frame carrying a ``status`` (§4.4).
+    """
+    return Reply(
+        query_id=query_id,
+        ok=False,
+        envelope={"status": status, "response": None},
+        elapsed_seconds=0.0,
+    )

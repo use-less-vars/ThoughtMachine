@@ -936,19 +936,34 @@ def test_spawn_reads_the_mode_from_the_process_environment(monkeypatch):
     # §10: the mode is configuration, so an operator who exports the flag must
     # not also have to thread it through the spawn call.
     monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_PROCESS)
-    with pytest.raises(NotImplementedError, match="S2"):
-        WorkerRuntimeHandle.spawn(FakeWorker())
+    handle = WorkerRuntimeHandle.spawn(FakeWorker())
+    try:
+        assert handle.mode == MODE_PROCESS
+    finally:
+        handle.close()
     monkeypatch.delenv(WORKER_RUNTIME_MODE_ENV)
     assert WorkerRuntimeHandle.spawn(FakeWorker()).mode == MODE_THREAD
 
 
-def test_process_mode_is_not_implemented_in_s0():
-    with pytest.raises(NotImplementedError, match="S2"):
-        WorkerRuntimeHandle.spawn(
-            FakeWorker(), environ={WORKER_RUNTIME_MODE_ENV: MODE_PROCESS}
-        )
-    with pytest.raises(NotImplementedError, match="S2"):
-        WorkerRuntimeHandle(FakeWorker(), mode=MODE_PROCESS)
+def test_process_mode_is_accepted_in_s2():
+    # §10: S2 accepts the mode. Construction must not spawn a process, so the
+    # spec and the runtime stay unset until the first dispatch_query (§7).
+    spawned = WorkerRuntimeHandle.spawn(
+        FakeWorker(), environ={WORKER_RUNTIME_MODE_ENV: MODE_PROCESS}
+    )
+    try:
+        assert spawned.mode == MODE_PROCESS
+        assert spawned._spec is None
+        assert spawned._process_runtime is None
+    finally:
+        spawned.close()
+    direct = WorkerRuntimeHandle(FakeWorker(), mode=MODE_PROCESS)
+    try:
+        assert direct.mode == MODE_PROCESS
+        assert direct._spec is None
+        assert direct._process_runtime is None
+    finally:
+        direct.close()
 
 
 def test_an_unknown_mode_is_refused_by_the_constructor_too():
