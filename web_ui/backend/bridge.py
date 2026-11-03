@@ -446,6 +446,24 @@ def _validate_workspace_id(workspace_id: Optional[str]) -> Optional[str]:
     return workspace_id
 
 
+def _subscribe_global(event_type, callback):
+    """Subscribe *callback* to the global bus and return the detachable pair.
+
+    The ``(event_type, callback)`` pair is stored instead of
+    ``subscribe()``'s return value, because ``EventBus.subscribe()`` falls off
+    the end of its registration branch without returning anything (``None``),
+    and a one-argument ``global_event_bus.unsubscribe(callback)`` is a silent
+    no-op: ``unsubscribe`` takes ``(event_type, callback)``, so a bare callback
+    is read as the *event type* and matches nothing. The stored pair is what
+    lets teardown call the two-argument form and actually detach the listener.
+
+    See ``.thoughtmachine/working_docs/
+    ticket-hygiene-eventbus-subscribe-returns-none-bridge-leaks-listeners.md``.
+    """
+    global_event_bus.subscribe(event_type, callback)
+    return (event_type, callback)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -656,7 +674,9 @@ class WebAgentBridge:
                     log('ERROR', 'server.bridge',
                         f'Failed to forward security prompt: {exc}')
 
-        self._security_subscription = global_event_bus.subscribe(
+        # Stored as an (event_type, callback) pair, not subscribe()'s return
+        # value (None) — see _subscribe_global() for why teardown needs the pair.
+        self._security_subscription = _subscribe_global(
             EventType.SECURITY_PROMPT, _security_prompt_handler
         )
         log('INFO', 'server.bridge', 'Subscribed to SECURITY_PROMPT events')
@@ -712,25 +732,34 @@ class WebAgentBridge:
                             f'Failed to forward worker event: {exc}')
             return _handler
 
-        self._worker_spawned_sub = global_event_bus.subscribe(
+        # Each global subscription is stored as an (event_type, callback) pair,
+        # not as subscribe()'s return value: EventBus.subscribe() returns None,
+        # and the one-arg global_event_bus.unsubscribe(callback) these attributes
+        # used to be fed is a silent no-op (the callback is read as the event
+        # type), so teardown could never detach anything and every closed bridge
+        # leaked all of its global listeners. The pair makes the two-argument
+        # unsubscribe(event_type, callback) possible in _unsubscribe_*_events().
+        # See .thoughtmachine/working_docs/
+        # ticket-hygiene-eventbus-subscribe-returns-none-bridge-leaks-listeners.md
+        self._worker_spawned_sub = _subscribe_global(
             EventType.WORKER_SPAWNED, self._on_worker_spawned
         )
-        self._worker_status_sub = global_event_bus.subscribe(
+        self._worker_status_sub = _subscribe_global(
             EventType.WORKER_STATUS, _make_handler(WorkerStatusEvent)
         )
-        self._worker_completed_sub = global_event_bus.subscribe(
+        self._worker_completed_sub = _subscribe_global(
             EventType.WORKER_COMPLETED, self._on_worker_completed
         )
-        self._worker_error_sub = global_event_bus.subscribe(
+        self._worker_error_sub = _subscribe_global(
             EventType.WORKER_ERROR, self._on_worker_error
         )
-        self._worker_partial_result_sub = global_event_bus.subscribe(
+        self._worker_partial_result_sub = _subscribe_global(
             EventType.WORKER_PARTIAL_RESULT, _make_handler(WorkerPartialResultEvent)
         )
-        self._worker_token_warning_sub = global_event_bus.subscribe(
+        self._worker_token_warning_sub = _subscribe_global(
             EventType.TOKEN_WARNING, self._on_worker_token_warning
         )
-        self._worker_message_sub = global_event_bus.subscribe(
+        self._worker_message_sub = _subscribe_global(
             EventType.WORKER_MESSAGE, _make_handler(BaseEvent)
         )
 
@@ -870,10 +899,11 @@ class WebAgentBridge:
         """Unsubscribe from security events."""
         if self._security_subscription is not None:
             try:
-                # The subscription might be a registration handle;
-                # try to remove it if the bus provides that API.
+                # Stored as an (event_type, callback) pair — only the
+                # two-argument form actually removes the subscriber.
                 if hasattr(global_event_bus, 'unsubscribe'):
-                    global_event_bus.unsubscribe(self._security_subscription)
+                    event_type, callback = self._security_subscription
+                    global_event_bus.unsubscribe(event_type, callback)
             except Exception:
                 pass
             self._security_subscription = None
@@ -894,7 +924,10 @@ class WebAgentBridge:
             if sub is not None:
                 try:
                     if hasattr(global_event_bus, 'unsubscribe'):
-                        global_event_bus.unsubscribe(sub)
+                        # Stored as an (event_type, callback) pair: the two-arg
+                        # form is the only one that detaches.
+                        event_type, callback = sub
+                        global_event_bus.unsubscribe(event_type, callback)
                 except Exception:
                     pass
                 setattr(self, attr_name, None)
