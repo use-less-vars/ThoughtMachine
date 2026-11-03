@@ -364,3 +364,8 @@ web_ui/frontend/.npmrc
 # `docs/*` above is a catch-all, so the negation is required or the file is never
 # versioned and vanishes on the next clone.
 !docs/design-worker-runtime-process.md
+
+# Design placeholder (worker dispatch fence): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design-worker-dispatch-fence.md
