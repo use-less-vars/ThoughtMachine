@@ -86,11 +86,25 @@ def _record_log(monkeypatch):
 
 @pytest.fixture
 def bridge(tmp_path):
+    # ``WebAgentBridge.__init__`` subscribes to the *global* event bus, so a
+    # bridge that is never stopped keeps its handlers registered for the rest of
+    # the pytest process.  Those handlers read ``self._forwarder._callbacks``;
+    # the tests below swap in ``_RecordingForwarder`` (which has no such
+    # attribute), so every later WORKER_* publish in the same process runs a
+    # leaked handler that raises AttributeError and is logged as
+    # "Error in event subscriber".  Restore the real forwarder and tear the
+    # bridge down, so nothing of this test survives it.
     store = FileSystemSessionStore(
         sessions_dir=str(tmp_path / "sessions"),
         state_dir=str(tmp_path / "state"),
     )
-    return WebAgentBridge(event_callback=lambda e: None, session_store=store)
+    bridge = WebAgentBridge(event_callback=lambda e: None, session_store=store)
+    original_forwarder = bridge._forwarder
+    try:
+        yield bridge
+    finally:
+        bridge._forwarder = original_forwarder
+        bridge.stop()
 
 
 def test_request_stop_while_busy_halts_turn_only(bridge, monkeypatch):

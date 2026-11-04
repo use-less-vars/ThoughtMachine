@@ -656,7 +656,7 @@ class WebAgentBridge:
 
         def _security_prompt_handler(event: SecurityPromptEvent) -> None:
             """Forward a SecurityPromptEvent to the frontend."""
-            if not self._forwarder._callbacks:
+            if not getattr(self._forwarder, '_callbacks', None):
                 log('DEBUG', 'server.bridge', 'No event callbacks — dropping security prompt')
                 return
             data = event.data or {}
@@ -968,12 +968,19 @@ class WebAgentBridge:
         instance_id = data.get('instance_id') or 1
         worker_label = _worker_instance_label(worker_name, instance_id)
         session_id = data.get('session_id', self._session_id or '')
+        # Diagnostics only, so tolerate a forwarder that does not expose
+        # ``_callbacks`` (e.g. a minimal stand-in): -1 means "unknown", and the
+        # real drop gate further down stays exactly where it is.
+        n_callbacks = (
+            len(self._forwarder._callbacks)
+            if hasattr(self._forwarder, '_callbacks') else -1
+        )
         log('DEBUG', 'pipeline.bridge',
             f"[TOKEN_PIPELINE] bridge._on_worker_spawned: worker_name={worker_name!r}, "
             f"event_session_id={data.get('session_id', 'N/A')!r}, "
             f"bridge_session_id={self._session_id!r}, "
             f"resolved_session_id={session_id!r}, "
-            f"n_callbacks={len(self._forwarder._callbacks)}, "
+            f"n_callbacks={n_callbacks}, "
             f"WORKER_BUS_AVAILABLE={WORKER_BUS_AVAILABLE}, "
             f"get_worker_event_bus={'SET' if get_worker_event_bus is not None else 'NONE'}")
         if data.get('session_id') and data['session_id'] != self._session_id:
