@@ -65,6 +65,7 @@ from tools.workspace.worker_runtime_protocol import (
     FrameEmitter,
     Hello,
     Ping,
+    Pong,
     QueryAccepted,
     Reply,
     Shutdown,
@@ -372,10 +373,14 @@ def worker_runtime_main(
                         worker, outbox, ConfigUpdate.from_frame(frame)
                     )
                 elif kind == Ping.KIND:
-                    # Liveness probe only: S2 has nothing to answer it with,
-                    # and the frame's whole purpose is "the socket is silent
-                    # otherwise" (§4.3), which our reader already disproves.
-                    continue
+                    # Answer from the pump, not the work loop (§4.4): this
+                    # thread is the one that stays readable while the worker
+                    # is busy, and ``put`` only queues -- the outbox's own
+                    # writer thread does the send, so an answer never waits
+                    # on a slow socket either. That is what makes a pong
+                    # evidence of a live *process* rather than of an idle
+                    # worker.
+                    outbox.put(Pong(nonce=Ping.from_frame(frame).nonce))
                 else:
                     print(
                         f"worker_runtime_main: ignoring {kind} frame "
