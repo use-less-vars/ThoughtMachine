@@ -519,24 +519,79 @@ def test_supervisor_ctor_accepts_session_and_permissions_provider():
     assert sup.permissions_provider() == {"x": 1}
 
 
-def test_soft_timeout_warning_emitted_once():
+class _ScriptedClock:
+    """Deterministic stand-in for ``time.monotonic()``.
+
+    Hands out the scripted values in order, then keeps returning the last one,
+    so a caller that asks the clock more often than expected gets a stable
+    answer instead of ``StopIteration``.
+    """
+
+    def __init__(self, values):
+        self._remaining_values = list(values)
+        self._current = self._remaining_values[0]
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self._remaining_values:
+            self._current = self._remaining_values.pop(0)
+        return self._current
+
+
+class _FakeTimeModule:
+    """Replace the module's ``time`` binding: fake ``monotonic``, real rest.
+
+    Only ``infra.workspace_lifecycle_manager``'s own reference is swapped, so
+    the process-wide ``time.monotonic`` that pytest and everything else share
+    keeps ticking for real.
+    """
+
+    def __init__(self, monotonic):
+        self.monotonic = monotonic
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def test_soft_timeout_warning_emitted_once(monkeypatch):
+    """The 80%-budget warning fires once, inside the window, before the timeout.
+
+    The clock is scripted, never raced: with a real clock the 0.12s window is
+    only observed on the supervisor's 0.5s ``queue.get`` tick, so a fast runner
+    can sail straight past it.  ``process_query`` reads ``time.monotonic()``
+    twice before the loop (``_query_started_at``, then the deadline) and once
+    per iteration, hence the values below: 0.05s and then 0.04s of budget left
+    (both inside the window, so the once-only guard is consulted twice) and
+    finally past the deadline.
+    """
+    clock = _ScriptedClock([1000.0, 1000.0, 1000.55, 1000.56, 1000.75])
+    monkeypatch.setattr(
+        "infra.workspace_lifecycle_manager.time", _FakeTimeModule(clock)
+    )
+
     sup = make_supervisor()
     calls = []
-    release = threading.Event()
-    sup.soft_timeout_warning_callback = lambda qid: calls.append(qid)
+    state_at_warning = []
 
-    def slow_handler(query, query_id):
-        release.wait(5.0)
-        sup._publish_reply(query_id, {"ok": query})
+    def record(query_id):
+        calls.append(query_id)
+        state_at_warning.append(sup.status_report()["state"])
 
-    sup.query_handler = slow_handler
+    sup.soft_timeout_warning_callback = record
+    sup.query_handler = lambda query, query_id: None
+
     with pytest.raises(TimeoutError):
         sup.process_query("x", timeout=0.6)
+
     assert sup.soft_timeout_warning_emitted is True
-    assert len(calls) == 1
+    assert len(calls) == 1, f"warning must fire exactly once, got {calls!r}"
     assert calls[0].startswith("q_")
+    assert state_at_warning == [WorkerState.BUSY], (
+        "the warning must fire while the query is still running (inside the "
+        f"soft window), not after the hard timeout: {state_at_warning!r}"
+    )
     assert sup.status_report()["state"] == WorkerState.TIMED_OUT
-    release.set()
 
 
 def test_drain_logs_wlm_drain_prefix(caplog, monkeypatch):
