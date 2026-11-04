@@ -44,7 +44,7 @@ from tools.workspace.command_channel import (
     write_command,
 )
 from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
-from tools.workspace.worker_runtime import runtime_handle_for
+from tools.workspace.worker_runtime import StaleWorkerFence, runtime_handle_for
 _worker_registry = _WorkerRegistry.get_instance()._worker_registry
 _registry_lock = _WorkerRegistry.get_instance()._registry_lock
 
@@ -1606,6 +1606,203 @@ async def kill_worker(
     ws_dir = _workspace_dir(ws_id)
     instance_id = _query_default(instance_id)
     return _stop_worker_instance(ws_dir, name, instance_id, terminate=True)
+
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/config ───────────────────────
+
+
+class WorkerConfigUpdateBody(BaseModel):
+    """Request body for ``POST .../workers/{name}/config``.
+
+    ``config`` is an ``AgentConfig`` *patch* -- the same shape a worker is
+    spawned with -- because that is what a ``config_update`` frame carries: a
+    runtime merges it onto the config it was born with, so a caller that does
+    not know every field cannot silently erase one.
+    """
+
+    config: Dict[str, Any] = {}
+
+
+def _resolve_worker_dir(
+    ws_dir: Path, name: str, instance_id: Optional[int]
+) -> tuple:
+    """Resolve ``(worker_dir, session_id)`` for one worker instance.
+
+    Same layout and same precedence as ``_stop_worker_instance``: the
+    session-scoped ``workers/<session_id>/<name>[#N]`` first, then the legacy
+    ``workers/<name>[#N]`` (which yields ``session_id=None``, the key a legacy
+    spawn registers its runtime handle under).  Returns ``(None, None)`` when
+    nothing matches, so the caller can answer 404 exactly as ``stop`` does.
+    """
+    lookup = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None
+        else name
+    )
+    workers_dir = ws_dir / "workers"
+    if not workers_dir.is_dir():
+        return None, None
+    for subdir in workers_dir.iterdir():
+        if not subdir.is_dir():
+            continue
+        first_child = next(subdir.iterdir(), None)
+        if first_child is not None and first_child.is_dir():
+            candidate = subdir / lookup
+            if candidate.is_dir():
+                return candidate, subdir.name
+        elif subdir.name == lookup:
+            return subdir, None
+    return None, None
+
+
+@router.post("/{ws_id}/workers/{name}/config")
+async def update_worker_config(
+    request: Request,
+    ws_id: str,
+    name: str,
+    body: WorkerConfigUpdateBody,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Push a new agent config at a LIVE worker and report the runtime's verdict.
+
+    W9: the answer is the runtime's ``config_ack`` -- ``ok`` plus ``tier`` --
+    never an optimistic "applied".  ``tier: hot_swap`` means the running agent
+    will take the change at its next turn boundary; ``tier:
+    requires_respawn`` means it will not, and the caller has to respawn.  The
+    route therefore does not pretend: ``applied_live`` is true only when the
+    ack says ``ok`` **and** ``hot_swap``.
+
+    No live runtime handle is a real answer, not an error to hide: a worker
+    spawned by another process, or one with no handle registered, cannot be
+    reached in-process, so the honest reply is ``409`` with a
+    ``requires_respawn`` tier -- the same information a caller would get from a
+    capability-gapped runtime.
+
+    Persisting the definition (``PUT .../workers/{name}``) is a SEPARATE step
+    and must happen FIRST: the store is what a respawn reads, so a respawn that
+    runs before the persist brings the worker back on the old config.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    instance_id = _query_default(instance_id)
+
+    worker_dir, resolved_session_id = _resolve_worker_dir(ws_dir, name, instance_id)
+    if worker_dir is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "not_found", "name": name},
+        )
+
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+    config = dict(body.config or {})
+
+    handle = runtime_handle_for(resolved_session_id, name, resolved_instance_id)
+    if handle is None:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "ok": False,
+                "tier": "requires_respawn",
+                "status": (
+                    "no live runtime handle for this worker: the config cannot "
+                    "be pushed in-process, so persist the definition and "
+                    "respawn the worker"
+                )[:200],
+                "request_id": None,
+                "applied_live": False,
+                "name": name,
+                "instance_id": resolved_instance_id,
+            },
+        )
+
+    try:
+        ack = handle.update_config(config)
+    except StaleWorkerFence as exc:
+        # A successor occupies the slot: pushing the config at it would be a
+        # change nobody asked for, so the fence wins and the caller respawns.
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "ok": False,
+                "tier": "requires_respawn",
+                "status": str(exc)[:200],
+                "request_id": None,
+                "applied_live": False,
+                "name": name,
+                "instance_id": resolved_instance_id,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - answered, never a 500
+        logger.warning(
+            "Worker %s (instance %s): config update failed",
+            name,
+            resolved_instance_id,
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "ok": False,
+                "tier": "requires_respawn",
+                "status": f"{type(exc).__name__}: {exc}"[:200],
+                "request_id": None,
+                "applied_live": False,
+                "name": name,
+                "instance_id": resolved_instance_id,
+            },
+        )
+
+    ok = bool(getattr(ack, "ok", False))
+    tier = str(getattr(ack, "tier", "") or "requires_respawn")
+    return {
+        "ok": ok,
+        "tier": tier,
+        "status": str(getattr(ack, "status", ""))[:200],
+        "request_id": getattr(ack, "request_id", None),
+        "applied_live": bool(ok and tier == "hot_swap"),
+        "name": name,
+        "instance_id": resolved_instance_id,
+        "session_id": resolved_session_id,
+    }
+
+
+# ── GET /api/workspace/{ws_id}/config_tiers ─────────────────────────────────
+
+
+@router.get("/{ws_id}/config_tiers")
+async def get_config_tiers(request: Request, ws_id: str):
+    """The config tier of every ``AgentConfig`` field, as the agent decides it.
+
+    ``agent.core.agent.config_field_tiers`` derives each entry by asking
+    ``config_requires_respawn`` -- the single authority ``Agent._can_hot_swap``
+    also delegates to -- so a UI badge built from this map cannot drift from
+    the verdict the running process acts on.  The field list is whatever
+    ``AgentConfig`` declares; neither this route nor the caller hardcodes it.
+    """
+    from agent.core.agent import config_field_tiers
+    from tools.workspace.worker_runtime_protocol import CONFIG_TIERS
+
+    ensure_workspace_dirs(ws_id)
+    try:
+        tiers = config_field_tiers()
+    except Exception as exc:  # noqa: BLE001 - never a bare 500 with no detail
+        logger.warning("Could not classify config fields: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+        )
+    return {
+        "workspace_id": ws_id,
+        "tiers": tiers,
+        "tier_values": list(CONFIG_TIERS),
+    }
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/pause ───────────────────────
 

@@ -415,7 +415,33 @@ const formRow = {
   marginBottom: '0.6rem',
 };
 
-export function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemplate }) {
+/** W9: a field's config tier, exactly as the backend authority reported it. */
+function ConfigTierBadge({ tier }) {
+  if (!tier) return null;
+  const hot = tier === 'hot_swap';
+  return (
+    <span
+      style={{
+        marginLeft: '0.4rem',
+        padding: '0.05rem 0.35rem',
+        borderRadius: '3px',
+        fontSize: '0.6rem',
+        fontWeight: 600,
+        background: hot ? '#a6e3a1' : '#f9e2af',
+        color: '#1e1e2e',
+      }}
+      title={
+        hot
+          ? 'hot_swap: a running worker applies this at its next turn boundary'
+          : 'requires_respawn: a running worker will not take this — it needs a fresh runtime'
+      }
+    >
+      {tier}
+    </span>
+  );
+}
+
+export function WorkerFormModal({ worker, templates, configTiers = {}, onSave, onCancel, isCreateFromTemplate }) {
   const isEdit = !!worker && !isCreateFromTemplate;
   const [name, setName] = useState(worker?.name || '');
   const [description, setDescription] = useState(worker?.description || '');
@@ -522,7 +548,10 @@ export function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateF
 
         {/* System prompt */}
         <div style={formRow}>
-          <label style={labelStyle}>System Prompt</label>
+          <label style={labelStyle}>
+            System Prompt
+            <ConfigTierBadge tier={configTiers.system_prompt} />
+          </label>
           <textarea
             style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
             value={systemPrompt}
@@ -772,6 +801,28 @@ export default function WorkerManagementPanel({
     fetchTemplates();
   }, [fetchTemplates]);
 
+  // ── Config tiers (W9) ────────────────────────────────────────────────
+  // Whether an AgentConfig field can be hot-swapped onto a RUNNING worker or
+  // needs a fresh runtime is decided by the backend authority
+  // (agent.core.agent.config_requires_respawn) and published as a map. The UI
+  // never hardcodes the field list: a field with no entry simply gets no badge,
+  // and a badge cannot disagree with the verdict the agent will act on.
+  const [configTiers, setConfigTiers] = useState({});
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let cancelled = false;
+    fetch(`/api/workspace/${workspaceId}/config_tiers`)
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setConfigTiers(data?.tiers || {});
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
   // ── Stop worker ──────────────────────────────────────────────────────────
   const handleStop = useCallback(
     async (name, instanceId) => {
@@ -928,6 +979,83 @@ export default function WorkerManagementPanel({
       }, 3000);
     }
   }, [workspaceId]);
+
+  // ── Force respawn (W9: persist → apply live → respawn, in that order) ────
+  // The persisted definition is what a respawn reads, so it is written FIRST;
+  // only then is the live worker asked to take it, and only a verdict that is
+  // not `applied_live` (requires_respawn, no runtime handle, stale fence)
+  // justifies terminating the instance so the next spawn builds from the
+  // definition just written. Respawning first would bring the worker back on
+  // the OLD config, which is the one outcome this ordering exists to prevent.
+  const [respawnBusy, setRespawnBusy] = useState({});
+  const handleForceRespawn = useCallback(
+    async (name, instanceId) => {
+      const key = workerInstanceKey({ name, instance_id: instanceId });
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+      const workerUrl = `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}`;
+      setRespawnBusy((prev) => ({ ...prev, [key]: true }));
+      try {
+        // 1. persist: read the stored definition and write it back unchanged.
+        const defRes = await fetch(workerUrl);
+        if (!defRes.ok) {
+          const body = await defRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `definition read failed: HTTP ${defRes.status}`);
+        }
+        const definition = await defRes.json();
+        const putRes = await fetch(workerUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(definition),
+        });
+        if (!putRes.ok) {
+          const body = await putRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `persist failed: HTTP ${putRes.status}`);
+        }
+
+        // 2. apply live. The patch is the intersection of the definition and
+        // the tier map -- i.e. the fields the backend says are agent config --
+        // so no field list is spelled out on this side.
+        const patch = {};
+        Object.entries(definition || {}).forEach(([field, value]) => {
+          if (Object.prototype.hasOwnProperty.call(configTiers, field)) patch[field] = value;
+        });
+        const applyRes = await fetch(`${workerUrl}/config${instanceQuery}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ config: patch }),
+        });
+        const ack = await applyRes.json().catch(() => ({}));
+        if (ack?.applied_live) {
+          // The runtime took it: no respawn needed, and none is performed.
+          setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+          return;
+        }
+
+        // 3. respawn: only now, and only because the config is not live.
+        const killRes = await fetch(`${workerUrl}/kill${instanceQuery}`, { method: 'POST' });
+        if (!killRes.ok) {
+          const body = await killRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `respawn failed: HTTP ${killRes.status}`);
+        }
+        setWorkers((prev) =>
+          prev.map((w) =>
+            w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+              ? { ...w, runtime_status: 'killed', queued_query_count: 0, queued_query_ids: [] }
+              : w
+          )
+        );
+        setStopErrors((prev) => ({
+          ...prev,
+          [key]: `${ack?.tier || 'requires_respawn'}: ${ack?.status || 'worker will respawn on the persisted definition'}`,
+        }));
+      } catch (err) {
+        setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+      } finally {
+        setRespawnBusy((prev) => { const n = { ...prev }; delete n[key]; return n; });
+      }
+    },
+    [workspaceId, configTiers]
+  );
 
   const canStop = useCallback((status) => {
     return status === 'busy' || status === 'ready' || !status;
@@ -1398,6 +1526,36 @@ export default function WorkerManagementPanel({
                           Kill
                         </button>
                       )}
+                      {/* Force Respawn (W9) — persist → apply live → respawn.
+                          A live-appliable change never costs the instance its
+                          life; a `requires_respawn` verdict (or a worker with
+                          no reachable runtime) does, which is what makes the
+                          worker come back on the definition just persisted. */}
+                      {isRunning && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleForceRespawn(w.name, w.instance_id);
+                          }}
+                          disabled={!!respawnBusy[workerInstanceKey(w)]}
+                          style={{
+                            background: 'transparent',
+                            color: '#89b4fa',
+                            border: '1px solid #89b4fa',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: respawnBusy[workerInstanceKey(w)] ? 'default' : 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginLeft: '4px',
+                            opacity: respawnBusy[workerInstanceKey(w)] ? 0.6 : 1,
+                          }}
+                          title={`Force respawn ${dispLabel} — persist the definition, apply it to the live worker, respawn only if it cannot be hot-swapped`}
+                        >
+                          {respawnBusy[workerInstanceKey(w)] ? 'Respawn…' : 'Force Respawn'}
+                        </button>
+                      )}
                       {/* manual-pause badge (payload.paused_manually) */}
                       {w.paused_manually && (
                         <span
@@ -1615,6 +1773,7 @@ export default function WorkerManagementPanel({
         <WorkerFormModal
           worker={editingWorker}
           templates={templates}
+          configTiers={configTiers}
           isCreateFromTemplate={isCreateFromTemplate}
           onSave={handleSaveWorker}
           onCancel={() => {

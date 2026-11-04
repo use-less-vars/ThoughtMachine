@@ -110,6 +110,75 @@ def config_requires_respawn(old_config, new_config) -> bool:
     return new_config.provider_config != old_config.provider_config
 
 
+def _tier_probe_value(value: Any) -> Any:
+    """A value guaranteed to differ from *value* for a one-field probe.
+
+    Type-directed but deliberately dumb: the point is only that
+    ``config_requires_respawn`` *sees* a difference, so the probe must differ
+    under the comparison the authority actually performs. Anything this does
+    not recognise becomes a fresh ``object()``, which is unequal to every
+    other value -- including ``None`` -- under ``!=``.
+    """
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        return value + '-tier-probe'
+    if isinstance(value, (int, float)):
+        return value + 1
+    if isinstance(value, dict):
+        return {**value, '_tier_probe': True}
+    if isinstance(value, (list, tuple)):
+        return [*value, '_tier_probe']
+    if value is None:
+        return '-tier-probe'
+    return object()
+
+
+def config_field_tiers(base_config=None) -> Dict[str, str]:
+    """Map every ``AgentConfig`` field name to its config tier (W9).
+
+    The tier of a field is not a property anyone declares -- it is whatever
+    :func:`config_requires_respawn` decides when that *one* field differs. So
+    this builds a one-field-differing copy of *base_config* per field and asks
+    the authority, using ``CONFIG_TIER_HOT_SWAP`` /
+    ``CONFIG_TIER_REQUIRES_RESPAWN`` from the protocol module so the strings
+    cannot drift from the ones a ``config_ack`` carries.
+
+    That is why the compared-field list is never written down here: a UI badge
+    built from this map shows the verdict the agent will actually act on, and
+    the two cannot disagree even after someone edits the authority.
+
+    A field whose probe cannot even be classified (the authority raised) is
+    reported ``requires_respawn``: fail closed, because claiming a hot swap the
+    agent will not perform is the one wrong answer here.
+    """
+    from tools.workspace.worker_runtime_protocol import (
+        CONFIG_TIER_HOT_SWAP,
+        CONFIG_TIER_REQUIRES_RESPAWN,
+    )
+
+    if base_config is None:
+        from agent.config import AgentConfig
+
+        base_config = AgentConfig.model_construct()
+
+    tiers: Dict[str, str] = {}
+    for field_name in type(base_config).model_fields:
+        current = getattr(base_config, field_name, None)
+        try:
+            candidate = base_config.model_copy(
+                update={field_name: _tier_probe_value(current)}
+            )
+            requires = bool(config_requires_respawn(base_config, candidate))
+        except Exception:  # noqa: BLE001 - unclassifiable is not a hot swap
+            tiers[field_name] = CONFIG_TIER_REQUIRES_RESPAWN
+            continue
+        tiers[field_name] = (
+            CONFIG_TIER_REQUIRES_RESPAWN if requires else CONFIG_TIER_HOT_SWAP
+        )
+    return tiers
+
+
 def _audit_config_change(old_config, new_config, restart_required: bool) -> None:
     """Audit a worker-side config change (redacted); never raises.
 

@@ -485,6 +485,39 @@ class StaleWorkerFence(RuntimeError):
         self.observed_epoch = observed_epoch
 
 
+def _new_request_id() -> str:
+    """A fresh ``request_id`` for a supervisor-originated frame (§4.9)."""
+    import uuid
+
+    return uuid.uuid4().hex
+
+
+class _CollectingOutbox:
+    """The ``.put()``-only outbox the child-side config handler expects (§4.9).
+
+    ``worker_runtime_main._handle_config_update`` writes its answer with
+    ``outbox.put(...)`` and does not care where it goes. In thread mode there is
+    no socket to write to, so this collects the frame(s) for the caller to read
+    back -- which is what lets the in-process handle reuse the exact handler the
+    child process runs instead of a second copy of the semantics.
+    """
+
+    def __init__(self) -> None:
+        self._frames: list[Any] = []
+
+    def put(self, frame: Any) -> None:
+        self._frames.append(frame)
+
+    def pop_config_ack(self) -> Optional[Any]:
+        """The first :class:`ConfigAck` collected, or ``None`` if there was none."""
+        from tools.workspace.worker_runtime_protocol import ConfigAck
+
+        for frame in self._frames:
+            if isinstance(frame, ConfigAck):
+                return frame
+        return None
+
+
 class WorkerRuntimeHandle:
     """The supervisor's view of one worker runtime (S2: thread or process).
 
@@ -703,6 +736,76 @@ class WorkerRuntimeHandle:
                 query, timeout=timeout
             )
         return self._worker.send_query(query, timeout=timeout)
+
+    def update_config(self, config: Mapping[str, Any], *, timeout: float = 30.0) -> Any:
+        """Push *config* (an ``AgentConfig`` patch) at the live worker (§4.9).
+
+        Returns the runtime's :class:`ConfigAck` -- ``ok`` **and** ``tier``.
+        ``tier`` is the answer that cannot be faked: a caller that reports
+        "applied" on top of ``requires_respawn`` is reporting something this
+        side never promised. This method therefore never upgrades an ack, and
+        it never lets a capability gap look like success.
+
+        Both modes go through the code that already owns the semantics, so
+        there is exactly one rule for "hot swap vs. respawn":
+
+        *Process mode*: :meth:`ProcessWorkerRuntime.update_config`. A runtime
+        that did not advertise ``config_update`` in its hello raises
+        :class:`WorkerRuntimeUnsupported` -- that is a capability gap, not an
+        error, so it is reported as an ``ok=False`` /
+        ``requires_respawn`` ack.
+        *Thread mode*: ``worker_runtime_main._handle_config_update`` -- the very
+        handler the child process runs -- driving the worker in-process and
+        handing back its single ack through a collecting outbox.
+
+        The S7a-2 fence runs first, exactly as in :meth:`dispatch_query`.
+        """
+        self._assert_current()
+        request_id = _new_request_id()
+        if self._mode == MODE_PROCESS:
+            from tools.workspace.worker_runtime_process import (
+                WorkerRuntimeUnsupported,
+            )
+            from tools.workspace.worker_runtime_protocol import (
+                CONFIG_TIER_REQUIRES_RESPAWN,
+                ConfigAck,
+            )
+
+            try:
+                return self._ensure_process_runtime().update_config(
+                    dict(config), timeout=timeout
+                )
+            except WorkerRuntimeUnsupported as exc:
+                return ConfigAck(
+                    request_id=request_id,
+                    ok=False,
+                    tier=CONFIG_TIER_REQUIRES_RESPAWN,
+                    status=str(exc)[:200],
+                )
+
+        from tools.workspace.worker_runtime_main import _handle_config_update
+        from tools.workspace.worker_runtime_protocol import (
+            CONFIG_TIER_REQUIRES_RESPAWN,
+            ConfigAck,
+            ConfigUpdate,
+        )
+
+        outbox = _CollectingOutbox()
+        _handle_config_update(
+            self._worker,
+            outbox,
+            ConfigUpdate(request_id=request_id, config=dict(config)),
+        )
+        ack = outbox.pop_config_ack()
+        if ack is None:
+            # A handler that answered nothing is NOT success: say so.
+            return ConfigAck(
+                request_id=request_id,
+                ok=False,
+                tier=CONFIG_TIER_REQUIRES_RESPAWN,
+                status="worker runtime produced no config_ack",
+            )
+        return ack
 
     def _ensure_process_runtime(self) -> Any:
         """Spawn the process runtime on first use, then reuse it (§7).
