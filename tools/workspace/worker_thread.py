@@ -3432,9 +3432,19 @@ class WorkerThread(threading.Thread):
                     {"role": "system", "content": system_prompt}
                 ]
                 if self._initial_context:
+                    ic_payload = f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}"
+                    # Auditability without leaking the brief: record only the
+                    # payload length and a short digest of the exact string
+                    # appended. Briefings can carry secrets, so no preview.
+                    logger.debug(
+                        "Initial context payload for worker '%s': %d chars, sha256=%s",
+                        self.worker_name,
+                        len(ic_payload),
+                        hashlib.sha256(ic_payload.encode("utf-8")).hexdigest()[:12],
+                    )
                     user_history.append({
                         "role": "system",
-                        "content": f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}",
+                        "content": ic_payload,
                     })
                 # Reset cached token count for a fresh run
                 self._cached_context_tokens = None
@@ -5777,6 +5787,10 @@ class Worker(ToolBase):
         # cross-contaminate workers and mutate caller-owned state.
         if self.context is not None and isinstance(self.context, dict):
             thread._initial_context = dict(self.context)
+        elif isinstance(self.context, str) and self.context:
+            # A plain-string context means "the task" per the tool schema; it
+            # must become the query, not be silently dropped.
+            thread._initial_context = {"query": self.context}
         else:
             thread._initial_context = {}
 
