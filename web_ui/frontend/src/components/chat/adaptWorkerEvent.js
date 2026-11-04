@@ -396,6 +396,7 @@ export default function adaptWorkerEvent(evt) {
       }
 
     case 'paused':
+    case 'worker_paused':
       return {
         _id: eventId(evt),
         role: 'system',
@@ -405,6 +406,7 @@ export default function adaptWorkerEvent(evt) {
       }
 
     case 'resumed':
+    case 'worker_resumed':
       return {
         _id: eventId(evt),
         role: 'system',
