@@ -1112,6 +1112,36 @@ class WorkerRuntimeHandle:
         worker._turn_cancel.set()
         return "accepted"
 
+    def ping(self, timeout: Optional[float] = None) -> Optional[bool]:
+        """Is the runtime still there? Tri-state, and it never raises (§4.4).
+
+        ``True``/``False`` is the runtime's own answer (``"alive"`` /
+        ``"no answer within *timeout*"``). ``None`` is a third statement: this
+        handle owns NO live process runtime -- thread mode, or process mode
+        before its first dispatch -- so there is nothing to ask. Folding that
+        into ``False`` would let a monitor read "no process to ping" as "the
+        process is wedged", which is the one inference a caller must not make.
+
+        Reads ``_process_runtime`` directly instead of going through
+        :meth:`_ensure_process_runtime`: that builder SPAWNS the runtime, so a
+        probe routed through it would make asking about a process the reason it
+        exists. For the same reason there is no :meth:`_assert_current` fence --
+        a fence raises, and a liveness probe that can raise forces every caller
+        to guard the one call whose job is to be answerable. A stale handle's
+        runtime is closed or dead, so it answers ``None``/``False`` here, which
+        is all a probe may say.
+        """
+        runtime = self._process_runtime
+        if not runtime:
+            return None
+        try:
+            if timeout is None:
+                return bool(runtime.ping())
+            return bool(runtime.ping(timeout=timeout))
+        except Exception as exc:  # noqa: BLE001 - a probe may never raise
+            _LOGGER.debug("runtime ping failed; treating as unanswered (%s)", exc)
+            return False
+
     def close(self, *, grace_ms: int = 5000) -> None:
         """Stop the process runtime, if one was ever spawned.
 

@@ -94,10 +94,10 @@ WORKER_STALE_WATCHDOG_INTERVAL_S = 30
 # silence. Deliberately much shorter than HEARTBEAT_STALE_AFTER_S (600), which
 # measures the in-process heartbeat and drives the INTERRUPTING path.
 WORKER_STALE_ANNOUNCE_AFTER_S = 3 * HEARTBEAT_INTERVAL_S
-# Phase-B placeholders -- consumed by the cooperative escalation ladder
-# (ping-ack liveness, then cancel -> pause -> kill). Unused in phase A: nothing
-# in the tree reads them yet, and they are declared here so the phase-B work
-# lands in the constants table rather than as literals at its call sites.
+# The escalation ladder's three budgets (S7c-3: ping-ack liveness, then cancel,
+# then kill). Read by ``worker_stale_watchdog.WorkerStaleWatchdog`` as its
+# per-instance defaults, so the ladder lands in the constants table rather than
+# as literals at its call sites.
 WORKER_STALE_PROBE_TIMEOUT_S = 15
 WORKER_STALE_CANCEL_TIMEOUT_S = 15
 WORKER_STALE_KILL_TIMEOUT_S = 15

@@ -301,22 +301,45 @@ def test_watchdog_announces_but_never_kills_cancels_or_interrupts():
     assert sum(1 for a in announced if a["kind"] == "frame_stale") == 1
     assert len(announced) == 3
 
-    # Source-level guard: no termination verb is reachable from this module, so
-    # a future edit cannot quietly turn an announcement into an action. Scanned
-    # over the module's NAMES and ATTRIBUTES (not its text), so the docstring
-    # may name the seams it promises never to touch.
+    # Source-level guard, phase-aware since S7c-3: the SCAN path (tick and
+    # everything it calls) may never reach a control verb, so a future edit
+    # cannot quietly turn a tick into an action; and the interrupting verbs stay
+    # out of the whole module -- the escalation ladder asks first (ping) and
+    # never interrupts, it cancels.
     tree = ast.parse(inspect.getsource(watchdog_module))
-    identifiers = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    identifiers |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-    for verb in (
-        "kill",
-        "cancel",
-        "interrupt",
-        "terminate_all",
-        "terminate_executions",
-        "_terminate_tracked_executions",
-    ):
-        assert verb not in identifiers, f"{verb!r} must not be reachable here"
+    scan_path = {
+        "run",
+        "tick",
+        "_scan_observer",
+        "_scan_frames",
+        "_announce_frame",
+        "_frame_age",
+        "_key_parts",
+        "_announce",
+        "_first_announce",
+        "_forget",
+        "_retain",
+        "_start_escalation",
+    }
+    for func in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        names = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)}
+        attrs = {n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)}
+        identifiers = names | attrs
+        for verb in (
+            "interrupt",
+            "terminate_all",
+            "terminate_executions",
+            "_terminate_tracked_executions",
+        ):
+            assert verb not in identifiers, (
+                f"{verb!r} must not be reachable in {func.name}"
+            )
+        if func.name in scan_path:
+            for verb in ("kill", "cancel", "ping"):
+                assert verb not in attrs, (
+                    f"{verb!r} must not be reachable from the scan path "
+                    f"({func.name})"
+                )
 
 
 # -- 6 -----------------------------------------------------------------------
