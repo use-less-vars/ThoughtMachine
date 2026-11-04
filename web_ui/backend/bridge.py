@@ -259,6 +259,19 @@ def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
     try:
         registry = WorkspaceRegistry.get_default()
         entry = registry.resolve_by_root(normalised)
+        if entry is None:
+            # ``resolve_by_root`` normalises BOTH sides with ``_normalize_path``
+            # (abspath only, no symlink collapse), so a workspace whose stored
+            # ``root_path`` is an unresolved alias never matches the
+            # realpath-normalised ``normalised`` request above -- e.g. any
+            # workspace created under macOS's ``/var`` -> ``/private/var``
+            # indirection, or under a symlinked directory.  Re-scan with the
+            # SAME normalisation ``_build_workspace_id_cache`` uses, so the
+            # fallback and the cache agree on what "the same root" means.
+            for candidate in registry.list_workspaces():
+                if _normalise_workspace_root(candidate.root_path) == normalised:
+                    entry = candidate
+                    break
         if entry is not None:
             _workspace_id_cache[normalised] = entry.id
             return entry.id

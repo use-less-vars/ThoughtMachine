@@ -1624,7 +1624,18 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             session_ws = (_session_obj.metadata or {}).get('agent_config', {}).get('workspace_path') or None
                         if session_ws is None:
                             session_ws = bridge._workspace_path or None
-                    current_path = os.path.normpath(session_ws or _project_path or "")
+                    # Canonicalise the baseline exactly the way the candidate
+                    # above was canonicalised (_confine_workspace_path ->
+                    # os.path.realpath).  Comparing a normpath'd baseline
+                    # against a realpath'd candidate made an UNCHANGED
+                    # workspace look like a switch whenever the two spellings
+                    # differ -- macOS's ``/var`` -> ``/private/var``
+                    # indirection, or any symlinked workspace root.
+                    _current_raw = session_ws or _project_path or ""
+                    current_path = (
+                        os.path.realpath(os.path.abspath(_current_raw))
+                        if _current_raw else ""
+                    )
                     workspace_changed = bool(new_workspace_path) and new_workspace_path != current_path
 
                     if workspace_changed:
