@@ -46,11 +46,16 @@ from typing import Any, Callable, Dict, Optional
 
 from tools.workspace.worker_runtime import CANCEL_TERMINAL_STATUSES
 from tools.workspace.worker_runtime_protocol import (
+    CONFIG_TIER_HOT_SWAP,
+    CONFIG_TIER_REQUIRES_RESPAWN,
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
+    HELLO_CAPABILITIES,
     Bye,
     Cancel,
     CancelAck,
+    ConfigAck,
+    ConfigUpdate,
     Control,
     ControlAck,
     DispatchQuery,
@@ -85,6 +90,12 @@ FATAL_DRAIN_SECONDS = 2.0
 
 #: Tail of a traceback that fits comfortably in one frame (§4.7).
 _TRACEBACK_TAIL_CHARS = 2000
+
+#: ``config_update`` carries ``AgentConfig`` field names, while the config dict a
+#: ``WorkerThread`` is built from uses the ToolExecutor's injection name for the
+#: provider. One alias, applied on merge, so a supervisor can speak the model's
+#: vocabulary without having to know the injection's (§4.9).
+_INJECTED_CONFIG_ALIASES = {"provider_type": "provider"}
 
 _SENTINEL = object()
 
@@ -311,6 +322,11 @@ def worker_runtime_main(
                 started_at=datetime.now(timezone.utc).isoformat(),
                 runtime_version=RUNTIME_VERSION,
                 epoch_seen=epoch,
+                # W9: announce the frames this build can serve. A supervisor that
+                # does not see ``config_update`` here must not send it -- this
+                # build would answer nothing, and silence is indistinguishable
+                # from a lost frame (§4.5).
+                capabilities=HELLO_CAPABILITIES,
             )
         )
         decoder = FrameDecoder(DIRECTION_TO_RUNTIME)
@@ -350,6 +366,10 @@ def worker_runtime_main(
                 elif kind == Cancel.KIND:
                     _handle_cancel(
                         worker, outbox, Cancel.from_frame(frame)
+                    )
+                elif kind == ConfigUpdate.KIND:
+                    _handle_config_update(
+                        worker, outbox, ConfigUpdate.from_frame(frame)
                     )
                 elif kind == Ping.KIND:
                     # Liveness probe only: S2 has nothing to answer it with,
@@ -467,6 +487,164 @@ def _handle_cancel(worker: Any, outbox: _Outbox, message: Cancel) -> None:
         outbox.put(CancelAck(request_id=message.request_id, phase="refused"))
         return
     outbox.put(CancelAck(request_id=message.request_id, phase="accepted"))
+
+
+def _handle_config_update(
+    worker: Any, outbox: _Outbox, message: ConfigUpdate
+) -> None:
+    """Queue one config update on the worker's agent mailbox, answer once (§4.9).
+
+    Two destinations, and the ack names which one was used:
+
+    *An agent exists.* ``Agent.request_config_update`` is the SAME mailbox the
+    in-process path uses (``agent/core/agent.py``), so the config is applied at
+    the top of the next ``process_query`` by the existing
+    ``_apply_pending_config`` -- hot-swap or in-place restart, decided there. A
+    second way to reach an agent would be a second set of semantics, which is
+    exactly what this frame avoids.
+    *No agent yet.* Creation is lazy (first turn only, ``WorkerThread.run``), so
+    the patch is merged into the config dict that creation reads and nothing has
+    to be replayed: the worker's first turn is built from the new values.
+
+    The ``tier`` comes from ``agent.core.agent.config_requires_respawn`` -- the
+    verdict ``Agent._can_hot_swap`` reaches -- never from
+    ``AgentConfig.FIELD_CATEGORIES``. A ``requires_respawn`` ack still means the
+    frame was accepted; it means "do not tell the operator this is live".
+
+    Never raises: every failure is answered ``ok=False`` so the supervisor's
+    ladder closes and the reader loop survives (§11.2 rule 1).
+    """
+    patch = dict(message.config or {})
+    merged = dict(_injected_config_dict(worker))
+    for key, value in patch.items():
+        merged[_INJECTED_CONFIG_ALIASES.get(key, key)] = value
+
+    build = getattr(worker, "_build_agent_config", None)
+    if build is None or not callable(build):
+        _ack_config(
+            outbox,
+            message,
+            ok=False,
+            tier=CONFIG_TIER_REQUIRES_RESPAWN,
+            status="worker has no _build_agent_config: cannot build a config",
+        )
+        return
+
+    try:
+        # REBIND rather than mutate: the turn loop reads this dict on its own
+        # thread when it builds the agent, and a fresh dict swap is atomic under
+        # the GIL where a key-by-key edit is not (§11.2 rule 1).
+        worker._agent_config_dict = merged
+        new_config = build()
+    except Exception as exc:  # noqa: BLE001 - answered, never swallowed
+        _ack_config(
+            outbox,
+            message,
+            ok=False,
+            tier=CONFIG_TIER_REQUIRES_RESPAWN,
+            status=f"{type(exc).__name__}: {exc}"[:200],
+        )
+        return
+
+    if new_config is None:
+        _ack_config(
+            outbox,
+            message,
+            ok=False,
+            tier=CONFIG_TIER_REQUIRES_RESPAWN,
+            status="invalid agent_config after update "
+            "(provider or model missing)",
+        )
+        return
+
+    agent = getattr(worker, "_agent", None)
+    if agent is None:
+        # No running agent to contradict: the first turn builds one from the
+        # config just merged, so no restart is needed by anybody.
+        _ack_config(
+            outbox,
+            message,
+            ok=True,
+            tier=CONFIG_TIER_HOT_SWAP,
+            status="stashed: no agent yet, applied when the first turn "
+            "builds one",
+        )
+        return
+
+    try:
+        from agent.core.agent import config_requires_respawn
+
+        requires = bool(config_requires_respawn(agent.config, new_config))
+    except Exception as exc:  # noqa: BLE001 - answered, never swallowed
+        _ack_config(
+            outbox,
+            message,
+            ok=False,
+            tier=CONFIG_TIER_REQUIRES_RESPAWN,
+            status=f"cannot classify the change: {type(exc).__name__}: {exc}"[:200],
+        )
+        return
+
+    queue_update = getattr(agent, "request_config_update", None)
+    if queue_update is None or not callable(queue_update):
+        _ack_config(
+            outbox,
+            message,
+            ok=False,
+            tier=CONFIG_TIER_REQUIRES_RESPAWN,
+            status="agent has no request_config_update mailbox",
+        )
+        return
+    try:
+        queue_update(new_config)
+    except Exception as exc:  # noqa: BLE001 - answered, never swallowed
+        _ack_config(
+            outbox,
+            message,
+            ok=False,
+            tier=CONFIG_TIER_REQUIRES_RESPAWN,
+            status=f"{type(exc).__name__}: {exc}"[:200],
+        )
+        return
+
+    _ack_config(
+        outbox,
+        message,
+        ok=True,
+        tier=CONFIG_TIER_REQUIRES_RESPAWN if requires else CONFIG_TIER_HOT_SWAP,
+        status=(
+            "queued for the next turn boundary; the agent rebuilds itself there"
+            if requires
+            else "queued for the next turn boundary"
+        ),
+    )
+
+
+def _injected_config_dict(worker: Any) -> Dict[str, Any]:
+    """The config dict *worker* was constructed from, or ``{}`` if it has none."""
+    current = getattr(worker, "_agent_config_dict", None)
+    if isinstance(current, dict):
+        return current
+    return {}
+
+
+def _ack_config(
+    outbox: _Outbox,
+    message: ConfigUpdate,
+    *,
+    ok: bool,
+    tier: str,
+    status: str,
+) -> None:
+    """Answer exactly one ``config_ack``, with the detail truncated to fit (§4.9)."""
+    outbox.put(
+        ConfigAck(
+            request_id=message.request_id,
+            ok=bool(ok),
+            tier=tier,
+            status=str(status)[:200],
+        )
+    )
 
 
 def _kill_on_link_loss(worker: Any) -> None:

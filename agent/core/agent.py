@@ -78,6 +78,38 @@ def _config_diff(old_config, new_config) -> List[str]:
     return diff
 
 
+def config_requires_respawn(old_config, new_config) -> bool:
+    """True when *new_config* cannot be hot-swapped onto *old_config*.
+
+    The single authority for the config tier (W9): ``Agent._can_hot_swap``
+    delegates here, so a caller that holds two config objects but no ``Agent``
+    instance -- the worker runtime, which has to answer a ``config_ack`` with a
+    tier -- reaches exactly the verdict this process will act on.
+
+    The field list is spelled out here rather than read off
+    ``AgentConfig.FIELD_CATEGORIES``: those categories are metadata for the
+    settings UI, while what actually decides a hot-swap is whether
+    ``Agent._hot_swap`` / ``Agent.restart`` rebuild the component that owns the
+    field, and this list mirrors those two methods.
+    """
+    if new_config.provider_type != old_config.provider_type:
+        return True
+    if new_config.model != old_config.model:
+        return True
+    if new_config.api_key != old_config.api_key:
+        return True
+    if normalize_base_url(new_config.base_url) != normalize_base_url(old_config.base_url):
+        return True
+    if new_config.system_prompt != old_config.system_prompt:
+        return True
+    # Workspace path changes require a full restart
+    if new_config.workspace_path != old_config.workspace_path:
+        return True
+    # Provider config changes (e.g. timeout/max_retries) require a full
+    # restart so the LLM provider is re-initialised with the new settings.
+    return new_config.provider_config != old_config.provider_config
+
+
 def _audit_config_change(old_config, new_config, restart_required: bool) -> None:
     """Audit a worker-side config change (redacted); never raises.
 
@@ -668,27 +700,7 @@ class Agent:
         model, provider, system_prompt, tool_classes, api_key, base_url,
         provider_config etc. require a full restart.
         """
-        if new_config.provider_type != self.config.provider_type:
-            return False
-        if new_config.model != self.config.model:
-            return False
-        if new_config.api_key != self.config.api_key:
-            return False
-        if normalize_base_url(new_config.base_url) != normalize_base_url(self.config.base_url):
-            return False
-        if new_config.system_prompt != self.config.system_prompt:
-            return False
-
-        # Workspace path changes require a full restart
-        if new_config.workspace_path != self.config.workspace_path:
-            return False
-
-        # Provider config changes (e.g. timeout/max_retries) require a full
-        # restart so the LLM provider is re-initialised with the new settings
-        # (AgentConfig.FIELD_CATEGORIES marks provider_config RESTART_REQUIRED).
-        if new_config.provider_config != self.config.provider_config:
-            return False
-        return True
+        return not config_requires_respawn(self.config, new_config)
 
     def _hot_swap(self, new_config: AgentConfig):
         """Apply a lightweight config update without restarting.

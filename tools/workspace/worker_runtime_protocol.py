@@ -132,6 +132,26 @@ CONTROL_ACTIONS: Tuple[str, ...] = ("stop", "pause", "resume", "kill")
 #: Closed ladder of ``cancel_ack.phase`` values (§5.4).
 CANCEL_ACK_PHASES: Tuple[str, ...] = ("accepted", "observed", "completed", "refused")
 
+#: ``config_ack.tier``: the change is applied at the next turn boundary without
+#: rebuilding the provider (§4.9, W9).
+CONFIG_TIER_HOT_SWAP = "hot_swap"
+
+#: ``config_ack.tier``: the change cannot be applied to the running agent, so the
+#: honest answer is that a fresh runtime is needed (§4.9, W9).
+CONFIG_TIER_REQUIRES_RESPAWN = "requires_respawn"
+
+#: Closed set of ``config_ack.tier`` values (§4.9).
+CONFIG_TIERS: Tuple[str, ...] = (CONFIG_TIER_HOT_SWAP, CONFIG_TIER_REQUIRES_RESPAWN)
+
+#: The ``hello.capabilities`` value that announces a runtime can take a
+#: ``config_update`` frame at all (§4.5). A runtime that does not advertise it
+#: is not broken -- it predates the frame -- so the supervisor feature-detects
+#: this name instead of assuming, and a frame it would ignore is never sent.
+CAPABILITY_CONFIG_UPDATE = "config_update"
+
+#: Every capability name this build understands.
+HELLO_CAPABILITIES: Tuple[str, ...] = (CAPABILITY_CONFIG_UPDATE,)
+
 #: The lifecycle reason set a ``cancel`` may carry (§4.3). Deliberately NOT
 #: enforced: a reason is a diagnostic string, not control flow, and new
 #: ceilings / budgets are additive (§4.5). An unknown reason is still acted on.
@@ -244,6 +264,11 @@ class Message:
 
     KIND: ClassVar[str] = ""
     _FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = ()
+    #: Declared fields a peer may OMIT (§4.5 additive rule). Absent means "the
+    #: peer was built before this field existed", so the dataclass default is
+    #: used instead of refusing the frame -- which is the only way an addition
+    #: can be additive for a receiver as well as for a sender.
+    _OPTIONAL: ClassVar[Tuple[str, ...]] = ()
 
     def to_payload(self) -> Dict[str, Any]:
         """The declared payload fields, in declaration order."""
@@ -303,6 +328,8 @@ class Message:
         values: Dict[str, Any] = {}
         for name, expected in cls._FIELDS:
             if name not in payload:
+                if name in cls._OPTIONAL:
+                    continue
                 raise FrameDecodeError(f"{cls.KIND} payload is missing {name!r}")
             values[name] = _coerce(cls.KIND, name, payload[name], expected)
         return cls(**values)
@@ -389,6 +416,27 @@ class Shutdown(Message):
 
 
 @dataclass(frozen=True)
+class ConfigUpdate(Message):
+    """``config_update`` -- push a new agent config to a running runtime (§4.9).
+
+    ``config`` is a JSON object of ``AgentConfig`` field names and values -- the
+    same shape the supervisor already injects into a worker at spawn. It is a
+    patch, not a whole config: a runtime merges it onto the config it was born
+    with, so a supervisor that does not know every field cannot silently erase
+    one it never heard of.
+    """
+
+    KIND: ClassVar[str] = "config_update"
+    _FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = (
+        ("request_id", str),
+        ("config", dict),
+    )
+
+    request_id: str
+    config: Dict[str, Any]
+
+
+@dataclass(frozen=True)
 class Ping(Message):
     """``ping`` -- only used when the socket is otherwise silent (§4.3)."""
 
@@ -405,7 +453,14 @@ class Ping(Message):
 
 @dataclass(frozen=True)
 class Hello(Message):
-    """``hello`` -- the runtime's first frame; asserts pid and epoch (§4.4)."""
+    """``hello`` -- the runtime's first frame; asserts pid and epoch (§4.4).
+
+    ``capabilities`` is OPTIONAL (§4.5): a runtime built before W9 sends a hello
+    without it, and that runtime must still handshake -- feature detection is
+    what lets the supervisor notice it can only be driven the old way. It is
+    therefore a field of this frame rather than a separate kind, so the one
+    handshake stays one round trip.
+    """
 
     KIND: ClassVar[str] = "hello"
     _FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = (
@@ -413,12 +468,35 @@ class Hello(Message):
         ("started_at", str),
         ("runtime_version", str),
         ("epoch_seen", int),
+        ("capabilities", list),
     )
+    _OPTIONAL: ClassVar[Tuple[str, ...]] = ("capabilities",)
 
     pid: int
     started_at: str
     runtime_version: str
     epoch_seen: int
+    #: Names from :data:`HELLO_CAPABILITIES`. A tuple so a received hello is
+    #: hashable and comparable; the wire form is a JSON array (§4.5).
+    capabilities: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        caps = self.capabilities
+        if not isinstance(caps, tuple):
+            object.__setattr__(self, "capabilities", tuple(caps))
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Emit ``capabilities`` as a JSON array, not as the internal tuple.
+
+        The declared wire type is ``list`` (§4.5) and :meth:`from_frame`
+        enforces it, so an envelope that has not yet been through
+        ``json.dumps`` -- ``emit()`` returns exactly that -- must already carry
+        an array. A tuple here would serialise fine and then fail to read back
+        from any path that skipped the encoder.
+        """
+        payload = super().to_payload()
+        payload["capabilities"] = list(self.capabilities)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -550,6 +628,39 @@ class ControlAck(Message):
 
 
 @dataclass(frozen=True)
+class ConfigAck(Message):
+    """``config_ack`` -- the runtime's verdict on one ``config_update`` (§4.9).
+
+    ``tier`` is the answer that cannot be faked: ``hot_swap`` means the running
+    agent will apply the change at its next turn boundary without being rebuilt,
+    ``requires_respawn`` means it will not -- a caller that reports "applied" on
+    top of a ``requires_respawn`` ack is reporting something this side never
+    promised. ``status`` carries the human-readable detail (``queued``,
+    ``stashed``, ``invalid agent_config``, ...) that ``tier`` deliberately does
+    not.
+    """
+
+    KIND: ClassVar[str] = "config_ack"
+    _FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = (
+        ("request_id", str),
+        ("ok", bool),
+        ("tier", str),
+        ("status", str),
+    )
+
+    request_id: str
+    ok: bool
+    tier: str
+    status: str
+
+    def __post_init__(self) -> None:
+        if self.tier not in CONFIG_TIERS:
+            raise UnexpectedFrameError(
+                f"config_ack.tier must be one of {CONFIG_TIERS}, got {self.tier!r}"
+            )
+
+
+@dataclass(frozen=True)
 class Fatal(Message):
     """``fatal`` -- the runtime is about to exit non-zero (§4.4)."""
 
@@ -577,6 +688,7 @@ MESSAGE_TYPES: Dict[str, Type[Message]] = {
     DispatchQuery.KIND: DispatchQuery,
     Cancel.KIND: Cancel,
     Control.KIND: Control,
+    ConfigUpdate.KIND: ConfigUpdate,
     Shutdown.KIND: Shutdown,
     Ping.KIND: Ping,
     Hello.KIND: Hello,
@@ -587,6 +699,7 @@ MESSAGE_TYPES: Dict[str, Type[Message]] = {
     WorkerState.KIND: WorkerState,
     CancelAck.KIND: CancelAck,
     ControlAck.KIND: ControlAck,
+    ConfigAck.KIND: ConfigAck,
     Fatal.KIND: Fatal,
     Bye.KIND: Bye,
 }
@@ -596,7 +709,14 @@ ALL_KINDS: Tuple[str, ...] = tuple(MESSAGE_TYPES)
 
 #: Which kinds may appear on which direction (§4.3 / §4.4).
 KINDS_BY_DIRECTION: Dict[str, Tuple[str, ...]] = {
-    DIRECTION_TO_RUNTIME: ("dispatch_query", "cancel", "control", "shutdown", "ping"),
+    DIRECTION_TO_RUNTIME: (
+        "dispatch_query",
+        "cancel",
+        "control",
+        "config_update",
+        "shutdown",
+        "ping",
+    ),
     DIRECTION_FROM_RUNTIME: (
         "hello",
         "query_accepted",
@@ -606,6 +726,7 @@ KINDS_BY_DIRECTION: Dict[str, Tuple[str, ...]] = {
         "worker_state",
         "cancel_ack",
         "control_ack",
+        "config_ack",
         "fatal",
         "bye",
     ),
