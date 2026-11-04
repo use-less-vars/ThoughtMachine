@@ -54,10 +54,25 @@ The directory is per instance (``_WorkerRegistry.instance_label``:
 ``architect`` for instance 1, ``architect#2`` for instance 2), so two instances
 of one name do not share a journal. Instance 1 keeps the bare name, so a
 SUCCESSOR instance 1 does reuse the directory -- with a new generation, i.e. a
-new ``epoch``. That is why a write always stamps the caller's fence and always
-wins: refusing to write over a foreign fence would wedge exactly the
-crash-recovery path this journal exists for. The destructive operations carry
-the fence instead (read quarantines, clear refuses).
+new ``epoch``.
+
+Displacement is therefore a POLICY, never an accident:
+
+* :func:`write_inflight` FAILS CLOSED. A foreign-fenced record on disk is
+  displaced only when it is dead -- a ``cancelled`` husk (the job must never be
+  resurrected, but its leftover must not wedge a legitimate new turn) -- or
+  unusable (a corrupt payload carries no fence, so it defends no rights;
+  sweeping those belongs to the session-close sweep, and the interim liability
+  is accepted). A foreign record that is WORK IN PROGRESS (``inflight``,
+  ``recoverable``, ``adopted``) is refused with a reason and left
+  byte-identical: overwriting it would destroy the only evidence that a turn
+  can still be recovered. ``inflight`` counts, because a HARD-KILLED
+  incarnation leaves exactly that behind -- it never reached the park flip.
+* :func:`adopt_inflight` is the ONE displacing writer: the explicit, named,
+  auditable way for a successor to take a work-in-progress record over. Keeping
+  it separate is what lets ordinary writes have no bypass at all.
+
+The destructive reads follow the same rule: read quarantines, clear refuses.
 
 Record statuses
 ---------------
@@ -98,7 +113,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -134,6 +149,23 @@ JOURNAL_STATUSES: Tuple[str, ...] = (
 #: (``"epoch 3 != 4"``, ``"no fence in payload"``), never re-worded here.
 _CORRUPT_JSON_REASON = "corrupt-json in inflight journal"
 _MALFORMED_REASON = "malformed inflight record"
+
+#: Prefix of the reason :func:`write_inflight` reports when it refuses to
+#: displace a foreign record that is still work in progress. The status and the
+#: ``fence_rejection_reason`` vocabulary are appended after it, verbatim, so a
+#: log grep matches either the policy or the axes.
+_REFUSAL_PREFIX = "refused: record for another incarnation is work in progress"
+
+#: Reasons :func:`adopt_inflight` reports. Stable, greppable strings: the caller
+#: logs them and moves on, and dropping a job because of one is a bug.
+_ADOPT_NOTHING_REASON = "refused: nothing to adopt (no inflight record)"
+_ADOPT_CANCELLED_REASON = (
+    "refused: cannot adopt a cancelled record (a killed job is never resurrected)"
+)
+_ADOPT_ALREADY_REASON = "refused: record is already adopted (a successor took it over)"
+_ADOPT_OWN_REASON = "refused: record already belongs to this incarnation"
+_ADOPT_UNUSABLE_REASON = "refused: cannot adopt an unusable inflight journal: %s"
+_ADOPT_ATTEMPTS_REASON = "refused: attempts %r does not follow on from %r"
 
 #: Log channel used by the worker for the same bookkeeping warnings.
 _LOG_CHANNEL = "tools.worker"
@@ -346,60 +378,24 @@ def _raw_fence_axes(data: object) -> Optional[Dict[str, Any]]:
     return axes or None
 
 
-def write_inflight(
+def _atomic_write_json(
     worker_dir: Path,
-    record: InflightRecord,
-    fence: CommandFence,
+    target: Path,
+    payload: Dict[str, Any],
 ) -> Optional[str]:
-    """Atomically write *record* (stamped with *fence*) into *worker_dir*.
+    """Put *payload* at *target* atomically: ``None`` or a short reason.
 
-    Returns ``None`` on success, or a short reason on failure. Never raises,
-    and never leaves a partial ``inflight.json``: the payload goes to a temp
-    file in the SAME directory, is flushed and fsynced, and is then
-    ``os.replace``-d over the live name; the temp file is unlinked on every
-    failure path.
+    This is the ONLY place the journal's bytes are written, shared by
+    :func:`write_inflight` and :func:`adopt_inflight` so two writers cannot
+    drift apart on atomicity. A temp file in the SAME directory as *target*
+    (so ``os.replace`` cannot cross a filesystem boundary), ``flush`` +
+    ``fsync`` before the replace, and the temp file unlinked on every failure
+    path -- a reader polling at any instant sees the old record or the new one,
+    never a half-written file.
 
-    The write is fenced in the sense that matters here: the record is STAMPED
-    with the caller's four fence axes, so a dead incarnation cannot write a
-    record that claims to belong to a live one. It deliberately does not
-    REFUSE a stale record on disk -- a successor instance 1 reuses the same
-    directory with a new epoch, and refusing there would wedge the recovery
-    path. A displaced record whose fence disagrees is reported (not silently
-    dropped): the reason names the disagreeing axes in
-    ``fence_rejection_reason``'s vocabulary.
+    Policy is the CALLER's: this function decides nothing about what may be
+    displaced, only that whatever it writes lands whole or not at all.
     """
-    worker_dir = Path(worker_dir)
-    target = journal_path(worker_dir)
-    try:
-        worker_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return "cannot create worker dir: %s" % exc
-
-    existing, existing_reason = _read_payload(target)
-    if existing is not None:
-        displaced = fence_rejection_reason(fence, existing)
-        if displaced is not None:
-            # A record for another incarnation is being replaced. Report it:
-            # the fence quarantines it exactly like a stale command, so nothing
-            # here needs a high-water map of its own.
-            _warn(
-                "Replacing an inflight journal record addressed to another "
-                "incarnation (worker '%s', instance_id=%s, epoch=%s): %s"
-                % (
-                    fence.worker_name,
-                    fence.instance_id,
-                    fence.epoch,
-                    displaced,
-                )
-            )
-    elif existing_reason is not None:
-        _warn(
-            "Replacing an unusable inflight journal for worker '%s' "
-            "(instance_id=%s): %s"
-            % (fence.worker_name, fence.instance_id, existing_reason)
-        )
-
-    payload = record.to_payload(fence)
     tmp_path: Optional[str] = None
     try:
         fd, tmp_path = tempfile.mkstemp(
@@ -422,6 +418,222 @@ def write_inflight(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def _refusal_for_existing(target: Path, fence: CommandFence) -> Optional[str]:
+    """Why the record at *target* must not be written over, or ``None``.
+
+    The displacement policy lives in ONE place so both writers read it the same
+    way. Allowed (``None``), with the warning the old unconditional write
+    already emitted: no file, an unusable file, a record fenced to *fence*
+    itself, and a foreign ``cancelled`` husk. Refused: a foreign record that is
+    work in progress, reported as ``<prefix>, status=<status> (<fence reason>)``
+    so a log grep matches the prefix or the fence vocabulary.
+
+    ``inflight`` counts as work in progress even though the ruling named only
+    ``recoverable`` and ``adopted``: a HARD-KILLED incarnation never reached
+    the park flip, so ``inflight`` is exactly what a crash leaves on disk.
+    Displacing that silently is the same work loss, so the refusal covers every
+    status except ``cancelled`` -- including an unknown one, which cannot be
+    shown to be safe to overwrite.
+    """
+    existing, existing_reason = _read_payload(target)
+    if existing is None:
+        if existing_reason is not None:
+            # Unusable, so displaceable: no fence means no rights to defend.
+            _warn(
+                "Replacing an unusable inflight journal for worker '%s' "
+                "(instance_id=%s, epoch=%s): %s"
+                % (fence.worker_name, fence.instance_id, fence.epoch, existing_reason)
+            )
+        return None
+
+    displaced = fence_rejection_reason(fence, existing)
+    if displaced is None:
+        return None  # this incarnation's own record: an ordinary update
+
+    status = existing.get("status")
+    if status == STATUS_CANCELLED:
+        # A killed job must never be resurrected, but its husk must not wedge a
+        # legitimate new turn either: the one live-looking status we displace.
+        _warn(
+            "Replacing a cancelled inflight journal record addressed to another "
+            "incarnation (worker '%s', instance_id=%s, epoch=%s): %s"
+            % (fence.worker_name, fence.instance_id, fence.epoch, displaced)
+        )
+        return None
+
+    _warn(
+        "Refused to replace an inflight journal record addressed to another "
+        "incarnation (worker '%s', instance_id=%s, epoch=%s, status=%r): %s"
+        % (fence.worker_name, fence.instance_id, fence.epoch, status, displaced)
+    )
+    return "%s, status=%r (%s)" % (_REFUSAL_PREFIX, status, displaced)
+
+
+def write_inflight(
+    worker_dir: Path,
+    record: InflightRecord,
+    fence: CommandFence,
+) -> Optional[str]:
+    """Atomically write *record* (stamped with *fence*) into *worker_dir*.
+
+    Returns ``None`` on success, or a short reason on failure. Never raises,
+    and never leaves a partial ``inflight.json``: the payload goes to a temp
+    file in the SAME directory, is flushed and fsynced, and is then
+    ``os.replace``-d over the live name; the temp file is unlinked on every
+    failure path.
+
+    The write is fenced in the sense that matters most here: the record is
+    STAMPED with the caller's four fence axes, so a dead incarnation cannot
+    write a record that claims to belong to a live one.
+
+    FAIL CLOSED on displacement. A record already on disk that is
+    foreign-fenced (per :func:`fence_rejection_reason`) and still WORK IN
+    PROGRESS is REFUSED: the caller gets a reason that keeps the fence's own
+    vocabulary verbatim, and the file is left BYTE-IDENTICAL -- nothing is
+    written and no temp file is created. Only two kinds of leftover are
+    displaceable: a ``cancelled`` husk (the job is dead and must never be
+    resurrected, but its record must not wedge a legitimate new turn) and an
+    unusable file (a corrupt payload carries no fence, so it defends no
+    rights; sweeping those is the session-close sweep's job, and the interim
+    liability is accepted rather than papered over). A record fenced to
+    *fence* itself is an ordinary update and is always allowed -- that is the
+    write-point/park-flip path.
+
+    A refusal is a NORMAL outcome, not a failure: it means "something
+    recoverable is still here". The caller must not read it as "the turn
+    cannot start"; it must adopt (S7b-4) or wait. Refusing to displace live
+    work is the whole reason :func:`adopt_inflight` exists.
+
+    Never raises for a data condition.
+    """
+    worker_dir = Path(worker_dir)
+    target = journal_path(worker_dir)
+    try:
+        worker_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return "cannot create worker dir: %s" % exc
+
+    refusal = _refusal_for_existing(target, fence)
+    if refusal is not None:
+        return refusal
+
+    return _atomic_write_json(worker_dir, target, record.to_payload(fence))
+
+
+def adopt_inflight(
+    worker_dir: Path,
+    fence: CommandFence,
+    record: InflightRecord,
+) -> Tuple[Optional[InflightRecord], Optional[str]]:
+    """Take over a foreign-fenced record: the ONE displacing writer.
+
+    WARNING: ADOPTION WRITER ONLY. The single legitimate caller is the S7b-4
+    adoption path at resume/spawn, which takes over the turn a DEAD
+    incarnation left in a directory the successor now owns. A
+    same-incarnation caller is a bug -- :func:`write_inflight` already updates
+    this incarnation's own record and FAILS CLOSED on everything else. That
+    asymmetry is the point: ordinary writes never displace live work, and the
+    single exception is named, explicit and auditable here.
+
+    The existing record is DISCOVERED here, through
+    :func:`read_inflight_unfenced` -- the fenced reader cannot see a
+    cross-epoch record by definition, and a caller that has already read the
+    file is not trusted to hand it back.
+
+    Refuses, writing nothing and leaving the file byte-identical, when: there
+    is nothing to adopt; the file is unusable; the record is ``cancelled``
+    (R3/R6 -- a killed job is never resurrected); the record is already
+    ``adopted`` (somebody else took it; do not double-adopt); the record
+    already belongs to *fence* (nothing to adopt, and a same-incarnation
+    adoption is a caller bug); or the ATTEMPT COUNT does not follow on from
+    the stored one.
+
+    ATTEMPTS: the CALLER counts -- it owns the R3 policy -- so *record* must
+    arrive with the count already bumped. This primitive only VERIFIES
+    ``record.attempts == existing.attempts + 1`` and refuses otherwise, naming
+    both numbers: a stale count is a lost update, and silently accepting it
+    would replay a turn an unknown number of times.
+
+    Returns ``(adopted_record, None)`` on success: *record* restamped with
+    *fence*, status ``adopted``, ``updated_at`` refreshed, written through the
+    same temp+fsync+``os.replace`` path as :func:`write_inflight`. Otherwise
+    ``(None, reason)``. Never raises for a data condition; a caller-bug type
+    error still raises, as everywhere else in this module.
+
+    R3: past :data:`MAX_ATTEMPTS` the caller must NOT build the bumped record
+    and adopt it -- it must terminalize the job as ``interrupted`` with a
+    ``reason`` instead.
+    """
+    worker_dir = Path(worker_dir)
+    target = journal_path(worker_dir)
+
+    existing, axes, read_reason = read_inflight_unfenced(worker_dir)
+    if existing is None:
+        if read_reason is not None:
+            _warn(
+                "Refused to adopt an unusable inflight journal at '%s': %s"
+                % (target, read_reason)
+            )
+            return None, _ADOPT_UNUSABLE_REASON % (read_reason,)
+        return None, _ADOPT_NOTHING_REASON
+
+    if existing.status == STATUS_CANCELLED:
+        _warn(
+            "Refused to adopt a cancelled inflight journal record at '%s' "
+            "(instance_id=%s, epoch=%s)"
+            % (target, fence.instance_id, fence.epoch)
+        )
+        return None, _ADOPT_CANCELLED_REASON
+
+    if existing.status == STATUS_ADOPTED:
+        _warn(
+            "Refused to adopt an already-adopted inflight journal record at "
+            "'%s' (instance_id=%s, epoch=%s)"
+            % (target, fence.instance_id, fence.epoch)
+        )
+        return None, _ADOPT_ALREADY_REASON
+
+    if axes is not None and fence_rejection_reason(fence, axes) is None:
+        _warn(
+            "Refused to adopt an inflight journal record this incarnation "
+            "already owns at '%s' (instance_id=%s, epoch=%s)"
+            % (target, fence.instance_id, fence.epoch)
+        )
+        return None, _ADOPT_OWN_REASON
+
+    if record.attempts != existing.attempts + 1:
+        _warn(
+            "Refused to adopt an inflight journal record at '%s': attempts %r "
+            "does not follow on from the stored %r"
+            % (target, record.attempts, existing.attempts)
+        )
+        return None, _ADOPT_ATTEMPTS_REASON % (record.attempts, existing.attempts)
+
+    adopted = replace(
+        record,
+        status=STATUS_ADOPTED,
+        updated_at=utcnow_iso(),
+    )
+    write_reason = _atomic_write_json(worker_dir, target, adopted.to_payload(fence))
+    if write_reason is not None:
+        return None, write_reason
+
+    _warn(
+        "Adopted an inflight journal record from another incarnation at '%s' "
+        "(worker '%s', instance_id=%s, epoch=%s -> %s, attempts %r -> %r)"
+        % (
+            target,
+            fence.worker_name,
+            fence.instance_id,
+            (axes or {}).get("epoch"),
+            fence.epoch,
+            existing.attempts,
+            adopted.attempts,
+        )
+    )
+    return adopted, None
 
 
 def read_inflight(

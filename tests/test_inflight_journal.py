@@ -18,7 +18,14 @@ What is pinned here:
   temp debris) and interleaved writes still leave one parseable record;
 * the ADOPTION reader (:func:`read_inflight_unfenced`) sees a dead
   incarnation's record -- the one case the fenced reader must quarantine --
-  while the fenced reader keeps refusing that same record.
+  while the fenced reader keeps refusing that same record;
+* the write FAILS CLOSED on a foreign record that is still work in progress:
+  the caller gets a reason and the file stays BYTE-IDENTICAL, so only a
+  ``cancelled`` husk and an unusable file are ever displaced;
+* :func:`adopt_inflight` is the ONE displacing writer: it takes over a dead
+  incarnation's record, verifies the attempt count follows on from the stored
+  one, and refuses -- writing nothing -- on nothing-to-adopt, ``cancelled``,
+  already-``adopted``, its own record and an unusable journal.
 """
 
 from __future__ import annotations
@@ -38,10 +45,12 @@ from tools.workspace.inflight_journal import (
     INFLIGHT_FILENAME,
     MAX_ATTEMPTS,
     SCHEMA_VERSION,
+    STATUS_ADOPTED,
     STATUS_CANCELLED,
     STATUS_INFLIGHT,
     STATUS_RECOVERABLE,
     InflightRecord,
+    adopt_inflight,
     clear_inflight,
     journal_path,
     read_inflight,
@@ -333,9 +342,80 @@ def test_interleaved_writes_still_leave_one_parseable_record(tmp_path, monkeypat
     assert _names(tmp_path) == [INFLIGHT_FILENAME]
 
 
-def test_write_over_a_foreign_record_reports_and_succeeds(tmp_path: Path) -> None:
-    """A successor reusing the label must not be wedged by a dead record."""
-    assert write_inflight(tmp_path, _record(query_id="q-dead"), STALE_FENCE) is None
+# -- fail-closed displacement --------------------------------------------------
+
+
+def test_write_displaces_a_foreign_cancelled_husk(tmp_path: Path) -> None:
+    """The one live-looking leftover a write may sweep: a killed job's husk."""
+    husk = _record(query_id="q-dead", status=STATUS_CANCELLED)
+    assert write_inflight(tmp_path, husk, STALE_FENCE) is None
+    assert write_inflight(tmp_path, _record(query_id="q-live"), FENCE) is None
+
+    record, axes, reason = read_inflight_unfenced(tmp_path)
+    assert reason is None
+    assert record.query_id == "q-live"
+    assert axes == FENCE.to_payload()
+
+    live, live_reason = read_inflight(tmp_path, FENCE)
+    assert live_reason is None
+    assert live.query_id == "q-live"
+    assert _names(tmp_path) == [INFLIGHT_FILENAME]
+
+
+@pytest.mark.parametrize(
+    "status",
+    [STATUS_INFLIGHT, STATUS_RECOVERABLE, STATUS_ADOPTED],
+)
+def test_write_refuses_to_displace_work_in_progress(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    """Fail closed: a dead incarnation's record is WORK, not litter."""
+    dead = _record(query_id="q-dead", status=status)
+    assert write_inflight(tmp_path, dead, STALE_FENCE) is None
+    path = journal_path(tmp_path)
+    before = path.read_bytes()
+
+    reason = write_inflight(tmp_path, _record(query_id="q-live"), FENCE)
+
+    assert reason is not None
+    assert reason.startswith(journal._REFUSAL_PREFIX)
+    assert "status=%r" % (status,) in reason
+    assert "epoch %r != %r" % (STALE_FENCE.epoch, FENCE.epoch) in reason
+    # Nothing was written: not even a temp file, not one byte.
+    assert path.read_bytes() == before
+    assert _names(tmp_path) == [INFLIGHT_FILENAME]
+
+    stored, axes, read_reason = read_inflight_unfenced(tmp_path)
+    assert read_reason is None
+    assert stored == dead
+    assert axes == STALE_FENCE.to_payload()
+
+
+def test_write_displaces_an_unusable_journal(tmp_path: Path) -> None:
+    """A corrupt payload carries no fence, so it defends no rights."""
+    _write_raw(tmp_path, '{"query_id": "q-dead", "query": "half a rec')
+
+    assert write_inflight(tmp_path, _record(query_id="q-live"), FENCE) is None
+
+    record, reason = read_inflight(tmp_path, FENCE)
+    assert reason is None
+    assert record.query_id == "q-live"
+    assert _names(tmp_path) == [INFLIGHT_FILENAME]
+
+
+def test_write_updates_its_own_record(tmp_path: Path) -> None:
+    """A record fenced to the caller is an ordinary update, not a displacement."""
+    assert write_inflight(tmp_path, _record(status=STATUS_INFLIGHT), FENCE) is None
+    assert write_inflight(tmp_path, _record(status=STATUS_RECOVERABLE), FENCE) is None
+
+    record, reason = read_inflight(tmp_path, FENCE)
+    assert reason is None
+    assert record.status == STATUS_RECOVERABLE
+
+
+def test_write_into_a_fresh_dir_is_allowed(tmp_path: Path) -> None:
+    assert _names(tmp_path) == []
     assert write_inflight(tmp_path, _record(query_id="q-live"), FENCE) is None
 
     record, reason = read_inflight(tmp_path, FENCE)
@@ -448,3 +528,140 @@ def test_only_adoption_can_read_what_the_fenced_reader_quarantines(tmp_path) -> 
     assert axes["epoch"] == STALE_FENCE.epoch
     # Reading is not taking over: neither reader moved or removed the record.
     assert path.is_file()
+
+
+# -- adoption ----------------------------------------------------------------
+
+
+def _parked(**overrides) -> InflightRecord:
+    """What a dead incarnation leaves behind: a restartable record, unparked."""
+    fields = dict(query_id="q-dead", status=STATUS_RECOVERABLE, attempts=0)
+    fields.update(overrides)
+    return _record(**fields)
+
+
+def test_adopt_takes_over_a_dead_incarnations_record(tmp_path: Path) -> None:
+    """The one displacing writer: restamped to the successor, status adopted."""
+    parked = _parked()
+    assert write_inflight(tmp_path, parked, STALE_FENCE) is None
+
+    adopted, reason = adopt_inflight(tmp_path, FENCE, _record(query_id="q-dead", attempts=1))
+
+    assert reason is None
+    assert adopted is not None
+    assert adopted.query_id == "q-dead"
+    assert adopted.status == STATUS_ADOPTED
+    assert adopted.attempts == 1  # the caller counted; the primitive verified
+    assert adopted.updated_at != STAMP  # refreshed, not carried over
+
+    stored, axes, read_reason = read_inflight_unfenced(tmp_path)
+    assert read_reason is None
+    assert stored == adopted
+    assert axes == FENCE.to_payload()
+
+    live, live_reason = read_inflight(tmp_path, FENCE)
+    assert live_reason is None
+    assert live == adopted
+    assert _names(tmp_path) == [INFLIGHT_FILENAME]
+
+
+def test_adopt_refuses_when_there_is_nothing_to_adopt(tmp_path: Path) -> None:
+    adopted, reason = adopt_inflight(tmp_path, FENCE, _record(attempts=1))
+
+    assert adopted is None
+    assert reason == journal._ADOPT_NOTHING_REASON
+    assert _names(tmp_path) == []  # a read, not a write: no dir, no file
+
+
+def test_adopt_refuses_a_cancelled_record(tmp_path: Path) -> None:
+    """R3/R6: a killed job is never resurrected, not even by an adopter."""
+    killed = _record(query_id="q-killed", status=STATUS_CANCELLED, attempts=1)
+    assert write_inflight(tmp_path, killed, STALE_FENCE) is None
+    path = journal_path(tmp_path)
+    before = path.read_bytes()
+
+    adopted, reason = adopt_inflight(tmp_path, FENCE, _record(query_id="q-killed", attempts=2))
+
+    assert adopted is None
+    assert reason == journal._ADOPT_CANCELLED_REASON
+    assert path.read_bytes() == before
+
+
+def test_adopt_refuses_an_already_adopted_record(tmp_path: Path) -> None:
+    """Somebody else took it: double-adopting would replay the turn twice."""
+    taken = _record(query_id="q-taken", status=STATUS_ADOPTED, attempts=1)
+    assert write_inflight(tmp_path, taken, STALE_FENCE) is None
+    path = journal_path(tmp_path)
+    before = path.read_bytes()
+
+    adopted, reason = adopt_inflight(tmp_path, FENCE, _record(query_id="q-taken", attempts=2))
+
+    assert adopted is None
+    assert reason == journal._ADOPT_ALREADY_REASON
+    assert path.read_bytes() == before
+
+
+def test_adopt_refuses_its_own_record(tmp_path: Path) -> None:
+    """Same-incarnation adoption is a caller bug -- write_inflight covers that."""
+    mine = _record(query_id="q-mine", status=STATUS_RECOVERABLE, attempts=0)
+    assert write_inflight(tmp_path, mine, FENCE) is None
+    path = journal_path(tmp_path)
+    before = path.read_bytes()
+
+    adopted, reason = adopt_inflight(tmp_path, FENCE, _record(query_id="q-mine", attempts=1))
+
+    assert adopted is None
+    assert reason == journal._ADOPT_OWN_REASON
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "passed, stored",
+    [(1, 1), (0, 3), (2, 0)],
+)
+def test_adopt_refuses_an_attempt_count_that_does_not_follow_on(
+    tmp_path: Path,
+    passed: int,
+    stored: int,
+) -> None:
+    """A stale or jumping count is a lost update: refuse and name both numbers."""
+    assert write_inflight(tmp_path, _parked(attempts=stored), STALE_FENCE) is None
+    path = journal_path(tmp_path)
+    before = path.read_bytes()
+
+    adopted, reason = adopt_inflight(
+        tmp_path,
+        FENCE,
+        _record(query_id="q-dead", attempts=passed),
+    )
+
+    assert adopted is None
+    assert reason == journal._ADOPT_ATTEMPTS_REASON % (passed, stored)
+    assert str(passed) in reason and str(stored) in reason
+    assert path.read_bytes() == before
+
+
+def test_adopt_refuses_an_unusable_journal(tmp_path: Path) -> None:
+    path = _write_raw(tmp_path, '{"query_id": "q-dead", "query": "half a rec')
+    before = path.read_bytes()
+
+    adopted, reason = adopt_inflight(tmp_path, FENCE, _record(attempts=1))
+
+    assert adopted is None
+    assert reason == journal._ADOPT_UNUSABLE_REASON % journal._CORRUPT_JSON_REASON
+    assert path.read_bytes() == before
+    assert _names(tmp_path) == [INFLIGHT_FILENAME]
+
+
+def test_writes_still_work_after_an_adoption(tmp_path: Path) -> None:
+    """The take-over leaves the adopter's own fenced writes untouched."""
+    assert write_inflight(tmp_path, _parked(), STALE_FENCE) is None
+    adopted, reason = adopt_inflight(tmp_path, FENCE, _record(query_id="q-dead", attempts=1))
+    assert reason is None and adopted is not None
+
+    assert write_inflight(tmp_path, _parked(attempts=1), FENCE) is None
+
+    record, read_reason = read_inflight(tmp_path, FENCE)
+    assert read_reason is None
+    assert record.status == STATUS_RECOVERABLE
+    assert _names(tmp_path) == [INFLIGHT_FILENAME]
