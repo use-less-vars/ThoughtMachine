@@ -6,6 +6,8 @@ import { makeDedupKey, normaliseToolEvent } from '../WorkerOutputPanel';
 const WORKER_STARTED_TEXT = '⬤ Worker started';
 const WORKER_COMPLETED_TEXT = '■ Worker completed';
 const WORKER_STOPPED_TEXT = '⏹ Worker stopped';
+const WORKER_PAUSED_TEXT = '⏸ Worker paused';
+const WORKER_RESUMED_TEXT = '▶ Worker resumed';
 const UNKNOWN_EVENT_TEXT = 'Unknown event: ';
 
 // ── Helper: build an event with just the essentials ────────────────────────
@@ -1287,6 +1289,35 @@ describe('transient lifecycle events are client_only', () => {
       const result = adaptWorkerEvent(makeEvent({ event }));
       expect(result.client_only).toBeUndefined();
     }
+  });
+});
+
+// ==========================================================================
+// 13. WS bridge spellings of the pause / resume lifecycle events
+// ==========================================================================
+// WorkerOutputPanel strips the 'worker:' prefix from the WebSocket event type,
+// so the pause / resume lifecycle events reach this adapter as 'worker_paused'
+// and 'worker_resumed'. They must resolve to the same transient bubbles as the
+// bare 'paused' / 'resumed' spellings, never to the "Unknown event" fallback.
+describe('worker_paused / worker_resumed (WS bridge spellings)', () => {
+  it('adapts worker_paused like paused', () => {
+    const result = adaptWorkerEvent(makeEvent({ event: 'worker_paused' }));
+    expect(result).toBeTruthy();
+    expect(result.content).toBe(WORKER_PAUSED_TEXT);
+    expect(result.content).not.toContain(UNKNOWN_EVENT_TEXT);
+    expect(result.role).toBe('system');
+    expect(result.is_system_notification).toBe(true);
+    expect(result.client_only).toBe(true);
+  });
+
+  it('adapts worker_resumed like resumed', () => {
+    const result = adaptWorkerEvent(makeEvent({ event: 'worker_resumed' }));
+    expect(result).toBeTruthy();
+    expect(result.content).toBe(WORKER_RESUMED_TEXT);
+    expect(result.content).not.toContain(UNKNOWN_EVENT_TEXT);
+    expect(result.role).toBe('system');
+    expect(result.is_system_notification).toBe(true);
+    expect(result.client_only).toBe(true);
   });
 });
 
