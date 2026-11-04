@@ -37,12 +37,15 @@ from tools.workspace.command_channel import (
 )
 from tools.workspace.inflight_journal import (
     INFLIGHT_FILENAME,
+    MAX_ATTEMPTS,
     STATUS_CANCELLED,
     STATUS_INFLIGHT,
     STATUS_RECOVERABLE,
     InflightRecord,
+    adopt_inflight,
     clear_inflight,
     read_inflight,
+    read_inflight_unfenced,
     utcnow_iso,
     write_inflight,
 )
@@ -1047,6 +1050,115 @@ def _canonicalize_worker_footprint(
 
 
 # ---------------------------------------------------------------------------
+# S7b-4a: adoption at spawn
+# ---------------------------------------------------------------------------
+
+
+def _adopt_predecessor_journal(
+    worker_dir: Path,
+    fence: CommandFence,
+    generation: int,
+) -> Optional[InflightRecord]:
+    """Take over the turn a DEAD predecessor left in *worker_dir*, or ``None``.
+
+    This is the S7b-4 one-and-only adoption path: it runs ONCE per incarnation,
+    at turn start, BEFORE WRITE POINT 1, because ``write_inflight`` FAILS CLOSED
+    on a foreign record that is still work in progress -- so without this the
+    successor's own WP1 write would be refused and its turn would run
+    unjournalled (the wedge pinned by
+    ``tests/test_worker_adoption_at_spawn.py``).
+
+    MODULE-LEVEL on purpose: the call site references it by bare module global
+    name, so a test can neuter adoption with a single
+    ``monkeypatch.setattr(worker_thread_module, "_adopt_predecessor_journal",
+    ...)`` -- exactly how ``write_inflight`` itself is faked.
+
+    WHOSE DIRECTORY THIS IS (why spawn can adopt at all): the spawn-side
+    ``_worker_registry`` iteration (``worker_thread.py:5294-5300``) filters on
+    ``is_alive()``, so after a crash ``live_same == []``; with
+    ``explicit_iid is None`` and an empty ``live_same`` the chain at
+    ``worker_thread.py:5301-5392`` therefore falls through to ``spawn_iid = 1``,
+    the instance label stays the BARE worker name
+    (``worker_registry.py:129-139``) and ``self._worker_dir`` is
+    ``workers/<name>`` -- the very directory the dead incarnation used.  (An
+    earlier design note wrongly assumed the successor got a fresh directory and
+    would need a label change; it does not, and none was made.)  So the
+    predecessor's record is HERE, and it is addressed to a LOWER epoch --
+    ``_generation`` is allocated per worker directory, monotonically
+    (``_allocate_generation``).
+
+    The LOOK is ``read_inflight_unfenced`` because this incarnation's fence can
+    never match a predecessor's epoch by definition; the TAKE is
+    ``adopt_inflight``, the one deliberate displacing writer. Neither is
+    reimplemented here, and neither refusal list is changed.
+
+    Adopts exactly ONE status: ``inflight`` -- the state a HARD-KILLED / crashed
+    incarnation leaves behind (it never reached the park flip). The others are
+    deliberately NOT this path's:
+
+    * ``recoverable`` -- the DETACH park's record; replaying it is the RESUME
+      path's business, not spawn's.
+    * ``cancelled`` -- terminal: a killed job is never resurrected (R3/R6).
+      ``adopt_inflight`` refuses these too; the check here means we never even
+      ask.
+    * ``adopted`` -- somebody else already took it; do not double-adopt.
+
+    ...and only when the record's on-disk epoch is STRICTLY LOWER than
+    *generation*: a record at this epoch or a later one is not a dead
+    predecessor's, and this same check is what makes adoption ONCE -- the
+    adoption write restamps the record to THIS fence, so every later turn's
+    look sees its own epoch and declines.
+
+    ATTEMPTS: the caller owns R3, and ``adopt_inflight`` only VERIFIES that the
+    handed-in count follows on, so the bumped record is built here. A record
+    already at :data:`MAX_ATTEMPTS` is NOT adopted (building attempt 4 would
+    raise) -- terminalizing that job ``interrupted`` is the resume path's R3
+    decision, not spawn's.
+
+    Returns the adopted record (status ``adopted``, stamped with *fence*,
+    ``attempts`` bumped by one) or ``None`` for every "nothing to do" case --
+    no record, an unusable/corrupt journal, a status this path does not own, an
+    epoch that is not older, a refusal from ``adopt_inflight``. NOTHING is
+    logged here for those: a predecessor's leftovers are normal, not an
+    incident, and a journal must never be able to fail or noisy-fail a turn.
+    """
+    try:
+        existing, axes, _read_reason = read_inflight_unfenced(worker_dir)
+        if existing is None:
+            # Nothing journalled, or unusable: nothing to adopt, nothing to say.
+            return None
+        if existing.status != STATUS_INFLIGHT:
+            # ``recoverable`` belongs to the RESUME path (the detach park left
+            # it for replay), ``cancelled`` is terminal, ``adopted`` is taken.
+            return None
+        epoch = (axes or {}).get("epoch")
+        if type(epoch) is not int or epoch >= generation:
+            # Not a DEAD predecessor's record -- either our own (already
+            # adopted, or written by this turn) or a newer incarnation's.
+            return None
+        if existing.attempts + 1 > MAX_ATTEMPTS:
+            # R3 territory: the caller must terminalize as ``interrupted``.
+            return None
+        bumped = InflightRecord(
+            query_id=existing.query_id,
+            query=existing.query,
+            status=STATUS_INFLIGHT,
+            attempts=existing.attempts + 1,
+            requested_by=existing.requested_by,
+            created_at=existing.created_at,
+            updated_at=utcnow_iso(),
+            last_tool=existing.last_tool,
+            reason=existing.reason,
+        )
+        adopted, _refusal = adopt_inflight(worker_dir, fence, bumped)
+        return adopted
+    except Exception as exc:  # bookkeeping must never fail a turn
+        log("WARNING", "tools.worker",
+            f"[journal] adoption failed for worker '{fence.worker_name}': {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
@@ -1242,6 +1354,17 @@ class WorkerThread(threading.Thread):
         # record is the terminal evidence the kill exists to produce. Cleared
         # per turn, so it can never leak into a later turn's exit.
         self._journal_cancel_reason: Optional[str] = None
+        # S7b-4a: the record a DEAD predecessor left in this worker's
+        # directory, once THIS incarnation took it over at turn start. ``None``
+        # means nothing has been adopted yet, which is also what makes adoption
+        # happen exactly ONCE per incarnation. The stored record is the adopted
+        # one (status ``adopted``, attempts bumped), kept for observability.
+        self._journal_adopted: Optional[InflightRecord] = None
+        # S7b-4b: the attempt count a REPLAYED turn must carry to disk, keyed by
+        # the adopted query id. Written at adoption, POPPED by WRITE POINT 1 of
+        # the turn that is that replay -- so an ordinary turn writes 0 and the
+        # count can never bleed into a later turn.
+        self._journal_replay_attempts: Dict[str, int] = {}
         # Per-caller reply channel (set by run() when it dequeues a
         # (query_id, query, reply_q) triple from send_query). Envelopes are
         # routed to this private queue when set, so concurrent send_query
@@ -2076,6 +2199,11 @@ class WorkerThread(threading.Thread):
         self._pruned_since_last_query = 0
         self._current_query_id = None
         self._journal_cancel_reason = None
+        # A reset is a NEW incarnation at a NEW epoch: whatever the previous
+        # incarnation adopted is no longer this one's business, and the record
+        # it might adopt afresh is a genuinely dead predecessor's.
+        self._journal_adopted = None
+        self._journal_replay_attempts.clear()
         self._current_reply_queue = None
         self.current_task = None
         self.error = None
@@ -2129,6 +2257,7 @@ class WorkerThread(threading.Thread):
         created_at: str,
         last_tool: Optional[Dict[str, str]] = None,
         reason: Optional[str] = None,
+        attempts: int = 0,
     ) -> bool:
         """Journal this turn as *status*; True when the record reached disk.
 
@@ -2138,8 +2267,12 @@ class WorkerThread(threading.Thread):
         in by the caller so an update is an UPDATE -- identity (``query_id``,
         ``created_at``) is set once per turn, never re-stamped.
 
-        ``attempts`` is always 0: the journal records the turn, not a replay
-        count, which the successor owns.  ``requested_by`` is a heuristic, not
+        ``attempts`` defaults to 0: a fresh turn is not a replay.  The ONE
+        caller that passes otherwise is WRITE POINT 1 of a turn adopted from a
+        dead predecessor (S7b-4b), which must carry the adoption's bumped count
+        to disk -- re-stamping 0 there would wipe the pre-crash count and
+        ``MAX_ATTEMPTS`` could never fire, so a poison query would replay
+        forever.  ``requested_by`` is a heuristic, not
         an identity claim: a turn that arrived through
         ``send_query``/``submit_query`` carries a query id (the registry job
         id), while one ``run()`` drained off the input queue in WLM mode does
@@ -2150,7 +2283,7 @@ class WorkerThread(threading.Thread):
             query_id=query_id,
             query=query,
             status=status,
-            attempts=0,
+            attempts=attempts,
             requested_by=(
                 "send_query" if self._current_query_id is not None
                 else "worker_queue"
@@ -2690,6 +2823,63 @@ class WorkerThread(threading.Thread):
         from tools.sleep_tool import unbind as _unbind_turn_cancel
         _bind_turn_cancel(self._turn_cancel)
 
+        # ── S7b-4a: ADOPT the dead predecessor's turn, ONCE, before WP1 ─────
+        # A crashed incarnation leaves an ``inflight`` record in THIS directory
+        # (instance 1 keeps the bare worker name, so the successor reuses it --
+        # see ``_adopt_predecessor_journal``), and WRITE POINT 1 below would be
+        # REFUSED by it: ``write_inflight`` fails closed on foreign work in
+        # progress. Adoption is the one deliberate takeover, so it happens here,
+        # at turn start, before the write, and at most once per incarnation
+        # (``_journal_adopted``); every later turn finds its own epoch on disk
+        # and adopts nothing. A journal that is absent, corrupt or somebody
+        # else's business is a silent no-op -- a predecessor's leftovers must
+        # never fail or noise up this turn.
+        if self._journal_adopted is None:
+            _adopted_record = _adopt_predecessor_journal(
+                self._worker_dir, self._fence(), self._generation
+            )
+            if _adopted_record is not None:
+                self._journal_adopted = _adopted_record
+                log("INFO", "tools.worker",
+                    f"[journal] adopted query '{_adopted_record.query_id}' from "
+                    f"a dead predecessor "
+                    f"(attempt {_adopted_record.attempts})")
+                # The adopted turn must RUN, not merely be recorded: queue it
+                # the way ``send_query`` does -- a ``(query_id, query,
+                # reply_q)`` TRIPLE, NOT the bare string the spawn auto-query
+                # and the WLM handler use.
+                #
+                # The ID is the whole reason for the triple. ``run()`` unpacks
+                # the item at worker_thread.py:3607-3618, and a bare string
+                # takes the ``query_id, query, reply_q = None, raw, None``
+                # branch: ``self._current_query_id`` would be ``None``, so the
+                # crashed caller's job-registry entry could never be finished
+                # -- run() only completes it when the id is set
+                # (``if self._current_query_id is not None: _registry.complete(
+                # self._current_query_id, envelope)``, :3996-4002) and only
+                # stamps ``envelope['query_id']`` in that same case
+                # (:3957-3958). The caller sitting in ``wait_for_job`` on that
+                # job would hang on a job nobody can terminalize. With the
+                # triple the replay IS attributed to the dead job and its
+                # envelope closes that entry.
+                #
+                # ``reply_q=None`` is accepted and safe: the envelope simply
+                # falls back to the shared output queue (``_emit_reply``,
+                # :1569-1575) -- the dead caller's private reply queue died
+                # with it.
+                #
+                # It runs on the NEXT loop iteration, exactly once: the queue
+                # item is consumed, and this block cannot fire again. Nothing is
+                # lost (the record's query text is carried, not dropped) and
+                # nothing runs twice (the adopted record is not replayed from
+                # disk, it is queued).
+                self._journal_replay_attempts[_adopted_record.query_id] = (
+                    _adopted_record.attempts
+                )
+                self._input_queue.put(
+                    (_adopted_record.query_id, _adopted_record.query, None)
+                )
+
         # ── WRITE POINT 1: journal the turn BEFORE it runs ──────────────────
         # Placed here, not earlier, so the two early returns above (no agent,
         # stop already signalled) leave NO stale record behind: nothing is
@@ -2708,11 +2898,19 @@ class WorkerThread(threading.Thread):
         # then survive to WRITE POINT 3.  A later turn must not inherit it --
         # that turn has its own record to clear.
         self._journal_cancel_reason = None
+        # S7b-4b: a REPLAYED turn carries the adoption's attempt count to disk
+        # instead of re-stamping 0 -- re-stamping would wipe the pre-crash count
+        # on this very write, MAX_ATTEMPTS could never fire and a poison query
+        # would replay forever. ``pop`` makes it apply to exactly ONE turn: an
+        # ordinary turn finds no entry and writes 0.
         self._journal_write(
             query_id=_journal_query_id,
             query=query,
             status=STATUS_INFLIGHT,
             created_at=_journal_created_at,
+            attempts=self._journal_replay_attempts.pop(
+                self._current_query_id, 0
+            ),
         )
 
         # A pause is reported to the bus/status file ONCE per turn, even though
