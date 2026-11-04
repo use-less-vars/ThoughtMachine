@@ -681,6 +681,24 @@ class Bye(Message):
     KIND: ClassVar[str] = "bye"
 
 
+@dataclass(frozen=True)
+class Pong(Message):
+    """``pong`` -- the runtime answers a ``ping`` (§4.4, liveness probe).
+
+    Emitted by the child's frame pump, never by the work loop: the pump is
+    the thread that is *not* blocked by whatever the worker is doing, so a
+    pong means "this process is alive and reading its socket" -- exactly the
+    question a supervisor asks before concluding a worker is wedged. The
+    ``nonce`` is echoed verbatim so a late pong can never satisfy the next
+    ping: correlation is the whole value of the frame.
+    """
+
+    KIND: ClassVar[str] = "pong"
+    _FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = (("nonce", int),)
+
+    nonce: int
+
+
 #: ``kind`` -> message type. Explicit rather than discovered: this table IS
 #: the closed set §4.5 refuses to widen by accident, so adding a kind must be
 #: a deliberate two-line change here and in the direction tables below.
@@ -702,6 +720,7 @@ MESSAGE_TYPES: Dict[str, Type[Message]] = {
     ConfigAck.KIND: ConfigAck,
     Fatal.KIND: Fatal,
     Bye.KIND: Bye,
+    Pong.KIND: Pong,
 }
 
 #: Every kind this build knows, in either direction.
@@ -729,6 +748,7 @@ KINDS_BY_DIRECTION: Dict[str, Tuple[str, ...]] = {
         "config_ack",
         "fatal",
         "bye",
+        "pong",
     ),
 }
 

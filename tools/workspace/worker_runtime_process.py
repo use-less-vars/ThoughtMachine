@@ -67,6 +67,8 @@ from tools.workspace.worker_runtime_protocol import (
     FrameEmitter,
     Heartbeat,
     Hello,
+    Ping,
+    Pong,
     QueryAccepted,
     Reply,
     Shutdown,
@@ -89,6 +91,12 @@ HELLO_TIMEOUT_SECONDS = 30.0
 #: whether a worker stopped, and "no answer" has to become an exception it can
 #: act on instead of a thread parked forever behind a wedged runtime.
 ACK_TIMEOUT_SECONDS = 5.0
+
+#: Default bound on :meth:`ProcessWorkerRuntime.ping` (§4.4). Deliberately the
+#: same order as :data:`ACK_TIMEOUT_SECONDS`: a probe only waits for a socket
+#: round-trip, never for work to be done, and a caller with a watchdog deadline
+#: of its own passes a shorter one.
+PING_TIMEOUT_SECONDS = 5.0
 
 #: The ``deadline_ms`` a ``cancel`` carries (§4.3). It rides in the frame so the
 #: runtime can honour it; the supervisor's own wait is bounded by
@@ -347,6 +355,15 @@ class ProcessWorkerRuntime:
         #: by whoever gets there first: a check-then-pop race there would let one
         #: ack close two waiters, or close the wrong one.
         self._acks: Dict[str, _AckSlot] = {}
+        #: ``nonce -> _AckSlot`` for outstanding liveness probes (§4.4). Keyed by
+        #: nonce rather than by request id because the nonce IS the correlation:
+        #: a pong for a ping that already timed out must not close a later one.
+        #: Shares ``_acks_lock`` -- the same pop-by-first-arrival hazard applies,
+        #: and one lock is cheaper than two orders of acquisition to reason about.
+        self._pings: Dict[int, _AckSlot] = {}
+        #: Last nonce this runtime issued; bumped under ``_acks_lock`` so two
+        #: concurrent probes can never share one.
+        self._ping_nonce = 0
         self._acks_lock = threading.Lock()
         #: Monotonic request-id source, one per runtime (§10).
         self._request_ids = _RequestIdSource()
@@ -652,6 +669,47 @@ class ProcessWorkerRuntime:
         message = self._await_ack(request_id, slot, timeout, what="cancel")
         return str(message.phase)
 
+    def ping(self, *, timeout: float = PING_TIMEOUT_SECONDS) -> bool:
+        """Ask the runtime whether it is still there; never raises (§4.4).
+
+        ``True`` only when the ``pong`` carrying *our* nonce came back within
+        ``timeout``. Every other outcome -- a stream already gone, a runtime
+        that was never started, a peer that stays silent, an outbox that
+        refuses the frame -- is ``False``. Raising here would force the caller
+        to wrap a liveness probe in the very ``try`` the probe exists to make
+        unnecessary, and would dress two different *answers* ("gone", "wedged")
+        up as two *errors*.
+
+        The frame is answered by the child's frame pump, not its work loop, so
+        a ``True`` means "this process is alive and reading its socket" even
+        while a query is still running.
+        """
+        try:
+            outbox = self._require_sendable("ping")
+        except WorkerRuntimeLost:
+            return False
+        with self._acks_lock:
+            self._ping_nonce += 1
+            nonce = self._ping_nonce
+            slot = _AckSlot()
+            self._pings[nonce] = slot
+        try:
+            outbox.put(Ping(nonce=nonce))
+        except Exception:  # noqa: BLE001 -- an unwritable outbox is "no answer"
+            with self._acks_lock:
+                self._pings.pop(nonce, None)
+            return False
+        woken = slot.event.wait(timeout)
+        with self._acks_lock:
+            self._pings.pop(nonce, None)
+        # Woken is not answered: ``_on_eof`` closes the slot *empty*, which is
+        # how a pong is told apart from the end of the stream (§4.7).
+        return (
+            woken
+            and slot.message is not None
+            and slot.message.nonce == nonce
+        )
+
     def _control(
         self, action: str, *, timeout: float = ACK_TIMEOUT_SECONDS
     ) -> ControlAck:
@@ -865,6 +923,9 @@ class ProcessWorkerRuntime:
         if kind == ConfigAck.KIND:
             self._deliver_ack(ConfigAck.from_frame(frame))
             return
+        if kind == Pong.KIND:
+            self._deliver_pong(Pong.from_frame(frame))
+            return
         # S4b: the supervisory frames are routed, not swallowed. The child
         # publishes ``event`` / ``heartbeat`` / ``worker_state``; each one is
         # decoded here and handed to the sink the handle installed. Decode and
@@ -931,6 +992,21 @@ class ProcessWorkerRuntime:
         slot.message = message
         slot.event.set()
 
+    def _deliver_pong(self, message: Pong) -> None:
+        """Close the probe that *message* answers, if anyone is still waiting.
+
+        Runs on the reader thread, so it never blocks and never sleeps. An
+        unknown nonce is dropped **silently**: a pong that arrives after its
+        ping timed out is the normal race between the two sides' clocks, not a
+        runtime bug, and there is nothing truthful to raise about it (§10).
+        """
+        with self._acks_lock:
+            slot = self._pings.pop(message.nonce, None)
+        if slot is None:
+            return
+        slot.message = message
+        slot.event.set()
+
     def _on_eof(self) -> None:
         """Fail every still-pending query with a terminal ``reply`` (§4.7)."""
         self._lost = True
@@ -942,10 +1018,15 @@ class ProcessWorkerRuntime:
         # its timeout: the ack can never arrive on a dead stream. The slot is
         # closed *empty*, which is how ``_await_ack`` tells "woken with no
         # frame" (lost) from "never woken" (slow).
+        # An outstanding ``ping`` must fail just as fast: a probe that waits
+        # out its whole timeout on a stream that has already ended would report
+        # "wedged" for a runtime that is simply gone (§4.7).
         with self._acks_lock:
             orphans = list(self._acks.values())
             self._acks.clear()
-        for slot in orphans:
+            ping_orphans = list(self._pings.values())
+            self._pings.clear()
+        for slot in orphans + ping_orphans:
             slot.event.set()
 
 

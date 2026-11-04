@@ -91,6 +91,7 @@ from tools.workspace.worker_runtime_protocol import (
     Hello,
     Message,
     Ping,
+    Pong,
     QueryAccepted,
     Reply,
     Shutdown,
@@ -147,6 +148,7 @@ SAMPLES = (
     ),
     Fatal(reason="boom", traceback_tail="Traceback (most recent call last): ..."),
     Bye(),
+    Pong(nonce=7),
 )
 
 SAMPLES_BY_KIND = {message.KIND: message for message in SAMPLES}

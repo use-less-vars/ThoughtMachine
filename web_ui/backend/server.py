@@ -1049,8 +1049,34 @@ async def lifespan(app: FastAPI):
         f'Periodic container sweep scheduled every '
         f'{_CONTAINER_SWEEP_INTERVAL_S:.0f}s')
 
+    # ── Stale watchdog (S7c, ANNOUNCE-ONLY) ──────────────────────────────────
+    # The stale machinery existed and never ran: ``start_stale_check`` had no
+    # production caller, so nothing ever scanned for a worker that had gone
+    # quiet. This starts the announce-only watchdog -- it reports a stale worker
+    # and takes no action on it. Best-effort: a watchdog that cannot start must
+    # never break startup.
+    try:
+        from tools.workspace.worker_stale_watchdog import ensure_watchdog
+        watchdog = ensure_watchdog()
+        app.state.worker_stale_watchdog = watchdog
+        from agent.config.defaults import WORKER_STALE_WATCHDOG_INTERVAL_S
+        log('INFO', 'server',
+            f'Stale watchdog started (announce-only, every '
+            f'{WORKER_STALE_WATCHDOG_INTERVAL_S:.0f}s)')
+    except Exception as exc:
+        app.state.worker_stale_watchdog = None
+        log('WARNING', 'server', f'Stale watchdog startup skipped: {exc}')
+
     yield
     log('INFO', 'server', 'Server shutting down.')
+
+    # Stop the announce-only stale watchdog (mirror of the startup above).
+    try:
+        from tools.workspace.worker_stale_watchdog import stop_watchdog
+        if stop_watchdog(timeout=5.0):
+            log('INFO', 'server', 'Stale watchdog stopped.')
+    except Exception as exc:
+        log('WARNING', 'server', f'Stale watchdog shutdown error: {exc}')
 
     # Stop the periodic container sweep task.
     try:

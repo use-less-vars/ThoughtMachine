@@ -451,6 +451,11 @@ class WorkerManager:
             registry if registry is not None else WorkerRegistry.get_instance()
         )
         self._default_max_workers: int = default_max_workers
+        # S7c: the checker THIS manager started, so ``start_stale_check`` can be
+        # idempotent. ``None`` until a caller asks for one -- the manager still
+        # starts nothing by itself (tests inject fake registries, and a thread
+        # per construction would leak).
+        self._stale_checker: Optional[PeriodicStaleCheck] = None
 
     # -- registry delegation ------------------------------------------------
 
@@ -812,14 +817,45 @@ class WorkerManager:
         explicitly (e.g. once per session) and own its ``stop()``/``join()``.
         Defaults come from the ``PeriodicStaleCheck`` constructor
         (``HEARTBEAT_INTERVAL_S`` / ``HEARTBEAT_STALE_AFTER_S``).
+
+        S7c: idempotent. A second call returns the checker already running
+        instead of starting a second thread over the same registry -- two
+        checkers would interrupt the same worker twice and neither caller would
+        own the extra one. A checker that has been stopped is replaced.
         """
+        existing = self._stale_checker
+        if existing is not None and existing.is_alive():
+            return existing
         checker = PeriodicStaleCheck(
             self._registry,
             interval=HEARTBEAT_INTERVAL_S if interval is None else interval,
             stale_after=HEARTBEAT_STALE_AFTER_S if stale_after is None else stale_after,
         )
         checker.start()
+        self._stale_checker = checker
         return checker
+
+    def ensure_stale_monitor(self) -> Any:
+        """Start the process-wide ANNOUNCE-ONLY stale watchdog (idempotent).
+
+        S7c: this is the seam that gives the never-started stale machinery a
+        production caller, and it starts the *announce-only* watchdog, not
+        ``start_stale_check`` -- the latter interrupts in-flight executions, and
+        phase A of this work must not act on an age reading.
+
+        The import is deferred to call time so ``worker_manager`` keeps its
+        acyclic import graph: ``worker_thread`` imports this module, so this
+        module may not import anything above it at module scope.
+        """
+        from tools.workspace.worker_stale_watchdog import ensure_watchdog
+
+        return ensure_watchdog()
+
+    def stop_stale_monitor(self, timeout: Optional[float] = None) -> bool:
+        """Stop the process-wide stale watchdog; ``True`` when one was running."""
+        from tools.workspace.worker_stale_watchdog import stop_watchdog
+
+        return stop_watchdog(timeout=timeout)
 
     def _control_worker(
         self, action: str, session_id: str, worker_name: str, instance_id: int = 1
@@ -917,10 +953,20 @@ _MANAGER_INSTANCE: Optional[WorkerManager] = None
 
 
 def get_manager() -> WorkerManager:
-    """Return the process-wide WorkerManager singleton (lazily created)."""
+    """Return the process-wide WorkerManager singleton (lazily created).
+
+    S7c: every production user of the manager reaches it here (the workspace and
+    global routes), so this is also where the announce-only stale monitor is
+    started -- once, idempotently, and only on the singleton path. Best-effort:
+    a supervisor endpoint must never fail because a watchdog could not start.
+    """
     global _MANAGER_INSTANCE
     if _MANAGER_INSTANCE is None:
         with _MANAGER_LOCK:
             if _MANAGER_INSTANCE is None:
                 _MANAGER_INSTANCE = WorkerManager()
+    try:
+        _MANAGER_INSTANCE.ensure_stale_monitor()
+    except Exception as exc:  # noqa: BLE001 - a monitor must not break the caller
+        logger.warning("stale monitor could not be started: %s", exc)
     return _MANAGER_INSTANCE
