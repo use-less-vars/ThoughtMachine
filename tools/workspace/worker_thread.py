@@ -35,6 +35,14 @@ from tools.workspace.command_channel import (
     quarantine,
     write_command,
 )
+from tools.workspace.inflight_journal import (
+    STATUS_INFLIGHT,
+    STATUS_RECOVERABLE,
+    InflightRecord,
+    clear_inflight,
+    utcnow_iso,
+    write_inflight,
+)
 from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
 
 try:
@@ -77,6 +85,11 @@ _NO_SESSION_KEY = "<no-session>"
 # silently drop every query queued behind it.
 _PARK_SENTINEL: Any = object()
 
+#: Reason stamped on a turn the DETACH park ABANDONED. It rides on the journal
+#: record the park flips to ``recoverable`` and on the envelope of the job the
+#: same park terminalizes as ``interrupted``, so one grep finds both halves.
+_JOURNAL_DETACH_REASON = "detached-midturn-park"
+
 # Bounded attempts for ``WorkerThread._allocate_generation``. A retry is only
 # taken when a concurrent allocator overwrote the sidecar after our rename
 # (see the post-rename verification there).
@@ -112,6 +125,20 @@ def _generation_thread_lock(key: str) -> "threading.Lock":
             lock = threading.Lock()
             _generation_thread_locks[key] = lock
         return lock
+
+
+def _sha256_args(args: Any) -> str:
+    """Stable hex digest of a tool call's arguments (the journal's ``args_hash``).
+
+    ``sort_keys`` so two dicts that differ only in insertion order hash the
+    same, ``default=str`` so a non-JSON-serialisable argument degrades to its
+    repr instead of raising -- the journal is bookkeeping, never a gate.
+    """
+    try:
+        payload = json.dumps(args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        payload = repr(args)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _stop_already_pending(thread: Any) -> bool:
@@ -2043,6 +2070,135 @@ class WorkerThread(threading.Thread):
             epoch=self._generation,
         )
 
+    # ── inflight journal write points (S7b-2b) ──────────────────────────────
+    # The journal is BOOKKEEPING for a successor incarnation, never a gate:
+    # every call below is fenced through ``_fence()`` (the same fresh, live
+    # ``_generation``-derived identity the command channel uses, so a record
+    # can never be stamped with a fence that disagrees with this incarnation's)
+    # and a write that raises or is REFUSED is only logged -- no journal
+    # failure may fail, delay or alter a turn.
+
+    def _journal_write(
+        self,
+        *,
+        query_id: str,
+        query: str,
+        status: str,
+        created_at: str,
+        last_tool: Optional[Dict[str, str]] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Journal this turn as *status*; True when the record reached disk.
+
+        WRITE POINT 1 (turn start) and WRITE POINT 2 (each tool call) call
+        this with ``STATUS_INFLIGHT``; WRITE POINT 4 (the DETACH park) with
+        ``STATUS_RECOVERABLE`` and a ``reason``.  ``created_at`` is threaded
+        in by the caller so an update is an UPDATE -- identity (``query_id``,
+        ``created_at``) is set once per turn, never re-stamped.
+
+        ``attempts`` is always 0: the journal records the turn, not a replay
+        count, which the successor owns.  ``requested_by`` is a heuristic, not
+        an identity claim: a turn that arrived through
+        ``send_query``/``submit_query`` carries a query id (the registry job
+        id), while one ``run()`` drained off the input queue in WLM mode does
+        not -- in that case the journal's ``query_id`` is synthetic and no job
+        exists to terminalize.
+        """
+        record = InflightRecord(
+            query_id=query_id,
+            query=query,
+            status=status,
+            attempts=0,
+            requested_by=(
+                "send_query" if self._current_query_id is not None
+                else "worker_queue"
+            ),
+            created_at=created_at,
+            updated_at=utcnow_iso(),
+            last_tool=last_tool,
+            reason=reason,
+        )
+        try:
+            refusal = write_inflight(self._worker_dir, record, self._fence())
+        except Exception as exc:
+            # Construction validates too (an invalid status/last_tool is a
+            # caller bug), so the whole call is inside the guard: the turn is
+            # what matters, not the bookkeeping.
+            log("WARNING", "tools.worker",
+                f"[journal] write failed for worker '{self.worker_name}' "
+                f"(query_id={query_id}, status={status}): {exc}")
+            return False
+        if refusal is not None:
+            # A refusal is NOT an error to act on here: the only recorded
+            # reason to refuse is another incarnation's non-cancelled record,
+            # and displacing that is a deliberate adoption (S7b-4), not
+            # something a turn may do implicitly.  So: log, and run on.
+            log("WARNING", "tools.worker",
+                f"[journal] write refused for worker '{self.worker_name}' "
+                f"(query_id={query_id}, status={status}): {refusal}")
+            return False
+        return True
+
+    def _journal_clear(self) -> None:
+        """Drop THIS incarnation's journal record (WRITE POINT 3).
+
+        Called on every terminal exit of the loop that did NOT park, so a
+        completed turn leaves nothing for a successor to replay.  Idempotent
+        (nothing to remove is success) and fenced: a record belonging to
+        another incarnation is left alone -- that is the successor's evidence,
+        not ours to erase.  Never raises.
+        """
+        try:
+            reason = clear_inflight(self._worker_dir, self._fence())
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] clear failed for worker '{self.worker_name}': {exc}")
+            return
+        if reason is not None:
+            log("WARNING", "tools.worker",
+                f"[journal] clear refused for worker '{self.worker_name}': "
+                f"{reason}")
+
+    def _journal_interrupt_job(self, content: str) -> None:
+        """Terminalize the job whose turn the DETACH park abandoned.
+
+        A detach park throws the turn's work away, so the job it belonged to
+        must never be completed or restarted by a later join: it is
+        ``interrupted``, not ``paused``.  ``WorkerJobRegistry.terminalize``
+        takes no ``reason`` parameter, so the journal's reason rides in the
+        ENVELOPE instead (stored verbatim as the job's result) -- one string,
+        one grep, both halves of the park.
+
+        No ``_current_query_id`` (a turn drained off the input queue) means no
+        job to terminalize; that is the normal WLM-mode case, not a failure.
+        """
+        job_id = self._current_query_id
+        if job_id is None:
+            return
+        try:
+            registry = _get_worker_job_registry()
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] job registry unavailable for worker "
+                f"'{self.worker_name}' (query_id={job_id}): {exc}")
+            return
+        if registry is None:
+            return
+        try:
+            registry.terminalize(
+                job_id,
+                status="interrupted",
+                envelope={
+                    "content": content,
+                    "status": "interrupted",
+                    "reason": _JOURNAL_DETACH_REASON,
+                },
+            )
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] terminalize failed for worker '{self.worker_name}' "
+                f"(query_id={job_id}): {exc}")
+
     def _poll_command(self) -> None:
         """Consume one command from this worker's fenced cross-process channel.
 
@@ -2427,6 +2583,26 @@ class WorkerThread(threading.Thread):
         from tools.sleep_tool import unbind as _unbind_turn_cancel
         _bind_turn_cancel(self._turn_cancel)
 
+        # ── WRITE POINT 1: journal the turn BEFORE it runs ──────────────────
+        # Placed here, not earlier, so the two early returns above (no agent,
+        # stop already signalled) leave NO stale record behind: nothing is
+        # journalled that this loop does not then either finish or park.  The
+        # query id is the registry job id when this turn has one; otherwise
+        # (a turn drained off the input queue in WLM mode) a synthetic one, so
+        # a successor can still name the work it is recovering.
+        _journal_query_id = self._current_query_id or uuid.uuid4().hex
+        _journal_created_at = utcnow_iso()
+        _journal_last_tool: Optional[Dict[str, str]] = None
+        # Set by the DETACH park, which is the ONE exit that must leave the
+        # record behind; every other terminal exit clears it (WRITE POINT 3).
+        _journal_parked = False
+        self._journal_write(
+            query_id=_journal_query_id,
+            query=query,
+            status=STATUS_INFLIGHT,
+            created_at=_journal_created_at,
+        )
+
         # A pause is reported to the bus/status file ONCE per turn, even though
         # every remaining event of the draining turn observes the park flag.
         _pause_reported = False
@@ -2503,6 +2679,25 @@ class WorkerThread(threading.Thread):
                             "status": "paused",
                             "message": "Worker paused by user",
                         })
+                        # ── WRITE POINT 4: DETACH abandons the turn ────────
+                        # The work under way is DISCARDED (unlike a pause,
+                        # which concludes the turn), so the record flips to
+                        # ``recoverable`` -- it is the successor's to replay --
+                        # and the job this turn belonged to is terminalized
+                        # ``interrupted`` so a join can never complete or
+                        # restart it.  The envelope stays the production stub
+                        # (run() stamps ``query_id`` into the reply); only the
+                        # JOB's envelope carries the reason.
+                        _journal_parked = True
+                        self._journal_write(
+                            query_id=_journal_query_id,
+                            query=query,
+                            status=STATUS_RECOVERABLE,
+                            created_at=_journal_created_at,
+                            last_tool=_journal_last_tool,
+                            reason=_JOURNAL_DETACH_REASON,
+                        )
+                        self._journal_interrupt_job(final_content)
                         break
                 else:
                     # A resume that lands inside this same turn clears the park
@@ -2626,6 +2821,26 @@ class WorkerThread(threading.Thread):
                             f"Execution registration failed for worker "
                             f"'{self.worker_name}': {exc}")
 
+                    # ── WRITE POINT 2: the tool now in flight ─────────────
+                    # R2's replacement for a per-tool idempotency ledger: the
+                    # successor gets ``{name, args_hash}`` of the LAST tool this
+                    # abandoned turn called, so a post-crash replay can tell a
+                    # side-effecting call from a pure one.  An UPDATE: same
+                    # query id, same ``created_at``, status still ``inflight``.
+                    _journal_tool = event.get("name") or event.get("tool_name")
+                    if isinstance(_journal_tool, str) and _journal_tool:
+                        _journal_last_tool = {
+                            "name": _journal_tool,
+                            "args_hash": _sha256_args(event.get("arguments")),
+                        }
+                        self._journal_write(
+                            query_id=_journal_query_id,
+                            query=query,
+                            status=STATUS_INFLIGHT,
+                            created_at=_journal_created_at,
+                            last_tool=_journal_last_tool,
+                        )
+
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
                     final_content = json.dumps({
@@ -2704,6 +2919,18 @@ class WorkerThread(threading.Thread):
 
         # Capture final token usage
         self._final_token_usage = self.get_current_context_tokens()
+
+        # ── WRITE POINT 3: nothing is left to recover ───────────────────────
+        # Every exit that reaches here DELIVERED (or explicitly reported) this
+        # turn's work: success, a budget refusal, stop, an agent error, a stop
+        # reason, an exception.  So the record goes, unconditionally -- with
+        # ONE exception: the DETACH park, which threw the turn away and has
+        # already flipped the record to ``recoverable`` for its successor.
+        # Clearing that here would erase exactly the evidence the park exists
+        # to leave.  A PAUSE needs no special case: it falls through to this
+        # clear like any other completed turn (the turn was drained, not lost).
+        if not _journal_parked:
+            self._journal_clear()
 
         return final_content
 
