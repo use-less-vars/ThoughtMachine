@@ -35,6 +35,20 @@ from tools.workspace.command_channel import (
     quarantine,
     write_command,
 )
+from tools.workspace.inflight_journal import (
+    INFLIGHT_FILENAME,
+    MAX_ATTEMPTS,
+    STATUS_CANCELLED,
+    STATUS_INFLIGHT,
+    STATUS_RECOVERABLE,
+    InflightRecord,
+    adopt_inflight,
+    clear_inflight,
+    read_inflight,
+    read_inflight_unfenced,
+    utcnow_iso,
+    write_inflight,
+)
 from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
 
 try:
@@ -77,6 +91,18 @@ _NO_SESSION_KEY = "<no-session>"
 # silently drop every query queued behind it.
 _PARK_SENTINEL: Any = object()
 
+#: Reason stamped on a turn the DETACH park ABANDONED. It rides on the journal
+#: record the park flips to ``recoverable`` and on the envelope of the job the
+#: same park terminalizes as ``interrupted``, so one grep finds both halves.
+_JOURNAL_DETACH_REASON = "detached-midturn-park"
+
+#: Reason stamped on the journal record a RESET kills and then drops. The
+#: cancelled record is unlinked a moment later (``_drop_persisted_files``),
+#: so no successor ever sees this string on disk -- it exists so the kill that
+#: a reset performs is still a DELIBERATE one (the same bookkeeping seam every
+#: other kill uses) rather than a silent ``kill()`` that journals nothing.
+_JOURNAL_RESET_REASON = "reset-drop"
+
 # Bounded attempts for ``WorkerThread._allocate_generation``. A retry is only
 # taken when a concurrent allocator overwrote the sidecar after our rename
 # (see the post-rename verification there).
@@ -112,6 +138,20 @@ def _generation_thread_lock(key: str) -> "threading.Lock":
             lock = threading.Lock()
             _generation_thread_locks[key] = lock
         return lock
+
+
+def _sha256_args(args: Any) -> str:
+    """Stable hex digest of a tool call's arguments (the journal's ``args_hash``).
+
+    ``sort_keys`` so two dicts that differ only in insertion order hash the
+    same, ``default=str`` so a non-JSON-serialisable argument degrades to its
+    repr instead of raising -- the journal is bookkeeping, never a gate.
+    """
+    try:
+        payload = json.dumps(args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        payload = repr(args)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _stop_already_pending(thread: Any) -> bool:
@@ -709,13 +749,72 @@ _worker_registry = _registry_instance._worker_registry
 _registry_lock = _registry_instance._registry_lock
 _worker_event_bus_registry = _registry_instance._worker_event_bus_registry
 _bus_registry_lock = _registry_instance._bus_registry_lock
-def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any, instance_id: int = 1) -> None:
-    """Delegate to WorkerRegistry singleton (backward compat)."""
-    _WorkerRegistry.get_instance().register_event_bus(session_id, worker_name, event_bus, instance_id=instance_id)
+def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any, instance_id: int = 1, *, epoch: int | None = None) -> Any:
+    """Delegate to WorkerRegistry singleton (backward compat).
 
-def unregister_worker_event_bus(session_id: str, worker_name: str, instance_id: int = 1) -> None:
-    """Delegate to WorkerRegistry singleton (backward compat)."""
-    _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name, instance_id=instance_id)
+    *epoch* is the owning incarnation's ``WorkerThread._generation``, passed
+    straight through so the registry can refuse a stale (older) registration.
+    """
+    return _WorkerRegistry.get_instance().register_event_bus(session_id, worker_name, event_bus, instance_id=instance_id, epoch=epoch)
+
+def unregister_worker_event_bus(session_id: str, worker_name: str, instance_id: int = 1, *, epoch: int | None = None) -> Any:
+    """Delegate to WorkerRegistry singleton (backward compat).
+
+    *epoch* is the owning incarnation's ``WorkerThread._generation``, passed
+    straight through so the registry can refuse a stale (older) teardown.
+    """
+    return _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name, instance_id=instance_id, epoch=epoch)
+
+def _unregister_runtime_handles(entries: Any, *, epoch: int | None = None) -> None:
+    """Best-effort, epoch-fenced removal of the runtime handles for *entries*.
+
+    *entries* is an iterable of registry keys -- ``(session_id, worker_name)``
+    or ``(session_id, worker_name, instance_id)``, the two shapes
+    ``_worker_registry`` itself uses -- so a caller can hand over exactly the
+    entries it just removed from the registry.  S7a-3 mirrors handle removal
+    onto the paths that already remove the registry entry and invents no
+    lifecycle semantics of its own: a parked or cooperatively stopped worker
+    keeps its registry entry, and therefore keeps its handle.
+
+    *epoch* is the dying incarnation's ``_generation``, passed straight through
+    for the reason ``WorkerRegistry`` fences its own removal: a predecessor's
+    teardown must not unplug its successor's handle (the S7a-1 EventBus bug,
+    moved to the store that feeds the supervisor's command path).
+
+    Never raises, and never called with ``_registry_lock`` held: the handle
+    store takes its own lock and the ordering is registry -> handle, never back.
+    Both properties matter because this runs in teardown paths, where
+    bookkeeping must never be the thing that breaks the exit.
+    """
+    try:
+        from tools.workspace.worker_runtime import unregister_runtime_handle
+    except Exception:
+        logger.debug(
+            "runtime handle store unavailable; no handle to unregister",
+            exc_info=True,
+        )
+        return
+    for entry in entries or ():
+        try:
+            session_id = entry[0]
+            worker_name = entry[1]
+            instance_id = entry[2] if len(entry) >= 3 else None
+        except Exception:
+            logger.debug("unusable runtime handle key %r; skipped", entry)
+            continue
+        try:
+            unregister_runtime_handle(
+                session_id, worker_name, instance_id=instance_id, epoch=epoch
+            )
+        except Exception:
+            logger.debug(
+                "could not unregister the runtime handle for worker %r "
+                "(session %r, instance %r)",
+                worker_name,
+                session_id,
+                instance_id,
+                exc_info=True,
+            )
 
 class _WorkerAmbiguityError(Exception):
     """Raised when a worker name maps to multiple live instances and no
@@ -951,6 +1050,115 @@ def _canonicalize_worker_footprint(
 
 
 # ---------------------------------------------------------------------------
+# S7b-4a: adoption at spawn
+# ---------------------------------------------------------------------------
+
+
+def _adopt_predecessor_journal(
+    worker_dir: Path,
+    fence: CommandFence,
+    generation: int,
+) -> Optional[InflightRecord]:
+    """Take over the turn a DEAD predecessor left in *worker_dir*, or ``None``.
+
+    This is the S7b-4 one-and-only adoption path: it runs ONCE per incarnation,
+    at turn start, BEFORE WRITE POINT 1, because ``write_inflight`` FAILS CLOSED
+    on a foreign record that is still work in progress -- so without this the
+    successor's own WP1 write would be refused and its turn would run
+    unjournalled (the wedge pinned by
+    ``tests/test_worker_adoption_at_spawn.py``).
+
+    MODULE-LEVEL on purpose: the call site references it by bare module global
+    name, so a test can neuter adoption with a single
+    ``monkeypatch.setattr(worker_thread_module, "_adopt_predecessor_journal",
+    ...)`` -- exactly how ``write_inflight`` itself is faked.
+
+    WHOSE DIRECTORY THIS IS (why spawn can adopt at all): the spawn-side
+    ``_worker_registry`` iteration (``worker_thread.py:5294-5300``) filters on
+    ``is_alive()``, so after a crash ``live_same == []``; with
+    ``explicit_iid is None`` and an empty ``live_same`` the chain at
+    ``worker_thread.py:5301-5392`` therefore falls through to ``spawn_iid = 1``,
+    the instance label stays the BARE worker name
+    (``worker_registry.py:129-139``) and ``self._worker_dir`` is
+    ``workers/<name>`` -- the very directory the dead incarnation used.  (An
+    earlier design note wrongly assumed the successor got a fresh directory and
+    would need a label change; it does not, and none was made.)  So the
+    predecessor's record is HERE, and it is addressed to a LOWER epoch --
+    ``_generation`` is allocated per worker directory, monotonically
+    (``_allocate_generation``).
+
+    The LOOK is ``read_inflight_unfenced`` because this incarnation's fence can
+    never match a predecessor's epoch by definition; the TAKE is
+    ``adopt_inflight``, the one deliberate displacing writer. Neither is
+    reimplemented here, and neither refusal list is changed.
+
+    Adopts exactly ONE status: ``inflight`` -- the state a HARD-KILLED / crashed
+    incarnation leaves behind (it never reached the park flip). The others are
+    deliberately NOT this path's:
+
+    * ``recoverable`` -- the DETACH park's record; replaying it is the RESUME
+      path's business, not spawn's.
+    * ``cancelled`` -- terminal: a killed job is never resurrected (R3/R6).
+      ``adopt_inflight`` refuses these too; the check here means we never even
+      ask.
+    * ``adopted`` -- somebody else already took it; do not double-adopt.
+
+    ...and only when the record's on-disk epoch is STRICTLY LOWER than
+    *generation*: a record at this epoch or a later one is not a dead
+    predecessor's, and this same check is what makes adoption ONCE -- the
+    adoption write restamps the record to THIS fence, so every later turn's
+    look sees its own epoch and declines.
+
+    ATTEMPTS: the caller owns R3, and ``adopt_inflight`` only VERIFIES that the
+    handed-in count follows on, so the bumped record is built here. A record
+    already at :data:`MAX_ATTEMPTS` is NOT adopted (building attempt 4 would
+    raise) -- terminalizing that job ``interrupted`` is the resume path's R3
+    decision, not spawn's.
+
+    Returns the adopted record (status ``adopted``, stamped with *fence*,
+    ``attempts`` bumped by one) or ``None`` for every "nothing to do" case --
+    no record, an unusable/corrupt journal, a status this path does not own, an
+    epoch that is not older, a refusal from ``adopt_inflight``. NOTHING is
+    logged here for those: a predecessor's leftovers are normal, not an
+    incident, and a journal must never be able to fail or noisy-fail a turn.
+    """
+    try:
+        existing, axes, _read_reason = read_inflight_unfenced(worker_dir)
+        if existing is None:
+            # Nothing journalled, or unusable: nothing to adopt, nothing to say.
+            return None
+        if existing.status != STATUS_INFLIGHT:
+            # ``recoverable`` belongs to the RESUME path (the detach park left
+            # it for replay), ``cancelled`` is terminal, ``adopted`` is taken.
+            return None
+        epoch = (axes or {}).get("epoch")
+        if type(epoch) is not int or epoch >= generation:
+            # Not a DEAD predecessor's record -- either our own (already
+            # adopted, or written by this turn) or a newer incarnation's.
+            return None
+        if existing.attempts + 1 > MAX_ATTEMPTS:
+            # R3 territory: the caller must terminalize as ``interrupted``.
+            return None
+        bumped = InflightRecord(
+            query_id=existing.query_id,
+            query=existing.query,
+            status=STATUS_INFLIGHT,
+            attempts=existing.attempts + 1,
+            requested_by=existing.requested_by,
+            created_at=existing.created_at,
+            updated_at=utcnow_iso(),
+            last_tool=existing.last_tool,
+            reason=existing.reason,
+        )
+        adopted, _refusal = adopt_inflight(worker_dir, fence, bumped)
+        return adopted
+    except Exception as exc:  # bookkeeping must never fail a turn
+        log("WARNING", "tools.worker",
+            f"[journal] adoption failed for worker '{fence.worker_name}': {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
@@ -1139,6 +1347,24 @@ class WorkerThread(threading.Thread):
         # such as the WLM handler). Stamped into the envelope so send_query
         # can correlate replies even when multiple callers overlap.
         self._current_query_id: Optional[str] = None
+        # S7b-3 (Option K): the reason a DELIBERATE kill cancelled this turn
+        # with, or None. Set by ``_journal_cancel`` (i.e. only on a kill that
+        # opted in) and consulted at WRITE POINT 3: the loop's exit must not
+        # erase the ``cancelled`` record that very kill just left, because that
+        # record is the terminal evidence the kill exists to produce. Cleared
+        # per turn, so it can never leak into a later turn's exit.
+        self._journal_cancel_reason: Optional[str] = None
+        # S7b-4a: the record a DEAD predecessor left in this worker's
+        # directory, once THIS incarnation took it over at turn start. ``None``
+        # means nothing has been adopted yet, which is also what makes adoption
+        # happen exactly ONCE per incarnation. The stored record is the adopted
+        # one (status ``adopted``, attempts bumped), kept for observability.
+        self._journal_adopted: Optional[InflightRecord] = None
+        # S7b-4b: the attempt count a REPLAYED turn must carry to disk, keyed by
+        # the adopted query id. Written at adoption, POPPED by WRITE POINT 1 of
+        # the turn that is that replay -- so an ordinary turn writes 0 and the
+        # count can never bleed into a later turn.
+        self._journal_replay_attempts: Dict[str, int] = {}
         # Per-caller reply channel (set by run() when it dequeues a
         # (query_id, query, reply_q) triple from send_query). Envelopes are
         # routed to this private queue when set, so concurrent send_query
@@ -1594,15 +1820,39 @@ class WorkerThread(threading.Thread):
         # Unblock the input queue wait so the park flags are re-read.
         self._input_queue.put(_PARK_SENTINEL)
 
-    def kill(self) -> None:
+    def kill(self, *, journal_reason: Optional[str] = None) -> None:
         """Terminate the worker: signal the run loop to exit and reclaim it.
 
         PHASE 2.1a: this is the ONLY termination path — ``stop`` detaches.
+
+        S7b-3 (Option K): *journal_reason* opts this kill IN to the inflight
+        journal.  It is keyword-only and defaulted to ``None`` on purpose — a
+        plain ``kill()`` keeps its exact previous behaviour (no journal read,
+        no journal write), which is what a crash-shaped / best-effort kill and
+        every existing call site want.  A caller that KNOWS the kill is
+        deliberate (a manager stop, a reset) passes a reason, and the turn on
+        disk becomes: record ``cancelled`` + job ``stopped``, both carrying
+        that reason.
+
+        The bookkeeping is guarded and runs FIRST, before the duties below,
+        but never GATES them: a journal failure may not stop a worker from
+        dying.
         """
         # Synchronous lifecycle transition: 'killed' must be observable before
         # the run loop acknowledges the stop event.
         self.status = "killed"
         self._write_status_file()
+        if journal_reason is not None:
+            # S7b-3 (Option K): a DELIBERATE kill records itself as terminal
+            # bookkeeping before the worker goes away — the record is flipped
+            # to ``cancelled`` (never to be resurrected, and the one live-
+            # looking status a successor's ordinary write may displace) and the
+            # job this turn belonged to is terminalized ``stopped`` with the
+            # same reason in its envelope, so one grep finds both halves.  The
+            # content is deliberately empty: the loop's own reply envelope
+            # (written by run()) carries the human-facing message.
+            self._journal_cancel(reason=journal_reason)
+            self._journal_interrupt_job("", status="stopped", reason=journal_reason)
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
             try:
@@ -1948,6 +2198,12 @@ class WorkerThread(threading.Thread):
         self._timeout_triggered = False
         self._pruned_since_last_query = 0
         self._current_query_id = None
+        self._journal_cancel_reason = None
+        # A reset is a NEW incarnation at a NEW epoch: whatever the previous
+        # incarnation adopted is no longer this one's business, and the record
+        # it might adopt afresh is a genuinely dead predecessor's.
+        self._journal_adopted = None
+        self._journal_replay_attempts.clear()
         self._current_reply_queue = None
         self.current_task = None
         self.error = None
@@ -1983,6 +2239,205 @@ class WorkerThread(threading.Thread):
             instance_id=self.instance_id,
             epoch=self._generation,
         )
+
+    # ── inflight journal write points (S7b-2b) ──────────────────────────────
+    # The journal is BOOKKEEPING for a successor incarnation, never a gate:
+    # every call below is fenced through ``_fence()`` (the same fresh, live
+    # ``_generation``-derived identity the command channel uses, so a record
+    # can never be stamped with a fence that disagrees with this incarnation's)
+    # and a write that raises or is REFUSED is only logged -- no journal
+    # failure may fail, delay or alter a turn.
+
+    def _journal_write(
+        self,
+        *,
+        query_id: str,
+        query: str,
+        status: str,
+        created_at: str,
+        last_tool: Optional[Dict[str, str]] = None,
+        reason: Optional[str] = None,
+        attempts: int = 0,
+    ) -> bool:
+        """Journal this turn as *status*; True when the record reached disk.
+
+        WRITE POINT 1 (turn start) and WRITE POINT 2 (each tool call) call
+        this with ``STATUS_INFLIGHT``; WRITE POINT 4 (the DETACH park) with
+        ``STATUS_RECOVERABLE`` and a ``reason``.  ``created_at`` is threaded
+        in by the caller so an update is an UPDATE -- identity (``query_id``,
+        ``created_at``) is set once per turn, never re-stamped.
+
+        ``attempts`` defaults to 0: a fresh turn is not a replay.  The ONE
+        caller that passes otherwise is WRITE POINT 1 of a turn adopted from a
+        dead predecessor (S7b-4b), which must carry the adoption's bumped count
+        to disk -- re-stamping 0 there would wipe the pre-crash count and
+        ``MAX_ATTEMPTS`` could never fire, so a poison query would replay
+        forever.  ``requested_by`` is a heuristic, not
+        an identity claim: a turn that arrived through
+        ``send_query``/``submit_query`` carries a query id (the registry job
+        id), while one ``run()`` drained off the input queue in WLM mode does
+        not -- in that case the journal's ``query_id`` is synthetic and no job
+        exists to terminalize.
+        """
+        record = InflightRecord(
+            query_id=query_id,
+            query=query,
+            status=status,
+            attempts=attempts,
+            requested_by=(
+                "send_query" if self._current_query_id is not None
+                else "worker_queue"
+            ),
+            created_at=created_at,
+            updated_at=utcnow_iso(),
+            last_tool=last_tool,
+            reason=reason,
+        )
+        try:
+            refusal = write_inflight(self._worker_dir, record, self._fence())
+        except Exception as exc:
+            # Construction validates too (an invalid status/last_tool is a
+            # caller bug), so the whole call is inside the guard: the turn is
+            # what matters, not the bookkeeping.
+            log("WARNING", "tools.worker",
+                f"[journal] write failed for worker '{self.worker_name}' "
+                f"(query_id={query_id}, status={status}): {exc}")
+            return False
+        if refusal is not None:
+            # A refusal is NOT an error to act on here: the only recorded
+            # reason to refuse is another incarnation's non-cancelled record,
+            # and displacing that is a deliberate adoption (S7b-4), not
+            # something a turn may do implicitly.  So: log, and run on.
+            log("WARNING", "tools.worker",
+                f"[journal] write refused for worker '{self.worker_name}' "
+                f"(query_id={query_id}, status={status}): {refusal}")
+            return False
+        return True
+
+    def _journal_clear(self) -> None:
+        """Drop THIS incarnation's journal record (WRITE POINT 3).
+
+        Called on every terminal exit of the loop that did NOT park, so a
+        completed turn leaves nothing for a successor to replay.  Idempotent
+        (nothing to remove is success) and fenced: a record belonging to
+        another incarnation is left alone -- that is the successor's evidence,
+        not ours to erase.  Never raises.
+        """
+        try:
+            reason = clear_inflight(self._worker_dir, self._fence())
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] clear failed for worker '{self.worker_name}': {exc}")
+            return
+        if reason is not None:
+            log("WARNING", "tools.worker",
+                f"[journal] clear refused for worker '{self.worker_name}': "
+                f"{reason}")
+
+    def _journal_cancel(self, *, reason: str) -> None:
+        """Flip THIS incarnation's journal record to ``cancelled`` (S7b-3).
+
+        A DELIBERATE kill (``kill(journal_reason=...)``) is not a crash: the
+        turn will never be resumed by anyone, so its record must say that
+        instead of being left ``inflight`` for a successor to mistake for
+        recoverable work.  ``cancelled`` is exactly that statement -- and it is
+        also the one live-looking status ``write_inflight`` lets an ordinary
+        write displace, so the husk a kill leaves behind cannot wedge the next
+        legitimate turn.
+
+        Read-modify-write over the record on disk, never a fresh one: identity
+        (``query_id``, ``created_at``, ``query``) and ``last_tool`` are carried
+        over, so a cancel is an UPDATE of the turn that exists.  NO record on
+        disk means nothing to cancel -- a kill on an idle worker must not
+        conjure a phantom turn for a successor to find.  ``attempts`` is
+        re-stamped 0 by ``_journal_write`` (which owns that field: the journal
+        records the turn, not a replay count).
+
+        Idempotent: a repetition for the same reason finds the record already
+        ``cancelled`` and writes nothing, so the first cancel's bytes -- and its
+        ``updated_at`` -- survive a repeated request unchanged.
+
+        Fenced like every other write point: a record belonging to another
+        incarnation reads as absent here and is left byte-identical.
+
+        Never raises: it is bookkeeping for a worker that is dying.
+        """
+        try:
+            existing, _why = read_inflight(self._worker_dir, self._fence())
+            if existing is None:
+                return
+            if existing.status == STATUS_CANCELLED and existing.reason == reason:
+                return
+            cancelled = self._journal_write(
+                query_id=existing.query_id,
+                query=existing.query,
+                status=STATUS_CANCELLED,
+                created_at=existing.created_at,
+                last_tool=existing.last_tool,
+                reason=reason,
+            )
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] cancel failed for worker '{self.worker_name}': {exc}")
+            return
+        if cancelled:
+            # Only a record that really reached disk may hold WRITE POINT 3
+            # back: if the cancel was refused or failed there is nothing on
+            # disk worth keeping, and the exit must clear as usual.
+            self._journal_cancel_reason = reason
+
+    def _journal_interrupt_job(
+        self,
+        content: str,
+        *,
+        status: str = "interrupted",
+        reason: str = _JOURNAL_DETACH_REASON,
+    ) -> None:
+        """Terminalize the job whose turn was ABANDONED mid-flight.
+
+        Two abandoners use this, and only the status/reason differ:
+
+        * the DETACH park (defaults: ``interrupted`` +
+          ``_JOURNAL_DETACH_REASON``) -- the turn's work is thrown away, so
+          the job it belonged to must never be completed or restarted by a
+          later join;
+        * a DELIBERATE kill (``stopped`` + the kill's own ``journal_reason``)
+          -- S7b-3.  ``stopped`` is the JOB's vocabulary for "a user/operator
+          ended this", which is exactly what the kill's reason says.
+
+        ``WorkerJobRegistry.terminalize`` takes no ``reason`` parameter, so the
+        reason rides in the ENVELOPE instead (stored verbatim as the job's
+        result) -- one string, one grep, both halves.
+
+        No ``_current_query_id`` (a turn drained off the input queue) means no
+        job to terminalize; that is the normal WLM-mode case, not a failure.
+        """
+        job_id = self._current_query_id
+        if job_id is None:
+            return
+        try:
+            registry = _get_worker_job_registry()
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] job registry unavailable for worker "
+                f"'{self.worker_name}' (query_id={job_id}): {exc}")
+            return
+        if registry is None:
+            return
+        try:
+            registry.terminalize(
+                job_id,
+                status=status,
+                envelope={
+                    "content": content,
+                    "status": status,
+                    "reason": reason,
+                },
+            )
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] terminalize failed for worker '{self.worker_name}' "
+                f"(query_id={job_id}): {exc}")
 
     def _poll_command(self) -> None:
         """Consume one command from this worker's fenced cross-process channel.
@@ -2368,6 +2823,100 @@ class WorkerThread(threading.Thread):
         from tools.sleep_tool import unbind as _unbind_turn_cancel
         _bind_turn_cancel(self._turn_cancel)
 
+        # ── S7b-4a: ADOPT the dead predecessor's turn, ONCE, before WP1 ─────
+        # A crashed incarnation leaves an ``inflight`` record in THIS directory
+        # (instance 1 keeps the bare worker name, so the successor reuses it --
+        # see ``_adopt_predecessor_journal``), and WRITE POINT 1 below would be
+        # REFUSED by it: ``write_inflight`` fails closed on foreign work in
+        # progress. Adoption is the one deliberate takeover, so it happens here,
+        # at turn start, before the write, and at most once per incarnation
+        # (``_journal_adopted``); every later turn finds its own epoch on disk
+        # and adopts nothing. A journal that is absent, corrupt or somebody
+        # else's business is a silent no-op -- a predecessor's leftovers must
+        # never fail or noise up this turn.
+        if self._journal_adopted is None:
+            _adopted_record = _adopt_predecessor_journal(
+                self._worker_dir, self._fence(), self._generation
+            )
+            if _adopted_record is not None:
+                self._journal_adopted = _adopted_record
+                log("INFO", "tools.worker",
+                    f"[journal] adopted query '{_adopted_record.query_id}' from "
+                    f"a dead predecessor "
+                    f"(attempt {_adopted_record.attempts})")
+                # The adopted turn must RUN, not merely be recorded: queue it
+                # the way ``send_query`` does -- a ``(query_id, query,
+                # reply_q)`` TRIPLE, NOT the bare string the spawn auto-query
+                # and the WLM handler use.
+                #
+                # The ID is the whole reason for the triple. ``run()`` unpacks
+                # the item at worker_thread.py:3607-3618, and a bare string
+                # takes the ``query_id, query, reply_q = None, raw, None``
+                # branch: ``self._current_query_id`` would be ``None``, so the
+                # crashed caller's job-registry entry could never be finished
+                # -- run() only completes it when the id is set
+                # (``if self._current_query_id is not None: _registry.complete(
+                # self._current_query_id, envelope)``, :3996-4002) and only
+                # stamps ``envelope['query_id']`` in that same case
+                # (:3957-3958). The caller sitting in ``wait_for_job`` on that
+                # job would hang on a job nobody can terminalize. With the
+                # triple the replay IS attributed to the dead job and its
+                # envelope closes that entry.
+                #
+                # ``reply_q=None`` is accepted and safe: the envelope simply
+                # falls back to the shared output queue (``_emit_reply``,
+                # :1569-1575) -- the dead caller's private reply queue died
+                # with it.
+                #
+                # It runs on the NEXT loop iteration, exactly once: the queue
+                # item is consumed, and this block cannot fire again. Nothing is
+                # lost (the record's query text is carried, not dropped) and
+                # nothing runs twice (the adopted record is not replayed from
+                # disk, it is queued).
+                self._journal_replay_attempts[_adopted_record.query_id] = (
+                    _adopted_record.attempts
+                )
+                self._input_queue.put(
+                    (_adopted_record.query_id, _adopted_record.query, None)
+                )
+
+        # ── WRITE POINT 1: journal the turn BEFORE it runs ──────────────────
+        # Placed here, not earlier, so the two early returns above (no agent,
+        # stop already signalled) leave NO stale record behind: nothing is
+        # journalled that this loop does not then either finish or park.  The
+        # query id is the registry job id when this turn has one; otherwise
+        # (a turn drained off the input queue in WLM mode) a synthetic one, so
+        # a successor can still name the work it is recovering.
+        _journal_query_id = self._current_query_id or uuid.uuid4().hex
+        _journal_created_at = utcnow_iso()
+        _journal_last_tool: Optional[Dict[str, str]] = None
+        # Set by the DETACH park, which is the ONE exit that must leave the
+        # record behind; every other terminal exit clears it (WRITE POINT 3).
+        _journal_parked = False
+        # S7b-3: cleared HERE, at the start of the turn and before the write,
+        # because a kill sets it MID-turn (after this line) and the value must
+        # then survive to WRITE POINT 3.  A later turn must not inherit it --
+        # that turn has its own record to clear.
+        self._journal_cancel_reason = None
+        # S7b-4b: a REPLAYED turn carries the adoption's attempt count to disk
+        # instead of re-stamping 0 -- re-stamping would wipe the pre-crash count
+        # on this very write, MAX_ATTEMPTS could never fire and a poison query
+        # would replay forever. ``pop`` makes it apply to exactly ONE turn: an
+        # ordinary turn finds no entry and writes 0.
+        self._journal_write(
+            query_id=_journal_query_id,
+            query=query,
+            status=STATUS_INFLIGHT,
+            created_at=_journal_created_at,
+            attempts=self._journal_replay_attempts.pop(
+                self._current_query_id, 0
+            ),
+        )
+
+        # A pause is reported to the bus/status file ONCE per turn, even though
+        # every remaining event of the draining turn observes the park flag.
+        _pause_reported = False
+
         try:
             for event in self._agent.process_query(query):
                                 # Fix 1.1B: Poll for stop command on every event
@@ -2404,23 +2953,66 @@ class WorkerThread(threading.Thread):
                     })
                     break
 
-                # Check pause signal
+                # Check pause signal.
+                #
+                # A PAUSE IS COOPERATIVE.  pause() has already put the agent
+                # into reading mode, whose whole point is to make it CONCLUDE
+                # this turn with a Respond instead of being cut off.  Replacing
+                # the turn with a synthetic "paused" envelope here threw that
+                # conclusion away -- work the user had already paid for -- and
+                # contradicted the reading-mode contract (pinned by
+                # tests/test_worker_pause_mid_turn_cooperative.py).  So: tell
+                # the agent to wind down, report the pause ONCE, and keep
+                # draining events until the agent's own conclusion arrives;
+                # run() parks the worker (and returns this loop's reply) once
+                # the turn is over.
+                #
+                # DETACH is deliberately NOT cooperative: it is the explicit
+                # "park now" signal (it also cancels the in-flight turn via
+                # _turn_cancel), so it keeps the terminal envelope and parks
+                # without waiting for the turn to wind down.
                 if self._park_event.is_set():
-                    self._agent.request_pause()
-                    self.status = "paused"
-                    self._write_status_file()
-                    self._publish_event('worker_paused', {
-                        'status': 'paused',
-                        'worker_name': self.worker_name,
-                        'session_id': self.session_id or "",
-                        'current_context_tokens': self.get_current_context_tokens(),
-                        'max_context_tokens': self.max_context_tokens,
-                    })
-                    final_content = json.dumps({
-                        "status": "paused",
-                        "message": "Worker paused by user",
-                    })
-                    break
+                    if not _pause_reported:
+                        _pause_reported = True
+                        self._agent.request_pause()
+                        self.status = "paused"
+                        self._write_status_file()
+                        self._publish_event('worker_paused', {
+                            'status': 'paused',
+                            'worker_name': self.worker_name,
+                            'session_id': self.session_id or "",
+                            'current_context_tokens': self.get_current_context_tokens(),
+                            'max_context_tokens': self.max_context_tokens,
+                        })
+                    if self._detach_requested:
+                        final_content = json.dumps({
+                            "status": "paused",
+                            "message": "Worker paused by user",
+                        })
+                        # ── WRITE POINT 4: DETACH abandons the turn ────────
+                        # The work under way is DISCARDED (unlike a pause,
+                        # which concludes the turn), so the record flips to
+                        # ``recoverable`` -- it is the successor's to replay --
+                        # and the job this turn belonged to is terminalized
+                        # ``interrupted`` so a join can never complete or
+                        # restart it.  The envelope stays the production stub
+                        # (run() stamps ``query_id`` into the reply); only the
+                        # JOB's envelope carries the reason.
+                        _journal_parked = True
+                        self._journal_write(
+                            query_id=_journal_query_id,
+                            query=query,
+                            status=STATUS_RECOVERABLE,
+                            created_at=_journal_created_at,
+                            last_tool=_journal_last_tool,
+                            reason=_JOURNAL_DETACH_REASON,
+                        )
+                        self._journal_interrupt_job(final_content)
+                        break
+                else:
+                    # A resume that lands inside this same turn clears the park
+                    # flag; a later pause must report itself again.
+                    _pause_reported = False
 
                 # WLM: surface the supervisor's soft-timeout warning to the
                 # worker log exactly once per query (the worker loop keeps
@@ -2539,6 +3131,26 @@ class WorkerThread(threading.Thread):
                             f"Execution registration failed for worker "
                             f"'{self.worker_name}': {exc}")
 
+                    # ── WRITE POINT 2: the tool now in flight ─────────────
+                    # R2's replacement for a per-tool idempotency ledger: the
+                    # successor gets ``{name, args_hash}`` of the LAST tool this
+                    # abandoned turn called, so a post-crash replay can tell a
+                    # side-effecting call from a pure one.  An UPDATE: same
+                    # query id, same ``created_at``, status still ``inflight``.
+                    _journal_tool = event.get("name") or event.get("tool_name")
+                    if isinstance(_journal_tool, str) and _journal_tool:
+                        _journal_last_tool = {
+                            "name": _journal_tool,
+                            "args_hash": _sha256_args(event.get("arguments")),
+                        }
+                        self._journal_write(
+                            query_id=_journal_query_id,
+                            query=query,
+                            status=STATUS_INFLIGHT,
+                            created_at=_journal_created_at,
+                            last_tool=_journal_last_tool,
+                        )
+
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
                     final_content = json.dumps({
@@ -2617,6 +3229,24 @@ class WorkerThread(threading.Thread):
 
         # Capture final token usage
         self._final_token_usage = self.get_current_context_tokens()
+
+        # ── WRITE POINT 3: nothing is left to recover ───────────────────────
+        # Every exit that reaches here DELIVERED (or explicitly reported) this
+        # turn's work: success, a budget refusal, stop, an agent error, a stop
+        # reason, an exception.  So the record goes, unconditionally -- with
+        # TWO exceptions.  The DETACH park threw the turn away and has already
+        # flipped the record to ``recoverable`` for its successor: clearing
+        # that here would erase exactly the evidence the park exists to leave.
+        # A DELIBERATE kill is the second: it cancelled the record (``cancelled``
+        # + its reason), which is the TERMINAL EVIDENCE the kill exists to
+        # produce -- the same principle, one status over.  ``clear_inflight``
+        # deletes any record fenced to this incarnation regardless of status,
+        # so without this guard the loop's own exit would erase the cancel a
+        # moment after writing it.  A PAUSE needs no special case: it falls
+        # through to this clear like any other completed turn (the turn was
+        # drained, not lost).
+        if not _journal_parked and self._journal_cancel_reason is None:
+            self._journal_clear()
 
         return final_content
 
@@ -2761,7 +3391,7 @@ class WorkerThread(threading.Thread):
                     "stop for this instance)")
             # Create per-worker EventBus early so _publish_event below works
             self._event_bus = EventBus()
-            register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus, instance_id=self.instance_id)
+            register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus, instance_id=self.instance_id, epoch=self._generation)
             # Attach EventLogger to this worker's per-worker bus
             try:
                 from agent.logging.event_logger import EventLogger
@@ -3494,11 +4124,20 @@ class WorkerThread(threading.Thread):
                     _WorkerRegistry.get_instance().unregister_worker(
                         self.session_id or "", self.worker_name,
                         instance_id=self.instance_id,
+                        epoch=getattr(self, "_generation", None),
                     )
                 except Exception:
                     pass
+                # S7a-3: mirror that removal onto the handle store, with the
+                # same epoch -- a dying predecessor's finally must not unplug
+                # its successor's handle.  Keyed by the RAW session id, the
+                # value spawn registered under and the routes look up with.
+                _unregister_runtime_handles(
+                    [(self.session_id, self.worker_name, self.instance_id)],
+                    epoch=getattr(self, "_generation", None),
+                )
             try:
-                unregister_worker_event_bus(self.session_id or "", self.worker_name, instance_id=self.instance_id)
+                unregister_worker_event_bus(self.session_id or "", self.worker_name, instance_id=self.instance_id, epoch=getattr(self, "_generation", None))
             except Exception:
                 pass
             if self._worker_ctx is not None:
@@ -4662,6 +5301,7 @@ class Worker(ToolBase):
                             getattr(thread, "instance_id", None),
                         )
                     else:
+                        _replaced_handle_keys = []
                         with _registry_lock:
                             for key, t in list(_worker_registry.items()):
                                 if (
@@ -4670,6 +5310,15 @@ class Worker(ToolBase):
                                     and t is thread
                                 ):
                                     _worker_registry.pop(key, None)
+                                    _replaced_handle_keys.append(key)
+                        # S7a-3: drop the replaced incarnation's handle too,
+                        # outside the registry lock and fenced with ITS epoch, so
+                        # this teardown can never unplug the handle of the
+                        # instance this spawn is about to create.
+                        _unregister_runtime_handles(
+                            _replaced_handle_keys,
+                            epoch=getattr(thread, "_generation", None),
+                        )
                 stopped_info.append({"session_id": sid, "status": thread.status})
             if stopped_info:
                 logger.info(
@@ -5081,6 +5730,13 @@ class Worker(ToolBase):
             except Exception:
                 container_manager = None
 
+        # Spawn-time snapshot semantics must be enforced by COPY: passing the
+        # supervisor's object by reference would leave every worker of a
+        # session sharing ONE mutable permissions dict.
+        _spawn_permissions = self.effective_permissions or self.session_permissions
+        if _spawn_permissions is not None:
+            _spawn_permissions = dict(_spawn_permissions)
+
         # Create and start the worker thread
         thread = WorkerThread(
             name=self.worker_name,
@@ -5088,7 +5744,7 @@ class Worker(ToolBase):
             agent_config=agent_config,
             workspace_dir=ws_dir,
             tool_classes=tool_classes if tool_classes else None,
-            session_permissions=self.effective_permissions or self.session_permissions,
+            session_permissions=_spawn_permissions,
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
@@ -5108,17 +5764,23 @@ class Worker(ToolBase):
         # the worker body's import graph, which the child process also loads),
         # not because of an import cycle -- worker_runtime imports only the
         # protocol module.
-        from tools.workspace.worker_runtime import attach_thread_frame_sink
+        from tools.workspace.worker_runtime import (
+            attach_thread_frame_sink,
+            register_runtime_handle,
+        )
 
-        attach_thread_frame_sink(thread)
+        _runtime_handle = attach_thread_frame_sink(thread)
 
-        # Store initial context for the thread to pick up in run()
+        # Store initial context for the thread to pick up in run().  This is a
+        # COPY, not an alias: the caller may reuse one context dict across
+        # several spawns, so aliasing it and then mutating it in place would
+        # cross-contaminate workers and mutate caller-owned state.
         if self.context is not None and isinstance(self.context, dict):
-            thread._initial_context = self.context
+            thread._initial_context = dict(self.context)
         else:
             thread._initial_context = {}
 
-        # Merge purpose, style, meta into initial context
+        # Merge purpose, style, meta into the COPY (never into self.context)
         if self.purpose is not None:
             thread._initial_context["purpose"] = self.purpose
         if self.style is not None:
@@ -5200,6 +5862,75 @@ class Worker(ToolBase):
                     "live_workers": live_now,
                 }
             _worker_registry[(session_key, self.worker_name, spawn_iid)] = thread
+            # S7a: seed the epoch record in THIS SAME critical section. Without
+            # it the raw write above registers a thread with no epoch, so the
+            # fenced run() teardown (CAS on the thread's own _generation) can
+            # never match and the entry would leak in _worker_registry forever.
+            # register_worker() cannot be used here: it takes this very
+            # (non-reentrant) _registry_lock, and moving the registration
+            # outside the block would re-open the capped-spawn TOCTOU race this
+            # block exists to close.
+            _spawn_epoch = getattr(thread, "_generation", None)
+            # S7a: mirror WorkerRegistry._coerce_epoch — only a real int may become
+            # an epoch; a duck-typed/mocked _generation must degrade to unversioned
+            # rather than poisoning the map with a value that breaks later int
+            # comparisons on this key.
+            if not isinstance(_spawn_epoch, int) or isinstance(_spawn_epoch, bool):
+                _spawn_epoch = None
+            if _spawn_epoch is not None:
+                _spawn_key = (session_key, self.worker_name, spawn_iid)
+                _stored_epoch = _registry_instance._worker_epochs.get(_spawn_key)
+                if _stored_epoch is None or _stored_epoch <= _spawn_epoch:
+                    _registry_instance._worker_epochs[_spawn_key] = _spawn_epoch
+
+        # S7a-3: publish the handle the frame-sink attachment just built, so the
+        # supervisor's command path can reach this worker in process instead of
+        # only through ``command.json``.
+        #
+        # Placement is AFTER the critical section above, never inside it: the
+        # handle store takes its own lock, and the ordering every caller
+        # respects is registry -> handle, never the other way round.  The
+        # section itself is not restructured for this -- moving the registry
+        # write out of it would re-open the capped-spawn TOCTOU race the block
+        # exists to close.
+        #
+        # The key's session id is the RAW ``self.session_id``, not
+        # ``session_key``: the routes look a handle up with exactly the value
+        # they address the worker with, and ``_NO_SESSION_KEY`` is a
+        # registry-only sentinel -- keying handles with it would make every
+        # legacy worker's handle unreachable, a silent miss instead of a
+        # visible failure.
+        #
+        # Fail open, like the other spawn-side bookkeeping here: an instance id
+        # that is not an int cannot key a handle, and a spawn must never break
+        # over it (nor invent a default).  ``epoch`` is the same coerced value
+        # seeded into ``_worker_epochs`` above, so the store's compare-and-set
+        # speaks the registry's language; ``None`` means "unversioned" and
+        # registers exactly as it did before this change.
+        try:
+            if isinstance(spawn_iid, int) and not isinstance(spawn_iid, bool):
+                register_runtime_handle(
+                    _runtime_handle,
+                    session_id=self.session_id,
+                    worker_name=self.worker_name,
+                    instance_id=spawn_iid,
+                    epoch=_spawn_epoch,
+                )
+            else:
+                logger.debug(
+                    "Spawn: not registering a runtime handle for worker '%s' "
+                    "instance %r: the instance id is not an int",
+                    self.worker_name,
+                    spawn_iid,
+                )
+        except Exception:
+            logger.debug(
+                "Spawn: could not register a runtime handle for worker '%s' "
+                "instance %r",
+                self.worker_name,
+                spawn_iid,
+                exc_info=True,
+            )
 
         # ── Commit 8: dispatch window opens — the worker thread starts here ──
         dispatch_started_at = time.time()
@@ -6159,7 +6890,18 @@ class Worker(ToolBase):
             wdir = getattr(t, "_worker_dir", None)
             if wdir is None:
                 return
-            for fname in ("context.json", "status.json", "command.json"):
+            # S7b-3: the inflight journal goes too.  A reset's promise is that
+            # the next spawn starts COMPLETELY fresh, and a surviving record --
+            # whatever its status -- would either owe a successor a replay or
+            # hold a new turn's write up as a foreign leftover.  ``unlink``
+            # never parses the file, so a corrupt journal is dropped by this
+            # same entry without a decode step that could raise.
+            for fname in (
+                "context.json",
+                "status.json",
+                "command.json",
+                INFLIGHT_FILENAME,
+            ):
                 try:
                     (wdir / fname).unlink(missing_ok=True)
                 except OSError:
@@ -6170,7 +6912,13 @@ class Worker(ToolBase):
                 # TRAP T1: reset must TERMINATE (kill), never detach — a
                 # detached thread's run() finally-block would re-save the
                 # context we are about to drop from disk.
-                t.kill()
+                # S7b-3: the kill is DELIBERATE, so it opts into the journal --
+                # the record is cancelled (and the job stopped) before the
+                # files below are dropped, so a successor can never adopt a
+                # turn this reset ended by hand.  ``_drop_persisted_files``
+                # then unlinks the record: a reset leaves nothing behind at
+                # all.
+                t.kill(journal_reason=_JOURNAL_RESET_REASON)
                 # Robust join with retry (same pattern as the force-respawn
                 # termination path): the worker may be blocked inside a slow
                 # LLM call.
@@ -6192,6 +6940,7 @@ class Worker(ToolBase):
                 return {"session_id": sid, "error": str(exc)}
             finally:
                 t._cleanup_worker_containers()
+                _reset_handle_keys = []
                 with _registry_lock:
                     for key, existing_t in list(_worker_registry.items()):
                         if (
@@ -6200,6 +6949,13 @@ class Worker(ToolBase):
                             and existing_t is t
                         ):
                             _worker_registry.pop(key, None)
+                            _reset_handle_keys.append(key)
+                # S7a-3: the reset just killed this incarnation, so its handle
+                # goes with the registry entry -- fenced with its own epoch, out
+                # side the registry lock.
+                _unregister_runtime_handles(
+                    _reset_handle_keys, epoch=getattr(t, "_generation", None)
+                )
                 # Delete AFTER the join completes so the thread's run()
                 # finally-block (which re-saves the context) cannot resurrect it.
                 _drop_persisted_files(t)
@@ -6266,8 +7022,18 @@ class Worker(ToolBase):
 
         # ── Found in current session ──
         if not thread.is_alive():
+            _reset_dropped_keys = []
             with _registry_lock:
-                _worker_registry.pop((sid, self.worker_name, iid), None)
+                _reset_key = (sid, self.worker_name, iid)
+                if _worker_registry.get(_reset_key) is thread:
+                    _worker_registry.pop(_reset_key, None)
+                    _reset_dropped_keys.append(_reset_key)
+            # S7a-3: same identity guard for the handle store -- only the
+            # incarnation that was actually still registered loses its handle,
+            # and the removal is fenced with that incarnation's epoch.
+            _unregister_runtime_handles(
+                _reset_dropped_keys, epoch=getattr(thread, "_generation", None)
+            )
             thread._cleanup_worker_containers()
             _drop_persisted_files(thread)
             return {

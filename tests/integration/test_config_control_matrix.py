@@ -69,13 +69,15 @@ def _load_session(wsock, sid):
 class _FakeRegistry:
     """Dict-backed stand-in for the worker registry."""
 
+    # S7a: the registry API is epoch-fenced; these doubles model presence only.
+
     def __init__(self):
         self._workers = {}
 
-    def register_worker(self, session_id, worker_name, thread, instance_id=1):
+    def register_worker(self, session_id, worker_name, thread, instance_id=1, *, epoch=None):
         self._workers[(session_id or "", worker_name, instance_id)] = thread
 
-    def unregister_worker(self, session_id, worker_name, instance_id=1, default=None):
+    def unregister_worker(self, session_id, worker_name, instance_id=1, default=None, *, epoch=None):
         return self._workers.pop(
             (session_id or "", worker_name, instance_id), default
         )

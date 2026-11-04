@@ -156,7 +156,9 @@ spawning ──▶ ready ──▶ busy ──▶ ready            (normal turn)
   `context.json` (`:3182`) and `status.json` (`:3137`), and **the worker's containers** —
   so `_cleanup_worker_containers()` (`:2153`) must *not* run on detach.
 - **Torn down on kill:** containers reclaimed (`:5390`), context saved but not resumable,
-  status `killed` written, registry entry popped (`:5398`), `_stop_event` set.
+  status `killed` written, registry entry popped (`:5398`), `_stop_event` set. A *reasoned* kill
+  also flips the turn's journal record to `cancelled` (with that reason) and terminalizes its job
+  `stopped` (`worker_thread.py:1854-1855`); a bare `kill()` writes nothing. Paths in **Q2E**.
 - `resume()` must accept `detached`: the guard at `worker_thread.py:1524` narrows from
   `("stopping", "stopped")` to `("killed",)`, and the existing wake path
   (`:1546` `self._park_event.clear()`, `:1547` `self._resume_event.set()`, `:1554`
@@ -193,7 +195,7 @@ spawning ──▶ ready ──▶ busy ──▶ ready            (normal turn)
    `cleanup_stale_worker_containers` (`infra/container_manager.py:5104`) must be modified
    to **skip** any container belonging to a worker whose status is `detached` — left
    unmodified it destroys exactly the containers detach exists to preserve.
-A limit of that queue is worth stating before the rules: it is a queue for a **live** worker that is parked, not a mailbox for a worker whose owning process has died. The cases are distinguishable only because a detach is recorded (`_detached_state`, `infra/container_manager.py:5143`) while a crash is not — which is exactly the gap **Q2C** fills, and the TTL kill named here is enforced by the in-process watchdog the appendix flags (row 7).
+A limit of that queue is worth stating before the rules: it is a queue for a **live** worker that is parked, not a mailbox for a worker whose owning process has died. The queue itself is memory and dies with the owning process; what survives a crash is the *turn* — an `inflight` record its successor adopts (**Q2E**) — and that record recovers work, not containers. So the cases are distinguishable only because a detach is recorded against containers (`_detached_state`, `infra/container_manager.py:5143`) while a crash is not — which is exactly the gap **Q2C** fills, and the TTL kill named here is enforced by the in-process watchdog the appendix flags (row 7).
 
 
 ### Queries submitted while the worker is detached
@@ -238,9 +240,13 @@ its `job_id` back at enqueue time — `tools/workspace/job_registry.py:7` —
   forwarding hop `web_ui/backend/event_forwarder.py:84`; the audit record is written by
   `audit_event` — `thoughtmachine/audit_logger.py:125`. `bridge.py:1791` is not an audit
   path: it is cited for a different claim and must not be reused as one.
-- **Kill discards.** `kill` — and the session Stop cascade, which routes to it — drops the
-  queue and rejects the queued queries the same way, because the instance (thread, agent,
-  containers) no longer exists to run them.
+- **Kill cancels; it does not discard the evidence.** `kill` drops the *queue* and rejects the
+  queued queries, because the instance (thread, agent, containers) no longer exists to run them.
+  The *turn* is a separate matter: for every reason-carrying kill the journal record becomes
+  `cancelled` + that reason and the turn's job `stopped` + that reason (manager `_stop_thread`,
+  `worker_manager.py:882`, reason `stopped-by-manager` `:78`; `_action_reset`,
+  `worker_thread.py:6921`, reason `reset-drop`). A bare `kill()` still writes nothing, and that
+  is what leaves a turn for a successor to adopt — see **Q2E**.
 - **Reconciling with the chained-query rule above.** The mechanical ordering "clear the
   park events, then dispatch (detach → resume → query)" describes what a *resume* does to
   the first queued entry — it is not a description of what a *submission* does. A submission
@@ -264,7 +270,8 @@ Resume. The main agent cannot resume a detached worker."
 **Option A — make `stop` detach; add `kill` (Ruling 1).**
 Tradeoff: `stop` matches the operator's intent and the button's affordance; in-flight
 work is preserved; resume becomes a real operation instead of "spawn a fresh instance"
-(`worker_thread.py:1521-1522`). Cost: two verbs, two routes, a new state, and a TTL
+(`worker_thread.py:1521-1522`). A fresh instance is no longer a lossy fallback either: it adopts
+a crashed predecessor's `inflight` record and replays that turn (**Q2E**). Cost: two verbs, two routes, a new state, and a TTL
 reaper; `_action_stop`'s teardown triple (`:5389-5390`, `:5398`) has to be *split* so
 detach keeps containers and kill reclaims them.
 
@@ -490,9 +497,10 @@ thread until the SDK returns.
 Tradeoff: `WORKER_MAX_RETRIES = 3` starts meaning something
 (`agent/config/defaults.py:64`) and transient overruns self-heal. Cost: retry must
 distinguish "timed out but healthy" from `tools/workspace/worker_thread.py:4805`
-(containers already reclaimed) — retrying after reclaim is a fresh spawn with a stale
-context, i.e. a likely repeat timeout, and it multiplies token spend by up to 4x with no
-new signal. Hard call deadlines also remove the main *wedge* cause, so retries would
+(containers already reclaimed) — retrying after reclaim is a fresh spawn replaying the
+journalled query from the persisted context (**Q2E**), and that replay already exists and is
+bounded (`MAX_ATTEMPTS = 3`, `inflight_journal.py:132`), so the knob buys a second, unbounded
+multiplier. Hard call deadlines also remove the main *wedge* cause, so retries would
 mostly fire on genuinely slow work.
 
 **Option C — keep it terminal but make continuation explicit and cheap.**
@@ -514,9 +522,14 @@ state.
 (`agent/config/defaults.py:64`) — a knob that is resolved, stored and never read is the
 actual defect here, and wiring it now would add a 4x token multiplier to a failure mode
 that hard deadlines have just made rarer. Continuation, if it is ever wanted, is Q1's
-detach/resume pair (Option C above), not a retry loop.
+detach/resume pair (Option C above), not a retry loop. One retry route does exist and is named
+rather than hidden: the query-timeout path kills with **no** journal reason
+(`worker_thread.py:6322`), so the turn's `inflight` record survives and the next spawn replays it,
+bounded at `MAX_ATTEMPTS`. It is not configurable, and it is not this knob.
 
-Two consequences of that ruling are carried forward: a timeout that is terminal needs a reaper for the containers whose owner died before it could honour the ruling, and a cancellation that is honoured needs a bounded cascade down to the last layer that is still holding work. Those are **Q2C** and **Q2D**, below.
+Two consequences of that ruling are carried forward: a timeout that is terminal needs a reaper for the containers whose owner died before it could honour the ruling, and a cancellation that is honoured needs a bounded cascade down to the last layer that is still holding work. Those are **Q2C** and **Q2D**, below. A third consequence is carried forward too: kill, crash and
+detach are three exits from the same turn, distinguished only by what a record on disk says —
+**Q2E**.
 
 ### Blast radius
 
@@ -588,7 +601,7 @@ constants `container_manager.py:265-266` — `_STOP_GRACE_SECONDS = 5` /
 
 | knob | where | why it is dead | disposition |
 |---|---|---|---|
-| `WORKER_MAX_RETRIES` | `agent/config/defaults.py:64` — `WORKER_MAX_RETRIES = 3`; assigned `worker_thread.py:1010`; **never read** repo-wide (tests excluded) | retries belong to the token/hard-deadline world: a timed-out turn is terminal and the answer is re-spawn (Q2 recommendation), so a retry multiplier is a token amplifier, not a recovery | **retired** — delete the constant, the resolver and the attribute |
+| `WORKER_MAX_RETRIES` | `agent/config/defaults.py:64` — `WORKER_MAX_RETRIES = 3`; assigned `worker_thread.py:1010`; **never read** repo-wide (tests excluded) | retries belong to the token/hard-deadline world: a re-spawn now does recover the turn through the journal at a bounded `MAX_ATTEMPTS` (Q2E), so this knob is a second, unbounded, unread multiplier — not the mechanism that recovers work | **retired** — delete the constant, the resolver and the attribute |
 | `clamped_wait_for_job_timeout` | `tools/workspace/worker_timeout.py:83`, re-exported `worker_query.py:50/60`, **zero call sites** | the cap it implements becomes rule 1 (`min(...)`) at the call site, not a helper nobody calls | **retired** — fold the `min()` into the callers, delete the helper |
 | `SPAWN_QUEUE_TIMEOUT` | `agent/config/defaults.py:33` — only ever used as `fallback=` for the resume/auto waits (`worker_thread.py:4491`, `:4791`), never as a queue wait bound | a queue wait that is not a deadline is a lie in the defaults table; the real bound is the token | **retired** — either promote to a real bound or delete; do not leave it as a `fallback=` |
 
@@ -1009,6 +1022,244 @@ contract).
 - Risk: **high** — the ladder touches the teardown ordering Q2's Option A depends on
   (`worker_thread.py:4805-4817`, cleanup before any resume), and a rung that fires early is
   data loss, not a latency win.
+
+---
+
+## Q2E — The in-flight journal: what survives a kill, and how a successor recovers
+
+### Requirement
+
+A worker's turn lives in three places that all die with the process: the thread's stack, the
+agent's context in memory, and the conversation history that reaches `context.json` only when
+the turn *completes*. Q2E adds a fourth place — written before the work runs, readable after
+the writer is gone — `<workspace>/workers/<name>/inflight.json` (`INFLIGHT_FILENAME`,
+`inflight_journal.py:124`; path via `journal_path`, `:332`).
+
+Scope, narrowly: **process death** — a crash, a `SIGKILL`, a kill issued by the query-timeout
+path. It is not power-loss durability, and it claims neither crash consistency nor `fsync`: the
+write is `_atomic_write_json` (`inflight_journal.py:381`), a temp file plus `os.replace` inside
+one directory, so a concurrent reader sees the old bytes or the new bytes and never a torn
+file. What the page cache does after `os.replace` returns is outside the claim. One record, one
+turn, one small JSON file per worker directory.
+
+The requirement: *the turn a dead worker was running must be nameable on disk, and the
+successor that inherits its directory must be able to take it over exactly once, at a bounded
+cost, without a human.*
+
+### The record
+
+`InflightRecord` (`inflight_journal.py:198`) is frozen and ten fields wide, `SCHEMA_VERSION = 1`
+(`:128`):
+
+| field | written by | why it exists |
+|---|---|---|
+| `query_id` | WP1 | identity of the turn; on a replay it is the *dead* job's id, so that job is not left dangling |
+| `query` | WP1 | the text a successor replays — the record carries the work, not a pointer to it |
+| `status` | every WP | `inflight` / `recoverable` / `cancelled` / `adopted` (`:136-139`) |
+| `attempts` | WP1, adoption | `0` for a fresh turn, `predecessor + 1` for a replay; capped by `MAX_ATTEMPTS = 3` (`:132`) |
+| `requested_by` | WP1 | `send_query` when the turn carries a registry job id, else `worker_queue` — a heuristic, not an identity claim |
+| `created_at` | WP1 | identity half of the UPDATE key, never re-stamped, so a later write can tell it is updating the same turn |
+| `updated_at` | every WP | freshness (`utcnow_iso`, `:192`) |
+| `last_tool` | WP2 | `{"name", "args_hash"}` — R2's replacement for a per-tool idempotency ledger |
+| `reason` | WP4, WP5 | which exit abandoned the turn (`detached-midturn-park`, `reset-drop`, `stopped-by-manager`) |
+| `schema` | WP1 | version gate; an unknown schema reads as unusable rather than being guessed at |
+
+The four fence axes are **not** fields: `to_payload(fence)` merges them in from the
+`CommandFence` (`command_channel.py:78`) the caller passes, so identity has exactly one source
+and a record can never be stamped with a fence that disagrees with its writer. Reads are
+asymmetric on purpose: `from_payload` is strict and returns `None` instead of raising (a corrupt
+file is a data condition), while the constructor raises `ValueError` (an invalid status, or
+`attempts` outside `0..MAX_ATTEMPTS`, is a caller bug).
+
+Four statuses, and the displacement rule that makes them usable:
+
+| status | who writes it | what it means | displaced by an ordinary write? |
+|---|---|---|---|
+| `inflight` | WP1, WP2, and the adoption's take | a turn is running — or was, when its writer died | yes: by the same incarnation, or by an adoption |
+| `recoverable` | WP4, the detach park | a turn was parked mid-flight with its containers alive | yes, by the same incarnation (a resume overwrites it in place) |
+| `cancelled` | WP5, a deliberate kill | terminal evidence: nobody will resume this turn | yes — the husk a kill leaves must not wedge the next legitimate turn |
+| `adopted` | `adopt_inflight` | a successor took the turn over | no — a second adoption is refused |
+
+**The fence is a refusal, not a lock.** `write_inflight` (`:474`) fails closed when the record on
+disk belongs to another incarnation and is still work in progress: it answers `_REFUSAL_PREFIX`
+(`:157`) and leaves the foreign file byte-identical (`_refusal_for_existing`, `:423`).
+`read_inflight` (`:639`) never hands back another incarnation's record — it reads as absent and
+reports why. Nothing here is a lease, a heartbeat or a liveness probe: the file cannot tell a
+live sibling from a dead one, and does not pretend to.
+
+### Five write points, and the two exits that must not clear
+
+| # | where | what it writes | why there |
+|---|---|---|---|
+| WP1 | `worker_thread.py:2906` | `inflight` + `query` + `created_at`, `attempts` popped from the replay map (`:2911`) | placed *after* the two early returns (no agent, stop already signalled), so nothing is journalled that this loop will not go on to finish or park |
+| WP2 | `worker_thread.py:3146` | `inflight` with `last_tool = {name, args_hash}` | the only hook that reaches between tool calls; an UPDATE of the same `(query_id, created_at)` |
+| WP3 | `worker_thread.py:3248-3249` | clear of this incarnation's record (`_journal_clear`, `:2317`) | the ordinary terminal exit, so a finished turn leaves nothing to replay |
+| WP4 | `worker_thread.py:3002-3008` | `recoverable` + `reason=detached-midturn-park` (`:97`), then `_journal_interrupt_job` (`:2389`) | the detach park is the one exit that *keeps* the record; the job is terminalized `interrupted` so a join cannot complete or restart it |
+| WP5 | `worker_thread.py:1854-1855` | `cancelled` + `reason`, and the job `stopped` with the same reason | a deliberate kill is terminal evidence, not an abandonment to be recovered |
+
+Two of those exits must not be undone by WP3, and the guard is the whole of `:3248`:
+
+- the **park** sets `_journal_parked` (WP4), so the loop exit skips the clear;
+- a **deliberate kill** sets `_journal_cancel_reason` — and only if the `cancelled` record really
+  reached disk (`:2387`; a refused or failed cancel leaves the flag unset and the exit clears as
+  usual, `test_a_refused_cancel_does_not_hold_the_exit_back`).
+
+Without the guard the loop's own exit would erase the evidence a moment after writing it:
+`clear_inflight` (`:752`) deletes a record fenced to this incarnation *regardless of status*. A
+pause needs no special case — a drained turn that neither parked nor was cancelled falls through
+to the clear like any completed turn.
+
+A **reset** is the fourth path and it drops the file outright: `_drop_persisted_files` (`:6889`)
+unlinks `context.json`, `status.json`, `command.json` and `INFLIGHT_FILENAME` without ever
+parsing the journal, because a reset's promise is that the next spawn starts completely fresh
+and a surviving record — whatever its status — would either owe a successor a replay or hold a
+new turn's WP1 write up as a foreign leftover.
+
+### Kill is a cancellation, not a discard
+
+`kill(*, journal_reason: Optional[str] = None)` (`worker_thread.py:1823`) is keyword-only and
+defaulted, and the default is load-bearing: **a bare `kill()` writes nothing.** No journal read,
+no journal write, no reason — the behaviour a crash-shaped or best-effort kill wants, and the
+behaviour every call site that has not opted in keeps. `tests/test_worker_journal_kill.py` pins
+both halves (`test_a_plain_kill_journals_nothing`, `test_kill_on_an_idle_worker_writes_no_journal`).
+The bookkeeping runs first and never gates the duties: a journal that raises cannot stop a worker
+from dying (`test_a_raising_journal_never_stops_the_kill`).
+
+A caller that *knows* the kill is deliberate hands a reason over, and the record becomes
+`cancelled` + that reason while the job becomes `stopped` + that reason — one grep finds both
+halves:
+
+| supplier | where | reason | what it is saying |
+|---|---|---|---|
+| manager stop | `_stop_thread` (`worker_manager.py:882`), handed at `:898-901` | `stopped-by-manager` (`:78`) | an operator/policy stop; callers `:585`, `:606`, `:655` |
+| worker reset | `_reset_one` (`worker_thread.py:6910`) → `t.kill(journal_reason=_JOURNAL_RESET_REASON)` (`:6921`) | `reset-drop` (`:104`) | the turn is dropped, and its files are about to be unlinked |
+| detached TTL kill | `_kill_detached_worker` (`worker_manager.py:303`) → bare `thread.kill()` (`:308`) | **none — deliberate opt-out** | the parked worker's record is `recoverable`; cancelling it would misfile a resume as a discard |
+| query timeout | `worker_thread.py:6322` → bare `thread.kill()` | **none — deliberate opt-out** | the record stays `inflight`, so the next spawn replays the turn (see the limits below) |
+
+Two opt-outs and not four, and both are the same judgement: a kill with no reason leaves the
+record as the in-flight evidence its successor can act on, while a reasoned kill says the turn is
+over. Reaching the manager path is not an accident of signature discovery either —
+`_accepts_journal_reason` (`worker_manager.py:80`) inspects the callable's signature rather than
+calling it and catching `TypeError`, so a counting double is never counted twice and a genuine
+`TypeError` inside `kill` is not swallowed as "no support"
+(`test_the_manager_still_kills_a_thread_without_the_keyword`,
+`test_the_manager_falls_back_to_stop_when_kill_is_absent`).
+
+`_journal_cancel` (`:2337`) is a read-modify-write, never a fresh record: identity (`query_id`,
+`created_at`, `query`) and `last_tool` are carried over. Three properties it holds deliberately —
+no record on disk means nothing to write (a kill on an idle worker must not conjure a phantom
+turn), a repetition for the same reason finds the record already `cancelled` and writes nothing
+(`:2369-2370`, so the first cancel's bytes and `updated_at` survive), and a record fenced to
+another incarnation reads as absent and is left byte-identical.
+
+### Recovery by adoption
+
+The successor's problem is created by its own write: WP1 **fails closed** on a foreign record
+that is still work in progress, so a spawn that inherited a crashed predecessor's `inflight`
+record would run its turn unjournalled unless something displaced it. One path does — once per
+incarnation, at turn start, before WP1 (`if self._journal_adopted is None:`,
+`worker_thread.py:2837-2839`): `_adopt_predecessor_journal` (`:1057`).
+
+Why the successor has the predecessor's directory at all: the spawn-side registry scan
+(`:5294-5300`) filters on `is_alive()`, so after a crash `live_same == []`; with no explicit
+instance id, the chain (`:5301-5392`) falls through to `spawn_iid = 1`, `instance_label` returns
+the **bare** worker name for instance 1 (`worker_registry.py:129-139`) and `_worker_dir` is
+`workers/<name>` — the very directory the dead incarnation used. Two live instances never share
+it; a dead one and its successor do.
+
+The gates, in order, each one a refusal rather than an error:
+
+| gate | where | condition | if it fails |
+|---|---|---|---|
+| look | `:1126` → `read_inflight_unfenced` (`inflight_journal.py:687`) | a record exists and decodes | `None`, silently — no record, or unusable |
+| ours to take? | `:1130` | `status` is exactly `inflight` | `None`: `recoverable` is the resume path's, `cancelled` is terminal, `adopted` is taken |
+| dead predecessor | `:1135` | the on-disk `epoch` is strictly lower than this incarnation's `_generation` | `None` — a record at this epoch or a later one is not a successor's business |
+| attempts | `:1139` | `existing.attempts + 1 <= MAX_ATTEMPTS` | `None`: attempt 4 is not built, and terminalizing that job is a different decision |
+| take | `:1153` → `adopt_inflight` (`inflight_journal.py:525`) | the *only* displacing writer in the module | whatever refusal it gives, unchanged |
+
+The look is unfenced on purpose: this incarnation's fence can never match a predecessor's epoch
+by definition. The take is `adopt_inflight` and not a local reimplementation, so the module's
+refusal list stays single-sourced (`:161` nothing, `:162` cancelled, `:165` already adopted,
+`:166` own fence, `:167` unusable, `:168` attempts mismatch). The bumped record carries
+`attempts + 1` and is restamped to the **adopting** fence — which is what makes adoption once per
+incarnation: every later turn's look sees its own epoch and declines.
+
+The epoch gate is only as good as the epoch, so `_allocate_generation` (`:4153`) is monotonic per
+worker directory (a `generation` sidecar folded with any `generation` already persisted in
+`context.json`) and **fail-closed**: a lock timeout or a failed rename propagates, because a
+worker that cannot be given a strictly greater epoch must not be spawned — otherwise it could not
+tell its predecessor's record from its own.
+
+The handover into the run loop is three fields and a map:
+
+```
+self._journal_replay_attempts[_adopted_record.query_id] = _adopted_record.attempts   # :2876
+self._input_queue.put((_adopted_record.query_id, _adopted_record.query, None))        # :2879
+```
+
+— and then the ordinary path takes it: the loop pops the queue item, WP1 writes the turn with
+`attempts=self._journal_replay_attempts.pop(self._current_query_id, 0)` (`:2911`), so the
+pre-crash count reaches disk instead of being re-stamped `0`, and `pop` makes the count apply to
+exactly one turn.
+
+The query id is not decoration. `run()` unpacks the triple into `_current_query_id`
+(`:3607-3618`), that id is stamped into the reply envelope (`:3957-3958`) and used to complete the
+registry job (`:3996-4002`), and `_emit_reply` (`:1569-1575`) publishes on it. Replaying under a
+*fresh* id would leave the dead job dangling forever — no completion, no reply, an orphan row in
+the UI. `test_the_replay_carries_the_dead_job_id_so_its_job_is_not_left_dangling` exists because
+that is the failure the id prevents.
+
+Recovery is therefore: same directory, same record file, same query id, `attempts + 1`, one queue
+item, one run. `test_the_adopted_query_actually_runs_once` (once, not twice),
+`test_without_adoption_the_successors_write_point_1_is_refused` (why the path exists at all),
+`test_attempts_accumulate_across_replays_and_stop_at_the_cap` (the chain terminates), and the
+three-process chain in `tests/test_worker_multi_process_adoption.py` (a real crash and a real
+successor, not a double).
+
+### What this does not do
+
+Five limits, stated as limits:
+
+1. **Nothing reads a `recoverable` record.** A repo-wide grep finds that status only where it is
+   defined (`inflight_journal.py:137`), documented (`worker_thread.py:2266`) and written by the
+   detach park (`worker_thread.py:3005`) — there is no reader, so no resume-path replay exists.
+   A same-incarnation resume overwrites the record in place through WP1 (the fence matches, so it
+   is an ordinary update). Adoption covers `inflight` — crash, `SIGKILL`, bare kill — and only
+   that.
+2. **A query timeout replays the turn.** `worker_thread.py:6322` kills the worker with no journal
+   reason, so the record stays `inflight` and the next spawn adopts it, bounded at
+   `MAX_ATTEMPTS`. That qualifies Q2's "a timed-out turn is terminal": terminal for the
+   *instance*, recovered for the *turn*, up to three spawns.
+3. **Adoption is once per incarnation, not once per record.** The takeover restamps the record to
+   the adopting fence; the next takeover continues the chain at `attempts + 1` and stops when
+   `existing.attempts + 1 > MAX_ATTEMPTS`. A poison turn therefore costs at most three spawns,
+   and after that it stays on disk for a human.
+4. **The queue is not journaled.** `_input_queue` is memory — a replay enqueues into it at
+   `:2879` exactly like an ordinary submission — and queries waiting there die with the process.
+   Only the turn in flight is recoverable.
+5. **No fence against a wedged live sibling.** Adoption proves the record is a *dead*
+   predecessor's by epoch; it does not prove the predecessor is dead. A process that stalls
+   indefinitely while its successor is spawned can have its turn adopted and then finish it
+   anyway. Nothing here detects that, and nothing here should be read as claiming otherwise.
+
+### Blast radius
+
+One new module (`tools/workspace/inflight_journal.py`, 790 lines with its docstrings), the five
+write points and the adoption gate in `worker_thread.py`, the reason handover in
+`worker_manager.py` — and nothing else: no route, no API schema, no config key, no event type.
+
+| surface | change |
+|---|---|
+| disk | one small JSON per worker directory; one write per turn start, per tool call, per abandoning exit; the file is the size of the query text |
+| read cost | one unfenced read per incarnation (the adoption look), one fenced read per cancel |
+| failure mode | every call is wrapped and answers a `WARNING`, never an exception: a journal that cannot be written, read, cancelled or adopted degrades to exactly the pre-Q2E behaviour and the turn runs. The guard wraps construction as well as I/O, because an invalid status is a caller bug, not a reason to lose a turn |
+| unchanged behaviour | a bare `kill()`; any thread double that predates the keyword; a worker directory with no journal file; a foreign or corrupt journal (left byte-identical, read as absent) |
+| tests | `tests/test_worker_inflight_journal.py` (the module), `tests/test_worker_journal_kill.py` (kill and the two exits), `tests/test_worker_adoption_at_spawn.py` (the gates and the replay), `tests/test_worker_multi_process_adoption.py` (real processes) |
+
+What it buys, precisely: the turn a crashed incarnation was running is nameable and replayable up
+to `MAX_ATTEMPTS`, carrying its query id, its attempt count and its last tool; and a deliberate
+kill leaves terminal evidence instead of a record that looks like work in progress. What it does
+not buy: containers, the queue, a replay for `recoverable`, or a liveness check on anybody.
 
 ---
 
@@ -1588,3 +1839,39 @@ revision.
     the park events survive only as the loop's idle gate. The four Stop-cascade passages carry
     inline supersession notes. Current model: docs/design-pause-reading-mode.md.
 
+16. **Q2E added — the in-flight journal, and four statements corrected around it (this pass).**
+    A new section, **Q2E — The in-flight journal: what survives a kill, and how a successor
+    recovers**, sits between Q2D and Q3. It documents what already exists in the working tree and
+    was undocumented: `tools/workspace/inflight_journal.py` (790 lines) and its five write points
+    (WP1 `worker_thread.py:2906`, WP2 `:3146`, WP3 `:3248-3249`, WP4 `:3002-3008`, WP5 `:1854-1855`),
+    the two exits WP3 must not clear (the detach park's `_journal_parked`, a deliberate kill's
+    `_journal_cancel_reason`, set only when the `cancelled` record reached disk, `:2387`), the
+    reason suppliers (`stopped-by-manager` `worker_manager.py:78`, `reset-drop`
+    `worker_thread.py:104`, and the two deliberate opt-outs at `worker_manager.py:308` and
+    `worker_thread.py:6322`), and the one adoption path (`_adopt_predecessor_journal` `:1057`,
+    gates `:1126`/`:1130`/`:1135`/`:1139`, take `:1153`, replay enqueued at `:2879`). Four
+    statements elsewhere in this document were corrected rather than left to contradict it:
+    (a) the kill teardown (`:158-159`) now says a *reasoned* kill cancels the turn's record and
+    terminalizes its job while a bare `kill()` writes nothing; (b) the detached-queue limit
+    (`:196`) now says the queue is memory that dies with the process and that what survives a
+    crash is the *turn*, not its containers — Q2C's gap is unchanged; (c) the "Kill discards"
+    rule (`:241-243`) is now "Kill cancels; it does not discard the evidence", with the deleted
+    Stop-cascade clause removed (item 15); (d) the retry rationale (`:493-495`, `:591`) no longer
+    claims a timed-out turn is unrecoverable — a re-spawn replays it through the journal at a
+    bounded `MAX_ATTEMPTS`, which is why `WORKER_MAX_RETRIES` remains retired as a *second*,
+    unbounded multiplier rather than as the only recovery mechanism. Two consequences are
+    recorded honestly. First, `recoverable` is **write-only**: a repo-wide grep finds that status
+    only at its definition (`inflight_journal.py:137`), in a docstring (`worker_thread.py:2266`)
+    and at WP4 (`:3005`) — there is no reader, so no resume-path replay exists, and adoption
+    covers `inflight` (crash, `SIGKILL`, bare kill) only. Second, the query-timeout kill
+    (`worker_thread.py:6322`) passes no journal reason, so a timed-out turn stays `inflight` and
+    is adopted by the next spawn, bounded at `MAX_ATTEMPTS = 3` — which qualifies Q2's "a
+    timed-out turn is terminal" to: terminal for the *instance*, recovered for the *turn*. The
+    section also states the three limits that follow (adoption is once per incarnation, so a
+    chain continues at `attempts + 1`; the input queue is not journaled; there is no fence
+    against a wedged live sibling finishing an already-adopted turn). No claim is made about
+    power loss, crash consistency or `fsync`: the write is a temp file plus `os.replace` inside
+    one directory (`_atomic_write_json`, `inflight_journal.py:381`). Scope of this pass was
+    documentation only — the journal code was not touched. Suite state quoted from the S7b-4
+    breadth gate, **not re-run here**: `6506 passed, 64 skipped, 3 deselected, 5 xfailed,
+    0 failed` across four quartile runs.

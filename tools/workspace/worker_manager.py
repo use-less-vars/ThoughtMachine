@@ -47,6 +47,7 @@ but NO ``reset`` — that action is unsupported until W3 adds it).
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -67,6 +68,33 @@ from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_timeout import wait_for_worker_exit
 
 logger = logging.getLogger(__name__)
+
+#: Reason handed to ``WorkerThread.kill(journal_reason=...)`` on every manager
+#: stop (S7b-3).  A manager stop is DELIBERATE, so the turn it ends is recorded
+#: as terminal bookkeeping rather than left behind as ``inflight`` work a
+#: successor would try to recover: the journal record becomes ``cancelled`` and
+#: the job ``stopped``, both carrying this string.
+_MANAGER_STOP_JOURNAL_REASON = "stopped-by-manager"
+
+
+def _accepts_journal_reason(fn: Any) -> bool:
+    """True when *fn* can be called with a ``journal_reason`` keyword.
+
+    A SIGNATURE check, deliberately not "call it and catch TypeError": a
+    lightweight thread double that counts calls would be counted twice by a
+    failed attempt, and a genuine TypeError raised INSIDE ``kill`` would be
+    swallowed as "no support" instead of surfacing.  ``**kwargs`` counts,
+    since that is how a double declares "I take anything".
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "journal_reason" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 
 class WorkerCapExceeded(Exception):
@@ -208,7 +236,7 @@ class PeriodicStaleCheck(threading.Thread):
         # -- loudly (runtime channel + audit log), never silently dropped.
         self._reject_queued_queries(thread, worker_name)
         self._kill_detached_worker(thread, worker_name)
-        self._forget_worker(key, session_id, worker_name)
+        self._forget_worker(key, session_id, worker_name, thread)
 
     def _announce_detached_ttl_kill(
         self, thread: Any, session_id: str, worker_name: str, age: float
@@ -304,7 +332,9 @@ class PeriodicStaleCheck(threading.Thread):
             instance_id = getattr(thread, "instance_id", 1)
         return session_id or "", worker_name, instance_id
 
-    def _forget_worker(self, key: Any, session_id: str, worker_name: str) -> None:
+    def _forget_worker(
+        self, key: Any, session_id: str, worker_name: str, thread: Any = None
+    ) -> None:
         """Drop a killed worker's registry entry (never raises)."""
         try:
             instance_id = key[2]
@@ -313,8 +343,12 @@ class PeriodicStaleCheck(threading.Thread):
         unregister = getattr(self._registry, "unregister_worker", None)
         if not callable(unregister):
             return
+        kwargs = {"instance_id": instance_id}
+        _epoch = getattr(thread, "_generation", None)
+        if _epoch is not None:
+            kwargs["epoch"] = _epoch
         try:
-            unregister(session_id, worker_name, instance_id=instance_id)
+            unregister(session_id, worker_name, **kwargs)
         except Exception as exc:
             logger.warning(
                 "detached TTL registry cleanup failed for worker '%s': %s",
@@ -428,8 +462,13 @@ class WorkerManager:
         instance_id: int = 1,
     ) -> None:
         """Register a worker thread under ``(session_id, worker_name, instance_id)``."""
+        # S7a: tag the registration with the incarnation's epoch, so a stale incarnation cannot displace it later.
         self._registry.register_worker(
-            session_id or "", worker_name, thread, instance_id=instance_id
+            session_id or "",
+            worker_name,
+            thread,
+            instance_id=instance_id,
+            epoch=getattr(thread, "_generation", None),
         )
 
     def unregister_worker(
@@ -438,10 +477,22 @@ class WorkerManager:
         worker_name: str,
         instance_id: int = 1,
         default: Any = None,
+        *,
+        epoch: int | None = None,
     ) -> Any:
         """Unregister and return the thread, or *default* if absent."""
+        if epoch is None:
+            epoch = getattr(
+                self.get_worker(session_id, worker_name, instance_id=instance_id),
+                "_generation",
+                None,
+            )
         return self._registry.unregister_worker(
-            session_id or "", worker_name, instance_id=instance_id, default=default
+            session_id or "",
+            worker_name,
+            instance_id=instance_id,
+            default=default,
+            epoch=epoch,
         )
 
     def get_worker(
@@ -580,6 +631,7 @@ class WorkerManager:
                 key[1],
                 key[2] if len(key) >= 3 else 1,
                 default=None,
+                epoch=getattr(thread, "_generation", None),
             )
             removed += 1
         return removed
@@ -606,6 +658,7 @@ class WorkerManager:
                 key[1],
                 key[2] if len(key) >= 3 else 1,
                 default=None,
+                epoch=getattr(thread, "_generation", None),
             )
             results.append(
                 {
@@ -804,7 +857,12 @@ class WorkerManager:
             self._registry.get_all_workers().items()
         ):
             if sid == key:
-                self.unregister_worker(sid, _name, instance_id=_iid)
+                self.unregister_worker(
+                    sid,
+                    _name,
+                    instance_id=_iid,
+                    epoch=getattr(_thread, "_generation", None),
+                )
 
     # -- internals ----------------------------------------------------------
 
@@ -828,8 +886,22 @@ class WorkerManager:
         returns), so a manager stop that leaves the instance running must call
         ``kill()`` -- with a ``stop()`` fallback for lightweight thread doubles
         that predate the split.
+
+        S7b-3: when the thread's ``kill`` takes a ``journal_reason``, this
+        stop HANDS THE REASON OVER (``_MANAGER_STOP_JOURNAL_REASON``) so the
+        inflight journal records the turn as ``cancelled`` and its job as
+        ``stopped``.  Threads (and test doubles) that predate the keyword keep
+        the plain zero-arg call -- the journal is bookkeeping, never a
+        requirement for stopping.
         """
-        _killer = getattr(thread, "kill", None) or getattr(thread, "stop", None)
+        _kill = getattr(thread, "kill", None)
+        if callable(_kill) and _accepts_journal_reason(_kill):
+            try:
+                _kill(journal_reason=_MANAGER_STOP_JOURNAL_REASON)
+            except Exception:
+                pass
+            return wait_for_worker_exit(thread, worker_name)
+        _killer = _kill or getattr(thread, "stop", None)
         if callable(_killer):
             try:
                 _killer()

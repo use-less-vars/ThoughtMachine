@@ -352,6 +352,61 @@ class TestGhostUnregisterTruth(_RunSafetyPatches):
             finally:
                 _pop_registry(key)
 
+    def test_teardown_is_epoch_fenced_against_a_newer_incarnation(self):
+        """A dying incarnation must not evict the successor holding its key.
+
+        Instance ids restart at 1, so a fresh spawn of the same worker name in
+        the same session REUSES this key while the predecessor is still winding
+        down.  Here the successor's epoch is exactly ``predecessor + 1`` and the
+        predecessor's ``run()`` ``finally:`` teardown must therefore refuse to
+        pop -- this test only passes because the teardown passes its own
+        ``epoch=``.
+        """
+        from tools.workspace.worker_registry import WorkerRegistry
+
+        registry = WorkerRegistry.get_instance()
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = self._make_thread(tmp)
+            key = ("s1", "w-ghost", thread.instance_id)
+            predecessor_epoch = thread._generation
+            successor_epoch = predecessor_epoch + 1
+            successor = SimpleNamespace(name="successor", instance_id=thread.instance_id)
+
+            with _registry_lock:
+                saved_value = _worker_registry.get(key)
+                saved_epoch = registry._worker_epochs.get(key)
+                # The successor has taken the key: its value and its record.
+                _worker_registry[key] = successor
+                registry._worker_epochs[key] = successor_epoch
+            try:
+                # The predecessor's run() reaches its finally: teardown here.
+                self._run(thread, timeout_triggered=True)
+
+                self.assertIs(
+                    _worker_registry.get(key), successor,
+                    "stale teardown evicted the successor that owns this key",
+                )
+                self.assertEqual(
+                    registry._worker_epochs.get(key), successor_epoch,
+                    "stale teardown lowered the epoch record below its owner's",
+                )
+            finally:
+                # Never leak the injected successor/record into neighbour tests.
+                with _registry_lock:
+                    if saved_value is None:
+                        _worker_registry.pop(key, None)
+                    else:
+                        _worker_registry[key] = saved_value
+                    if saved_epoch is None:
+                        registry._worker_epochs.pop(key, None)
+                    else:
+                        registry._worker_epochs[key] = saved_epoch
+            # Deletion-provability: drop the ``epoch=getattr(self,
+            # "_generation", None)`` kwarg from the ``finally:``
+            # unregister_worker(...) call in worker_thread.py and the pop
+            # becomes unconditional (legacy path), so the successor sentinel
+            # is evicted and the assertion above fails.
+
 
 # ── 7. Spawn-reuse deliver-and-block (D2) ───────────────────────────────
 

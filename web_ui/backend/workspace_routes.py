@@ -358,11 +358,12 @@ def _dispatch_via_runtime(handle: Any, action: str) -> None:
     """Deliver one command verb straight to a live runtime *handle*.
 
     Reached only when :func:`tools.workspace.worker_runtime.runtime_handle_for`
-    found a handle for this worker -- i.e. never in production today, where the
-    registry is empty and the ``command.json`` path below carries every command.
-    When there IS a handle the supervisor can reach the runtime in-process, so
-    the direct call is the transport and no command file is written: one
-    command, one transport.
+    found a handle for this worker.  Since S7a-3 that is the ordinary case for a
+    worker spawned by this process (the spawn path registers its handle); it is
+    still not the only one, so the caller keeps the ``command.json`` path below
+    as its fallback.  With a handle the supervisor reaches the runtime
+    in-process, so the direct call is the transport and no command file is
+    written: one command, one transport.
 
     An action with no handle equivalent raises :class:`ValueError` rather than
     being silently swallowed -- a verb this seam cannot honour has to be
@@ -395,8 +396,11 @@ def _write_worker_command(
 
     If the supervisor holds a live ``WorkerRuntimeHandle`` for this worker the
     command goes straight to it (:func:`_dispatch_via_runtime`) and nothing is
-    written to disk; that registry is empty today, so in practice every command
-    still lands in ``command.json`` exactly as before.
+    written to disk.  Since S7a-3 that registry is populated by the spawn path,
+    so a worker spawned by this process is normally reached in process -- and
+    when the handle is absent, fenced or the dispatch itself fails, the command
+    is written to ``command.json`` exactly as it was before the seam existed,
+    which is what keeps a failed dispatch a degraded path and not a lost verb.
 
     The fence (session / worker name / instance / epoch) is what lets the
     polling worker reject a command addressed to a different incarnation --
