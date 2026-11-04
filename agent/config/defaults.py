@@ -83,6 +83,25 @@ GLOBAL_RING_SIZE = 500
 # stale worker is immediately hung.
 WORKER_HUNG_GRACE_S = 0
 
+# ── tools/workspace/worker_stale_watchdog.py ─────────────────────────────────
+# How often the ANNOUNCE-ONLY stale watchdog scans (seconds). One heartbeat
+# cadence: the watchdog exists to notice silence, so reacting more often than
+# the worker is asked to speak would only add noise.
+WORKER_STALE_WATCHDOG_INTERVAL_S = 30
+# A worker whose cached runtime frame is older than this is ANNOUNCED (never
+# killed, cancelled or interrupted -- phase A is announcement only). Three
+# missed heartbeats at the shipped cadence: one missed tick is jitter, three is
+# silence. Deliberately much shorter than HEARTBEAT_STALE_AFTER_S (600), which
+# measures the in-process heartbeat and drives the INTERRUPTING path.
+WORKER_STALE_ANNOUNCE_AFTER_S = 3 * HEARTBEAT_INTERVAL_S
+# Phase-B placeholders -- consumed by the cooperative escalation ladder
+# (ping-ack liveness, then cancel -> pause -> kill). Unused in phase A: nothing
+# in the tree reads them yet, and they are declared here so the phase-B work
+# lands in the constants table rather than as literals at its call sites.
+WORKER_STALE_PROBE_TIMEOUT_S = 15
+WORKER_STALE_CANCEL_TIMEOUT_S = 15
+WORKER_STALE_KILL_TIMEOUT_S = 15
+
 # ── tools/workspace/job_registry.py ──────────────────────────────────────────
 # Maximum number of job records kept (bounded; oldest evicted when full).
 JOB_REGISTRY_MAX_JOBS = 200
