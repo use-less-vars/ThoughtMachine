@@ -869,5 +869,199 @@ class TestTimeoutDoesNotPoisonNextQuery(_RunSafetyPatches):
 
 
 
+class _InitialContextHelpers(_RunSafetyPatches):
+    """Shared helpers for the initial-context ('briefing') delivery tests."""
+
+    def _run_fresh_thread(self, workspace_dir, initial_context, name="w-ic"):
+        """Run a brand-new WorkerThread with the given _initial_context.
+
+        The stop sentinel is pre-filled so run() builds the fresh
+        WorkerContext (system prompt + 'Initial context:' message), auto-queues
+        the query, and then breaks out of the loop without running it.
+        """
+        thread = make_thread(workspace_dir, name=name)
+        thread._initial_context = initial_context
+        thread._agent = make_fake_agent()
+        thread._input_queue.put(None)
+        thread.run()
+        return thread
+
+    def _spawn_string_context(self, workspace_dir, context,
+                              assign_after_construction=False):
+        """Drive the real Worker._action_spawn with a string `context`.
+
+        The WorkerThread is replaced by a MagicMock so nothing actually spawns;
+        the object under test is the initial-context coercion in _action_spawn.
+
+        ``assign_after_construction`` sets ``.context`` AFTER the pydantic model
+        exists, which bypasses the ``coerce_context`` before-validator (pydantic
+        v2 does not validate plain assignment). That is the only way to reach
+        _action_spawn with a raw string, and it must not be dropped either.
+        """
+        tool = Worker(action="spawn", worker_name="w-str",
+                      context=None if assign_after_construction else context,
+                      session_id="s1")
+        if assign_after_construction:
+            tool.context = context
+        tool._find_worker = mock.Mock(return_value={"name": "w-str"})
+        tool._build_agent_config = mock.Mock(return_value={})
+        tool._resolve_ws_dir = mock.Mock(return_value=Path(workspace_dir))
+        fake_thread = mock.MagicMock()
+        fake_thread._output_queue.get.side_effect = queue.Empty
+        fake_thread._last_elapsed.return_value = None
+        try:
+            with mock.patch("tools.workspace.worker.WorkerThread",
+                            return_value=fake_thread):
+                tool._action_spawn([], "ws-1")
+        finally:
+            with _registry_lock:
+                _worker_registry.pop(("s1", "w-str", 1), None)
+        return fake_thread
+
+
+class TestPlainStringContextBecomesQuery(_InitialContextHelpers):
+    """A plain-string `context` is the task (per the tool schema), not noise."""
+
+    def test_string_context_becomes_query_dict(self):
+        # Constructor path: Worker.coerce_context (before-validator) already
+        # wraps strings, so this pins the documented contract end-to-end.
+        string_ctx = "Brief the worker about the parser rewrite."
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_thread = self._spawn_string_context(Path(tmp) / "spawn", string_ctx)
+
+        self.assertEqual(fake_thread._initial_context["query"], string_ctx)
+        # An auto-query means spawn blocks for the first response.
+        fake_thread._output_queue.get.assert_called_once_with(
+            timeout=SPAWN_QUEUE_TIMEOUT
+        )
+
+    def test_string_context_set_after_construction_becomes_query(self):
+        # No validator runs on plain attribute assignment (pydantic v2), so
+        # _action_spawn must coerce a raw string itself instead of dropping it.
+        string_ctx = "Brief the worker about the parser rewrite."
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_thread = self._spawn_string_context(
+                Path(tmp) / "spawn", string_ctx, assign_after_construction=True
+            )
+
+        self.assertEqual(fake_thread._initial_context["query"], string_ctx)
+        fake_thread._output_queue.get.assert_called_once_with(
+            timeout=SPAWN_QUEUE_TIMEOUT
+        )
+
+    def test_empty_or_none_context_stays_empty(self):
+        for empty in (None, ""):
+            with self.subTest(context=empty):
+                with tempfile.TemporaryDirectory() as tmp:
+                    fake_thread = self._spawn_string_context(
+                        Path(tmp) / "spawn", empty, assign_after_construction=True
+                    )
+                # An empty/absent context must not become a query.
+                self.assertNotIn("query", fake_thread._initial_context)
+                # No auto-query: spawn returns immediately instead of waiting.
+                fake_thread._output_queue.get.assert_not_called()
+
+    def test_string_context_reaches_message_history(self):
+        string_ctx = "Task: check the BRIEF-STR-7F3A regression."
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_thread = self._spawn_string_context(Path(tmp) / "spawn", string_ctx)
+            # Feed exactly what the spawn produced into a real thread.
+            thread = self._run_fresh_thread(
+                Path(tmp) / "run", dict(fake_thread._initial_context)
+            )
+
+        self.assertEqual(list(thread._input_queue.queue), [string_ctx])
+        history = thread._worker_ctx.user_history
+        self.assertEqual(history[0], {"role": "system", "content": SYS_PROMPT})
+        self.assertEqual(history[1]["role"], "system")
+        self.assertTrue(history[1]["content"].startswith("Initial context: "))
+        self.assertIn("BRIEF-STR-7F3A", history[1]["content"])
+
+
+class TestBriefingDeliveredInFull(_InitialContextHelpers):
+    """A long briefing arrives whole, after the system prompt, in its own
+    separate role='system' message."""
+
+    def test_long_briefing_survives_delivery_whole(self):
+        head = "BRIEF-HEAD-7F3A"
+        tail = "BRIEF-TAIL-7F3A"
+        # ~5,000 words, single line, no punctuation tricks.
+        briefing = " ".join([head] + [f"word{i}" for i in range(5000)] + [tail])
+        initial_context = {"query": "read the brief", "briefing": briefing}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = self._run_fresh_thread(Path(tmp), dict(initial_context))
+
+        history = thread._worker_ctx.user_history
+        # Ordering property: prompt first, briefing second, both role='system'.
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0], {"role": "system", "content": SYS_PROMPT})
+        ic = history[1]
+        self.assertEqual(ic["role"], "system")
+        self.assertNotEqual(ic["content"], SYS_PROMPT)
+
+        # Full-content assertion (not just the first sentence).
+        self.assertEqual(ic["content"], initial_ctx_msg(initial_context)["content"])
+        payload = json.loads(ic["content"][len("Initial context: "):])
+        self.assertEqual(payload["briefing"], briefing)
+        self.assertEqual(payload["query"], "read the brief")
+        self.assertIn(head, payload["briefing"])
+        self.assertIn(tail, payload["briefing"])
+        self.assertTrue(payload["briefing"].endswith(tail))
+        self.assertGreater(len(payload["briefing"]), 20000)
+
+    def test_non_ascii_briefing_round_trips(self):
+        briefing = "Consignes : vérifier les accents — 日本語 — ✓ BRIEF-UTF8-7F3A"
+        initial_context = {"query": "read the brief", "briefing": briefing}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = self._run_fresh_thread(Path(tmp), dict(initial_context))
+
+        ic = thread._worker_ctx.user_history[1]
+        # ensure_ascii=True: the wire form is escaped, the decoded value is not.
+        self.assertTrue(ic["content"].isascii())
+        payload = json.loads(ic["content"][len("Initial context: "):])
+        self.assertEqual(payload["briefing"], briefing)
+        self.assertIn("BRIEF-UTF8-7F3A", payload["briefing"])
+
+
+class TestBriefingSurvivesCompaction(unittest.TestCase):
+    """The brief is a leading system message, so summarisation must not eat it."""
+
+    def test_briefing_survives_compact_after_summary(self):
+        sentinel = "BRIEF-COMPACT-7F3A"
+        briefing = f"{sentinel} " + " ".join(f"rule{i}" for i in range(500))
+        ic = initial_ctx_msg({"query": "start", "briefing": briefing})
+        old_turns = []
+        for i in range(20):
+            old_turns.append({"role": "user", "content": f"old question {i}"})
+            old_turns.append({"role": "assistant", "content": f"old answer {i}"})
+        ctx = WorkerContext(
+            session_id="s1",
+            worker_name="w-c",
+            user_history=[
+                {"role": "system", "content": SYS_PROMPT},
+                ic,
+                *old_turns,
+                {"role": "system", "content": "Summary of the above.",
+                 "summary": True},
+                {"role": "user", "content": "new question after summary"},
+            ],
+        )
+
+        self.assertTrue(ctx.compact_after_summary())
+
+        contents = [m["content"] for m in ctx.user_history]
+        # Old turns pruned ...
+        self.assertNotIn("old question 0", contents)
+        self.assertNotIn("old answer 19", contents)
+        # ... system prompt and the brief are not.
+        self.assertEqual(contents[0], SYS_PROMPT)
+        self.assertEqual(contents[1], ic["content"])
+        self.assertEqual(ctx.user_history[1]["role"], "system")
+        self.assertIn(sentinel, ctx.user_history[1]["content"])
+        self.assertEqual(contents[-1], "new question after summary")
+
+
 if __name__ == "__main__":
     unittest.main()
