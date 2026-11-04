@@ -2427,6 +2427,10 @@ class WorkerThread(threading.Thread):
         from tools.sleep_tool import unbind as _unbind_turn_cancel
         _bind_turn_cancel(self._turn_cancel)
 
+        # A pause is reported to the bus/status file ONCE per turn, even though
+        # every remaining event of the draining turn observes the park flag.
+        _pause_reported = False
+
         try:
             for event in self._agent.process_query(query):
                                 # Fix 1.1B: Poll for stop command on every event
@@ -2463,23 +2467,47 @@ class WorkerThread(threading.Thread):
                     })
                     break
 
-                # Check pause signal
+                # Check pause signal.
+                #
+                # A PAUSE IS COOPERATIVE.  pause() has already put the agent
+                # into reading mode, whose whole point is to make it CONCLUDE
+                # this turn with a Respond instead of being cut off.  Replacing
+                # the turn with a synthetic "paused" envelope here threw that
+                # conclusion away -- work the user had already paid for -- and
+                # contradicted the reading-mode contract (pinned by
+                # tests/test_worker_pause_mid_turn_cooperative.py).  So: tell
+                # the agent to wind down, report the pause ONCE, and keep
+                # draining events until the agent's own conclusion arrives;
+                # run() parks the worker (and returns this loop's reply) once
+                # the turn is over.
+                #
+                # DETACH is deliberately NOT cooperative: it is the explicit
+                # "park now" signal (it also cancels the in-flight turn via
+                # _turn_cancel), so it keeps the terminal envelope and parks
+                # without waiting for the turn to wind down.
                 if self._park_event.is_set():
-                    self._agent.request_pause()
-                    self.status = "paused"
-                    self._write_status_file()
-                    self._publish_event('worker_paused', {
-                        'status': 'paused',
-                        'worker_name': self.worker_name,
-                        'session_id': self.session_id or "",
-                        'current_context_tokens': self.get_current_context_tokens(),
-                        'max_context_tokens': self.max_context_tokens,
-                    })
-                    final_content = json.dumps({
-                        "status": "paused",
-                        "message": "Worker paused by user",
-                    })
-                    break
+                    if not _pause_reported:
+                        _pause_reported = True
+                        self._agent.request_pause()
+                        self.status = "paused"
+                        self._write_status_file()
+                        self._publish_event('worker_paused', {
+                            'status': 'paused',
+                            'worker_name': self.worker_name,
+                            'session_id': self.session_id or "",
+                            'current_context_tokens': self.get_current_context_tokens(),
+                            'max_context_tokens': self.max_context_tokens,
+                        })
+                    if self._detach_requested:
+                        final_content = json.dumps({
+                            "status": "paused",
+                            "message": "Worker paused by user",
+                        })
+                        break
+                else:
+                    # A resume that lands inside this same turn clears the park
+                    # flag; a later pause must report itself again.
+                    _pause_reported = False
 
                 # WLM: surface the supervisor's soft-timeout warning to the
                 # worker log exactly once per query (the worker loop keeps
