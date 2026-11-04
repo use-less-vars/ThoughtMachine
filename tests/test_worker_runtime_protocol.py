@@ -73,7 +73,10 @@ from tools.workspace.worker_runtime_protocol import (
     REQUIRED_ENVELOPE_KEYS,
     Bye,
     Cancel,
+    CONFIG_TIER_HOT_SWAP,
     CancelAck,
+    ConfigAck,
+    ConfigUpdate,
     Control,
     ControlAck,
     DispatchQuery,
@@ -115,6 +118,7 @@ SAMPLES = (
     DispatchQuery(query_id="q-1", query="what is 2 + 2?", timeout_seconds=120.0),
     Cancel(request_id="r-1", reason="ceiling", deadline_ms=500),
     Control(request_id="r-2", action="stop"),
+    ConfigUpdate(request_id="r-3", config={"model": "m2"}),
     Shutdown(grace_ms=2000),
     Ping(nonce=7),
     Hello(
@@ -135,6 +139,12 @@ SAMPLES = (
     WorkerState(status="idle", current_task=None, error=None, paused_manually=False),
     CancelAck(request_id="r-1", phase="completed"),
     ControlAck(request_id="r-2", action="stop", ok=True, status="detached"),
+    ConfigAck(
+        request_id="r-3",
+        ok=True,
+        tier=CONFIG_TIER_HOT_SWAP,
+        status="queued for the next turn boundary",
+    ),
     Fatal(reason="boom", traceback_tail="Traceback (most recent call last): ..."),
     Bye(),
 )

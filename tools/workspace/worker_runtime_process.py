@@ -50,11 +50,14 @@ from typing import Any, Callable, Dict, Optional
 
 from tools.workspace.worker_runtime_main import worker_runtime_main
 from tools.workspace.worker_runtime_protocol import (
+    CAPABILITY_CONFIG_UPDATE,
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
     Bye,
     Cancel,
     CancelAck,
+    ConfigAck,
+    ConfigUpdate,
     Control,
     ControlAck,
     DispatchQuery,
@@ -130,6 +133,17 @@ class WorkerRuntimeLost(RuntimeError):
         #: The ``reply`` frame that ends this query, synthesised when the
         #: process died without one (§4.7).
         self.reply = reply
+
+
+class WorkerRuntimeUnsupported(RuntimeError):
+    """The runtime's ``hello`` did not advertise the capability a verb needs.
+
+    A scope fact, not a fault (§4.5): a runtime built before the frame existed
+    ignores it in silence, and silence is indistinguishable from a lost frame.
+    Feature-detecting in the handshake turns that ambiguity into an exception
+    the caller can act on -- respawn the worker, or degrade -- before anything
+    is sent.
+    """
 
 
 class WorkerQueryTimeout(TimeoutError):
@@ -337,6 +351,10 @@ class ProcessWorkerRuntime:
         #: Monotonic request-id source, one per runtime (§10).
         self._request_ids = _RequestIdSource()
         self._hello: Optional[Hello] = None
+        #: Capability names the runtime advertised in ``hello`` (§4.5, W9). Empty
+        #: until the handshake lands, which is why every capability-gated verb
+        #: checks this set rather than assuming a build.
+        self._capabilities: frozenset = frozenset()
         self._hello_event = threading.Event()
         self._bye_seen = False
         self._fatal: Optional[Fatal] = None
@@ -567,6 +585,41 @@ class ProcessWorkerRuntime:
             self.close()
         return acknowledged
 
+    def update_config(
+        self,
+        config: Dict[str, Any],
+        *,
+        timeout: float = ACK_TIMEOUT_SECONDS,
+    ) -> ConfigAck:
+        """Push a config patch to the runtime's agent mailbox (§4.9, W9).
+
+        Returns the runtime's own verdict rather than a bool, because the two
+        halves of it are not interchangeable: ``ok`` says the frame was accepted
+        and ``tier`` says whether the running agent can apply it in place
+        (``hot_swap``) or needs a fresh runtime (``requires_respawn``). A caller
+        that reports "applied" on ``ok=True`` alone is reporting something this
+        side never promised -- and a worker that must be respawned anyway is a
+        decision for the supervisor, not something to guess at here.
+
+        Raises :class:`WorkerRuntimeUnsupported` when the handshake did not
+        advertise ``config_update``: an old runtime ignores the frame in silence,
+        so sending it would look like success and answer nothing.
+        """
+        if not self.supports(CAPABILITY_CONFIG_UPDATE):
+            raise WorkerRuntimeUnsupported(
+                f"the runtime for {self._spec['worker']!r} did not advertise "
+                f"{CAPABILITY_CONFIG_UPDATE!r} in its hello: it would ignore a "
+                f"config_update frame instead of answering it (§4.5)"
+            )
+        outbox = self._require_sendable("config_update")
+        request_id = self._request_ids.next()
+        slot = self._register_ack(request_id)
+        outbox.put(ConfigUpdate(request_id=request_id, config=dict(config or {})))
+        message = self._await_ack(
+            request_id, slot, timeout, what="config_update"
+        )
+        return message
+
     def cancel(
         self,
         reason: str = CANCEL_REASON_OPERATOR_KILL,
@@ -721,6 +774,15 @@ class ProcessWorkerRuntime:
         return self._hello
 
     @property
+    def capabilities(self) -> frozenset:
+        """Capability names from ``hello``; empty before the handshake (§4.5)."""
+        return self._capabilities
+
+    def supports(self, capability: str) -> bool:
+        """True when the runtime advertised *capability* in its ``hello``."""
+        return capability in self._capabilities
+
+    @property
     def accepted(self) -> frozenset:
         """``query_id`` values the runtime acknowledged, for correlation checks."""
         return frozenset(self._accepted)
@@ -759,6 +821,11 @@ class ProcessWorkerRuntime:
         kind = frame["kind"]
         if kind == Hello.KIND:
             self._hello = Hello.from_frame(frame)
+            # W9: capabilities are read off the handshake itself. An older
+            # runtime sends a hello without them, which decodes to an empty
+            # tuple (§4.5) -- an empty set here is the feature-detect result,
+            # not a parse failure.
+            self._capabilities = frozenset(self._hello.capabilities)
             self._hello_event.set()
             return
         if kind == QueryAccepted.KIND:
@@ -794,6 +861,9 @@ class ProcessWorkerRuntime:
             return
         if kind == CancelAck.KIND:
             self._deliver_ack(CancelAck.from_frame(frame))
+            return
+        if kind == ConfigAck.KIND:
+            self._deliver_ack(ConfigAck.from_frame(frame))
             return
         # S4b: the supervisory frames are routed, not swallowed. The child
         # publishes ``event`` / ``heartbeat`` / ``worker_state``; each one is

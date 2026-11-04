@@ -87,6 +87,41 @@ function buildDefaultSaveNotice(savedKeys, droppedKeys) {
 
 const DEFAULT_SAVE_TIMEOUT_MS = 5000;
 
+// ── Read-only field-tier badge ────────────────────────────────────────────
+// Whether an AgentConfig field can be hot-swapped onto a RUNNING session or
+// needs a restart is decided by the backend authority
+// (agent.core.agent.config_field_tiers) and published at
+// GET /api/workspace/{ws_id}/config_tiers. This component only ever renders
+// that verdict: no field list lives here, nothing is guessed locally, and a
+// field the map has no entry for gets no badge at all.
+function ConfigTierBadge({ field, tiers }) {
+  const tier = tiers?.[field];
+  if (tier !== 'hot_swap' && tier !== 'requires_respawn') return null;
+  const hot = tier === 'hot_swap';
+  return (
+    <span
+      data-testid={`config-tier-${field}`}
+      style={{
+        marginLeft: '0.4rem',
+        padding: '0.05rem 0.3rem',
+        borderRadius: '3px',
+        fontSize: '0.65rem',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+        background: hot ? '#a6e3a1' : '#fab387',
+        color: '#1e1e2e',
+      }}
+      title={
+        hot
+          ? 'Applies to the next query — no restart needed'
+          : 'Requires restarting the session to take effect'
+      }
+    >
+      {hot ? 'Applies to next query' : 'Requires restart'}
+    </span>
+  );
+}
+
 function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, configQueued = false, applyFailed = null }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error' | 'timeout'
   const [notice, setNotice] = useState(null);  // null | { kind: 'status' | 'alert', text }
@@ -94,6 +129,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
   const [allTools, setAllTools] = useState([]);
+  // {} until (and unless) GET /config_tiers answers — no badges is a valid render.
+  const [configTiers, setConfigTiers] = useState({});
   // Permission safe defaults mirror the backend SINGLE OWNER through the store's
   // `permissionDefaults` slice (hydrated from GET /api/permission-defaults);
   // {} until the fetch resolves (fail-closed).  No hand-copied literal here.
@@ -263,6 +300,27 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         // Ignore — tools tab will just show whatever the session config provides
       });
   }, []);
+
+  // Fetch the field tiers for the badges below. Read-only and best-effort: a
+  // failure leaves configTiers empty, so the panel renders exactly as it did
+  // before (no badges) rather than inventing a verdict the backend would
+  // disagree with. Nothing here touches the draft, the save or the apply path.
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let cancelled = false;
+    fetch(apiUrl(`/api/workspace/${workspaceId}/config_tiers`))
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled && data?.tiers && typeof data.tiers === 'object') {
+          setConfigTiers(data.tiers);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
 
   // ── Permissions tab: disk-pure REST state ──────────────────────────
   // Tab-LOCAL: raw (editable grant map), effective (read-only enforced
@@ -819,7 +877,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         <div>
           {/* ── Workspace Path (read-only) ── */}
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Workspace Path</strong></label>
+            <label style={labelStyle}>
+              <strong>Workspace Path</strong>
+              <ConfigTierBadge field="workspace_path" tiers={configTiers} />
+            </label>
             <div style={{
               marginTop: '0.3rem',
               padding: '0.4rem 0.6rem',
@@ -954,7 +1015,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Temperature:</strong> {draft.temperature}</label>
+            <label style={labelStyle}>
+              <strong>Temperature:</strong> {draft.temperature}
+              <ConfigTierBadge field="temperature" tiers={configTiers} />
+            </label>
             <input
               type="range" min="0" max="2" step="0.1"
               value={draft.temperature}
@@ -964,7 +1028,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Max Turns</strong></label>
+            <label style={labelStyle}>
+              <strong>Max Turns</strong>
+              <ConfigTierBadge field="max_turns" tiers={configTiers} />
+            </label>
             <input
               type="number" min="1" max="150"
               value={draft.max_turns}
@@ -976,7 +1043,11 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens, warning is 15k below)</span></label>
+            <label style={labelStyle}>
+              <strong>Critical Threshold</strong>{' '}
+              <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens, warning is 15k below)</span>
+              <ConfigTierBadge field="token_monitor_critical_threshold" tiers={configTiers} />
+            </label>
             <input
               type="number" min="0"
               value={draft.token_monitor_critical_threshold}
@@ -998,7 +1069,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       {activeTab === 'model' && (
         <div>
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Provider</strong></label>
+            <label style={labelStyle}>
+              <strong>Provider</strong>
+              <ConfigTierBadge field="provider_type" tiers={configTiers} />
+            </label>
             <select
               value={activeProviderId}
               onChange={handleProviderChange}
@@ -1014,7 +1088,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Model</strong></label>
+            <label style={labelStyle}>
+              <strong>Model</strong>
+              <ConfigTierBadge field="model" tiers={configTiers} />
+            </label>
             <select
               value={draft.model || ''}
               onChange={handleModelChange}
@@ -1084,6 +1161,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle} htmlFor="tool_output_token_limit">
               <strong>Tool Output Token Limit</strong>
+              <ConfigTierBadge field="tool_output_token_limit" tiers={configTiers} />
             </label>
             <input
               id="tool_output_token_limit"
@@ -1114,7 +1192,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               const displayTools = isModeLocked ? allTools : availableTools;
               return (
                 <>
-                  <label style={labelStyle}><strong>Tools ({displayTools.length} total)</strong></label>
+                  <label style={labelStyle}>
+                    <strong>Tools ({displayTools.length} total)</strong>
+                    <ConfigTierBadge field="enabled_tools" tiers={configTiers} />
+                  </label>
                   {displayTools.length > 0 ? (
                     displayTools.map((tool) => {
                       const toolName = typeof tool === 'string' ? tool : tool?.name;
@@ -1339,7 +1420,11 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               </div>
               {/* Read-only preview */}
               <div style={{ marginBottom: '1rem' }}>
-                <label style={labelStyle}><strong>System Prompt</strong> <span style={{ color: '#6c7086', fontSize: '0.7rem' }}>(read-only — factory default for this mode)</span></label>
+                <label style={labelStyle}>
+                  <strong>System Prompt</strong>{' '}
+                  <span style={{ color: '#6c7086', fontSize: '0.7rem' }}>(read-only — factory default for this mode)</span>
+                  <ConfigTierBadge field="system_prompt" tiers={configTiers} />
+                </label>
                 <div style={{
                   ...inputStyle,
                   fontFamily: 'monospace',
@@ -1371,7 +1456,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             /* ── Custom mode: editable textarea + library ── */
             <>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={labelStyle}><strong>System Prompt</strong></label>
+                <label style={labelStyle}>
+                  <strong>System Prompt</strong>
+                  <ConfigTierBadge field="system_prompt" tiers={configTiers} />
+                </label>
                 <textarea
                   rows={6}
                   style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical' }}

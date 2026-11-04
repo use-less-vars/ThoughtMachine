@@ -78,6 +78,107 @@ def _config_diff(old_config, new_config) -> List[str]:
     return diff
 
 
+def config_requires_respawn(old_config, new_config) -> bool:
+    """True when *new_config* cannot be hot-swapped onto *old_config*.
+
+    The single authority for the config tier (W9): ``Agent._can_hot_swap``
+    delegates here, so a caller that holds two config objects but no ``Agent``
+    instance -- the worker runtime, which has to answer a ``config_ack`` with a
+    tier -- reaches exactly the verdict this process will act on.
+
+    The field list is spelled out here rather than read off
+    ``AgentConfig.FIELD_CATEGORIES``: those categories are metadata for the
+    settings UI, while what actually decides a hot-swap is whether
+    ``Agent._hot_swap`` / ``Agent.restart`` rebuild the component that owns the
+    field, and this list mirrors those two methods.
+    """
+    if new_config.provider_type != old_config.provider_type:
+        return True
+    if new_config.model != old_config.model:
+        return True
+    if new_config.api_key != old_config.api_key:
+        return True
+    if normalize_base_url(new_config.base_url) != normalize_base_url(old_config.base_url):
+        return True
+    if new_config.system_prompt != old_config.system_prompt:
+        return True
+    # Workspace path changes require a full restart
+    if new_config.workspace_path != old_config.workspace_path:
+        return True
+    # Provider config changes (e.g. timeout/max_retries) require a full
+    # restart so the LLM provider is re-initialised with the new settings.
+    return new_config.provider_config != old_config.provider_config
+
+
+def _tier_probe_value(value: Any) -> Any:
+    """A value guaranteed to differ from *value* for a one-field probe.
+
+    Type-directed but deliberately dumb: the point is only that
+    ``config_requires_respawn`` *sees* a difference, so the probe must differ
+    under the comparison the authority actually performs. Anything this does
+    not recognise becomes a fresh ``object()``, which is unequal to every
+    other value -- including ``None`` -- under ``!=``.
+    """
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        return value + '-tier-probe'
+    if isinstance(value, (int, float)):
+        return value + 1
+    if isinstance(value, dict):
+        return {**value, '_tier_probe': True}
+    if isinstance(value, (list, tuple)):
+        return [*value, '_tier_probe']
+    if value is None:
+        return '-tier-probe'
+    return object()
+
+
+def config_field_tiers(base_config=None) -> Dict[str, str]:
+    """Map every ``AgentConfig`` field name to its config tier (W9).
+
+    The tier of a field is not a property anyone declares -- it is whatever
+    :func:`config_requires_respawn` decides when that *one* field differs. So
+    this builds a one-field-differing copy of *base_config* per field and asks
+    the authority, using ``CONFIG_TIER_HOT_SWAP`` /
+    ``CONFIG_TIER_REQUIRES_RESPAWN`` from the protocol module so the strings
+    cannot drift from the ones a ``config_ack`` carries.
+
+    That is why the compared-field list is never written down here: a UI badge
+    built from this map shows the verdict the agent will actually act on, and
+    the two cannot disagree even after someone edits the authority.
+
+    A field whose probe cannot even be classified (the authority raised) is
+    reported ``requires_respawn``: fail closed, because claiming a hot swap the
+    agent will not perform is the one wrong answer here.
+    """
+    from tools.workspace.worker_runtime_protocol import (
+        CONFIG_TIER_HOT_SWAP,
+        CONFIG_TIER_REQUIRES_RESPAWN,
+    )
+
+    if base_config is None:
+        from agent.config import AgentConfig
+
+        base_config = AgentConfig.model_construct()
+
+    tiers: Dict[str, str] = {}
+    for field_name in type(base_config).model_fields:
+        current = getattr(base_config, field_name, None)
+        try:
+            candidate = base_config.model_copy(
+                update={field_name: _tier_probe_value(current)}
+            )
+            requires = bool(config_requires_respawn(base_config, candidate))
+        except Exception:  # noqa: BLE001 - unclassifiable is not a hot swap
+            tiers[field_name] = CONFIG_TIER_REQUIRES_RESPAWN
+            continue
+        tiers[field_name] = (
+            CONFIG_TIER_REQUIRES_RESPAWN if requires else CONFIG_TIER_HOT_SWAP
+        )
+    return tiers
+
+
 def _audit_config_change(old_config, new_config, restart_required: bool) -> None:
     """Audit a worker-side config change (redacted); never raises.
 
@@ -668,27 +769,7 @@ class Agent:
         model, provider, system_prompt, tool_classes, api_key, base_url,
         provider_config etc. require a full restart.
         """
-        if new_config.provider_type != self.config.provider_type:
-            return False
-        if new_config.model != self.config.model:
-            return False
-        if new_config.api_key != self.config.api_key:
-            return False
-        if normalize_base_url(new_config.base_url) != normalize_base_url(self.config.base_url):
-            return False
-        if new_config.system_prompt != self.config.system_prompt:
-            return False
-
-        # Workspace path changes require a full restart
-        if new_config.workspace_path != self.config.workspace_path:
-            return False
-
-        # Provider config changes (e.g. timeout/max_retries) require a full
-        # restart so the LLM provider is re-initialised with the new settings
-        # (AgentConfig.FIELD_CATEGORIES marks provider_config RESTART_REQUIRED).
-        if new_config.provider_config != self.config.provider_config:
-            return False
-        return True
+        return not config_requires_respawn(self.config, new_config)
 
     def _hot_swap(self, new_config: AgentConfig):
         """Apply a lightweight config update without restarting.

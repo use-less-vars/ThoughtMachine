@@ -188,6 +188,69 @@ function workerInstanceKey(w) {
   return `${w.name}#${w.instance_id ?? '0'}`;
 }
 
+// ── Helper: the live-apply patch for a stored worker definition ───────────
+// The patch is the intersection of the definition and the backend's tier map,
+// i.e. exactly the fields the backend says are agent config. No field list is
+// spelled out on this side, here or anywhere else in this panel.
+function workerConfigPatch(definition, configTiers) {
+  const patch = {};
+  Object.entries(definition || {}).forEach(([field, value]) => {
+    if (Object.prototype.hasOwnProperty.call(configTiers || {}, field)) patch[field] = value;
+  });
+  return patch;
+}
+
+// ── Helper: does this patch force a respawn? ──────────────────────────────
+// A single `requires_respawn` field is what makes the click persist → apply →
+// kill; a patch with nothing the live worker cannot take is a pure kill.
+function patchNeedsRespawn(patch, configTiers) {
+  return Object.entries(patch || {}).some(
+    ([field]) => (configTiers || {})[field] === 'requires_respawn'
+  );
+}
+
+// ── The button's whole contract in one place (W9) ─────────────────────────
+// Label, title, clickability and "does the handler kill afterwards" are ONE
+// decision: `handleForceRespawn` recomputes this same object at click time and
+// obeys it, so the label the operator read and the action performed cannot
+// disagree. Every state is explicit -- including the one where nothing is
+// known yet, because a button that promises nothing must not be clickable.
+export function workerRespawnPlan(definition, configTiers, definitionsLoaded) {
+  if (!definitionsLoaded) {
+    return {
+      label: '…',
+      title: 'reading stored definition',
+      disabled: true,
+      killAfterApply: false,
+    };
+  }
+  if (!definition) {
+    return {
+      label: 'No stored config',
+      title:
+        'no stored worker definition: there is nothing to persist or apply, so a kill could not bring this worker back on a new config',
+      disabled: true,
+      killAfterApply: false,
+    };
+  }
+  if (patchNeedsRespawn(workerConfigPatch(definition, configTiers), configTiers)) {
+    return {
+      label: 'Apply & Kill Worker',
+      title:
+        'persist the definition, push it at the live worker, then kill the instance: the stored config has a requires_respawn field, so the worker must be rebuilt to take it',
+      disabled: false,
+      killAfterApply: true,
+    };
+  }
+  return {
+    label: 'Apply (no restart)',
+    title:
+      'persist the definition and push it at the live worker: every field is hot_swap, so the worker keeps running',
+    disabled: false,
+    killAfterApply: false,
+  };
+}
+
 // ── Helper: queued-query surface (PHASE 2.1b) ─────────────────────────────
 // `queued_query_count` / `queued_query_ids` come verbatim from the active-
 // worker payload (`**_worker_queued_queries(thread)`,
@@ -415,7 +478,33 @@ const formRow = {
   marginBottom: '0.6rem',
 };
 
-export function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemplate }) {
+/** W9: a field's config tier, exactly as the backend authority reported it. */
+function ConfigTierBadge({ tier }) {
+  if (!tier) return null;
+  const hot = tier === 'hot_swap';
+  return (
+    <span
+      style={{
+        marginLeft: '0.4rem',
+        padding: '0.05rem 0.35rem',
+        borderRadius: '3px',
+        fontSize: '0.6rem',
+        fontWeight: 600,
+        background: hot ? '#a6e3a1' : '#f9e2af',
+        color: '#1e1e2e',
+      }}
+      title={
+        hot
+          ? 'hot_swap: a running worker applies this at its next turn boundary'
+          : 'requires_respawn: a running worker will not take this — it needs a fresh runtime'
+      }
+    >
+      {tier}
+    </span>
+  );
+}
+
+export function WorkerFormModal({ worker, templates, configTiers = {}, onSave, onCancel, isCreateFromTemplate }) {
   const isEdit = !!worker && !isCreateFromTemplate;
   const [name, setName] = useState(worker?.name || '');
   const [description, setDescription] = useState(worker?.description || '');
@@ -522,7 +611,10 @@ export function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateF
 
         {/* System prompt */}
         <div style={formRow}>
-          <label style={labelStyle}>System Prompt</label>
+          <label style={labelStyle}>
+            System Prompt
+            <ConfigTierBadge tier={configTiers.system_prompt} />
+          </label>
           <textarea
             style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
             value={systemPrompt}
@@ -772,6 +864,71 @@ export default function WorkerManagementPanel({
     fetchTemplates();
   }, [fetchTemplates]);
 
+  // ── Config tiers (W9) ────────────────────────────────────────────────
+  // Whether an AgentConfig field can be hot-swapped onto a RUNNING worker or
+  // needs a fresh runtime is decided by the backend authority
+  // (agent.core.agent.config_requires_respawn) and published as a map. The UI
+  // never hardcodes the field list: a field with no entry simply gets no badge,
+  // and a badge cannot disagree with the verdict the agent will act on.
+  //
+  // This map is NOT a grant of authority: a patch built here can only carry
+  // what a worker definition actually holds (prompt, temperature, turns).
+  // Provider/model are never worker-panel settings -- the SESSION ConfigPanel
+  // is the only authority for them, and a worker inherits them at spawn.
+  const [configTiers, setConfigTiers] = useState({});
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let cancelled = false;
+    fetch(`/api/workspace/${workspaceId}/config_tiers`)
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setConfigTiers(data?.tiers || {});
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
+  // ── Stored worker definitions (input to the button plan) ─────────────────
+  // GET /workers/active carries runtime state only, so the render-time
+  // question "would this click apply anything?" is answered from the stored
+  // definition instead. ``null`` means "not read yet" and is a DISTINCT state:
+  // until the map resolves the button promises nothing and is disabled, which
+  // is why the initial value is not an empty object. Re-read when the set of
+  // defined workers changes; the click handler re-reads the definition itself,
+  // so a stale cache can only affect the label of a button the plan still
+  // allowed -- never turn one promised action into another.
+  const [definitions, setDefinitions] = useState(null);
+  const workerNameKey = workers.map((w) => w.name).join('|');
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let cancelled = false;
+    fetch(`/api/workspace/${workspaceId}/workers`)
+      .then(async (res) => {
+        if (!res.ok) {
+          if (cancelled) return;
+          setDefinitions({});
+          return;
+        }
+        const rows = await res.json();
+        if (cancelled) return;
+        const map = {};
+        (Array.isArray(rows) ? rows : []).forEach((d) => {
+          if (d && d.name) map[d.name] = d;
+        });
+        setDefinitions(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setDefinitions({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, workerNameKey]);
+
   // ── Stop worker ──────────────────────────────────────────────────────────
   const handleStop = useCallback(
     async (name, instanceId) => {
@@ -928,6 +1085,115 @@ export default function WorkerManagementPanel({
       }, 3000);
     }
   }, [workspaceId]);
+
+  // ── Apply / respawn (W9: persist → apply live → kill, in that order) ─────
+  // The persisted definition is what a respawn reads, so it is written FIRST;
+  // only then is the live worker asked to take it. Whether the instance is
+  // killed afterwards is decided BEFORE anything is sent, by the same
+  // `workerRespawnPlan` the label came from -- never by the ack, because an ack
+  // that contradicts the label must not silently rewrite what the button said
+  // it would do. Respawning first would bring the worker back on the OLD
+  // config, which is the one outcome this ordering exists to prevent.
+  const [respawnBusy, setRespawnBusy] = useState({});
+  const handleForceRespawn = useCallback(
+    async (name, instanceId) => {
+      const key = workerInstanceKey({ name, instance_id: instanceId });
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+      const workersUrl = `/api/workspace/${workspaceId}/workers`;
+      const workerUrl = `${workersUrl}/${encodeURIComponent(name)}`;
+      // The plan is recomputed here from the same three inputs the label used,
+      // so the label that was clicked and the action performed are one
+      // decision. A disabled plan promised nothing, so nothing is done.
+      const plan = workerRespawnPlan(
+        definitions ? definitions[name] : undefined,
+        configTiers,
+        definitions !== null
+      );
+      if (plan.disabled) return;
+      setRespawnBusy((prev) => ({ ...prev, [key]: true }));
+      try {
+        // 1. persist: read the stored definition and write it back unchanged.
+        // The reader is the list route's ?name= filter (there is no by-name
+        // GET); the PUT below does target the by-name route.
+        const defRes = await fetch(`${workersUrl}?name=${encodeURIComponent(name)}`);
+        if (!defRes.ok) {
+          const body = await defRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `definition read failed: HTTP ${defRes.status}`);
+        }
+        const definition = await defRes.json();
+        const putRes = await fetch(workerUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(definition),
+        });
+        if (!putRes.ok) {
+          const body = await putRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `persist failed: HTTP ${putRes.status}`);
+        }
+
+        // 2. apply live. The patch is the intersection of the definition and
+        // the tier map -- i.e. the fields the backend says are agent config --
+        // so no field list is spelled out on this side.
+        // workerConfigPatch is shared with the button label, so the plan the
+        // label advertises and the plan executed here cannot drift apart.
+        const patch = workerConfigPatch(definition, configTiers);
+        const applyRes = await fetch(`${workerUrl}/config${instanceQuery}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ config: patch }),
+        });
+        const ack = await applyRes.json().catch(() => ({}));
+        const ackTier = ack?.tier || 'unknown';
+        const ackStatus = ack?.status || 'no status in the config ack';
+
+        if (!plan.killAfterApply) {
+          // The label said "no restart", so no kill happens here -- not even if
+          // the ack says the config did not go live. That contradiction is
+          // surfaced on the row instead; it never converts this button into a
+          // kill the operator was not promised.
+          setStopErrors((prev) => {
+            const n = { ...prev };
+            if (ack?.applied_live) {
+              delete n[key];
+            } else {
+              n[key] = `${ackTier}: ${ackStatus} — config not applied live; kill the worker manually to rebuild it`;
+            }
+            return n;
+          });
+          return;
+        }
+
+        // 3. respawn: the label said the worker dies, so it dies. Deliberately
+        // NOT gated on `ack.applied_live` -- a promise kept only when the
+        // backend agrees is not a promise; the contradiction is logged below.
+        const killRes = await fetch(`${workerUrl}/kill${instanceQuery}`, { method: 'POST' });
+        if (!killRes.ok) {
+          const body = await killRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `respawn failed: HTTP ${killRes.status}`);
+        }
+        setWorkers((prev) =>
+          prev.map((w) =>
+            w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+              ? { ...w, runtime_status: 'killed', queued_query_count: 0, queued_query_ids: [] }
+              : w
+          )
+        );
+        setStopErrors((prev) => ({
+          ...prev,
+          [key]: `${ackTier}: ${ackStatus}${
+            ack?.applied_live
+              ? ' — config reported applied_live; killed anyway because the label promised a kill'
+              : ' — killed; the next spawn builds on the persisted definition'
+          }`,
+        }));
+      } catch (err) {
+        setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+      } finally {
+        setRespawnBusy((prev) => { const n = { ...prev }; delete n[key]; return n; });
+      }
+    },
+    [workspaceId, configTiers, definitions]
+  );
 
   const canStop = useCallback((status) => {
     return status === 'busy' || status === 'ready' || !status;
@@ -1132,6 +1398,14 @@ export default function WorkerManagementPanel({
             const perms = w.permission_footprint || {};
             const instKey = workerInstanceKey(w);
             const dispLabel = w.instance_label || w.name;
+            // One plan drives the button AND the click that follows it: the
+            // label, the title, whether it is clickable at all, and whether
+            // the handler kills afterwards.
+            const plan = workerRespawnPlan(
+              definitions ? definitions[w.name] : undefined,
+              configTiers,
+              definitions !== null
+            );
             const isSelected =
               selectedWorker?.name === w.name &&
               selectedWorker?.workspaceId === workspaceId &&
@@ -1398,6 +1672,41 @@ export default function WorkerManagementPanel({
                           Kill
                         </button>
                       )}
+                      {/* Apply / respawn (W9) — persist → apply live → kill.
+                          The label IS the contract: `plan` above is the same
+                          object the click handler recomputes, so the promise
+                          made here is the action taken there. A disabled plan
+                          (definition map still loading, or no stored
+                          definition) promises nothing and cannot be clicked. */}
+                      {isRunning && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleForceRespawn(w.name, w.instance_id);
+                          }}
+                          disabled={!!respawnBusy[workerInstanceKey(w)] || plan.disabled}
+                          style={{
+                            background: 'transparent',
+                            color: '#89b4fa',
+                            border: '1px solid #89b4fa',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor:
+                              respawnBusy[workerInstanceKey(w)] || plan.disabled
+                                ? 'default'
+                                : 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginLeft: '4px',
+                            opacity:
+                              respawnBusy[workerInstanceKey(w)] || plan.disabled ? 0.6 : 1,
+                          }}
+                          title={plan.title}
+                        >
+                          {respawnBusy[workerInstanceKey(w)] ? 'Applying…' : plan.label}
+                        </button>
+                      )}
                       {/* manual-pause badge (payload.paused_manually) */}
                       {w.paused_manually && (
                         <span
@@ -1615,6 +1924,7 @@ export default function WorkerManagementPanel({
         <WorkerFormModal
           worker={editingWorker}
           templates={templates}
+          configTiers={configTiers}
           isCreateFromTemplate={isCreateFromTemplate}
           onSave={handleSaveWorker}
           onCancel={() => {
