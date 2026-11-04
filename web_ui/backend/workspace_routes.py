@@ -1618,6 +1618,12 @@ class WorkerConfigUpdateBody(BaseModel):
     spawned with -- because that is what a ``config_update`` frame carries: a
     runtime merges it onto the config it was born with, so a caller that does
     not know every field cannot silently erase one.
+
+    The worker PANEL is not an authority for every field this body accepts: it
+    sends only what a ``WorkerDefinition`` carries (``system_prompt``,
+    ``temperature``, ``max_turns``, ...), and a ``WorkerDefinition`` has no
+    provider field at all.  ``provider_type`` / ``model`` are set in the
+    SESSION ``ConfigPanel`` and nowhere else; a worker inherits them at spawn.
     """
 
     config: Dict[str, Any] = {}

@@ -107,10 +107,12 @@ describe('WorkerManagementPanel — active instances', () => {
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(`${ACTIVE_URL}?session_id=${SESSION_ID}`)
     )
+    // Running list comes ONLY from the session-scoped active endpoint. Other
+    // ``/workers`` URLs (definition reads) are not the running list, so the
+    // check is that the active endpoint IS among them, not that it is the only
+    // ``/workers`` URL fetched.
     const urls = fetchMock.mock.calls.map(([u]) => String(u))
-    expect(urls.filter((u) => u.includes('/workers')).every((u) => u.includes('/workers/active'))).toBe(
-      true
-    )
+    expect(urls.some((u) => u.includes('/workers/active'))).toBe(true)
 
     // Rows: instance labels (coder / coder#2), runtime status, elapsed.
     expect(await screen.findByText('coder')).toBeInTheDocument()
