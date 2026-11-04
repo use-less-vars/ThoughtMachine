@@ -47,6 +47,7 @@ but NO ``reset`` — that action is unsupported until W3 adds it).
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -67,6 +68,33 @@ from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_timeout import wait_for_worker_exit
 
 logger = logging.getLogger(__name__)
+
+#: Reason handed to ``WorkerThread.kill(journal_reason=...)`` on every manager
+#: stop (S7b-3).  A manager stop is DELIBERATE, so the turn it ends is recorded
+#: as terminal bookkeeping rather than left behind as ``inflight`` work a
+#: successor would try to recover: the journal record becomes ``cancelled`` and
+#: the job ``stopped``, both carrying this string.
+_MANAGER_STOP_JOURNAL_REASON = "stopped-by-manager"
+
+
+def _accepts_journal_reason(fn: Any) -> bool:
+    """True when *fn* can be called with a ``journal_reason`` keyword.
+
+    A SIGNATURE check, deliberately not "call it and catch TypeError": a
+    lightweight thread double that counts calls would be counted twice by a
+    failed attempt, and a genuine TypeError raised INSIDE ``kill`` would be
+    swallowed as "no support" instead of surfacing.  ``**kwargs`` counts,
+    since that is how a double declares "I take anything".
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "journal_reason" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 
 class WorkerCapExceeded(Exception):
@@ -858,8 +886,22 @@ class WorkerManager:
         returns), so a manager stop that leaves the instance running must call
         ``kill()`` -- with a ``stop()`` fallback for lightweight thread doubles
         that predate the split.
+
+        S7b-3: when the thread's ``kill`` takes a ``journal_reason``, this
+        stop HANDS THE REASON OVER (``_MANAGER_STOP_JOURNAL_REASON``) so the
+        inflight journal records the turn as ``cancelled`` and its job as
+        ``stopped``.  Threads (and test doubles) that predate the keyword keep
+        the plain zero-arg call -- the journal is bookkeeping, never a
+        requirement for stopping.
         """
-        _killer = getattr(thread, "kill", None) or getattr(thread, "stop", None)
+        _kill = getattr(thread, "kill", None)
+        if callable(_kill) and _accepts_journal_reason(_kill):
+            try:
+                _kill(journal_reason=_MANAGER_STOP_JOURNAL_REASON)
+            except Exception:
+                pass
+            return wait_for_worker_exit(thread, worker_name)
+        _killer = _kill or getattr(thread, "stop", None)
         if callable(_killer):
             try:
                 _killer()

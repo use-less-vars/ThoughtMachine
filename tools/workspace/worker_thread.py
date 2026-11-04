@@ -36,10 +36,13 @@ from tools.workspace.command_channel import (
     write_command,
 )
 from tools.workspace.inflight_journal import (
+    INFLIGHT_FILENAME,
+    STATUS_CANCELLED,
     STATUS_INFLIGHT,
     STATUS_RECOVERABLE,
     InflightRecord,
     clear_inflight,
+    read_inflight,
     utcnow_iso,
     write_inflight,
 )
@@ -89,6 +92,13 @@ _PARK_SENTINEL: Any = object()
 #: record the park flips to ``recoverable`` and on the envelope of the job the
 #: same park terminalizes as ``interrupted``, so one grep finds both halves.
 _JOURNAL_DETACH_REASON = "detached-midturn-park"
+
+#: Reason stamped on the journal record a RESET kills and then drops. The
+#: cancelled record is unlinked a moment later (``_drop_persisted_files``),
+#: so no successor ever sees this string on disk -- it exists so the kill that
+#: a reset performs is still a DELIBERATE one (the same bookkeeping seam every
+#: other kill uses) rather than a silent ``kill()`` that journals nothing.
+_JOURNAL_RESET_REASON = "reset-drop"
 
 # Bounded attempts for ``WorkerThread._allocate_generation``. A retry is only
 # taken when a concurrent allocator overwrote the sidecar after our rename
@@ -1225,6 +1235,13 @@ class WorkerThread(threading.Thread):
         # such as the WLM handler). Stamped into the envelope so send_query
         # can correlate replies even when multiple callers overlap.
         self._current_query_id: Optional[str] = None
+        # S7b-3 (Option K): the reason a DELIBERATE kill cancelled this turn
+        # with, or None. Set by ``_journal_cancel`` (i.e. only on a kill that
+        # opted in) and consulted at WRITE POINT 3: the loop's exit must not
+        # erase the ``cancelled`` record that very kill just left, because that
+        # record is the terminal evidence the kill exists to produce. Cleared
+        # per turn, so it can never leak into a later turn's exit.
+        self._journal_cancel_reason: Optional[str] = None
         # Per-caller reply channel (set by run() when it dequeues a
         # (query_id, query, reply_q) triple from send_query). Envelopes are
         # routed to this private queue when set, so concurrent send_query
@@ -1680,15 +1697,39 @@ class WorkerThread(threading.Thread):
         # Unblock the input queue wait so the park flags are re-read.
         self._input_queue.put(_PARK_SENTINEL)
 
-    def kill(self) -> None:
+    def kill(self, *, journal_reason: Optional[str] = None) -> None:
         """Terminate the worker: signal the run loop to exit and reclaim it.
 
         PHASE 2.1a: this is the ONLY termination path — ``stop`` detaches.
+
+        S7b-3 (Option K): *journal_reason* opts this kill IN to the inflight
+        journal.  It is keyword-only and defaulted to ``None`` on purpose — a
+        plain ``kill()`` keeps its exact previous behaviour (no journal read,
+        no journal write), which is what a crash-shaped / best-effort kill and
+        every existing call site want.  A caller that KNOWS the kill is
+        deliberate (a manager stop, a reset) passes a reason, and the turn on
+        disk becomes: record ``cancelled`` + job ``stopped``, both carrying
+        that reason.
+
+        The bookkeeping is guarded and runs FIRST, before the duties below,
+        but never GATES them: a journal failure may not stop a worker from
+        dying.
         """
         # Synchronous lifecycle transition: 'killed' must be observable before
         # the run loop acknowledges the stop event.
         self.status = "killed"
         self._write_status_file()
+        if journal_reason is not None:
+            # S7b-3 (Option K): a DELIBERATE kill records itself as terminal
+            # bookkeeping before the worker goes away — the record is flipped
+            # to ``cancelled`` (never to be resurrected, and the one live-
+            # looking status a successor's ordinary write may displace) and the
+            # job this turn belonged to is terminalized ``stopped`` with the
+            # same reason in its envelope, so one grep finds both halves.  The
+            # content is deliberately empty: the loop's own reply envelope
+            # (written by run()) carries the human-facing message.
+            self._journal_cancel(reason=journal_reason)
+            self._journal_interrupt_job("", status="stopped", reason=journal_reason)
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
             try:
@@ -2034,6 +2075,7 @@ class WorkerThread(threading.Thread):
         self._timeout_triggered = False
         self._pruned_since_last_query = 0
         self._current_query_id = None
+        self._journal_cancel_reason = None
         self._current_reply_queue = None
         self.current_task = None
         self.error = None
@@ -2159,15 +2201,80 @@ class WorkerThread(threading.Thread):
                 f"[journal] clear refused for worker '{self.worker_name}': "
                 f"{reason}")
 
-    def _journal_interrupt_job(self, content: str) -> None:
-        """Terminalize the job whose turn the DETACH park abandoned.
+    def _journal_cancel(self, *, reason: str) -> None:
+        """Flip THIS incarnation's journal record to ``cancelled`` (S7b-3).
 
-        A detach park throws the turn's work away, so the job it belonged to
-        must never be completed or restarted by a later join: it is
-        ``interrupted``, not ``paused``.  ``WorkerJobRegistry.terminalize``
-        takes no ``reason`` parameter, so the journal's reason rides in the
-        ENVELOPE instead (stored verbatim as the job's result) -- one string,
-        one grep, both halves of the park.
+        A DELIBERATE kill (``kill(journal_reason=...)``) is not a crash: the
+        turn will never be resumed by anyone, so its record must say that
+        instead of being left ``inflight`` for a successor to mistake for
+        recoverable work.  ``cancelled`` is exactly that statement -- and it is
+        also the one live-looking status ``write_inflight`` lets an ordinary
+        write displace, so the husk a kill leaves behind cannot wedge the next
+        legitimate turn.
+
+        Read-modify-write over the record on disk, never a fresh one: identity
+        (``query_id``, ``created_at``, ``query``) and ``last_tool`` are carried
+        over, so a cancel is an UPDATE of the turn that exists.  NO record on
+        disk means nothing to cancel -- a kill on an idle worker must not
+        conjure a phantom turn for a successor to find.  ``attempts`` is
+        re-stamped 0 by ``_journal_write`` (which owns that field: the journal
+        records the turn, not a replay count).
+
+        Idempotent: a repetition for the same reason finds the record already
+        ``cancelled`` and writes nothing, so the first cancel's bytes -- and its
+        ``updated_at`` -- survive a repeated request unchanged.
+
+        Fenced like every other write point: a record belonging to another
+        incarnation reads as absent here and is left byte-identical.
+
+        Never raises: it is bookkeeping for a worker that is dying.
+        """
+        try:
+            existing, _why = read_inflight(self._worker_dir, self._fence())
+            if existing is None:
+                return
+            if existing.status == STATUS_CANCELLED and existing.reason == reason:
+                return
+            cancelled = self._journal_write(
+                query_id=existing.query_id,
+                query=existing.query,
+                status=STATUS_CANCELLED,
+                created_at=existing.created_at,
+                last_tool=existing.last_tool,
+                reason=reason,
+            )
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"[journal] cancel failed for worker '{self.worker_name}': {exc}")
+            return
+        if cancelled:
+            # Only a record that really reached disk may hold WRITE POINT 3
+            # back: if the cancel was refused or failed there is nothing on
+            # disk worth keeping, and the exit must clear as usual.
+            self._journal_cancel_reason = reason
+
+    def _journal_interrupt_job(
+        self,
+        content: str,
+        *,
+        status: str = "interrupted",
+        reason: str = _JOURNAL_DETACH_REASON,
+    ) -> None:
+        """Terminalize the job whose turn was ABANDONED mid-flight.
+
+        Two abandoners use this, and only the status/reason differ:
+
+        * the DETACH park (defaults: ``interrupted`` +
+          ``_JOURNAL_DETACH_REASON``) -- the turn's work is thrown away, so
+          the job it belonged to must never be completed or restarted by a
+          later join;
+        * a DELIBERATE kill (``stopped`` + the kill's own ``journal_reason``)
+          -- S7b-3.  ``stopped`` is the JOB's vocabulary for "a user/operator
+          ended this", which is exactly what the kill's reason says.
+
+        ``WorkerJobRegistry.terminalize`` takes no ``reason`` parameter, so the
+        reason rides in the ENVELOPE instead (stored verbatim as the job's
+        result) -- one string, one grep, both halves.
 
         No ``_current_query_id`` (a turn drained off the input queue) means no
         job to terminalize; that is the normal WLM-mode case, not a failure.
@@ -2187,11 +2294,11 @@ class WorkerThread(threading.Thread):
         try:
             registry.terminalize(
                 job_id,
-                status="interrupted",
+                status=status,
                 envelope={
                     "content": content,
-                    "status": "interrupted",
-                    "reason": _JOURNAL_DETACH_REASON,
+                    "status": status,
+                    "reason": reason,
                 },
             )
         except Exception as exc:
@@ -2596,6 +2703,11 @@ class WorkerThread(threading.Thread):
         # Set by the DETACH park, which is the ONE exit that must leave the
         # record behind; every other terminal exit clears it (WRITE POINT 3).
         _journal_parked = False
+        # S7b-3: cleared HERE, at the start of the turn and before the write,
+        # because a kill sets it MID-turn (after this line) and the value must
+        # then survive to WRITE POINT 3.  A later turn must not inherit it --
+        # that turn has its own record to clear.
+        self._journal_cancel_reason = None
         self._journal_write(
             query_id=_journal_query_id,
             query=query,
@@ -2924,12 +3036,18 @@ class WorkerThread(threading.Thread):
         # Every exit that reaches here DELIVERED (or explicitly reported) this
         # turn's work: success, a budget refusal, stop, an agent error, a stop
         # reason, an exception.  So the record goes, unconditionally -- with
-        # ONE exception: the DETACH park, which threw the turn away and has
-        # already flipped the record to ``recoverable`` for its successor.
-        # Clearing that here would erase exactly the evidence the park exists
-        # to leave.  A PAUSE needs no special case: it falls through to this
-        # clear like any other completed turn (the turn was drained, not lost).
-        if not _journal_parked:
+        # TWO exceptions.  The DETACH park threw the turn away and has already
+        # flipped the record to ``recoverable`` for its successor: clearing
+        # that here would erase exactly the evidence the park exists to leave.
+        # A DELIBERATE kill is the second: it cancelled the record (``cancelled``
+        # + its reason), which is the TERMINAL EVIDENCE the kill exists to
+        # produce -- the same principle, one status over.  ``clear_inflight``
+        # deletes any record fenced to this incarnation regardless of status,
+        # so without this guard the loop's own exit would erase the cancel a
+        # moment after writing it.  A PAUSE needs no special case: it falls
+        # through to this clear like any other completed turn (the turn was
+        # drained, not lost).
+        if not _journal_parked and self._journal_cancel_reason is None:
             self._journal_clear()
 
         return final_content
@@ -6574,7 +6692,18 @@ class Worker(ToolBase):
             wdir = getattr(t, "_worker_dir", None)
             if wdir is None:
                 return
-            for fname in ("context.json", "status.json", "command.json"):
+            # S7b-3: the inflight journal goes too.  A reset's promise is that
+            # the next spawn starts COMPLETELY fresh, and a surviving record --
+            # whatever its status -- would either owe a successor a replay or
+            # hold a new turn's write up as a foreign leftover.  ``unlink``
+            # never parses the file, so a corrupt journal is dropped by this
+            # same entry without a decode step that could raise.
+            for fname in (
+                "context.json",
+                "status.json",
+                "command.json",
+                INFLIGHT_FILENAME,
+            ):
                 try:
                     (wdir / fname).unlink(missing_ok=True)
                 except OSError:
@@ -6585,7 +6714,13 @@ class Worker(ToolBase):
                 # TRAP T1: reset must TERMINATE (kill), never detach — a
                 # detached thread's run() finally-block would re-save the
                 # context we are about to drop from disk.
-                t.kill()
+                # S7b-3: the kill is DELIBERATE, so it opts into the journal --
+                # the record is cancelled (and the job stopped) before the
+                # files below are dropped, so a successor can never adopt a
+                # turn this reset ended by hand.  ``_drop_persisted_files``
+                # then unlinks the record: a reset leaves nothing behind at
+                # all.
+                t.kill(journal_reason=_JOURNAL_RESET_REASON)
                 # Robust join with retry (same pattern as the force-respawn
                 # termination path): the worker may be blocked inside a slow
                 # LLM call.
