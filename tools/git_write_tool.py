@@ -1,5 +1,6 @@
 # tools/git_write_tool.py
 import json
+import os
 import re
 import logging
 import subprocess
@@ -53,6 +54,49 @@ _MISSING_IDENTITY_MARKERS = (
     "committer identity unknown",
     "empty ident name",
 )
+
+# Ambient identity environment variables, per label, in the order they are
+# consulted. These are git's OWN documented identity sources
+# (``GIT_AUTHOR_*`` outranks every config file for the author,
+# ``GIT_COMMITTER_*`` for the committer). They are read ONLY when the workspace
+# ``git_identity`` is blank, and only as a source the operator/spawner provided
+# explicitly -- no identity is ever invented from the host account, the system
+# user or the repository.
+_AMBIENT_IDENTITY_ENV = (
+    ("name", ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME")),
+    ("email", ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL")),
+)
+
+# Characters git rejects (or silently mangles) inside an ident.
+_IDENTITY_FORBIDDEN_CHARS = "\r\n\x00<>"
+
+
+def _ambient_git_identity(environ=None) -> Optional[dict]:
+    """Return the ambient ``{"name", "email"}`` identity, or ``None``.
+
+    Reads the documented git identity environment variables only (see
+    ``_AMBIENT_IDENTITY_ENV``). A label counts as provided only when its value
+    is non-blank after stripping; a missing, blank or unusable value means "not
+    provided" and the WHOLE pair is ``None`` -- there is no per-label mixture,
+    because half an identity is exactly the wrong attribution this guards
+    against. A value carrying an ident-forbidden character is ignored rather
+    than refused: the environment is ambient, so the commit keeps the
+    pre-existing behaviour (no pins, git's own resolution, and the clean
+    ``_NO_GIT_IDENTITY_ERROR`` refusal when git itself cannot resolve one).
+    """
+    env = os.environ if environ is None else environ
+    identity = {}
+    for label, names in _AMBIENT_IDENTITY_ENV:
+        for name in names:
+            value = (env.get(name) or "").strip()
+            if value:
+                if any(ch in value for ch in _IDENTITY_FORBIDDEN_CHARS):
+                    return None
+                identity[label] = value
+                break
+        else:
+            return None
+    return identity
 
 
 class GitWriteTool(GitReadTool):
@@ -828,16 +872,28 @@ class GitWriteTool(GitReadTool):
         commit should use git's own resolution), ``error`` a refusal message.
 
         The workspace ``git_identity`` is pinned via ``-c``, which outranks
-        every config file for that one invocation; without one nothing is
-        pinned and git's own repo-local/global resolution stands untouched
-        (unchanged pre-existing behaviour, including auto-detection). No
-        subprocess is issued to find out: with no pins the commit runs exactly
-        as before and a missing identity is reported from the commit's own
-        failure (see ``_is_missing_identity_error``).
+        every config file for that one invocation. When it is blank (absent
+        key, blank strings = explicitly cleared, or no workspace bound), the
+        ambient identity environment -- ``GIT_AUTHOR_NAME`` /
+        ``GIT_COMMITTER_NAME`` and ``GIT_AUTHOR_EMAIL`` /
+        ``GIT_COMMITTER_EMAIL`` -- is pinned the same way: a documented git
+        identity source the operator/spawner supplied explicitly, which git
+        honours natively on the host but NEVER sees in container mode (that
+        execution environment is rebuilt from scratch), so pinning it is what
+        makes the user's own identity reach both backends.
+        With neither, nothing is pinned and git's own repo-local/global
+        resolution stands untouched (unchanged pre-existing behaviour, including
+        auto-detection). No subprocess is issued to find out: with no pins the
+        commit runs exactly as before and a missing identity is reported from
+        the commit's own failure (see ``_is_missing_identity_error``).
         """
         identity, error = self._workspace_git_identity()
         if error:
             return (None, error)
+        if not identity:
+            # The workspace config always wins; the environment is only the
+            # fallback for the "not configured" states.
+            identity = _ambient_git_identity()
         if not identity:
             return (None, None)
         return (

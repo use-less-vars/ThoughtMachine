@@ -623,3 +623,180 @@ def test_refusal_message_is_the_documented_text():
         "Cannot commit: no git identity. Set `git_identity` in the workspace "
         "config, or run `git config --local user.name/email`."
     )
+
+
+# --- ambient identity environment fallback ---------------------------------
+#
+# The workspace `git_identity` always wins. When it is blank, the identity comes
+# from the documented git identity environment the operator/spawner provided
+# (`GIT_AUTHOR_*` / `GIT_COMMITTER_*`), pinned with the SAME `-c` mechanism so
+# both execution backends honour it (container mode never sees the ambient env
+# otherwise). With neither, nothing is pinned and the clean
+# `_NO_GIT_IDENTITY_ERROR` refusal stands -- no identity is ever invented.
+
+ENV_IDENTITY = {"name": "Spawner User", "email": "spawner@example.test"}
+ENV_PINS = ["user.name=Spawner User", "user.email=spawner@example.test"]
+
+_IDENTITY_ENV_NAMES = (
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_identity_env(monkeypatch):
+    """Neutralize the ambient identity env so every case here is deterministic.
+
+    An operator's exported ``GIT_AUTHOR_*`` must never leak into the
+    "no identity anywhere" cases (or into the pre-existing cases above).
+    """
+    for name in _IDENTITY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+
+def _set_identity_env(monkeypatch, identity=ENV_IDENTITY):
+    monkeypatch.setenv("GIT_AUTHOR_NAME", identity["name"])
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", identity["email"])
+    monkeypatch.setenv("GIT_COMMITTER_NAME", identity["name"])
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", identity["email"])
+
+
+def test_workspace_identity_wins_over_ambient_env(tmp_path, monkeypatch):
+    """A configured `git_identity` is never overridden by the environment."""
+    (tmp_path / "a.txt").write_text("x\n")
+    _workspace_config(monkeypatch, {WS_A: {"git_identity": IDENTITY_A}})
+    _set_identity_env(monkeypatch)
+    tool = _tool()
+    recorder = _Recorder()
+    staged = _stage_spy(tool, recorder)
+
+    result = tool._git_commit(tmp_path)
+
+    assert "COMMIT_OK" in result
+    assert staged[-1] == ["user.name=Agent A", "user.email=agent-a@example.test"]
+    assert recorder.config_writes == []
+
+
+def test_blank_workspace_identity_falls_back_to_ambient_env(tmp_path, monkeypatch):
+    """The seeded blank pair (the UI "unset" state) + env -> the env is pinned."""
+    (tmp_path / "a.txt").write_text("x\n")
+    _workspace_config(
+        monkeypatch, {WS_A: {"git_identity": {"name": "", "email": ""}}}
+    )
+    _set_identity_env(monkeypatch)
+    tool = _tool()
+    recorder = _Recorder()
+    staged = _stage_spy(tool, recorder)
+
+    result = tool._git_commit(tmp_path)
+
+    assert "COMMIT_OK" in result
+    assert staged[0] is None  # never on the branch probe
+    assert staged[-1] == ENV_PINS
+    # No extra subprocess and no `git config` read/write: same three calls.
+    assert recorder.calls == [
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["add", "--", "a.txt"],
+        ["commit", "-m", "agent commit", "--", "a.txt"],
+    ]
+    assert recorder.config_writes == []
+
+
+def test_absent_workspace_identity_falls_back_to_committer_env(monkeypatch):
+    """Only the committer pair exported is still a complete identity."""
+    _workspace_config(monkeypatch, {WS_A: {}})
+    monkeypatch.setenv("GIT_COMMITTER_NAME", ENV_IDENTITY["name"])
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", ENV_IDENTITY["email"])
+    tool = _tool()
+
+    assert tool._commit_identity_pins() == (ENV_PINS, None)
+
+
+def test_partial_ambient_identity_is_not_used(monkeypatch):
+    """Half an identity (name without email) is "not provided", never pinned."""
+    _workspace_config(monkeypatch, {WS_A: {}})
+    monkeypatch.setenv("GIT_AUTHOR_NAME", ENV_IDENTITY["name"])
+    tool = _tool()
+
+    assert tool._commit_identity_pins() == (None, None)
+
+
+def test_malformed_ambient_identity_is_not_used(monkeypatch):
+    """An ident-forbidden character makes the env value unusable, not pinned."""
+    _workspace_config(monkeypatch, {WS_A: {}})
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Agent <A>")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", ENV_IDENTITY["email"])
+    tool = _tool()
+
+    assert tool._commit_identity_pins() == (None, None)
+
+
+def test_no_identity_anywhere_still_refuses(tmp_path, monkeypatch):
+    """Neither config nor env -> no pins, and the documented refusal is intact."""
+    (tmp_path / "a.txt").write_text("x\n")
+    _workspace_config(
+        monkeypatch, {WS_A: {"git_identity": {"name": "", "email": ""}}}
+    )
+    tool = _tool()
+    recorder = _Recorder(
+        commit_output=GIT_NO_IDENTITY_OUTPUTS["nothing-configured"]
+    )
+    staged = _stage_spy(tool, recorder)
+
+    result = tool._git_commit(tmp_path)
+
+    assert result.startswith(_NO_GIT_IDENTITY_ERROR)
+    # No garbage author: nothing was pinned at any point.
+    assert not any(staged)
+    assert recorder.calls[-1] == ["commit", "-m", "agent commit", "--", "a.txt"]
+
+
+def test_ambient_identity_pins_land_in_host_commit_argv(tmp_path, monkeypatch):
+    """The resolved env pins reach the host backend's FINAL commit argv."""
+    _workspace_config(monkeypatch, {WS_A: {}})
+    _set_identity_env(monkeypatch)
+    tool = _tool()
+    tool.session_permissions = {"git": "write"}
+    tool.effective_permissions = {"git": "write"}
+    object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+
+    pins, error = tool._commit_identity_pins()
+    assert (pins, error) == (ENV_PINS, None)
+    object.__setattr__(tool, "_commit_identity_config", list(pins))
+
+    _FakeSandboxExecution.instances.clear()
+    monkeypatch.setattr(
+        "tools.git_info_tool.SandboxedExecution", _FakeSandboxExecution
+    )
+
+    tool._exec_host_raw(tmp_path, ["commit", "-m", "m"])
+
+    command = _FakeSandboxExecution.instances[0].calls[0][0]
+    assert command[:5] == ["git", "-c", ENV_PINS[0], "-c", ENV_PINS[1]]
+    assert command[-4:] == ["commit", "--no-verify", "-m", "m"]
+
+
+def test_ambient_identity_pins_land_in_container_commit_argv(tmp_path, monkeypatch):
+    """Container mode (which never sees the ambient env) gets the same pins."""
+    _workspace_config(monkeypatch, {WS_A: {}})
+    _set_identity_env(monkeypatch)
+    manager = _FakeManager()
+    tool = _tool()
+    tool.session_permissions = {"git": "write"}
+    tool.effective_permissions = {"git": "write"}
+    object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+    object.__setattr__(tool, "_resolved_workspace_id", WS_A)
+
+    pins, error = tool._commit_identity_pins()
+    assert (pins, error) == (ENV_PINS, None)
+    object.__setattr__(tool, "_commit_identity_config", list(pins))
+
+    result = tool._exec_container_raw(
+        tmp_path, ["commit", "-m", "x"], manager=manager
+    )
+
+    assert result == (0, "ok\n", "")
+    assert manager.calls[0][0][:5] == ["git", "-c", ENV_PINS[0], "-c", ENV_PINS[1]]
+
