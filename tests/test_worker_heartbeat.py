@@ -116,7 +116,15 @@ class TestIdleHeartbeat(_RunSafetyPatches):
             with mock.patch("tools.workspace.worker.time.monotonic",
                             side_effect=[31.0]):
                 thread._heartbeat_tick()
-            evt = self.heartbeat_events()[0]
+            # Select THIS test's own worker by name.  A heartbeat published
+            # into the (patched) global bus by a worker thread leaked from
+            # another test module in the same session can arrive first, and it
+            # is not the payload under test -- its shape says nothing about
+            # _heartbeat_tick()'s output for w-hb3.
+            evt = next(
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb3"
+            )
             data = evt.data
             self.assertEqual(data["worker_name"], "w-hb3")
             self.assertEqual(data["session_id"], "s1")
