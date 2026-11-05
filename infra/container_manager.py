@@ -116,7 +116,7 @@ def _redact_permission_shape(permissions) -> str:
     categories = ",".join(sorted(str(k) for k in permissions))
     return "count={} categories={}".format(len(permissions), categories)
 
-from infra.container_env import merge_container_identity_env
+from infra.container_env import merge_container_identity_env, workspace_git_identity
 from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
 from infra.container_create import (
     ContainerCreateSpec,
@@ -2546,6 +2546,7 @@ class ContainerManager:
             environment,
             session_id=self.session_id,
             workspace_id=self.workspace_id,
+            git_identity=workspace_git_identity(self.workspace_id),
         )
         if merged_env:
             exec_kwargs["environment"] = merged_env

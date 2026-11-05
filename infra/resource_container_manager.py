@@ -187,7 +187,7 @@ GIT_OVERLAY_BUILD_CMD = (
 )
 RESOURCE_IMAGE_BUILD_CMD = GIT_OVERLAY_BUILD_CMD
 
-from infra.container_env import merge_container_identity_env
+from infra.container_env import merge_container_identity_env, workspace_git_identity
 from infra.container_create import (
     ContainerCreateSpec,
     HardeningRecipe as _HardeningRecipe,
@@ -1537,6 +1537,7 @@ class ResourceContainerManager:
             environment,
             session_id=self.session_id,
             workspace_id=self.workspace_id,
+            git_identity=workspace_git_identity(self.workspace_id),
         )
         if merged_env:
             exec_kwargs["environment"] = merged_env
