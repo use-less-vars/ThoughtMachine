@@ -4679,6 +4679,32 @@ except ImportError:
     _workspace_dir = None
 
 
+def _same_workspace_root(left: Any, right: Any) -> bool:
+    """True when two workspace-root values name the same directory.
+
+    Used to decide whether a registry-resolved workspace root and this tool's
+    injected ``workspace_path`` agree.  Values that are not path-like (test
+    doubles, MagicMocks) are reported as "same", so callers keep their
+    previous behaviour instead of being dragged into a comparison they never
+    opted into.
+    """
+    if not isinstance(left, (str, os.PathLike)) or not isinstance(
+        right, (str, os.PathLike)
+    ):
+        return True
+    try:
+        def _norm(value: Any) -> str:
+            return (
+                os.path.normcase(os.path.abspath(os.path.expanduser(os.fspath(value))))
+                .replace("\\", "/")
+                .rstrip("/")
+            )
+
+        return _norm(left) == _norm(right)
+    except Exception:
+        return True
+
+
 # ============================================================================
 # StateBridge / EventProcessor placeholders  (moved verbatim from tools.workspace.worker; W4 facade extraction)
 # ============================================================================
@@ -4883,7 +4909,6 @@ class Worker(ToolBase):
 
     # ------------------------------------------------------------------
     def execute(self) -> str:
-        from tools.workspace.worker import resolve_workspace_id
         try:
             if self.action not in self.VALID_ACTIONS:
                 if self.action in ("kill", "resume"):
@@ -4912,29 +4937,11 @@ class Worker(ToolBase):
                     "error": f"worker_name is required for action '{self.action}'",
                 })
 
-            # === Resolve workspace ID from registries (primary, always correct) ===
-            ws_id = None
-            workspace_path_for_fallback = getattr(self, 'workspace_path', None)
-
-            # 1. Ask SessionRegistry for the session's workspace_id
-            if self.session_id:
-                try:
-                    from session.session_registry import SessionRegistry
-                    session_info = SessionRegistry.get_default().get(self.session_id)
-                    if session_info and session_info.get("workspace_id"):
-                        ws_id = session_info["workspace_id"]
-                except Exception:
-                    pass
-
-            # 2. Fallback to deprecated AgentConfig.workspace_path
-            if not ws_id and workspace_path_for_fallback and CAPABILITIES_AVAILABLE:
-                ws_id = resolve_workspace_id(workspace_path_for_fallback)
-                if ws_id:
-                    import logging
-                    logging.warning(
-                        "Worker tool resolved workspace via deprecated AgentConfig.workspace_path. "
-                        "Consider ensuring session_id is present."
-                    )
+            # === Resolve the workspace id the worker must inherit ===
+            # The parent's own workspace_path wins over SessionRegistry; see
+            # _resolve_worker_workspace_id() for why (a stale registry entry
+            # cross-wires the worker onto another, possibly dead, workspace).
+            ws_id = self._resolve_worker_workspace_id()
 
             workers = self._load_workers(ws_id)
 
@@ -5068,6 +5075,113 @@ class Worker(ToolBase):
                 return w
         return None
 
+    # ── workspace identity resolution ──────────────────────────────────
+    #
+    # A spawned worker is gated by ITS OWN ToolExecutor, against ITS OWN
+    # workspace id.  If that id names a different (e.g. deleted) workspace than
+    # the one this tool is running in, every permission category fails closed
+    # and the worker can do nothing at all — the field symptom is
+    # ``filesystem:banned`` inside a worker whose parent session has full
+    # filesystem permission.
+    #
+    # Two independent sources can disagree:
+    #
+    #   1. ``self.workspace_path`` — the path ToolExecutor injected into this
+    #      call, which is exactly the path the PARENT's permission gate
+    #      resolved its own workspace id from.  Authoritative by construction.
+    #   2. ``SessionRegistry`` — the ``workspace_id`` recorded against
+    #      ``self.session_id``.  This is the source that goes stale: the
+    #      registry is rebuilt from disk by scanning the legacy ``sessions/``
+    #      dir *and* every ``workspaces/*/sessions/`` dir, and a session file
+    #      found under more than one workspace dir is read "first found wins",
+    #      stamped with whichever ``workspaces/<id>`` directory the scan
+    #      reached first.  A moved/duplicated workspace, or a rebind that left
+    #      the old record behind, therefore resolves a session to the wrong
+    #      (possibly deleted) workspace.
+    #
+    # ``resolve_workspace_id()`` carries a second, milder aliasing hazard:
+    # several workspace ``config.json`` files can normalise to the same root
+    # and it then returns the alphabetically first match.  Both hazards are why
+    # the path-derived id wins below and why a divergence is logged loudly
+    # instead of being papered over.
+
+    def _workspace_id_from_parent_path(self) -> Optional[str]:
+        """Resolve the workspace id from this tool's injected ``workspace_path``.
+
+        Uses the *facade* binding (``tools.workspace.worker``) rather than this
+        module's own, so that tests patching
+        ``tools.workspace.worker.resolve_workspace_id`` stay effective.
+        """
+        workspace_path = getattr(self, "workspace_path", None)
+        if not isinstance(workspace_path, str) or not workspace_path:
+            return None
+        if not CAPABILITIES_AVAILABLE:
+            return None
+        try:
+            from tools.workspace.worker import resolve_workspace_id
+
+            return resolve_workspace_id(workspace_path) or None
+        except Exception:
+            logger.debug(
+                "Worker tool could not resolve a workspace id from its injected "
+                "workspace_path",
+                exc_info=True,
+            )
+            return None
+
+    def _workspace_id_from_registry(self) -> Optional[str]:
+        """Return the ``workspace_id`` SessionRegistry records for this session.
+
+        Best-effort: any registry failure (missing vault, unreadable state,
+        unknown session) yields ``None`` so the path-derived id can decide.
+        """
+        if not self.session_id:
+            return None
+        try:
+            from session.session_registry import SessionRegistry
+
+            session_info = SessionRegistry.get_default().get(self.session_id)
+        except Exception:
+            return None
+        if not session_info:
+            return None
+        return session_info.get("workspace_id") or None
+
+    def _resolve_worker_workspace_id(self) -> Optional[str]:
+        """Return the workspace id a spawned worker must inherit.
+
+        Precedence: the id derived from this tool's own injected
+        ``workspace_path`` (the workspace the parent session was actually gated
+        against) beats the id recorded in ``SessionRegistry``.  The registry
+        remains the source when no path is injected, and the last resort when
+        the path cannot be mapped to a workspace at all.
+
+        A divergence is logged as a WARNING naming both ids: it means one of
+        the two sources is stale (see the block comment above
+        ``_workspace_id_from_parent_path``).  The worker deliberately inherits
+        the PARENT's id — inheriting the registry's id instead is what produced
+        workers that resolve against a dead workspace and fail every permission
+        category closed (``filesystem:banned``).
+        """
+        path_id = self._workspace_id_from_parent_path()
+        registry_id = self._workspace_id_from_registry()
+
+        if path_id and registry_id and path_id != registry_id:
+            logger.warning(
+                "Worker tool workspace cross-wiring: session %s is recorded in "
+                "SessionRegistry under workspace %r, but the workspace_path it "
+                "is actually running in resolves to %r. Using the path-derived "
+                "id %r so the worker inherits THIS session's workspace; the "
+                "registry entry is stale (duplicate session records across "
+                "workspace dirs resolve 'first found wins').",
+                self.session_id,
+                registry_id,
+                path_id,
+                path_id,
+            )
+
+        return path_id or registry_id
+
     def _resolve_ws_dir(self, ws_id: str) -> Optional[Path]:
         """Resolve workspace directory from workspace ID."""
         from tools.workspace.worker import _workspace_dir
@@ -5091,15 +5205,35 @@ class Worker(ToolBase):
         cfg = self.agent_config or {}
         result = dict(cfg)
 
-        # Resolve workspace path from registries (primary)
-        ws_path = self._resolve_registry_workspace()
+        # The worker's own ToolExecutor gates EVERY tool call against whatever
+        # workspace this path resolves to, so it must be THIS session's
+        # workspace and never a stale registry entry (see the workspace-identity
+        # block above).  ``_resolve_registry_workspace()`` prefers
+        # SessionRegistry -> WorkspaceRegistry and only falls back to the
+        # injected ``workspace_path``; here the injected path wins instead,
+        # because that is the value the parent's own gate already resolved
+        # against.  Passing the registry's answer unconditionally is its own
+        # cross-wiring path: the worker would re-gate against a foreign (or
+        # deleted) workspace and fail every category closed.
+        parent_ws = getattr(self, 'workspace_path', None)
+        registry_ws = self._resolve_registry_workspace()
+        ws_path = registry_ws or parent_ws
+        if (
+            isinstance(parent_ws, (str, os.PathLike))
+            and isinstance(registry_ws, (str, os.PathLike))
+            and not _same_workspace_root(parent_ws, registry_ws)
+        ):
+            logger.warning(
+                "Worker tool building a worker config: the registry workspace "
+                "root %r differs from this session's workspace_path %r. "
+                "Passing the parent's path so the worker is not gated against "
+                "a foreign workspace.",
+                registry_ws,
+                parent_ws,
+            )
+            ws_path = parent_ws
         if ws_path:
             result["workspace_path"] = ws_path
-        else:
-            # Last-resort fallback for worker config propagation
-            legacy_ws = getattr(self, 'workspace_path', None)
-            if legacy_ws:
-                result["workspace_path"] = legacy_ws
 
         # Propagate the workspace-lifecycle-manager feature flag so the
         # WorkerThread's _wlm_flag_enabled() sees it at the top level.
