@@ -369,3 +369,8 @@ web_ui/frontend/.npmrc
 # `docs/*` above is a catch-all, so the negation is required or the file is never
 # versioned and vanishes on the next clone.
 !docs/design-worker-dispatch-fence.md
+
+# Design brief (permission bins shape): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design_permission_bins_shape.md

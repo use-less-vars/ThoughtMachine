@@ -161,6 +161,33 @@ pathlib.Path.home = staticmethod(
     lambda: pathlib.Path(os.environ.get("HOME", HERMETIC_BASE_DIR))
 )
 
+# ---------------------------------------------------------------------------
+# Ambient git identity env vars -- scrubbed at CONFTEST IMPORT TIME.
+# ---------------------------------------------------------------------------
+# ``GIT_AUTHOR_*`` / ``GIT_COMMITTER_*`` are OPERATOR SHELL STATE, not test
+# input. tools/git_write_tool.py pins them onto every commit whose workspace
+# config names no ``git_identity`` (see ``_ambient_git_identity``), which is
+# correct production behaviour -- but it means a developer (or CI runner, or
+# agent spawner) who exports them silently rewrites the argv of EVERY commit
+# the suite exercises. The exact-argv assertions in
+# tests/security/test_git_info_tool_operations.py then fail on that one machine
+# while passing everywhere else, which is indistinguishable from a real
+# regression and costs an hour of forensics.
+#
+# Scrubbing here -- before any test module is imported, next to the HOME
+# redirect -- makes the suite hermetic: tests that WANT an ambient identity set
+# it explicitly with ``monkeypatch.setenv``
+# (tests/test_git_workspace_identity.py), and tests that want none get none.
+_AMBIENT_IDENTITY_ENV_VARS = (
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+)
+for _identity_env_name in _AMBIENT_IDENTITY_ENV_VARS:
+    os.environ.pop(_identity_env_name, None)
+del _identity_env_name
+
 # ``os.path.expanduser`` is the second "~"-resolving seam: POSIX-path code
 # reaches the vault via ``os.path.expanduser("~/.thoughtmachine")`` without
 # going through ``pathlib.Path.home`` (patched above). Wrap it so the two

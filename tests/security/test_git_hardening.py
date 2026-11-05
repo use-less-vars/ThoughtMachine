@@ -246,6 +246,14 @@ def test_ambient_global_config_is_ignored(hardened_repo, monkeypatch, tmp_path):
     The tool overrides HOME=/dev/null itself, so this passes even though the
     ambient HOME points at a directory full of evil settings.
     """
+    # Belt-and-braces: ``tests/conftest.py`` already scrubs these at import
+    # time, but this test asserts the AUTHOR of a real commit, so it must not
+    # depend on that scrub still being there. Kept BELOW the docstring -- a
+    # statement above it turns the docstring into a no-op expression.
+    monkeypatch.delenv("GIT_AUTHOR_NAME", raising=False)
+    monkeypatch.delenv("GIT_AUTHOR_EMAIL", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_NAME", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_EMAIL", raising=False)
     workspace, repo, _ = hardened_repo
     hostile_home = tmp_path / "hostile_home"
     hostile_home.mkdir()
