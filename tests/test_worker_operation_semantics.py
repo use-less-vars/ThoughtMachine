@@ -1400,6 +1400,23 @@ def _write_command_file(thread, action):
     return thread._worker_dir / COMMAND_FILENAME
 
 
+def _persisted_runtime_status(thread):
+    """``status.json``'s ``runtime_status`` -- the CROSS-PROCESS view.
+
+    Returns ``None`` when the file is absent or unreadable: while a detach is
+    in flight the file legitimately holds the pre-flip value (or no value at
+    all), exactly as the REST backend tolerates, so callers POLL this rather
+    than sample it once.  The in-memory ``thread.status`` and this file are
+    written in two separate steps, so a test that waits on the attribute
+    alone can still read the stale persisted value.
+    """
+    try:
+        status_path = thread._worker_dir / "status.json"
+        return json.loads(status_path.read_text(encoding="utf-8"))["runtime_status"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def _retire_thread(thread, timeout=10.0):
     """Kill + join so a PARKED (detached) thread never leaks into the next test
     (``_registry_teardown`` only calls ``stop()``, which detaches)."""
@@ -1752,13 +1769,36 @@ def test_command_file_detach_is_seen_while_parked(tmp_path, monkeypatch):
 
     cmd = _write_command_file(thread, "stop")
     started = time.monotonic()
-    detached = _wait_until(lambda: thread.status == "detached", timeout=10.0)
+    # DETERMINISTIC WAIT -- was ``thread.status == "detached"`` only.
+    #
+    # A detach is THREE separate steps on the worker thread:
+    #   (1) the container-manager registration (:2522, FIRST by the documented
+    #       ordering invariant),
+    #   (2) the in-memory ``self.status = "detached"`` (:2523), and
+    #   (3) the persisted ``status.json`` write (:2524).
+    # Waiting on (2) alone let this test run ahead and read a ``status.json``
+    # that still carried the pre-flip "paused", so the assertion further down
+    # failed with a bare ``assert 'paused' == 'detached'`` -- an outcome that
+    # depended purely on how the GIL interleaved those two writes, which is why
+    # it surfaced as a version-dependent race.  Wait for the in-memory state
+    # AND the cross-process view (the same poll-the-file idiom the resume test
+    # below uses), so the transition is observed only when BOTH have landed.
+    # No timeout inflation: still bounded by the same 10 s, and a status write
+    # that genuinely never reaches the file now fails HERE, naming the value
+    # that was persisted, instead of as an opaque ``==`` mismatch.
+    detached = _wait_until(
+        lambda: thread.status == "detached"
+        and _persisted_runtime_status(thread) == "detached",
+        timeout=10.0,
+    )
     elapsed = time.monotonic() - started
     assert detached, (
         "a command.json 'stop' was NOT seen while the worker was parked "
         f"(alive={thread.is_alive()}, status={thread.status!r}, "
+        f"persisted_status={_persisted_runtime_status(thread)!r}, "
         f"detach_requested={thread._detach_requested!r}, "
-        f"command_file_still_present={cmd.exists()}) -- the park loop is deaf"
+        f"command_file_still_present={cmd.exists()}) -- the park loop is deaf "
+        "or the detach status write never reached status.json"
     )
     assert elapsed < 10.0, f"detach latency while parked was {elapsed:.1f}s"
     assert elapsed < _DETACHED_TTL_SECONDS / 10.0, (
@@ -1932,17 +1972,12 @@ def test_command_file_resume_lifts_the_detached_registration(tmp_path, monkeypat
     )
     # status.json is the cross-process view of the same state: poll it rather
     # than sampling it, exactly as the REST backend does.
-    status_path = thread._worker_dir / "status.json"
-
-    def _persisted_runtime_status():
-        try:
-            return json.loads(status_path.read_text(encoding="utf-8"))["runtime_status"]
-        except (OSError, ValueError, KeyError):
-            return None
-
     assert _wait_until(
-        lambda: _persisted_runtime_status() == "ready", timeout=10.0
-    ), f"status.json still reports {_persisted_runtime_status()!r} after resume"
+        lambda: _persisted_runtime_status(thread) == "ready", timeout=10.0
+    ), (
+        "status.json still reports "
+        f"{_persisted_runtime_status(thread)!r} after resume"
+    )
     _retire_thread(thread)
 
 
