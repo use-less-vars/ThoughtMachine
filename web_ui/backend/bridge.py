@@ -1618,13 +1618,18 @@ class WebAgentBridge:
             except Exception:
                 pass
 
-        agent_config = session_config.to_agent_config()
-
         # If no workspace_id on SessionConfig, try to resolve from bridge state
         if not session_config.workspace_id and self._workspace_id:
             session_config.workspace_id = self._workspace_id
 
-        # Set workspace_path from workspace registry if available
+        # Set workspace_path from workspace registry if available.
+        # ORDER MATTERS: this must run *before* to_agent_config() below.  On a
+        # cold start the bridge path is None here, and the AgentConfig built
+        # below is the one the Agent — and therefore every tool call — resolves
+        # its workspace from.  Resolving the path afterwards produced an
+        # AgentConfig with workspace_path=None, so the tool executor injected
+        # workspace_id=None and the Worker tool fell back to a stale registry
+        # id (sessions/worker workspace cross-wiring).
         if self._workspace_id and not self._workspace_path:
             try:
                 from thoughtmachine.workspace_registry import WorkspaceRegistry
@@ -1634,6 +1639,10 @@ class WebAgentBridge:
                     self._workspace_path = entry.root_path
             except Exception:
                 pass
+
+        # The bridge owns the authoritative workspace path — inject it
+        # explicitly rather than relying on whatever the SessionConfig carries.
+        agent_config = session_config.to_agent_config(workspace_path=self._workspace_path)
 
         # ── Log workspace defaults status (diagnostic for fresh-vault debugging) ──
         if self._workspace_id and self._workspace_path:
@@ -1748,7 +1757,7 @@ class WebAgentBridge:
             if self._session is not None and self._session_config is not None:
                 new_controller.set_session(
                     self._session,
-                    self._session_config.to_agent_config()
+                    self._session_config.to_agent_config(workspace_path=self._workspace_path)
                 )
                 new_controller.process_query(query)
             self._controller = new_controller
@@ -2134,7 +2143,7 @@ class WebAgentBridge:
         )
 
         # Step 3: Convert to AgentConfig (always needed below for audit + merge).
-        agent_config = self._session_config.to_agent_config()
+        agent_config = self._session_config.to_agent_config(workspace_path=self._workspace_path)
 
         # Permission-only changes are persist-only: pushing them into the live
         # controller is pointless and re-syncing the container would needlessly
@@ -2607,13 +2616,27 @@ class WebAgentBridge:
                     entry = registry.get_workspace(self._workspace_id)
                     if entry and entry.root_path:
                         self._workspace_path = entry.root_path
-                        if self._session_config is None:
-                            global_cfg = self._build_global_agent_config()
-                            self._session_config = SessionConfig.from_agent_config(
-                                global_cfg, workspace_id=self._workspace_id or ''
-                            )
                         log('INFO', 'server.bridge',
                             f"Backfilled workspace_path from registry for workspace {self._workspace_id}: {entry.root_path}")
+                        # Seeding the session config is a SEPARATE concern from
+                        # the path backfill above, and it used to share this
+                        # try-block — so a failure here (a missing method, for
+                        # one) reported "Could not backfill workspace_path"
+                        # even though the path had just been backfilled
+                        # successfully.  Keep them separate and say what
+                        # actually failed.
+                        if self._session_config is None:
+                            try:
+                                global_cfg = self._build_global_agent_config()
+                                self._session_config = SessionConfig.from_agent_config(
+                                    global_cfg,
+                                    workspace_id=self._workspace_id,
+                                    workspace_path=entry.root_path,
+                                )
+                            except Exception as sc_exc:
+                                log('WARNING', 'server.bridge',
+                                    f"Could not seed session_config from global config "
+                                    f"after workspace_path backfill: {sc_exc}")
                 except Exception as exc:
                     log('WARNING', 'server.bridge',
                         f"Could not backfill workspace_path from registry: {exc}")
