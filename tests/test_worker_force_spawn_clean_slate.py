@@ -33,6 +33,7 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock
 
+from agent.core.worker_context import WorkerContext
 from tools.workspace.worker import Worker
 
 SESSION = "sess-clean-slate"
@@ -41,20 +42,18 @@ WORKSPACE = "ws_clean_slate"
 STALE_MARKER = "STALE-TRANSCRIPT-FROM-THE-PREVIOUS-INCARNATION"
 
 
-def _populated_context() -> dict:
-    """A context.json as a previous incarnation leaves it behind."""
-    return {
-        "session_id": SESSION,
-        "workspace_id": WORKSPACE,
-        "worker_name": "ws-worker",
-        "user_history": [
-            {"role": "system", "content": "worker system prompt"},
-            {"role": "system", "content": f"Initial context: {STALE_MARKER}"},
-            {"role": "assistant", "content": "old turn: " + STALE_MARKER},
-        ],
-        "status": "ready",
-        "generation": 4,
-    }
+def _stale_transcript() -> list[dict]:
+    """The message list a previous incarnation's transcript carries.
+
+    Deliberately just the messages: how they are wrapped into ``context.json``
+    is the serialiser's business (see ``_plant_transcript``), never this
+    fixture's.
+    """
+    return [
+        {"role": "system", "content": "worker system prompt"},
+        {"role": "system", "content": f"Initial context: {STALE_MARKER}"},
+        {"role": "assistant", "content": "old turn: " + STALE_MARKER},
+    ]
 
 
 class TestForceSpawnCleanSlate(unittest.TestCase):
@@ -128,9 +127,33 @@ class TestForceSpawnCleanSlate(unittest.TestCase):
         return self._ws / "workers" / worker_name / "context.json"
 
     def _plant_transcript(self, worker_name: str) -> Path:
+        """Leave behind a previous incarnation's transcript via the REAL save path.
+
+        This does NOT hand-write ``context.json``.  It used to, and the
+        hand-written shape had silently drifted from the schema: the serialiser
+        stores the message list under ``conversation``
+        (``WorkerContext.to_persistable_dict``), so a planted top-level
+        ``user_history`` key was ignored by
+        ``WorkerContext.from_persistable_dict`` -- the loader returned a
+        context whose history was empty and the continuity assertion failed
+        with ``the restored conversation lost its history: []``.  Driving the
+        real ``_save_context()`` means this fixture can never drift from the
+        schema ``_load_context()`` actually reads.
+        """
+        thread = self._real_thread(worker_name)
+        thread._worker_ctx = WorkerContext(
+            session_id=SESSION,
+            workspace_id=WORKSPACE,
+            worker_name=worker_name,
+            user_history=_stale_transcript(),
+        )
+        thread._save_context()
         path = self._context_path(worker_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(_populated_context()), encoding="utf-8")
+        self.assertTrue(
+            path.exists(),
+            "the real save path wrote no context.json, so this fixture cannot "
+            "exercise continuity at all",
+        )
         return path
 
     def _spawn(self, name: str, force: bool) -> dict:
