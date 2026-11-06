@@ -601,14 +601,22 @@ class AgentController:
         except Exception:
             pass  # Best-effort: don't crash the agent thread if event bus publish fails
 
-        # Lifecycle stream: session.log (best-effort, never raises)
+        # Lifecycle stream: session.log (best-effort, never raises).
+        # Stream-only deltas are transport, not history: one session.log line per
+        # streamed token floods the audit trail and pushes real events out at the
+        # 5 MB rotation boundary.  They stay on the global event bus above, which
+        # is what live UI streaming depends on.  The classification is asked by
+        # the event's own name (never via the converted typed event), so a
+        # conversion hiccup above cannot re-open the firehose.
         try:
+            from agent.events import is_stream_only_event_type
             from agent.logging.lifecycle import log_session_event
-            log_session_event(
-                event.get('type', 'event'),
-                session_id=event.get('session_id') or self.current_session_id or '',
-                data={k: v for k, v in event.items() if k not in ('session_id', 'type')},
-            )
+            if not is_stream_only_event_type(event.get('type')):
+                log_session_event(
+                    event.get('type', 'event'),
+                    session_id=event.get('session_id') or self.current_session_id or '',
+                    data={k: v for k, v in event.items() if k not in ('session_id', 'type')},
+                )
         except Exception:
             pass
 

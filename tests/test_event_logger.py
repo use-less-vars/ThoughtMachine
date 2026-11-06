@@ -2,9 +2,18 @@
 from __future__ import annotations
 import json
 import os
+import queue
 import tempfile
 import pytest
-from agent.events import EventBus, BaseEvent, EventType, EventMetadata
+from agent.events import (
+    EventBus,
+    BaseEvent,
+    EventType,
+    EventMetadata,
+    STREAM_ONLY_EVENT_TYPES,
+    PERSISTED_EVENT_TYPES,
+    is_stream_only_event_type,
+)
 
 
 class TestEventLogger:
@@ -150,3 +159,136 @@ class TestEventLogger:
         assert ev.data["connection_id"] == "42"
         ev2 = create_event(EventType.CONFIG_LOADED, {"path": "/tmp/cfg"}, source="test")
         assert ev2.type == EventType.CONFIG_LOADED
+
+    def test_stream_only_event_types_holds_the_deltas(self):
+        """STREAM_ONLY_EVENT_TYPES must name exactly the per-token stream deltas."""
+        assert STREAM_ONLY_EVENT_TYPES == {EventType.TEXT_DELTA, EventType.REASONING_DELTA}
+
+    def test_normal_event_types_are_not_excluded(self):
+        """Guard: real history types must never be widened into the exclusion."""
+        for event_type in (
+            EventType.TOOL_CALL,
+            EventType.TOOL_RESULT,
+            EventType.TURN,
+            EventType.AGENT_START,
+            EventType.AGENT_END,
+            EventType.ASSISTANT_MESSAGE,
+        ):
+            assert event_type not in STREAM_ONLY_EVENT_TYPES
+
+    def test_event_type_classification_is_total(self):
+        """Every EventType must land in exactly one of the two classification sets.
+
+        Persistence is opt-out, so without this guard a newly added per-token
+        event type would silently reopen the session.log firehose (or, worse, a
+        real history type could be dropped by a careless widening of
+        STREAM_ONLY_EVENT_TYPES).
+        """
+        all_types = set(EventType)
+        unclassified = all_types - PERSISTED_EVENT_TYPES - STREAM_ONLY_EVENT_TYPES
+        assert not unclassified, (
+            "unclassified EventType members: "
+            f"{sorted(t.name for t in unclassified)} -- add them to "
+            "PERSISTED_EVENT_TYPES in agent/events.py unless they are "
+            "per-token stream transport"
+        )
+        assert not (PERSISTED_EVENT_TYPES & STREAM_ONLY_EVENT_TYPES), (
+            "an event type cannot be both persisted and stream-only"
+        )
+        assert PERSISTED_EVENT_TYPES == all_types - STREAM_ONLY_EVENT_TYPES
+
+    def test_is_stream_only_event_type_accepts_enum_and_string(self):
+        """The shared classifier must answer for enum members and string values."""
+        assert is_stream_only_event_type(EventType.TEXT_DELTA) is True
+        assert is_stream_only_event_type(EventType.REASONING_DELTA) is True
+        assert is_stream_only_event_type("text_delta") is True
+        assert is_stream_only_event_type("reasoning_delta") is True
+        assert is_stream_only_event_type(EventType.TURN) is False
+        assert is_stream_only_event_type("tool_call") is False
+        # Unknown/empty names fail open to "persist": history is never dropped
+        # just because a name could not be classified.
+        assert is_stream_only_event_type(None) is False
+        assert is_stream_only_event_type("") is False
+        assert is_stream_only_event_type("not_a_real_event") is False
+
+    def test_stream_deltas_are_not_persisted(self, event_bus, logger):
+        """Per-token deltas must not reach event_log.jsonl; normal events still do."""
+        logger.start()
+        event_bus.publish(BaseEvent(
+            type=EventType.TEXT_DELTA,
+            metadata=EventMetadata(source="stream"),
+            data={"text": "hi", "turn": 1},
+        ))
+        event_bus.publish(BaseEvent(
+            type=EventType.REASONING_DELTA,
+            metadata=EventMetadata(source="stream"),
+            data={"text": "thinking", "turn": 1},
+        ))
+        event_bus.publish(BaseEvent(
+            type=EventType.TOOL_CALL,
+            metadata=EventMetadata(source="tool"),
+            data={"tool_name": "test", "arguments": {}},
+        ))
+        logger.stop()
+        with open(logger.file_path) as f:
+            lines = f.readlines()
+        assert [json.loads(line)["event_type"] for line in lines] == ["tool_call"]
+
+
+class TestControllerEmitEventPersistence:
+    """Controller._emit_event keeps streaming deltas off session.log.
+
+    The global event bus is what live UI streaming depends on, so deltas must
+    still be published there; only the session.log sink skips them.
+    """
+
+    @pytest.fixture
+    def bus(self, monkeypatch):
+        from agent import events as events_module
+        local_bus = EventBus()
+        monkeypatch.setattr(events_module, "global_event_bus", local_bus)
+        return local_bus
+
+    @pytest.fixture
+    def persisted(self, monkeypatch):
+        from agent.logging import lifecycle
+        records = []
+
+        def _record(event_type, session_id="", data=None):
+            records.append((event_type, session_id, data))
+
+        monkeypatch.setattr(lifecycle, "log_session_event", _record)
+        return records
+
+    @pytest.fixture
+    def controller(self):
+        from agent.controller import AgentController
+        ctrl = AgentController.__new__(AgentController)
+        ctrl.current_session_id = "sess-test"
+        ctrl.event_queue = queue.Queue()
+        ctrl._event_callbacks = []
+        return ctrl
+
+    def test_stream_delta_reaches_bus_but_is_not_persisted(self, controller, bus, persisted):
+        published = []
+        bus.subscribe(None, published.append)
+        controller._emit_event({"type": "text_delta", "text": "hi", "turn": 1})
+        # UI streaming intact: the delta is still on the global event bus...
+        assert [event.type for event in published] == [EventType.TEXT_DELTA]
+        # ...but it never touches session.log.
+        assert persisted == []
+
+    def test_reasoning_delta_is_not_persisted(self, controller, bus, persisted):
+        published = []
+        bus.subscribe(None, published.append)
+        controller._emit_event({"type": "reasoning_delta", "text": "thinking", "turn": 1})
+        assert [event.type for event in published] == [EventType.REASONING_DELTA]
+        assert persisted == []
+
+    def test_normal_event_is_still_persisted(self, controller, bus, persisted):
+        published = []
+        bus.subscribe(None, published.append)
+        controller._emit_event({"type": "turn", "turn": 2})
+        assert [event.type for event in published] == [EventType.TURN]
+        assert [record[0] for record in persisted] == ["turn"]
+        assert persisted[0][1] == "sess-test"
