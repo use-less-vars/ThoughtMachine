@@ -36,7 +36,7 @@ from agent.config.defaults import (
     host_tmpfs,
     host_user,
 )
-from infra.container_env import merge_container_identity_env
+from infra.container_env import merge_container_identity_env, workspace_git_identity
 from security.admission_gate import (
     AdmissionDenied,
     AdmissionRequest,
@@ -382,8 +382,16 @@ def create_hardened_container(
     Returns:
         The :class:`CreatedContainer` wrapping the new container.
     """
+    # The single hardened create path for EVERY container kind (user, worker,
+    # resource, executor), so the identity env is injected here — one choke
+    # point instead of one per caller.  The git identity is read from the
+    # workspace config (falsy/absent/blank -> None -> nothing injected, which
+    # leaves git's own resolution untouched).
     env = merge_container_identity_env(
-        spec.environment, session_id=spec.session_id, workspace_id=spec.workspace_id
+        spec.environment,
+        session_id=spec.session_id,
+        workspace_id=spec.workspace_id,
+        git_identity=workspace_git_identity(spec.workspace_id),
     )
 
     if admission is not None:

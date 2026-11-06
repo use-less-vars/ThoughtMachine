@@ -300,6 +300,9 @@ class SessionConfig(BaseModel):
 
         Args:
             workspace_path: Optional workspace path to inject into the AgentConfig.
+                When omitted, ``self.workspace_path`` is used — the field is
+                declared on this model, so a caller that already put the path
+                on the session config must not have it silently dropped.
 
         Returns:
             An ``AgentConfig`` instance populated from session-level fields.
@@ -323,8 +326,14 @@ class SessionConfig(BaseModel):
         if self.mode:
             kwargs['mode'] = self.mode
 
-        if workspace_path:
-            kwargs['workspace_path'] = workspace_path
+        # The explicit argument wins; otherwise fall back to the path carried
+        # by the session config itself.  Dropping it here is what left
+        # ``AgentConfig.workspace_path`` at None, which cascaded into
+        # ``resolve_workspace_id(None)`` and the whole tool-permission chain
+        # collapsing to a stale workspace.
+        ws_path = workspace_path or self.workspace_path
+        if ws_path:
+            kwargs['workspace_path'] = ws_path
 
         if self.session_permissions is not None:
             sp_copy = dict(self.session_permissions)
@@ -357,3 +366,47 @@ class SessionConfig(BaseModel):
             workspace_path=workspace_path or None,
             **kwargs
         )
+
+    @classmethod
+    def from_agent_config(cls, cfg: Any, **overrides: Any) -> 'SessionConfig':
+        """Build a ``SessionConfig`` from a full :class:`~agent.config.models.AgentConfig`.
+
+        The inverse of :meth:`to_agent_config`: keeps only the fields this model
+        declares (``AgentConfig`` is a superset), drops ``None`` values so the
+        model defaults apply, and lets *overrides* supply bridge-known values
+        that the ``AgentConfig`` does not carry (``workspace_id``, for one —
+        ``AgentConfig`` has no such field, only the deprecated
+        ``workspace_path``).
+
+        This method was missing while :mod:`web_ui.backend.bridge` and
+        :mod:`agent.presenter.session_lifecycle` both already called it, so
+        every call raised ``AttributeError`` at runtime; the bridge swallowed
+        it and continued with ``_session_config = None``.
+
+        Args:
+            cfg: An ``AgentConfig``, a pydantic model, or a plain mapping.
+            **overrides: Extra ``SessionConfig`` field values (highest priority).
+
+        Returns:
+            A ``SessionConfig`` populated from *cfg* plus *overrides*.
+        """
+        if cfg is None:
+            payload: Dict[str, Any] = {}
+        elif hasattr(cfg, 'model_dump'):
+            payload = cfg.model_dump()
+        elif isinstance(cfg, dict):
+            payload = dict(cfg)
+        else:
+            raise TypeError(
+                f"from_agent_config() expects an AgentConfig or mapping, got {type(cfg)!r}"
+            )
+
+        data = {
+            k: v for k, v in payload.items()
+            if k in cls.model_fields and v is not None
+        }
+        data.update({
+            k: v for k, v in overrides.items()
+            if k in cls.model_fields and v is not None
+        })
+        return cls(**data)

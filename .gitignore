@@ -250,6 +250,14 @@ web_ui/frontend/.npmrc
 !.thoughtmachine/knowledge/personal/
 .thoughtmachine/knowledge/personal/*
 !.thoughtmachine/knowledge/personal/handoffs.md
+# Gen 58 (stabilization sprint) — `architecture_invariants.md` is named by
+# MANDATORY_STOP.md item 1d, so it belongs to the same onboarding contract set
+# as the files above: a read-on-entry file that does not survive a clone is a
+# dangling instruction. `.thoughtmachine/knowledge/project/**/*.md` is ignored
+# wholesale (`!` lines must follow the ignore they override), so without this
+# negation a fresh clone would tell every new seat to read a file it does not
+# have. Everything else under project/ stays ignored, as KB_POLICY intends.
+!.thoughtmachine/knowledge/project/architecture_invariants.md
 
 # Gen 50 design pass: auth layer — re-included because docs/* is a catch-all.
 !docs/design-auth-layer.md

@@ -8,19 +8,26 @@ Covers:
   E. ResourceContainerManager direct-create environment,
   F. ResourceContainerManager registry-path create environment,
   G. ResourceContainerManager.exec() environment merge,
-  H. GitReadTool plumbing forwarding session_id into ResourceContainerManager.
+  H. GitReadTool plumbing forwarding session_id into ResourceContainerManager,
+  I. git identity (W10): the ``git_identity`` vault config exported as the
+     four ``GIT_AUTHOR_*`` / ``GIT_COMMITTER_*`` variables — the pure
+     translation, the vault reader, and the create/exec wiring.
 """
 
 import copy
+import json
 import os
 import types
 
 import pytest
 
 from infra.container_env import (
+    GIT_IDENTITY_ENV_NAMES,
     SESSION_ID_ENV,
     WORKSPACE_ID_ENV,
+    git_identity_env,
     merge_container_identity_env,
+    workspace_git_identity,
 )
 import infra.container_manager as container_manager
 import infra.resource_container_manager as rcm
@@ -528,3 +535,247 @@ class TestGitReadToolPlumbing:
         assert len(ctor_kwargs) == 1
         assert ctor_kwargs[0]["session_id"] == "s-git"
         assert ctor_kwargs[0]["workspace_id"] == "ws-git"
+
+
+# ===========================================================================
+# I. Git identity env (W10)
+# ===========================================================================
+
+_IDENTITY = {"name": "Ada Lovelace", "email": "ada@example.com"}
+
+_EXPECTED_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "Ada Lovelace",
+    "GIT_AUTHOR_EMAIL": "ada@example.com",
+    "GIT_COMMITTER_NAME": "Ada Lovelace",
+    "GIT_COMMITTER_EMAIL": "ada@example.com",
+}
+
+
+def _write_workspace_config(workspace_id, payload):
+    """Write ``<tmp vault>/workspaces/<id>/config.json``.
+
+    The autouse ``_tmp_vault`` fixture points ``THOUGHTMACHINE_VAULT_ROOT`` at a
+    per-test vault, which is the same root ``infra.container_env`` reads.
+    """
+    vault = os.environ["THOUGHTMACHINE_VAULT_ROOT"]
+    config_dir = os.path.join(vault, "workspaces", str(workspace_id))
+    os.makedirs(config_dir, exist_ok=True)
+    with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+
+class TestGitIdentityEnvPure:
+    """The ``git_identity`` -> env translation (no I/O)."""
+
+    def test_usable_pair_sets_all_four_vars(self):
+        assert git_identity_env(_IDENTITY) == _EXPECTED_GIT_ENV
+
+    def test_env_name_constant_lists_all_four(self):
+        assert set(GIT_IDENTITY_ENV_NAMES) == set(_EXPECTED_GIT_ENV)
+
+    def test_blank_seed_pair_injects_nothing(self):
+        # Registration seeds every workspace with {"name": "", "email": ""} so
+        # the UI has a key to edit.  git REJECTS an empty ident, so that seed
+        # must export nothing at all.
+        assert git_identity_env({"name": "", "email": ""}) == {}
+        assert git_identity_env({"name": "  ", "email": "\t"}) == {}
+
+    def test_partial_pair_injects_nothing(self):
+        assert git_identity_env({"name": "Ada"}) == {}
+        assert git_identity_env({"email": "ada@example.com"}) == {}
+
+    def test_non_string_label_injects_nothing(self):
+        assert git_identity_env({"name": 42, "email": "ada@example.com"}) == {}
+        assert git_identity_env({"name": None, "email": None}) == {}
+
+    @pytest.mark.parametrize("bad", ["a\nb", "a\x00b", "<a>", "a<b", "a>b"])
+    def test_forbidden_characters_inject_nothing(self, bad):
+        assert git_identity_env({"name": bad, "email": "ada@example.com"}) == {}
+        assert git_identity_env({"name": "Ada", "email": bad}) == {}
+
+    def test_non_mapping_injects_nothing(self):
+        assert git_identity_env(None) == {}
+        assert git_identity_env("Ada <ada@example.com>") == {}
+        assert git_identity_env([("name", "Ada")]) == {}
+
+    def test_values_are_stripped(self):
+        env = git_identity_env({"name": " Ada ", "email": " a@b "})
+        assert env["GIT_AUTHOR_NAME"] == "Ada"
+        assert env["GIT_COMMITTER_EMAIL"] == "a@b"
+
+
+class TestWorkspaceGitIdentityReader:
+    """``workspace_git_identity`` reads the vault config; never raises."""
+
+    def test_reads_pair_from_vault_config(self):
+        _write_workspace_config("w-git", {"git_identity": _IDENTITY})
+        assert workspace_git_identity("w-git") == _IDENTITY
+
+    def test_missing_workspace_id(self):
+        assert workspace_git_identity(None) is None
+        assert workspace_git_identity("") is None
+
+    def test_missing_config_file(self):
+        assert workspace_git_identity("no-such-workspace") is None
+
+    def test_absent_key(self):
+        _write_workspace_config("w-nokey", {"max_containers": 4})
+        assert workspace_git_identity("w-nokey") is None
+
+    def test_blank_seed_counts_as_absent(self):
+        _write_workspace_config(
+            "w-seed", {"git_identity": {"name": "", "email": ""}}
+        )
+        assert workspace_git_identity("w-seed") is None
+
+    def test_malformed_shapes(self):
+        _write_workspace_config("w-str", {"git_identity": "Ada <a@b>"})
+        assert workspace_git_identity("w-str") is None
+        _write_workspace_config("w-int", {"git_identity": {"name": 42, "email": "a@b"}})
+        assert workspace_git_identity("w-int") is None
+        _write_workspace_config("w-partial", {"git_identity": {"name": "Ada"}})
+        assert workspace_git_identity("w-partial") is None
+
+    def test_invalid_json_and_non_dict_body(self):
+        vault = os.environ["THOUGHTMACHINE_VAULT_ROOT"]
+        bad_json = os.path.join(vault, "workspaces", "w-badjson")
+        os.makedirs(bad_json, exist_ok=True)
+        with open(os.path.join(bad_json, "config.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        assert workspace_git_identity("w-badjson") is None
+        _write_workspace_config("w-list", ["git_identity"])
+        assert workspace_git_identity("w-list") is None
+
+    def test_unreadable_config_never_raises(self):
+        # A directory where the file should be -> IsADirectoryError (OSError).
+        vault = os.environ["THOUGHTMACHINE_VAULT_ROOT"]
+        cfg_dir = os.path.join(vault, "workspaces", "w-dir", "config.json")
+        os.makedirs(cfg_dir, exist_ok=True)
+        assert workspace_git_identity("w-dir") is None
+
+    def test_explicit_vault_root_override(self, tmp_path):
+        root = tmp_path / "other-vault"
+        (root / "workspaces" / "w-alt").mkdir(parents=True)
+        (root / "workspaces" / "w-alt" / "config.json").write_text(
+            json.dumps({"git_identity": _IDENTITY}), encoding="utf-8"
+        )
+        assert workspace_git_identity("w-alt", vault_root=str(root)) == _IDENTITY
+        # ...and the process-wide default does NOT see it.
+        assert workspace_git_identity("w-alt") is None
+
+
+class TestGitIdentityMerge:
+    """The merge helper injects the pair without clobbering caller keys."""
+
+    def test_identity_added_to_existing_env(self):
+        env = merge_container_identity_env(
+            {"PYTHONUSERBASE": "/home/agent/.local"},
+            session_id="s1",
+            workspace_id="w1",
+            git_identity=_IDENTITY,
+        )
+        assert env == {
+            "PYTHONUSERBASE": "/home/agent/.local",
+            SESSION_ID_ENV: "s1",
+            WORKSPACE_ID_ENV: "w1",
+            **_EXPECTED_GIT_ENV,
+        }
+
+    def test_caller_git_values_not_clobbered(self):
+        env = merge_container_identity_env(
+            {"GIT_AUTHOR_NAME": "caller"},
+            session_id="s1",
+            git_identity=_IDENTITY,
+        )
+        assert env["GIT_AUTHOR_NAME"] == "caller"
+        assert env["GIT_COMMITTER_NAME"] == "Ada Lovelace"
+
+    def test_no_git_identity_keeps_pre_existing_shape(self):
+        assert merge_container_identity_env(None, session_id="s1") == {
+            SESSION_ID_ENV: "s1"
+        }
+        assert merge_container_identity_env(None, git_identity={"name": "", "email": ""}) == {}
+
+
+class TestGitIdentityWiring:
+    """The create choke point and both exec paths carry the git identity."""
+
+    def test_container_create_injects_git_identity(self):
+        _write_workspace_config("w1", {"git_identity": _IDENTITY})
+        client = _FakeDockerClient()
+        cm = _make_container_manager(client, session_id="s1", workspace_id="w1")
+        cm.start(name="my-box")
+        env = client.containers.run_calls[0]["kwargs"]["environment"]
+        for key, value in _EXPECTED_GIT_ENV.items():
+            assert env[key] == value, key
+        assert env[SESSION_ID_ENV] == "s1"
+        assert env[WORKSPACE_ID_ENV] == "w1"
+
+    def test_container_create_without_identity_is_unchanged(self):
+        # No git_identity in the config -> the pre-existing env, byte for byte.
+        client = _FakeDockerClient()
+        cm = _make_container_manager(client, session_id="s1", workspace_id="w1")
+        cm.start(name="my-box")
+        env = client.containers.run_calls[0]["kwargs"]["environment"]
+        assert env == {
+            "PYTHONUSERBASE": "/home/agent/.local",
+            SESSION_ID_ENV: "s1",
+            WORKSPACE_ID_ENV: "w1",
+        }
+
+    def test_container_create_blank_seed_is_unchanged(self):
+        _write_workspace_config(
+            "w1", {"git_identity": {"name": "", "email": ""}}
+        )
+        client = _FakeDockerClient()
+        cm = _make_container_manager(client, session_id="s1", workspace_id="w1")
+        cm.start(name="my-box")
+        env = client.containers.run_calls[0]["kwargs"]["environment"]
+        assert env == {
+            "PYTHONUSERBASE": "/home/agent/.local",
+            SESSION_ID_ENV: "s1",
+            WORKSPACE_ID_ENV: "w1",
+        }
+
+    def test_container_exec_injects_git_identity(self):
+        _write_workspace_config("w1", {"git_identity": _IDENTITY})
+        cm, client = TestContainerManagerExec()._make_exec_cm()
+        cm.exec("c-run-1", ["echo", "hi"], timeout=10, environment=None)
+        env = client.containers.containers[0].exec_calls[0]["environment"]
+        for key, value in _EXPECTED_GIT_ENV.items():
+            assert env[key] == value, key
+
+    def test_container_exec_caller_git_value_wins(self):
+        _write_workspace_config("w1", {"git_identity": _IDENTITY})
+        cm, client = TestContainerManagerExec()._make_exec_cm()
+        cm.exec(
+            "c-run-1",
+            ["echo", "hi"],
+            timeout=10,
+            environment={"GIT_AUTHOR_NAME": "caller"},
+        )
+        env = client.containers.containers[0].exec_calls[0]["environment"]
+        assert env["GIT_AUTHOR_NAME"] == "caller"
+        assert env["GIT_COMMITTER_NAME"] == "Ada Lovelace"
+
+    def test_resource_create_injects_git_identity(self, monkeypatch):
+        _write_workspace_config("ws-r", {"git_identity": _IDENTITY})
+        fake_docker = _FakeDockerModule()
+        mgr = _make_resource_manager(monkeypatch, fake_docker, session_id="s-r")
+        mgr.ensure_container()
+        env = fake_docker._client.containers.run_calls[0]["kwargs"]["environment"]
+        for key, value in _EXPECTED_GIT_ENV.items():
+            assert env[key] == value, key
+        assert env[SESSION_ID_ENV] == "s-r"
+        assert env[WORKSPACE_ID_ENV] == "ws-r"
+
+    def test_resource_exec_injects_git_identity(self, monkeypatch):
+        _write_workspace_config("ws-r", {"git_identity": _IDENTITY})
+        mgr, fake_docker, seed = TestResourceContainerManagerExec()._make_mgr(
+            monkeypatch
+        )
+        mgr.exec(["echo", "hi"], environment=None, timeout=10)
+        env = seed.exec_calls[0]["environment"]
+        for key, value in _EXPECTED_GIT_ENV.items():
+            assert env[key] == value, key
+
