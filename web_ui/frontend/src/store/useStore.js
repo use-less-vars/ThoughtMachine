@@ -161,6 +161,12 @@ const useStore = create((set) => ({
           permissions: payload?.permissions ?? null,
           providers: payload?.providers || [],
           tools: normalizeTools(payload?.tools),
+          // The LIVE workspace binding: session_loaded carries the top-level
+          // workspace_path the server actually bound.  null = explicitly
+          // unbound; undefined (key absent -> unknown) so consumers fall back
+          // to the config snapshot.  An ABSENT key must NOT be coerced to null:
+          // that would assert "unbound" for a state we simply do not know.
+          workspace_path: payload && ('workspace_path' in payload) ? (payload.workspace_path ?? null) : undefined,
           isLoaded: true,
         },
       },
@@ -193,6 +199,9 @@ const useStore = create((set) => ({
             permissions: payload?.permissions ?? null,
             providers: payload?.providers || existing.providers || [],
             tools: payload?.tools !== undefined ? normalizeTools(payload.tools) : (existing.tools ?? []),
+            // Never drop the live binding on a partial config_changed: keep the
+            // previous value (undefined stays undefined -> snapshot fallback).
+            workspace_path: payload?.workspace_path ?? existing.workspace_path,
             isLoaded: true,
           },
         },
