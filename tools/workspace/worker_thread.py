@@ -5166,47 +5166,66 @@ class Worker(ToolBase):
         path_id = self._workspace_id_from_parent_path()
         registry_id = self._workspace_id_from_registry()
 
-        if path_id and registry_id and path_id != registry_id:
-            logger.warning(
-                "Worker tool workspace cross-wiring: session %s is recorded in "
-                "SessionRegistry under workspace %r, but the workspace_path it "
-                "is actually running in resolves to %r. Using the path-derived "
-                "id %r so the worker inherits THIS session's workspace; the "
-                "registry entry is stale (duplicate session records across "
-                "workspace dirs resolve 'first found wins').",
-                self.session_id,
-                registry_id,
-                path_id,
-                path_id,
-            )
-
         # Prefer the workspace whose on-disk sidecar matches this session.
         # Reason: _workspace_id_from_parent_path() is a reverse-map from a
         # persisted workspace_path; after a project rename (EE ->
         # ThoughtMachine-dev) that cached path can be stale. Registry can be
         # stale too (older sessions pre-date it). Sidecar presence is the only
         # ground truth that says "this session is actually provisioned here".
+        # The path is built from ``_workspace_dir`` -- the one authority for
+        # ``<vault>/workspaces/<id>`` -- so the probe honours
+        # ``THOUGHTMACHINE_VAULT_ROOT`` like every other vault path.
+        chosen: Optional[str] = None
         try:
-            import os as _os
-            _vault = _os.path.expanduser("~/.thoughtmachine/workspaces")
             _sid = self.session_id or ""
+
             def _has_sidecar(wid: str) -> bool:
-                if not wid or not _sid:
+                if not wid or not _sid or _workspace_dir is None:
                     return False
-                return _os.path.exists(
-                    _os.path.join(_vault, wid, "sessions", _sid, "permissions.json")
-                )
+                return (
+                    _workspace_dir(wid) / "sessions" / _sid / "permissions.json"
+                ).exists()
+
             _path_ok = _has_sidecar(path_id)
-            _reg_ok  = _has_sidecar(registry_id)
+            _reg_ok = _has_sidecar(registry_id)
             if _path_ok and not _reg_ok:
-                return path_id
-            if _reg_ok and not _path_ok:
-                return registry_id
+                chosen = path_id
+            elif _reg_ok and not _path_ok:
+                chosen = registry_id
         except Exception:
             # Never let a sidecar probe break resolution — fall through.
-            pass
-        # Both, neither, or probe failed: registry is the authority.
-        return registry_id or path_id
+            logger.debug(
+                "worker workspace sidecar probe failed; falling back to the "
+                "path-derived id",
+                exc_info=True,
+            )
+            chosen = None
+
+        if chosen is None:
+            # Inconclusive (both candidates provisioned, or neither, or the
+            # probe failed): the path-derived id is the directory this session
+            # is ACTUALLY running in, while the registry record is a persisted
+            # mapping that can point at a workspace that has since been
+            # moved/deleted -- that is the exact cross-wiring this method
+            # exists to prevent. `path_id` falls back to the registry only
+            # when the path-derived id is unavailable.
+            chosen = path_id or registry_id
+
+        if path_id and registry_id and path_id != registry_id:
+            logger.warning(
+                "Worker tool workspace cross-wiring: session %s is recorded in "
+                "SessionRegistry under workspace %r, but the workspace_path it "
+                "is actually running in resolves to %r; choosing %r. The worker "
+                "inherits THIS session's workspace, so a stale registry entry "
+                "(duplicate session records across workspace dirs resolve "
+                "'first found wins') cannot point it at a dead workspace.",
+                self.session_id,
+                registry_id,
+                path_id,
+                chosen,
+            )
+
+        return chosen
 
 
     def _resolve_ws_dir(self, ws_id: str) -> Optional[Path]:
