@@ -5927,6 +5927,35 @@ class Worker(ToolBase):
         if _spawn_permissions is not None:
             _spawn_permissions = dict(_spawn_permissions)
 
+        # ── Forced spawn starts from a clean slate ──
+        # A forced spawn REPLACES the previous incarnation, so it must not
+        # rehydrate that incarnation's conversation.  The persisted transcript
+        # is removed here, BEFORE the constructor allocates the new generation,
+        # so ``_load_context()`` in run() finds nothing and the worker builds a
+        # fresh WorkerContext.  (Before this, a forced spawn restored the old
+        # transcript, so a freshly spawned worker came up already consuming
+        # ~92k of its own token budget.)  The path deliberately mirrors
+        # ``WorkerThread.__init__``'s ``self._worker_dir``.  A NON-forced spawn
+        # never reaches this block: conversation continuity across spawn/query
+        # boundaries stays the default for it.
+        # No resolved workspace dir ⇒ nothing to unlink, and building the path
+        # must not raise TypeError (only OSError is caught below).
+        if self.force and ws_dir is not None:
+            _stale_context = (
+                ws_dir
+                / "workers"
+                / _WorkerRegistry.instance_label(self.worker_name, spawn_iid)
+                / "context.json"
+            )
+            try:
+                _stale_context.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Force-spawn: could not remove the previous conversation "
+                    "at %s (%s); the new instance may restore it",
+                    _stale_context, exc,
+                )
+
         # Create and start the worker thread
         thread = WorkerThread(
             name=self.worker_name,
@@ -5982,11 +6011,15 @@ class Worker(ToolBase):
         if self.meta is not None:
             thread._initial_context["meta"] = self.meta
 
-        # Context is always preserved — context.json is never deleted on spawn.
-        # If context.json exists from a previous run, it is loaded in run()
-        # and _initial_context is merged into the loaded context rather than
-        # replacing it. This ensures worker conversation state persists across
-        # spawn/query boundaries.
+        # Context persistence on spawn is now conditional:
+        #   * NON-forced spawn — context.json is preserved. If it exists from a
+        #     previous run it is loaded in run() and _initial_context is merged
+        #     into the loaded context rather than replacing it, so worker
+        #     conversation state persists across spawn/query boundaries.
+        #   * FORCED spawn — the previous conversation was already unlinked
+        #     above (before the constructor), so run() loads nothing and the
+        #     worker starts from an empty conversation plus _initial_context.
+        #     force means a genuine clean slate, not a restore.
 
         # -- Command channel: a stale command.json is left IN PLACE --
         # There is deliberately no spawn-time cleanup here any more.  The
