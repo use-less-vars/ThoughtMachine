@@ -5180,7 +5180,34 @@ class Worker(ToolBase):
                 path_id,
             )
 
-        return path_id or registry_id
+        # Prefer the workspace whose on-disk sidecar matches this session.
+        # Reason: _workspace_id_from_parent_path() is a reverse-map from a
+        # persisted workspace_path; after a project rename (EE ->
+        # ThoughtMachine-dev) that cached path can be stale. Registry can be
+        # stale too (older sessions pre-date it). Sidecar presence is the only
+        # ground truth that says "this session is actually provisioned here".
+        try:
+            import os as _os
+            _vault = _os.path.expanduser("~/.thoughtmachine/workspaces")
+            _sid = self.session_id or ""
+            def _has_sidecar(wid: str) -> bool:
+                if not wid or not _sid:
+                    return False
+                return _os.path.exists(
+                    _os.path.join(_vault, wid, "sessions", _sid, "permissions.json")
+                )
+            _path_ok = _has_sidecar(path_id)
+            _reg_ok  = _has_sidecar(registry_id)
+            if _path_ok and not _reg_ok:
+                return path_id
+            if _reg_ok and not _path_ok:
+                return registry_id
+        except Exception:
+            # Never let a sidecar probe break resolution — fall through.
+            pass
+        # Both, neither, or probe failed: registry is the authority.
+        return registry_id or path_id
+
 
     def _resolve_ws_dir(self, ws_id: str) -> Optional[Path]:
         """Resolve workspace directory from workspace ID."""
