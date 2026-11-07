@@ -243,3 +243,101 @@ class TestWorkspaceIdSerialization:
         # Since current is 'ws-original' and new is 'ws-updated', it should raise
         with pytest.raises(AttributeError, match="workspace_id is immutable"):
             session.update_from_persistable_dict(data)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test 5: load_session_workspace_id parity with the legacy backfill (read-only)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestResolverLegacyParity:
+    """``load_session_workspace_id`` is the read-only replacement for the old
+    ``load_session(sid).workspace_id`` probe.  It must answer exactly what that
+    probe answered — including the legacy ``metadata['workspace_path']``
+    backfill — while never mutating the store.
+    """
+
+    @staticmethod
+    def _store_and_vault(tmp_path, monkeypatch):
+        """Store whose ``_base_dir`` (vault_root) is inside tmp_path."""
+        from session.store import FileSystemSessionStore
+
+        vault = tmp_path / "vault"
+        vault.mkdir(parents=True, exist_ok=True)
+        # _base_dir is a property that calls vault_root() on every access, so
+        # patching the module attribute keeps the whole test inside tmp_path.
+        monkeypatch.setattr("session.store.vault_root", lambda: vault)
+        store = FileSystemSessionStore(
+            sessions_dir=str(tmp_path / "sessions"),
+            state_dir=str(tmp_path / "state"),
+            enable_session_history_pruning=False,
+        )
+        return store, vault
+
+    def test_legacy_workspace_path_resolves_without_mutation(self, tmp_path, monkeypatch):
+        """A legacy record (workspace_id=None, metadata.workspace_path set) must
+        resolve to its workspace — and the resolver must not write anything."""
+        store, vault = self._store_and_vault(tmp_path, monkeypatch)
+
+        session = Session(
+            workspace_id=None,
+            metadata={'workspace_path': '/tmp/some-project'},
+        )
+        session.metadata['name'] = 'Legacy Resolver Session'
+        store.save_session(session)
+        sid = session.session_id
+
+        # No _meta_<sid>.json sidecar may short-circuit resolution: drop the
+        # legacy one and confirm no workspace-scoped one exists.
+        for meta in (tmp_path / "sessions").glob(f"_meta_{sid}.json"):
+            meta.unlink()
+        assert not (vault / "workspaces").exists()
+
+        payloads = [p for p in (tmp_path / "sessions").glob("*.json")
+                    if not p.name.startswith("_meta_")]
+        assert len(payloads) == 1
+        payload = payloads[0]
+        files_before = sorted(p.name for p in (tmp_path / "sessions").glob("*.json"))
+        bytes_before = payload.read_bytes()
+        mtime_before = payload.stat().st_mtime_ns
+
+        with patch("thoughtmachine.workspace_capabilities.resolve_workspace_id") as mock_resolve:
+            mock_resolve.return_value = "ws-migrated-789"
+            resolved = store.load_session_workspace_id(sid)
+
+        # (a) the workspace is resolved from metadata.workspace_path
+        assert resolved == "ws-migrated-789"
+        mock_resolve.assert_called_once_with('/tmp/some-project')
+
+        # (b) the probe stayed read-only: no rewrite, no new files, no migration
+        assert payload.read_bytes() == bytes_before
+        assert payload.stat().st_mtime_ns == mtime_before
+        assert sorted(p.name for p in (tmp_path / "sessions").glob("*.json")) == files_before
+        assert not (vault / "workspaces" / "ws-migrated-789" / "sessions").exists()
+
+    def test_unresolvable_legacy_record_still_returns_none(self, tmp_path, monkeypatch):
+        """If workspace_path does not resolve, the answer stays None (no raise)."""
+        store, _vault = self._store_and_vault(tmp_path, monkeypatch)
+
+        session = Session(
+            workspace_id=None,
+            metadata={'workspace_path': '/tmp/not-a-workspace'},
+        )
+        store.save_session(session)
+
+        with patch("thoughtmachine.workspace_capabilities.resolve_workspace_id") as mock_resolve:
+            mock_resolve.return_value = None
+            assert store.load_session_workspace_id(session.session_id) is None
+
+    def test_scoped_record_matches_load_session(self, tmp_path, monkeypatch):
+        """Parity matrix: for a workspace-scoped record the resolver returns the
+        same value load_session(sid).workspace_id returns."""
+        store, _vault = self._store_and_vault(tmp_path, monkeypatch)
+
+        session = Session(workspace_id="ws-scoped-1")
+        session.metadata['name'] = 'Scoped Session'
+        store.save_session(session, workspace_id="ws-scoped-1")
+        sid = session.session_id
+
+        loaded = store.load_session(sid)
+        assert loaded is not None
+        assert store.load_session_workspace_id(sid) == loaded.workspace_id == "ws-scoped-1"
+

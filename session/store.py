@@ -58,6 +58,27 @@ def _generate_friendly_filename(session_id: str, session_name: str) -> str:
     return f"{sanitized}_{short_id}.json"
 
 
+def _workspace_id_from_session_path(path: Optional[Path]) -> Optional[str]:
+    """Return the workspace a session FILE lives in, or ``None``.
+
+    A workspace-scoped record lives in
+    ``<vault>/workspaces/<ws_id>/sessions/<file>``, so the directory itself is
+    the workspace — no payload read is needed to answer the question.  The
+    legacy ``sessions_dir`` is workspace-agnostic by construction and always
+    yields ``None``.
+    """
+    if path is None:
+        return None
+    try:
+        parts = Path(path).parts
+    except (TypeError, ValueError):
+        return None
+    if len(parts) < 4 or parts[-2] != "sessions" or parts[-4] != "workspaces":
+        return None
+    ws_id = parts[-3]
+    return ws_id or None
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     """Write *data* as JSON to *path* atomically (temp file + ``os.replace``).
 
@@ -633,6 +654,115 @@ class FileSystemSessionStore(SessionStore):
         except Exception as e:
             logger.error(f"[SessionStore] Error loading session metadata for {session_id}: {e}")
             return None
+
+    def load_session_workspace_id(self, session_id: str) -> Optional[str]:
+        """Resolve a stored session's workspace id WITHOUT loading the session.
+
+        A cold load needs exactly ONE attribute of the stored record —
+        ``workspace_id`` — before the real load runs: the WS ``load_session``
+        handler must pin the bridge's workspace first, or the load resolves a
+        different workspace and quietly adopts it.  Asking for that one
+        attribute with :meth:`load_session` deserialised the whole payload into
+        a ``Session`` (hundreds of ``Message`` objects) and then threw it away,
+        so a single cold load parsed the same multi-MB history twice.
+
+        Resolution order (first hit wins):
+
+          1. The path cache: a path already resolved by
+             :meth:`_find_session_path` names the workspace by its directory.
+             No I/O at all.
+          2. The ``_meta_<session_id>.json`` sidecar under
+             ``workspaces/<ws_id>/sessions/``: the FILENAME carries the exact
+             session id and the PARENT DIRECTORY carries the workspace, so the
+             match is exact (it cannot collide with another session) and no
+             payload is parsed — only a file existence check.
+          3. :class:`SessionRegistry`, the global index that records the
+             workspace of every session it has seen.
+          4. Last resort: locate the payload and read its top-level
+             ``workspace_id`` field.  Correct but not cheap, and reached only
+             by records that neither the sidecar nor the registry knows.
+          5. Parity fallback, inside the same last resort: a record written
+             before workspaces existed carries no top-level ``workspace_id``
+             at all \u2014 only ``metadata['workspace_path']``.  That path is
+             resolved with the SAME ``resolve_workspace_id`` helper the legacy
+             backfill in :meth:`load_session` uses, so the probe answers what
+             the old ``load_session()``-based probe answered.  Unlike that
+             backfill this lookup is READ-ONLY: it never calls
+             ``save_session``.  A probe that mutated the store would write on
+             every cold load and blur which path owns the migration \u2014 the
+             real load still owns it.
+
+        Returns ``None`` when the session is unknown, when it is a legacy
+        record in the workspace-agnostic ``sessions_dir`` that carries no
+        ``workspace_path`` that does not resolve to a known workspace, and on any
+        lookup error — i.e. exactly the
+        "no workspace to scope to" answer the previous
+        ``getattr(session, 'workspace_id', None)`` probe produced, never an
+        exception.
+        """
+        if not session_id:
+            return None
+
+        # 1. Cached path — the directory already names the workspace.
+        cached = self._cached_paths.get((None, session_id))
+        if cached is not None:
+            ws_id = _workspace_id_from_session_path(cached)
+            if ws_id:
+                return ws_id
+
+        # 2. Sidecar metadata file: exact id in the name, workspace in the dir.
+        try:
+            for ws_sessions in (self._base_dir / "workspaces").glob("*/sessions"):
+                if (ws_sessions / f"_meta_{session_id}.json").is_file():
+                    return ws_sessions.parent.name or None
+        except Exception:  # noqa: BLE001 - best effort, fall through
+            pass
+
+        # 3. Global registry index.
+        try:
+            from .session_registry import SessionRegistry
+            entry = SessionRegistry.get_default().get(session_id)
+            if isinstance(entry, dict):
+                ws_id = entry.get('workspace_id')
+                if ws_id:
+                    return ws_id
+        except Exception:  # noqa: BLE001 - best effort, fall through
+            pass
+
+        # 4. Last resort: locate the payload (directory first, then its field).
+        try:
+            path = self._find_session_path(session_id)
+            if path is None:
+                return None
+            ws_id = _workspace_id_from_session_path(path)
+            if ws_id:
+                return ws_id
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                ws_id = data.get('workspace_id')
+                if isinstance(ws_id, str) and ws_id:
+                    return ws_id
+                # Legacy parity (resolution order, step 5): a pre-workspace
+                # record names its workspace only in metadata['workspace_path'].
+                # Same helper as the backfill inside load_session(), but strictly
+                # read-only — no save_session(), no file mutation.  The real
+                # load path still performs the migration write.
+                metadata = data.get('metadata') or {}
+                if isinstance(metadata, dict):
+                    ws_path = metadata.get('workspace_path')
+                    if isinstance(ws_path, str) and ws_path:
+                        from thoughtmachine.workspace_capabilities import (
+                            resolve_workspace_id,
+                        )
+                        resolved = resolve_workspace_id(ws_path)
+                        if isinstance(resolved, str) and resolved:
+                            return resolved
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"[SessionStore] Error resolving the workspace of session "
+                f"{session_id}: {exc}")
+        return None
 
     def load_sessions_metadata_batch(self, session_ids: List[str], workspace_id: Optional[str] = None) -> Dict[str, Optional[Dict[str, Any]]]:
         """
